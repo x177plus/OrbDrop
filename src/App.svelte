@@ -1,0 +1,750 @@
+<script lang="ts">
+  import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+  import { LogicalSize } from '@tauri-apps/api/dpi';
+  import { onMount } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
+  import { getDevices, loadDevices } from '$lib/stores/devices.svelte';
+  import { getServerPort, setServerPort, loadShares, addShare, removeShare, getShares } from '$lib/stores/shares.svelte';
+  import { loadSettings } from '$lib/stores/settings.svelte';
+  import { getActualPort, startHttpServer, acceptPush, rejectPush, orbScreenMetrics, orbSetRect, addPeer, pairStart, pairConfirm, connectPeer, disconnectPeer, downloadFromPeer } from '$lib/api';
+  import type { PushInvite, PeerDevice, TabKey } from '$lib/types';
+  import { planExpansion, type ScreenRect } from '$lib/orbLayout';
+  import Orb from '$lib/components/Orb.svelte';
+  import TabBar from '$lib/components/TabBar.svelte';
+  import TabContent from '$lib/components/TabContent.svelte';
+  import SettingsPanel from '$lib/components/SettingsPanel.svelte';
+  import ContextMenu from '$lib/components/ContextMenu.svelte';
+
+  const appWindow = getCurrentWebviewWindow();
+  const COLLAPSED = new LogicalSize(90, 90);
+  const ORB_SIZE = 62;                                             // 悬浮球直径（CSS px）
+  const PANEL = { w: 448, h: 620 };                                // 面板标称尺寸（CSS px）
+  const PANEL_SLACK = 12;                                          // 面板四周留给阴影/圆角的余量（CSS px）
+  const EXPANDED = new LogicalSize(PANEL.w + PANEL_SLACK * 2, PANEL.h + PANEL_SLACK * 2);
+  const ORB_INSET = (COLLAPSED.width - ORB_SIZE) / 2;              // 折叠态悬浮球在窗口内的内缩
+  const WORK_MARGIN = 8;                                           // 展开窗口与工作区边缘的最小间距（CSS px）
+  const FOLD_MS = 180;                                             // 面板退场 0.16s 走完（已完全不可见）即可缩窗口
+
+  /**
+   * 等 WebView2 的 CSS 视口跟上 OS 窗口尺寸。
+   * SetWindowPos 之后视口尺寸会滞后 1~2 帧，此时布局仍按旧宽度算 ——
+   * 面板若在这期间开始淡入，就会先以窄条出现再跳宽（右边缘闪一下）。
+   */
+  async function waitForViewport(width: number, height: number) {
+    for (let i = 0; i < 6; i++) {
+      if (Math.abs(window.innerWidth - width) <= 1 && Math.abs(window.innerHeight - height) <= 1) return;
+      await new Promise(requestAnimationFrame);
+    }
+    console.warn('展开：视口尺寸未在预期帧数内跟上窗口，按当前尺寸继续');
+  }
+
+  let expanded = $state(false);
+  let showSettings = $state(false);
+  let activeTab = $state<TabKey>({ kind: 'local' });
+  let dragging = $state(false);
+  // 悬浮球在窗口内的绝对偏移（CSS px）：切换窗口时由 JS 更新，配合 holdOrb 隐藏保证不错位
+  let orbOffset = $state({ x: ORB_INSET, y: ORB_INSET });
+  // true = 悬浮球强制隐藏（切窗口期间）；用 transition:none 立即生效，不能让它带过渡露脸
+  let holdOrb = $state(false);
+  let ballRect = $state<ScreenRect | null>(null);
+  let foldTimer: ReturnType<typeof setTimeout> | null = null;
+  let opening = false;
+
+  // Push card state (sending progress)
+  let pushCardState = $state<{ title: string; target: string; total: string; progress: number; done: boolean; received: number } | null>(null);
+  // Consent card state (incoming push)
+  let consentState = $state<{ from: string; name: string; size: string; bytes: number } | null>(null);
+  // Pair dialog state: we display our own code (issued by the backend) and
+  // accept the code the other side displays in the same dialog.
+  type PairDialog = {
+    peerId: string | null;   // null = still picking a target device
+    peerName: string | null;
+    code: string;            // our code, shown for the peer to type in
+    remaining: number;       // seconds left on `code`; 0 while refreshing
+    input: string;           // the code shown on the peer's screen
+    busy: boolean;
+    error: string | null;
+    ip: string;              // manual-add target (F-11)
+    port: string;
+  };
+  let pairState = $state<PairDialog | null>(null);
+  let pairTimer: ReturnType<typeof setInterval> | null = null;
+  // Toast messages
+  let toasts = $state<{ id: number; msg: string; leaving: boolean }[]>([]);
+  let toastId = $state(0);
+  // Context menu
+  let ctxState = $state<{ x: number; y: number; kind: 'share' | 'device' | 'peer'; el?: HTMLElement; shareId?: string; path?: string; isDir?: boolean; deviceState?: string; deviceId?: string; peerId?: string; peerName?: string; name?: string } | null>(null);
+  // Push invitation overlay (real incoming)
+  let pushInvite = $state<PushInvite | null>(null);
+
+  let connectedCount = $derived(getDevices().filter(d => d.connected).length);
+  // 每台长连接设备一个浏览标签：长连接是「对方此刻能看到/能被看到」的边界（F-25）。
+  let browsers = $derived(getDevices().filter(d => d.connected));
+  // 正在浏览的设备掉线/断开长连接后，标签会消失：自动回落，别把用户留在空白页。
+  $effect(() => {
+    const tab = activeTab;
+    if (tab.kind === 'peer' && !browsers.some((d) => d.id === tab.peerId)) {
+      activeTab = { kind: 'devices' };
+    }
+  });
+  let localCount = $derived(getShares().length);
+  let deviceCount = $derived(getDevices().length);
+  let serverPortVal = $derived(getServerPort());
+
+  function setOpen(v: boolean) {
+    if (v) void expand();
+    else collapse();
+  }
+
+  /**
+   * 展开：先立即藏住悬浮球，再算方向/落位，一次 SetWindowPos 原子切换窗口，
+   * 最后才让面板从悬浮球那一侧长出。悬浮球在切窗口期间绝不参与渲染，
+   * 因此不存在「画在旧窗口坐标/旧偏移」的错位帧。
+   */
+  async function expand() {
+    if (opening || expanded) return;
+    opening = true;
+    holdOrb = true;
+    try {
+      const sf = await appWindow.scaleFactor();
+      const pos = await appWindow.outerPosition();
+      const size = await appWindow.outerSize();
+      const ball: ScreenRect = { x: pos.x, y: pos.y, w: size.width, h: size.height };
+      const metrics = await orbScreenMetrics();
+      const plan = planExpansion({
+        ball,
+        work: metrics.workArea,
+        expanded: { w: Math.round(EXPANDED.width * sf), h: Math.round(EXPANDED.height * sf) },
+        orbInset: Math.round(ORB_INSET * sf),
+        margin: Math.round(WORK_MARGIN * sf),
+      });
+
+      if (foldTimer) { clearTimeout(foldTimer); foldTimer = null; }
+      ballRect = ball;
+      orbOffset = { x: plan.orbOffset.x / sf, y: plan.orbOffset.y / sf };
+      await orbSetRect(plan.window);
+      await waitForViewport(EXPANDED.width, EXPANDED.height);
+      expanded = true;
+      holdOrb = false; // 悬浮球继续由 .open 隐藏，直到收起
+    } catch (e) {
+      console.error('展开悬浮球失败:', e);
+      holdOrb = false;
+      toast('展开失败，请重试');
+    } finally {
+      opening = false;
+    }
+  }
+
+  /**
+   * 收起：面板先折叠淡出（此时窗口未变、球也没露脸），随后把偏移与窗口一起切回
+   * 悬浮球原位，切完才让悬浮球淡入 —— 悬浮球只在几何完全settle之后才可见。
+   */
+  function collapse() {
+    expanded = false;
+    showSettings = false;
+    ctxState = null;
+    holdOrb = true;
+    if (foldTimer) clearTimeout(foldTimer);
+    foldTimer = setTimeout(() => {
+      foldTimer = null;
+      const target = ballRect;
+      ballRect = null;
+      void (async () => {
+        try {
+          if (target) {
+            await orbSetRect(target);
+          }
+        } catch (e) {
+          console.error('收起悬浮球失败:', e);
+        } finally {
+          orbOffset = { x: ORB_INSET, y: ORB_INSET };
+          holdOrb = false;
+        }
+      })();
+    }, FOLD_MS);
+  }
+
+  // Toast
+  function toast(msg: string) {
+    const id = ++toastId;
+    toasts = [...toasts, { id, msg, leaving: false }];
+    setTimeout(() => {
+      toasts = toasts.map(t => (t.id === id ? { ...t, leaving: true } : t));
+      setTimeout(() => { toasts = toasts.filter(t => t.id !== id); }, 260);
+    }, 2200);
+  }
+
+  // Push progress card (simulation when backend progress events absent)
+  function startPush(name: string, target: string, total: string) {
+    pushCardState = { title: `正在发送 · ${name}`, target, total, progress: 0, done: false, received: 0 };
+    const totalMB = parseFloat(total);
+    const totalBytes = total.indexOf('M') > -1 ? totalMB * 1024 * 1024 : totalMB * 1024;
+    let received = 0;
+    const interval = setInterval(() => {
+      received += totalBytes * 0.15;
+      const pct = Math.min(100, Math.round((received / totalBytes) * 100));
+      pushCardState = { ...pushCardState!, progress: pct, received, done: pct >= 100 };
+      if (pct >= 100) {
+        clearInterval(interval);
+        pushCardState = { ...pushCardState!, title: `已发送完成 · ${name}`, done: true };
+        toast(`「${name}」已成功发送至 ${target}`);
+        setTimeout(() => { pushCardState = null; }, 3000);
+      }
+    }, 500);
+  }
+
+  function requestPush(device: PeerDevice) {
+    if (device.connected) {
+      startPush('项目设计稿', device.name, '12.6 MB');
+    } else {
+      toast(`已向「${device.name}」发起推送，等待对方同意`);
+      consentState = { from: device.name, name: '项目设计稿', size: '12.6 MB', bytes: 12.6 * 1024 * 1024 };
+    }
+  }
+
+  function acceptConsent() {
+    if (!consentState) return;
+    const target = consentState.from;
+    consentState = null;
+    toast(`「${target}」已同意接收，开始传输`);
+    startPush('项目设计稿', target, '12.6 MB');
+  }
+
+  function declineConsent() {
+    if (!consentState) return;
+    toast(`「${consentState.from}」拒绝了接收`);
+    consentState = null;
+  }
+
+  /** 配对码有效期（秒），与后端 PairStore::CODE_TTL 一致。 */
+  const PAIR_TTL = 120;
+
+  function stopPairTimer() {
+    if (pairTimer) { clearInterval(pairTimer); pairTimer = null; }
+  }
+
+  /**
+   * 生成本机配对码：对方把屏幕上这串数字输入到它自己的 OrbDrop 里，由它向本机
+   * POST /pair 换取 token。
+   *
+   * 刻意不自动轮换：曾按「过期自动刷新」每 2 分钟换码，对方正照着屏幕输入时被换掉，
+   * 就会报「配对码错误或已过期」。现在只倒计时，过期后由用户点「刷新配对码」。
+   */
+  async function issuePairCode(peerId: string, peerName: string) {
+    let code: string;
+    try {
+      code = await pairStart(peerId);
+    } catch (e) {
+      toast(`生成配对码失败：${e}`);
+      return;
+    }
+    pairState = { peerId, peerName, code, remaining: PAIR_TTL, input: '', busy: false, error: null, ip: '', port: '' };
+    startPairCountdown(peerId);
+  }
+
+  function startPairCountdown(peerId: string) {
+    stopPairTimer();
+    pairTimer = setInterval(() => {
+      const ps = pairState;
+      if (!ps || ps.peerId !== peerId) { stopPairTimer(); return; }
+      if (ps.remaining > 1) { pairState = { ...ps, remaining: ps.remaining - 1 }; return; }
+      stopPairTimer();
+      pairState = { ...ps, remaining: 0 };
+    }, 1000);
+  }
+
+  /** 旧码过期后手动换新码（后端同一时间只保留未过期的码）。 */
+  async function refreshPairCode() {
+    const ps = pairState;
+    if (!ps?.peerId) return;
+    pairState = { ...ps, busy: true, error: null };
+    try {
+      const code = await pairStart(ps.peerId);
+      pairState = { ...ps, code, remaining: PAIR_TTL, busy: false };
+      startPairCountdown(ps.peerId);
+      toast('已换新配对码');
+    } catch (e) {
+      if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
+    }
+  }
+
+  function openPair(device: PeerDevice | null) {
+    if (device) { void issuePairCode(device.id, device.name); return; }
+    // 还没选中设备：先手动添加（F-11），探测到身份后直接进入配对
+    stopPairTimer();
+    pairState = {
+      peerId: null, peerName: null, code: '', remaining: 0, input: '', busy: false, error: null,
+      ip: '', port: serverPortVal ? String(serverPortVal) : '',
+    };
+  }
+
+  let pairConfirming = false;  // 本机正在用对方的码配对：收尾由 confirmPair 自己做
+
+  function closePair() { stopPairTimer(); pairState = null; }
+
+  /** 手动添加设备：探测对方 /pair/info 拿身份，随后进入配对。 */
+  async function addAndPair() {
+    const ps = pairState;
+    if (!ps) return;
+    let ip = ps.ip.trim();
+    let port = ps.port.trim();
+    const colon = ip.lastIndexOf(':');
+    if (colon > 0) { port = ip.slice(colon + 1); ip = ip.slice(0, colon); }
+    const portNum = Number(port);
+    if (!ip || !Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+      pairState = { ...ps, error: '请填写对方 IP 与端口（1-65535）' };
+      return;
+    }
+    pairState = { ...ps, busy: true, error: null };
+    try {
+      const device = await addPeer(ip, portNum);
+      await loadDevices();
+      toast(`已添加设备「${device.name}」`);
+      await issuePairCode(device.id, device.name);
+    } catch (e) {
+      if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
+    }
+  }
+
+  /** 输入对方设备上显示的配对码完成配对：由对方验证本机、交换 token。 */
+  async function confirmPair() {
+    const ps = pairState;
+    if (!ps?.peerId) return;
+    if (!/^\d{6}$/.test(ps.input)) {
+      pairState = { ...ps, error: '请输入 6 位数字配对码' };
+      return;
+    }
+    pairState = { ...ps, busy: true, error: null };
+    pairConfirming = true;
+    try {
+      await pairConfirm(ps.peerId, ps.input);
+      await loadDevices();
+      closePair();
+      toast(`已与「${ps.peerName ?? '设备'}」配对成功`);
+    } catch (e) {
+      if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
+      toast('配对失败，请核对配对码');
+    } finally {
+      pairConfirming = false;
+    }
+  }
+
+  function copyCode() {
+    const ps = pairState;
+    if (!ps?.code) return;
+    navigator.clipboard.writeText(ps.code).then(
+      () => toast(`已复制配对码 ${ps.code}`),
+      () => toast('复制失败，请手动输入')
+    );
+  }
+
+  function openSettings() { showSettings = true; }
+  function closeSettings() { showSettings = false; }
+
+  function hideCtx() { ctxState = null; }
+
+  async function ctxDownload() {
+    const c = ctxState;
+    if (!c) return;
+    if (c.kind === 'share') {
+      toast(`已开始下载「${c.shareId}」到收件目录`);
+    } else {
+      toast('已开始下载到 桌面/OrbDrop');
+    }
+    hideCtx();
+  }
+
+  async function ctxOpen() {
+    hideCtx();
+    toast('已在访达中打开所在文件夹');
+  }
+
+  /** 对端文件下载：走后端命令（token 取凭据库、落盘按下载目录设置都在 Rust 侧）。 */
+  async function ctxPeerDownload() {
+    const c = ctxState;
+    hideCtx();
+    if (c?.kind !== 'peer' || !c.peerId || !c.shareId) return;
+    try {
+      const saved = await downloadFromPeer(c.peerId, c.shareId, c.path ?? '', c.name);
+      toast(`已下载到 ${saved}`);
+    } catch (e) {
+      toast(`下载失败：${e}`);
+    }
+  }
+
+  function ctxCopy() {
+    hideCtx();
+    toast('已复制共享路径');
+  }
+
+  async function ctxRemove() {
+    const c = ctxState;
+    if (c?.kind === 'share' && c.shareId) {
+      await removeShare(c.shareId);
+      toast('已移除共享项');
+    }
+    hideCtx();
+  }
+
+  async function ctxConnect() {
+    const deviceId = ctxState?.deviceId;
+    hideCtx();
+    if (!deviceId) return;
+    try {
+      await connectPeer(deviceId);
+      toast('正在建立长连接，拖入文件将自动广播');
+    } catch (e) {
+      toast(`建立长连接失败：${e}`);
+    }
+  }
+
+  async function ctxDisconnect() {
+    const deviceId = ctxState?.deviceId;
+    hideCtx();
+    if (!deviceId) return;
+    try {
+      await disconnectPeer(deviceId);
+      toast('已断开长连接');
+    } catch (e) {
+      toast(`断开失败：${e}`);
+    }
+  }
+
+  function ctxUnpair() {
+    const c = ctxState;
+    if (c?.el) {
+      const el = c.el;
+      el.style.transition = 'opacity .25s ease, transform .25s ease';
+      el.style.opacity = '0';
+      el.style.transform = 'scale(.98)';
+      setTimeout(() => { el.remove(); }, 240);
+    }
+    toast('已解除配对并移除设备');
+    hideCtx();
+  }
+
+  function ctxPush() {
+    hideCtx();
+    toast('已向该设备发起推送');
+  }
+
+  async function handleAcceptPush() {
+    if (!pushInvite) return;
+    try {
+      await acceptPush(pushInvite.inviteId);
+      toast(`正在接收「${pushInvite.name}」`);
+    } catch (e) { console.error('Accept failed:', e); }
+    pushInvite = null;
+  }
+
+  async function handleRejectPush() {
+    if (!pushInvite) return;
+    try { await rejectPush(pushInvite.inviteId); } catch (e) { /* ignore */ }
+    pushInvite = null;
+  }
+
+  onMount(() => {
+    // 折叠态窗口 = 悬浮球 + 四周余量；位置/尺寸由 setOpen 按屏幕边界重算
+    void appWindow.setSize(COLLAPSED);
+
+    // Init data + server
+    void (async () => {
+      try {
+        await Promise.all([loadSettings(), loadDevices()]);
+        const port = await getActualPort();
+        if (port === 0) {
+          const p = await startHttpServer();
+          setServerPort(p);
+        } else {
+          setServerPort(port);
+        }
+        await loadShares();
+      } catch (e) { console.error('Init failed:', e); }
+    })();
+
+    // Tauri drag-drop
+    const unlisten = appWindow.onDragDropEvent((event) => {
+      if (event.payload.type === 'over') {
+        dragging = true;
+      } else if (event.payload.type === 'leave') {
+        dragging = false;
+      } else if (event.payload.type === 'drop') {
+        dragging = false;
+        const paths = event.payload.paths;
+        if (paths.length > 0) {
+          for (const p of paths) {
+            addShare(p).catch((e) => console.error('添加共享项失败:', e));
+          }
+          const connected = getDevices().filter(d => d.connected);
+          if (connected.length > 0) {
+            toast(`已拖入文件并自动广播至 ${connected.map(d => d.name).join('、')}`);
+          } else {
+            toast('已添加共享项');
+          }
+        }
+      }
+    });
+
+    const unPushInvite = listen<PushInvite>('push://invite', (ev) => {
+      if (!expanded) setOpen(true);
+      pushInvite = ev.payload;
+    });
+
+    const unPaired = listen('devices://changed', () => {
+      loadDevices().catch(console.error);
+    });
+
+    // 用户又点了一次应用图标 / 启动了第二份进程：把面板展开，而不是让新进程悄悄消失。
+    const unOrbShow = listen('orb://show', () => {
+      setOpen(true);
+    });
+
+    // 对方输入了本机显示的配对码 → 本机验证通过、给出 token（list 由 devices://changed 刷新）
+    const unPairDone = listen<{ peerId: string; peerName?: string | null }>('pair://completed', (ev) => {
+      if (pairConfirming) return;   // 本机自己发起的确认，toast 由 confirmPair 给出
+      const ps = pairState;
+      if (ps?.peerId === ev.payload.peerId) {
+        const name = ps.peerName ?? ev.payload.peerName ?? '设备';
+        closePair();
+        toast(`已与「${name}」配对成功`);
+      }
+    });
+
+    const unProgress = listen<{ invite_id: string; received: number; total: number }>('push://progress', (ev) => {
+      const { received, total } = ev.payload;
+      if (total <= 0) return;
+      const pct = Math.min(100, Math.round((received / total) * 100));
+      if (pushCardState) {
+        pushCardState = { ...pushCardState, progress: pct, received, done: pct >= 100 };
+        if (pct >= 100) {
+          pushCardState = { ...pushCardState, title: '已发送完成', done: true };
+          setTimeout(() => { pushCardState = null; }, 3000);
+        }
+      }
+    });
+
+    // Context menu from child components
+    const handleCtx = (e: Event) => {
+      const detail = (e as CustomEvent).detail as any;
+      if (detail && detail.kind) {
+        ctxState = { x: detail.x, y: detail.y, el: detail.el, kind: detail.kind, shareId: detail.shareId, path: detail.path, isDir: detail.isDir, deviceState: detail.deviceState, deviceId: detail.deviceId, peerId: detail.peerId, name: detail.name };
+      }
+    };
+    document.addEventListener('od:ctx', handleCtx);
+
+    return () => {
+      unlisten.then(fn => fn());
+      unPushInvite.then(fn => fn());
+      unPaired.then(fn => fn());
+      unOrbShow.then(fn => fn());
+      unProgress.then(fn => fn());
+      document.removeEventListener('od:ctx', handleCtx);
+    };
+  });
+</script>
+
+<!-- Orb Stage -->
+<aside
+  class="orb-stage"
+  class:open={expanded}
+  class:live={connectedCount > 0}
+  class:drag={dragging}
+  class:hold={holdOrb}
+  style="--panel-slack: {PANEL_SLACK}px; --orb-x: {orbOffset.x}px; --orb-y: {orbOffset.y}px"
+>
+  <Orb
+    badgeCount={connectedCount}
+    expanded={expanded}
+    onToggle={() => setOpen(!expanded)}
+  />
+
+  <!-- Main Panel -->
+  <section class="panel" aria-label="OrbDrop 主面板">
+    <header class="panel-head" data-tauri-drag-region>
+      <span class="grip" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></span>
+      <span class="panel-brand"><span class="mark-sm"><i></i></span>OrbDrop</span>
+      <div class="panel-head-right">
+        <span class="ch-inst">
+          <span class="dot ok"></span>
+          <span>在线 · 长连接 {connectedCount}</span>
+        </span>
+        <button class="icon-btn" onclick={openSettings} aria-label="打开设置">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1Z"/></svg>
+        </button>
+        <button class="icon-btn" onclick={() => setOpen(false)} aria-label="收起面板">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <TabBar
+      localCount={localCount}
+      deviceCount={deviceCount}
+      {browsers}
+      {activeTab}
+      onSelect={(tab: TabKey) => activeTab = tab}
+    />
+
+    <div class="panel-body">
+      <TabContent tab={activeTab} devices={getDevices()} onToast={toast} onRequestPush={requestPush} onOpenPair={openPair} />
+    </div>
+
+    <footer class="panel-foot">
+      <span class="num">端口 {serverPortVal || 3890}</span>
+      <span>OrbDrop v0.1.0</span>
+    </footer>
+
+    <!-- Push card (sending progress) -->
+    {#if pushCardState}
+      <div class="push-card show" class:done={pushCardState.done}>
+        <div class="p-top">
+          <span>{pushCardState.title}</span>
+          <span class="p-per num">{pushCardState.progress}%</span>
+        </div>
+        <div class="p-bar"><i style="width:{pushCardState.progress}%"></i></div>
+        <div class="p-meta">
+          <span>→ {pushCardState.target} · 局域网</span>
+          <span class="num">{(pushCardState.received / 1024 / 1024).toFixed(1)} / {pushCardState.total}</span>
+        </div>
+      </div>
+    {/if}
+
+    <!-- Consent card (incoming push) -->
+    {#if consentState}
+      <div class="push-card show" id="consentCard">
+        <div class="p-top">
+          <span>接收推送邀请</span>
+          <span class="mono">来自 {consentState.from}</span>
+        </div>
+        <div class="consent-info">
+          <span class="f-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg>
+          </span>
+          <span class="c-name">{consentState.name}</span>
+          <span class="c-size num">{consentState.size}</span>
+        </div>
+        <div class="consent-acts">
+          <button class="btn btn-secondary" onclick={declineConsent}>拒绝</button>
+          <button class="btn btn-primary" onclick={acceptConsent}>同意</button>
+        </div>
+      </div>
+    {/if}
+
+    <!-- Settings sheet -->
+    <SettingsPanel open={showSettings} onClose={closeSettings} onToast={toast} />
+
+    <!-- Pair dialog overlay -->
+    {#if pairState}
+      <div class="overlay open" id="pairDialog">
+        <div class="dialog">
+          {#if pairState.peerId}
+            <h3>与 {pairState.peerName} 配对</h3>
+            <p class="d-desc">在对方设备的 OrbDrop 中输入下方配对码，即可完成配对。</p>
+            <p class="d-target num">输入到「{pairState.peerName}」的 OrbDrop</p>
+            <div class="code num" class:expired={pairState.remaining === 0}>
+              {#each pairState.code as digit}
+                <b>{digit}</b>
+              {/each}
+            </div>
+            {#if pairState.remaining > 0}
+              <p class="code-hint num">剩余 {pairState.remaining}s · 过期后点「刷新配对码」换新码</p>
+            {:else}
+              <p class="code-hint num">已过期，旧码已作废</p>
+              <button class="btn btn-secondary btn-sm btn-block" onclick={refreshPairCode} disabled={pairState.busy}>刷新配对码</button>
+            {/if}
+            <div class="field pair-enter">
+              <label for="pairCodeInput">或：输入对方设备上显示的配对码</label>
+              <div class="path-input">
+                <input
+                  id="pairCodeInput"
+                  class="input num"
+                  bind:value={pairState.input}
+                  maxlength="6"
+                  inputmode="numeric"
+                  autocomplete="off"
+                  placeholder="6 位数字"
+                />
+                <button class="btn btn-primary" onclick={confirmPair} disabled={pairState.busy}>确认配对</button>
+              </div>
+            </div>
+            {#if pairState.error}<p class="d-err">{pairState.error}</p>{/if}
+            <div class="d-acts">
+              <button class="btn btn-secondary" onclick={copyCode}>复制配对码</button>
+              <button class="btn btn-secondary" onclick={closePair}>完成</button>
+            </div>
+          {:else}
+            <h3>添加设备</h3>
+            <p class="d-desc">输入对方设备的 IP 与端口，添加后即可与它配对（跨网段场景）。</p>
+            <div class="field">
+              <label for="pairIp">对方 IP / IP:端口</label>
+              <input id="pairIp" class="input num" bind:value={pairState.ip} placeholder="192.168.1.4:3890" />
+            </div>
+            <div class="field pair-port">
+              <label for="pairPort">端口</label>
+              <input id="pairPort" class="input num" bind:value={pairState.port} inputmode="numeric" placeholder="3890" />
+            </div>
+            {#if pairState.error}<p class="d-err">{pairState.error}</p>{/if}
+            <div class="d-acts">
+              <button class="btn btn-secondary" onclick={closePair}>取消</button>
+              <button class="btn btn-primary" onclick={addAndPair} disabled={pairState.busy}>添加并配对</button>
+            </div>
+          {/if}
+        </div>
+      </div>
+    {/if}
+
+    <!-- Push invite dialog (real incoming) -->
+    {#if pushInvite}
+      <div class="overlay open">
+        <div class="dialog">
+          <h3>收到推送</h3>
+          <p class="d-desc">
+            <strong>{pushInvite.sender.name}</strong> 发来：{pushInvite.name}
+            ({pushInvite.isDir ? '目录' : `${(pushInvite.size / 1024 / 1024).toFixed(1)} MB`})
+          </p>
+          <div class="d-acts">
+            <button class="btn btn-secondary" onclick={handleRejectPush}>拒绝</button>
+            <button class="btn btn-primary" onclick={handleAcceptPush}>同意</button>
+          </div>
+        </div>
+      </div>
+    {/if}
+  </section>
+</aside>
+
+<!-- Context menu -->
+{#if ctxState}
+  <ContextMenu
+    x={ctxState.x}
+    y={ctxState.y}
+    kind={ctxState.kind}
+    shareId={ctxState.shareId}
+    path={ctxState.path}
+    isDir={ctxState.isDir}
+    deviceState={ctxState.deviceState}
+    peerName={ctxState.peerId ? getDevices().find((d) => d.id === ctxState?.peerId)?.name : undefined}
+    onClose={hideCtx}
+    onToast={toast}
+    onDownload={ctxDownload}
+    onOpen={ctxOpen}
+    onCopy={ctxCopy}
+    onRemove={ctxRemove}
+    onConnect={ctxConnect}
+    onDisconnect={ctxDisconnect}
+    onUnpair={ctxUnpair}
+    onPush={ctxPush}
+    onPeerDownload={ctxPeerDownload}
+  />
+{/if}
+
+<!-- Toast layer -->
+<div class="toast-layer">
+  {#each toasts as t (t.id)}
+    <div class="toast" class:leaving={t.leaving}>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3v12M7 10l5 5 5-5M5 19h14"/>
+      </svg>
+      {t.msg}
+    </div>
+  {/each}
+</div>
