@@ -261,8 +261,8 @@ fn get_peer_token(peer_id: String) -> Result<Option<String>, String> {
     credential::get_peer_token(&peer_id).map_err(|e| e.to_string())
 }
 
-/// Re-arm the long connection by hand（F-16）: 自动建链只由 id 较小的一方发起，
-/// 用户点「连接」时无视该规则直接拨号，并结束本机之前的「断开」暂停。
+/// Arm the long connection by hand（F-16）: 拨号只由用户点「连接」发起，
+/// 点它就无视"必须已配对"以外的任何规则直接拨号，并结束本机之前的「断开」暂停。
 ///
 /// **必须是 async 命令**：Tauri 的同步命令跑在主线程（没有 Tokio reactor），
 /// 里面 `tokio::spawn` 会 panic 掉整个进程（表现为点「连接」闪退）。
@@ -305,15 +305,52 @@ async fn add_peer(ip: String, port: u16, state: State<'_, Arc<AppState>>) -> Res
     Ok(peer)
 }
 
-/// Remove (unpair) a device.
-#[tauri::command]
-fn remove_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    // Send unpair notification via WS (best-effort).
-    let _ = state.ws.send(&peer_id, ws::events::WsEvent::Unpair { peer_id: state.config.lock().device_id.clone() });
-    credential::remove_peer(&peer_id).map_err(|e| e.to_string())?;
-    state.ws.drop_peer(&peer_id);
-    state.remove_peer(&peer_id);
+/// 解除配对（F-14）：先让对方也清掉（HTTP，尽力而为），再清本机。
+///
+/// 走 HTTP 而不是 WS 事件：解除的那一刻链路可能已经断了，而且 WS 事件是**排队**
+/// 发送的，紧接着的 `drop_peer` 会把还没写出去的它一起丢掉 —— 对端就一直停在
+/// "已配对"（用户实际遇到的）。HTTP 不依赖长连接，谁拨的号也不影响。
+///
+/// 本机只清 token 与配对标记、**保留设备行**：对方还在网络上看得见，就该继续
+/// 以"未绑定"出现在列表里（离线时前端自然不显示）。
+pub async fn unpair_peer(state: &Arc<AppState>, peer_id: &str) -> Result<(), String> {
+    let peer = state.get_peer(peer_id).ok_or_else(|| "设备不存在".to_string())?;
+
+    // 通知对端用的是本机手里"对它"的 token —— 必须在本机删除之前用掉。
+    if !peer.ip.is_empty() && peer.port != 0 {
+        if let Ok(Some(token)) = credential::get_peer_token(peer_id) {
+            let url = format!("http://{}:{}/unpair", peer.ip, peer.port);
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .map_err(|e| e.to_string())?;
+            // body 里的 peerId 是**本机自己的 id**：对端要解除的是"调用方这台设备"
+            // （与 WS 事件 `Unpair { peer_id: 本机 id }` 的语义一致）。远端调用时身份
+            // 由 token 反解、这个字段只是冗余；同机回环调用没有 token 可解，就靠它。
+            let own_id = state.config.lock().device_id.clone();
+            match client
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "peerId": own_id }))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => info!(%peer_id, "peer notified of unpair"),
+                Ok(resp) => warn!(%peer_id, status = %resp.status(), "peer did not accept unpair"),
+                Err(e) => warn!(%peer_id, "peer unreachable for unpair: {e}"),
+            }
+        }
+    }
+
+    credential::remove_peer(peer_id).map_err(|e| e.to_string())?;
+    state.ws.drop_peer(peer_id);
+    state.unpair(peer_id);
     Ok(())
+}
+
+#[tauri::command]
+async fn remove_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    unpair_peer(state.inner(), &peer_id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -384,10 +421,7 @@ async fn pair_confirm(peer_id: String, code: String, state: State<'_, Arc<AppSta
         paired: true,
     });
 
-    // Connect the outbound WS link (deterministic: our device_id < theirs
-    // initiates) — automatic, no user click (F-16).
-    ws::ensure_link(state.inner(), &remote_id);
-
+    // 配对只确立"已配对"关系：长连接等用户自己点「连接」再建（不再自动拨号）。
     ws::emit_ui(&state, ws::events::ui::PAIR_COMPLETED, &serde_json::json!({
         "peerId": remote_id,
     }));
@@ -596,6 +630,12 @@ fn orb_set_rect(window: WebviewWindow, x: i32, y: i32, w: i32, h: i32) -> Result
     orb_window::set_rect(&window, orb_window::Rect { x, y, w, h })
 }
 
+/// 鼠标主键是否仍按着：拖动悬浮球时页面收不到 mouseup，贴边落位得靠它等松手。
+#[tauri::command]
+fn orb_mouse_down() -> bool {
+    orb_window::mouse_down()
+}
+
 // ---------------------------------------------------------------------------
 // App setup
 // ---------------------------------------------------------------------------
@@ -647,11 +687,8 @@ fn setup_server_task(app: &AppHandle) {
                                     });
                                     // mDNS is often the only source of a paired
                                     // peer's address (the credential store keeps
-                                    // no address), so the long connection is
-                                    // dialled from here — automatically (F-16).
-                                    if paired {
-                                        ws::ensure_link(&s2, &id);
-                                    }
+                                    // no address) — but it only fills the address
+                                    // in: the long connection waits for a click.
                                 }
                                 PeerEvent::Offline(id) => {
                                     s2.set_peer_online(&id, false);
@@ -696,25 +733,9 @@ fn setup_server_task(app: &AppHandle) {
                                     info!(peer_id = %p.id, "peer unreachable, marking offline");
                                 }
                                 probe_state.set_peer_online(&p.id, alive);
-                                // A reachable paired peer must hold a long
-                                // connection: re-arm the dial whenever it is not
-                                // already linked (restart, DHCP move, a dial that
-                                // gave up). No user click involved (F-16).
-                                if alive && p.paired {
-                                    ws::ensure_link(&probe_state, &p.id);
-                                }
                             }
                         }
                     });
-
-                    // Already-paired peers: arm the long connection at startup.
-                    // Address may still be unknown (a peer learned from the
-                    // credential store carries none) — the dial loop waits for
-                    // discovery to fill it in.
-                    let peers = arc_state.peers.lock().clone();
-                    for p in peers.iter().filter(|p| p.paired) {
-                        ws::ensure_link(&arc_state, &p.id);
-                    }
 
                     // Apply autostart per saved config.
                     if arc_state.config.lock().auto_start {
@@ -802,6 +823,7 @@ pub fn run() {
             get_app_state,
             orb_screen_metrics,
             orb_set_rect,
+            orb_mouse_down,
         ])
         .setup(|app| {
             // Store the AppHandle so WS events can be emitted.

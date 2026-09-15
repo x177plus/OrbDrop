@@ -204,11 +204,17 @@ impl AppState {
         }
     }
 
-    /// Remove a peer entirely (unpair) and persist.
-    pub fn remove_peer(&self, peer_id: &str) {
+    /// 解除配对（F-14）：清 token、断链，但**保留设备行**并把它标回"未绑定"。
+    ///
+    /// 设备还在 mDNS 视野里就该继续出现在列表里（可以再点「配对」把关系建回来），
+    /// 离线时才自然消失（前端只显示 online 的设备）。地址簿（config.peers）里删掉，
+    /// 重启后不再记着它 —— 除非它再次被发现。
+    pub fn unpair(&self, peer_id: &str) {
         {
             let mut peers = self.peers.lock();
-            peers.retain(|p| p.id != peer_id);
+            if let Some(p) = peers.iter_mut().find(|p| p.id == peer_id) {
+                p.paired = false;
+            }
         }
         {
             let mut config = self.config.lock();

@@ -207,10 +207,11 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             emit_ui(state, ui::SHARES_CHANGED, &serde_json::json!({ "peerId": peer_id }));
         }
         WsEvent::Unpair { peer_id: who } => {
-            info!(%who, "received unpair");
+            // 兼容旧版本对端（新版本走 POST /unpair，不依赖长连接）。
+            info!(%who, "received unpair over WS");
             let _ = credential::remove_peer(&who);
-            state.remove_peer(&who);
             state.ws.drop_peer(&who);
+            state.unpair(&who);
             emit_ui(state, ui::DEVICES_CHANGED, &serde_json::json!({}));
         }
     }

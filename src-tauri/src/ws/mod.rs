@@ -40,9 +40,10 @@ pub struct WsManager {
     senders: Mutex<HashMap<String, Vec<Session>>>,
     /// Task handles (for abort on unpair).
     tasks: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
-    /// Peers the user disconnected by hand: auto-connect stays off until the user
-    /// hits "连接" again (or unpairs). Without this the discovery/probe loop would
-    /// re-dial a second after the click and the "断开" button would be a lie.
+    /// Peers the user disconnected by hand（「断开」）: their dial-loop reconnects
+    /// are turned away (403) until the user hits 「连接」 here or the peer asks to
+    /// connect with its own 「连接」. Without this the peer's retry a second later
+    /// would silently undo the click and the "断开" button would be a lie.
     paused: Mutex<HashSet<String>>,
     next_gen: AtomicU64,
 }
@@ -146,13 +147,13 @@ impl WsManager {
         self.teardown(peer_id);
     }
 
-    /// User hit "断开": drop the link and keep auto-connect off for this peer.
+    /// User hit "断开": drop the link and turn away this peer's retries.
     pub fn pause(&self, peer_id: &str) {
         self.paused.lock().insert(peer_id.to_string());
         self.teardown(peer_id);
     }
 
-    /// User hit "连接" (or re-paired): let auto-connect dial again.
+    /// User hit "连接" — or the peer asked to connect with its own: let it dial.
     pub fn resume(&self, peer_id: &str) {
         self.paused.lock().remove(peer_id);
     }
@@ -187,27 +188,11 @@ pub fn send_to_peer(state: &AppState, peer_id: &str, event: WsEvent) {
 // Outbound link (we are the initiator — our device_id < peer's)
 // ---------------------------------------------------------------------------
 
-/// Bring the long connection to a paired peer up, if we are the side that dials.
+/// 用户点「连接」：发一次拨号，把到对端的长连接建起来（F-16）。
 ///
-/// Called on pairing, on mDNS discovery, on every reachability probe and at
-/// startup — the link establishes itself, no user click (F-16). Idempotent: a
-/// live session, a running dial loop, or a manual "断开" all make it a no-op.
-pub fn ensure_link(state: &Arc<AppState>, peer_id: &str) {
-    match state.get_peer(peer_id) {
-        Some(p) if p.paired => {}
-        _ => return,
-    }
-    if state.ws.is_paused(peer_id) {
-        return;
-    }
-    spawn_outbound_link(Arc::clone(state), peer_id.to_string(), false);
-}
-
-/// 用户点「连接」：无视"由 id 较小的一方拨号"的规则，直接发一次拨号。
-///
-/// 自动建链只有一个方向（避免两条链接互相 unregister），但人的显式请求两边都得
-/// 算数：对端「断开」时本机连不回来、或者本机是被拨号的那一侧时，只有这条路径能把
-/// 长连接重新拉起来。拨号会带 `manual=1`，对端据此放行它自己的「断开」暂停。
+/// 长连接**只由用户的显式点击发起**：配对只确立"已配对"关系，不碰链路；mDNS 发现、
+/// 5s 探活、启动都不再自行拨号。两端都能点，对端点过「断开」、或本机是被拨号的那一侧
+/// 时同样算数。拨号带 `manual=1`，对端据此放行它自己的「断开」暂停。
 pub fn ensure_link_now(state: &Arc<AppState>, peer_id: &str) {
     match state.get_peer(peer_id) {
         Some(p) if p.paired => {}
@@ -217,32 +202,16 @@ pub fn ensure_link_now(state: &Arc<AppState>, peer_id: &str) {
         return;
     }
     state.ws.abort_dial(peer_id);
-    spawn_outbound_link(Arc::clone(state), peer_id.to_string(), true);
+    spawn_outbound_link(Arc::clone(state), peer_id.to_string());
 }
 
-pub fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool) {
-    // Deterministic rule for automatic dials: the peer with the smaller device_id
-    // initiates — one link per pair, no two sessions unregistering each other.
-    if !manual {
-        let own_id = state.config.lock().device_id.clone();
-        if own_id >= peer_id {
-            info!(self_id = %own_id, %peer_id, "lower-id peer should initiate");
-            return;
-        }
-    }
-
-    // One link per peer: a live channel, or a dial loop still running, means we
-    // are already linked (or about to be). Two concurrent loops would unregister
-    // each other's channel and flap the peer's online state.
+/// 拨号循环：每一次连接都由用户点击进入这里，直到会话建立并保住。
+pub fn spawn_outbound_link(state: Arc<AppState>, peer_id: String) {
+    // One link per peer: a live channel means we are already linked. A loop still
+    // running is aborted by `ensure_link_now` first — two concurrent loops would
+    // unregister each other's channel and flap the peer's online state.
     if state.ws.has_connection(&peer_id) {
         return;
-    }
-    if !manual {
-        if let Some(task) = state.ws.tasks.lock().get(&peer_id) {
-            if !task.is_finished() {
-                return;
-            }
-        }
     }
 
     let state_reg = state.clone();
@@ -251,7 +220,7 @@ pub fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool) 
         let mut backoff = 5u64;
         // manual=1 只搭第一次尝试：它是「用户此刻让我连」的一次性声明，不是这个
         // 循环的长期属性 —— 否则会话建起来又掉之后，本机会一直替对端解除它的「断开」。
-        let mut manual_pending = manual;
+        let mut manual_pending = true;
 
         loop {
             // 已经有一条链接就不要重复拨号（对端点「连接」拨上来、或双方同时拨）。
@@ -378,8 +347,7 @@ pub fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool) 
 
     // 拨号任务必须有 Tokio 运行时。Tauri 的**同步**命令跑在主线程（没有 reactor），
     // 直接 tokio::spawn 会 panic 掉整个进程（用户侧表现为点「连接」闪退），
-    // 所以走统一收口：没有运行时就不拨号（自动建链的探活会在有运行时的上下文里
-    // 重新拉起），绝不 panic。
+    // 所以走统一收口：没有运行时就不拨号（用户再点一次「连接」即可），绝不 panic。
     let handle = match crate::task::spawn("outbound ws link", body) {
         Some(h) => h,
         None => return,

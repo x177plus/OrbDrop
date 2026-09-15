@@ -72,12 +72,27 @@ input { font: inherit; }
   z-index: 20;
 }
 
+/* 悬停热区：贴边收起时覆盖「露出的半颗」与「悬停后完整球」的并集（由 App.svelte 算好
+   --zone-*）。热区固定不动，只有球在它里面滑 —— 热区若跟着球动，指针会被滑走的球甩下，
+   球随即滑回又被指针压到，一进一出抖个不停。未贴边时热区就是球本身，行为与从前一致。 */
+.orb-zone {
+  position: absolute;
+  left: var(--zone-x, 14px);
+  top: var(--zone-y, 14px);
+  width: var(--zone-w, 62px);
+  height: var(--zone-h, 62px);
+  z-index: 1;
+}
+/* 展开/切窗口期间球不可见，热区不能截走面板的点击（贴边时热区比球大） */
+.orb-stage.open .orb-zone,
+.orb-stage.hold .orb-zone { pointer-events: none; }
+
 .orb {
   position: absolute;
-  /* 绝对偏移（由 App.svelte 按悬浮球在屏幕上的位置算好）：left/top 不依赖 CSS 视口
-     尺寸，因此 OS 窗口移动/缩放时不会因为视口尺寸滞后 1~2 帧而被画偏。 */
-  left: var(--orb-x, 14px);
-  top: var(--orb-y, 14px);
+  /* 相对热区的偏移：窗口内绝对偏移（App.svelte 按悬浮球在屏幕上的位置算好）减去热区原点。
+     left/top 不依赖 CSS 视口尺寸，因此 OS 窗口移动/缩放时不会因为视口尺寸滞后 1~2 帧而被画偏。 */
+  left: calc(var(--orb-x, 14px) - var(--zone-x, 14px));
+  top: calc(var(--orb-y, 14px) - var(--zone-y, 14px));
   z-index: 1;
   width: 62px; height: 62px;
   border-radius: 50%;
@@ -85,7 +100,14 @@ input { font: inherit; }
   border: 1px solid var(--border);
   box-shadow: var(--shadow);
   display: grid; place-items: center;
-  transition: transform 0.15s ease, opacity 0.15s ease, box-shadow 0.2s ease;
+  /* left/top 的过渡 = 贴边收起半颗 / 悬停滑回完整球的动画（球只在这两个偏移间移动） */
+  transition: left 0.22s cubic-bezier(0.2, 0.8, 0.2, 1), top 0.22s cubic-bezier(0.2, 0.8, 0.2, 1),
+    transform 0.15s ease, opacity 0.15s ease, box-shadow 0.2s ease;
+}
+/* 悬停：滑回完整可见（未贴边的轴 --orb-x/y 与 --orb-inset 相同，因此原地不动） */
+.orb-zone:hover .orb {
+  left: calc(var(--orb-inset, 14px) - var(--zone-x, 14px));
+  top: calc(var(--orb-inset, 14px) - var(--zone-y, 14px));
 }
 .orb:hover { box-shadow: 0 26px 70px -26px oklch(18% 0.012 250 / 0.30), 0 2px 8px -2px oklch(18% 0.012 250 / 0.10); }
 .orb:active { transform: scale(0.94); }

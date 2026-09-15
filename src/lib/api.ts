@@ -60,8 +60,8 @@ export function getPeerToken(peerId: string): Promise<string | null> {
   return invoke('get_peer_token', { peerId });
 }
 
-// Long connection (F-16). Pairing arms it automatically; these two are for the
-// manual 断开 / 连接 buttons.
+// Long connection (F-16). Only the user opens it — pairing just establishes the
+// 「已配对」 relationship — these two are the manual 断开 / 连接 buttons.
 export function connectPeer(peerId: string): Promise<void> {
   return invoke('connect_peer', { peerId });
 }
@@ -124,6 +124,11 @@ export function orbScreenMetrics(): Promise<ScreenMetrics> {
 
 export function orbSetRect(rect: ScreenRect): Promise<void> {
   return invoke('orb_set_rect', { x: rect.x, y: rect.y, w: rect.w, h: rect.h });
+}
+
+/** 鼠标主键是否仍按着：拖动悬浮球期间页面收不到 mouseup，贴边落位靠它等松手 */
+export function orbMouseDown(): Promise<boolean> {
+  return invoke('orb_mouse_down');
 }
 
 // HTTP-based remote browsing (P1: against a peer's server with Bearer token)

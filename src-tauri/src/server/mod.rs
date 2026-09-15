@@ -11,7 +11,6 @@ use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info};
 
-use crate::credential;
 use crate::state::AppState;
 use crate::ws;
 
@@ -47,6 +46,7 @@ fn build_router(state: Arc<AppState>) -> Router {
     // Authenticated routes (auth middleware).
     let auth_routes = Router::new()
         .route("/tree", axum::routing::get(routes_tree::tree_handler))
+        .route("/unpair", axum::routing::post(routes_pair::unpair))
         .route("/file", axum::routing::get(routes_file::file_handler))
         .route("/shares", axum::routing::get(routes_shares::shares_handler))
         .route(
@@ -81,21 +81,16 @@ async fn events_ws_handler(
     let token = params.get("token").cloned().unwrap_or_default();
     let manual = params.get("manual").map(|v| v == "1").unwrap_or(false);
 
-    // In the "no peers" (P0) case, allow any incoming WS — likely a local
-    // frontend.  With paired peers, require a valid token.
-    let allow = if credential::has_paired_peers().unwrap_or(false) {
-        ws::session::peer_id_from_token(&state, &token).is_some()
-    } else {
-        true
+    // 必须能反解出身份才放行。这里**没有**"本机一台设备都没配对就放行"的 P0 后门：
+    // 那会让一个刚被解除配对的对端拿旧 token 连上、还被登记成本机的 "self" ——
+    // 对端显示"长连接"，本机却把它当"未绑定"，共享可见性也全乱。
+    let peer_id = match ws::session::peer_id_from_token(&state, &token) {
+        Some(peer_id) => peer_id,
+        None => {
+            info!("WS upgrade refused: unknown or revoked token");
+            return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
+        }
     };
-
-    if !allow {
-        return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
-    }
-
-    // Determine the peer id from the token, or use "self" for local
-    // connections in P0 mode.
-    let peer_id = ws::session::peer_id_from_token(&state, &token).unwrap_or_else(|| "self".into());
 
     if state.ws.is_paused(&peer_id) {
         if manual {

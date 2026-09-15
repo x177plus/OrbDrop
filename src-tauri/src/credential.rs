@@ -60,12 +60,6 @@ pub fn get_peer_token(id: &str) -> Result<Option<String>> {
     Ok(peers.get(id).cloned())
 }
 
-/// Check if any peers have been paired.
-pub fn has_paired_peers() -> Result<bool> {
-    let peers = load_peers()?;
-    Ok(!peers.is_empty())
-}
-
 /// Check if a specific peer is paired (has a stored token).
 pub fn has_peer(id: &str) -> bool {
     load_peers()
