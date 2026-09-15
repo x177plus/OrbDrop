@@ -1,0 +1,1327 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OrbDrop · 局域网文件传送 — 交互原型</title>
+<style>
+  :root {
+    --bg:      oklch(99% 0.002 240);
+    --surface: oklch(100% 0 0);
+    --fg:      oklch(18% 0.012 250);
+    --muted:   oklch(54% 0.012 250);
+    --border:  oklch(92% 0.005 250);
+    --accent:  oklch(58% 0.18 255);
+
+    --ok:      oklch(58% 0.16 158);
+    --warn:    oklch(62% 0.15 60);
+
+    --accent-soft:  color-mix(in oklch, var(--accent) 13%, transparent);
+    --fg-soft:      color-mix(in oklch, var(--fg) 6%, transparent);
+    --ok-soft:      color-mix(in oklch, var(--ok) 13%, transparent);
+    --accent-deep:  color-mix(in oklch, var(--accent) 82%, black);
+    --accent-deeper: color-mix(in oklch, var(--accent) 74%, black);
+
+--font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+    --font-body:    -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+    --font-mono:    ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+    --fs-xxs: 11px;
+    --fs-xs: 12px;
+    --fs-sm: 13px;
+    --fs-md: 14px;
+    --fs-lg: 16px;
+
+    --gap-xs: 6px;
+    --gap-sm: 10px;
+    --gap-md: 14px;
+    --gap-lg: 22px;
+
+    --radius: 8px;
+    --radius-lg: 14px;
+    --control-h: 38px;  /* 主操作控件统一高度：添加设备配对码按钮 / 本机拖入框 */
+    --shadow: 0 24px 64px -24px oklch(18% 0.012 250 / 0.22), 0 2px 8px -2px oklch(18% 0.012 250 / 0.10);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+font-family: var(--font-body);
+    font-size: var(--fs-md);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    user-select: none;
+  }
+  img, svg { display: block; }
+  a { color: inherit; text-decoration: none; }
+  button { font: inherit; cursor: pointer; color: inherit; background: none; border: 0; padding: 0; }
+  input { font: inherit; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+  .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .mono { font-family: var(--font-mono); font-size: var(--fs-xs); }
+
+  /* ─── desktop scene ─────────────────────────────────────────── */
+  .scene {
+    position: fixed; inset: 0;
+    background:
+      radial-gradient(1100px 520px at 12% -10%, color-mix(in oklch, var(--accent) 5%, transparent), transparent 60%),
+      var(--bg);
+    overflow: hidden;
+  }
+  .menubar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 30;
+    height: 30px;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 18px;
+    font-size: var(--fs-xs);
+    color: var(--muted);
+    background: color-mix(in oklch, var(--bg) 86%, transparent);
+    backdrop-filter: blur(14px) saturate(1.4);
+    -webkit-backdrop-filter: blur(14px) saturate(1.4);
+    border-bottom: 1px solid var(--border);
+  }
+  .menubar .brand { font-family: var(--font-display); color: var(--fg); font-weight: 600; letter-spacing: -0.01em; margin-right: 20px; }
+  .menubar .mb-left { display: flex; align-items: center; gap: 18px; }
+  .menubar .mb-item { cursor: default; }
+  .menubar .mb-item:hover { color: var(--fg); }
+
+  .desk-window {
+    position: absolute;
+    background: color-mix(in oklch, var(--surface) 88%, var(--bg));
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 1px 0 0 var(--surface);
+  }
+  .desk-window::before {
+    content: ""; display: block; height: 30px;
+    background: color-mix(in oklch, var(--fg) 3%, transparent);
+    border-bottom: 1px solid var(--border);
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  }
+  .desk-window .traffic { position: absolute; top: 9px; left: 12px; display: flex; gap: 6px; }
+  .desk-window .traffic i { width: 9px; height: 9px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 12%, transparent); }
+  .desk-window .fake-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
+  .desk-window .line { height: 7px; border-radius: 4px; background: color-mix(in oklch, var(--fg) 7%, transparent); }
+  .desk-window .line.short { width: 46%; }
+  .desk-window .line.med { width: 72%; }
+  .dw-code { left: 6%; top: 13%; width: 42%; max-width: 520px; }
+  .dw-misc { right: 8%; top: 38%; width: 30%; max-width: 380px; }
+  @media (max-width: 920px) { .desk-window { display: none; } }
+
+  /* ─── orb stage ─────────────────────────────────────────────── */
+  .orb-stage {
+    position: fixed; right: 26px; bottom: 26px; z-index: 20;
+    display: grid;
+    transform-origin: bottom right;
+    transition: transform 0.26s cubic-bezier(0.2, 0.8, 0.2, 1), width 0.26s cubic-bezier(0.2, 0.8, 0.2, 1), height 0.26s cubic-bezier(0.2, 0.8, 0.2, 1);
+    border-radius: 22px;
+  }
+  @media (max-width: 560px) { .orb-stage { right: 12px; bottom: 12px; } }
+
+  .orb {
+    position: relative;
+    width: 62px; height: 62px;
+    grid-area: 1 / 1;
+    border-radius: 50%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+    display: grid; place-items: center;
+    transition: transform 0.16s ease, opacity 0.2s ease, box-shadow 0.2s ease;
+  }
+  .orb:hover { box-shadow: 0 26px 70px -26px oklch(18% 0.012 250 / 0.30), 0 2px 8px -2px oklch(18% 0.012 250 / 0.10); }
+  .orb:active { transform: scale(0.94); }
+  .orb .mark { position: relative; width: 30px; height: 30px; }
+  .orb .mark svg { width: 100%; height: 100%; }
+  .orb .pulse {
+    position: absolute; inset: -6px; border-radius: 50%;
+    border: 1px solid var(--accent); opacity: 0;
+    animation: orb-pulse 3.2s ease-out infinite; /* 常驻脉冲：无设备连接时也持续扩散 */
+  }
+  .orb-stage.open .orb { transform: scale(0.5); opacity: 0; pointer-events: none; }
+  .orb-stage.open .orb .pulse { animation-play-state: paused; }
+  .orb-badge {
+    position: absolute;
+    top: -4px; right: -4px;
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    background: color-mix(in oklch, var(--ok) 72%, black);
+    color: var(--surface);
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-mono); font-size: 12px; font-weight: 700; line-height: 1;
+    border: 2px solid var(--surface);
+    box-shadow: 0 2px 6px -2px oklch(18% 0.012 250 / 0.35);
+  }
+  .orb-badge[hidden] { display: none; }
+  .orb-stage.live .orb .pulse { border-color: var(--ok); } /* 有长连接设备时脉冲转绿，节奏不变 */
+  @keyframes orb-pulse {
+    /* 起始半径对齐内圈：脉冲框 42px（half 21px），0.643×21 − 0.5px ≈ 13px = 内圈 SVG 圆半径 */
+    0% { transform: scale(0.643); opacity: 0.55; }
+    70%, 100% { transform: scale(1.55); opacity: 0; }
+  }
+  .orb-stage.drag .orb {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 5px var(--accent-soft), var(--shadow);
+    transform: scale(1.07);
+  }
+
+  /* ─── main panel ────────────────────────────────────────────── */
+  .panel {
+    grid-area: 1 / 1;
+    width: 448px; height: 620px;
+    max-width: calc(100vw - 24px);
+    max-height: calc(100dvh - 96px);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    box-shadow: var(--shadow);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+    transform: scale(0.92); opacity: 0;
+    transform-origin: bottom right;
+    transition: transform 0.26s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.2s ease;
+    pointer-events: none;
+  }
+  .orb-stage.open .panel { transform: scale(1); opacity: 1; pointer-events: auto; }
+
+  .panel-head {
+    display: flex; align-items: center; gap: var(--gap-md);
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .grip { display: grid; grid-template-columns: repeat(3, 3px); gap: 3px; margin-right: 2px; }
+  .grip i { width: 3px; height: 3px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 18%, transparent); }
+  .panel-brand { display: flex; align-items: center; gap: 8px; font-family: var(--font-display); font-weight: 650; letter-spacing: -0.01em; font-size: var(--fs-md); }
+  .panel-brand .mark-sm {
+    width: 20px; height: 20px; border-radius: 50%;
+    background: var(--accent-soft);
+    border: 1px solid color-mix(in oklch, var(--accent) 30%, transparent);
+    display: grid; place-items: center;
+  }
+  .panel-brand .mark-sm i { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+  .panel-head-right { margin-left: auto; display: flex; align-items: center; gap: var(--gap-xs); }
+  .ch-inst { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--muted); padding: 4px 8px; border: 1px solid var(--border); border-radius: 999px; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+  .dot.off { background: color-mix(in oklch, var(--fg) 22%, transparent); }
+  .icon-btn {
+    width: 28px; height: 28px; border-radius: var(--radius);
+    display: grid; place-items: center;
+    color: var(--muted);
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  .icon-btn:hover { background: var(--fg-soft); color: var(--fg); }
+  .icon-btn svg { width: 16px; height: 16px; }
+
+  /* ─── tabs ──────────────────────────────────────────────────── */
+  /* 设备标签会随长连接设备增加：横向滚动，别把标签压成省略号 */
+  .tabs {
+    display: flex; gap: 2px; padding: 6px 14px 0;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto; overflow-y: hidden;
+    scrollbar-width: none;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab {
+    position: relative;
+    display: inline-flex; align-items: center; gap: 7px;
+    flex: none;
+    padding: 9px 4px 11px;
+    margin-right: 18px;
+    font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500;
+    color: var(--muted);
+    transition: color 0.15s ease;
+    white-space: nowrap;
+  }
+  .tab.peer-tab { max-width: 132px; overflow: hidden; text-overflow: ellipsis; }
+  .tab::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
+    border-radius: 2px 2px 0 0;
+    background: var(--accent);
+    transform: scaleX(0);
+    transition: transform 0.2s ease;
+  }
+  .tab:hover { color: var(--fg); }
+  .tab.active { color: var(--fg); }
+  .tab.active::after { transform: scaleX(1); }
+  .tab .count {
+    font-family: var(--font-mono); font-size: var(--fs-xxs);
+    padding: 1px 6px; border-radius: 999px;
+    background: var(--fg-soft); color: var(--muted);
+  }
+  .tab.active .count { background: var(--accent-soft); color: var(--accent); }
+
+  .panel-body { flex: 1; overflow-y: auto; padding: 14px 14px 10px; overscroll-behavior: contain; }
+  .panel-body::-webkit-scrollbar { width: 10px; }
+  .panel-body::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg) 14%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: content-box; }
+
+  /* ─── dropzone ──────────────────────────────────────────────── */
+  /* 高度与「添加设备 · 配对码」按钮一致（同为主操作控件，同一 --control-h） */
+  .dropzone {
+    width: 100%;
+    height: var(--control-h);
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 0 12px;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius);
+    color: var(--muted);
+    font-size: var(--fs-sm);
+    transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+  }
+  .dropzone:hover { border-color: var(--accent); color: var(--fg); background: var(--accent-soft); }
+  .dropzone svg { width: 15px; height: 15px; }
+
+  .list-label {
+    display: flex; align-items: center; justify-content: space-between;
+    margin: 18px 2px 8px;
+    font-family: var(--font-mono); font-size: var(--fs-xxs);
+    letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  /* ─── share items ───────────────────────────────────────────── */
+  .share-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  .share-item { border: 1px solid transparent; border-radius: var(--radius); transition: background 0.15s ease; }
+  .share-item:hover { background: var(--fg-soft); }
+  .share-row { display: flex; align-items: center; gap: var(--gap-sm); padding: 8px 8px; cursor: default; }
+  .chev {
+    width: 22px; height: 22px; flex: none;
+    display: grid; place-items: center;
+    border-radius: 6px; color: var(--muted);
+    transition: transform 0.2s ease, background 0.15s ease;
+  }
+  .chev:hover { background: color-mix(in oklch, var(--fg) 9%, transparent); color: var(--fg); }
+  .chev svg { width: 13px; height: 13px; }
+  .share-item.open > .share-row .chev { transform: rotate(90deg); }
+  .f-icon { width: 18px; height: 18px; flex: none; color: var(--muted); }
+  .share-item.folder > .share-row .f-icon { color: var(--warn); }
+  .f-icon svg { width: 18px; height: 18px; }
+  .s-main { flex: 1; min-width: 0; }
+  .s-name { font-family: var(--font-display); font-size: var(--fs-md); font-weight: 500; letter-spacing: -0.005em; line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .s-meta { font-size: var(--fs-xs); color: var(--muted); display: flex; gap: 6px; align-items: center; overflow: hidden; white-space: nowrap; }
+  .bcast-chip {
+    display: inline-flex; align-items: center; gap: 4px; flex: none;
+    font-size: var(--fs-xs); font-weight: 500;
+    padding: 1px 6px 1px 4px; border-radius: 999px;
+    background: color-mix(in oklch, var(--accent) 10%, transparent);
+    color: color-mix(in oklch, var(--accent) 75%, black);
+    cursor: default;
+  }
+  .bcast-chip .dot { width: 6px; height: 6px; }
+.s-acts { display: flex; align-items: center; gap: 4px; flex: none; }
+
+  /* ─── switch ────────────────────────────────────────────────── */
+  .switch { position: relative; display: inline-flex; width: 34px; height: 20px; flex: none; }
+  .switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+  .switch .track {
+    position: absolute; inset: 0; border-radius: 999px;
+    background: color-mix(in oklch, var(--fg) 12%, transparent);
+    transition: background 0.18s ease;
+  }
+  .switch .track::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: var(--surface);
+    box-shadow: 0 1px 3px oklch(18% 0.012 250 / 0.25);
+    transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .switch input:checked + .track { background: var(--accent); }
+  .switch input:checked + .track::after { transform: translateX(14px); }
+  .switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* ─── tree ──────────────────────────────────────────────────── */
+  .tree { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 0.22s ease; }
+  .tree-inner { overflow: hidden; min-height: 0; }
+  .share-item.open > .tree { grid-template-rows: 1fr; }
+  .node {
+    display: flex; align-items: center; gap: var(--gap-sm);
+    padding: 5px 8px 5px 46px;
+    border-radius: 6px;
+    cursor: default;
+  }
+  .node:hover { background: color-mix(in oklch, var(--fg) 5%, transparent); }
+  .node .f-icon { width: 14px; height: 14px; }
+  .node .f-icon svg { width: 14px; height: 14px; }
+  .node .n-name { font-family: var(--font-display); font-size: var(--fs-sm); color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .node .n-meta { margin-left: auto; font-size: var(--fs-xs); color: var(--muted); flex: none; }
+  .node.sub { padding-left: 62px; }
+
+  /* ─── device rows ───────────────────────────────────────────── */
+  .device-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  .device-row {
+    display: flex; align-items: center; gap: var(--gap-sm);
+    padding: 10px 8px;
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    transition: background 0.15s ease;
+  }
+  .device-row:hover { background: var(--fg-soft); }
+  .d-avatar {
+    width: 34px; height: 34px; flex: none;
+    border-radius: 10px;
+    display: grid; place-items: center;
+    font-family: var(--font-display); font-weight: 650; font-size: var(--fs-md);
+    color: var(--muted);
+    background: color-mix(in oklch, var(--fg) 6%, transparent);
+    border: 1px solid var(--border);
+  }
+  .device-row.online .d-avatar { color: var(--fg); }
+  .d-main { flex: 1; min-width: 0; }
+.d-name { display: flex; align-items: center; gap: 8px; font-family: var(--font-display); font-size: var(--fs-md); font-weight: 500; letter-spacing: -0.005em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .d-ip { margin-top: 1px; font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .auto-tag { display:none; align-items:center; gap:3px; margin-left:2px; padding:0 6px; font-size:10px; line-height:1.6; color:var(--muted); background:var(--fg-soft); border-radius:999px; white-space:nowrap; }
+  .device-row[data-state="connected"] .auto-tag { display:inline-flex; }
+
+  /* ── peer browse tab（对端设备标签）───────────────────────────── */
+  /* 顶部设备条：来自哪台设备 + 连接状态 + 手动刷新兜底（F-33）。 */
+  .peer-head {
+    display: flex; align-items: center; gap: var(--gap-sm);
+    padding: 10px 10px 10px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+  .peer-head .icon-btn { flex: none; }
+  .d-acts { display: flex; align-items: center; gap: 6px; flex: none; }
+  .d-acts .btn { white-space: nowrap; flex: none; }
+  .d-acts .btn-primary { min-width: 84px; }
+  .d-acts .btn-ghost.btn-sm { min-width: 52px; }
+
+  /* ─── buttons ───────────────────────────────────────────────── */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    height: 34px; padding: 0 14px;
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    font-size: var(--fs-sm); font-weight: 500;
+    letter-spacing: -0.005em;
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.05s ease;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn-sm { height: 28px; padding: 0 12px; font-size: var(--fs-xs); }
+  .btn-primary { background: var(--accent-deep); color: var(--surface); }
+  .btn-primary:hover { background: var(--accent-deeper); }
+  .btn-secondary { background: var(--surface); color: var(--fg); border-color: var(--border); }
+  .btn-secondary:hover { border-color: color-mix(in oklch, var(--fg) 40%, transparent); }
+  .btn-ghost { background: transparent; color: var(--muted); }
+  .btn-ghost:hover { color: var(--fg); background: var(--fg-soft); }
+  .btn-block { width: 100%; }
+  .btn svg { width: 15px; height: 15px; }
+
+  .panel-foot {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 16px;
+    border-top: 1px solid var(--border);
+    font-size: var(--fs-xs); color: var(--muted);
+  }
+
+  /* ─── push card ─────────────────────────────────────────────── */
+  .push-card {
+    position: absolute; left: 12px; right: 12px; bottom: 56px;
+    padding: 12px 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow);
+    transform: translateY(16px); opacity: 0; pointer-events: none;
+    transition: transform 0.24s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.2s ease;
+    z-index: 5;
+  }
+  .push-card.show { transform: translateY(0); opacity: 1; pointer-events: auto; }
+  .p-top { display: flex; align-items: center; justify-content: space-between; gap: var(--gap-md); font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500; }
+  .p-top .p-per { color: var(--muted); font-size: var(--fs-xs); }
+  .p-bar { height: 4px; margin-top: 10px; border-radius: 999px; background: var(--fg-soft); overflow: hidden; }
+  .p-bar i { display: block; height: 100%; width: 0; border-radius: 999px; background: var(--accent); transition: width 0.1s linear; }
+  .p-meta { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; font-size: var(--fs-xs); color: var(--muted); }
+.push-card.done .p-bar i { background: var(--ok); }
+
+  /* ─── device states: 未绑定 / 已配对 / 长连接 ──────────────── */
+  .state-chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 1px 8px; border-radius: 999px;
+    font-size: var(--fs-xs); font-weight: 500;
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  .state-chip .dot { width: 5px; height: 5px; box-shadow: none; }
+  .state-chip.connected { color: color-mix(in oklch, var(--ok) 70%, black); border-color: color-mix(in oklch, var(--ok) 38%, transparent); background: var(--ok-soft); }
+  .state-chip.unbound { color: color-mix(in oklch, var(--warn) 70%, black); border-color: color-mix(in oklch, var(--warn) 40%, transparent); background: color-mix(in oklch, var(--warn) 12%, transparent); }
+  .dot.warn { background: var(--warn); }
+  .bcast-hint { display: flex; align-items: center; gap: 6px; margin: 8px 2px 0; font-size: var(--fs-xs); color: var(--muted); }
+  .bcast-hint .dot { width: 5px; height: 5px; }
+  .hl { color: var(--fg); font-weight: 500; }
+
+  /* ─── consent card ──────────────────────────────────────────── */
+  .consent-info { display: flex; align-items: center; gap: 10px; margin-top: 10px; padding: 10px 12px; border-radius: var(--radius); background: var(--fg-soft); font-size: var(--fs-sm); }
+  .consent-info .f-icon { width: 16px; height: 16px; color: var(--warn); flex: none; }
+  .consent-info .f-icon svg { width: 16px; height: 16px; }
+  .consent-info .c-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: var(--font-display); font-weight: 500; }
+  .consent-info .c-size { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); flex: none; }
+  .consent-acts { display: flex; gap: 8px; margin-top: 12px; }
+  .consent-acts .btn { flex: 1; height: 32px; }
+
+  .sheet { position: absolute; inset: 0; z-index: 10; background: var(--surface); transform: translateX(100%); transition: transform 0.28s cubic-bezier(0.2, 0.8, 0.2, 1); display: flex; flex-direction: column; }
+  .sheet.open { transform: translateX(0); }
+  .sheet-head { display: flex; align-items: center; gap: var(--gap-md); padding: 13px 16px; border-bottom: 1px solid var(--border); }
+  .sheet-head h3 { margin: 0; font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
+  .sheet-body { flex: 1; overflow-y: auto; padding: 18px 16px; display: flex; flex-direction: column; gap: 16px; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field > label { font-size: var(--fs-xs); color: var(--muted); }
+  .input { width: 100%; height: 36px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--fg); font-size: var(--fs-sm); }
+  .input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  .path-input { display: flex; gap: 8px; }
+  .path-input .input { flex: 1; color: var(--muted); font-family: var(--font-mono); font-size: var(--fs-xs); }
+  .path-input .btn { flex: none; }
+  .radio-group { display: flex; flex-direction: column; gap: 8px; }
+  .radio { display: flex; align-items: center; gap: 9px; padding: 9px 11px; border: 1px solid var(--border); border-radius: var(--radius); cursor: pointer; font-size: var(--fs-sm); transition: border-color 0.15s ease, background 0.15s ease; }
+  .radio:hover { background: var(--fg-soft); }
+  .radio input { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; }
+  .radio:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+  .radio .r-label { flex: 1; }
+  .radio .r-sub { font-size: var(--fs-xs); color: var(--muted); display: block; cursor: default; }
+  .sheet-foot { display: flex; justify-content: flex-end; gap: var(--gap-sm); padding: 12px 16px; border-top: 1px solid var(--border); }
+  .overlay { position: absolute; inset: 0; z-index: 12; background: color-mix(in oklch, var(--fg) 22%, transparent); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); display: grid; place-items: center; opacity: 0; pointer-events: none; transition: opacity 0.2s ease; }
+  .overlay.open { opacity: 1; pointer-events: auto; }
+  .dialog { width: min(340px, calc(100% - 32px)); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); padding: 22px; transform: translateY(10px) scale(0.98); transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1); }
+  .overlay.open .dialog { transform: none; }
+  .dialog h3 { margin: 0 0 6px; font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
+  .dialog .d-desc { margin: 0 0 16px; font-size: var(--fs-sm); color: var(--muted); }
+  .code { display: flex; gap: 8px; justify-content: center; padding: 16px; border-radius: var(--radius-lg); background: var(--fg-soft); font-family: var(--font-mono); font-size: 26px; font-weight: 600; letter-spacing: 0.18em; color: var(--fg); }
+  .code b { font-weight: 600; }
+  .code-hint { text-align: center; font-size: var(--fs-xs); color: var(--muted); margin-top: 10px; }
+  .dialog .d-acts { display: flex; gap: var(--gap-sm); margin-top: 18px; }
+  .dialog .d-acts .btn { flex: 1; }
+  .ctx { position: fixed; z-index: 60; min-width: 172px; padding: 5px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); opacity: 0; transform: scale(0.96); pointer-events: none; transform-origin: top left; transition: opacity 0.12s ease, transform 0.12s ease; }
+  .ctx.show { opacity: 1; transform: scale(1); pointer-events: auto; }
+  .ctx-item { display: flex; align-items: center; gap: 9px; width: 100%; padding: 7px 10px; border-radius: 7px; font-size: var(--fs-sm); color: var(--fg); text-align: left; }
+  .ctx-item:hover { background: var(--fg-soft); }
+  .ctx-item svg { width: 14px; height: 14px; color: var(--muted); flex: none; }
+  .ctx-item.danger { color: color-mix(in oklch, var(--warn) 75%, black); }
+  .ctx-item.danger:hover { background: color-mix(in oklch, var(--warn) 12%, transparent); }
+  .ctx-sep { height: 1px; margin: 5px 6px; background: var(--border); }
+  .toast-layer { position: fixed; left: 50%; bottom: 34px; transform: translateX(-50%); z-index: 70; display: flex; flex-direction: column; gap: 8px; align-items: center; }
+  .toast { padding: 9px 16px; background: color-mix(in oklch, var(--fg) 92%, transparent); color: var(--surface); border-radius: 999px; font-size: var(--fs-sm); box-shadow: var(--shadow); display: flex; align-items: center; gap: 8px; animation: toast-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1); }
+  .toast svg { width: 14px; height: 14px; color: color-mix(in oklch, var(--surface) 80%, transparent); }
+  .toast.leaving { opacity: 0; transform: translateY(6px); transition: opacity 0.25s ease, transform 0.25s ease; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  .empty { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 34px 16px; text-align: center; color: var(--muted); }
+  .empty p { margin: 0; font-size: var(--fs-sm); }
+  .empty .e-sub { font-size: var(--fs-xs); max-width: 240px; }
+  .empty svg { width: 26px; height: 26px; opacity: 0.5; margin-bottom: 4px; }
+  .d-target { text-align: center; font-size: var(--fs-xs); color: var(--muted); margin: -8px 0 12px; }
+  @media (max-width: 560px) { .menubar .mb-right { display: none; } .orb-stage.open { max-width: calc(100vw - 24px); } }
+  @media (prefers-reduced-motion: reduce) {
+    .orb-stage, .panel, .orb, .toast, .ctx, .push-card, #consentCard, .sheet, .dialog, .tree, .chev, .p-bar i, .pulse, .overlay { transition: none !important; animation: none !important; }
+  }
+</style>
+</head>
+<body>
+<div class="scene" data-od-id="desktop-scene" aria-hidden="true">
+    <div class="desk-window dw-code">
+      <div class="traffic"><i></i><i></i><i></i></div>
+      <div class="fake-body">
+        <div class="line short"></div>
+        <div class="line"></div>
+        <div class="line med"></div>
+        <div class="line"></div>
+        <div class="line short"></div>
+      </div>
+    </div>
+    <div class="desk-window dw-misc">
+      <div class="traffic"><i></i><i></i><i></i></div>
+      <div class="fake-body">
+        <div class="line med"></div>
+        <div class="line"></div>
+      </div>
+    </div>
+  </div>
+
+  <header class="menubar" data-od-id="menubar">
+    <div class="mb-left">
+      <span class="brand">OrbDrop</span>
+      <span class="mb-item">文件</span>
+      <span class="mb-item">编辑</span>
+      <span class="mb-item">设备</span>
+      <span class="mb-item">帮助</span>
+    </div>
+    <div class="mb-right mono">周一 9月14日 · 10:24</div>
+  </header>
+
+  <aside class="orb-stage" id="orbStage" data-od-id="orb-stage">
+    <button class="orb" id="orbBtn" aria-label="展开 OrbDrop 面板" aria-expanded="false">
+      <span class="mark">
+        <span class="pulse"></span>
+        <svg viewBox="0 0 30 30" fill="none" aria-hidden="true">
+          <circle cx="15" cy="15" r="13" stroke="var(--accent)" stroke-opacity="0.28" stroke-width="1.4"/>
+          <circle cx="15" cy="15" r="5" fill="var(--accent)"/>
+          <path d="M15 9.5 10.5 14M15 9.5l4.5 4.5" stroke="var(--surface)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </span>
+      <span class="orb-badge num" id="orbBadge" hidden>0</span>
+    </button>
+
+    <section class="panel" id="panel" data-od-id="main-panel" aria-label="OrbDrop 主面板">
+      <header class="panel-head">
+        <span class="grip" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></span>
+        <span class="panel-brand"><span class="mark-sm"><i></i></span>OrbDrop</span>
+        <div class="panel-head-right">
+          <span class="ch-inst" id="connPill"><span class="dot ok"></span><span>在线 · 长连接 1</span></span>
+          <button class="icon-btn" id="settingsBtn" aria-label="打开设置">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1Z"/></svg>
+          </button>
+          <button class="icon-btn" id="collapseBtn" aria-label="收起面板">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <nav class="tabs" data-od-id="tabs" role="tablist">
+        <button class="tab active" role="tab" aria-selected="true" data-tab="local">本机 <span class="count">4</span></button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="devices">设备 <span class="count">3</span></button>
+        <!-- 每台长连接设备一个浏览标签（F-24 / F-30）：内容 = 该设备广播给本机的共享项 -->
+        <button class="tab peer-tab" role="tab" aria-selected="false" data-tab="peer" title="MacBook · 192.168.1.20:3890 · 长连接">
+          <span class="dot ok"></span>MacBook
+        </button>
+      </nav>
+
+      <div class="panel-body">
+        <section id="tab-local" data-od-id="tab-local" role="tabpanel">
+          <button class="dropzone" id="addShareBtn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M6 9l6 6 6-6M5 19h14"/></svg>
+            拖入文件或文件夹，点击添加共享项
+          </button>
+          <p class="bcast-hint" id="bcastHint" hidden><span class="dot ok"></span><span id="bcastHintTxt">拖入文件将自动广播至长连接设备</span></p>
+
+          <div class="list-label"><span>共享项</span><span class="num">4 项 · 22.1 MB</span></div>
+          <ul class="share-list" id="shareList">
+            <li class="share-item folder" data-id="s1">
+              <div class="share-row">
+                <button class="chev" aria-label="展开"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
+                <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg></span>
+                <div class="s-main">
+                  <div class="s-name">项目设计稿</div>
+                  <div class="s-meta"><span class="num">12.6 MB · 23 个文件</span><span class="bcast-chip" data-bcast title="广播至 PC-B、MacBook Pro"><span class="dot ok"></span>2台设备</span></div>
+                </div>
+                <div class="s-acts">
+                  <label class="switch" title="向设备广播"><input type="checkbox" checked data-broadcast><span class="track"></span></label>
+                  <button class="icon-btn" data-ctx aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
+                </div>
+              </div>
+              <div class="tree">
+                <div class="tree-inner">
+                  <div class="node"><span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg></span><span class="n-name">assets</span><span class="n-meta num">14 个文件</span></div>
+                  <div class="node"><span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span><span class="n-name">主页-v3.fig</span><span class="n-meta num">4.2 MB</span></div>
+                  <div class="node"><span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span><span class="n-name">组件库.sketch</span><span class="n-meta num">2.8 MB</span></div>
+                  <div class="node sub"><span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span><span class="n-name">设计说明.md</span><span class="n-meta num">24 KB</span></div>
+                </div>
+              </div>
+            </li>
+
+            <li class="share-item folder" data-id="s2">
+              <div class="share-row">
+                <button class="chev" aria-label="展开"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
+                <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg></span>
+                <div class="s-main">
+                  <div class="s-name">产品文档</div>
+                  <div class="s-meta"><span class="num">8.3 MB · 9 个文件</span></div>
+                </div>
+                <div class="s-acts">
+                  <label class="switch" title="向设备广播"><input type="checkbox" data-broadcast><span class="track"></span></label>
+                  <button class="icon-btn" data-ctx aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
+                </div>
+              </div>
+              <div class="tree">
+                <div class="tree-inner">
+                  <div class="node"><span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span><span class="n-name">PRD-v0.5.md</span><span class="n-meta num">48 KB</span></div>
+                  <div class="node"><span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span><span class="n-name">接口清单.xlsx</span><span class="n-meta num">1.1 MB</span></div>
+                </div>
+              </div>
+            </li>
+
+            <li class="share-item" data-id="s3">
+              <div class="share-row">
+                <button class="chev" style="visibility:hidden"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
+                <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span>
+                <div class="s-main">
+                  <div class="s-name">Q3 排期表.xlsx</div>
+                  <div class="s-meta"><span class="num">1.2 MB</span></div>
+                </div>
+                <div class="s-acts">
+                  <label class="switch" title="向设备广播"><input type="checkbox" data-broadcast><span class="track"></span></label>
+                  <button class="icon-btn" data-ctx aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
+                </div>
+              </div>
+            </li>
+
+            <li class="share-item" data-id="s4">
+              <div class="share-row">
+                <button class="chev" style="visibility:hidden"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
+                <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span>
+                <div class="s-main">
+                  <div class="s-name">需求说明v0.5.md</div>
+                  <div class="s-meta"><span class="num">48 KB</span></div>
+                </div>
+                <div class="s-acts">
+                  <label class="switch" title="向设备广播"><input type="checkbox" data-broadcast><span class="track"></span></label>
+                  <button class="icon-btn" data-ctx aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
+                </div>
+              </div>
+            </li>
+          </ul>
+        </section>
+
+        <section id="tab-devices" data-od-id="tab-devices" role="tabpanel" hidden>
+          <button class="btn btn-secondary btn-block" id="pairBtn" style="height:var(--control-h)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+            添加设备 · 配对码
+          </button>
+
+          <div class="list-label"><span>局域网设备</span><span class="num" id="devCount">3 台 · 1 长连接</span></div>
+          <ul class="device-list" id="deviceList">
+            <li class="device-row online" data-id="d1" data-state="connected" data-ip="192.168.1.6:3890">
+              <span class="d-avatar">B</span>
+              <div class="d-main">
+                <div class="d-name">PC-B <span class="state-chip connected"><span class="dot ok"></span>长连接</span> <span class="auto-tag">自动广播</span></div>
+                <div class="d-ip">192.168.1.6:3890</div>
+              </div>
+              <div class="d-acts">
+                <button class="btn btn-ghost btn-sm" data-disconnect>断开</button>
+                <button class="btn btn-ghost btn-sm" data-push>推送</button>
+              </div>
+            </li>
+            <li class="device-row online" data-id="d2" data-state="paired" data-ip="192.168.1.4:3891">
+              <span class="d-avatar">M</span>
+              <div class="d-main">
+                <div class="d-name">MacBook Pro <span class="state-chip"><span class="dot off"></span>已配对</span></div>
+                <div class="d-ip">192.168.1.4:3891</div>
+              </div>
+              <div class="d-acts">
+                <button class="btn btn-primary btn-sm" data-connect>建立长连接</button>
+                <button class="btn btn-ghost btn-sm" data-push>推送</button>
+              </div>
+            </li>
+            <li class="device-row online" data-id="d3" data-state="unbound" data-ip="192.168.1.9:3890">
+              <span class="d-avatar">C</span>
+              <div class="d-main">
+                <div class="d-name">PC-C <span class="state-chip unbound"><span class="dot warn"></span>未绑定</span></div>
+                <div class="d-ip">192.168.1.9:3890</div>
+              </div>
+              <div class="d-acts">
+                <button class="btn btn-primary btn-sm" data-pair>配对</button>
+                <button class="btn btn-ghost btn-sm" data-push>推送</button>
+              </div>
+            </li>
+          </ul>
+          <div class="empty" id="devEmpty" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="3" width="16" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+            <p>还没有已配对设备</p>
+            <p class="e-sub">点击上方「添加设备 · 配对码」，在对方设备的 OrbDrop 中输入本机配对码即可完成配对。</p>
+          </div>
+          <p style="margin:14px 2px 0; font-size:var(--fs-xs); color:var(--muted); line-height:1.6;">
+            <span class="hl">未绑定</span>设备可点击「推送」直接发送（接收方需同意）；<span class="hl">已配对</span>设备可点击「建立长连接」；
+            处于<span class="hl">长连接</span>的设备会自动收到你拖入悬浮球文件的广播，无需逐条操作。          </p>
+        </section>
+
+        <!-- 对端设备标签：对方广播给本机的共享项 + 懒加载树（F-30/F-31/F-33）。
+             零拷贝：内容实时读对方的磁盘，本机只拿到 name/isDir/大小/时间。 -->
+        <section id="tab-peer" data-od-id="tab-peer" role="tabpanel" hidden>
+          <div class="peer-head">
+            <span class="d-avatar">M</span>
+            <div class="d-main">
+              <div class="d-name">MacBook</div>
+              <div class="d-ip num">192.168.1.20:3890</div>
+            </div>
+            <span class="state-chip connected"><span class="dot ok"></span>长连接</span>
+            <button class="icon-btn" aria-label="刷新共享项" title="刷新共享项"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5"/></svg></button>
+          </div>
+
+          <div class="list-label"><span>共享项</span><span class="num">2 项</span></div>
+
+          <ul class="share-list">
+            <li class="share-item folder open">
+              <div class="share-row">
+                <button class="chev" aria-label="展开"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
+                <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg></span>
+                <div class="s-main">
+                  <div class="s-name">设计稿</div>
+                  <div class="s-meta"><span class="num">来自 MacBook</span></div>
+                </div>
+                <div class="s-acts">
+                  <button class="icon-btn" aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
+                </div>
+              </div>
+              <div class="tree">
+                <div class="tree-inner">
+                  <div class="node">
+                    <button class="chev" style="width:18px; height:18px; flex:none; margin-left:-22px" aria-label="展开"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
+                    <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg></span>
+                    <span class="n-name">首页-v3</span>
+                    <span class="n-meta num">12 个文件</span>
+                  </div>
+                  <div class="node">
+                    <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span>
+                    <span class="n-name">notes.txt</span>
+                    <span class="n-meta num">2.0 KB</span>
+                  </div>
+                </div>
+              </div>
+            </li>
+            <li class="share-item">
+              <div class="share-row">
+                <button class="chev" style="visibility:hidden"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
+                <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span>
+                <div class="s-main">
+                  <div class="s-name">report.pdf</div>
+                  <div class="s-meta"><span class="num">来自 MacBook</span></div>
+                </div>
+                <div class="s-acts">
+                  <button class="icon-btn" aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
+                </div>
+              </div>
+            </li>
+          </ul>
+        </section>
+      </div>
+
+      <footer class="panel-foot">
+        <span class="num">端口 3890</span>
+        <span>原型 · 示例数据</span>
+      </footer>
+
+      <div class="push-card" id="pushCard" data-od-id="push-card">
+        <div class="p-top"><span id="pushTitle">正在发送 · 项目设计稿</span><span class="p-per num" id="pushPer">0%</span></div>
+        <div class="p-bar"><i id="pushBar"></i></div>
+        <div class="p-meta"><span id="pushTarget">→ PC-B · 局域网</span><span class="num" id="pushBytes">0 / 12.6 MB</span></div>
+      </div>
+
+      <div class="push-card" id="consentCard" data-od-id="consent-card">
+        <div class="p-top"><span>接收推送邀请</span><span class="mono" id="consentFrom">来自设备</span></div>
+        <div class="consent-info">
+          <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span>
+          <span class="c-name" id="consentName">项目设计稿</span>
+          <span class="c-size num" id="consentSize">12.6 MB</span>
+        </div>
+        <div class="consent-acts">
+          <button class="btn btn-secondary" id="declineBtn">拒绝</button>
+          <button class="btn btn-primary" id="acceptBtn">同意</button>
+        </div>
+      </div>
+
+      <section class="sheet" id="settingsSheet" data-od-id="settings" aria-label="设置">
+        <header class="sheet-head">
+          <span class="panel-brand" style="margin-right:auto"><span class="mark-sm"><i></i></span>设置</span>
+          <button class="icon-btn" id="closeSettingsBtn" aria-label="关闭设置"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+        </header>
+        <div class="sheet-body">
+          <div class="field">
+            <label for="deviceName">设备名称</label>
+            <input class="input" id="deviceName" value="王磊的MacBook Pro" />
+          </div>
+          <div class="field">
+            <label for="downloadDir">下载目录</label>
+            <div class="path-input">
+              <input class="input" id="downloadDir" value="~/Desktop/OrbDrop" readonly />
+              <button class="btn btn-secondary btn-sm" data-browse>选择</button>
+            </div>
+          </div>
+          <div class="field">
+            <label>下载模式</label>
+            <div class="radio-group">
+              <label class="radio"><input type="radio" name="dlMode" checked /><span class="r-label">直接下载<span class="r-sub">收下文件并保存到下载目录</span></span></label>
+              <label class="radio"><input type="radio" name="dlMode" /><span class="r-label">每次询问<span class="r-sub">收到文件时先征求确认</span></span></label>
+            </div>
+          </div>
+          <div class="field">
+            <label for="inboxDir">收件目录</label>
+            <div class="path-input">
+              <input class="input" id="inboxDir" value="~/Desktop/OrbDrop/收件箱" readonly />
+              <button class="btn btn-secondary btn-sm" data-browse>选择</button>
+            </div>
+          </div>
+          <div class="field">
+            <label for="port">服务端口</label>
+            <input class="input num" id="port" value="3890" />
+            <p style="margin:2px 0 0; font-size:var(--fs-xs); color:var(--muted);">被占用时自动 +1 探测，实际端口显示在底部状态栏。</p>
+          </div>
+          <div class="field">
+            <label>开机自启</label>
+            <div style="display:flex; align-items:center; justify-content:space-between;">
+              <span style="font-size:var(--fs-sm); color:var(--muted);">登录后自动启动 OrbDrop</span>
+              <label class="switch"><input type="checkbox" checked data-autostart /><span class="track"></span></label>
+            </div>
+          </div>
+        </div>
+        <footer class="sheet-foot">
+          <button class="btn btn-ghost" id="cancelSettingsBtn">取消</button>
+          <button class="btn btn-primary" id="saveSettingsBtn">保存设置</button>
+        </footer>
+      </section>
+
+      <div class="overlay" id="pairDialog" data-od-id="pair-dialog">
+        <div class="dialog">
+          <h3 id="pairTitle">配对设备</h3>
+          <p class="d-desc">在对方设备的 OrbDrop 中输入下方配对码，即可完成配对。</p>
+          <p class="d-target num" id="pairTarget" hidden></p>
+          <div class="code num"><b>4</b><b>8</b><b>2</b><b>1</b><b>6</b><b>0</b></div>
+          <p class="code-hint num">2 分钟内有效 · 过期后自动刷新</p>
+          <div class="d-acts">
+            <button class="btn btn-secondary" id="copyCodeBtn">复制配对码</button>
+            <button class="btn btn-primary" id="closePairBtn">完成</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </aside>
+
+  <div class="ctx" id="ctxMenu" data-od-id="context-menu"></div>
+
+  <div class="toast-layer" id="toastLayer"></div>
+
+
+<script>
+(function () {
+  const $ = function (s, r) { return (r || document).querySelector(s); };
+  const $$ = function (s, r) { return Array.from((r || document).querySelectorAll(s)); };
+  var stage = $('#orbStage');
+  var panel = $('#panel');
+  var orbBtn = $('#orbBtn');
+  var body = document.body;
+
+  function setOpen(v) {
+    stage.classList.toggle('open', v);
+    orbBtn.setAttribute('aria-expanded', String(v));
+    if (!v) { closeSheet(); closePair(); hideCtx(); }
+  }
+
+  orbBtn.addEventListener('click', function () { setOpen(true); });
+  $('#collapseBtn').addEventListener('click', function () { setOpen(false); });
+
+  /* tabs */
+  $$('.tab').forEach(function (t) {
+    t.addEventListener('click', function () {
+      $$('.tab').forEach(function (x) {
+        x.classList.toggle('active', x === t);
+        x.setAttribute('aria-selected', x === t ? 'true' : 'false');
+      });
+      $('#tab-local').hidden = t.dataset.tab !== 'local';
+      $('#tab-devices').hidden = t.dataset.tab !== 'devices';
+      $('#tab-peer').hidden = t.dataset.tab !== 'peer';
+    });
+  });
+
+  /* share tree expand */
+  $$('.share-item').forEach(function (li) {
+    var chev = $('.chev', li);
+    if (chev) chev.addEventListener('click', function (e) {
+      e.stopPropagation();
+      li.classList.toggle('open');
+    });
+  });
+
+  /* broadcast switch */
+  $$('input[data-broadcast]').forEach(function (sw) {
+    sw.addEventListener('change', function () {
+      var li = sw.closest('.share-item');
+      var bcast = $('[data-bcast]', li);
+      if (bcast) bcast.hidden = !sw.checked;
+      toast(sw.checked ? '已开启广播 · 对方设备可在 OrbDrop 中浏览该共享项' : '已停止广播该共享项');
+    });
+  });
+
+  /* context menu */
+  var ctx = $('#ctxMenu');
+  var ctxTarget = null;
+  function hideCtx() { ctx.classList.remove('show'); ctxTarget = null; }
+  var ICON_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>';
+  var ICON_OPEN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>';
+  var ICON_COPY = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11v13H4z"/><path d="M8 4h12v12"/></svg>';
+  var ICON_TRASH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>';
+  var ICON_LINK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/></svg>';
+  var ICON_LINKOFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/><path d="M3 3l18 18"/></svg>';
+  var ICON_PUSH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>';
+  function ctxHTMLFor(target) {
+    var share = target && target.closest('.share-item');
+    var device = target && target.closest('.device-row');
+    if (share) {
+      return '<button class="ctx-item" data-act="download">' + ICON_DOWN + '下载到本地</button>' +
+        '<button class="ctx-item" data-act="open">' + ICON_OPEN + '打开所在文件夹</button>' +
+        '<button class="ctx-item" data-act="copy">' + ICON_COPY + '复制共享路径</button>' +
+        '<div class="ctx-sep"></div>' +
+        '<button class="ctx-item danger" data-act="remove">' + ICON_TRASH + '移除共享项</button>';
+    }
+    if (device) {
+      var st = device.dataset.state;
+      return (st === 'connected'
+          ? '<button class="ctx-item" data-act="disconnect">' + ICON_LINKOFF + '断开长连接</button>'
+          : '<button class="ctx-item" data-act="connect">' + ICON_LINK + '建立长连接</button>') +
+        '<button class="ctx-item" data-act="push">' + ICON_PUSH + '推送文件</button>' +
+        '<div class="ctx-sep"></div>' +
+        '<button class="ctx-item danger" data-act="unpair">' + ICON_TRASH + '解除配对</button>';
+    }
+    return '';
+  }
+  function showCtx(x, y, target) {
+    ctxTarget = target;
+    ctx.innerHTML = ctxHTMLFor(target);
+    ctx.classList.remove('show');
+    ctx.style.left = x + 'px';
+    ctx.style.top = y + 'px';
+    requestAnimationFrame(function () {
+      var r = ctx.getBoundingClientRect();
+      if (r.right > innerWidth - 8) ctx.style.left = Math.max(8, innerWidth - r.width - 8) + 'px';
+      if (r.bottom > innerHeight - 8) ctx.style.top = Math.max(8, innerHeight - r.height - 8) + 'px';
+      ctx.classList.add('show');
+    });
+  }
+  function openCtxFor(e, target) {
+    showCtx(e.clientX, e.clientY, target);
+  }
+
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest('[data-ctx]');
+    if (b) { e.stopPropagation(); openCtxFor(e, b); }
+  });
+  $$('.share-row').forEach(function (row) {
+    row.addEventListener('contextmenu', function (e) { e.preventDefault(); e.stopPropagation(); openCtxFor(e, row); });
+  });
+  $$('.device-row').forEach(function (row) {
+    row.addEventListener('contextmenu', function (e) { e.preventDefault(); e.stopPropagation(); openCtxFor(e, row); });
+  });
+  document.addEventListener('click', function (e) { if (!ctx.contains(e.target)) hideCtx(); });
+  document.addEventListener('contextmenu', function (e) { if (!ctx.contains(e.target)) hideCtx(); });
+  window.addEventListener('resize', hideCtx);
+
+  ctx.addEventListener('click', function (e) {
+    var act = e.target.closest('[data-act]');
+    if (!act) return;
+    var target = ctxTarget;
+    hideCtx();
+    var name = '该项目';
+    if (target) {
+      var n = $('.s-name', target) || $('.d-name', target);
+      if (n) name = n.textContent;
+    }
+    var drow = target && target.closest('.device-row');
+    var li = target && target.closest('.share-item');
+    switch (act.dataset.act) {
+      case 'download': toast('已开始下载「' + name + '」到 桌面/OrbDrop'); break;
+      case 'open': toast('已在访达中打开「' + name + '」所在文件夹'); break;
+      case 'copy': toast('已复制「' + name + '」的共享路径'); break;
+      case 'remove':
+        if (li) {
+          li.style.transition = 'opacity .25s ease, transform .25s ease';
+          li.style.opacity = '0';
+          li.style.transform = 'scale(.98)';
+          setTimeout(function () { if (li.parentNode) li.parentNode.removeChild(li); }, 240);
+        }
+        toast('已移除共享项「' + name + '」');
+        break;
+      case 'connect': connectDevice(drow); break;
+      case 'disconnect': disconnectDevice(drow); break;
+      case 'push': requestPush(drow); break;
+      case 'unpair':
+        if (drow) {
+          drow.dataset.state = 'removed';
+          drow.style.transition = 'opacity .25s ease, transform .25s ease';
+          drow.style.opacity = '0';
+          drow.style.transform = 'scale(.98)';
+          setTimeout(function () { if (drow.parentNode) drow.parentNode.removeChild(drow); }, 240);
+        }
+        toast('已解除配对并移除设备「' + name + '」');
+        updateBroadcastUI();
+        break;
+    }
+  });
+
+  /* add share item */
+  var addedCount = 0;
+  function addShareItem(withBroadcast) {
+    var names = ['宣传视频.mp4', '会议纪要-周会.md', '报价单2026Q3.xlsx'];
+    var name = names[addedCount % names.length];
+    addedCount++;
+    var li = document.createElement('li');
+    li.className = 'share-item';
+    li.style.animation = 'toast-in .25s cubic-bezier(.2,.8,.2,1)';
+    li.innerHTML =
+      '<div class="share-row">' +
+      '<button class="chev" style="visibility:hidden"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>' +
+      '<span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span>' +
+      '<div class="s-main"><div class="s-name"></div><div class="s-meta"><span class="num">刚刚 · 已加入共享项</span></div></div>' +
+      '<div class="s-acts"><label class="switch" title="向设备广播"><input type="checkbox" data-broadcast><span class="track"></span></label>' +
+      '<button class="icon-btn" data-ctx aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button></div></div>';
+    li.querySelector('.s-name').textContent = name;
+    $('#shareList').prepend(li);
+    li.querySelector('input[data-broadcast]').addEventListener('change', function (e) {
+      var l = e.target.closest('.share-item');
+      var b = $('[data-bcast]', l);
+      if (b) b.hidden = !e.target.checked;
+    });
+    li.querySelector('[data-ctx]').addEventListener('click', function (ev) {
+      ev.stopPropagation(); openCtxFor(ev, li.querySelector('[data-ctx]'));
+    });
+    var live = deviceRows.filter(function (r) { return r.parentNode && r.dataset.state === 'connected'; });
+    if (live.length && withBroadcast !== false) {
+      var bNames = live.map(devName).join('、');
+      li.querySelector('.s-meta').insertAdjacentHTML('beforeend', '<span class="bcast-chip" data-bcast title="自动广播至 ' + bNames + '"><span class="dot ok"></span>' + live.length + '台设备</span>');
+      toast('已拖入「' + name + '」并自动广播至 ' + bNames);
+    } else if (withBroadcast === false) {
+      toast('没有长连接设备，文件仅加入共享项');
+    } else {
+      toast('已添加共享项「' + name + '」');
+    }
+  }
+  $('#addShareBtn').addEventListener('click', function () { addShareItem(); });
+
+  /* drag files onto the orb → auto-broadcast to connected devices */
+  var dragDepth = 0;
+  stage.addEventListener('dragenter', function (e) {
+    e.preventDefault();
+    dragDepth++;
+    stage.classList.add('drag');
+  });
+  stage.addEventListener('dragover', function (e) { e.preventDefault(); });
+  stage.addEventListener('dragleave', function (e) {
+    e.preventDefault();
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) stage.classList.remove('drag');
+  });
+  stage.addEventListener('drop', function (e) {
+    e.preventDefault();
+    dragDepth = 0;
+    stage.classList.remove('drag');
+    var live = deviceRows.filter(function (r) { return r.parentNode && r.dataset.state === 'connected'; });
+    if (live.length) addShareItem(true);
+    else addShareItem(false);
+  });
+
+  /* settings sheet */
+  var sheet = $('#settingsSheet');
+  function closeSheet() { sheet.classList.remove('open'); }
+  $('#settingsBtn').addEventListener('click', function () { sheet.classList.add('open'); });
+  $('#closeSettingsBtn').addEventListener('click', closeSheet);
+  $('#cancelSettingsBtn').addEventListener('click', closeSheet);
+
+  /* pair dialog */
+  var pairDlg = $('#pairDialog');
+  var pairCode = '482160';
+  function freshPairCode() {
+    var c = '';
+    for (var i = 0; i < 6; i++) c += Math.floor(Math.random() * 10);
+    return c;
+  }
+  function paintPairCode() {
+    var boxes = $$('.code b');
+    for (var i = 0; i < boxes.length; i++) boxes[i].textContent = pairCode[i];
+  }
+  function closePair() { pairDlg.classList.remove('open'); }
+  $('#pairBtn').addEventListener('click', function () { openPair(null); });
+  $('#closePairBtn').addEventListener('click', function () {
+    if (pendingPairRow && pendingPairRow.dataset.state === 'unbound') pairDevice(pendingPairRow);
+    pendingPairRow = null;
+    closePair();
+  });
+  $('#copyCodeBtn').addEventListener('click', function () {
+    navigator.clipboard.writeText(pairCode).then(function () {
+      toast('已复制配对码 ' + pairCode);
+    }, function () { toast('复制失败，请手动输入'); });
+  });
+
+  /* push card simulation */
+  var pushCard = $('#pushCard');
+  var pushTitle = $('#pushTitle');
+  var pushPer = $('#pushPer');
+  var pushBar = $('#pushBar');
+  var pushBytes = $('#pushBytes');
+  var pushTarget = $('#pushTarget');
+  var pushInterval = null;
+
+  function startPush(name, target, total) {
+    pushTitle.textContent = '正在发送 · ' + name;
+    pushTarget.textContent = '→ ' + target + ' · 局域网';
+    pushBytes.textContent = '0 / ' + total;
+    pushCard.classList.remove('done');
+    pushCard.classList.add('show');
+    var received = 0;
+    if (pushInterval) clearInterval(pushInterval);
+    pushInterval = setInterval(function () {
+      received += Math.floor(total.indexOf('M') > -1 ? parseFloat(total) * 0.2 * 1024 * 1024 : parseFloat(total) * 0.2 * 1024);
+      var pct = Math.min(100, Math.round(received / (total.indexOf('M') > -1 ? parseFloat(total) * 1024 * 1024 : parseFloat(total) * 1024) * 100));
+      pct = Math.min(100, pct);
+      pushBar.style.width = pct + '%';
+      pushPer.textContent = pct + '%';
+      var rMB = Math.round(received / 1024 / 1024 * 10) / 10;
+      pushBytes.textContent = rMB + ' / ' + total;
+      if (pct >= 100) {
+        clearInterval(pushInterval);
+        pushInterval = null;
+        pushCard.classList.add('done');
+        pushTitle.textContent = '已发送完成 · ' + name;
+        toast('「' + name + '」已成功发送至 ' + target);
+        setTimeout(function () { pushCard.classList.remove('show'); pushCard.classList.remove('done'); }, 3000);
+      }
+    }, 600);
+  }
+
+  /* ── device states: 未绑定 / 已配对 / 长连接 ── */
+  var deviceRows = $$('.device-row');
+  function devState(row) { return row ? row.dataset.state : ''; }
+  function devName(row) {
+    var n = $('.d-name', row);
+    return n ? n.childNodes[0].textContent.trim() : '设备';
+  }
+  function renderStateChip(row) {
+    var chip = $('.state-chip', row);
+    if (!chip) return;
+    var st = devState(row);
+    var cls = 'state-chip', label, dot;
+    if (st === 'connected') { cls += ' connected'; label = '长连接'; dot = 'ok'; }
+    else if (st === 'unbound') { cls += ' unbound'; label = '未绑定'; dot = 'warn'; }
+    else { label = '已配对'; dot = 'off'; }
+    chip.className = cls;
+    chip.innerHTML = '<span class="dot ' + dot + '"></span>' + label;
+  }
+  function renderDeviceActions(row) {
+    var acts = $('.d-acts', row);
+    var st = devState(row);
+    if (st === 'connected') {
+      acts.innerHTML = '<button class="btn btn-ghost btn-sm" data-disconnect>断开</button>' +
+        '<button class="btn btn-ghost btn-sm" data-push>推送</button>';
+    } else if (st === 'paired') {
+      acts.innerHTML = '<button class="btn btn-primary btn-sm" data-connect>建立长连接</button>' +
+        '<button class="btn btn-ghost btn-sm" data-push>推送</button>';
+    } else {
+      acts.innerHTML = '<button class="btn btn-primary btn-sm" data-pair>配对</button>' +
+        '<button class="btn btn-ghost btn-sm" data-push>推送</button>';
+    }
+  }
+  function updateBroadcastUI() {
+    var live = deviceRows.filter(function (r) { return r.parentNode; });
+    var connected = live.filter(function (r) { return r.dataset.state === 'connected'; });
+    var n = connected.length;
+    var connPillEl = $('#connPill');
+    if (connPillEl) connPillEl.innerHTML = '<span class="dot ok"></span><span>在线 · 长连接 ' + n + '</span>';
+    var hint = $('#bcastHint');
+    if (n > 0) {
+      hint.hidden = false;
+      $('#bcastHintTxt').textContent = '拖入文件将自动广播至 ' + connected.map(devName).join('、');
+    } else {
+      hint.hidden = true;
+    }
+    var c = $('#devCount');
+    if (c) c.textContent = live.length + ' 台 · ' + n + ' 长连接';
+    var empty = $('#devEmpty');
+    if (empty) empty.hidden = live.length > 0;
+    var badge = $('#orbBadge');
+    if (badge) { badge.textContent = n; badge.hidden = n === 0; }
+    stage.classList.toggle('live', n > 0);
+  }
+  function connectDevice(row) {
+    row.dataset.state = 'connected';
+    renderStateChip(row); renderDeviceActions(row);
+    updateBroadcastUI();
+    toast('已与「' + devName(row) + '」建立长连接，拖入文件将自动广播');
+  }
+  function disconnectDevice(row) {
+    row.dataset.state = 'paired';
+    renderStateChip(row); renderDeviceActions(row);
+    updateBroadcastUI();
+    toast('已断开与「' + devName(row) + '」的长连接');
+  }
+  function pairDevice(row) {
+    row.dataset.state = 'paired';
+    renderStateChip(row); renderDeviceActions(row);
+    updateBroadcastUI();
+    toast('配对成功 ·「' + devName(row) + '」已加入设备列表');
+  }
+  var pendingPairRow = null;
+  function openPair(row) {
+    pendingPairRow = row || null;
+    pairCode = freshPairCode();
+    paintPairCode();
+    var target = $('#pairTarget');
+    var dName = row ? devName(row) : null;
+    if (target) {
+      target.hidden = !dName;
+      target.textContent = dName ? '输入到「' + dName + '」的 OrbDrop' : '';
+    }
+    var title = $('#pairTitle');
+    if (title) title.textContent = dName ? '与 ' + dName + ' 配对' : '配对设备';
+    pairDlg.classList.add('open');
+  }
+
+  /* 推送：未绑定/已配对需同意，长连接直接推送 */
+  var consentCard = $('#consentCard');
+  function requestPush(row) {
+    var st = devState(row);
+    var dName = devName(row);
+    if (st === 'connected') {
+      startPush('项目设计稿', dName, '12.6 MB');
+      return;
+    }
+    toast('已向「' + dName + '」发起推送，等待对方同意');
+    $('#consentName').textContent = '项目设计稿';
+    $('#consentSize').textContent = '12.6 MB';
+    $('#consentFrom').textContent = '来自 ' + dName;
+    consentCard.dataset.pending = dName;
+    consentCard.classList.add('show');
+  }
+  $('#acceptBtn').addEventListener('click', function () {
+    var dName = consentCard.dataset.pending;
+    consentCard.classList.remove('show');
+    toast('「' + dName + '」已同意接收，开始传输');
+    startPush('项目设计稿', dName, '12.6 MB');
+  });
+  $('#declineBtn').addEventListener('click', function () {
+    var dName = consentCard.dataset.pending;
+    consentCard.classList.remove('show');
+    toast('「' + dName + '」拒绝了接收');
+  });
+
+  /* device row action delegation */
+  $('#deviceList').addEventListener('click', function (e) {
+    var btn = e.target.closest('button');
+    if (!btn) return;
+    var row = btn.closest('.device-row');
+    if (!row) return;
+    if (btn.hasAttribute('data-connect')) connectDevice(row);
+    else if (btn.hasAttribute('data-disconnect')) disconnectDevice(row);
+    else if (btn.hasAttribute('data-pair')) openPair(row);
+    else if (btn.hasAttribute('data-push')) requestPush(row);
+    else if (btn.hasAttribute('data-ctx')) openCtxFor(e, btn);
+  });
+
+  updateBroadcastUI();
+
+  /* toast */
+  var toastLayer = $('#toastLayer');
+  function toast(msg) {
+    var el = document.createElement('div');
+    el.className = 'toast';
+    el.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>' + msg;
+    toastLayer.appendChild(el);
+    setTimeout(function () {
+      el.classList.add('leaving');
+      setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 260);
+    }, 2200);
+  }
+
+  /* save settings toast */
+  $('#saveSettingsBtn').addEventListener('click', function () {
+    closeSheet();
+    toast('设置已保存');
+  });
+
+  /* auto-start switch toast */
+  $('input[data-autostart]').addEventListener('change', function () {
+    toast(this.checked ? '开机自启已开启' : '开机自启已关闭');
+  });
+
+})();
+</script>
+</body>
+</html>

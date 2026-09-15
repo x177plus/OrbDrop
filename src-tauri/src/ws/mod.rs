@@ -1,0 +1,389 @@
+pub mod events;
+pub mod session;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use parking_lot::Mutex;
+use tauri::Emitter;
+use tokio::sync::mpsc;
+use tokio::time::interval;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+use tracing::{error, info, warn};
+
+use crate::credential;
+use crate::state::AppState;
+use crate::ws::events::WsEvent;
+
+// ---------------------------------------------------------------------------
+// WS Manager
+// ---------------------------------------------------------------------------
+
+/// One live WS session with a peer.
+///
+/// `gen` identifies the session for [`WsManager::unregister`]: only the session
+/// that registered a slot may clear it. Without that, a dying session removes the
+/// entry a newer session just installed — and since dropping the last sender is
+/// what ends an inbound session, the two links then kill each other.
+struct Session {
+    gen: u64,
+    tx: mpsc::UnboundedSender<WsEvent>,
+}
+
+pub struct WsManager {
+    /// Peer connections: peer_id → live sessions (usually one; two when both
+    /// sides dial at the same instant — they must coexist, not fight).
+    senders: Mutex<HashMap<String, Vec<Session>>>,
+    /// Task handles (for abort on unpair).
+    tasks: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Peers the user disconnected by hand: auto-connect stays off until the user
+    /// hits "连接" again (or unpairs). Without this the discovery/probe loop would
+    /// re-dial a second after the click and the "断开" button would be a lie.
+    paused: Mutex<HashSet<String>>,
+    next_gen: AtomicU64,
+}
+
+impl WsManager {
+    pub fn new() -> Self {
+        Self {
+            senders: Mutex::new(HashMap::new()),
+            tasks: Mutex::new(HashMap::new()),
+            paused: Mutex::new(HashSet::new()),
+            next_gen: AtomicU64::new(1),
+        }
+    }
+
+    /// Send an event to a connected peer; returns false if not connected.
+    pub fn send(&self, peer_id: &str, event: WsEvent) -> bool {
+        let mut senders = self.senders.lock();
+        let Some(sessions) = senders.get_mut(peer_id) else { return false };
+        // 新会话优先；它刚死掉时（还没注销）退回旧会话。
+        while let Some(session) = sessions.last() {
+            if session.tx.send(event.clone()).is_ok() {
+                return true;
+            }
+            sessions.pop();
+        }
+        senders.remove(peer_id);
+        false
+    }
+
+    /// True if a channel is registered for the peer (connection exists).
+    pub fn has_connection(&self, peer_id: &str) -> bool {
+        self.senders.lock().get(peer_id).is_some_and(|s| !s.is_empty())
+    }
+
+    /// 此刻处于长连接的对端 id 集合。共享项可见性与变更广播都按这个集合算，
+    /// 不再读「开播那一刻的快照」。
+    pub fn connected_peers(&self) -> Vec<String> {
+        self.senders
+            .lock()
+            .iter()
+            .filter(|(_, s)| !s.is_empty())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Register a session's channel; returns the generation to hand back to
+    /// [`WsManager::unregister`].
+    pub fn register(&self, peer_id: &str, tx: mpsc::UnboundedSender<WsEvent>) -> u64 {
+        let gen = self.next_gen.fetch_add(1, Ordering::Relaxed);
+        let mut senders = self.senders.lock();
+        let slot = senders.entry(peer_id.to_string()).or_default();
+        let was_empty = slot.is_empty();
+        slot.push(Session { gen, tx });
+        drop(senders);
+        if was_empty {
+            info!(%peer_id, gen, "WS session registered (link up)");
+        }
+        gen
+    }
+
+    /// Unregister one session. Only the owner can clear its slot, and the peer
+    /// stays connected while any other session is still alive.
+    pub fn unregister(&self, peer_id: &str, gen: u64) {
+        let mut senders = self.senders.lock();
+        let Some(slot) = senders.get_mut(peer_id) else { return };
+        let before = slot.len();
+        slot.retain(|s| s.gen != gen);
+        let emptied = slot.is_empty();
+        if emptied {
+            senders.remove(peer_id);
+        }
+        drop(senders);
+        if emptied && before > 0 {
+            info!(%peer_id, gen, "WS session unregistered (link down)");
+        }
+    }
+
+    pub fn register_task(&self, peer_id: &str, handle: tokio::task::JoinHandle<()>) {
+        self.tasks.lock().insert(peer_id.to_string(), handle);
+    }
+
+    /// Kill the live session and the dial loop for a peer, keeping the pause flag.
+    fn teardown(&self, peer_id: &str) {
+        self.senders.lock().remove(peer_id);
+        if let Some(h) = self.tasks.lock().remove(peer_id) {
+            h.abort();
+        }
+    }
+
+    /// 掐掉正在跑的拨号循环（保留暂停标记）。手动「连接」要立刻发起一次新拨号，
+    /// 不能干等一个还在指数退避里打转（或正被对端拒绝）的旧循环。
+    pub fn abort_dial(&self, peer_id: &str) {
+        if let Some(h) = self.tasks.lock().remove(peer_id) {
+            h.abort();
+        }
+    }
+
+    /// Unpair: tear everything down and forget the manual-disconnect intent.
+    pub fn drop_peer(&self, peer_id: &str) {
+        self.paused.lock().remove(peer_id);
+        self.teardown(peer_id);
+    }
+
+    /// User hit "断开": drop the link and keep auto-connect off for this peer.
+    pub fn pause(&self, peer_id: &str) {
+        self.paused.lock().insert(peer_id.to_string());
+        self.teardown(peer_id);
+    }
+
+    /// User hit "连接" (or re-paired): let auto-connect dial again.
+    pub fn resume(&self, peer_id: &str) {
+        self.paused.lock().remove(peer_id);
+    }
+
+    pub fn is_paused(&self, peer_id: &str) -> bool {
+        self.paused.lock().contains(peer_id)
+    }
+}
+
+impl Default for WsManager {
+    fn default() -> Self { Self::new() }
+}
+
+// ---------------------------------------------------------------------------
+// Tauri event helper
+// ---------------------------------------------------------------------------
+
+pub fn emit_ui(state: &AppState, event: &str, payload: &serde_json::Value) {
+    if let Some(app) = state.app_handle.lock().as_ref() {
+        let _ = app.emit(event, payload);
+    }
+}
+
+/// Convenience: send to peer or warn.
+pub fn send_to_peer(state: &AppState, peer_id: &str, event: WsEvent) {
+    if !state.ws.send(peer_id, event) {
+        warn!(%peer_id, "no WS session to peer");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Outbound link (we are the initiator — our device_id < peer's)
+// ---------------------------------------------------------------------------
+
+/// Bring the long connection to a paired peer up, if we are the side that dials.
+///
+/// Called on pairing, on mDNS discovery, on every reachability probe and at
+/// startup — the link establishes itself, no user click (F-16). Idempotent: a
+/// live session, a running dial loop, or a manual "断开" all make it a no-op.
+pub fn ensure_link(state: &Arc<AppState>, peer_id: &str) {
+    match state.get_peer(peer_id) {
+        Some(p) if p.paired => {}
+        _ => return,
+    }
+    if state.ws.is_paused(peer_id) {
+        return;
+    }
+    spawn_outbound_link(Arc::clone(state), peer_id.to_string(), false);
+}
+
+/// 用户点「连接」：无视"由 id 较小的一方拨号"的规则，直接发一次拨号。
+///
+/// 自动建链只有一个方向（避免两条链接互相 unregister），但人的显式请求两边都得
+/// 算数：对端「断开」时本机连不回来、或者本机是被拨号的那一侧时，只有这条路径能把
+/// 长连接重新拉起来。拨号会带 `manual=1`，对端据此放行它自己的「断开」暂停。
+pub fn ensure_link_now(state: &Arc<AppState>, peer_id: &str) {
+    match state.get_peer(peer_id) {
+        Some(p) if p.paired => {}
+        _ => return,
+    }
+    if state.ws.has_connection(peer_id) {
+        return;
+    }
+    state.ws.abort_dial(peer_id);
+    spawn_outbound_link(Arc::clone(state), peer_id.to_string(), true);
+}
+
+pub fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool) {
+    // Deterministic rule for automatic dials: the peer with the smaller device_id
+    // initiates — one link per pair, no two sessions unregistering each other.
+    if !manual {
+        let own_id = state.config.lock().device_id.clone();
+        if own_id >= peer_id {
+            info!(self_id = %own_id, %peer_id, "lower-id peer should initiate");
+            return;
+        }
+    }
+
+    // One link per peer: a live channel, or a dial loop still running, means we
+    // are already linked (or about to be). Two concurrent loops would unregister
+    // each other's channel and flap the peer's online state.
+    if state.ws.has_connection(&peer_id) {
+        return;
+    }
+    if !manual {
+        if let Some(task) = state.ws.tasks.lock().get(&peer_id) {
+            if !task.is_finished() {
+                return;
+            }
+        }
+    }
+
+    let state_reg = state.clone();
+    let pid_for_register = peer_id.clone();
+    let body = async move {
+        let mut backoff = 5u64;
+        // manual=1 只搭第一次尝试：它是「用户此刻让我连」的一次性声明，不是这个
+        // 循环的长期属性 —— 否则会话建起来又掉之后，本机会一直替对端解除它的「断开」。
+        let mut manual_pending = manual;
+
+        loop {
+            // 已经有一条链接就不要重复拨号（对端点「连接」拨上来、或双方同时拨）。
+            // 两条链接各自持有 socket，重复拨号会让它们互相踩，界面就会"连-断"狂闪。
+            if state.ws.has_connection(&peer_id) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            // Address and pairing are re-read every attempt: the address arrives
+            // later (mDNS discovery, the pairing handshake) and can change under
+            // DHCP, so a snapshot taken at spawn time would either dial nowhere
+            // or dial a stale address forever.
+            let peer = match state.get_peer(&peer_id) {
+                Some(p) if p.paired => p,
+                _ => {
+                    info!(%peer_id, "peer unpaired or gone, outbound link stopped");
+                    return;
+                }
+            };
+            if peer.ip.is_empty() || peer.port == 0 {
+                // Not discoverable yet — wait for the address without burning
+                // the backoff (a doomed dial would just delay the real one).
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+
+            let token = credential::get_peer_token(&peer_id)
+                .ok().flatten().unwrap_or_default();
+            if token.is_empty() {
+                warn!(%peer_id, "no token, outbound link stopped");
+                return;
+            }
+
+            // manual=1 只在第一次尝试时带上：这是一次"用户让连"的请求，不是持续声明。
+            let url = format!(
+                "ws://{}:{}/events?token={}{}",
+                peer.ip,
+                peer.port,
+                token,
+                if manual_pending { "&manual=1" } else { "" },
+            );
+            manual_pending = false;
+            match connect_async(&url).await {
+                Ok((ws_stream, _)) => {
+                    info!(%peer_id, "outbound WS linked");
+                    state.set_peer_online(&peer_id, true);
+                    backoff = 5;
+
+                    let (mut write, mut read) = ws_stream.split();
+                    let (tx, mut rx) = mpsc::unbounded_channel::<WsEvent>();
+                    let gen = state.ws.register(&peer_id, tx);
+                    state.emit_devices_changed();
+
+                    let mut ping_interval = interval(Duration::from_secs(30));
+                    let mut missed = 0u32;
+
+                    'session: loop {
+                        tokio::select! {
+                            _ = ping_interval.tick() => {
+                                if let Err(e) = write.send(Message::Ping(vec![].into())).await {
+                                    warn!(%peer_id, "ping send: {e}");
+                                    break 'session;
+                                }
+                                missed += 1;
+                                if missed >= 3 {
+                                    warn!(%peer_id, "3 missed pongs");
+                                    break 'session;
+                                }
+                            }
+                            event = rx.recv() => {
+                                let event = match event {
+                                    Some(e) => e,
+                                    None => break 'session,
+                                };
+                                let json = match serde_json::to_string(&event) {
+                                    Ok(s) => s,
+                                    Err(e) => { error!(%e, "WS serialize"); continue; }
+                                };
+                                if let Err(e) = write.send(Message::Text(json.into())).await {
+                                    warn!(%peer_id, "write: {e}");
+                                    break 'session;
+                                }
+                            }
+                            msg = read.next() => {
+                                match msg {
+                                    Some(Ok(Message::Text(text))) => {
+                                        if let Ok(event) = serde_json::from_str::<WsEvent>(&text) {
+                                            session::handle_inbound(&state, &peer_id, event).await;
+                                        }
+                                    }
+                                    Some(Ok(Message::Pong(_))) => { missed = 0; }
+                                    Some(Ok(Message::Ping(data))) => {
+                                        let _ = write.send(Message::Pong(data)).await;
+                                    }
+                                    Some(Ok(Message::Close(_))) | None => {
+                                        info!(%peer_id, "outbound WS closed");
+                                        break 'session;
+                                    }
+                                    Some(Err(e)) => {
+                                        warn!(%peer_id, "read err: {e}");
+                                        break 'session;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
+                    state.ws.unregister(&peer_id, gen);
+                    state.emit_devices_changed();
+                    // Reachability is not ours to judge: a dropped link says
+                    // nothing about whether the peer still answers HTTP (push
+                    // works without WS). mDNS and the probe demote it if it is
+                    // really gone.
+                }
+                Err(e) => {
+                    warn!(%peer_id, "connect failed: {e}, retry {backoff}s");
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(60);
+                }
+            }
+        }
+    };
+
+    // 拨号任务必须有 Tokio 运行时。Tauri 的**同步**命令跑在主线程（没有 reactor），
+    // 直接 tokio::spawn 会 panic 掉整个进程（用户侧表现为点「连接」闪退），
+    // 所以走统一收口：没有运行时就不拨号（自动建链的探活会在有运行时的上下文里
+    // 重新拉起），绝不 panic。
+    let handle = match crate::task::spawn("outbound ws link", body) {
+        Some(h) => h,
+        None => return,
+    };
+    // peer_id was moved into the async block; register via the pre-cloned id.
+    state_reg.ws.register_task(&pid_for_register, handle);
+}
