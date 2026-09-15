@@ -2,7 +2,7 @@
 //!
 //! 覆盖校验清单：
 //! - 配对：A 发起（本机生成 6 位码并显示）→ B 输入该码 → B 向 A 换取 token（F-12）
-//! - 配对即自动建链：id 较小的一方自行拨号，无需用户点击"连接"（F-16）
+//! - 配对只到"已配对"：配对本身**不**建长连接，拨号由用户点「连接」发起（F-16）
 //! - 推送：邀请 → 同意 → 流式下载 → 文件落盘收件目录（F-50~F-52）
 //! - 推送进度事件（F-54 进度数据）
 //!
@@ -137,8 +137,9 @@ async fn pairing_then_push_transfers_file_to_receiver() {
         paired: true,
     });
 
-    // 4. Pairing already started the link (A initiates: device-a < device-b).
-    // Wait for the WS session to register on both sides.
+    // 4. Pairing stops at "已配对" — it never dials. A's user hits 「连接」 here
+    // (mirrors `connect_peer`) to open the WS link the push rides on.
+    orbdrop_lib::ws::ensure_link_now(&state_a, "device-b");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         if state_a.ws.has_connection("device-b") && state_b.ws.has_connection("device-a") {
@@ -236,6 +237,114 @@ fn crash_recorder_appends_synchronously() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 解除配对（F-14）必须是**双向**的，而且不能把设备行抹掉：对方还在网络上看得见，
+/// 就该继续以"未绑定"显示（离线才消失）。
+///
+/// 特意先把长连接断掉再解除：旧的实现靠 WS 事件通知对端，事件是排队发送的，紧跟着
+/// 的 drop_peer 会把它一起丢掉，链路不通时更是必然丢 —— 对端就一直停在"已配对"。
+#[tokio::test]
+async fn unpair_clears_both_sides_and_keeps_the_device_listed() {
+    credential::remove_peer("device-ua").ok();
+    credential::remove_peer("device-ub").ok();
+
+    let dir = std::env::temp_dir().join(format!("orbdrop_unpair_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state_a = make_state(3998, "device-ua", "PC-UA", dir.clone());
+    let state_b = make_state(3999, "device-ub", "PC-UB", dir.clone());
+    let port_a = orbdrop_lib::server::start_server(state_a.clone(), 3998).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server(state_b.clone(), 3999).await.expect("B server");
+
+    // 配对：B 用 A 显示的码向 A 换取 token（A 从请求里拿到 B 的地址）。
+    let code = state_a.pair.create_code();
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port_a}/pair"))
+        .json(&serde_json::json!({
+            "peerId": "device-ub",
+            "peerName": "PC-UB",
+            "peerPort": port_b,
+            "code": code,
+        }))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let token = resp.json::<serde_json::Value>().await.unwrap()["token"].as_str().unwrap().to_string();
+    credential::set_peer("device-ua", &token).unwrap();
+    state_b.mark_paired(&orbdrop_lib::config::PeerDevice {
+        id: "device-ua".into(),
+        name: "PC-UA".into(),
+        ip: "127.0.0.1".into(),
+        port: port_a,
+        online: true,
+        paired: true,
+    });
+
+    // 配对不再自己建链：A 点「连接」（镜像 connect_peer）才有链路。
+    orbdrop_lib::ws::ensure_link_now(&state_a, "device-ub");
+    wait_until("点连接后建链", || {
+        state_a.ws.has_connection("device-ub") && state_b.ws.has_connection("device-ua")
+    }).await;
+
+    // 故意先把长连接断掉：解除配对不允许依赖 WS 通道。
+    state_a.ws.pause("device-ub");
+    wait_until("断开生效", || !state_b.ws.has_connection("device-ua")).await;
+
+    orbdrop_lib::unpair_peer(&state_a, "device-ub").await.expect("unpair");
+
+    // A 侧：token 清掉、链路没了，但设备行还在、只是回到"未绑定"。
+    assert!(!credential::has_peer("device-ub"), "A 的 token 必须清掉");
+    assert!(!state_a.ws.has_connection("device-ub"));
+    let on_a = state_a.get_peer("device-ub").expect("A 仍列出该设备（未绑定）");
+    assert!(!on_a.paired, "A 侧回到未绑定");
+
+    // B 侧：被通知到，同样清 token、保留设备行。
+    assert!(!credential::has_peer("device-ua"), "B 的 token 必须被清掉（解除配对是双向的）");
+    let on_b = state_b.get_peer("device-ua").expect("B 仍列出该设备（未绑定）");
+    assert!(!on_b.paired, "B 侧回到未绑定");
+
+    // 被解除配对后，对方（尤其**旧版本**对端，它不知道要清 token）拿着旧 token 再来拨号时：
+    // 必须被拒，而且**不能**被登记成本机的 "self" —— 否则对端显示"长连接"、本机却把它
+    // 当"未绑定"，正是用户遇到的现象。
+    credential::set_peer("device-ua", "stale-token-after-unpair").unwrap();
+    orbdrop_lib::ws::ensure_link_now(&state_b, "device-ua");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let on_a = state_a.get_peer("device-ub").expect("A 仍列出该设备");
+    assert!(!on_a.paired, "被解除配对后不能因为对端强行拨号就变回已配对");
+    assert!(
+        !state_a.ws.has_connection("device-ub") && !state_a.ws.has_connection("self"),
+        "过期 token 的拨号必须被拒（不得以 self 身份混进本机）"
+    );
+    assert!(!state_b.ws.has_connection("device-ua"), "对端也不该连上");
+
+    // 旧版本对端还握着旧 token 时，连共享项列表也拿不到（Bearer 反解不出身份 → 401）。
+    // 来源用本机 LAN 地址，绕开"回环 = 本机 UI"的免鉴权分支。
+    if let Some(lan_ip) = local_lan_ip() {
+        let resp = reqwest::Client::new()
+            .get(format!("http://{lan_ip}:{port_a}/shares"))
+            .bearer_auth("stale-token-after-unpair")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "被解除配对后，旧 token 不得再读到本机共享项"
+        );
+    }
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    credential::remove_peer("device-ua").ok();
+    credential::remove_peer("device-ub").ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 本机的局域网地址：用来模拟"来自另一台设备"的请求（回环会被当成本机 UI 免鉴权）。
+fn local_lan_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?; // 只为挑出出口网卡，不实际发包
+    let ip = socket.local_addr().ok()?.ip();
+    if ip.is_loopback() { None } else { Some(ip) }
+}
+
 /// 同步上下文（没有 Tokio 运行时）里点「连接」/「同意接收推送」不能把进程打崩。
 ///
 /// Tauri 的**同步**命令就跑在这种上下文里：修复前 `tokio::spawn` 直接 panic
@@ -247,7 +356,7 @@ fn button_tasks_without_a_tokio_runtime_do_not_panic() {
 
     let inbox = std::env::temp_dir().join(format!("orbdrop_nort_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&inbox).unwrap();
-    // "device-za" < "device-zb"：本机是"该拨号的一方"，必然走到 spawn 那一步。
+    // 点「连接」必然走到 spawn 那一步（拨号只由这个入口发起）。
     let state = make_state(3994, "device-za", "PC-ZA", inbox.clone());
     state.mark_paired(&orbdrop_lib::config::PeerDevice {
         id: "device-zb".into(),
@@ -259,7 +368,6 @@ fn button_tasks_without_a_tokio_runtime_do_not_panic() {
     });
 
     // 「连接」
-    orbdrop_lib::ws::ensure_link(&state, "device-zb");
     orbdrop_lib::ws::ensure_link_now(&state, "device-zb");
     assert!(
         !state.ws.has_connection("device-zb"),
@@ -282,14 +390,16 @@ fn button_tasks_without_a_tokio_runtime_do_not_panic() {
     let _ = std::fs::remove_dir_all(&inbox);
 }
 
-/// F-16 回归：配对后长连接由 id 较小的一方自行建立，用户不需要点"连接"。
+/// F-16 回归：配对只到"已配对"——**配对本身不建长连接**，谁都不许自己拨号。
 ///
-/// 这里让**验证方**（本机生成码、被 POST /pair 的那台）就是 id 较小的一方，
-/// 且它从未通过 mDNS/手动添加见过对方 —— 也就是对方地址唯一来源是这次配对请求。
-/// 修复前它拿着空地址拨号（`ws://:0`），长连接永远建不起来，界面上只能靠用户点
-/// "建立长连接"；修复后配对请求带回来源 IP + 对端自报端口，配对完成即自动建链。
+/// 用户报的现象正是"配对完自己就变成长连接了"：配对只该确立关系。这里让配对双方
+/// 都有地址、都握着 token（地址还都是对方自报/来源 IP 给的，等于把自动拨号的所有
+/// 条件都摆齐），再给 mDNS 发现 / 5s 探活 / 启动这三条旧的自动路径留出出手的时间窗，
+/// 断言一条链路都不许冒出来；随后用户点「连接」，链路才建立。
+///
+/// 后半段是「连接 / 断开」两个按钮的既有语义（与自动建链无关，仍然必须成立）。
 #[tokio::test]
-async fn pairing_arms_long_connection_without_a_click() {
+async fn pairing_stops_at_paired_until_the_user_clicks_connect() {
     // 凭据库是机器级的，进程结束也不会清：先抹掉上一轮（尤其是跑挂的那轮）留下的
     // token，否则 A 一启动就从凭据库重建出 B 的条目，"从未见过 B" 这个前提不成立。
     credential::remove_peer("device-aa").ok();
@@ -298,7 +408,6 @@ async fn pairing_arms_long_connection_without_a_click() {
     let inbox = std::env::temp_dir().join(format!("orbdrop_auto_inbox_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&inbox).unwrap();
 
-    // "device-aa" < "device-ab" → A 才是拨号方（确定性规则）。
     let state_a = make_state(3992, "device-aa", "PC-AA", inbox.clone());
     let state_b = make_state(3993, "device-ab", "PC-AB", inbox.clone());
     let port_a = orbdrop_lib::server::start_server(state_a.clone(), 3992).await.expect("A server");
@@ -345,17 +454,29 @@ async fn pairing_arms_long_connection_without_a_click() {
         paired: true,
     });
 
-    // A 从配对请求里学到了 B 的地址（来源 IP + B 自报端口）并落库。
+    // A 从配对请求里学到了 B 的地址（来源 IP + B 自报端口）并落库 —— 有地址也不自己拨。
     let learned = state_a.get_peer("device-ab").expect("A now knows B");
     assert!(learned.paired, "A marks B paired");
     assert_eq!((learned.ip.as_str(), learned.port), ("127.0.0.1", port_b));
 
-    // 关键断言：双方都没有调用任何"连接"命令，长连接却必须自己起来。
-    wait_until("pairing must arm the link by itself", || {
+    // 关键断言：双方都已配对、地址齐全、token 在手，但没人点「连接」→ 一条链路都不许有。
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !state_a.ws.has_connection("device-ab"),
+        "配对不该自己建立长连接（A 侧）"
+    );
+    assert!(
+        !state_b.ws.has_connection("device-aa"),
+        "配对不该自己建立长连接（B 侧）"
+    );
+
+    // 用户点「连接」（A 侧，镜像 connect_peer）→ 链路这才起来。
+    orbdrop_lib::ws::ensure_link_now(&state_a, "device-ab");
+    wait_until("点连接必须建立长连接", || {
         state_a.ws.has_connection("device-ab") && state_b.ws.has_connection("device-aa")
     }).await;
 
-    // ---- 下面三条是用户实际报的故障（F-16 的两个按钮）----
+    // ---- 下面是「断开 / 连接」两个按钮的既有语义 ----
 
     // 1) 被拨号的那一台（B，A 拨的号）点"断开"：双方都必须掉线。
     //    修复前只有本机认为断了，对端一直显示"长连接"。
@@ -365,7 +486,7 @@ async fn pairing_arms_long_connection_without_a_click() {
     }).await;
     assert!(state_b.ws.is_paused("device-aa"));
 
-    // 2) 断开方自己点"连接"：它并不是"id 较小的一方"，但显式请求必须能连回来。
+    // 2) 断开方自己点"连接"：显式点击必须能连回来（哪个方向点都算数）。
     state_b.ws.resume("device-aa");
     orbdrop_lib::ws::ensure_link_now(&state_b, "device-aa");
     wait_until("断开方点连接必须能重新建立长连接", || {

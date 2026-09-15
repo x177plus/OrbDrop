@@ -40,6 +40,15 @@ pub fn set_rect(window: &WebviewWindow, rect: Rect) -> Result<(), String> {
     imp::set_rect(window, rect)
 }
 
+/// 鼠标主键此刻是否按下。
+///
+/// 拖动悬浮球走的是 OS 的模态移动循环：窗口一直在动，但页面收不到 mouseup（被拖拽
+/// 循环吃掉）。吸附判定若只看 move 事件的间隔，用户拖到一半停一下就会被判定成「松手」，
+/// 球在手里被抢到贴边位置。所以落位判定前先问 OS 键状态，按住就不动。
+pub fn mouse_down() -> bool {
+    imp::mouse_down()
+}
+
 /// 抹掉 Windows 给顶层窗口自动绘制的 1px 边框与圆角。
 ///
 /// 我们的窗口是透明无边框的，那层 OS 边框会沿着 OS 自己的圆角露在面板之外
@@ -58,10 +67,16 @@ mod imp {
         GetMonitorInfoW, MonitorFromWindow, MONITOR_DEFAULTTONEAREST, MONITORINFO,
     };
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
     use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
 
     fn to_rect(r: RECT) -> Rect {
         Rect { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top }
+    }
+
+    pub fn mouse_down() -> bool {
+        // 高位 = 当前是否按下（低位是「自上次调用以来按过」，这里不关心）
+        unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000 != 0 }
     }
 
     pub fn metrics(window: &WebviewWindow) -> Result<ScreenMetrics, String> {
@@ -133,6 +148,11 @@ mod imp {
 
     pub fn strip_os_frame(_window: &WebviewWindow) -> Result<(), String> {
         Ok(())
+    }
+
+    /// 非 Windows 拿不到全局键状态：一律当作「没按住」，落位判定退回按 move 事件间隔触发。
+    pub fn mouse_down() -> bool {
+        false
     }
 
     pub fn metrics(window: &WebviewWindow) -> Result<ScreenMetrics, String> {

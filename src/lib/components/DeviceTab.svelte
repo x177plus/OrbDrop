@@ -44,7 +44,7 @@
     return 'dot warn';
   }
 
-  /** 手动断开/重新连接：正常流程两端配对后自动建链，这两个按钮只用于用户主动干预。 */
+  /** 手动断开/连接：长连接只由用户点击发起（配对不再自动建链）。 */
   async function setLink(d: PeerDevice, connect: boolean) {
     try {
       if (connect) {
@@ -52,7 +52,7 @@
         onToast(`正在与「${d.name}」建立长连接`);
       } else {
         await disconnectPeer(d.id);
-        onToast(`已断开与「${d.name}」的长连接（本机暂停自动重连）`);
+        onToast(`已断开与「${d.name}」的长连接（对端的重连会被拒，直到任一方点「连接」）`);
       }
     } catch (e) {
       onToast(`${connect ? '建立长连接' : '断开'}失败：${e}`);
@@ -145,8 +145,7 @@
             <button class="btn btn-ghost btn-sm" data-disconnect>断开</button>
             <button class="btn btn-ghost btn-sm" data-push>推送</button>
           {:else if d.paired}
-            <!-- 配对后自动建链（无需点击）；这一栏只在没连上时才出现 ——
-                 比如本机刚点过「断开」、或对端把本机拒了，此时点它即可重新发起 -->
+            <!-- 已配对：配对只确立关系，长连接要用户自己点「连接」建立 -->
             <button class="btn btn-primary btn-sm" data-connect>连接</button>
             <button class="btn btn-ghost btn-sm" data-push>推送</button>
           {:else}
@@ -161,6 +160,6 @@
 
 <p style="margin:14px 2px 0; font-size:var(--fs-xs); color:var(--muted); line-height:1.6;">
   <span class="hl">未绑定</span>设备可点击「推送」直接发送（接收方需同意）；
-  <span class="hl">已配对</span>设备会<span class="hl">自动建立长连接</span>（无需手动点击）；
+  <span class="hl">已配对</span>设备点「连接」建立长连接（配对本身不建链）；
   处于<span class="hl">长连接</span>的设备会自动收到你拖入悬浮球文件的广播，无需逐条操作。
 </p>

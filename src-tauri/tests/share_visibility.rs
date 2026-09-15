@@ -83,7 +83,7 @@ async fn peer_sees_only_broadcast_shares_while_connected() {
     assert_eq!(shares_seen_by(&state, Caller::Local).await.len(), 1);
 
     // 断开长连接 → 可见性立刻消失，不需要谁去回填目标列表（F-25）
-    state.ws.unregister("peer-a");
+    state.ws.drop_peer("peer-a");
     assert!(shares_seen_by(&state, peer_a()).await.is_empty());
 
     let _ = std::fs::remove_dir_all(root);
@@ -210,7 +210,7 @@ async fn peer_identity_from_token_scopes_the_share_list() {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     // 对方断开长连接：可见性立刻消失
-    state.ws.unregister(PEER_ID);
+    state.ws.drop_peer(PEER_ID);
     let resp = client
         .get(format!("http://{ip}:{port}/shares"))
         .bearer_auth(TOKEN)

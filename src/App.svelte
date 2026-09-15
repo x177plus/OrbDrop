@@ -6,9 +6,9 @@
   import { getDevices, loadDevices } from '$lib/stores/devices.svelte';
   import { getServerPort, setServerPort, loadShares, addShare, removeShare, getShares } from '$lib/stores/shares.svelte';
   import { loadSettings } from '$lib/stores/settings.svelte';
-  import { getActualPort, startHttpServer, acceptPush, rejectPush, orbScreenMetrics, orbSetRect, addPeer, pairStart, pairConfirm, connectPeer, disconnectPeer, downloadFromPeer } from '$lib/api';
+  import { getActualPort, startHttpServer, acceptPush, rejectPush, orbScreenMetrics, orbSetRect, orbMouseDown, addPeer, pairStart, pairConfirm, connectPeer, disconnectPeer, removePeer, downloadFromPeer } from '$lib/api';
   import type { PushInvite, PeerDevice, TabKey } from '$lib/types';
-  import { planExpansion, type ScreenRect } from '$lib/orbLayout';
+  import { planExpansion, planCollapse, planDock, type DockPlan, type ScreenRect } from '$lib/orbLayout';
   import Orb from '$lib/components/Orb.svelte';
   import TabBar from '$lib/components/TabBar.svelte';
   import TabContent from '$lib/components/TabContent.svelte';
@@ -24,6 +24,10 @@
   const ORB_INSET = (COLLAPSED.width - ORB_SIZE) / 2;              // 折叠态悬浮球在窗口内的内缩
   const WORK_MARGIN = 8;                                           // 展开窗口与工作区边缘的最小间距（CSS px）
   const FOLD_MS = 180;                                             // 面板退场 0.16s 走完（已完全不可见）即可缩窗口
+  const DOCK_THRESHOLD = 20;                                       // 悬浮球边缘距工作区边缘 ≤ 此值即贴边收起（CSS px）
+  const DOCK_EXPOSE = 1 / 3;                                       // 贴边收起后仍露在屏幕内的比例（其余推到屏幕外）
+  const DOCK_SETTLE_MS = 160;                                      // 拖动停手多久后判定吸附（OS 拖动期间 move 事件成串到达）
+  const DRAG_POLL_MS = 60;                                         // 还按着鼠标时轮询「松手了没有」的间隔
 
   /**
    * 等 WebView2 的 CSS 视口跟上 OS 窗口尺寸。
@@ -44,11 +48,17 @@
   let dragging = $state(false);
   // 悬浮球在窗口内的绝对偏移（CSS px）：切换窗口时由 JS 更新，配合 holdOrb 隐藏保证不错位
   let orbOffset = $state({ x: ORB_INSET, y: ORB_INSET });
+  // 悬停热区（窗口内偏移 + 尺寸，CSS px）：贴边时覆盖「露出的半颗」到「完整球」的并集，
+  // 由 CSS :hover 触发球滑出/滑回；未贴边时就是球本身
+  let orbZone = $state<ScreenRect>({ x: ORB_INSET, y: ORB_INSET, w: ORB_SIZE, h: ORB_SIZE });
   // true = 悬浮球强制隐藏（切窗口期间）；用 transition:none 立即生效，不能让它带过渡露脸
   let holdOrb = $state(false);
   let ballRect = $state<ScreenRect | null>(null);
+  // 展开态窗口矩形（物理像素）：收起时与「当前窗口位置」作差，得到窗口被拖动的位移
+  let expandedRect = $state<ScreenRect | null>(null);
   let foldTimer: ReturnType<typeof setTimeout> | null = null;
   let opening = false;
+  let settling = false;   // 落位判定进行中（含「等松手」轮询）：防止 move 事件重复起一轮
 
   // Push card state (sending progress)
   let pushCardState = $state<{ title: string; target: string; total: string; progress: number; done: boolean; received: number } | null>(null);
@@ -121,13 +131,17 @@
 
       if (foldTimer) { clearTimeout(foldTimer); foldTimer = null; }
       ballRect = ball;
-      orbOffset = { x: plan.orbOffset.x / sf, y: plan.orbOffset.y / sf };
+      expandedRect = plan.window;
+      const off = { x: plan.orbOffset.x / sf, y: plan.orbOffset.y / sf };
+      orbOffset = off;
+      orbZone = { ...off, w: ORB_SIZE, h: ORB_SIZE };
       await orbSetRect(plan.window);
       await waitForViewport(EXPANDED.width, EXPANDED.height);
       expanded = true;
       holdOrb = false; // 悬浮球继续由 .open 隐藏，直到收起
     } catch (e) {
       console.error('展开悬浮球失败:', e);
+      resetOrbDom();   // 窗口没长开，球别按展开偏移留在一个看不见的位置
       holdOrb = false;
       toast('展开失败，请重试');
     } finally {
@@ -135,9 +149,84 @@
     }
   }
 
+  /** 未贴边的折叠态：球居中内缩、热区就是球自己 */
+  function resetOrbDom() {
+    orbOffset = { x: ORB_INSET, y: ORB_INSET };
+    orbZone = { x: ORB_INSET, y: ORB_INSET, w: ORB_SIZE, h: ORB_SIZE };
+  }
+
   /**
-   * 收起：面板先折叠淡出（此时窗口未变、球也没露脸），随后把偏移与窗口一起切回
-   * 悬浮球原位，切完才让悬浮球淡入 —— 悬浮球只在几何完全settle之后才可见。
+   * 落位到吸附结果：先把窗口（连同球的裁剪边界）挪到位，再更新球偏移与热区 ——
+   * 顺序不能反，否则球会在旧窗口里先滑一次、再随窗口跳一下。
+   */
+  async function applyDock(plan: DockPlan, sf: number) {
+    await orbSetRect(plan.window);
+    setDockDom(plan, sf);
+  }
+
+  /** 球偏移与悬停热区（窗口内 CSS px） */
+  function setDockDom(plan: DockPlan, sf: number) {
+    orbZone = { x: plan.zone.x / sf, y: plan.zone.y / sf, w: plan.zone.w / sf, h: plan.zone.h / sf };
+    orbOffset = { x: plan.orb.x / sf, y: plan.orb.y / sf };
+  }
+
+  /** 吸附判定：自由落位的折叠态窗口 → 贴边收起大半颗（未贴边的轴保持原样） */
+  function dockPlan(ball: ScreenRect, sf: number, work: ScreenRect): DockPlan {
+    return planDock({
+      ball,
+      work,
+      orbSize: Math.round(ORB_SIZE * sf),
+      orbInset: Math.round(ORB_INSET * sf),
+      overhang: Math.round(ORB_SIZE * (1 - DOCK_EXPOSE) * sf),
+      threshold: Math.round(DOCK_THRESHOLD * sf),
+    });
+  }
+
+  /**
+   * 拖动结束后的吸附判定：折叠态窗口就是悬浮球本身，直接拿它当前矩形当自由落位再判一次。
+   *
+   * 判定前先等鼠标真正松开 —— OS 拖动期间窗口一直在动、页面却收不到 mouseup，只看 move
+   * 事件的间隔会把「拖到一半停一下」当成松手：球会在手里被抢到贴边位置。松手那一刻的
+   * 窗口位置才是落点，球从那儿滑出去。
+   *
+   * 贴边结果与当前位置一致时不发 SetWindowPos —— 否则这次移动又会触发 move 事件，
+   * 判定再跑一遍，空转成环。
+   */
+  async function settleDrag() {
+    if (settling || expanded || holdOrb || opening) return;
+    settling = true;
+    try {
+      while (await orbMouseDown()) {
+        await new Promise((r) => setTimeout(r, DRAG_POLL_MS));
+        if (expanded || holdOrb) return;
+      }
+      const pos = await appWindow.outerPosition();
+      const size = await appWindow.outerSize();
+      const metrics = await orbScreenMetrics();
+      const plan = dockPlan({ x: pos.x, y: pos.y, w: size.width, h: size.height }, metrics.scaleFactor, metrics.workArea);
+      if (plan.window.x !== pos.x || plan.window.y !== pos.y) await orbSetRect(plan.window);
+      setDockDom(plan, metrics.scaleFactor);
+    } finally {
+      settling = false;
+    }
+  }
+
+  /**
+   * 收起落位：先把悬浮球原矩形按窗口位移平移（球贴回面板里它原来所在的那一角），
+   * 再判吸附 —— 面板被拖到屏幕边上时，收起就是贴边收起半颗。
+   */
+  async function settleCollapse(ball: ScreenRect, expanded: ScreenRect | null) {
+    const metrics = await orbScreenMetrics();
+    const sf = metrics.scaleFactor;
+    const free = expanded
+      ? planCollapse({ ball, expanded, current: await appWindow.outerPosition() })
+      : ball;   // 没记下展开矩形（异常路径）：按原样缩回
+    await applyDock(dockPlan(free, sf, metrics.workArea), sf);
+  }
+
+  /**
+   * 收起：面板先折叠淡出（此时窗口未变、球也没露脸），随后把窗口与球偏移一起切到
+   * 吸附后的落位，切完才让悬浮球淡入 —— 悬浮球只在几何完全 settle 之后才可见。
    */
   function collapse() {
     expanded = false;
@@ -147,17 +236,17 @@
     if (foldTimer) clearTimeout(foldTimer);
     foldTimer = setTimeout(() => {
       foldTimer = null;
-      const target = ballRect;
+      const ball = ballRect;
+      const expanded = expandedRect;
       ballRect = null;
+      expandedRect = null;
       void (async () => {
         try {
-          if (target) {
-            await orbSetRect(target);
-          }
+          if (ball) await settleCollapse(ball, expanded);
+          else resetOrbDom();   // 没记下展开矩形（异常路径）：回到未贴边的折叠态
         } catch (e) {
           console.error('收起悬浮球失败:', e);
         } finally {
-          orbOffset = { x: ORB_INSET, y: ORB_INSET };
           holdOrb = false;
         }
       })();
@@ -320,7 +409,7 @@
       await pairConfirm(ps.peerId, ps.input);
       await loadDevices();
       closePair();
-      toast(`已与「${ps.peerName ?? '设备'}」配对成功`);
+      toast(`已与「${ps.peerName ?? '设备'}」配对成功（点「连接」建立长连接）`);
     } catch (e) {
       if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
       toast('配对失败，请核对配对码');
@@ -410,17 +499,17 @@
     }
   }
 
-  function ctxUnpair() {
-    const c = ctxState;
-    if (c?.el) {
-      const el = c.el;
-      el.style.transition = 'opacity .25s ease, transform .25s ease';
-      el.style.opacity = '0';
-      el.style.transform = 'scale(.98)';
-      setTimeout(() => { el.remove(); }, 240);
-    }
-    toast('已解除配对并移除设备');
+  async function ctxUnpair() {
+    const deviceId = ctxState?.deviceId;
     hideCtx();
+    if (!deviceId) return;
+    try {
+      await removePeer(deviceId);
+      // 设备行不会消失：它还在网络上被看见，就继续以"未绑定"出现（离线才会不见）。
+      toast('已解除配对（设备在线时继续显示为未绑定）');
+    } catch (e) {
+      toast(`解除配对失败：${e}`);
+    }
   }
 
   function ctxPush() {
@@ -485,6 +574,14 @@
       }
     });
 
+    // 拖动结束 → 判定吸附。OS 拖动期间 move 事件成串到达（且可能在拖动循环结束后才处理），
+    // 所以停手 DOCK_SETTLE_MS 之后才算一次，避免每帧都发 SetWindowPos。
+    let moveTimer: ReturnType<typeof setTimeout> | null = null;
+    const unMoved = appWindow.onMoved(() => {
+      if (moveTimer) clearTimeout(moveTimer);
+      moveTimer = setTimeout(() => { moveTimer = null; void settleDrag(); }, DOCK_SETTLE_MS);
+    });
+
     const unPushInvite = listen<PushInvite>('push://invite', (ev) => {
       if (!expanded) setOpen(true);
       pushInvite = ev.payload;
@@ -506,7 +603,7 @@
       if (ps?.peerId === ev.payload.peerId) {
         const name = ps.peerName ?? ev.payload.peerName ?? '设备';
         closePair();
-        toast(`已与「${name}」配对成功`);
+        toast(`已与「${name}」配对成功（点「连接」建立长连接）`);
       }
     });
 
@@ -534,6 +631,8 @@
 
     return () => {
       unlisten.then(fn => fn());
+      unMoved.then(fn => fn());
+      if (moveTimer) clearTimeout(moveTimer);
       unPushInvite.then(fn => fn());
       unPaired.then(fn => fn());
       unOrbShow.then(fn => fn());
@@ -550,13 +649,16 @@
   class:live={connectedCount > 0}
   class:drag={dragging}
   class:hold={holdOrb}
-  style="--panel-slack: {PANEL_SLACK}px; --orb-x: {orbOffset.x}px; --orb-y: {orbOffset.y}px"
+  style="--panel-slack: {PANEL_SLACK}px; --orb-inset: {ORB_INSET}px; --orb-x: {orbOffset.x}px; --orb-y: {orbOffset.y}px; --zone-x: {orbZone.x}px; --zone-y: {orbZone.y}px; --zone-w: {orbZone.w}px; --zone-h: {orbZone.h}px"
 >
-  <Orb
-    badgeCount={connectedCount}
-    expanded={expanded}
-    onToggle={() => setOpen(!expanded)}
-  />
+  <!-- 悬停热区：贴边收起半颗后，指针落在热区（露出的半颗 ~ 完整球那一带）就把球滑出来 -->
+  <div class="orb-zone">
+    <Orb
+      badgeCount={connectedCount}
+      expanded={expanded}
+      onToggle={() => setOpen(!expanded)}
+    />
+  </div>
 
   <!-- Main Panel -->
   <section class="panel" aria-label="OrbDrop 主面板">

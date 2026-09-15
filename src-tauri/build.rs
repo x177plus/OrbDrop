@@ -10,12 +10,19 @@ fn main() {
     // 清单所以没事，测试目标没有任何清单 —— 不补这一条，`cargo test` 在本机
     // 一条都跑不起来。
     //
-    // 只对测试目标生效（rustc-link-arg-tests），app/bin 的链接保持 tauri-build 原样。
+    // 只对测试目标补清单依赖：rfd（tauri-plugin-dialog 的依赖）静态导入
+    // comctl32!TaskDialogIndirect，而 comctl32 是 KnownDLL，没有「Common-Controls v6」
+    // 清单依赖时加载器只绑 System32 的 5.82（没有该导出）→ 二进制加载期就
+    // 0xC0000139 退出。app 二进制由 tauri-build 注入清单，测试目标没有。
+    //
+    // 注意：别用不带后缀的 rustc-link-arg —— 它连 app/bin 一起改，
+    // /MANIFEST:EMBED 会与 tauri-build 的 .res 清单冲突（LNK1123）。
     #[cfg(windows)]
-    for arg in [
-        "/MANIFEST:EMBED",
-        "/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'",
-    ] {
-        println!("cargo:rustc-link-arg-tests={arg}");
+    {
+        // comctl32 延迟加载：任何二进制在**加载期**都不再需要解析
+        // `comctl32!TaskDialogIndirect`，测试目标因此不必额外补清单。
+        // delayimp.lib 是延迟加载的辅助库（随 Windows SDK 提供）。
+        println!("cargo:rustc-link-arg=/DELAYLOAD:comctl32.dll");
+        println!("cargo:rustc-link-arg=delayimp.lib");
     }
 }

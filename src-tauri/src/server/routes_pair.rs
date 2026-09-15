@@ -54,6 +54,46 @@ pub struct PairResponse {
     pub peer_name: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnpairRequest {
+    /// 要解除配对的对象。远端对端由 token 反解身份、不读这个字段；
+    /// 本机（回环）调用没有 token 可解，只能显式给出（与回环本来就免鉴权一致）。
+    pub peer_id: Option<String>,
+}
+
+/// POST /unpair — 解除配对的另一半（F-14）。
+///
+/// 对端用「解除配对」时它手里还有**本机给它的** token（它随后才删），所以这里带的是
+/// 那个 token（Bearer），身份由 auth 中间件解析成 `Caller::Peer(id)`；同机回环调用
+/// 会走 `Caller::Local` 免鉴权分支，此时从 body 取 peerId。
+///
+/// 只清 token 与配对状态、**保留设备行**：本端仍在网络上看得见对方，就应该继续显示为
+/// "未绑定"（离线时才从列表消失）。
+pub async fn unpair(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(caller): axum::Extension<crate::server::auth::Caller>,
+    body: Option<Json<UnpairRequest>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let peer_id = match caller {
+        crate::server::auth::Caller::Peer(id) => id,
+        crate::server::auth::Caller::Local => body
+            .and_then(|Json(req)| req.peer_id)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "本机调用需要给出 peerId".to_string()))?,
+    };
+
+    if let Err(e) = credential::remove_peer(&peer_id) {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("凭据清理失败: {e}")));
+    }
+    state.ws.drop_peer(&peer_id);
+    state.unpair(&peer_id);
+
+    ws::emit_ui(&state, ui::DEVICES_CHANGED, &serde_json::json!({}));
+    info!(%peer_id, "peer unpaired us via HTTP");
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// POST /pair — verifying half of the pairing handshake (F-12).
 ///
 /// The peer that initiated pairing issued its 6-digit code locally (`pair_start`)
@@ -115,10 +155,7 @@ pub async fn pair_handshake(
         paired: true,
     });
 
-    // Long connection: the smaller device id initiates (see spawn_outbound_link)
-    // and it starts by itself — no user click (F-16).
-    ws::ensure_link(&state, &peer_id);
-
+    // 配对只到"已配对"为止：不在这里建长连接，等本机用户点「连接」再拨号。
     let own_id = state.config.lock().device_id.clone();
     let own_name = state.config.lock().device_name.clone();
     ws::emit_ui(&state, ui::PAIR_COMPLETED, &serde_json::json!({
