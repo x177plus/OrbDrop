@@ -76,17 +76,9 @@
     }));
   }
 
-  function moreBtnCtx(e: MouseEvent, share: ShareItem) {
-    const item = (e.target as HTMLElement).closest('.share-item') as HTMLElement | null;
-    document.dispatchEvent(new CustomEvent('od:ctx', {
-      detail: { x: e.clientX, y: e.clientY, el: item, kind: 'share', shareId: share.id, name: share.name }
-    }));
-  }
-
   const ICON_CHEVRON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>';
   const ICON_FOLDER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>';
   const ICON_FILE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg>';
-  const ICON_DOTS = '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>';
 </script>
 
 <button class="dropzone" onclick={() => onToast('请将文件或文件夹拖入悬浮球')}>
@@ -155,7 +147,6 @@
               />
               <span class="track"></span>
             </label>
-            <button class="icon-btn" onclick={(e) => moreBtnCtx(e, share)} aria-label="更多操作">{@html ICON_DOTS}</button>
           </div>
         </div>
 
