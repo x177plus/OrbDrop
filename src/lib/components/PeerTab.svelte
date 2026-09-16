@@ -97,10 +97,6 @@
     dispatchCtx(e, { shareId: share.id, path: '', isDir: share.isDir, name: share.name });
   }
 
-  function moreBtnCtx(e: MouseEvent, share: PeerShareItem) {
-    dispatchCtx(e, { shareId: share.id, path: '', isDir: share.isDir, name: share.name });
-  }
-
   function dispatchCtx(e: MouseEvent, item: { shareId: string; path: string; isDir: boolean; name: string }) {
     document.dispatchEvent(new CustomEvent('od:ctx', {
       detail: { x: e.clientX, y: e.clientY, kind: 'peer', peerId: device.id, ...item }
@@ -110,7 +106,6 @@
   const ICON_CHEVRON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>';
   const ICON_FOLDER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>';
   const ICON_FILE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg>';
-  const ICON_DOTS = '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>';
 </script>
 
 <div class="peer-head">
@@ -168,9 +163,6 @@
           <div class="s-main">
             <div class="s-name">{share.name}</div>
             <div class="s-meta"><span class="num">来自 {device.name}</span></div>
-          </div>
-          <div class="s-acts">
-            <button class="icon-btn" onclick={(e) => moreBtnCtx(e, share)} aria-label="更多操作">{@html ICON_DOTS}</button>
           </div>
         </div>
 

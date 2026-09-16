@@ -609,7 +609,6 @@ font-family: var(--font-body);
                 </div>
                 <div class="s-acts">
                   <label class="switch" title="向设备广播"><input type="checkbox" checked data-broadcast><span class="track"></span></label>
-                  <button class="icon-btn" data-ctx aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
                 </div>
               </div>
               <div class="tree">
@@ -632,7 +631,6 @@ font-family: var(--font-body);
                 </div>
                 <div class="s-acts">
                   <label class="switch" title="向设备广播"><input type="checkbox" data-broadcast><span class="track"></span></label>
-                  <button class="icon-btn" data-ctx aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
                 </div>
               </div>
               <div class="tree">
@@ -653,7 +651,6 @@ font-family: var(--font-body);
                 </div>
                 <div class="s-acts">
                   <label class="switch" title="向设备广播"><input type="checkbox" data-broadcast><span class="track"></span></label>
-                  <button class="icon-btn" data-ctx aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
                 </div>
               </div>
             </li>
@@ -668,7 +665,6 @@ font-family: var(--font-body);
                 </div>
                 <div class="s-acts">
                   <label class="switch" title="向设备广播"><input type="checkbox" data-broadcast><span class="track"></span></label>
-                  <button class="icon-btn" data-ctx aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
                 </div>
               </div>
             </li>
@@ -751,9 +747,6 @@ font-family: var(--font-body);
                   <div class="s-name">设计稿</div>
                   <div class="s-meta"><span class="num">来自 MacBook</span></div>
                 </div>
-                <div class="s-acts">
-                  <button class="icon-btn" aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
-                </div>
               </div>
               <div class="tree">
                 <div class="tree-inner">
@@ -778,9 +771,6 @@ font-family: var(--font-body);
                 <div class="s-main">
                   <div class="s-name">report.pdf</div>
                   <div class="s-meta"><span class="num">来自 MacBook</span></div>
-                </div>
-                <div class="s-acts">
-                  <button class="icon-btn" aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
                 </div>
               </div>
             </li>
@@ -982,10 +972,6 @@ font-family: var(--font-body);
     showCtx(e.clientX, e.clientY, target);
   }
 
-  document.addEventListener('click', function (e) {
-    var b = e.target.closest('[data-ctx]');
-    if (b) { e.stopPropagation(); openCtxFor(e, b); }
-  });
   $$('.share-row').forEach(function (row) {
     row.addEventListener('contextmenu', function (e) { e.preventDefault(); e.stopPropagation(); openCtxFor(e, row); });
   });
@@ -1052,8 +1038,7 @@ font-family: var(--font-body);
       '<button class="chev" style="visibility:hidden"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>' +
       '<span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span>' +
       '<div class="s-main"><div class="s-name"></div><div class="s-meta"><span class="num">刚刚 · 已加入共享项</span></div></div>' +
-      '<div class="s-acts"><label class="switch" title="向设备广播"><input type="checkbox" data-broadcast><span class="track"></span></label>' +
-      '<button class="icon-btn" data-ctx aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button></div></div>';
+      '<div class="s-acts"><label class="switch" title="向设备广播"><input type="checkbox" data-broadcast><span class="track"></span></label></div></div>';
     li.querySelector('.s-name').textContent = name;
     $('#shareList').prepend(li);
     li.querySelector('input[data-broadcast]').addEventListener('change', function (e) {
@@ -1061,9 +1046,7 @@ font-family: var(--font-body);
       var b = $('[data-bcast]', l);
       if (b) b.hidden = !e.target.checked;
     });
-    li.querySelector('[data-ctx]').addEventListener('click', function (ev) {
-      ev.stopPropagation(); openCtxFor(ev, li.querySelector('[data-ctx]'));
-    });
+
     var live = deviceRows.filter(function (r) { return r.parentNode && r.dataset.state === 'connected'; });
     if (live.length && withBroadcast !== false) {
       var bNames = live.map(devName).join('、');

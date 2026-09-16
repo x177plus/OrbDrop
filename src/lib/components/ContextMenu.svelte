@@ -49,8 +49,8 @@
    * 菜单在挂载期间独占「点击任意位置关闭」的职责：组件只在 ctxState 非空时存在，
    * 因此这里的监听生命周期就等于菜单的可见期。
    *
-   * 用 pointerdown（捕获阶段）而不是 click：列表行 / 更多操作按钮各自会
-   * stopPropagation 或消费 click，只有 pointerdown 能保证任何位置按下都先到这里。
+   * 用 pointerdown（捕获阶段）而不是 click：列表行会 stopPropagation 或消费 click，
+   * 只有 pointerdown 能保证任何位置按下都先到这里。
    */
   onMount(() => {
     function onPointerDown(e: PointerEvent) {
