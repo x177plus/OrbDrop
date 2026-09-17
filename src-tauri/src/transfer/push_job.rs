@@ -202,8 +202,11 @@ pub fn spawn_download(
     crate::task::spawn("push download", async move {
         let client = reqwest::Client::new();
         let config = state.config.lock().clone();
-        let inbox_root = config.inbox_dir.clone();
-        let sender_dir = inbox_root.join(&invite.sender.name).join(&invite.name);
+        // 落盘根 = 用户设的下载目录（S-01）：推送接收不再单独有「收件目录」。
+        // 下面按 <发送方名>/<推送名>/… 建子目录，所以推送进来的东西不会和手动下载的文件混在
+        // 同一层，也不会互相覆盖；`safe_join` 的根就是这里。
+        let save_root = config.download_dir.clone();
+        let sender_dir = save_root.join(&invite.sender.name).join(&invite.name);
         let _ = tokio::fs::create_dir_all(&sender_dir).await;
 
         let mut total_received: u64 = 0;

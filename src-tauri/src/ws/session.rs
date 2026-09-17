@@ -24,6 +24,9 @@ use crate::ws::{emit_ui, send_to_peer};
 pub async fn run_inbound_session(state: Arc<AppState>, peer_id: String, ws: WebSocket) {
     info!(%peer_id, "inbound WS session starting");
     state.set_peer_online(&peer_id, true);
+    // 被拨号的一端同样是"处于长连接"（F-16）：重启后这一侧也要能自动接回来。
+    state.set_auto_connect(&peer_id, true);
+    state.ws.set_link_state(&peer_id, crate::ws::LinkState::Connected);
 
     let (mut sink, mut stream) = ws.split();
     let (tx_events, mut rx_events) = mpsc::unbounded_channel::<WsEvent>();
@@ -72,6 +75,11 @@ pub async fn run_inbound_session(state: Arc<AppState>, peer_id: String, ws: WebS
     }
 
     state.ws.unregister(&peer_id, gen);
+    // 本机「断开」的暂停标记要留着（那说明"为什么现在没连着"），其余情况把这个状态交回给
+    // 拨号循环（它 1s 内会写成重连中/待命）。
+    if !state.ws.is_paused(&peer_id) {
+        state.ws.clear_link_state(&peer_id);
+    }
     // 在线状态不在这里翻：本机"断开"不代表对端不可达（推送仍走 HTTP），
     // 可达性交给 mDNS 与探活，避免设备行在断开瞬间消失再冒出来。
     state.emit_devices_changed();
@@ -109,6 +117,7 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 port: 0,
                 online: true,
                 paired: true,
+                auto_connect: false,
             });
             emit_ui(state, ui::DEVICES_CHANGED, &serde_json::json!({}));
         }

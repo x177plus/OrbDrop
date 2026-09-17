@@ -15,15 +15,18 @@ use crate::state::AppState;
 use crate::ws;
 
 mod auth;
+mod routes_dav;
 mod routes_file;
 mod routes_pair;
 mod routes_push;
 mod routes_shares;
+mod routes_stat;
 mod routes_tree;
 
 pub use auth::Caller;
 pub use routes_file::file_handler;
 pub use routes_shares::shares_handler;
+pub use routes_stat::stat_handler;
 pub use routes_tree::tree_handler;
 
 /// Build the axum Router with all routes, including the WS /events
@@ -46,6 +49,7 @@ fn build_router(state: Arc<AppState>) -> Router {
     // Authenticated routes (auth middleware).
     let auth_routes = Router::new()
         .route("/tree", axum::routing::get(routes_tree::tree_handler))
+        .route("/stat", axum::routing::get(routes_stat::stat_handler))
         .route("/unpair", axum::routing::post(routes_pair::unpair))
         .route("/file", axum::routing::get(routes_file::file_handler))
         .route("/shares", axum::routing::get(routes_shares::shares_handler))
@@ -58,11 +62,37 @@ fn build_router(state: Arc<AppState>) -> Router {
             auth::auth_middleware,
         ));
 
-    Router::new()
+    let http_routes = Router::new()
         .merge(public_routes)
         .merge(auth_routes)
-        .layer(cors)
-        .with_state(state)
+        .layer(cors);
+
+    // WebDAV 面（F-41 ~ F-43）：Beyond Compare 直连共享项。
+    // **不能挂 CORS 层**：tower-http 的 CORS 会把 OPTIONS 直接抢答（返回它自己的 preflight
+    // 响应），而 BC 正是用 `OPTIONS` 协商 DAV 能力（要看到 `DAV: 1,2`）——被抢答就等于
+    // "这不是 WebDAV"，远端目录在 BC 里直接加载不了（实测过）。
+    // 路径命名空间用 shareId：共享项名字带空格/中文且会和上面的 REST 路由抢前缀。
+    let dav_routes = Router::new()
+        .route(
+            "/dav/{share_id}",
+            axum::routing::any(routes_dav::dav_share_root),
+        )
+        // BC 对目录用带尾斜杠的地址（实测 `PROPFIND /dav/sub/`），根目录同理：
+        // `/dav/<shareId>` 与 `/dav/<shareId>/` 都得能路由，否则目录级请求直接 404。
+        .route(
+            "/dav/{share_id}/",
+            axum::routing::any(routes_dav::dav_share_root),
+        )
+        .route(
+            "/dav/{share_id}/{*path}",
+            axum::routing::any(routes_dav::dav_share_sub),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::auth_middleware,
+        ));
+
+    http_routes.merge(dav_routes).with_state(state)
 }
 
 /// WS upgrade handler — validates the token in the query string before

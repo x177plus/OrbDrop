@@ -10,10 +10,19 @@ use chrono::{DateTime, Utc};
 // Data models
 // ---------------------------------------------------------------------------
 
+/// 下载模式（S-02）。
+///
+/// 字面量跟**前端同一套**：`types.ts` 的 `'Direct' | 'AskEachTime'` 联合类型、
+/// `update_settings` 请求里的同名字段都是 PascalCase。这里再用 `camelCase` 序列化就会
+/// 变成 `"direct"`，前端单选框一个都对不上（面板显示成"两个都没选"），保存时又把
+/// `"direct"` 发回来 —— 后端只认 `"Direct"`/`"AskEachTime"`，于是**整个设置面板存不下去**。
+/// alias 保留旧配置里的 `"direct"` / `"askEachTime"`，已落盘的 config.toml 不会解析失败
+/// （解析失败 = 改名成 `.toml.bad` 再写默认值，用户的共享项和配对表就没了）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum DownloadMode {
+    #[serde(rename = "Direct", alias = "direct")]
     Direct,
+    #[serde(rename = "AskEachTime", alias = "askEachTime")]
     AskEachTime,
 }
 
@@ -44,6 +53,41 @@ pub struct PeerDevice {
     pub port: u16,
     pub online: bool,
     pub paired: bool,
+    /// 关机时这台设备处于长连接（F-16）：重启后自动把链路拨回来。
+    ///
+    /// 在**链路建立那一刻**写、用户点「断开」时清零，所以进程被强杀也不丢。
+    /// 这是**地址簿**（`Config::peers`）里的状态：`state.peers` 是发现结果的合并视图，
+    /// `upsert_peer` / `mark_paired` 都不合并这个字段 —— 别让 mDNS 的一次广播把用户
+    /// 的长连接意图抹掉。
+    #[serde(default)]
+    pub auto_connect: bool,
+}
+
+/// BeyondCompare 的"比较位"目标（F-41）：本机共享项，或长连接设备上的共享项。
+///
+/// 只存定位需要的东西；`label` 是前端给的可读名字——对端共享项的名字本机不知道
+/// （只有 id），所以菜单/toast 里要显示的名字只能由界面带下来，缺失时后端再凑一个。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum BcTarget {
+    Share {
+        #[serde(rename = "shareId")]
+        share_id: String,
+        #[serde(default, rename = "path")]
+        path: String,
+        #[serde(default, rename = "label", skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    Peer {
+        #[serde(rename = "peerId")]
+        peer_id: String,
+        #[serde(rename = "shareId")]
+        share_id: String,
+        #[serde(default, rename = "path")]
+        path: String,
+        #[serde(default, rename = "label", skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,9 +96,10 @@ pub struct AppSettings {
     pub port: u16,
     pub download_dir: PathBuf,
     pub download_mode: DownloadMode,
-    pub inbox_dir: PathBuf,
     pub device_name: String,
     pub auto_start: bool,
+    /// BeyondCompare 可执行文件路径；空 = 自动探测（注册表 / 常见安装路径）。
+    pub bc_exe_path: String,
 }
 
 impl Default for AppSettings {
@@ -63,9 +108,9 @@ impl Default for AppSettings {
             port: 3890,
             download_dir: default_download_dir(),
             download_mode: DownloadMode::Direct,
-            inbox_dir: default_inbox_dir(),
             device_name: default_device_name(),
             auto_start: true,
+            bc_exe_path: String::new(),
         }
     }
 }
@@ -74,23 +119,45 @@ impl Default for AppSettings {
 // Persistent config (TOML)
 // ---------------------------------------------------------------------------
 
+/// 悬浮球上一次的落位：折叠态窗口左上角（物理像素，虚拟屏坐标）。
+///
+/// 只记窗口左上角，**不记贴边方向与球偏移**：吸附是幂等的 —— 把已贴边的矩形再判一次
+/// 得到同样的窗口与球偏移，所以复原时（`orbLayout.planDock`）能把贴边形态一起算回来；
+/// 尺寸也不记，跟着当前 DPI 走。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrbPos {
+    pub x: i32,
+    pub y: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
+    /// **唯一**的落盘位置：手动「下载到本地」（S-01，受 `download_mode` 影响）和对端
+    /// 「推送」接收（F-52）都写这里；推送额外按 `<发送方名>/<推送名>/…` 建子目录。
+    /// 不再单设「收件目录」——两个预设位置对用户是同一种操作，分成两份只会让人猜哪个生效。
     #[serde(default = "default_download_dir")]
     pub download_dir: PathBuf,
+    /// 下载模式（S-02）：只作用于手动下载；推送一直是弹窗同意后就落盘。
     #[serde(default)]
     pub download_mode: DownloadMode,
-    #[serde(default = "default_inbox_dir")]
-    pub inbox_dir: PathBuf,
     #[serde(default = "default_device_name")]
     pub device_name: String,
     #[serde(default = "default_auto_start")]
     pub auto_start: bool,
     #[serde(default)]
     pub shares: Vec<ShareItem>,
+    /// BeyondCompare 可执行文件（留空 = 自动探测）。便携版 BC 不在注册表里，只能靠这项。
+    #[serde(default)]
+    pub bc_exe_path: Option<PathBuf>,
+    /// 「添加到左侧/右侧比较位」的两个槽位（跨重启保留，BC 自己的右键扩展也是这么做的）。
+    #[serde(default)]
+    pub bc_left: Option<BcTarget>,
+    #[serde(default)]
+    pub bc_right: Option<BcTarget>,
     /// Stable device identity advertised via mDNS / used as peer id.
     ///
     /// Every other field is optional on load: a config written by an older
@@ -101,6 +168,9 @@ pub struct Config {
     /// Known devices: manual adds + paired peers (address book, persisted).
     #[serde(default)]
     pub peers: Vec<PeerDevice>,
+    /// 悬浮球落位（F-74「窗口位置」）：`None` = 还没记过（首启 / 旧配置），启动时按居中显示。
+    #[serde(default)]
+    pub orb_pos: Option<OrbPos>,
 }
 
 fn default_port() -> u16 {
@@ -121,9 +191,13 @@ impl Config {
             port: self.port,
             download_dir: self.download_dir.clone(),
             download_mode: self.download_mode,
-            inbox_dir: self.inbox_dir.clone(),
             device_name: self.device_name.clone(),
             auto_start: self.auto_start,
+            bc_exe_path: self
+                .bc_exe_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
         }
     }
 }
@@ -134,12 +208,15 @@ impl Default for Config {
             port: 3890,
             download_dir: default_download_dir(),
             download_mode: DownloadMode::Direct,
-            inbox_dir: default_inbox_dir(),
             device_name: default_device_name(),
             auto_start: true,
             shares: Vec::new(),
+            bc_exe_path: None,
+            bc_left: None,
+            bc_right: None,
             device_id: new_device_id(),
             peers: Vec::new(),
+            orb_pos: None,
         }
     }
 }
@@ -148,37 +225,45 @@ impl Default for Config {
 // Path helpers
 // ---------------------------------------------------------------------------
 
-/// Config root: `%APPDATA%/OrbDrop` or `~/Library/Application Support/OrbDrop`
-pub fn config_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let base = std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs::config_dir().unwrap_or_else(|| PathBuf::from("C:/Users/Default/AppData/Roaming"))
-            });
-        base.join("OrbDrop")
+/// OrbDrop 数据根目录：Windows `%LOCALAPPDATA%\OrbDrop`，macOS `~/Library/Application Support/OrbDrop`。
+///
+/// 一律落在**本机专属**目录（`dirs::data_local_dir`）：设置、日志、传输断点都不参与域
+/// 漫游用户配置文件的登录/注销同步，也不进文件夹重定向。落在 Roaming 会让"几百 MB 日志
+/// 拖慢登录"和"设置被多台机器互相覆盖"同时发生；而且设备 id 本来就该是每台机器独立的。
+///
+/// 拿不到 known folder 时退到 `%LOCALAPPDATA%`、再退到临时目录：能跑，只是不持久
+/// （同 `log.rs::crash_log_path` 的兜底策略）。
+pub fn data_dir() -> PathBuf {
+    // 整包搬走数据目录（便携部署 / 测试里指向临时目录，别碰真实数据）。
+    if let Some(dir) = std::env::var_os("ORBDROP_DATA_DIR") {
+        return PathBuf::from(dir);
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("~/Library/Application Support"))
-            .join("OrbDrop")
-    }
+    dirs::data_local_dir()
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("OrbDrop")
+}
+
+/// 原子写：先写同目录的临时文件，再 `rename` 覆盖目标。
+///
+/// 写到一半被打断（崩溃、断电、被杀）**不会**留下半截目标文件 —— 凭据文件和 BC 的
+/// profile 文件都靠它：半截凭据文件 = 读不出来 = 用户眼里"配对全没了"。
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "orbdrop".to_string());
+    let tmp = path.with_file_name(format!("{name}.orbdrop-tmp"));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 pub fn config_file_path() -> PathBuf {
-    config_dir().join("config.toml")
+    data_dir().join("config.toml")
 }
 
 fn default_download_dir() -> PathBuf {
     dirs::desktop_dir().unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\Desktop"))
-}
-
-fn default_inbox_dir() -> PathBuf {
-    dirs::download_dir()
-        .unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\Downloads"))
-        .join("OrbDrop")
 }
 
 fn default_device_name() -> String {
@@ -307,11 +392,18 @@ mod tests {
             port: 3895,
             download_dir: PathBuf::from("C:/test/downloads"),
             download_mode: DownloadMode::AskEachTime,
-            inbox_dir: PathBuf::from("C:/test/inbox"),
             device_name: "TestPC".into(),
             auto_start: false,
             device_id: "device-test-1".into(),
             peers: vec![],
+            bc_exe_path: Some(PathBuf::from("D:/Tools/BCompare/BCompare.exe")),
+            bc_left: Some(BcTarget::Share {
+                share_id: "share-1".into(),
+                path: "src".into(),
+                label: None,
+            }),
+            bc_right: None,
+            orb_pos: Some(OrbPos { x: -1280, y: 40 }),
             shares: vec![ShareItem {
                 id: "share-1".into(),
                 name: "Projects".into(),
@@ -331,7 +423,6 @@ mod tests {
         assert_eq!(loaded.port, 3895);
         assert_eq!(loaded.download_dir, PathBuf::from("C:/test/downloads"));
         assert_eq!(loaded.download_mode, DownloadMode::AskEachTime);
-        assert_eq!(loaded.inbox_dir, PathBuf::from("C:/test/inbox"));
         assert_eq!(loaded.device_name, "TestPC");
         assert_eq!(loaded.auto_start, false);
         assert_eq!(loaded.shares.len(), 1);
@@ -339,8 +430,78 @@ mod tests {
         assert_eq!(loaded.shares[0].name, "Projects");
         assert_eq!(loaded.shares[0].path, PathBuf::from("C:/Projects"));
         assert_eq!(loaded.shares[0].broadcast_enabled, true);
+        assert_eq!(
+            loaded.bc_exe_path,
+            Some(PathBuf::from("D:/Tools/BCompare/BCompare.exe")),
+            "BC 路径要跨重启保留（便携版 BC 只能靠它）"
+        );
+        assert_eq!(
+            loaded.bc_left,
+            Some(BcTarget::Share {
+                share_id: "share-1".into(),
+                path: "src".into(),
+                label: None
+            }),
+            "比较位要跨重启保留"
+        );
+        assert_eq!(loaded.bc_right, None);
+        assert_eq!(
+            loaded.orb_pos,
+            Some(OrbPos { x: -1280, y: 40 }),
+            "悬浮球位置要跨重启保留（F-74）：负坐标是左边那块显示器"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 前后端字面量契约：`AppSettings.downloadMode` 与 `UpdateSettingsRequest.downloadMode`
+    /// 都是 `Direct` / `AskEachTime`（前端 types.ts 的联合类型）。
+    ///
+    /// 这条曾经挂过：enum 上挂 `rename_all = "camelCase"` → 序列化成 `"direct"`，
+    /// 前端的单选框一个都对不上（面板显示"没选"），保存时又把 `"direct"` 发回来被后端拒掉。
+    /// 所以这里钉死线上字面量，同时确认旧配置（`"direct"` / `"askEachTime"`）照样读得回来。
+    #[test]
+    fn download_mode_wire_spelling_matches_frontend() {
+        assert_eq!(
+            serde_json::to_string(&DownloadMode::Direct).unwrap(),
+            "\"Direct\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DownloadMode::AskEachTime).unwrap(),
+            "\"AskEachTime\""
+        );
+
+        let legacy: Config = toml::from_str("downloadMode = \"direct\"\n").unwrap();
+        assert_eq!(legacy.download_mode, DownloadMode::Direct);
+        let legacy: Config = toml::from_str("downloadMode = \"askEachTime\"\n").unwrap();
+        assert_eq!(legacy.download_mode, DownloadMode::AskEachTime);
+
+        let current: Config = toml::from_str("downloadMode = \"AskEachTime\"\n").unwrap();
+        assert_eq!(current.download_mode, DownloadMode::AskEachTime);
+    }
+
+    /// 旧配置里的 `inboxDir`（收件目录已并入 `downloadDir`）不能把配置文件判成损坏：
+    /// 未知字段照旧忽略，共享项和配对表保住（解析失败会把文件改名成 `.toml.bad` 再写默认值）。
+    #[test]
+    fn config_with_legacy_inbox_dir_keeps_loading() {
+        let config: Config = toml::from_str(
+            "downloadDir = 'C:/dl'\ninboxDir = 'C:/old-inbox'\ndeviceId = \"device-1\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.download_dir, PathBuf::from("C:/dl"));
+        assert_eq!(config.device_id, "device-1");
+    }
+
+    /// 旧配置文件里没有 `orbPos`：照样解析成 `None`，不能判成损坏。
+    ///
+    /// （`load_config` 遇到损坏文件会把它改名成 `.toml.bad` 再写回默认值 —— 加一个字段
+    /// 就让用户的共享项/配对表消失，代价太大。）
+    #[test]
+    fn config_without_orb_pos_keeps_loading() {
+        let config: Config = toml::from_str("port = 3895\ndeviceId = \"device-1\"\n").unwrap();
+        assert_eq!(config.orb_pos, None);
+        assert_eq!(config.port, 3895);
+        assert_eq!(config.device_id, "device-1");
     }
 
     /// S-01: same-name downloads get "xxx (1).ext" style renames.

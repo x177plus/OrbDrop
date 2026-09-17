@@ -6,8 +6,9 @@
   import { getDevices, loadDevices } from '$lib/stores/devices.svelte';
   import { getServerPort, setServerPort, loadShares, addShare, removeShare, getShares } from '$lib/stores/shares.svelte';
   import { loadSettings } from '$lib/stores/settings.svelte';
-  import { getActualPort, startHttpServer, acceptPush, rejectPush, orbScreenMetrics, orbSetRect, orbMouseDown, addPeer, pairStart, pairConfirm, connectPeer, disconnectPeer, removePeer, downloadFromPeer } from '$lib/api';
-  import type { PushInvite, PeerDevice, TabKey } from '$lib/types';
+  import { getBcStatus, loadBcStatus, setBcSide, clearSide, compare } from '$lib/stores/bc.svelte';
+  import { getActualPort, startHttpServer, acceptPush, rejectPush, orbScreenMetrics, orbSetRect, orbMouseDown, orbSavePos, addPeer, pairStart, pairConfirm, connectPeer, disconnectPeer, removePeer, downloadFromPeer } from '$lib/api';
+  import type { PushInvite, PeerDevice, TabKey, BcTarget } from '$lib/types';
   import { planExpansion, planCollapse, planDock, type DockPlan, type ScreenRect } from '$lib/orbLayout';
   import Orb from '$lib/components/Orb.svelte';
   import TabBar from '$lib/components/TabBar.svelte';
@@ -19,7 +20,7 @@
   const COLLAPSED = new LogicalSize(90, 90);
   const ORB_SIZE = 62;                                             // 悬浮球直径（CSS px）
   const PANEL = { w: 448, h: 620 };                                // 面板标称尺寸（CSS px）
-  const PANEL_SLACK = 12;                                          // 面板四周留给阴影/圆角的余量（CSS px）
+  const PANEL_SLACK = 20;                                          // 面板四周留给阴影的余量（CSS px）：必须 ≥ --shadow 的可见半径（main.css 里有实测值），否则阴影被窗口边裁出切线
   const EXPANDED = new LogicalSize(PANEL.w + PANEL_SLACK * 2, PANEL.h + PANEL_SLACK * 2);
   const ORB_INSET = (COLLAPSED.width - ORB_SIZE) / 2;              // 折叠态悬浮球在窗口内的内缩
   const WORK_MARGIN = 8;                                           // 展开窗口与工作区边缘的最小间距（CSS px）
@@ -83,7 +84,8 @@
   let toasts = $state<{ id: number; msg: string; leaving: boolean }[]>([]);
   let toastId = $state(0);
   // Context menu
-  let ctxState = $state<{ x: number; y: number; kind: 'share' | 'device' | 'peer'; el?: HTMLElement; shareId?: string; path?: string; isDir?: boolean; deviceState?: string; deviceId?: string; peerId?: string; peerName?: string; name?: string } | null>(null);
+  type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer'; el?: HTMLElement; shareId?: string; path?: string; isDir?: boolean; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; peerName?: string; name?: string };
+  let ctxState = $state<CtxState | null>(null);
   // Push invitation overlay (real incoming)
   let pushInvite = $state<PushInvite | null>(null);
 
@@ -100,6 +102,44 @@
   let localCount = $derived(getShares().length);
   let deviceCount = $derived(getDevices().length);
   let serverPortVal = $derived(getServerPort());
+
+  /** ctxState → BcTarget。label 是给人看的名字（后端拼不出对端共享项的名字），后端优先采用。 */
+  function ctxBcTarget(c: CtxState): BcTarget | null {
+    if (!c.shareId) return null;                                    // 没有共享项 id 就没有可比较的对象
+    const path = c.path ?? '';
+    if (c.kind === 'peer') {
+      if (!c.peerId) return null;
+      const dev = getDevices().find((d) => d.id === c.peerId)?.name ?? c.peerId;
+      const item = path || c.name;                                  // 树内节点用累积相对路径，共享项根用共享项名
+      return { kind: 'peer', peerId: c.peerId, shareId: c.shareId, path, label: item ? `${dev} · ${item}` : dev };
+    }
+    const share = getShares().find((s) => s.id === c.shareId)?.name ?? '';
+    const label = path ? (share ? `${share}/${path}` : path) : (share || c.name || '');
+    return { kind: 'share', shareId: c.shareId, path, label };
+  }
+
+  /** 同一个比较对象（label 只是显示名，不参与比较）。 */
+  function sameBcTarget(a: BcTarget, b: BcTarget): boolean {
+    if (a.kind !== b.kind || a.shareId !== b.shareId || a.path !== b.path) return false;
+    return a.kind === 'peer' && b.kind === 'peer' ? a.peerId === b.peerId : true;
+  }
+
+  // BC 菜单的显示条件：右键项与比较位的组合决定文案与可用性
+  let bcMenu = $derived.by(() => {
+    const st = getBcStatus();
+    const target = ctxState ? ctxBcTarget(ctxState) : null;
+    const thisLeft = !!(target && st.left && sameBcTarget(st.left.target, target));
+    const thisRight = !!(target && st.right && sameBcTarget(st.right.target, target));
+    const otherLeft = !!(target && st.left && !thisLeft);           // 对手方在左侧
+    const otherRight = !!(target && st.right && !thisRight);
+    return {
+      leftLabel: st.left?.label ?? null,
+      rightLabel: st.right?.label ?? null,
+      compareLabel: otherLeft && otherRight ? '左右比较位' : otherLeft ? '与左侧' : otherRight ? '与右侧' : '',
+      compareEnabled: otherLeft || otherRight,
+      thisStaged: thisLeft || thisRight,
+    };
+  });
 
   function setOpen(v: boolean) {
     if (v) void expand();
@@ -183,7 +223,26 @@
   }
 
   /**
-   * 拖动结束后的吸附判定：折叠态窗口就是悬浮球本身，直接拿它当前矩形当自由落位再判一次。
+   * 记录悬浮球落位（折叠态窗口左上角，物理像素）：下次启动回到这里（F-74）。
+   *
+   * 记的永远是**球**的落位，不是窗口的：折叠态窗口就是球；展开态窗口是面板，得先把球按
+   * 窗口位移算回折叠态矩形（见 `rememberBallUnderPanel`）。调用点只在「几何落定之后」：
+   * settleDrag（拖动结束、吸附判定跑完）与 settleCollapse（收起落位完）。
+   */
+  async function rememberOrbPos(rect: ScreenRect) {
+    try {
+      await orbSavePos(Math.round(rect.x), Math.round(rect.y));
+    } catch (e) {
+      console.error('记录悬浮球位置失败:', e);   // 记不上只是下次回不到原位，不打断交互
+    }
+  }
+
+  /**
+   * 拖动结束后的落位判定。
+   *
+   * 折叠态：窗口就是悬浮球本身，拿它当前矩形当自由落位再判一次吸附，吸附结果落到窗口上。
+   * 展开态：窗口是面板，拖动它时球跟着面板走 —— 球的新位置**算**出来（按窗口位移平移展开前
+   *   记下的原矩形，再判一次吸附），只记录、不动窗口：球要贴边就把面板拽走显然不对。
    *
    * 判定前先等鼠标真正松开 —— OS 拖动期间窗口一直在动、页面却收不到 mouseup，只看 move
    * 事件的间隔会把「拖到一半停一下」当成松手：球会在手里被抢到贴边位置。松手那一刻的
@@ -193,12 +252,17 @@
    * 判定再跑一遍，空转成环。
    */
   async function settleDrag() {
-    if (settling || expanded || holdOrb || opening) return;
+    if (settling || holdOrb || opening) return;
     settling = true;
+    const from = expanded;
     try {
       while (await orbMouseDown()) {
         await new Promise((r) => setTimeout(r, DRAG_POLL_MS));
-        if (expanded || holdOrb) return;
+        if (holdOrb || opening || expanded !== from) return;   // 期间展开/收起/切窗口：这轮作废
+      }
+      if (from) {
+        await rememberBallUnderPanel();
+        return;
       }
       const pos = await appWindow.outerPosition();
       const size = await appWindow.outerSize();
@@ -206,9 +270,23 @@
       const plan = dockPlan({ x: pos.x, y: pos.y, w: size.width, h: size.height }, metrics.scaleFactor, metrics.workArea);
       if (plan.window.x !== pos.x || plan.window.y !== pos.y) await orbSetRect(plan.window);
       setDockDom(plan, metrics.scaleFactor);
+      await rememberOrbPos(plan.window);
     } finally {
       settling = false;
     }
+  }
+
+  /**
+   * 展开态拖动面板之后：算出球现在在哪并记下来。
+   *
+   * 与收起落位是同一套算法（`planCollapse` + `dockPlan`），所以这里记下的就是「此刻点收起，
+   * 球会落到哪」—— 拖完面板直接关掉应用，下次启动也在那儿（否则记的还是展开前的老位置）。
+   */
+  async function rememberBallUnderPanel() {
+    if (!ballRect || !expandedRect) return;   // 异常路径：没有展开前的矩形，算不出球在哪
+    const metrics = await orbScreenMetrics();
+    const free = planCollapse({ ball: ballRect, expanded: expandedRect, current: await appWindow.outerPosition() });
+    await rememberOrbPos(dockPlan(free, metrics.scaleFactor, metrics.workArea).window);
   }
 
   /**
@@ -221,7 +299,9 @@
     const free = expanded
       ? planCollapse({ ball, expanded, current: await appWindow.outerPosition() })
       : ball;   // 没记下展开矩形（异常路径）：按原样缩回
-    await applyDock(dockPlan(free, sf, metrics.workArea), sf);
+    const plan = dockPlan(free, sf, metrics.workArea);
+    await applyDock(plan, sf);
+    await rememberOrbPos(plan.window);   // 收起后的落位才是球下次该出现的地方
   }
 
   /**
@@ -232,6 +312,7 @@
     expanded = false;
     showSettings = false;
     ctxState = null;
+    toasts = [];          // 提示是面板上的浮层：收起即作废，别等下次展开又冒出来
     holdOrb = true;
     if (foldTimer) clearTimeout(foldTimer);
     foldTimer = setTimeout(() => {
@@ -435,11 +516,7 @@
   async function ctxDownload() {
     const c = ctxState;
     if (!c) return;
-    if (c.kind === 'share') {
-      toast(`已开始下载「${c.shareId}」到收件目录`);
-    } else {
-      toast('已开始下载到 桌面/OrbDrop');
-    }
+    toast('已开始下载到下载目录');
     hideCtx();
   }
 
@@ -499,22 +576,100 @@
     }
   }
 
-  async function ctxUnpair() {
-    const deviceId = ctxState?.deviceId;
-    hideCtx();
-    if (!deviceId) return;
+  /** 解除配对：本机动作，**不需要对端在线**（后端只尽力通知它一声）。
+   * 设备行不立刻消失：对端还在网上就继续以「未绑定」列出；它离线时这一行本来就不会显示。 */
+  async function unpairDevice(deviceId: string) {
     try {
       await removePeer(deviceId);
-      // 设备行不会消失：它还在网络上被看见，就继续以"未绑定"出现（离线才会不见）。
-      toast('已解除配对（设备在线时继续显示为未绑定）');
+      toast('已解除配对（对方在线时会继续显示为「未绑定」）');
     } catch (e) {
       toast(`解除配对失败：${e}`);
     }
   }
 
+  async function ctxUnpair() {
+    const deviceId = ctxState?.deviceId;
+    hideCtx();
+    if (!deviceId) return;
+    await unpairDevice(deviceId);
+  }
+
+  /** 右键「重新配对」：token 已失效，走一遍配对流程换新 token（与行内「配对」同一个入口）。 */
+  function ctxPair() {
+    const deviceId = ctxState?.deviceId;
+    hideCtx();
+    const device = deviceId ? getDevices().find((d) => d.id === deviceId) : undefined;
+    if (device) openPair(device);
+  }
+
   function ctxPush() {
     hideCtx();
     toast('已向该设备发起推送');
+  }
+
+  /** 放入比较位：side 是 'left' | 'right'，文案沿用同一套。 */
+  async function ctxBcPlace(side: 'left' | 'right') {
+    const c = ctxState;
+    hideCtx();
+    const target = c ? ctxBcTarget(c) : null;
+    if (!target) {
+      toast('这项没有可比较的共享路径');
+      return;
+    }
+    try {
+      const s = await setBcSide(side, target);
+      toast(`已放入${side === 'left' ? '左' : '右'}侧比较位：${s?.label ?? target.label ?? ''}`);
+    } catch (e) {
+      toast(`设置比较位失败：${e}`);
+    }
+  }
+
+  async function ctxBcClear() {
+    const c = ctxState;
+    hideCtx();
+    const target = c ? ctxBcTarget(c) : null;
+    if (!target) return;
+    const st = getBcStatus();
+    try {
+      // 同一项可能同时占着左右两侧，两边都要清
+      for (const side of ['left', 'right'] as const) {
+        const s = st[side];
+        if (s && sameBcTarget(s.target, target)) await clearSide(side);
+      }
+      toast('已清除比较位');
+    } catch (e) {
+      toast(`清除比较位失败：${e}`);
+    }
+  }
+
+  async function ctxBcCompare() {
+    const c = ctxState;
+    hideCtx();
+    const target = c ? ctxBcTarget(c) : null;
+    if (!target) {
+      toast('这项没有可比较的共享路径');
+      return;
+    }
+    const st = getBcStatus();
+    const { left, right } = st;
+    const thisLeft = !!left && sameBcTarget(left.target, target);
+    const thisRight = !!right && sameBcTarget(right.target, target);
+    // 当前项占位时与另一侧比；没占位时用它补空位（只有一侧占位）；两侧都占位就直接比两侧
+    const pair: { a: BcTarget; b: BcTarget; la: string; lb: string } | null =
+      left && right ? { a: left.target, b: right.target, la: left.label, lb: right.label }
+      : left && !thisLeft ? { a: left.target, b: target, la: left.label, lb: target.label ?? '' }
+      : right && !thisRight ? { a: target, b: right.target, la: target.label ?? '', lb: right.label }
+      : null;
+    if (!pair) {
+      toast('请先把要比较的另一项「添加到左侧/右侧比较位」');
+      return;
+    }
+    try {
+      await compare(pair.a, pair.b);
+      toast(`已在 BeyondCompare 中打开比较：${pair.la} ↔ ${pair.lb}`);
+    } catch (e) {
+      toast(`BeyondCompare 启动失败：${e}`);
+    }
   }
 
   async function handleAcceptPush() {
@@ -533,13 +688,24 @@
   }
 
   onMount(() => {
-    // 折叠态窗口 = 悬浮球 + 四周余量；位置/尺寸由 setOpen 按屏幕边界重算
-    void appWindow.setSize(COLLAPSED);
+    // 折叠态窗口 = 悬浮球 + 四周余量：尺寸在这里归位，**位置**由后端在首帧之前按上次的
+    // 落位写好（lib.rs `restore_orb_pos`）—— 等界面起来再挪会看到球从屏幕中央跳过去。
+    // 位置复原之后还得按同一个矩形重算贴边形态：上次是贴边收起的话，球要滑到被窗口裁掉
+    // 的那一位、热区跟着贴边，否则球会以「未贴边」的样子完整站在屏幕边上（而窗口已经贴住
+    // 边缘，看上去像被谁挪出来了一截）。这正是 `settleDrag` 对落位矩形做的事，直接复用。
+    void (async () => {
+      try {
+        await appWindow.setSize(COLLAPSED);
+        await settleDrag();
+      } catch (e) {
+        console.error('复原悬浮球落位失败:', e);
+      }
+    })();
 
     // Init data + server
     void (async () => {
       try {
-        await Promise.all([loadSettings(), loadDevices()]);
+        await Promise.all([loadSettings(), loadDevices(), loadBcStatus()]);
         const port = await getActualPort();
         if (port === 0) {
           const p = await startHttpServer();
@@ -624,10 +790,17 @@
     const handleCtx = (e: Event) => {
       const detail = (e as CustomEvent).detail as any;
       if (detail && detail.kind) {
-        ctxState = { x: detail.x, y: detail.y, el: detail.el, kind: detail.kind, shareId: detail.shareId, path: detail.path, isDir: detail.isDir, deviceState: detail.deviceState, deviceId: detail.deviceId, peerId: detail.peerId, name: detail.name };
+        ctxState = { x: detail.x, y: detail.y, el: detail.el, kind: detail.kind, shareId: detail.shareId, path: detail.path, isDir: detail.isDir, deviceState: detail.deviceState, deviceOnline: detail.online, deviceNeedsPair: detail.needsPair, deviceId: detail.deviceId, peerId: detail.peerId, name: detail.name };
       }
     };
     document.addEventListener('od:ctx', handleCtx);
+
+    // 子组件要提示（拖拽下载的准备进度/失败原因）时冒上来：浮层只有这一层有。
+    const handleToast = (e: Event) => {
+      const msg = (e as CustomEvent<string>).detail;
+      if (msg) toast(msg);
+    };
+    document.addEventListener('od:toast', handleToast);
 
     return () => {
       unlisten.then(fn => fn());
@@ -638,6 +811,7 @@
       unOrbShow.then(fn => fn());
       unProgress.then(fn => fn());
       document.removeEventListener('od:ctx', handleCtx);
+      document.removeEventListener('od:toast', handleToast);
     };
   });
 </script>
@@ -688,7 +862,7 @@
     />
 
     <div class="panel-body">
-      <TabContent tab={activeTab} devices={getDevices()} onToast={toast} onRequestPush={requestPush} onOpenPair={openPair} />
+      <TabContent tab={activeTab} devices={getDevices()} onToast={toast} onRequestPush={requestPush} onOpenPair={openPair} onUnpair={(d) => void unpairDevice(d.id)} />
     </div>
 
     <footer class="panel-foot">
@@ -811,6 +985,19 @@
         </div>
       </div>
     {/if}
+
+    <!-- Toast layer：提示属于面板（提示出现时收起面板，它就随面板一起退场）。
+         放在 panel 里而不是顶层：面板收起时 opacity:0，提示结构上就不可能画进那个 90px 的悬浮球窗口。 -->
+    <div class="toast-layer">
+      {#each toasts as t (t.id)}
+        <div class="toast" class:leaving={t.leaving}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3v12M7 10l5 5 5-5M5 19h14"/>
+          </svg>
+          {t.msg}
+        </div>
+      {/each}
+    </div>
   </section>
 </aside>
 
@@ -824,7 +1011,14 @@
     path={ctxState.path}
     isDir={ctxState.isDir}
     deviceState={ctxState.deviceState}
+    deviceOnline={ctxState.deviceOnline}
+    deviceNeedsPair={ctxState.deviceNeedsPair}
     peerName={ctxState.peerId ? getDevices().find((d) => d.id === ctxState?.peerId)?.name : undefined}
+    bcLeftLabel={bcMenu.leftLabel}
+    bcRightLabel={bcMenu.rightLabel}
+    bcCompareLabel={bcMenu.compareLabel}
+    bcCompareEnabled={bcMenu.compareEnabled}
+    bcThisStaged={bcMenu.thisStaged}
     onClose={hideCtx}
     onToast={toast}
     onDownload={ctxDownload}
@@ -833,20 +1027,13 @@
     onRemove={ctxRemove}
     onConnect={ctxConnect}
     onDisconnect={ctxDisconnect}
+    onPair={ctxPair}
     onUnpair={ctxUnpair}
     onPush={ctxPush}
     onPeerDownload={ctxPeerDownload}
+    onBcCompare={ctxBcCompare}
+    onBcAddLeft={() => ctxBcPlace('left')}
+    onBcAddRight={() => ctxBcPlace('right')}
+    onBcClear={ctxBcClear}
   />
 {/if}
-
-<!-- Toast layer -->
-<div class="toast-layer">
-  {#each toasts as t (t.id)}
-    <div class="toast" class:leaving={t.leaving}>
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M12 3v12M7 10l5 5 5-5M5 19h14"/>
-      </svg>
-      {t.msg}
-    </div>
-  {/each}
-</div>

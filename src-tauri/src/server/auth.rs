@@ -6,6 +6,8 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::http::StatusCode;
+use parking_lot::Mutex;
+use tracing::info;
 
 use crate::config::ShareItem;
 use crate::state::AppState;
@@ -57,34 +59,70 @@ pub async fn auth_middleware(
     let headers = request.headers();
     let auth_header = match headers.get("Authorization").and_then(|v| v.to_str().ok()) {
         Some(h) => h,
-        None => return (StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response(),
+        None => return unauthorized("Missing Authorization header"),
     };
 
+    let mut basic_user: Option<String> = None;
     let token: String = if let Some(t) = auth_header.strip_prefix("Bearer ") {
         t.to_string()
     } else if let Some(t) = auth_header.strip_prefix("Basic ") {
-        // Basic auth fallback for WebDAV (BC uses Basic): "x:<token>" base64 encoded
+        // Basic auth fallback for WebDAV (BC uses Basic): `"<用户名>:<token>"` base64 编码。
+        // 用户名不参与鉴权，只当作"发起方是谁"记录下来（见 `note_dav_caller`）。
         match base64_decode_basic(t) {
-            Ok(decoded) => match decoded.split(':').nth(1) {
-                Some(token_part) => token_part.to_string(),
-                None => {
-                    return (StatusCode::UNAUTHORIZED, "Invalid Basic auth format").into_response()
+            Ok(decoded) => match split_basic(&decoded) {
+                Some((user, token)) => {
+                    basic_user = Some(user.to_string());
+                    token.to_string()
                 }
+                None => return unauthorized("Invalid Basic auth format"),
             },
-            Err(_) => {
-                return (StatusCode::UNAUTHORIZED, "Invalid Basic auth encoding").into_response()
-            }
+            Err(_) => return unauthorized("Invalid Basic auth encoding"),
         }
     } else {
-        return (StatusCode::UNAUTHORIZED, "Unsupported auth scheme").into_response();
+        return unauthorized("Unsupported auth scheme");
     };
 
     // token → 对端 id：这一步既完成鉴权，也确定了「谁在看」。
     // 未配对（token 不在凭据库）一律 401——没有身份就没有可见范围可言。
     match peer_id_from_token(&state, &token) {
-        Some(peer_id) => next.run(with_caller(request, Caller::Peer(peer_id))).await,
-        None => (StatusCode::UNAUTHORIZED, "Invalid token").into_response(),
+        Some(peer_id) => {
+            if let Some(user) = basic_user {
+                note_dav_caller(&peer_id, &user);
+            }
+            next.run(with_caller(request, Caller::Peer(peer_id))).await
+        }
+        None => unauthorized("Invalid token"),
     }
+}
+
+/// 「谁经 DAV 面连进来了」要留在日志里（N-11 排障）：BC 那条路用的是本应用写进 profile 的
+/// 账号（`bc::DAV_USER`），所以这一行就是"本应用替用户发起的连接"的凭据。
+///
+/// 每台设备在本进程只记一行：BC 浏览一个目录就会连发十几个 PROPFIND/GET，逐条记等于把
+/// 日志刷爆，而"发起方是谁"这个事实只需要出现一次。
+fn note_dav_caller(peer_id: &str, user: &str) {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock();
+    if seen.iter().any(|id| id == peer_id) {
+        return;
+    }
+    seen.push(peer_id.to_string());
+    info!(%peer_id, user, "WebDAV 请求已认证：发起方用的是本应用写下的 BC profile");
+}
+
+/// 401 必须带 `WWW-Authenticate: Basic`：Beyond Compare 的 WebDAV 客户端先发一次不带凭据的
+/// 请求（实测先 HEAD/OPTIONS 裸探），收到挑战后才用 profile 里存的账号密码重试——
+/// 只回 401 不带挑战头，BC 会直接判定连接失败。
+fn unauthorized(msg: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            axum::http::header::WWW_AUTHENTICATE,
+            "Basic realm=\"OrbDrop\"",
+        )],
+        msg.to_string(),
+    )
+        .into_response()
 }
 
 fn with_caller(mut request: Request<Body>, caller: Caller) -> Request<Body> {
@@ -97,4 +135,28 @@ fn base64_decode_basic(input: &str) -> Result<String, String> {
     let engine = base64::engine::general_purpose::STANDARD;
     let bytes = engine.decode(input).map_err(|e| e.to_string())?;
     String::from_utf8(bytes).map_err(|e| e.to_string())
+}
+
+/// 拆开已解码的 Basic 凭据：`<用户名>:<token>`。
+///
+/// token 取**第一个**冒号之后的部分：用户名是我们自己挑的（BC profile 里的 `OrbDrop`），
+/// 万一它含冒号，`split(':').nth(1)` 会取到用户名里的第二段去当 token —— 那是错的。
+/// 空 token 直接判格式错误，省得拿空串去查凭据库。
+fn split_basic(decoded: &str) -> Option<(&str, &str)> {
+    let (user, token) = decoded.split_once(':')?;
+    (!token.is_empty()).then_some((user, token))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basic_credentials_split_on_the_first_colon() {
+        assert_eq!(split_basic("x:tok"), Some(("x", "tok")));
+        assert_eq!(split_basic("OrbDrop:deadbeef"), Some(("OrbDrop", "deadbeef")));
+        assert_eq!(split_basic("weird:user:tok"), Some(("weird", "user:tok")));
+        assert_eq!(split_basic("no-colon"), None, "没有分隔符 = 格式错误");
+        assert_eq!(split_basic("OrbDrop:"), None, "空 token 不该拿去查凭据库");
+    }
 }

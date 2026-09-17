@@ -5,6 +5,7 @@
   import { getServerPort, setServerPort } from '$lib/stores/shares.svelte';
   import { getActualPort } from '$lib/api';
   import TreeNode from './TreeNode.svelte';
+  import { dragOut } from '$lib/dragOut';
   import type { TreeEntry } from '$lib/types';
   import { fetchTree } from '$lib/api';
   import type { ShareItem } from '$lib/types';
@@ -120,7 +121,7 @@
         data-id={share.id}
         oncontextmenu={(e) => openCtx(e, e.currentTarget, share)}
       >
-        <div class="share-row">
+        <div class="share-row" use:dragOut={{ source: { shareId: share.id, path: '', name: share.name, isDir: dir }, onMessage: onToast }}>
           {#if dir}
             <button class="chev" onclick={() => toggleTree(share.id)} aria-label="展开">{@html ICON_CHEVRON}</button>
           {:else}

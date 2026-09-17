@@ -23,10 +23,20 @@ fn temp_share_dir() -> std::path::PathBuf {
     dir
 }
 
+/// 给测试一个"便携版"假 BeyondCompare：预写 profile 只会写进临时目录，不碰用户真实 BC 配置。
+fn hermetic_bc_exe() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("orbdrop_vis_bc_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("BCompare.exe"), b"stub").unwrap();
+    std::fs::write(dir.join("BCState.xml"), b"<BCState/>").unwrap();
+    dir.join("BCompare.exe")
+}
+
 /// 一个共享项、开播开关关着；对端 `peer-a` 有一条（假的）长连接。
 fn make_state(root: std::path::PathBuf, peer_connected: bool) -> Arc<AppState> {
     let mut config = Config::default();
     config.shares.push(ShareItem::new(root));
+    config.bc_exe_path = Some(hermetic_bc_exe());
     let config_path = std::env::temp_dir().join(format!("orbdrop_vis_cfg_{}.toml", uuid::Uuid::new_v4()));
     let state = Arc::new(AppState::new(config, config_path));
     if peer_connected {

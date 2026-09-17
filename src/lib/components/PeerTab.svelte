@@ -4,6 +4,7 @@
   import { fetchPeerTree, getPeerToken } from '$lib/api';
   import { getPeerSharesState, loadPeerShares, peerBaseUrl } from '$lib/stores/peers.svelte';
   import type { PeerDevice, PeerShareItem, TreeEntry } from '$lib/types';
+  import { dragOut } from '$lib/dragOut';
   import TreeNode from './TreeNode.svelte';
 
   let {
@@ -153,7 +154,7 @@
         class:open={ts.expanded}
         oncontextmenu={(e) => openCtx(e, share)}
       >
-        <div class="share-row">
+        <div class="share-row" use:dragOut={{ source: { peerId: device.id, shareId: share.id, path: '', name: share.name, isDir: share.isDir }, onMessage: onToast }}>
           {#if share.isDir}
             <button class="chev" onclick={() => toggleShare(share)} aria-label="展开">{@html ICON_CHEVRON}</button>
           {:else}

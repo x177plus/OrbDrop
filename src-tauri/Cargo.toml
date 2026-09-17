@@ -38,6 +38,7 @@ thiserror = "1"
 anyhow = "1"
 tokio-util = "0.7"
 base64 = "0.22"
+aes-gcm = "0.10"
 parking_lot = "0.12"
 dirs = "5"
 reqwest = { version = "0.12", features = ["stream", "json"] }
@@ -46,16 +47,28 @@ futures-util = "0.3"
 pathdiff = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# Token 持久化必须落到系统凭据库：keyring 3 不带默认 store，缺 feature 会退回
-# 进程内 mock（写成功、读为空），配对后拿不到 token。
+# 只为**迁移老数据**保留：老版本把配对 token 放在系统凭据库的一条里，启动时读它一次搬进
+# 数据目录的凭据文件（见 credential::migrate_legacy_entry）。keyring 3 不带默认 store，
+# 缺 feature 会退回进程内 mock（写成功、读为空），迁移会变成"什么都没读到"。
 keyring = { version = "3", features = ["windows-native"] }
 winreg = "0.52"
+# `#[implement(...)]` 生成的代码里写的是 `windows_core::…` 这个 crate 名，
+# 所以它必须作为**直接依赖**出现（和 `windows` 是同一份源码，不会重复编）。
+windows-core = "0.61"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

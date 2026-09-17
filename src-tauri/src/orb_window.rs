@@ -49,6 +49,69 @@ pub fn mouse_down() -> bool {
     imp::mouse_down()
 }
 
+/// 这个位置（连同窗口当前尺寸）是否还落在某块显示器上。
+///
+/// 复原悬浮球位置前必须问一句：显示器被拔掉 / 分辨率变了之后，上次的落点可能已经在
+/// 屏幕外 —— 透明无边框窗口没有标题栏可以拖回来，用户只能去删配置文件。
+///
+/// 判据是「与显示器矩形有正面积相交」而不是「球完整可见」：贴边收起时窗口整个留在
+/// 工作区内（球是被窗口裁掉的），所以正常落位必然相交；而两块显示器之间的接缝、
+/// 任务栏下方这些地方也不该算失联。
+pub fn visible_on_some_monitor(window: &WebviewWindow, x: i32, y: i32) -> bool {
+    let size = match window.outer_size() {
+        Ok(s) => s,
+        // 问不出尺寸就没有判据，按「可见」处理：宁可复原到原位，也别把用户记下的位置丢掉
+        Err(_) => return true,
+    };
+    let rect = Rect { x, y, w: size.width as i32, h: size.height as i32 };
+    let monitors: Vec<Rect> = window
+        .available_monitors()
+        .unwrap_or_default()
+        .iter()
+        .map(|m| {
+            let p = m.position();
+            let s = m.size();
+            Rect { x: p.x, y: p.y, w: s.width as i32, h: s.height as i32 }
+        })
+        .collect();
+    if monitors.is_empty() {
+        return true;   // 拿不到显示器列表（远程会话等）：无据可依，不拦
+    }
+    overlaps_any(rect, &monitors)
+}
+
+/// 矩形是否与 `monitors` 中任一块有正面积交集。
+fn overlaps_any(rect: Rect, monitors: &[Rect]) -> bool {
+    monitors.iter().any(|m| {
+        rect.x < m.x + m.w && m.x < rect.x + rect.w && rect.y < m.y + m.h && m.y < rect.y + rect.h
+    })
+}
+
+/// 首启（配置里还没有落位记录）时悬浮球离工作区右边缘的余量（CSS px）。
+///
+/// 必须大于前端的吸附阈值（`App.svelte` 的 `DOCK_THRESHOLD` = 20）：默认落位是「靠边但
+/// **不吸附**」，落在阈值内的话启动时那次落位判定会当场把球吸到边上、收起大半颗。
+const DEFAULT_ORB_MARGIN: f64 = 50.0;
+
+/// 没记过位置时的默认落位（物理像素）：工作区右上、垂直 1/3 处，右边留 `DEFAULT_ORB_MARGIN`。
+///
+/// 边长取**标称值**（`collapsed_logical` = tauri.conf 里 main 窗口的 width，乘当前 DPI），
+/// 不问窗口当前的 `outer_size()`：启动那一刻那个外框还带着 DWM 阴影余量（实测 90 → 136），
+/// 照它算出来的落位离右边缘有 84px —— 「没贴边」但也不「靠边」。
+///
+/// 按悬浮球**窗口**算而不是按球算：球在窗口里只内缩 14 CSS px，两者看起来是同一个位置。
+pub fn default_pos(window: &WebviewWindow, collapsed_logical: f64) -> Result<(i32, i32), String> {
+    let m = metrics(window)?;
+    let side = (collapsed_logical * m.scale_factor).round() as i32;
+    let margin = (DEFAULT_ORB_MARGIN * m.scale_factor).round() as i32;
+    Ok(default_pos_in(m.work_area, side, margin))
+}
+
+/// `default_pos` 的纯几何部分：右上角内缩 `margin`、垂直线 1/3 处（工作区左上角不为 0 时也算对）。
+fn default_pos_in(work: Rect, win_w: i32, margin: i32) -> (i32, i32) {
+    (work.x + work.w - win_w - margin, work.y + work.h / 3)
+}
+
 /// 抹掉 Windows 给顶层窗口自动绘制的 1px 边框与圆角。
 ///
 /// 我们的窗口是透明无边框的，那层 OS 边框会沿着 OS 自己的圆角露在面板之外
@@ -169,5 +232,57 @@ mod imp {
     pub fn set_rect(window: &WebviewWindow, rect: Rect) -> Result<(), String> {
         window.set_position(PhysicalPosition::new(rect.x, rect.y)).map_err(|e| e.to_string())?;
         window.set_size(PhysicalSize::new(rect.w.max(1) as u32, rect.h.max(1) as u32)).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一块 1920x1080 主屏 + 它左边一块 1280x1024（负坐标）的副屏。
+    fn monitors() -> Vec<Rect> {
+        vec![
+            Rect { x: 0, y: 0, w: 1920, h: 1080 },
+            Rect { x: -1280, y: 0, w: 1280, h: 1024 },
+        ]
+    }
+
+    /// 复原判据的核心：落点在屏上就别拦，落在屏外（显示器拔了/分辨率变了）就该回居中。
+    #[test]
+    fn overlaps_only_inside_monitors() {
+        let ms = monitors();
+        // 主屏正中、主屏左下角（贴边收起：窗口贴住工作区边缘，仍在屏内）
+        assert!(overlaps_any(Rect { x: 800, y: 400, w: 90, h: 90 }, &ms));
+        assert!(overlaps_any(Rect { x: 0, y: 990, w: 90, h: 90 }, &ms));
+        // 左侧副屏（负坐标）
+        assert!(overlaps_any(Rect { x: -1280, y: 100, w: 90, h: 90 }, &ms));
+        // 跨屏接缝：窗口一半在副屏、一半在主屏
+        assert!(overlaps_any(Rect { x: -45, y: 100, w: 90, h: 90 }, &ms));
+        // 副屏被拔掉之后：原来的落点整块在主屏左侧之外
+        assert!(
+            !overlaps_any(Rect { x: -1280, y: 100, w: 90, h: 90 }, &[ms[0]]),
+            "只剩主屏时，记在副屏上的位置必须判为不可见（否则球复原到屏幕外，用户拖不回来）"
+        );
+        // 主屏分辨率变小（改成 1600x900）：原来的右下角落点已经出界
+        let small = [Rect { x: 0, y: 0, w: 1600, h: 900 }];
+        assert!(!overlaps_any(Rect { x: 1600, y: 100, w: 90, h: 90 }, &small), "右侧出界");
+        assert!(!overlaps_any(Rect { x: 100, y: 900, w: 90, h: 90 }, &small), "下方出界");
+        // 恰好贴边（无正面积交集）也算出界：窗口与显示器边界只相接时球一个像素都看不到
+        assert!(!overlaps_any(Rect { x: 1920, y: 0, w: 90, h: 90 }, &[ms[0]]));
+    }
+
+    /// 默认落位在右上、垂直线 1/3 处，且右边余量大于前端吸附阈值（20 CSS px）——
+    /// 否则首启那次落位判定会立刻把球吸到边上，「靠边但不吸附」当场失效。
+    #[test]
+    fn default_pos_is_upper_right_and_not_dockable() {
+        let work = Rect { x: 0, y: 0, w: 1920, h: 1032 };
+        let (x, y) = default_pos_in(work, 90, 24);
+        assert_eq!(x, 1920 - 90 - 24, "窗口右边贴着工作区右边的内侧");
+        assert!(work.x + work.w - (x + 90) > 20, "余量必须超过吸附阈值");
+        assert!(y > work.y && y < work.y + work.h / 2, "垂直落在上半部的 1/3 处");
+
+        // 工作区左上角不在原点（副屏 / 左侧任务栏）也按绝对坐标算
+        let left = Rect { x: -1280, y: 0, w: 1280, h: 1024 };
+        assert_eq!(default_pos_in(left, 90, 24), (-1280 + 1280 - 90 - 24, 1024 / 3));
     }
 }

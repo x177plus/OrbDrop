@@ -32,7 +32,7 @@ tauri-plugin-shell = "2"                                # 启动外部进程（B
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"                                            # 配置文件
-keyring = "3"                                           # 系统凭据库
+keyring = "3"                                           # 仅用于迁移老系统凭据库那一条
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }           # HTTP + WS + WebDAV
 tower-http = { version = "0.6", features = ["cors"] }   # 中间件
@@ -52,7 +52,7 @@ src-tauri/src/
 ├── main.rs                    # 入口，Tauri builder
 ├── lib.rs                     # Tauri 插件/命令导出
 ├── config.rs                  # 配置读写（TOML）
-├── credential.rs               # 系统凭据库封装（keyring）
+├── credential.rs               # 凭据文件封装（credentials.dat）
 ├── server/
 │   ├── mod.rs                 # axum 服务启动 + 端口探测
 │   ├── routes_tree.rs         # GET /tree
@@ -149,23 +149,24 @@ P0 第一个落地模块，所有后续依赖它。
 
 ```rust
 // config.rs — 配置文件路径 + 读写
-// Windows: %APPDATA%/OrbDrop/config.toml
+// Windows: %LOCALAPPDATA%/OrbDrop/config.toml
 // macOS:   ~/Library/Application Support/OrbDrop/config.toml
+// 全部落在"本机专属"目录：不参与域漫游配置文件的同步
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub port: u16,
     pub download_dir: PathBuf,
     pub download_mode: DownloadMode,  // Direct | AskEachTime
-    pub inbox_dir: PathBuf,
     pub device_name: String,
     pub auto_start: bool,
 }
 
-// credential.rs — 系统凭据库封装
-pub fn save_peers(peers: &HashMap<String, String>) -> Result<()>  // 写入 keyring
-pub fn load_peers() -> Result<HashMap<String, String>>            // 从 keyring 读取
+// credential.rs — 凭据文件封装（数据目录下的 credentials.dat）
+pub fn save_peers(peers: &HashMap<String, String>) -> Result<()>  // 覆盖写凭据文件（原子写）
+pub fn load_peers() -> Result<HashMap<String, String>>            // 读凭据文件；文件不在时只读回落到老系统凭据库那条
 pub fn remove_peer(id: &str) -> Result<()>                       // 解除配对
+pub fn wipe() -> Result<bool>                                    // 一键清空（删文件 + 老条目）
 ```
 
 ### Step 2：axum HTTP 服务（server/mod.rs）
@@ -242,6 +243,17 @@ fn toggle_broadcast(share_id: String, targets: Vec<String>) -> Result<(), String
 - 拖动期间不吸附：OS 拖动的模态循环会吃掉 mouseup，页面看不到松手，只看 move 事件间隔就会把「拖到一半停一下」当成松手，
   球在手里被抢到贴边位置。所以落位判定先查 OS 键状态（`orb_mouse_down` = Win32 `GetAsyncKeyState(VK_LBUTTON)`），按住就不动窗口，
   松手那一刻的窗口位置才是落点，球从那儿滑出去
+- 悬浮球位置记忆（F-74「窗口位置」）：把**几何落定之后**的折叠态窗口左上角（物理像素）记进配置 `orbPos`，
+  下次启动在首帧之前由后端写回窗口（`place_orb_on_startup`），界面随后对它重跑一次吸附判定复原贴边形态
+  （吸附是幂等的 —— 已贴边的矩形再判一次得到同样的窗口与球偏移），所以只存左上角，不存贴边方向/球偏移/尺寸。
+  **记录点**：折叠态拖动落位判定跑完（`settleDrag` 末尾）、展开态拖动面板落位判定跑完
+  （`settleDrag` → `rememberBallUnderPanel`：按窗口位移把球算回折叠态矩形 + 判一次吸附，
+  只记录**不动窗口** —— 窗口是面板，为了球贴边把面板拽走显然不对）、收起落位跑完（`settleCollapse`）。
+  松手那一刻不记：那时只是自由落点，贴边还会再挪一次窗口；展开动画期间也不记（`opening`）。
+  没有记录时（首启 / 配置丢了）默认落在**工作区右上、垂直线 1/3 处**，右边留 `DEFAULT_ORB_MARGIN` ——
+  余量必须大于吸附阈值 `DOCK_THRESHOLD`（20 CSS px），否则首启那次落位判定会当场把球吸到边上收起大半颗。
+  复原前做一次「与显示器矩形相交」校验：上次那块屏被拔掉/分辨率变小就保持居中，
+  否则球落到屏幕外，而透明无边框窗口没有标题栏可以拖回来
 - Win11 透明无边框窗口默认带一条系统绘制的 1px 边框（沿 OS 圆角露在面板圆角之外，每次改窗口尺寸重画 → 窗口最外缘闪烁的线）：
   启动与每次改窗口尺寸时用 `DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE` + `DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_DONOTROUND` 抹掉
 - 本机标签（显示共享项列表 + 广播开关）
@@ -249,7 +261,7 @@ fn toggle_broadcast(share_id: String, targets: Vec<String>) -> Result<(), String
 
 ### Step 5：设置面板
 
-- 下载目录 + 下载模式 + 收件目录 + 端口配置
+- 下载目录 + 下载模式 + 端口配置
 - 对应 S-01 ~ S-06
 
 ### Step 6：远程树浏览 + 下载
@@ -266,9 +278,10 @@ P0 的远程树是通过 `GET /tree` 和 `GET /file` 实现的——但对端是
 // 初始化 tracing，写文件 + 轮转
 fn init_log() {
     let file_appender = tracing_appender::rolling::daily(
-        config_dir().join("logs"), "orbdrop.log"
+        data_dir().join("logs"), "orbdrop.log"
     );
-    //  详细日志：%APPDATA%/OrbDrop/logs/orbdrop.YYYY-MM-DD.log
+    //  详细日志：%LOCALAPPDATA%/OrbDrop/logs/orbdrop.YYYY-MM-DD.log
+    //  ⚠ 尚未设 max_log_files：N-11 要求的"保留 7 天/100MB"还没落地
 }
 ```
 
@@ -285,7 +298,7 @@ struct ShareItem {
     broadcast_targets: Vec<String>, // 目标设备 ID 列表
 }
 
-// 设备（持久化到配置 + token 到凭据库）
+// 设备（持久化到配置 + token 到凭据文件）
 struct PeerDevice {
     id: String,
     name: String,
@@ -293,16 +306,15 @@ struct PeerDevice {
     port: u16,
     online: bool,
     paired: bool,
-    // token 存在 keyring，不在配置文件里
+    // token 存在凭据文件里，不在配置文件里
 }
 
 // 设置（持久化到配置文件）
 #[derive(Serialize, Deserialize)]
 struct Settings {
     port: u16,                           // S-06 默认 3890
-    download_dir: PathBuf,               // S-01 默认桌面
+    download_dir: PathBuf,               // S-01 默认桌面（唯一的落盘位置：下载 + 推送接收）
     download_mode: DownloadMode,         // S-02 默认 Direct
-    inbox_dir: PathBuf,                  // S-03
     auto_start: bool,                    // S-04 默认 true
     device_name: String,                 // S-05 默认 hostname
 }
@@ -317,7 +329,7 @@ struct Settings {
 ☐ 右键 → 下载到本地（到 S-01 指定目录）
 ☐ 右键 → 下载到本地并用 Explorer/Finder 打开
 ☐ 广播开关 UI：开关 + 设备选择面板（P0 显示空列表）
-☐ 设置面板：下载目录/收件目录/下载模式/端口
-☐ 配置持久化：重启后共享项/设置恢复
+☐ 设置面板：下载目录/下载模式/端口
+☐ 配置持久化：重启后共享项/设置/悬浮球位置恢复
 ☐ 端口被占用自动 +N 探测（日志记录实际端口）
 ```

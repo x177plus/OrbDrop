@@ -15,6 +15,8 @@
 
     --ok:      oklch(58% 0.16 158);
     --warn:    oklch(62% 0.15 60);
+    /* 「关系出问题」才用的红：对端点过「断开」（重拨被拒）/ 对端不认本机 token。 */
+    --danger:  oklch(58% 0.2 25);
 
     --accent-soft:  color-mix(in oklch, var(--accent) 13%, transparent);
     --fg-soft:      color-mix(in oklch, var(--fg) 6%, transparent);
@@ -450,8 +452,24 @@ font-family: var(--font-body);
   }
   .state-chip .dot { width: 5px; height: 5px; box-shadow: none; }
   .state-chip.connected { color: color-mix(in oklch, var(--ok) 70%, black); border-color: color-mix(in oklch, var(--ok) 38%, transparent); background: var(--ok-soft); }
-  .state-chip.unbound { color: color-mix(in oklch, var(--warn) 70%, black); border-color: color-mix(in oklch, var(--warn) 40%, transparent); background: color-mix(in oklch, var(--warn) 12%, transparent); }
+  /* 已配对 = 蓝色（项目主色）：关系正常、随时可用。 */
+  .state-chip.paired { color: color-mix(in oklch, var(--accent) 70%, black); border-color: color-mix(in oklch, var(--accent) 34%, transparent); background: var(--accent-soft); }
+  /* 未绑定 = 局域网设备的常态（不配对也能推送），不是告警：中性灰，暖色只留给"要处理"。 */
+  .state-chip.unbound { color: var(--muted); border-color: var(--border); }
+  /* 关系出问题（对端点过「断开」/ token 失效）：红。这两档才是真正"出事了"。 */
+  .state-chip.danger { color: color-mix(in oklch, var(--danger) 72%, black); border-color: color-mix(in oklch, var(--danger) 32%, transparent); background: color-mix(in oklch, var(--danger) 8%, transparent); }
+  .dot.danger { background: var(--danger); }
+  /* 呼吸：只给绿（链路活着）与琥珀（正在重试）；红/灰是静止的。 */
+  @keyframes chip-breathe {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.72); }
+  }
+  .state-chip.connected .dot,
+  .state-chip.pending .dot { animation: chip-breathe 1.9s ease-in-out infinite; }
   .dot.warn { background: var(--warn); }
+  /* 已配对但离线的行：仍列在在线设备下方，只提供「解除配对」。 */
+  .state-chip.offline { border-style: dashed; }
+  .device-row:not(.online) .d-name { color: var(--muted); }
   .bcast-hint { display: flex; align-items: center; gap: 6px; margin: 8px 2px 0; font-size: var(--fs-xs); color: var(--muted); }
   .bcast-hint .dot { width: 5px; height: 5px; }
   .hl { color: var(--fg); font-weight: 500; }
@@ -474,9 +492,9 @@ font-family: var(--font-body);
   .field > label { font-size: var(--fs-xs); color: var(--muted); }
   .input { width: 100%; height: 36px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--fg); font-size: var(--fs-sm); }
   .input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
-  .path-input { display: flex; gap: 8px; }
+  .path-input { display: flex; gap: 8px; align-items: stretch; }
   .path-input .input { flex: 1; color: var(--muted); font-family: var(--font-mono); font-size: var(--fs-xs); }
-  .path-input .btn { flex: none; }
+  .path-input .btn { flex: none; height: auto; }
   .radio-group { display: flex; flex-direction: column; gap: 8px; }
   .radio { display: flex; align-items: center; gap: 9px; padding: 9px 11px; border: 1px solid var(--border); border-radius: var(--radius); cursor: pointer; font-size: var(--fs-sm); transition: border-color 0.15s ease, background 0.15s ease; }
   .radio:hover { background: var(--fg-soft); }
@@ -677,7 +695,7 @@ font-family: var(--font-body);
             添加设备 · 配对码
           </button>
 
-          <div class="list-label"><span>局域网设备</span><span class="num" id="devCount">3 台 · 1 长连接</span></div>
+          <div class="list-label"><span>局域网设备</span><span class="num" id="devCount">4 台 · 1 长连接 · 1 离线</span></div>
           <ul class="device-list" id="deviceList">
             <li class="device-row online" data-id="d1" data-state="connected" data-ip="192.168.1.6:3890">
               <span class="d-avatar">B</span>
@@ -693,7 +711,7 @@ font-family: var(--font-body);
             <li class="device-row online" data-id="d2" data-state="paired" data-ip="192.168.1.4:3891">
               <span class="d-avatar">M</span>
               <div class="d-main">
-                <div class="d-name">MacBook Pro <span class="state-chip"><span class="dot off"></span>已配对</span></div>
+                <div class="d-name">MacBook Pro <span class="state-chip paired"><span class="dot off"></span>已配对</span></div>
                 <div class="d-ip">192.168.1.4:3891</div>
               </div>
               <div class="d-acts">
@@ -704,12 +722,24 @@ font-family: var(--font-body);
             <li class="device-row online" data-id="d3" data-state="unbound" data-ip="192.168.1.9:3890">
               <span class="d-avatar">C</span>
               <div class="d-main">
-                <div class="d-name">PC-C <span class="state-chip unbound"><span class="dot warn"></span>未绑定</span></div>
+                <div class="d-name">PC-C <span class="state-chip unbound"><span class="dot off"></span>未绑定</span></div>
                 <div class="d-ip">192.168.1.9:3890</div>
               </div>
               <div class="d-acts">
                 <button class="btn btn-primary btn-sm" data-pair>配对</button>
                 <button class="btn btn-ghost btn-sm" data-push>推送</button>
+              </div>
+            </li>
+            <!-- 已配对但对方不在网上：排在最下方，唯一能做的事情就是「解除配对」
+                 （本机动作，不需要对方在线）。 -->
+            <li class="device-row" data-id="d4" data-state="paired" data-online="false" data-ip="192.168.1.7:3890">
+              <span class="d-avatar">W</span>
+              <div class="d-main">
+                <div class="d-name">Workstation <span class="state-chip offline" title="对方此刻不在网上：这一行留着是为了让你能解除配对"><span class="dot off"></span>离线</span></div>
+                <div class="d-ip">192.168.1.7:3890</div>
+              </div>
+              <div class="d-acts">
+                <button class="btn btn-ghost btn-sm" data-unpair>解除配对</button>
               </div>
             </li>
           </ul>
@@ -823,14 +853,7 @@ font-family: var(--font-body);
             <label>下载模式</label>
             <div class="radio-group">
               <label class="radio"><input type="radio" name="dlMode" checked /><span class="r-label">直接下载<span class="r-sub">收下文件并保存到下载目录</span></span></label>
-              <label class="radio"><input type="radio" name="dlMode" /><span class="r-label">每次询问<span class="r-sub">收到文件时先征求确认</span></span></label>
-            </div>
-          </div>
-          <div class="field">
-            <label for="inboxDir">收件目录</label>
-            <div class="path-input">
-              <input class="input" id="inboxDir" value="~/Desktop/OrbDrop/收件箱" readonly />
-              <button class="btn btn-secondary btn-sm" data-browse>选择</button>
+              <label class="radio"><input type="radio" name="dlMode" /><span class="r-label">每次询问<span class="r-sub">手动下载时每次弹窗选保存位置</span></span></label>
             </div>
           </div>
           <div class="field">
@@ -946,6 +969,15 @@ font-family: var(--font-body);
     }
     if (device) {
       var st = device.dataset.state;
+      if (device.dataset.online === 'false') {
+        // 离线设备：连接/推送都够不到对端，只剩「解除配对」。
+        return '<button class="ctx-item danger" data-act="unpair">' + ICON_TRASH + '解除配对</button>';
+      }
+      if (st === 'unbound') {
+        // 未绑定：只做两件事 —— 配对，或直接推送（推送不需要预先配对）。
+        return '<button class="ctx-item" data-act="pair">' + ICON_LINK + '配对</button>' +
+          '<button class="ctx-item" data-act="push">' + ICON_PUSH + '推送文件</button>';
+      }
       return (st === 'connected'
           ? '<button class="ctx-item" data-act="disconnect">' + ICON_LINKOFF + '断开长连接</button>'
           : '<button class="ctx-item" data-act="connect">' + ICON_LINK + '建立长连接</button>') +
@@ -1008,6 +1040,7 @@ font-family: var(--font-body);
         toast('已移除共享项「' + name + '」');
         break;
       case 'connect': connectDevice(drow); break;
+      case 'pair': openPair(drow); break;
       case 'disconnect': disconnectDevice(drow); break;
       case 'push': requestPush(drow); break;
       case 'unpair':
@@ -1162,16 +1195,20 @@ font-family: var(--font-body);
     if (!chip) return;
     var st = devState(row);
     var cls = 'state-chip', label, dot;
-    if (st === 'connected') { cls += ' connected'; label = '长连接'; dot = 'ok'; }
-    else if (st === 'unbound') { cls += ' unbound'; label = '未绑定'; dot = 'warn'; }
-    else { label = '已配对'; dot = 'off'; }
+    if (row.dataset.online === 'false') { cls += ' offline'; label = '离线'; dot = 'off'; }
+    else if (st === 'connected') { cls += ' connected'; label = '长连接'; dot = 'ok'; }
+    else if (st === 'unbound') { cls += ' unbound'; label = '未绑定'; dot = 'off'; }
+    else { cls += ' paired'; label = '已配对'; dot = 'off'; }
     chip.className = cls;
     chip.innerHTML = '<span class="dot ' + dot + '"></span>' + label;
   }
   function renderDeviceActions(row) {
     var acts = $('.d-acts', row);
     var st = devState(row);
-    if (st === 'connected') {
+    if (row.dataset.online === 'false') {
+      // 离线设备：连接/推送的目标都不在网上，只有「解除配对」是本机动作。
+      acts.innerHTML = '<button class="btn btn-ghost btn-sm" data-unpair>解除配对</button>';
+    } else if (st === 'connected') {
       acts.innerHTML = '<button class="btn btn-ghost btn-sm" data-disconnect>断开</button>' +
         '<button class="btn btn-ghost btn-sm" data-push>推送</button>';
     } else if (st === 'paired') {
@@ -1196,7 +1233,10 @@ font-family: var(--font-body);
       hint.hidden = true;
     }
     var c = $('#devCount');
-    if (c) c.textContent = live.length + ' 台 · ' + n + ' 长连接';
+    if (c) {
+      var offline = live.filter(function (r) { return r.dataset.online === 'false'; }).length;
+      c.textContent = live.length + ' 台 · ' + n + ' 长连接' + (offline ? ' · ' + offline + ' 离线' : '');
+    }
     var empty = $('#devEmpty');
     if (empty) empty.hidden = live.length > 0;
     var badge = $('#orbBadge');
