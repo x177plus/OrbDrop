@@ -10,6 +10,7 @@
     onToast,
     onRequestPush,
     onOpenPair,
+    onUnpair,
   }: {
     tab: TabKey;
     /** 设备标签靠它取到 ip/port 与长连接状态。 */
@@ -17,15 +18,20 @@
     onToast: (msg: string) => void;
     onRequestPush?: (device: PeerDevice) => void;
     onOpenPair?: (device: PeerDevice | null) => void;
+    onUnpair?: (device: PeerDevice) => void;
   } = $props();
 
-  let peer = $derived(tab.kind === 'peer' ? devices.find((d) => d.id === tab.peerId) : undefined);
+  // 设备列表里**已配对但离线**的行也在（为了能解除配对），但对端离线时浏览标签没有
+  // 意义（树要走长连接）—— 所以这里仍按"在线"筛选，离线时落到下面的空态。
+  let peer = $derived(
+    tab.kind === 'peer' ? devices.find((d) => d.id === tab.peerId && d.online) : undefined
+  );
 </script>
 
 {#if tab.kind === 'local'}
   <LocalTab {onToast} />
 {:else if tab.kind === 'devices'}
-  <DeviceTab {onToast} {onRequestPush} {onOpenPair} />
+  <DeviceTab {onToast} {onRequestPush} {onOpenPair} {onUnpair} />
 {:else if peer}
   {#key peer.id}
     <PeerTab device={peer} {onToast} />

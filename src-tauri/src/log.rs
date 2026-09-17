@@ -7,7 +7,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 use tracing_appender::rolling;
 
-use crate::config::config_dir;
+use crate::config::data_dir;
 
 /// 非阻塞文件写入器的 guard 必须活到进程结束（tracing-appender 的要求）：它负责把
 /// 队列刷盘，绑成 `_guard` 这种立即丢弃的绑定等于提前结束这个职责。日志文件建了却
@@ -28,9 +28,9 @@ pub fn record_crash(path: &Path, message: &str) {
     }
 }
 
-/// 崩溃记录文件的位置：配置目录不可写时退到系统临时目录，总之要留下东西。
+/// 崩溃记录文件的位置：数据目录不可写时退到系统临时目录，总之要留下东西。
 fn crash_log_path() -> PathBuf {
-    let dir = config_dir().join("logs");
+    let dir = data_dir().join("logs");
     if std::fs::create_dir_all(&dir).is_ok() {
         dir.join("crash.log")
     } else {
@@ -47,11 +47,11 @@ fn install_panic_recorder() {
     }));
 }
 
-/// Initialize tracing with daily rolling file appender in config dir /logs.
+/// Initialize tracing with daily rolling file appender in the data dir /logs.
 pub fn init_log() {
     install_panic_recorder();
 
-    let log_dir = config_dir().join("logs");
+    let log_dir = data_dir().join("logs");
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
         eprintln!("Failed to create log directory {log_dir:?}: {e}");
         return;

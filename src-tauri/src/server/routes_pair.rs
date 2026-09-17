@@ -19,7 +19,22 @@ use crate::ws::events::ui;
 /// Reports the port we are **actually listening on**: the server falls forward to
 /// port+1..port+10 when the configured port is taken, and a caller that stores the
 /// configured value would dial the wrong process (or nothing) forever.
-pub async fn pair_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+pub async fn pair_info(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Json<serde_json::Value> {
+    // 「你把带这个 token 的调用方认作谁」：对端换过 device id（数据目录被清、凭据库
+    // 还在）之后，这是对端唯一能确认"配对关系还活着"的地方 —— 凭据本身不回显，只回
+    // 它反解出的 id。
+    //
+    // 必须在锁 config 之前算：`peer_id_from_token` 自己也要读 config，parking_lot 的
+    // Mutex 不可重入。
+    let paired_as = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .and_then(|t| crate::ws::session::peer_id_from_token(&state, t));
+
     let listening = state.server_port.load(std::sync::atomic::Ordering::SeqCst);
     let config = state.config.lock();
     let port = if listening == 0 { config.port } else { listening };
@@ -28,6 +43,7 @@ pub async fn pair_info(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         "name": config.device_name,
         "port": port,
         "ver": 1,
+        "pairedAs": paired_as,
     }).into()
 }
 
@@ -88,6 +104,9 @@ pub async fn unpair(
     }
     state.ws.drop_peer(&peer_id);
     state.unpair(&peer_id);
+
+    // 同一件收尾：BC 里那条指向对方的 profile 已随 token 作废（只删我们自己写下的条目）。
+    crate::bc::provision_profiles(&state);
 
     ws::emit_ui(&state, ui::DEVICES_CHANGED, &serde_json::json!({}));
     info!(%peer_id, "peer unpaired us via HTTP");
@@ -153,11 +172,17 @@ pub async fn pair_handshake(
         port,
         online: true,
         paired: true,
+        // 刚配对：还没长连接，没有要恢复的东西。
+        auto_connect: false,
     });
 
     // 配对只到"已配对"为止：不在这里建长连接，等本机用户点「连接」再拨号。
     let own_id = state.config.lock().device_id.clone();
     let own_name = state.config.lock().device_name.clone();
+    // 刚拿到 token：把 BC 的 WebDAV profile 预写好（BC 只在启动时登记 profile 文件，
+    // 所以要抢在用户下次启动 BC 之前落盘）。
+    let written = crate::bc::provision_profiles(&state);
+    info!(peer_id, written, "配对完成，已预写 BC profile");
     ws::emit_ui(&state, ui::PAIR_COMPLETED, &serde_json::json!({
         "peerId": peer_id,
         "peerName": req.peer_name,

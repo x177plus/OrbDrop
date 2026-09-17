@@ -15,6 +15,14 @@ export interface PeerShareItem {
   isDir: boolean;
 }
 
+/** 没连着的时候"为什么"（后端 `LinkState`）。`connected` 为真时忽略它。 */
+export type LinkState =
+  | { kind: 'connected' }
+  | { kind: 'retrying' }
+  /** 对端此刻不在网上：等它出现（不再空发 TCP）。 */
+  | { kind: 'waiting' }
+  | { kind: 'stopped'; reason: 'peerDisconnected' | 'tokenRejected' | 'localDisconnected' };
+
 export interface PeerDevice {
   id: string;
   name: string;
@@ -24,15 +32,41 @@ export interface PeerDevice {
   paired: boolean;
   /** WS long connection is live (paired only) — this is what "长连接" means. */
   connected: boolean;
+  /** 自动重连的现状；缺省 = 没有拨号意图（已配对但没人点过「连接」）。 */
+  linkState?: LinkState | null;
 }
 
 export interface AppSettings {
   port: number;
+  /** 唯一的落盘目录：手动下载（受 downloadMode 影响）与推送接收都写这里。 */
   downloadDir: string;
   downloadMode: 'Direct' | 'AskEachTime';
-  inboxDir: string;
   deviceName: string;
   autoStart: boolean;
+  /** BeyondCompare 可执行文件路径；'' = 自动探测。 */
+  bcExePath: string;
+}
+
+/**
+ * BeyondCompare 比较的一端：本机共享项 / 长连接设备的共享项。
+ * `path` 是共享项内相对路径（'' = 共享项根）。
+ * `label` 是给人看的名字，由前端填（对端共享项的名字只有前端知道）；后端优先采用它。
+ */
+export type BcTarget =
+  | { kind: 'share'; shareId: string; path: string; label?: string }
+  | { kind: 'peer'; peerId: string; shareId: string; path: string; label?: string };
+
+/** 比较位上的项。 */
+export interface BcSide {
+  target: BcTarget;
+  label: string;
+}
+
+/** 后端返回的 BeyondCompare 状态：左/右比较位为空时对应字段为 null。 */
+export interface BcStatus {
+  exePath: string | null;
+  left: BcSide | null;
+  right: BcSide | null;
 }
 
 export interface TreeEntry {
@@ -44,6 +78,26 @@ export interface TreeEntry {
 
 export interface TreeResponse {
   entries: TreeEntry[];
+}
+
+/**
+ * 拖拽下载的源（F-46）：本机共享项（省略 `peerId`）或对端共享项。
+ * `path` 是共享项内相对路径（'' = 共享项根），`name` 是拖出去那一项的名字 ——
+ * 对端共享项根的名字本机不知道（只有 id），只能由界面带下来。
+ */
+export interface DragOutSource {
+  peerId?: string;
+  shareId: string;
+  path: string;
+  name: string;
+  isDir: boolean;
+}
+
+/** 拖拽票据：`ready` = false 表示后端还在把对端内容下到暂存目录。 */
+export interface DragTicket {
+  ticket: string;
+  name: string;
+  ready: boolean;
 }
 
 export interface PushInvite {

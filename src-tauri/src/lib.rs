@@ -1,7 +1,9 @@
 pub mod autostart;
+pub mod bc;
 pub mod config;
 pub mod credential;
 pub mod discover;
+pub mod drag;
 pub mod log;
 pub mod orb_window;
 pub mod pair;
@@ -21,7 +23,7 @@ use tauri_plugin_opener::OpenerExt;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use config::{AppSettings, DownloadMode, PeerDevice, ShareItem};
+use config::{AppSettings, BcTarget, DownloadMode, OrbPos, PeerDevice, ShareItem};
 use state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -61,11 +63,15 @@ pub struct ToggleBroadcastRequest {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettingsRequest {
     pub port: u16,
+    /// 唯一的落盘目录：手动下载与推送接收都写这里（见 `config::Config::download_dir`）。
     pub download_dir: String,
-    pub download_mode: String,
-    pub inbox_dir: String,
+    /// 与前端 `AppSettings.downloadMode` 同一套字面量（`Direct` / `AskEachTime`）。
+    pub download_mode: DownloadMode,
     pub device_name: String,
     pub auto_start: bool,
+    /// BeyondCompare 可执行文件路径；空串 = 自动探测。
+    #[serde(default)]
+    pub bc_exe_path: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -165,12 +171,6 @@ async fn update_settings(
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
 ) -> Result<AppSettings, String> {
-    let mode = match req.download_mode.as_str() {
-        "Direct" => DownloadMode::Direct,
-        "AskEachTime" => DownloadMode::AskEachTime,
-        other => return Err(format!("未知下载模式: {other}")),
-    };
-
     let (old_port, old_name, old_autostart);
     {
         let mut config = state.config.lock();
@@ -179,10 +179,11 @@ async fn update_settings(
         old_autostart = config.auto_start;
         config.port = req.port;
         config.download_dir = PathBuf::from(&req.download_dir);
-        config.download_mode = mode;
-        config.inbox_dir = PathBuf::from(&req.inbox_dir);
+        config.download_mode = req.download_mode;
         config.device_name = req.device_name.clone();
         config.auto_start = req.auto_start;
+        config.bc_exe_path = Some(PathBuf::from(req.bc_exe_path.trim()))
+            .filter(|p| !p.as_os_str().is_empty());
         config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
     }
 
@@ -226,6 +227,67 @@ async fn update_settings(
 }
 
 // ---------------------------------------------------------------------------
+// BeyondCompare 集成（F-41 ~ F-43）
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn bc_status(state: State<'_, Arc<AppState>>) -> bc::BcStatusDto {
+    bc::status(state.inner())
+}
+
+#[tauri::command]
+fn bc_set_side(
+    side: String,
+    target: BcTarget,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bc::BcStatusDto, String> {
+    {
+        let mut config = state.config.lock();
+        match side.as_str() {
+            "left" => config.bc_left = Some(target),
+            "right" => config.bc_right = Some(target),
+            other => return Err(format!("未知比较位: {other}")),
+        }
+        config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
+    }
+    Ok(bc::status(state.inner()))
+}
+
+#[tauri::command]
+fn bc_clear_side(
+    side: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bc::BcStatusDto, String> {
+    {
+        let mut config = state.config.lock();
+        match side.as_str() {
+            "left" => config.bc_left = None,
+            "right" => config.bc_right = None,
+            other => return Err(format!("未知比较位: {other}")),
+        }
+        config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
+    }
+    Ok(bc::status(state.inner()))
+}
+
+/// 用 BeyondCompare 打开两侧比较：目标是本机共享项就直接给本地路径，
+/// 是对端共享项就给 `profile:<ip:port>?<shareId>/<路径>`（顺手写好 WebDAV profile）。
+#[tauri::command]
+fn bc_compare(
+    a: BcTarget,
+    b: BcTarget,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let exe = bc::locate_exe(state.config.lock().bc_exe_path.as_deref())
+        .ok_or_else(|| "未找到 BeyondCompare 可执行文件，请在设置里指定路径".to_string())?;
+    let left = bc::resolve_side(state.inner(), &exe, &a)?;
+    let right = bc::resolve_side(state.inner(), &exe, &b)?;
+    bc::launch_compare(&exe, &left.arg, &right.arg)?;
+    info!(left = %left.arg, right = %right.arg, "已在 BeyondCompare 中打开比较");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Server / Device commands
 // ---------------------------------------------------------------------------
 
@@ -247,6 +309,9 @@ fn list_devices(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
         // Real WS link state — "长连接" in the UI follows this, not `online`
         // (a peer can answer HTTP push invites without any WS session).
         "connected": state.ws.has_connection(&p.id),
+        // 没连着的时候"为什么"：重连中 / 等对端上线 / 已停止（对端断开过、token 失效…）。
+        // 界面把它显示成人话，用户才知道该等、该点「连接」、还是该重新配对。
+        "linkState": state.ws.link_state(&p.id),
     })).collect()
 }
 
@@ -261,8 +326,12 @@ fn get_peer_token(peer_id: String) -> Result<Option<String>, String> {
     credential::get_peer_token(&peer_id).map_err(|e| e.to_string())
 }
 
-/// Arm the long connection by hand（F-16）: 拨号只由用户点「连接」发起，
-/// 点它就无视"必须已配对"以外的任何规则直接拨号，并结束本机之前的「断开」暂停。
+/// Arm the long connection by hand（F-16）: 拨号只由用户点「连接」（或启动时的恢复）
+/// 发起，点它就无视"必须已配对"以外的任何规则直接拨号，并结束本机之前的「断开」暂停。
+///
+/// 与启动恢复的区别在 `manual=1`：这里是**有人按了按钮**，对端收到后连它自己的暂停
+/// 一起结束；启动恢复（`ws::restore_links_on_startup`）不带这个标记，对端点过「断开」
+/// 时照旧被拒。
 ///
 /// **必须是 async 命令**：Tauri 的同步命令跑在主线程（没有 Tokio reactor），
 /// 里面 `tokio::spawn` 会 panic 掉整个进程（表现为点「连接」闪退）。
@@ -278,12 +347,16 @@ async fn connect_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Resul
 
 /// Drop the long connection and keep it down (auto-connect stays off) until the
 /// user here reconnects, or the peer asks to connect with its own 「连接」.
+///
+/// 「断开」的意图也跨重启有效：把地址簿里的长连接标记一起清掉，否则下次启动会照着
+/// 上次的记忆（F-16 重启恢复）把它自动连回来。
 #[tauri::command]
 fn disconnect_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     if state.get_peer(&peer_id).is_none() {
         return Err("设备不存在".to_string());
     }
     state.ws.pause(&peer_id);
+    state.set_auto_connect(&peer_id, false);
     state.emit_devices_changed();
     Ok(())
 }
@@ -300,7 +373,7 @@ async fn add_peer(ip: String, port: u16, state: State<'_, Arc<AppState>>) -> Res
     let info: serde_json::Value = resp.json().await.map_err(|e| format!("响应异常: {e}"))?;
     let id = info["id"].as_str().unwrap_or("").to_string();
     let name = info["name"].as_str().unwrap_or(&ip).to_string();
-    let peer = PeerDevice { id, name, ip, port, online: true, paired: false };
+    let peer = PeerDevice { id, name, ip, port, online: true, paired: false, auto_connect: false };
     state.add_peer_book(peer.clone());
     Ok(peer)
 }
@@ -345,12 +418,49 @@ pub async fn unpair_peer(state: &Arc<AppState>, peer_id: &str) -> Result<(), Str
     credential::remove_peer(peer_id).map_err(|e| e.to_string())?;
     state.ws.drop_peer(peer_id);
     state.unpair(peer_id);
+
+    // 关系没了，BC 里那条指向它的 WebDAV profile 也就没用了（token 已作废）：按当前
+    // 在册设备刷新一遍 —— prune 只删我们自己写下且已失效的条目（见 `bc::prune_webdav_profiles`）。
+    bc::provision_profiles(state);
     Ok(())
 }
 
 #[tauri::command]
 async fn remove_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     unpair_peer(state.inner(), &peer_id).await
+}
+
+/// 一键清空本机**全部**配对凭据（F-15）：用户不必（也不该）去翻文件或系统凭据管理器。
+///
+/// 三处一起清，少一处就等于没清干净：
+/// 1. 凭据文件（`%LOCALAPPDATA%\OrbDrop\credentials.dat`）—— 全部设备的 token 都在里面，
+///    删它就全清（`credential::wipe`，顺带清掉老版本留在系统凭据库里的那一条）；
+/// 2. 地址簿里的配对标记与地址行 —— 设备行留着（还在网上看得见就继续以"未绑定"列出，
+///    见 F-14），只是关系回到未配对；
+/// 3. 本机写进 Beyond Compare 的 WebDAV profile —— 那是 token 的**第二份拷贝**，
+///    清凭据不清它，BC 里就还躺着一份能连上对端的密码。token 没了，`provision_profiles`
+///    会把我们自己写下的条目全部剪掉（只删用户名是 `OrbDrop` 的那些）。
+///
+/// 只清本机：不逐个通知对端（那要 N 次 HTTP，对端离线时"清空"会被网络卡住）。
+/// 对端的反应与"本机凭据被外部清掉"完全一样：它下次请求 401 → 「需重新配对」。
+pub fn wipe_all_credentials(state: &Arc<AppState>) -> Result<usize, String> {
+    let ids: Vec<String> = state.peers.lock().iter().map(|p| p.id.clone()).collect();
+
+    // 先清凭据：失败就原样退出，别把地址簿清了却留下还能用的 token
+    // （用户点了"清空"却发现对端还认我们 —— 那是最糟的半清状态）。
+    credential::wipe().map_err(|e| e.to_string())?;
+    for id in &ids {
+        state.ws.drop_peer(id);
+        state.unpair(id);
+    }
+    bc::provision_profiles(state);
+    info!(peers = ids.len(), "wiped all pairing credentials");
+    Ok(ids.len())
+}
+
+#[tauri::command]
+async fn wipe_credentials(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
+    wipe_all_credentials(state.inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -419,9 +529,12 @@ async fn pair_confirm(peer_id: String, code: String, state: State<'_, Arc<AppSta
         port: peer.port,
         online: true,
         paired: true,
+        auto_connect: false,
     });
 
     // 配对只确立"已配对"关系：长连接等用户自己点「连接」再建（不再自动拨号）。
+    let written = bc::provision_profiles(state.inner());
+    info!(peer_id = %remote_id, written, "配对完成，已预写 BC profile");
     ws::emit_ui(&state, ws::events::ui::PAIR_COMPLETED, &serde_json::json!({
         "peerId": remote_id,
     }));
@@ -590,6 +703,35 @@ async fn download_and_open(
     Ok(path)
 }
 
+// ---------------------------------------------------------------------------
+// 拖拽下载（把树里的任意文件/目录拖到资源管理器里落盘）
+// ---------------------------------------------------------------------------
+
+/// 登记一次拖拽意图（界面按下鼠标动起来就调它）。本机共享项当场返回可拖的票据，
+/// 对端共享项返回"还在准备"的票据并开始在后台下到暂存目录 ——
+/// 拖放循环要跟着按住的主键走，所以下载只能赶在起拖之前先跑起来。
+///
+/// **必须是 async 命令**：对端项要 `task::spawn` 一个下载任务，而 Tauri 的同步命令跑在
+/// 主线程（没有 Tokio reactor），那里 spawn 会被 `task::spawn` 挡下 —— 票据就永远停在
+/// 「准备中」，用户只看到一行 "no tokio runtime here; task skipped"（同 `connect_peer`）。
+#[tauri::command]
+async fn prepare_drag_out(
+    req: drag::DragOutRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<drag::DragTicket, String> {
+    state.drag.prepare(state.inner(), &req)
+}
+
+/// 起拖：等暂存备好后在主线程跑 OLE 拖放（阻塞到用户松手）。返回时拖放已经结束。
+#[tauri::command]
+async fn start_drag_out(
+    app: AppHandle,
+    ticket: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    drag::start(app, state.inner().clone(), ticket).await
+}
+
 fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -636,6 +778,68 @@ fn orb_mouse_down() -> bool {
     orb_window::mouse_down()
 }
 
+/// 记录悬浮球落位（折叠态窗口左上角，物理像素）：下次启动复原到同一位置（F-74）。
+///
+/// 由界面在**几何落定之后**调用（拖动松手 → 吸附判定跑完 → 窗口不再动），见 App.svelte
+/// `rememberOrbPos`；松手那一刻记下的是自由落点，贴边还会再挪一次窗口。位置没变就不落盘。
+#[tauri::command]
+fn orb_save_pos(x: i32, y: i32, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let mut config = state.config.lock();
+    if config.orb_pos == Some(OrbPos { x, y }) {
+        return Ok(());
+    }
+    config.orb_pos = Some(OrbPos { x, y });
+    config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())
+}
+
+/// 启动落位：有记录就回到记录的位置，没记录（首启 / 配置丢了）就放到默认落位。
+///
+/// 两种都在 `setup` 里做完、赶在首帧之前：窗口是按 tauri.conf 的 `center: true` 建的，
+/// 等界面起来再挪会看到球从屏幕中央跳过去。落位之后界面还会对同一个矩形重跑一次吸附
+/// 判定，复原贴边形态（吸附幂等，默认落位则因为余量大于阈值而不吸附）。
+fn place_orb_on_startup(app: &AppHandle) {
+    let Some(win) = app.get_webview_window("main") else {
+        warn!("未找到 main 窗口，跳过悬浮球落位");
+        return;
+    };
+    let saved = app.state::<Arc<AppState>>().config.lock().orb_pos;
+    let (x, y) = match saved {
+        // 上次那块显示器没了 / 分辨率变小：留在居中，否则球落到屏幕外、用户拖不回来
+        // （透明无边框窗口没有标题栏）
+        Some(pos) if !orb_window::visible_on_some_monitor(&win, pos.x, pos.y) => {
+            warn!(x = pos.x, y = pos.y, "上次的悬浮球位置已不在任何显示器上，保持居中");
+            return;
+        }
+        Some(pos) => (pos.x, pos.y),
+        None => match orb_window::default_pos(&win, collapsed_logical(&app.config())) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("算默认悬浮球落位失败，保持居中: {e}");
+                return;
+            }
+        },
+    };
+    match win.set_position(tauri::PhysicalPosition::new(x, y)) {
+        Ok(()) if saved.is_some() => info!(x, y, "已复原悬浮球位置"),
+        Ok(()) => info!(x, y, "首启：悬浮球放在默认落位（右上 1/3，靠边不吸附）"),
+        Err(e) => warn!("悬浮球落位失败: {e}"),
+    }
+}
+
+/// 折叠态窗口的标称边长（逻辑像素，即 tauri.conf 里 main 窗口的 `width`）。
+///
+/// 默认落位要用它算窗口边长：启动那一刻窗口的 `outer_size()` 还带着 DWM 阴影余量，
+/// 不是真实边长（见 `orb_window::default_pos`）。
+fn collapsed_logical(config: &tauri::Config) -> f64 {
+    config
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "main")
+        .map(|w| w.width)
+        .unwrap_or(90.0)
+}
+
 // ---------------------------------------------------------------------------
 // App setup
 // ---------------------------------------------------------------------------
@@ -668,6 +872,13 @@ fn setup_server_task(app: &AppHandle) {
                     let s2 = arc_state.clone();
                     tokio::spawn(async move {
                         use discover::PeerEvent;
+                        // 身份核对要按对端自己的 token 问一次 `/pair/info`（见
+                        // `state::reconcile_stale_identity`）：超时给短一点，别让
+                        // 一次慢回话卡住后面的事件。
+                        let client = reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(2))
+                            .build()
+                            .unwrap_or_default();
                         while let Some(event) = mdns_rx.recv().await {
                             match event {
                                 PeerEvent::Online { id, name, ip, port } => {
@@ -677,6 +888,12 @@ fn setup_server_task(app: &AppHandle) {
                                         let peers = s2.peers.lock();
                                         peers.iter().any(|p| p.id == id && p.paired)
                                     };
+                                    // 之前是不是已经算在线：只有"重新出现"[离线→在线]才值得
+                                    // 触发一次接回（mDNS 反复重解析同一条记录很常见）。
+                                    let was_online = s2
+                                        .get_peer(&id)
+                                        .map(|p| p.online)
+                                        .unwrap_or(false);
                                     s2.upsert_peer(&PeerDevice {
                                         id: id.clone(),
                                         name,
@@ -684,11 +901,32 @@ fn setup_server_task(app: &AppHandle) {
                                         port,
                                         online: true,
                                         paired,
+                                        // 发现条目不带长连接意图：这由链路本身
+                                        // （`set_auto_connect`）记，别在这里覆盖。
+                                        auto_connect: false,
                                     });
                                     // mDNS is often the only source of a paired
                                     // peer's address (the credential store keeps
                                     // no address) — but it only fills the address
-                                    // in: the long connection waits for a click.
+                                    // in: the link comes from a 「连接」 click or
+                                    // from `restore_links_on_startup` on boot（或
+                                    // 由下面这条"重新出现"的证据触发）。
+                                    if !was_online {
+                                        ws::redial_if_remembered(&s2, &id);
+                                    }
+
+                                    // 一个地址上只能有一个身份：对端被重置过（数据目录
+                                    // 清了 → 换了 device id）时，本机为旧 id 存的那一行
+                                    // 还指着这个地址 —— 收拾掉它，别让同一台设备在列表里
+                                    // 留两行（旧行"已绑定"、新行"未绑定"）。
+                                    for stale_id in s2.stale_ids_at(&ip.to_string(), port, &id) {
+                                        state::reconcile_stale_identity(
+                                            &s2,
+                                            &client,
+                                            &stale_id,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 PeerEvent::Offline(id) => {
                                     s2.set_peer_online(&id, false);
@@ -700,6 +938,10 @@ fn setup_server_task(app: &AppHandle) {
                     // Watch existing shares.
                     share::watcher::watch_all_shares(&arc_state);
 
+                    // 恢复上次关机时的长连接（F-16）：地址簿里记着"还连着"的设备自动
+                    // 拨回来——用户不用重新点一遍「连接」。
+                    ws::restore_links_on_startup(&arc_state);
+
                     // Liveness backstop: mDNS only reports a departure when the peer
                     // sends goodbye or its records expire (up to ~2 min), and a
                     // re-registration under the same instance name may not be
@@ -707,6 +949,10 @@ fn setup_server_task(app: &AppHandle) {
                     // endpoint both demotes dead peers and promotes returned ones,
                     // so the device list reflects reachability within seconds.
                     // Peers with a live WS link need no probe.
+                    //
+                    // 探活认的是**身份**，不是"这个地址上有人答话"：同一个地址换过
+                    // device id（对端清过数据）时必须认出来，否则旧行会永远"在线"，
+                    // 与它真正的新身份并排显示成两行（见 `state::probe_step`）。
                     let probe_state = arc_state.clone();
                     tokio::spawn(async move {
                         let client = reqwest::Client::builder()
@@ -715,25 +961,7 @@ fn setup_server_task(app: &AppHandle) {
                             .unwrap_or_default();
                         loop {
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            let candidates: Vec<PeerDevice> = probe_state
-                                .peers
-                                .lock()
-                                .iter()
-                                .filter(|p| !p.ip.is_empty() && p.port != 0)
-                                .cloned()
-                                .collect();
-                            for p in candidates {
-                                if probe_state.ws.has_connection(&p.id) {
-                                    probe_state.set_peer_online(&p.id, true);
-                                    continue;
-                                }
-                                let url = format!("http://{}:{}/pair/info", p.ip, p.port);
-                                let alive = matches!(client.get(&url).send().await, Ok(r) if r.status().is_success());
-                                if !alive && p.online {
-                                    info!(peer_id = %p.id, "peer unreachable, marking offline");
-                                }
-                                probe_state.set_peer_online(&p.id, alive);
-                            }
+                            state::probe_peers_once(&probe_state, &client).await;
                         }
                     });
 
@@ -774,6 +1002,25 @@ pub fn run() {
         "OrbDrop 启动"
     );
 
+    // 老版本把整份配对凭据放在系统凭据库里；现在它住在数据目录的凭据文件里。
+    // 迁移**只在这里**发生（启动时显式一次）：读路径绝不改用户的东西。
+    // 先写文件、后删老条目，中途失败只是两处都在，下次启动重来。
+    match credential::migrate_legacy_entry() {
+        Ok(Some(peers)) => info!(peers = peers.len(), "已把系统凭据库里的配对迁移到凭据文件"),
+        Ok(None) => {}
+        // 迁不动不是致命错误：读路径会只读地回落到老条目，功能照旧。
+        Err(e) => warn!("配对凭据迁移失败（继续用系统凭据库里的老条目）: {e}"),
+    }
+
+    // P1 写出的凭据文件是"头部 + base64 正文 + 署名"的明文遮挡；现在是整块混淆。
+    // 老文件照样读得回来，但只在启动时改写一次（读路径绝不改用户的东西）。
+    // 改不动不是致命错误：老格式的读兼容一直在，下次启动重来。
+    match credential::upgrade_vault_format() {
+        Ok(Some(peers)) => info!(peers, "已把凭据文件改写成整块混淆格式"),
+        Ok(None) => {}
+        Err(e) => warn!("凭据文件格式改写失败（继续按老格式读）: {e}"),
+    }
+
     let state = Arc::new(AppState::new(config, config_path));
 
     tauri::Builder::default()
@@ -801,6 +1048,10 @@ pub fn run() {
             toggle_broadcast,
             get_settings,
             update_settings,
+            bc_status,
+            bc_set_side,
+            bc_clear_side,
+            bc_compare,
             get_actual_port,
             list_devices,
             add_peer,
@@ -810,6 +1061,7 @@ pub fn run() {
             get_peer_token,
             connect_peer,
             disconnect_peer,
+            wipe_credentials,
             push_invite,
             accept_push,
             reject_push,
@@ -819,11 +1071,14 @@ pub fn run() {
             download_from_peer,
             download_file,
             download_and_open,
+            prepare_drag_out,
+            start_drag_out,
             start_http_server,
             get_app_state,
             orb_screen_metrics,
             orb_set_rect,
             orb_mouse_down,
+            orb_save_pos,
         ])
         .setup(|app| {
             // Store the AppHandle so WS events can be emitted.
@@ -840,7 +1095,15 @@ pub fn run() {
                 None => warn!("未找到 main 窗口，跳过系统边框处理"),
             }
 
+            // 悬浮球回到上次的位置；没有记录（首启）就放到默认落位（右上 1/3）
+            place_orb_on_startup(app.handle());
+
             setup_server_task(app.handle());
+
+            // 尽早把 BC 的 profile 文件立起来（含所有已配对设备）：
+            // BC 只在启动时登记 profile 文件，晚了就得等它重启才认。
+            let written = bc::provision_profiles(&state_arc);
+            info!(written, "启动预写 BeyondCompare profile 完成");
             Ok(())
         })
         .run(tauri::generate_context!())

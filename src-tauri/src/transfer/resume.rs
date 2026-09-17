@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::config::config_dir;
+use crate::config::data_dir;
 
 /// Persisted resume offsets (F-60): invite_id → relative path → safe offset.
 ///
@@ -24,7 +24,7 @@ pub struct ResumeStore {
 
 impl ResumeStore {
     pub fn new() -> Self {
-        let path = config_dir().join("resume.json");
+        let path = data_dir().join("resume.json");
         let inner = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<ResumeFile>(&s).ok())
@@ -85,7 +85,7 @@ impl Default for ResumeStore {
     }
 }
 
-/// Sanitize a relative path so it cannot escape the inbox dir.
+/// Sanitize a relative path so it cannot escape the save root (下载目录 / 推送落盘根).
 pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     let mut out = root.to_path_buf();
     for part in rel.split('/') {

@@ -1,4 +1,4 @@
-use std::path::Path;
+
 use std::sync::Arc;
 
 use axum::extract::{Extension, State};
@@ -17,30 +17,23 @@ pub async fn shares_handler(
     Extension(caller): Extension<Caller>,
 ) -> Json<Value> {
     let shares = state.config.lock().shares.clone();
-    let items: Vec<Value> = shares
-        .iter()
-        .filter(|s| caller.sees_share(&state, s))
-        .map(|s| {
-            json!({
-                "id": s.id,
-                "name": s.name,
-                "createdAt": s.created_at,
-                "isDir": looks_like_dir(&s.path),
-            })
-        })
-        .collect();
+    let mut items = Vec::new();
+    for s in shares.iter().filter(|s| caller.sees_share(&state, s)) {
+        // 真去问文件系统。早先用"名字里有没有点"猜（无扩展名算目录），猜错的代价不只是
+        // 图标：对端按这个 `isDir` 决定"展开成树"还是"当成一个文件"，一旦把文件当成目录，
+        // 展开就是一句 `Path is not a directory`（拖拽同样会被当成目录走）。
+        let is_dir = tokio::fs::metadata(&s.path)
+            .await
+            .map(|m| m.is_dir())
+            // 拿不到元数据（文件被删/无权限）时按"文件"处理：文件拖得动，目录也没有
+            // "点开才报错"的尴尬。
+            .unwrap_or(false);
+        items.push(json!({
+            "id": s.id,
+            "name": s.name,
+            "createdAt": s.created_at,
+            "isDir": is_dir,
+        }));
+    }
     Json(json!({ "shares": items }))
-}
-
-/// 与前端 `LocalTab.isDir` 同一套判断（无扩展名视为目录），
-/// 保证本机列表与对端设备标签里的图标/可展开性一致。
-fn looks_like_dir(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    if s.ends_with('\\') || s.ends_with('/') {
-        return true;
-    }
-    match s.rsplit(['\\', '/']).next() {
-        Some(name) => !name.contains('.'),
-        None => false,
-    }
 }
