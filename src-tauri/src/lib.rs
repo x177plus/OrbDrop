@@ -296,6 +296,26 @@ fn get_actual_port(state: State<'_, Arc<AppState>>) -> u16 {
     state.server_port.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// 本机内网地址（左下角「端口 · IP」用）。
+///
+/// 多网卡（有线 + 无线 + VPN）时会返回好几个：`primary` 是界面显示的那一个，
+/// `all` 供悬停提示把其余几个列全 —— 只显示第一个是必须的（footer 装不下），
+/// 但"我还有别的地址"这件事得让人看得见，否则跨网段手动添加时会对不上号。
+#[derive(Debug, Serialize)]
+struct LocalAddresses {
+    primary: Option<String>,
+    all: Vec<String>,
+}
+
+#[tauri::command]
+fn local_addresses() -> LocalAddresses {
+    let all = server::local_ipv4_addresses();
+    LocalAddresses {
+        primary: all.first().cloned(),
+        all,
+    }
+}
+
 #[tauri::command]
 fn list_devices(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
     let peers = state.peers.lock();
@@ -333,8 +353,8 @@ fn get_peer_token(peer_id: String) -> Result<Option<String>, String> {
 /// 一起结束；启动恢复（`ws::restore_links_on_startup`）不带这个标记，对端点过「断开」
 /// 时照旧被拒。
 ///
-/// **必须是 async 命令**：Tauri 的同步命令跑在主线程（没有 Tokio reactor），
-/// 里面 `tokio::spawn` 会 panic 掉整个进程（表现为点「连接」闪退）。
+/// **保持 async**：拨号任务要在运行时上跑。异步命令天然满足；写成同步的话就得靠
+/// `task::spawn` 退到 Tauri 的全局运行时（能跑，但多绕一层）。
 #[tauri::command]
 async fn connect_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     if state.get_peer(&peer_id).is_none() {
@@ -517,48 +537,81 @@ async fn pair_confirm(peer_id: String, code: String, state: State<'_, Arc<AppSta
     let remote_id = result["peerId"].as_str().unwrap_or(&peer_id).to_string();
     let remote_name = result["peerName"].as_str().unwrap_or(&peer.name).to_string();
 
-    // Store token under the peer's actual id.
-    credential::set_peer(&remote_id, &token).map_err(|e| e.to_string())?;
-
-    // Mark paired.
+    // Store token under the peer's actual id + mark paired （与邀请那条路共用同一段落库：
+    // 凭据、地址簿、BC profile 预写、界面事件）。
     let peer_name = remote_name.clone();
-    state.mark_paired(&PeerDevice {
-        id: remote_id.clone(),
-        name: remote_name,
-        ip: peer.ip.clone(),
-        port: peer.port,
-        online: true,
-        paired: true,
-        auto_connect: false,
-    });
+    pair::commit_pairing(
+        state.inner(),
+        pair::PairedPeer {
+            id: remote_id,
+            name: remote_name,
+            ip: peer.ip.clone(),
+            port: peer.port,
+        },
+        &token,
+        None,
+    )?;
 
     // 配对只确立"已配对"关系：长连接等用户自己点「连接」再建（不再自动拨号）。
-    let written = bc::provision_profiles(state.inner());
-    info!(peer_id = %remote_id, written, "配对完成，已预写 BC profile");
-    ws::emit_ui(&state, ws::events::ui::PAIR_COMPLETED, &serde_json::json!({
-        "peerId": remote_id,
-    }));
-    ws::emit_ui(&state, ws::events::ui::DEVICES_CHANGED, &serde_json::json!({}));
-
     Ok(peer_name)
+}
+
+// ---------------------------------------------------------------------------
+// Pairing invite commands (F-12 免配对码那条路)
+// ---------------------------------------------------------------------------
+
+/// 发起配对邀请：对端在它自己的通知里点「接收」即可完成配对，不需要任何人输入配对码。
+/// 返回邀请 id；对方接受与否走 `pair://completed` / `pair://invite_failed` 事件回来。
+#[tauri::command]
+async fn pair_invite(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    pair::invite_peer(state.inner().clone(), &peer_id).await
+}
+
+/// 撤回一条还没被处理的配对邀请（用户点了「取消」）：对端界面上那条通知跟着撤掉。
+#[tauri::command]
+async fn cancel_pair_invite(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    pair::withdraw_invite_remote(state.inner().clone(), &invite_id).await
+}
+
+/// 接收方：在通知里点「接收」——交换 token、两边都变「已配对」。返回对方设备名。
+///
+/// **同步命令是安全的**：它只做内存/文件写（凭据、地址簿、BC profile），不起后台任务。
+#[tauri::command]
+fn accept_pair_invite(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    pair::accept_invite(state.inner(), &invite_id)
+}
+
+/// 接收方：在通知里点「拒绝」。
+#[tauri::command]
+fn reject_pair_invite(invite_id: String, state: State<'_, Arc<AppState>>) {
+    pair::reject_invite(state.inner(), &invite_id);
 }
 
 // ---------------------------------------------------------------------------
 // Push commands (F-50 ~ F-54)
 // ---------------------------------------------------------------------------
 
+/// 推送本机文件/目录（用户在文件选择框里挑的，可多选）给某台设备（F-50）。
+///
+/// 目标可以是任何在线设备：长连接、已配对未连、未绑定都能推（未绑定走 HTTP 邀请）。
+/// 多选合并成**一条**推送：对端只弹一张卡、只同意一次、一条进度。
+/// 返回邀请 id；对方同意与否由 `push://response` / `push://done` 事件回来。
 #[tauri::command]
-async fn push_invite(
-    share_id: String,
-    path: String,
+async fn push_paths(
+    paths: Vec<String>,
     peer_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    transfer::invite_push(state.inner().clone(), &share_id, &path, &peer_id).await
+    transfer::push_paths(state.inner().clone(), paths, &peer_id).await
 }
 
+/// 接收方点「同意接收」：起下载任务。
+///
+/// **必须是 async 命令**：下载任务要在运行时上跑。写成同步命令的话它跑在主线程上 —— 那里
+/// 没有 reactor，任务会被丢掉（用户侧："点了同意，两边都停在 0%"）。`task::spawn` 现在有
+/// 兜底（退到 Tauri 的全局运行时），但异步命令才是这里最自然的上下文。
 #[tauri::command]
-fn accept_push(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+async fn accept_push(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     transfer::accept_invite(state.inner().clone(), &invite_id)
 }
 
@@ -568,20 +621,17 @@ fn reject_push(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<(),
     Ok(())
 }
 
+/// 发送方取消：要顺带把撤销告诉对端（没有长连接时是 `POST /push/report`）—— 同样需要运行时。
 #[tauri::command]
-fn cancel_push(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+async fn cancel_push(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     transfer::cancel_push(&state, &invite_id)
 }
 
+/// 接收方取消：要回执发送方（同样可能走 `POST /push/report`）—— 同样需要运行时。
 #[tauri::command]
-fn cancel_receive(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+async fn cancel_receive(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     transfer::cancel_receive(&state, &invite_id);
     Ok(())
-}
-
-#[tauri::command]
-fn push_job_status(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<Option<String>, String> {
-    Ok(state.push.job_status(&invite_id))
 }
 
 // ---------------------------------------------------------------------------
@@ -711,9 +761,7 @@ async fn download_and_open(
 /// 对端共享项返回"还在准备"的票据并开始在后台下到暂存目录 ——
 /// 拖放循环要跟着按住的主键走，所以下载只能赶在起拖之前先跑起来。
 ///
-/// **必须是 async 命令**：对端项要 `task::spawn` 一个下载任务，而 Tauri 的同步命令跑在
-/// 主线程（没有 Tokio reactor），那里 spawn 会被 `task::spawn` 挡下 —— 票据就永远停在
-/// 「准备中」，用户只看到一行 "no tokio runtime here; task skipped"（同 `connect_peer`）。
+/// **保持 async**：对端项要在后台拉元数据/内容，这活儿得在运行时上跑。
 #[tauri::command]
 async fn prepare_drag_out(
     req: drag::DragOutRequest,
@@ -770,6 +818,15 @@ fn orb_screen_metrics(window: WebviewWindow) -> Result<orb_window::ScreenMetrics
 #[tauri::command]
 fn orb_set_rect(window: WebviewWindow, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
     orb_window::set_rect(&window, orb_window::Rect { x, y, w, h })
+}
+
+/// 开始拖动悬浮球窗口：先按按下点校正抓取锚点，再当场把拖动交给 OS。
+///
+/// 校正与起拖必须在同一次调用里完成（OS 是在起拖那一刻把窗口钉在指针上的，中间多一趟往返，
+/// 指针就又走了一段）—— 见 `orb_window::drag_start`。
+#[tauri::command]
+fn orb_drag_start(window: WebviewWindow, press_x: f64, press_y: f64) -> Result<(), String> {
+    orb_window::drag_start(&window, press_x, press_y)
 }
 
 /// 鼠标主键是否仍按着：拖动悬浮球时页面收不到 mouseup，贴边落位得靠它等松手。
@@ -1053,21 +1110,25 @@ pub fn run() {
             bc_clear_side,
             bc_compare,
             get_actual_port,
+            local_addresses,
             list_devices,
             add_peer,
             remove_peer,
             pair_start,
             pair_confirm,
+            pair_invite,
+            cancel_pair_invite,
+            accept_pair_invite,
+            reject_pair_invite,
             get_peer_token,
             connect_peer,
             disconnect_peer,
             wipe_credentials,
-            push_invite,
+            push_paths,
             accept_push,
             reject_push,
             cancel_push,
             cancel_receive,
-            push_job_status,
             download_from_peer,
             download_file,
             download_and_open,
@@ -1077,6 +1138,7 @@ pub fn run() {
             get_app_state,
             orb_screen_metrics,
             orb_set_rect,
+            orb_drag_start,
             orb_mouse_down,
             orb_save_pos,
         ])

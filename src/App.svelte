@@ -2,19 +2,25 @@
   import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
   import { LogicalSize } from '@tauri-apps/api/dpi';
   import { onMount } from 'svelte';
+  import { fly } from 'svelte/transition';
+  import { cubicOut } from 'svelte/easing';
   import { listen } from '@tauri-apps/api/event';
   import { getDevices, loadDevices } from '$lib/stores/devices.svelte';
   import { getServerPort, setServerPort, loadShares, addShare, removeShare, getShares } from '$lib/stores/shares.svelte';
   import { loadSettings } from '$lib/stores/settings.svelte';
   import { getBcStatus, loadBcStatus, setBcSide, clearSide, compare } from '$lib/stores/bc.svelte';
-  import { getActualPort, startHttpServer, acceptPush, rejectPush, orbScreenMetrics, orbSetRect, orbMouseDown, orbSavePos, addPeer, pairStart, pairConfirm, connectPeer, disconnectPeer, removePeer, downloadFromPeer } from '$lib/api';
-  import type { PushInvite, PeerDevice, TabKey, BcTarget } from '$lib/types';
+  import { getActualPort, startHttpServer, acceptPush, rejectPush, cancelPush, cancelReceive, pushPaths, localAddresses, orbScreenMetrics, orbSetRect, orbDragStart, orbMouseDown, orbSavePos, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer } from '$lib/api';
+  import { open as openDialog } from '@tauri-apps/plugin-dialog';
+  import type { PushInvite, PeerDevice, TabKey, BcTarget, OrbDragInfo } from '$lib/types';
   import { planExpansion, planCollapse, planDock, type DockPlan, type ScreenRect } from '$lib/orbLayout';
   import Orb from '$lib/components/Orb.svelte';
+  import Logo from '$lib/components/Logo.svelte';
   import TabBar from '$lib/components/TabBar.svelte';
   import TabContent from '$lib/components/TabContent.svelte';
   import SettingsPanel from '$lib/components/SettingsPanel.svelte';
   import ContextMenu from '$lib/components/ContextMenu.svelte';
+  import Hint from '$lib/components/Hint.svelte';
+  import HintLayer from '$lib/components/HintLayer.svelte';
 
   const appWindow = getCurrentWebviewWindow();
   const COLLAPSED = new LogicalSize(90, 90);
@@ -29,6 +35,9 @@
   const DOCK_EXPOSE = 1 / 3;                                       // 贴边收起后仍露在屏幕内的比例（其余推到屏幕外）
   const DOCK_SETTLE_MS = 160;                                      // 拖动停手多久后判定吸附（OS 拖动期间 move 事件成串到达）
   const DRAG_POLL_MS = 60;                                         // 还按着鼠标时轮询「松手了没有」的间隔
+  // 通知气泡甩入/甩出的时长。`prefers-reduced-motion` 下归零：动效可以省，功能不能省
+  // （收/展、确认都照旧）。
+  const MOTION = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 200;
 
   /**
    * 等 WebView2 的 CSS 视口跟上 OS 窗口尺寸。
@@ -61,10 +70,55 @@
   let opening = false;
   let settling = false;   // 落位判定进行中（含「等松手」轮询）：防止 move 事件重复起一轮
 
-  // Push card state (sending progress)
-  let pushCardState = $state<{ title: string; target: string; total: string; progress: number; done: boolean; received: number } | null>(null);
-  // Consent card state (incoming push)
-  let consentState = $state<{ from: string; name: string; size: string; bytes: number } | null>(null);
+  // 发送侧：一条推送从"等对方同意"到传完，全程只有这一张卡片。
+  // 是个列表而不是单张：同时在推两个目标（或同一目标的两个文件）时，两张卡各自走完，
+  // 不会被后来者顶掉 —— 顶掉等于把前一条的进度条凭空抹掉。
+  type PushCard = {
+    inviteId: string;
+    target: string;      // 目标设备名
+    name: string;        // 文件/目录名（多选时是容器名）
+    /** 这次推了几项（>1 = 多选）。 */
+    count: number;
+    total: number;       // 总字节数
+    received: number;
+    phase: 'waiting' | 'sending' | 'done';
+    /** 目标已绑定：对方**不需要点同意**，所以"等待对方同意"那一段只是短暂过场。 */
+    auto: boolean;
+  };
+  let pushCards = $state<PushCard[]>([]);
+  // 接收侧：待处理的通知（推送邀请 / 接收中 / 已收到待确认 / 接收失败）。
+  // 悬浮球左上角的数字就是这个数组的长度 —— 卡片/气泡撤掉，数字就减。
+  type PushNotice = {
+    inviteId: string;
+    /**
+     * invite    未绑定设备发来的邀请：要用户点「接收/拒绝」（底部那张全宽卡）
+     * receiving 传输进行中（底部那张全宽卡，带进度与「取消」）
+     * done      已经收完，**等用户确认**（右下角气泡，点了「知道了」才消失）
+     * failed    失败，同样等用户确认（右下角气泡）
+     * pair      对端发来的**配对邀请**：点「接收」即配对（免输入配对码，F-12）
+     * pairWait  本机**发出去**、还在等对端在它的通知里处理的配对邀请（带「取消」）
+     */
+    kind: 'invite' | 'receiving' | 'done' | 'failed' | 'pair' | 'pairWait';
+    from: string;        // 对方设备名
+    name: string;        // 文件/目录名（多选时是容器名）
+    size: number;
+    isDir: boolean;
+    /** 对方这次选了几项（>1 = 多选；通知标题按它换文案）。 */
+    count: number;
+    received: number;
+    error?: string;
+    /** 落盘位置（`<下载目录>/<发送方名>`），只有 done 有。 */
+    dest?: string;
+    /** 配对邀请的发起方 id（kind = 'pair'）。 */
+    peerId?: string;
+  };
+  let notices = $state<PushNotice[]>([]);
+  // 铃铛：展开/收起右下角那组"等你确认"的气泡。收起 ≠ 已读 —— 角标照旧挂着。
+  let notifOpen = $state(true);
+  // 「推送到 X」的选择框：系统选择框一次只能挑一种（文件 / 文件夹是两种对话框），
+  // 所以先在这一层问一句要哪种，再弹原生框。
+  // 选择框一律允许多选：多选也能只挑一个，没有额外操作成本（挑一个 = 单发）。
+  let pushPicker = $state<{ device: PeerDevice } | null>(null);
   // Pair dialog state: we display our own code (issued by the backend) and
   // accept the code the other side displays in the same dialog.
   type PairDialog = {
@@ -86,10 +140,48 @@
   // Context menu
   type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer'; el?: HTMLElement; shareId?: string; path?: string; isDir?: boolean; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; peerName?: string; name?: string };
   let ctxState = $state<CtxState | null>(null);
-  // Push invitation overlay (real incoming)
-  let pushInvite = $state<PushInvite | null>(null);
 
   let connectedCount = $derived(getDevices().filter(d => d.connected).length);
+  // 悬浮球左上角 / 铃铛的角标：这一组里还有几件事（通知 + 在途推送）。
+  // 铃铛收起的不只是"通知"—— 发送方的进度卡也在同一组里，所以角标得一起算，
+  // 否则会出现"收起后角标还在、但组里明明有东西"的错位。
+  let notifCount = $derived(notices.length + pushCards.length);
+  // 通知（面板右下角那组气泡）：未绑定的邀请、正在接收、已收到待确认、失败 —— **全都在
+  // 这一组里**，形状统一（右对齐、2/3 面板宽，不占满）。要当场点的按钮（接收/拒绝/取消）
+  // 就长在气泡里，所以它们不单独占一层。
+  // 气泡组容器：新气泡总是贴在最下缘（就是面板右下角），所以每次都把它滚到底。
+  let notifEl = $state<HTMLDivElement | null>(null);
+  $effect(() => {
+    void notices.length;
+    if (notifEl) notifEl.scrollTop = notifEl.scrollHeight;
+  });
+  // footer 的实际高度 + 通知组能用的最大高度：两个都量，不写死数字。
+  // 通知组的可用区间 = **标签栏下方 → footer 上缘**（`.panel-body` 的顶边正好是标签栏的
+  // 下缘），上下各留 12px、与左右一致；标签栏会随长连接设备增减、footer 会随地址换行变高，
+  // 所以挂 ResizeObserver 跟着重算。
+  let footEl = $state<HTMLElement | null>(null);
+  let bodyEl = $state<HTMLElement | null>(null);
+  let footH = $state(40);
+  let notifMaxH = $state(320);
+  $effect(() => {
+    const foot = footEl;
+    const body = bodyEl;
+    if (!foot) return;
+    const measure = () => {
+      footH = foot.offsetHeight;
+      if (!body) return;
+      // 通知组盒子的高度预算 = **标签栏下缘 → footer 上缘**（盒子的上下边就是这两条横线，
+      // 滚动区域正好夹在中间，内容越不过线去）。阴影余量在盒子内部的 padding 里让，
+      // 不从这里扣 —— 所以这里不减任何数字。
+      const avail = foot.getBoundingClientRect().top - body.getBoundingClientRect().top;
+      notifMaxH = Math.max(140, Math.round(avail));
+    };
+    const ro = new ResizeObserver(measure);
+    ro.observe(foot);
+    if (body) ro.observe(body);
+    measure();
+    return () => ro.disconnect();
+  });
   // 每台长连接设备一个浏览标签：长连接是「对方此刻能看到/能被看到」的边界（F-25）。
   let browsers = $derived(getDevices().filter(d => d.connected));
   // 正在浏览的设备掉线/断开长连接后，标签会消失：自动回落，别把用户留在空白页。
@@ -102,6 +194,25 @@
   let localCount = $derived(getShares().length);
   let deviceCount = $derived(getDevices().length);
   let serverPortVal = $derived(getServerPort());
+  // 本机内网地址（左下角「端口 · IP」）：多网卡时只显示首个，其余在悬停提示里列全 ——
+  // 一块 footer 装不下三四个地址，但"我还有别的地址"必须让人看得见（手动添加设备要用）。
+  let localAddrs = $state<{ primary: string | null; all: string[] }>({ primary: null, all: [] });
+  let addrTitle = $derived(
+    localAddrs.all.length > 1
+      ? `本机有 ${localAddrs.all.length} 个内网地址（点一下复制第一个）：\n${localAddrs.all.join('\n')}`
+      : '点一下复制「IP:端口」',
+  );
+
+  /** 复制「IP:端口」—— 手动添加设备（F-11）时直接粘到对面就行。 */
+  function copyAddr() {
+    const ip = localAddrs.primary;
+    if (!ip) return;
+    const text = `${ip}:${serverPortVal || 3890}`;
+    navigator.clipboard.writeText(text).then(
+      () => toast(`已复制 ${text}`),
+      () => toast('复制失败，请手动输入'),
+    );
+  }
 
   /** ctxState → BcTarget。label 是给人看的名字（后端拼不出对端共享项的名字），后端优先采用。 */
   function ctxBcTarget(c: CtxState): BcTarget | null {
@@ -223,6 +334,27 @@
   }
 
   /**
+   * 把悬浮球窗口的拖动交给 OS（`Orb.svelte` 越过阈值、且球没有正在滑动时调用）。
+   *
+   * OS 的窗口拖动（`startDragging` → `WM_NCLBUTTONDOWN`/HTCAPTION 模态循环）在**起拖那一刻**
+   * 把窗口钉在指针上：此后「指针在窗口里的位置」就是整个拖动的不变量。于是从按下点走到那一刻
+   * 的位移会永久丢失 —— 球在指针旁边偏着走，松手时指针落在球上的相对位置也不是按下时那个
+   * （快速甩鼠标时一个 pointermove 就有十几到几十像素，偏得肉眼可见）。按住面板头部拖动没这
+   * 问题：那条路径在 mousedown 当场上交，锚点天然就是按下点。
+   *
+   * 校正与起拖必须在**同一瞬间**发生：指针位置在后端现读（不用事件坐标 —— pointermove 最多
+   * 滞后一帧，高速拖动时那一帧就是十几个像素），挪完窗口当场 `start_dragging`，中间不回前端。
+   * 「球正在悬停滑入」那一段由 `Orb` 挡在起拖之前（等滑动结束），所以这里只需算指针那一段。
+   */
+  async function beginOrbDrag(info: OrbDragInfo) {
+    try {
+      await orbDragStart(info.pressX, info.pressY);
+    } catch (e) {
+      console.error('悬浮球起拖失败:', e);   // 起不来就是这一次拖不动，别把异常抛进事件处理里
+    }
+  }
+
+  /**
    * 记录悬浮球落位（折叠态窗口左上角，物理像素）：下次启动回到这里（F-74）。
    *
    * 记的永远是**球**的落位，不是窗口的：折叠态窗口就是球；展开态窗口是面板，得先把球按
@@ -312,6 +444,7 @@
     expanded = false;
     showSettings = false;
     ctxState = null;
+    pushPicker = null;    // 选择框和右键菜单一样属于面板：收起即作废
     toasts = [];          // 提示是面板上的浮层：收起即作废，别等下次展开又冒出来
     holdOrb = true;
     if (foldTimer) clearTimeout(foldTimer);
@@ -344,46 +477,179 @@
     }, 2200);
   }
 
-  // Push progress card (simulation when backend progress events absent)
-  function startPush(name: string, target: string, total: string) {
-    pushCardState = { title: `正在发送 · ${name}`, target, total, progress: 0, done: false, received: 0 };
-    const totalMB = parseFloat(total);
-    const totalBytes = total.indexOf('M') > -1 ? totalMB * 1024 * 1024 : totalMB * 1024;
-    let received = 0;
-    const interval = setInterval(() => {
-      received += totalBytes * 0.15;
-      const pct = Math.min(100, Math.round((received / totalBytes) * 100));
-      pushCardState = { ...pushCardState!, progress: pct, received, done: pct >= 100 };
-      if (pct >= 100) {
-        clearInterval(interval);
-        pushCardState = { ...pushCardState!, title: `已发送完成 · ${name}`, done: true };
-        toast(`「${name}」已成功发送至 ${target}`);
-        setTimeout(() => { pushCardState = null; }, 3000);
-      }
-    }, 500);
+  // ── 推送（F-50 ~ F-54）────────────────────────────────────────────────
+  /** 字节数 → 人看的短文本（卡片/通知里都够短）。 */
+  function fmtBytes(n: number): string {
+    if (n >= 1024 * 1024 * 1024) return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+    if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+    if (n >= 1024) return `${(n / 1024).toFixed(0)} KB`;
+    return `${n} B`;
   }
 
+  function pushPercent(received: number, total: number): number {
+    return total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0;
+  }
+
+  /**
+   * 发送卡的标题。
+   *
+   * 多选时**只说项数不说名字**：那个"名字"是分组用的标签（共同父目录名或「N 项」），
+   * 而落盘时它并不参与路径（见 `manifest_for_paths`）—— 写成"正在发送 · 3 项（3 项）"
+   * 是把同一件事说了两遍。
+   */
+  function pushCardTitle(c: PushCard): string {
+    if (c.count > 1) {
+      const what = `（${c.count} 项）`;
+      return c.phase === 'done' ? `已发送${what}` : c.phase === 'sending' ? `正在发送${what}` : `等待对方同意${what}`;
+    }
+    if (c.phase === 'done') return `已发送 · ${c.name}`;
+    if (c.phase === 'sending') return `正在发送 · ${c.name}`;
+    return '等待对方同意';
+  }
+
+  /**
+   * 点「推送」：先问一句推文件还是文件夹，再弹原生选择框。
+   *
+   * 系统的选择框一次只能挑一种（Windows/macOS 的文件与文件夹是两种对话框，rfd 也只给
+   * `pick_file(s) / pick_folder(s)` 四个入口，没有"文件或文件夹"混合模式），所以这层询问
+   * 是省不掉的 —— 与其把一个箭标塞进设备行，不如把两个选择都摆在这一层里。
+   */
   function requestPush(device: PeerDevice) {
-    if (device.connected) {
-      startPush('项目设计稿', device.name, '12.6 MB');
-    } else {
-      toast(`已向「${device.name}」发起推送，等待对方同意`);
-      consentState = { from: device.name, name: '项目设计稿', size: '12.6 MB', bytes: 12.6 * 1024 * 1024 };
+    if (!device.online) {
+      toast(`「${device.name}」不在网上，推送未发送`);
+      return;
+    }
+    pushPicker = { device };
+  }
+
+  function closePushPicker() {
+    pushPicker = null;
+  }
+
+  /** 弹出原生选择框，把挑中的路径交给后端去送。`directory` = 选文件夹。 */
+  async function pickAndPush(directory: boolean) {
+    const device = pushPicker?.device;
+    closePushPicker();
+    if (!device) return;
+    let picked: string[] = [];
+    try {
+      const sel = await openDialog({
+        // 一律允许多选：挑一个就是单发，挑多个合并成一条推送（对方一次同意）。
+        multiple: true,
+        directory,
+        title: `选择要推送给「${device.name}」的${directory ? '文件夹' : '文件'}`,
+      });
+      if (Array.isArray(sel)) picked = sel;
+      else if (typeof sel === 'string') picked = [sel];
+    } catch (e) {
+      toast(`打开选择框失败：${e}`);
+      return;
+    }
+    if (picked.length === 0) return;   // 用户取消
+    try {
+      // 多选合并成**一条**推送：对端一张卡、一次同意、一条进度。
+      await pushPaths(picked, device.id);
+    } catch (e) {
+      toast(String(e));    // 对方离线等：就地失败，不排队（F-53）
     }
   }
 
-  function acceptConsent() {
-    if (!consentState) return;
-    const target = consentState.from;
-    consentState = null;
-    toast(`「${target}」已同意接收，开始传输`);
-    startPush('项目设计稿', target, '12.6 MB');
+  async function cancelSending(inviteId: string) {
+    try { await cancelPush(inviteId); } catch (e) { toast(String(e)); }
   }
 
-  function declineConsent() {
-    if (!consentState) return;
-    toast(`「${consentState.from}」拒绝了接收`);
-    consentState = null;
+  function dropNotice(inviteId: string) {
+    notices = notices.filter((n) => n.inviteId !== inviteId);
+  }
+
+  /** 气泡上的「知道了」：只撤这一条 —— 悬浮球与铃铛上的数字跟着减。 */
+  function confirmNotice(inviteId: string) {
+    dropNotice(inviteId);
+  }
+
+  /** 通知标题（与发送卡同一套规则：多项只说项数，不说那个分组标签）。 */
+  function noticeTitle(n: PushNotice): string {
+    // 配对邀请与推送无关：既没有文件也没有项数，只说"谁在等你的决定"。
+    if (n.kind === 'pair') return `「${n.from}」请求与你配对`;
+    // 本机发出去的那条：说清"在等谁" —— 卡片挂着就代表对面还没处理。
+    if (n.kind === 'pairWait') return `等待「${n.from}」确认配对`;
+    if (n.count > 1) {
+      const what = `（${n.count} 项）`;
+      if (n.kind === 'invite') return `收到「${n.from}」的推送${what}`;
+      if (n.kind === 'done') return `已收到「${n.from}」的推送${what}`;
+      return n.kind === 'receiving' ? `正在接收${what}` : `接收失败${what}`;
+    }
+    if (n.kind === 'invite') return `收到「${n.from}」的推送${n.isDir ? '目录' : '文件'}`;
+    if (n.kind === 'done') return `已收到「${n.from}」的推送${n.isDir ? '目录' : '文件'}`;
+    return n.kind === 'receiving' ? `正在接收 · ${n.name}` : `接收失败 · ${n.name}`;
+  }
+
+  /** 气泡正文：收完的说清"东西在哪"（`dest` 由后端给），失败的说清原因。 */
+  function noticeBody(n: PushNotice): string {
+    // 配对邀请：说清"点下去会发生什么" —— 接受即交换凭据、互为「已配对」。
+    if (n.kind === 'pair') {
+      return '接受后两台设备互为「已配对」（互相交换凭据），之后就能建立长连接、互相推送；60 秒内未处理自动作废。';
+    }
+    if (n.kind === 'pairWait') {
+      return `已把邀请推到「${n.from}」：它在自己的通知里点「接收」即配对成功。60 秒内没人处理自动作废。`;
+    }
+    if (n.kind === 'done') {
+      const what = n.count > 1 ? `${n.count} 项` : n.name;
+      return n.dest ? `${what} 已保存到 ${n.dest}` : `${what} 已保存到下载目录`;
+    }
+    return n.error ?? '接收失败';
+  }
+
+  /** 同意接收：卡片立刻转成"正在接收"，进度随后由 push://progress 推进。 */
+  async function acceptNotice(n: PushNotice) {
+    try {
+      await acceptPush(n.inviteId);
+    } catch (e) {
+      toast(String(e));
+      dropNotice(n.inviteId);
+      return;
+    }
+    notices = notices.map((x) => (x.inviteId === n.inviteId ? { ...x, kind: 'receiving' } : x));
+  }
+
+  async function rejectNotice(n: PushNotice) {
+    dropNotice(n.inviteId);
+    try { await rejectPush(n.inviteId); } catch (e) { toast(String(e)); }
+  }
+
+  async function cancelNotice(n: PushNotice) {
+    dropNotice(n.inviteId);
+    try { await cancelReceive(n.inviteId); } catch (e) { toast(String(e)); }
+  }
+
+  /**
+   * 接受一条配对邀请：凭据在后端交换（本机铸一枚 token 放在那条挂着 HTTP 请求的响应里
+   * 交给对方，同时把对方那枚存下来）——回到这里的已经是"配对完成"。
+   */
+  async function acceptPairNotice(n: PushNotice) {
+    dropNotice(n.inviteId);
+    try {
+      const name = await acceptPairInvite(n.inviteId);
+      toast(`已与「${name}」配对成功（点「连接」建立长连接）`);
+    } catch (e) {
+      toast(`配对未完成：${e}`);
+    }
+  }
+
+  /** 拒绝一条配对邀请：对端会收到明确的"对方拒绝"，本机什么都不写。 */
+  async function rejectPairNotice(n: PushNotice) {
+    dropNotice(n.inviteId);
+    try { await rejectPairInvite(n.inviteId); } catch (e) { toast(String(e)); }
+  }
+
+  /**
+   * 取消本机发出去、还挂着的配对邀请：撤回对端界面上那条通知，本机这张卡收掉。
+   * 撤回失败（对端已经处理/不在网上）不是错误 —— 它那条邀请的 TTL 会兜底。
+   */
+  async function cancelPairWaitNotice(n: PushNotice) {
+    dropNotice(n.inviteId);
+    try { await cancelPairInvite(n.inviteId); } catch (e) { toast(String(e)); }
+    toast('已取消配对邀请');
   }
 
   /** 配对码有效期（秒），与后端 PairStore::CODE_TTL 一致。 */
@@ -499,6 +765,42 @@
     }
   }
 
+  /**
+   * 发起配对邀请（F-12 免配对码）：本机点一下按钮，对端在**它自己的通知里**点「接收」
+   * 即可配对成功 —— 谁都不用读屏、也不用输码。
+   *
+   * 邀请是后端的一次 HTTP POST（`/pair/invite`），对端在等它自己的用户做决定（最长 60s）。
+   * **本机这边不等在弹窗里**：弹窗当场收起，那条邀请变成右下角通知组里的一张卡
+   * （与"等待对方同意"的推送卡同一个位置、同一套收尾），对端接受/拒绝/超时都落到它身上。
+   */
+  async function invitePair() {
+    const ps = pairState;
+    if (!ps?.peerId) return;
+    pairState = { ...ps, busy: true, error: null };
+    // 同一台设备再发一次：先把上一条还挂着的邀请撤回来，别让对端界面上堆两条一样的。
+    for (const old of notices.filter((n) => n.kind === 'pairWait' && n.peerId === ps.peerId)) {
+      dropNotice(old.inviteId);
+      void cancelPairInvite(old.inviteId).catch(() => {});
+    }
+    let inviteId: string;
+    try {
+      inviteId = await pairInvite(ps.peerId);
+    } catch (e) {
+      if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
+      return;
+    }
+    const name = ps.peerName ?? '设备';
+    closePair();
+    notices = [...notices, {
+      inviteId,
+      kind: 'pairWait',
+      peerId: ps.peerId,
+      from: name,
+      name: '', size: 0, isDir: false, count: 1, received: 0,
+    }];
+    toast(`已向「${name}」发起配对邀请：对方在通知里点「接收」即配对成功`);
+  }
+
   function copyCode() {
     const ps = pairState;
     if (!ps?.code) return;
@@ -602,9 +904,12 @@
     if (device) openPair(device);
   }
 
+  /** 右键「推送」：与设备行同一个入口（先问文件还是文件夹）。 */
   function ctxPush() {
+    const deviceId = ctxState?.deviceId;
     hideCtx();
-    toast('已向该设备发起推送');
+    const device = deviceId ? getDevices().find((d) => d.id === deviceId) : undefined;
+    if (device) requestPush(device);
   }
 
   /** 放入比较位：side 是 'left' | 'right'，文案沿用同一套。 */
@@ -672,21 +977,6 @@
     }
   }
 
-  async function handleAcceptPush() {
-    if (!pushInvite) return;
-    try {
-      await acceptPush(pushInvite.inviteId);
-      toast(`正在接收「${pushInvite.name}」`);
-    } catch (e) { console.error('Accept failed:', e); }
-    pushInvite = null;
-  }
-
-  async function handleRejectPush() {
-    if (!pushInvite) return;
-    try { await rejectPush(pushInvite.inviteId); } catch (e) { /* ignore */ }
-    pushInvite = null;
-  }
-
   onMount(() => {
     // 折叠态窗口 = 悬浮球 + 四周余量：尺寸在这里归位，**位置**由后端在首帧之前按上次的
     // 落位写好（lib.rs `restore_orb_pos`）—— 等界面起来再挪会看到球从屏幕中央跳过去。
@@ -714,6 +1004,9 @@
           setServerPort(port);
         }
         await loadShares();
+        // 左下角「端口 · 本机 IP」：内网地址启动时取一次 —— 换网/插网线属于罕见情形，
+        // 重启 App 就刷新了，不值得为它在界面上常驻一个网卡监听。
+        localAddrs = await localAddresses();
       } catch (e) { console.error('Init failed:', e); }
     })();
 
@@ -732,7 +1025,7 @@
           }
           const connected = getDevices().filter(d => d.connected);
           if (connected.length > 0) {
-            toast(`已拖入文件并自动广播至 ${connected.map(d => d.name).join('、')}`);
+            toast(`已拖入文件并自动广播至 ${connected.map(d => `「${d.name}」`).join('、')}`);
           } else {
             toast('已添加共享项');
           }
@@ -748,9 +1041,94 @@
       moveTimer = setTimeout(() => { moveTimer = null; void settleDrag(); }, DOCK_SETTLE_MS);
     });
 
+    // ── 推送事件：发送侧一张进度卡，接收侧一串通知（面板右下角的气泡组）──────
+    // 邀请：接收方收到别人的推送 → 挂一条通知（悬浮球左上角的数字 +1）。
+    // **不主动弹面板**：人来点，球上那个黄色数字就是"有事等你"的信号。
+    // 未绑定设备发的邀请带「接收/拒绝」按钮，已绑定（`auto`）的已经直接开收、只显示进度。
     const unPushInvite = listen<PushInvite>('push://invite', (ev) => {
-      if (!expanded) setOpen(true);
-      pushInvite = ev.payload;
+      const inv = ev.payload;
+      notices = [...notices, {
+        inviteId: inv.inviteId,
+        kind: inv.auto ? 'receiving' : 'invite',
+        from: inv.sender.name,
+        name: inv.name,
+        size: inv.size,
+        isDir: inv.isDir,
+        count: inv.count ?? 1,
+        received: 0,
+      }];
+    });
+
+    // 邀请已发出：等对方同意（长连接与 HTTP 两条通道都是这一条事件）。
+    // 目标已绑定的话对方不会问人（后端直接收），所以这张卡上的"等待对方同意"只是一瞬。
+    const unPushSent = listen<{ inviteId: string; peerId: string; target: string; name: string; total: number; count: number }>('push://sent', (ev) => {
+      const p = ev.payload;
+      const auto = getDevices().find((d) => d.id === p.peerId)?.paired ?? false;
+      pushCards = [...pushCards, { inviteId: p.inviteId, target: p.target, name: p.name, total: p.total, received: 0, phase: 'waiting', count: p.count ?? 1, auto }];
+    });
+
+    const unPushResponse = listen<{ inviteId: string; accepted: boolean; reason?: string | null }>('push://response', (ev) => {
+      const { inviteId, accepted, reason } = ev.payload;
+      const notice = notices.find((n) => n.inviteId === inviteId);
+      const card = pushCards.find((c) => c.inviteId === inviteId);
+      if (accepted) {
+        if (notice) notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'receiving' } : n));
+        if (card) {
+          pushCards = pushCards.map((c) => (c.inviteId === inviteId ? { ...c, phase: 'sending' } : c));
+          // 已绑定设备那条路上没有"对方同意"这一步，说"已同意"会让人以为对面点过。
+          toast(card.auto ? `开始向「${card.target}」传输` : `「${card.target}」已同意接收，开始传输`);
+        }
+        return;
+      }
+      // 对方拒绝 / 60s 没人处理而作废 / 已绑定设备**自动收下时本机放行失败**：本机挂着
+      // 的那条通知必须撤掉，否则它会一直留在那儿，点「接收」才发现邀请早就没了（后面那种
+      // 情况下 kind 已经是 'receiving' —— 后端这时补一条 accepted:false 回来）。
+      // 发送方那张进度卡由随后的 push://done 收尾（两条通道都会跟一条）。
+      if (notice && (notice.kind === 'invite' || notice.kind === 'receiving')) {
+        dropNotice(inviteId);
+        toast(
+          notice.kind === 'invite'
+            ? `推送邀请已作废：${reason ?? '对方拒绝'}`
+            : `接收没能开始：${reason ?? '未知原因'}`,
+        );
+      }
+    });
+
+    const unPushProgress = listen<{ inviteId: string; received: number; total: number }>('push://progress', (ev) => {
+      const { inviteId, received, total } = ev.payload;
+      if (total <= 0) return;
+      // 接收侧：卡片就地变成"正在接收 xx%"。
+      notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'receiving', received, size: total } : n));
+      // 发送侧：进度条。
+      pushCards = pushCards.map((c) => (c.inviteId === inviteId ? { ...c, received, total, phase: 'sending' } : c));
+    });
+
+    const unPushDone = listen<{ inviteId: string; status: string; reason?: string | null; dest?: string }>('push://done', (ev) => {
+      const { inviteId, status, reason, dest } = ev.payload;
+      const notice = notices.find((n) => n.inviteId === inviteId);
+      if (notice) {
+        if (status === 'completed') {
+          toast(`已收到「${notice.name}」`);
+          // 收完 ≠ 处理完：转成一条**待确认**的通知挂在右下角气泡里，直到用户点
+          // 「知道了」才消失 —— 否则"东西落在哪"会跟着 toast 一起蒸发掉。
+          notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'done', received: n.size, dest } : n));
+        } else if (status === 'cancelled') {
+          dropNotice(inviteId);
+        } else {
+          notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'failed', error: reason ?? '接收失败' } : n));
+        }
+      }
+      const card = pushCards.find((c) => c.inviteId === inviteId);
+      if (card) {
+        if (status === 'completed') {
+          pushCards = pushCards.map((c) => (c.inviteId === inviteId ? { ...c, phase: 'done', received: c.total } : c));
+          toast(`「${card.name}」已发送完成`);
+          setTimeout(() => { pushCards = pushCards.filter((c) => c.inviteId !== inviteId); }, 3000);
+        } else {
+          toast(status === 'cancelled' ? '已取消推送' : (reason ?? '推送失败'));
+          pushCards = pushCards.filter((c) => c.inviteId !== inviteId);
+        }
+      }
     });
 
     const unPaired = listen('devices://changed', () => {
@@ -763,8 +1141,15 @@
     });
 
     // 对方输入了本机显示的配对码 → 本机验证通过、给出 token（list 由 devices://changed 刷新）
-    const unPairDone = listen<{ peerId: string; peerName?: string | null }>('pair://completed', (ev) => {
+    const unPairDone = listen<{ peerId: string; peerName?: string | null; inviteId?: string | null }>('pair://completed', (ev) => {
       if (pairConfirming) return;   // 本机自己发起的确认，toast 由 confirmPair 给出
+      // 本机发出去的那条邀请被对方接受了：右下角那张"等待确认"的卡收掉 + 提示。
+      const waited = notices.find((n) => n.kind === 'pairWait' && n.inviteId === ev.payload.inviteId);
+      if (waited) {
+        dropNotice(waited.inviteId);
+        toast(`已与「${waited.from}」配对成功（点「连接」建立长连接）`);
+        return;
+      }
       const ps = pairState;
       if (ps?.peerId === ev.payload.peerId) {
         const name = ps.peerName ?? ev.payload.peerName ?? '设备';
@@ -773,17 +1158,39 @@
       }
     });
 
-    const unProgress = listen<{ invite_id: string; received: number; total: number }>('push://progress', (ev) => {
-      const { received, total } = ev.payload;
-      if (total <= 0) return;
-      const pct = Math.min(100, Math.round((received / total) * 100));
-      if (pushCardState) {
-        pushCardState = { ...pushCardState, progress: pct, received, done: pct >= 100 };
-        if (pct >= 100) {
-          pushCardState = { ...pushCardState, title: '已发送完成', done: true };
-          setTimeout(() => { pushCardState = null; }, 3000);
-        }
-      }
+    // 收到一条配对邀请 → 挂一条通知（带「接收/拒绝」），悬浮球左上角的数字 +1。
+    // **不主动弹面板**：与推送邀请同一套约定（F-51），人来点那颗球。
+    const unPairInvite = listen<{ inviteId: string; peerId: string; peerName: string }>('pair://invite', (ev) => {
+      const p = ev.payload;
+      notices = [...notices, {
+        inviteId: p.inviteId,
+        kind: 'pair',
+        peerId: p.peerId,
+        from: p.peerName,
+        name: '',
+        size: 0,
+        isDir: false,
+        count: 1,
+        received: 0,
+      }];
+    });
+
+    // 一条进来的邀请作废了（本机 60s 没处理 / 对方把邀请撤回了）：撤掉那条通知并说明原因。
+    const unPairInviteClosed = listen<{ inviteId: string; reason?: string | null }>('pair://invite_closed', (ev) => {
+      const { inviteId, reason } = ev.payload;
+      if (!notices.some((n) => n.inviteId === inviteId)) return;
+      dropNotice(inviteId);
+      toast(`配对邀请已作废：${reason ?? '超时未处理'}`);
+    });
+
+    // 本机发起的邀请没成（对方拒绝 / 超时 / 已撤回 / 联系不上）：把右下角那张卡收掉并说明原因。
+    const unPairInviteFailed = listen<{ inviteId: string; reason?: string | null }>('pair://invite_failed', (ev) => {
+      const { inviteId, reason } = ev.payload;
+      if (!notices.some((n) => n.kind === 'pairWait' && n.inviteId === inviteId)) return;
+      dropNotice(inviteId);
+      // 用户自己点「取消」时那张卡已经收掉了（撤回来的 403 落到这里时什么都不用说）。
+      const why = reason ?? '对方未接受';
+      toast(why.includes('取消') ? '配对邀请已取消' : `配对邀请未完成：${why}`);
     });
 
     // Context menu from child components
@@ -807,9 +1214,16 @@
       unMoved.then(fn => fn());
       if (moveTimer) clearTimeout(moveTimer);
       unPushInvite.then(fn => fn());
+      unPushSent.then(fn => fn());
+      unPushResponse.then(fn => fn());
+      unPushProgress.then(fn => fn());
+      unPushDone.then(fn => fn());
       unPaired.then(fn => fn());
       unOrbShow.then(fn => fn());
-      unProgress.then(fn => fn());
+      unPairDone.then(fn => fn());
+      unPairInvite.then(fn => fn());
+      unPairInviteClosed.then(fn => fn());
+      unPairInviteFailed.then(fn => fn());
       document.removeEventListener('od:ctx', handleCtx);
       document.removeEventListener('od:toast', handleToast);
     };
@@ -823,27 +1237,32 @@
   class:live={connectedCount > 0}
   class:drag={dragging}
   class:hold={holdOrb}
-  style="--panel-slack: {PANEL_SLACK}px; --orb-inset: {ORB_INSET}px; --orb-x: {orbOffset.x}px; --orb-y: {orbOffset.y}px; --zone-x: {orbZone.x}px; --zone-y: {orbZone.y}px; --zone-w: {orbZone.w}px; --zone-h: {orbZone.h}px"
+  style="--panel-slack: {PANEL_SLACK}px; --orb-inset: {ORB_INSET}px; --foot-h: {footH}px; --notif-max-h: {notifMaxH}px; --orb-x: {orbOffset.x}px; --orb-y: {orbOffset.y}px; --zone-x: {orbZone.x}px; --zone-y: {orbZone.y}px; --zone-w: {orbZone.w}px; --zone-h: {orbZone.h}px"
 >
   <!-- 悬停热区：贴边收起半颗后，指针落在热区（露出的半颗 ~ 完整球那一带）就把球滑出来 -->
   <div class="orb-zone">
     <Orb
       badgeCount={connectedCount}
+      notifCount={notifCount}
       expanded={expanded}
       onToggle={() => setOpen(!expanded)}
+      onDragStart={beginOrbDrag}
     />
   </div>
 
   <!-- Main Panel -->
   <section class="panel" aria-label="OrbDrop 主面板">
-    <header class="panel-head" data-tauri-drag-region>
-      <span class="grip" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></span>
-      <span class="panel-brand"><span class="mark-sm"><i></i></span>OrbDrop</span>
+    <!-- `deep`：Tauri 的拖拽脚本只在**命中元素自己**带属性时才拖（`composedPath[0]`），
+         logo/文字这些子元素会把 mousedown 从 header 上挡掉，于是只有空隙能拖。`deep` 让整棵
+         子树里的非可点击元素都触发拖拽；按钮仍照旧拦截（脚本先判 clickable 再看属性）。 -->
+    <header class="panel-head" data-tauri-drag-region="deep">
+      <span class="panel-brand"><Logo size={20} />OrbDrop</span>
       <div class="panel-head-right">
         <span class="ch-inst">
           <span class="dot ok"></span>
           <span>在线 · 长连接 {connectedCount}</span>
         </span>
+        <!-- 通知铃铛搬到 footer 最右侧（版本号右边）—— 面板头部只留窗口级的动作。 -->
         <button class="icon-btn" onclick={openSettings} aria-label="打开设置">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1Z"/></svg>
         </button>
@@ -861,50 +1280,148 @@
       onSelect={(tab: TabKey) => activeTab = tab}
     />
 
-    <div class="panel-body">
+    <div class="panel-body" bind:this={bodyEl}>
       <TabContent tab={activeTab} devices={getDevices()} onToast={toast} onRequestPush={requestPush} onOpenPair={openPair} onUnpair={(d) => void unpairDevice(d.id)} />
     </div>
 
-    <footer class="panel-foot">
-      <span class="num">端口 {serverPortVal || 3890}</span>
-      <span>OrbDrop v0.1.0</span>
+    <footer class="panel-foot" bind:this={footEl}>
+      <span class="foot-left">
+        <span class="num">端口 {serverPortVal || 3890}</span>
+        {#if localAddrs.primary}
+          <!-- 本机内网 IP：多网卡时这里只显示首个，悬停列出全部（跨网段手动添加要用） -->
+          <button class="foot-addr num" onclick={copyAddr} title={addrTitle}>{localAddrs.primary}</button>
+        {/if}
+      </span>
+      <span class="foot-right">
+        <span>OrbDrop v0.1.0</span>
+        <!-- 通知铃铛（最右下角、版本号右边）：点一下收起/展开右下角那组通知气泡。
+             角标 = 未处理的通知数，与悬浮球左上角黄标是同一个数 —— **收起 ≠ 已读**。 -->
+        <button
+          class="icon-btn bell"
+          class:active={notifOpen}
+          class:has={notifCount > 0}
+          onclick={() => (notifOpen = !notifOpen)}
+          aria-label={notifOpen ? '收起通知' : '展开通知'}
+          aria-expanded={notifOpen}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+          {#if notifCount > 0}<span class="bell-badge num">{notifCount}</span>{/if}
+        </button>
+      </span>
     </footer>
 
-    <!-- Push card (sending progress) -->
-    {#if pushCardState}
-      <div class="push-card show" class:done={pushCardState.done}>
-        <div class="p-top">
-          <span>{pushCardState.title}</span>
-          <span class="p-per num">{pushCardState.progress}%</span>
-        </div>
-        <div class="p-bar"><i style="width:{pushCardState.progress}%"></i></div>
-        <div class="p-meta">
-          <span>→ {pushCardState.target} · 局域网</span>
-          <span class="num">{(pushCardState.received / 1024 / 1024).toFixed(1)} / {pushCardState.total}</span>
-        </div>
-      </div>
-    {/if}
+    <!-- 面板底部堆叠层（`column-reverse`：**DOM 里靠前的元素贴底** —— 谁写在前面，谁最靠近
+         footer）。顺序 = 通知气泡 → 发送进度卡 → 提示：通知要贴右下角、就落在 footer 上缘；
+         进度卡与瞬时提示往上叠。放在 panel 里而不是顶层：面板收起时 opacity:0，
+         这一列结构上就不可能画进那个 90px 的悬浮球窗口。 -->
+    <div class="panel-bottom">
+      <!-- 通知组（面板右下角的气泡组）：未绑定的邀请（带接收/拒绝）、正在接收（进度 + 取消）、
+           已收到待确认、接收失败，外加**发送侧的进度卡**（"等待对方同意"要等很久，
+           它也是右下角的一件事）—— 全都同一形状：右对齐、2/3 面板宽（不占满）。
+           来一条甩入一条、收起时整组甩回右侧（`fly`）；footer 最右侧的铃铛整体收起/展开它，
+           **收起 ≠ 已读**（角标照旧挂着，与悬浮球左上角黄标同一个数）。 -->
+      {#if notifOpen && (notices.length > 0 || pushCards.length > 0)}
+        <div class="notif-group" bind:this={notifEl}>
+          {#each notices as n, i (n.inviteId)}
+            <div
+              class="notif-bubble"
+              class:fail={n.kind === 'failed'}
+              in:fly={{ x: 32, duration: MOTION, delay: Math.min(i, 4) * 30, easing: cubicOut }}
+              out:fly={{ x: 32, duration: MOTION }}
+            >
+              <div class="p-top">
+                <span class="nb-title">{noticeTitle(n)}</span>
+                <span class="nb-size num">
+                  {#if n.kind === 'pair'}{:else if n.kind === 'receiving'}{pushPercent(n.received, n.size)}%{:else}{fmtBytes(n.size)}{/if}
+                </span>
+              </div>
 
-    <!-- Consent card (incoming push) -->
-    {#if consentState}
-      <div class="push-card show" id="consentCard">
-        <div class="p-top">
-          <span>接收推送邀请</span>
-          <span class="mono">来自 {consentState.from}</span>
+              {#if n.kind === 'receiving'}
+                <div class="p-bar"><i style="width:{pushPercent(n.received, n.size)}%"></i></div>
+                <div class="p-meta">
+                  <span>来自「{n.from}」</span>
+                  <span class="num">{fmtBytes(n.received)} / {fmtBytes(n.size)}</span>
+                </div>
+                <div class="nb-acts">
+                  <button class="btn btn-secondary btn-sm" onclick={() => void cancelNotice(n)}>取消</button>
+                </div>
+              {:else if n.kind === 'pair'}
+                <div class="consent-info">
+                  <span class="f-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/></svg>
+                  </span>
+                  <span class="c-name">{n.from}</span>
+                </div>
+                <p class="nb-body">{noticeBody(n)}</p>
+                <div class="nb-acts">
+                  <button class="btn btn-secondary btn-sm" onclick={() => void rejectPairNotice(n)}>拒绝</button>
+                  <button class="btn btn-primary btn-sm" onclick={() => void acceptPairNotice(n)}>接收</button>
+                </div>
+              {:else if n.kind === 'pairWait'}
+                <p class="nb-body">{noticeBody(n)}</p>
+                <div class="nb-acts">
+                  <button class="btn btn-secondary btn-sm" onclick={() => void cancelPairWaitNotice(n)}>取消</button>
+                </div>
+              {:else if n.kind === 'invite'}
+                <div class="consent-info">
+                  <span class="f-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg>
+                  </span>
+                  <span class="c-name">{n.name}</span>
+                </div>
+                <div class="nb-acts">
+                  <button class="btn btn-secondary btn-sm" onclick={() => void rejectNotice(n)}>拒绝</button>
+                  <button class="btn btn-primary btn-sm" onclick={() => void acceptNotice(n)}>接收</button>
+                </div>
+              {:else}
+                <p class="nb-body">{noticeBody(n)}</p>
+                <div class="nb-acts">
+                  <button class="btn btn-secondary btn-sm" onclick={() => confirmNotice(n.inviteId)}>知道了</button>
+                </div>
+              {/if}
+            </div>
+          {/each}
+
+          <!-- 发送侧：每条在途的推送一张卡 —— 和通知同一个形状、同一组、同一个铃铛管，
+               因为它也是"右下角的一件事"（"等待对方同意"可以等很久；已绑定目标那一档
+               只是一瞬）。它排在通知前面：通知贴最下缘（要你看一眼的事优先）。 -->
+          {#each pushCards as c (c.inviteId)}
+            <div
+              class="notif-bubble"
+              class:done={c.phase === 'done'}
+              in:fly={{ x: 32, duration: MOTION, easing: cubicOut }}
+              out:fly={{ x: 32, duration: MOTION }}
+            >
+              <div class="p-top">
+                <span class="nb-title">{pushCardTitle(c)}</span>
+                <span class="nb-size num">{pushPercent(c.received, c.total)}%</span>
+              </div>
+              <div class="p-bar"><i style="width:{pushPercent(c.received, c.total)}%"></i></div>
+              <div class="p-meta">
+                <span>→「{c.target}」· 局域网</span>
+                <span class="num">{fmtBytes(c.received)} / {fmtBytes(c.total)}</span>
+              </div>
+              {#if c.phase !== 'done'}
+                <div class="nb-acts">
+                  <button class="btn btn-secondary btn-sm" onclick={() => void cancelSending(c.inviteId)}>取消</button>
+                </div>
+              {/if}
+            </div>
+          {/each}
         </div>
-        <div class="consent-info">
-          <span class="f-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg>
-          </span>
-          <span class="c-name">{consentState.name}</span>
-          <span class="c-size num">{consentState.size}</span>
-        </div>
-        <div class="consent-acts">
-          <button class="btn btn-secondary" onclick={declineConsent}>拒绝</button>
-          <button class="btn btn-primary" onclick={acceptConsent}>同意</button>
-        </div>
+      {/if}
+
+      <div class="toast-stack">
+        {#each toasts as t (t.id)}
+          <div class="toast" class:leaving={t.leaving}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3v12M7 10l5 5 5-5M5 19h14"/>
+            </svg>
+            {t.msg}
+          </div>
+        {/each}
       </div>
-    {/if}
+    </div>
 
     <!-- Settings sheet -->
     <SettingsPanel open={showSettings} onClose={closeSettings} onToast={toast} />
@@ -914,9 +1431,17 @@
       <div class="overlay open" id="pairDialog">
         <div class="dialog">
           {#if pairState.peerId}
-            <h3>与 {pairState.peerName} 配对</h3>
-            <p class="d-desc">在对方设备的 OrbDrop 中输入下方配对码，即可完成配对。</p>
-            <p class="d-target num">输入到「{pairState.peerName}」的 OrbDrop</p>
+            <!-- 设备名一律「」框住（本文件里的 toast / 通知标题同此），并排的「推送到「X」」同理 -->
+            <h3 class="d-head">
+              与「{pairState.peerName}」配对<Hint>
+                两种方式任选：「发起邀请」由对方在它自己的通知里点「接收」（不需要输入配对码）；
+                或让对方把下方这串码输入到它的 OrbDrop 里。
+              </Hint>
+            </h3>
+            <button class="btn btn-primary btn-block pair-invite" onclick={() => void invitePair()} disabled={pairState.busy}>
+              发起邀请
+            </button>
+            <p class="d-target num">或：输入到「{pairState.peerName}」的 OrbDrop</p>
             <div class="code num" class:expired={pairState.remaining === 0}>
               {#each pairState.code as digit}
                 <b>{digit}</b>
@@ -929,7 +1454,7 @@
               <button class="btn btn-secondary btn-sm btn-block" onclick={refreshPairCode} disabled={pairState.busy}>刷新配对码</button>
             {/if}
             <div class="field pair-enter">
-              <label for="pairCodeInput">或：输入对方设备上显示的配对码</label>
+              <label for="pairCodeInput">输入对方设备上显示的配对码</label>
               <div class="path-input">
                 <input
                   id="pairCodeInput"
@@ -946,7 +1471,7 @@
             {#if pairState.error}<p class="d-err">{pairState.error}</p>{/if}
             <div class="d-acts">
               <button class="btn btn-secondary" onclick={copyCode}>复制配对码</button>
-              <button class="btn btn-secondary" onclick={closePair}>完成</button>
+              <button class="btn btn-secondary" onclick={closePair}>取消</button>
             </div>
           {:else}
             <h3>添加设备</h3>
@@ -969,37 +1494,32 @@
       </div>
     {/if}
 
-    <!-- Push invite dialog (real incoming) -->
-    {#if pushInvite}
-      <div class="overlay open">
+    <!-- 推送：先问推文件还是文件夹（系统选择框一次只能挑一种），再弹原生选择框 -->
+    {#if pushPicker}
+      <div class="overlay open" id="pushPicker">
         <div class="dialog">
-          <h3>收到推送</h3>
-          <p class="d-desc">
-            <strong>{pushInvite.sender.name}</strong> 发来：{pushInvite.name}
-            ({pushInvite.isDir ? '目录' : `${(pushInvite.size / 1024 / 1024).toFixed(1)} MB`})
-          </p>
+          <h3 class="d-head">
+            推送到「{pushPicker.device.name}」<Hint>
+              选择要发送的文件或文件夹（可多选）—— 对方同意后开始传输；多项会合并成一条推送，对方只需同意一次。
+            </Hint>
+          </h3>
           <div class="d-acts">
-            <button class="btn btn-secondary" onclick={handleRejectPush}>拒绝</button>
-            <button class="btn btn-primary" onclick={handleAcceptPush}>同意</button>
+            <button class="btn btn-secondary" onclick={() => void pickAndPush(false)}>选择文件…</button>
+            <button class="btn btn-secondary" onclick={() => void pickAndPush(true)}>选择文件夹…</button>
+          </div>
+          <div class="d-acts">
+            <button class="btn btn-ghost" onclick={closePushPicker}>取消</button>
           </div>
         </div>
       </div>
     {/if}
 
-    <!-- Toast layer：提示属于面板（提示出现时收起面板，它就随面板一起退场）。
-         放在 panel 里而不是顶层：面板收起时 opacity:0，提示结构上就不可能画进那个 90px 的悬浮球窗口。 -->
-    <div class="toast-layer">
-      {#each toasts as t (t.id)}
-        <div class="toast" class:leaving={t.leaving}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 3v12M7 10l5 5 5-5M5 19h14"/>
-          </svg>
-          {t.msg}
-        </div>
-      {/each}
-    </div>
   </section>
 </aside>
+
+<!-- 悬停说明的气泡层：必须挂在 `.orb-stage` 之外 —— 面板里的滚动容器会裁掉它，
+     对话框的 `backdrop-filter` 还会把 `position: fixed` 改成相对对话框定位。 -->
+<HintLayer />
 
 <!-- Context menu -->
 {#if ctxState}

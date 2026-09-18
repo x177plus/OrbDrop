@@ -106,12 +106,24 @@ export interface PushInvite {
   name: string;
   size: number;
   isDir: boolean;
+  /** 发送方这次选了几项（>1 = 多选合并成的一条推送）。 */
+  count: number;
+  /**
+   * 后端已经**自动收下**了这条推送（发送方是本机已绑定设备：token 就是那份信任，
+   * 不再问用户一次）。界面据此直接显示"正在接收"，不放「接收/拒绝」。
+   */
+  auto?: boolean;
 }
 
-export interface PushProgress {
-  inviteId: string;
-  received: number;
-  total: number;
+/**
+ * 悬浮球起拖那一刻的按下点（CSS px，窗口坐标 = 折叠态窗口的视口坐标）。
+ *
+ * `App.beginOrbDrag` 把它交给后端：后端按它把窗口的抓取锚点校正回按下点，再当场起拖。
+ */
+export interface OrbDragInfo {
+  /** 按下时的指针位置 */
+  pressX: number;
+  pressY: number;
 }
 
 /** 一级标签栏的标签：本机 / 设备（关系管理） / 每台长连接设备一个浏览标签（F-24、F-30）。 */

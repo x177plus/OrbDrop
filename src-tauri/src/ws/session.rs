@@ -8,8 +8,8 @@ use tracing::{error, info, warn};
 use crate::credential;
 use crate::state::AppState;
 use crate::transfer;
-use crate::ws::events::{ui, WsEvent};
-use crate::ws::{emit_ui, send_to_peer};
+use crate::ws::events::{ui, PeerInfo, WsEvent};
+use crate::ws::emit_ui;
 
 /// Inbound WebSocket session — a paired peer connected to our /events.
 ///
@@ -124,60 +124,80 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
         WsEvent::PeerOffline { peer_id: _ } => {
             // WS drop itself drives offline; nothing to do here.
         }
-        WsEvent::PushInvite { invite_id, sender, name, size, is_dir, files } => {
-            info!(%invite_id, sender = %sender.name, "inbound push invite");
+        WsEvent::PushInvite { invite_id, sender, name, size, is_dir, count, files } => {
+            // 身份以**这条会话**为准，不用载荷里自称的那个：长连接是 token 换来的，
+            // 而载荷里的 sender.id 只是对端自己填的字符串。
+            let known = state.get_peer(peer_id);
+            // 已绑定（已配对）的设备：身份是这条会话用 token 换来的，无需再问用户一次。
+            let paired = known.as_ref().is_some_and(|p| p.paired);
+            let display_name = known
+                .as_ref()
+                .map(|p| p.name.clone())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| sender.name.clone());
+            info!(%invite_id, peer_id, sender = %display_name, paired, "inbound push invite (ws)");
             let total = if is_dir {
                 files.iter().map(|f| f.size).sum::<u64>()
             } else {
                 size
             };
+            // 这条路的回执走 WS，地址只在"万一套用得上"时记一下（地址簿里没地址就留空）。
+            let callback = known
+                .as_ref()
+                .and_then(|p| (!p.ip.is_empty() && p.port != 0).then(|| (p.ip.clone(), p.port)));
             state.push.insert_invite(transfer::push_job::InboundInvite {
                 invite_id: invite_id.clone(),
-                sender: sender.clone(),
+                sender: PeerInfo { id: peer_id.to_string(), name: display_name.clone() },
                 name: name.clone(),
                 size,
                 is_dir,
+                count,
                 files,
+                callback,
+                responder: None,
             });
             emit_ui(state, ui::PUSH_INVITE, &serde_json::json!({
                 "inviteId": invite_id,
-                "sender": sender,
+                "sender": { "id": peer_id, "name": display_name },
                 "name": name,
                 "size": total,
                 "isDir": is_dir,
+                "count": count,
+                "auto": paired,
             }));
-
-            // 60s auto-reject.
-            let state_clone = state.clone();
-            let id = invite_id.clone();
-            let sid = peer_id.to_string();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                if state_clone.push.remove_invite_if_present(&id) {
-                    send_to_peer(&state_clone, &sid, WsEvent::PushResponse {
-                        invite_id: id.clone(),
-                        accepted: false,
-                    });
-                    emit_ui(&state_clone, ui::PUSH_RESPONSE, &serde_json::json!({
-                        "inviteId": id,
-                        "accepted": false,
-                        "reason": "timeout",
-                    }));
+            // 已配对的设备推送**不需要接收方同意**（token 就是那份信任）：直接开收 —
+            // 界面那条通知是"正在接收"而不是"要不要收"。未绑定的才挂卡片等用户点。
+            if paired {
+                if let Err(reason) = transfer::accept_invite(state.clone(), &invite_id) {
+                    warn!(%invite_id, %reason, "auto-accept failed");
+                    // 本机那条"正在接收"的通知得收尾：这条邀请已经不可能变成完成了。
+                    transfer::reject_invite_with(state, &invite_id, &reason);
                 }
-            });
+                return;
+            }
+            // 到点没处理就自动拒绝：发送方那边一直在等回执，不能只有一边作废。
+            transfer::schedule_invite_timeout(state.clone(), invite_id);
         }
         WsEvent::PushResponse { invite_id, accepted } => {
             info!(%invite_id, accepted, "push response");
             use transfer::push_job::PushStatus;
-            state.push.update_status(&invite_id, if accepted {
-                PushStatus::Accepted
+            if accepted {
+                state.push.update_status(&invite_id, PushStatus::Accepted);
             } else {
-                PushStatus::Failed("rejected".into())
-            });
+                // 拒绝：发送方不能再等下去 —— 清掉 job，并让界面把"等待对方同意"那张卡收掉。
+                state.push.remove_job(&invite_id);
+            }
             emit_ui(state, ui::PUSH_RESPONSE, &serde_json::json!({
                 "inviteId": invite_id,
                 "accepted": accepted,
             }));
+            if !accepted {
+                emit_ui(state, ui::PUSH_DONE, &serde_json::json!({
+                    "inviteId": invite_id,
+                    "status": "failed",
+                    "reason": "对方拒绝了这次推送",
+                }));
+            }
         }
         WsEvent::PushProgress { invite_id, received, total } => {
             use transfer::push_job::PushStatus;
@@ -191,6 +211,9 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
         WsEvent::PushDone { invite_id, status, reason } => {
             info!(%invite_id, %status, "push done");
             use transfer::push_job::PushStatus;
+            // 发送方撤销时这条邀请可能还挂在通知列表里（对方还没点同意）：
+            // 一并撤掉 —— 界面收到下面这条 push://done 就会把卡片收走。
+            state.push.remove_invite(&invite_id);
             state.push.update_status(&invite_id, if status == "completed" {
                 PushStatus::Completed
             } else {

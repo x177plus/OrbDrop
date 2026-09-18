@@ -29,6 +29,39 @@ pub use routes_shares::shares_handler;
 pub use routes_stat::stat_handler;
 pub use routes_tree::tree_handler;
 
+/// 本机在局域网上的 IPv4 地址（非回环），**按"该先报哪个"排好序**。
+///
+/// 一块网卡一个地址：有线 + 无线 + VPN 同时开着就会有 2~3 个。界面（左下角
+/// 「端口 · IP」）只显示第一个，其余在悬停提示里列全 —— 那一条 footer 装不下三四个地址。
+/// 排序：私有网段（家用/办公局域网）→ 其他全局地址 → 链路本地（169.254，通常是没拿到
+/// DHCP 的残留）；同级按地址升序，保证每次刷新顺序一样、不跳。
+pub fn local_ipv4_addresses() -> Vec<String> {
+    let mut addrs: Vec<std::net::Ipv4Addr> = if_addrs::get_if_addrs()
+        .map(|list| {
+            list.into_iter()
+                .filter_map(|i| match i.addr {
+                    if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() => Some(v4.ip),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    addrs.sort_by_key(|ip| (ip_rank(ip), u32::from(*ip)));
+    addrs.dedup();
+    addrs.into_iter().map(|ip| ip.to_string()).collect()
+}
+
+/// 显示优先级：私有网段 0、其他全局地址 1、链路本地 2。
+fn ip_rank(ip: &std::net::Ipv4Addr) -> u8 {
+    if ip.is_link_local() {
+        2
+    } else if ip.is_private() {
+        0
+    } else {
+        1
+    }
+}
+
 /// Build the axum Router with all routes, including the WS /events
 /// endpoint (outside the auth layer).
 fn build_router(state: Arc<AppState>) -> Router {
@@ -38,12 +71,31 @@ fn build_router(state: Arc<AppState>) -> Router {
         .allow_headers(Any);
 
     // Public routes (no auth): pairing, info, WS upgrade.
+    // 推送的两端也在公开面上：未绑定设备没有 token 可带（F-50），
+    // 各自的认人规则写在 handler 里（routes_push::authorize / push_invite_handler）。
     let public_routes = Router::new()
         .route("/pair/info", axum::routing::get(routes_pair::pair_info))
         .route("/pair", axum::routing::post(routes_pair::pair_handshake))
         .route(
-            "/events",
-            axum::routing::get(events_ws_handler),
+            "/pair/invite",
+            axum::routing::post(routes_pair::pair_invite_handler),
+        )
+        .route(
+            "/pair/invite/withdraw",
+            axum::routing::post(routes_pair::pair_invite_withdraw_handler),
+        )
+        .route("/events", axum::routing::get(events_ws_handler))
+        .route(
+            "/push/invite",
+            axum::routing::post(routes_push::push_invite_handler),
+        )
+        .route(
+            "/push/report",
+            axum::routing::post(routes_push::push_report_handler),
+        )
+        .route(
+            "/push/download",
+            axum::routing::get(routes_push::push_download_handler),
         );
 
     // Authenticated routes (auth middleware).
@@ -53,10 +105,6 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/unpair", axum::routing::post(routes_pair::unpair))
         .route("/file", axum::routing::get(routes_file::file_handler))
         .route("/shares", axum::routing::get(routes_shares::shares_handler))
-        .route(
-            "/push/download",
-            axum::routing::get(routes_push::push_download_handler),
-        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,

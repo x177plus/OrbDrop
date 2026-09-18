@@ -140,7 +140,6 @@ font-family: var(--font-body);
   .orb:hover { box-shadow: 0 26px 70px -26px oklch(18% 0.012 250 / 0.30), 0 2px 8px -2px oklch(18% 0.012 250 / 0.10); }
   .orb:active { transform: scale(0.94); }
   .orb .mark { position: relative; width: 30px; height: 30px; }
-  .orb .mark svg { width: 100%; height: 100%; }
   .orb .pulse {
     position: absolute; inset: -6px; border-radius: 50%;
     border: 1px solid var(--accent); opacity: 0;
@@ -163,8 +162,8 @@ font-family: var(--font-body);
   .orb-badge[hidden] { display: none; }
   .orb-stage.live .orb .pulse { border-color: var(--ok); } /* 有长连接设备时脉冲转绿，节奏不变 */
   @keyframes orb-pulse {
-    /* 起始半径对齐内圈：脉冲框 42px（half 21px），0.643×21 − 0.5px ≈ 13px = 内圈 SVG 圆半径 */
-    0% { transform: scale(0.643); opacity: 0.55; }
+    /* 起始半径对齐 logo 圆盘外沿：脉冲框 42px（half 21px），0.622×21 − 0.5px ≈ 12.56px = 圆盘外半径 */
+    0% { transform: scale(0.622); opacity: 0.55; }
     70%, 100% { transform: scale(1.55); opacity: 0; }
   }
   .orb-stage.drag .orb {
@@ -197,16 +196,7 @@ font-family: var(--font-body);
     padding: 12px 16px;
     border-bottom: 1px solid var(--border);
   }
-  .grip { display: grid; grid-template-columns: repeat(3, 3px); gap: 3px; margin-right: 2px; }
-  .grip i { width: 3px; height: 3px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 18%, transparent); }
   .panel-brand { display: flex; align-items: center; gap: 8px; font-family: var(--font-display); font-weight: 650; letter-spacing: -0.01em; font-size: var(--fs-md); }
-  .panel-brand .mark-sm {
-    width: 20px; height: 20px; border-radius: 50%;
-    background: var(--accent-soft);
-    border: 1px solid color-mix(in oklch, var(--accent) 30%, transparent);
-    display: grid; place-items: center;
-  }
-  .panel-brand .mark-sm i { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
   .panel-head-right { margin-left: auto; display: flex; align-items: center; gap: var(--gap-xs); }
   .ch-inst { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--muted); padding: 4px 8px; border: 1px solid var(--border); border-radius: 999px; }
   .dot { width: 6px; height: 6px; border-radius: 50%; }
@@ -574,10 +564,8 @@ font-family: var(--font-body);
     <button class="orb" id="orbBtn" aria-label="展开 OrbDrop 面板" aria-expanded="false">
       <span class="mark">
         <span class="pulse"></span>
-        <svg viewBox="0 0 30 30" fill="none" aria-hidden="true">
-          <circle cx="15" cy="15" r="13" stroke="var(--accent)" stroke-opacity="0.28" stroke-width="1.4"/>
-          <circle cx="15" cy="15" r="5" fill="var(--accent)"/>
-          <path d="M15 9.5 10.5 14M15 9.5l4.5 4.5" stroke="var(--surface)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <svg viewBox="0 0 32 32" width="30" height="30" fill="none" aria-hidden="true">
+          <path fill-rule="evenodd" clip-rule="evenodd" d="M16 2.6A13.4 13.4 0 1 0 16 29.4A13.4 13.4 0 1 0 16 2.6ZM13 9.4H16.4A6.6 6.6 0 0 1 16.4 22.6H13Z" fill="var(--accent)"/>
         </svg>
       </span>
       <span class="orb-badge num" id="orbBadge" hidden>0</span>
@@ -585,8 +573,7 @@ font-family: var(--font-body);
 
     <section class="panel" id="panel" data-od-id="main-panel" aria-label="OrbDrop 主面板">
       <header class="panel-head">
-        <span class="grip" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></span>
-        <span class="panel-brand"><span class="mark-sm"><i></i></span>OrbDrop</span>
+        <span class="panel-brand"><svg viewBox="0 0 32 32" width="20" height="20" fill="none" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M16 2.6A13.4 13.4 0 1 0 16 29.4A13.4 13.4 0 1 0 16 2.6ZM13 9.4H16.4A6.6 6.6 0 0 1 16.4 22.6H13Z" fill="var(--accent)"/></svg>OrbDrop</span>
         <div class="panel-head-right">
           <span class="ch-inst" id="connPill"><span class="dot ok"></span><span>在线 · 长连接 1</span></span>
           <button class="icon-btn" id="settingsBtn" aria-label="打开设置">
@@ -834,7 +821,7 @@ font-family: var(--font-body);
 
       <section class="sheet" id="settingsSheet" data-od-id="settings" aria-label="设置">
         <header class="sheet-head">
-          <span class="panel-brand" style="margin-right:auto"><span class="mark-sm"><i></i></span>设置</span>
+          <span class="panel-brand" style="margin-right:auto"><svg viewBox="0 0 32 32" width="20" height="20" fill="none" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M16 2.6A13.4 13.4 0 1 0 16 29.4A13.4 13.4 0 1 0 16 2.6ZM13 9.4H16.4A6.6 6.6 0 0 1 16.4 22.6H13Z" fill="var(--accent)"/></svg>设置</span>
           <button class="icon-btn" id="closeSettingsBtn" aria-label="关闭设置"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
         </header>
         <div class="sheet-body">

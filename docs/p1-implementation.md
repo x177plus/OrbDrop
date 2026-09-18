@@ -45,6 +45,11 @@ rand = "0.8"                                        # 6 位配对码生成
 
 P0 依赖已覆盖：`axum`（含 WS）、`mdns-sd`、`keyring`（仅迁移老凭据）、`notify`、`tokio`——P1 不需要额外大件。
 
+P1 之后补的小件：`if-addrs`（本机网卡地址枚举，F-09 的「端口 · 本机 IP」用；`mdns-sd` 本来就带着
+同一个 crate，加成直接依赖不会多编一份）。枚举规则在 `server::local_ipv4_addresses`：过滤回环、
+私有网段优先、链路本地（`169.254`）最后、同级按地址升序 —— 顺序稳定，界面只显示首个，
+其余在悬停提示里列全。
+
 ## 3. 新增 Rust 模块
 
 ```
@@ -52,8 +57,10 @@ src-tauri/src/
 ├── ...
 ├─┬ server/
 │ ├── ...
-│ ├── routes_push.rs          # POST /push/invite, /respond, /confirm, GET /download
-│ └── routes_pair.rs          # POST /pair（配对）、POST /unpair（解除配对的另一半，Bearer/回环）
+│ ├── mod.rs                  # 路由装配 + 启动/停止 + local_ipv4_addresses（本机内网地址，F-09）
+│ ├── routes_push.rs          # POST /push/invite, POST /push/report, GET /push/download
+│ └── routes_pair.rs          # POST /pair（配对码换 token）、POST /pair/invite（配对邀请，免输码）、
+│                             # POST /pair/invite/withdraw（发起方撤回）、POST /unpair（解除配对的另一半）
 ├─┬ discover/
 │ ├── mod.rs                  # mDNS 注册 _orbdrop._tcp + 后台扫描服务
 │ └── peer.rs                 # PeerDevice 模型 + 在线状态管理
@@ -66,7 +73,8 @@ src-tauri/src/
 │ ├── session.rs              # 单条 WS session（读+写循环）
 │ ├── heartbeat.rs            # 30s ping + 3 次超时离线
 │ └── events.rs               # 事件类型定义 + 序列化
-├── pair.rs                   # 配对码生成/缓存/验证（2 分钟过期）
+├── pair.rs                   # 配对码生成/缓存/验证（2 分钟过期）+ 配对邀请（进来/出去两条表、
+│                             # 60s TTL、落库唯一入口 commit_pairing）
 ├── task.rs                   # 后台任务启动收口（无 Tokio 运行时则记日志跳过，绝不 panic）
 └── autostart.rs              # 开机自启注册/取消
 ```
@@ -244,6 +252,44 @@ mDNS 只在对方主动告别或记录过期（约 2 分钟）时报告离开，
 任一端都能发起：谁点了「配对」谁显示码，另一端在同一个弹窗里输入即可。
 未绑定设备可用弹窗里的「添加设备」（IP / IP:端口，探测对端 `GET /pair/info`）先入库（F-11）。
 
+### 配对邀请（免输码那条路，同一个弹窗里的「发起邀请」）
+
+```
+        A 端（点「发起邀请」）                B 端（在通知里点「接收/拒绝」）
+    ┌────────────────────┐            ┌──────────────────────────────┐
+    │ 弹窗里点「发起邀请」  │            │ 面板右下角挂一条通知：         │
+    │ pair_invite(peerId) │            │ 「「A」请求与你配对」+接收/拒绝 │
+    │ 记一条外发邀请       │            └──────────────┬───────────────┘
+    └─────────┬──────────┘                          │
+              │  POST /pair/invite                  │ 用户点「接收」
+              │  { inviteId, peerId, peerName, port}│
+              │────────────────────────────────────►│ 铸 token → 存凭据（键 = A.id）
+              │  （请求一直挂着，等 B 的用户做决定）   │ 标记 A 已配对（IP = TCP 来源，端口 = A 自报）
+              │                                     │ emit pair://completed / devices://changed
+              │  ◄──────────── 200 { token, peerId, peerName }
+              │  存同一枚 token（键 = B.id）+ 标记 B 已配对
+              │  emit pair://completed → 弹窗收起 + 通知组那张卡收掉 + 提示配对成功
+              │
+              │  被拒绝 / 60s 没人处理 / A 点「取消」→ 403（正文即原因）
+              │  → emit pair://invite_failed → 通知组那张卡收掉并写明原因
+```
+
+- **推送靠点击**：A 点一下按钮，后端就地发一次 `POST /pair/invite`（不需要 WS，也不需要预先配对）。
+- **本机不等在弹窗里**：点完「发起邀请」弹窗当场收起，这条邀请落成面板右下角通知组里的一张
+  「等待对方确认配对」卡（与"等待对方同意"的推送卡同一位置、带「取消」）—— 对方处理得慢也不占着弹窗。
+  同一台设备再发一次会先把上一条还挂着的邀请撤回来，不让对面堆两条一样的。
+- **同意制**：B 不点「接收」就不会交换 token；60s 没人处理，两边同时作废（B 的通知消失、
+  A 那条挂着的请求以 403 收场）。
+- **撤回是双向的**：A 点「取消邀请」→ `POST /pair/invite/withdraw` → B 界面上那条通知跟着撤掉
+  （不然对面点「接收」才发现"邀请已作废"）。
+- **冒充已配对设备必须出示 token**：自称的 `peerId` 在本机是**已配对**的，就要带上能反解成它的
+  Bearer token（`deliver_invite_http` 会自动带）—— 与 `/push/invite` 同一道关。没有这道关，
+  谁都能自称你的老搭档，用户点一次「接收」那台设备的 token 就被换成了对面手里的那枚。
+- **先伸手后落库**：接收方在 oneshot 送得到（= 发起方还在等）之后才写凭据与地址簿
+  （`pair::accept_invite`）；发起方拿到 token 就落库，不因为"用户中途点过取消"丢弃
+  （对端那边已经记下了，丢掉只会让两边不一致）。
+- 两条路的落库收敛到同一个入口 `pair::commit_pairing`（写凭据 + 写地址簿 + 预写 BC profile + 广播事件）。
+
 ### 代码结构
 
 ```rust
@@ -259,12 +305,20 @@ struct PairRequest {
     code: String,              // 发起方屏幕上显示的那 6 位码
 }
 
-// POST /pair 响应（camelCase）
+// POST /pair 响应（camelCase）—— 邀请那条路的响应**完全一样**
 struct PairResponse {
     token: String,
     peer_id: String,           // 验证方自己的 id（caller 以它登记对端）
     peer_name: String,
 }
+
+// 邀请（同一个 PairStore 里另两张表）
+struct PairStore {
+    invites: Mutex<Vec<PendingInvite>>,        // 进来、等本机用户决定的
+    outbound: Mutex<HashMap<String, String>>,  // 发出、等对端决定的（取消时凭它找到对端）
+}
+struct PendingInvite { invite_id: String, peer: PairedPeer, responder: Option<oneshot::Sender<..>> }
+const INVITE_TTL: Duration = Duration::from_secs(60);   // 与推送邀请同一个数
 ```
 
 ### 配对码生成
@@ -286,7 +340,8 @@ fn generate_code() -> String {
 
 ### token 交换
 
-配对成功时（token 由**验证方**生成，双方保存同一枚）：
+配对成功时（token 由**验证方**生成，双方保存同一枚）—— 邀请那条路里"验证方"就是**收下邀请的一方**
+（它点「接收」时铸一枚放在那条挂着的 HTTP 请求的响应里还给发起方）：
 - A 生成 token（32 字节随机，hex 编码）
 - `credential::set_peer(&B.id, &token)` → A 的凭据文件
 - 响应返回 token → B 收到 → `credential::set_peer(&A.id, &token)` → B 的凭据文件
@@ -350,106 +405,234 @@ ODBF 2                                   ← 魔数 + 十进制版本（版本�
 
 ### 通知通道
 
-| 目标设备状态 | 邀请方式 | 认证 |
-|---|---|---|
-| **长连接** | WS 推送 `push_invite` | Bearer token |
-| **已配对（未长连接）** | HTTP POST `/push/invite` 直达 | Bearer token |
-| **未绑定** | HTTP POST `/push/invite` 直达 | **无需认证**——同意制兜底 |
+| 目标设备状态 | 邀请方式 | 认证 | 接收侧要不要问同意 |
+|---|---|---|---|
+| **长连接** | WS 推送 `push_invite` 事件 | 链路本身就是 token 换来的 | **不问** —— 已绑定（已配对）设备直接收下 |
+| **已配对（未长连接）** | HTTP POST `/push/invite` 直达 | Bearer token | **不问** —— 同上（配对即互信） |
+| **未绑定** | HTTP POST `/push/invite` 直达 | **无需认证**——同意制兜底 | **要问** —— 挂卡片等点「接收/拒绝」，60s 自动拒绝 |
 
-> 未绑定设备推送：邀请本身不认证（任何人可发邀请，你同意才传输）；接收方同意后，发送方为本次 job 生成**短期一次性 download_token**（内存缓存，5 分钟有效），随同意响应返回接收方，用于 `GET /push/download` 认证。
+> 未绑定设备推送：邀请本身不认证（任何人都能发邀请，你同意才会传）；`GET /push/download`
+> 摊销在**邀请 id** 上 —— 那是一枚只在这条邀请里出现过的 v4 uuid，对端刚凭它同意，
+> 局域网明文 HTTP 里再套一层 token 换不到什么，需求本来就把安全性放在"接收方同意"这一步上。
+> 已配对的推送仍然必须带 token（`routes_push::authorize`），否则等于谁都能冒充你的老搭档。
+
+> `/push/invite`、`/push/report`、`/push/download` 三条都在**公开**路由面上（不带 auth 中间件），
+> 认人规则写在各自的 handler 里；它们仍挂在 CORS 之外的那套 REST 命名空间里，与 WebDAV 面互不影响。
 
 ### 状态机
 
 ```
-A（发送方）                              B（接收方）
-┌──────────┐                            ┌──────────┐
-│ 选文件/设备 │                           │          │
-│ 发邀请：    │                           │   受邀    │
-│  • 长连接: WS push_invite             │          │
-│  • 其他:  POST /push/invite ─ HTTP ─►│ 弹窗通知   │
-│  状态: invited                        │          │
-│                                      │ 点击同意   │
-│  (WS 收到 push_response 或            │ POST /push/respond ─ HTTP ─►
-│   HTTP 收到同意响应)                  │  状态: accepted
-│  状态: accepted                       │          │
-│  未绑定 → 生成短期 download_token     │ (响应带回 token)
-│                                      │          │
-│                          GET /push/download?id=&offset=  ←─ HTTP Range │
-│                          (B 主动拉取，带 Bearer/一次性 token)  │
-│                                      │ 流式写入下载目录 │
-│               POST /push/confirm ◄────│───────────│
-│  状态: completed                      │           │
-└──────────────────────────────────────┘           │
+A（发送方）                                    B（接收方）
+┌──────────────────┐                        ┌─────────────────────────┐
+│ 选文件/文件夹      │                        │                         │
+│ 发邀请：           │                        │        受邀             │
+│  • 长连接: WS push_invite                 │                         │
+│  • 其他:  POST /push/invite ─── HTTP ───► │ 面板右下角一条通知气泡     │
+│  状态: invited（界面：等待对方同意）         │ 悬浮球左上角数字 +1       │
+│                                           │                         │
+│ ────────── 同意 / 拒绝 ──────────────── │ 点「接收」/「拒绝」        │
+│   长连接: WS push_response                 │ 60s 没动作 → 自动拒绝     │
+│   其他:   invite 请求的**同步响应**         │                         │
+│  状态: accepted                            │                         │
+│                                           │                         │
+│      GET /push/download?id=&path=&offset=  ◄──── HTTP（B 主动拉取）   │
+│      （offset 续传；取消时流就地断掉）        │ 流式写入 下载目录/        │
+│ ◄───── POST /push/report（进度/完成/失败）── │ 发送方名/…（清单里的路径） │
+│  状态: completed                           │                         │
+└──────────────────┘                        └─────────────────────────┘
 ```
+
+> **已绑定（已配对）设备不弹同意**：邀请一到就直接放行（`transfer::accept_invite`），界面上是
+> 一条"正在接收"的通知；那条带「接收/拒绝」的气泡只留给**未绑定**设备。两条通道（WS / HTTP）
+> 都是这个规则，两处各有一段代码：`ws::session` 的 `push_invite` 分支、`routes_push::push_invite_handler`。
+> 依据是 token 就是那份信任：对已绑定设备来说，下面那段"受邀 → 同意"是**自动填上 `true`** 的。
+> 认人这一步仍然不能省 —— HTTP 那条路上，自称已配对的对端必须出示能反解成它的 token。
+
+> **两条通道说同一套协议**：HTTP 那两条路的请求体就是 WS 上的 `push_progress` / `push_done`
+> 事件（同一个 `WsEvent` 序列化），发送方用同一个 dispatcher（`ws::session::handle_inbound`）
+> 处理。邀请体比 WS 版本多一个 `port`：请求的**源端口**是一次性的，回执要发回发送方真正的
+> 服务端口，所以它自报端口，ip 则取自 TCP 来源（不可伪造）。
+
+### 取消与拒绝
+
+| 动作 | 结果 |
+|---|---|
+| 接收方点「拒绝」 | HTTP 邀请的同步响应 +（有长连接时）WS `push_response` + 本机那条通知撤掉 |
+| 接收方点「取消接收」 | 邀请从内存移除 → 下载循环收手 → 回执 `push_done{failed, 接收方已取消}`（发送方的进度卡跟着收掉） |
+| 发送方点「取消」 | 主动告诉对端（长连接 WS / 否则 `POST /push/report`）：**邀请还挂着**就把对面那条邀请通知撤掉；**正在传**则由下载端点当场断流、下一次请求拿 410，两边几百毫秒内一起收手 |
+| 60s 没人处理（**只对未绑定设备**） | 自动拒绝（两条通道共用 `transfer::schedule_invite_timeout`），发送方的等待不会落空。已绑定设备的邀请一刻都不等人 —— 它压根不排这个超时 |
+
+> **取消必须双向可见**：任一端点了取消，另一端那张卡片就不能再挂着 —— 界面收到的是同一条
+> `push://done{status:"cancelled"}`（发送方自己的那张卡也由它收掉）。漏掉这一层的后果是
+> 对面一直停在「等待对方同意 / 正在接收」，点下去才发现早就没了。
 
 ### 推送 job 模型
 
 ```rust
-// transfer/push_job.rs
-enum PushStatus { Invited, Accepted, Downloading { received: u64, total: u64 }, Completed, Failed(String) }
+// transfer/mod.rs —— 源清单：从"用户选中的那批路径"直接生成，不再依赖共享项
+struct PushSource {
+    name: String,                      // 对端落盘子目录名（多选 = 共同父目录名或「N 项」）
+    files: Vec<FileEntry>,             // 清单（相对路径 + 大小），对端看到的就是这一份
+    sources: Vec<(String, PathBuf)>,   // 清单相对路径 → 本机绝对路径（只在本机用）
+    total: u64, is_dir: bool,          // is_dir = 清单是否权威（单文件推送是唯一例外）
+    count: usize,                      // 用户选了几项（>1 = 多选）
+}
 
-struct PushJob {
-    id: String,
-    from_peer_id: String,
-    from_peer_name: String,
-    path: String,              // 源路径（相对于共享项根）
-    local_path: PathBuf,       // 接收方下载目录下的实际路径
-    is_dir: bool,
+// transfer/push_job.rs
+enum PushStatus { Invited, Accepted, Downloading { received, total }, Completed, Failed(String) }
+
+struct PushJob {           // 发送方
+    id, peer_id, peer_name, name, is_dir, files, sources, total_size,
+    peer_paired: bool,     // 决定下载端点怎么认人
     status: PushStatus,
+}
+
+struct InboundInvite {     // 接收方
+    invite_id, sender: PeerInfo, name, size, is_dir, count, files,
+    callback: Option<(String, u16)>,        // 没有长连接时回执发这儿
+    responder: Option<oneshot::Sender<bool>>, // HTTP 邀请的同步回执口
 }
 ```
 
 ### 发送方侧（A）
 
 ```rust
-// 1. A 点击推送 → 选择目标设备（含未绑定）→ 发起邀请
-// 根据目标设备状态分发邀请通道：
-//   - 长连接：WS 发 push_invite 事件
-//   - 已配对（未长连接）：HTTP POST /push/invite（带 Bearer token）
-//   - 未绑定：HTTP POST /push/invite（无认证，body 含 sender device info）
-
-// 2. A 收到 push_response（WS 事件 / HTTP 响应）
-//   if accepted →
-//     if 接收方未绑定 → 生成短期 download_token（32B hex，内存缓存 5 分钟）
-//     标记 PushJob 状态为 accepted，等待接收方来 GET /push/download
-//   if rejected → 更新状态为 failed，展示给用户
+// transfer::push_paths(state, paths: Vec<String>, peer_id)
+// 1. 目标不在网上 → 就地失败（F-53），不排队
+// 2. 清单 = 这批路径合成的一棵树（见上节"多源清单"）
+// 3. 按对端状态选通道：
+//    长连接                → state.ws.send(peer, PushInvite)
+//    已配对未连 / 未绑定    → POST http://ip:port/push/invite
+//                            （已配对带 Bearer；超时 75s > 接收方 60s 自动拒绝）
+// 4. 界面拿到的永远是同一串事件：push://sent（等对方同意）→ push://response → push://progress → push://done
 ```
 
 ### 接收方侧（B）
 
 ```rust
-// 1. B 收到 push_invite（WS 事件 / HTTP POST 请求）
-//    → 弹窗（同意/拒绝），60 秒超时无操作 → 自动拒绝
-//    同意 → POST /push/respond { invite_id, accepted: true }
-//    → 响应带回认证 token：
-//       - 长连接/已配对：既有 Bearer token
-//       - 未绑定：一次性 download_token
-
-// 2. B 拉起下载：
-//   let offset = resume::load_offset(invite_id);  // 断点续传
-//   for each file:
-//     loop GET /push/download?id=&offset=   // 带 Bearer 或一次性 token
-//         写入下载目录/{share_name}/{path}
-//         offset += received
-
-// 3. 完成 → POST /push/confirm { invite_id, status: "completed" }
+// 1. 收到邀请（WS 事件 / HTTP POST /push/invite）
+//    → 发送方是**已绑定**设备：直接 accept_invite（不问同意），界面一条"正在接收"
+//      发送方**未绑定**：面板右下角挂一条通知气泡 + 悬浮球左上角数字 +1；60s 没动作 → 自动拒绝
+// 2. 同意 → transfer::accept_invite → spawn_download：
+//      let offset = resume::load(invite_id, path);   // 断点续传
+//      loop GET /push/download?id=&path=&offset=     // 带 token（已配对时）
+//           写入 下载目录/{发送方名}/{清单里的相对路径}
+//           （清单路径就是落盘后的样子：A.txt / D/… / 甲目录/… + 散文件.txt
+//             —— 没有"推送名子目录"那一层）
+//      report_to_sender(...)  // 长连接走 WS，否则 POST /push/report（200ms 节流）
+// 3. 完成 → push_done{completed, dest = <下载目录>/<发送方名>}；发送方清掉 job，
+//    接收方那条"正在接收"就地变成**待确认的长通知**（右下角气泡，点「知道了」才消失）
 ```
 
-### 推送通知弹窗交互
+### 吞吐、进度与运行时（几个坑，别踩回去）
 
-```rust
-// 收到 push_invite 时：
-//   - 托盘气泡提示："PC-A 给你发了一个文件「项目文档」(12.3MB)"
-//   - 点击气泡展开主界面 → 弹确认对话框：
-//     ┌─────────────────────────────────┐
-//     │ 收到推送                        │
-//     │ PC-A 发来：项目文档 (12.3MB)     │
-//     │ 保存到：下载目录                  │
-//     │                                 │
-//     │    [拒绝]        [接收]          │
-//     └─────────────────────────────────┘
-//   - 超时 60 秒无操作 → 自动拒绝
+| 位置 | 事实 |
+|---|---|
+| 接收循环 | **不按块休眠**。P1 初版在每块之后 `sleep(50ms)` 当节流 —— 块只有几 KB，于是速度被按死在几十 KB/s，几十 MB 的文件要几分钟，发送方的进度条看起来"永远是 0%"。现在传输不限速，**限速只作用于进度事件**（`REPORT_INTERVAL` = 200ms，发送方回执与本机 UI 事件共用同一个节流点）。 |
+| 下载端点 | 判"这条推送还在不在"用 `PushStore::has_job`（查表）。用 `job()` 会把整份文件清单 `Vec<FileEntry>` 每块克隆一遍：推一个几万文件的目录时，进度条会慢到像卡住。 |
+| 进度回执 | 节流后由 `report_to_sender` 发出：长连接走 WS，否则 `POST /push/report`（请求体就是同一个 `WsEvent`）。发送方的 job 状态由**这条路径**更新（与推给界面的 `push://progress` 同一处），所以"界面能看到进度"和"job 状态在变"是同一个事实。 |
+| 后台任务怎么起 | **同步** Tauri 命令跑在主线程上，那里没有 Tokio reactor：`tokio::spawn` 会 panic（"点一下就闪退"），而"没有运行时就跳过"会把这次点击**无声吞掉**（推送接收踩过：点「同意」后下载任务被丢掉，两边永远停在 0%，日志里只有 `no tokio runtime here; task skipped`）。现在统一走 `task::spawn`：当前运行时 → 否则退回 Tauri 的全局运行时（`tauri::async_runtime`，随用随建），不再有"起不来"这个分支；命令能写 `async fn` 就写（`accept_push` / `cancel_push` / `cancel_receive` 都是）。 |
+
+### 发送入口（前端）
+
 ```
+设备行： [推送]  ─►  对话框：推送到「PC-C」
+                        [选择文件…] [选择文件夹…] [取消]
+```
+
+- 系统选择框一次只能挑**一种**（Windows/macOS 的文件与文件夹是两种对话框；插件 Rust 侧也只有
+  `pick_file(s) / pick_folder(s)` 四个入口，**没有"文件或文件夹"混合模式**），所以这一层询问
+  省不掉。
+- 选择框**一律允许多选**（`multiple: true`）：挑一个就是单发，挑多个合并成一条推送 ——
+  多选也能只选一个，所以不需要"允许多选"这种开关（那是白加一次操作）。
+
+### 清单与落盘（路径就是"对端看到的样子"）
+
+```
+清单里的相对路径（= 对端落盘路径）      本机绝对路径
+A.txt                                → C:\…\A.txt                单文件
+D/报告.txt                            → C:\…\D\报告.txt           单目录
+甲目录/报告.txt                        → C:\…\甲目录\报告.txt       多选
+散文件.txt                             → C:\…\散文件.txt
+```
+
+- 每个源用**自己的名字**当顶层路径；**同名源**自动去重，编号插在扩展名前面
+  （`报告.txt` → `报告 (2).txt`），扩展名不变。
+- 对端只做一件事：把清单里的每条路径落到 `<下载目录>/<发送方名>/` 下面。**没有"推送名
+  子目录"那一层** —— 直接传多文件就是多文件，不是在目录里（`A.txt/A.txt`、`3 项/a.txt`
+  那种嵌套不符合直觉）。
+- `name`（推送名）只剩显示用途（通知/卡片里"推的是什么"）：单源 = 它自己，多源 = 这批源的
+  共同父目录名，跨目录/跨盘取不到就用「N 项」；**它不参与落盘路径**。
+- 服务端不再"拼根目录"，而是按 `sources` 表**精确查表**取文件 —— 清单里没有的路径取不到，
+  `../` 之类越界路径自然也不在表里（这张表是发送方按自己选中的源建的）。
+
+### 推送通知的交互（前端）
+
+**通知只有一组**：面板**右下角**的气泡组（`.notif-group` / `.notif-bubble`），五种东西同形：
+
+| 气泡 | 里面有什么 | 什么时候消失 |
+|---|---|---|
+| 未绑定的邀请 | 文件名 + 「拒绝」「接收」 | 点了 / 60s 自动拒绝 |
+| 正在接收 | 进度条 + 「取消」 | 传完 → 变"已收到"；取消/失败 → 变"失败" |
+| 发送中 / **等待对方同意**（发送侧） | 进度条 + 「取消」（传完转绿、3 秒后自己收掉） | 传完 / 取消 / 失败 |
+| 已收到（`done`） | 落盘位置 + 「知道了」 | **点「知道了」才消失**（长通知） |
+| 接收失败（`failed`） | 原因 + 「知道了」 | 同上 |
+
+形状统一：右对齐、**宽 = 面板的 2/3**（448 × 2/3 ≈ 300，不占满）、多条垂直堆叠、新的贴最下缘
+（`column-reverse` 的 `panel-bottom` 里**靠前的 DOM 元素贴底**，通知组写在最前；组内顺序是
+"通知在前、发送侧进度卡在后"—— 通知贴角）。
+
+> **滚动区域夹在两条横线之间**：`.notif-group` 的盒子（= 滚动容器的剪裁边界）**上下边就是**
+> 标签栏下缘与 footer 上缘 —— 底边靠 `bottom: var(--foot-h)` 贴住 footer 上缘那条线，
+> 高度靠 `--notif-max-h`（App 量出来 = 两条线的距离）。所以**滚动时内容也越不过线**
+> （以前为了让 17px 的阴影有地方落，盒子往下探了 17px，滚动中气泡能从线下面溜出来）。
+> 左右 12px；放不下才在组内滚（**`scrollbar-width: none`，不画滚动条**，滚轮 + 每次滚到底照常）。
+>
+> **阴影的余量留在盒子内部**：`.notif-group` 自带 `padding: 5px 10px 10px 0`（右侧配
+> `margin-right: -10px` 把边界往面板边借 10px，气泡右缘仍是 12px）。这几处数字不是拍脑袋：
+> 气泡用的是**更紧的** `--shadow-bubble`，实测可见半径（渲染后逐像素扫到残差 ≤1/255）
+> **左右 6.4 / 7.2、下 9.6、上 4** —— 正好收进上面那几个 padding。改动这几个数必须重新量：
+> 截图 → 页面里把图贴到 canvas → 从气泡边界向外扫到"恢复纯白"的距离。
+>
+> **阴影点击穿透**：`box-shadow` 属于"墨迹"不属于命中区，唯一会挡住它的是容器自身的盒子 ——
+> 所以 `.panel-bottom` 与 `.notif-group` 都是 `pointer-events: none`，只有 `.notif-bubble` /
+> `.toast` 自己 `auto`。footer 上的铃铛、气泡之间的空隙都点得穿。
+
+```
+收到 push_invite 时：
+  - **不主动弹面板**：不抢屏幕 —— 悬浮球左上角的黄色数字就是要不要点开的信号。
+    未绑定 → 右下角一条气泡（带接收/拒绝）；已绑定（`auto: true`）→ 后端已经开收，
+    气泡直接是"正在接收"
+  - 悬浮球**左上角**的黄色数字 = 组里还剩几件事（通知 + 在途推送；与右上角的
+    「长连接设备数」对称，同一个数也挂在 footer 上的铃铛角标里）：
+      接收中 → 原地推进度（进度条 + 「取消」）
+      完成   → 变成**待确认**的气泡，直到点「知道了」：
+        ┌──────────────────────────────────────┐
+        │ 已收到「PC-A」的推送（3 项）    48.2 MB │
+        │ 3 项 已保存到 C:\…\Desktop\PC-A        │
+        │                          [知道了]     │
+        └──────────────────────────────────────┘
+      失败   → 同样留在气泡里（原因写在正文）
+```
+
+> **动效**：整组用 `fly` 甩入/甩出（`in`/`out` 都挂），来新的一条也各自甩进来（按序号错开
+> 30ms）；`prefers-reduced-motion` 下时长归零（动效可以省，收/展与确认的功能不能省）。
+> 弹窗容器必须 `overflow-x: hidden` —— 气泡甩入时先落在组外，这一轴若算成 `auto`，
+> 动画期间会冒出一条横向滚动条。
+>
+> **铃铛**在面板最右下角（footer 里、版本号右边），点一下收起/展开整组；**收起 ≠ 已读**：
+> 角标照旧挂着。放不下时只在组内滚（**不画滚动条**），App 每次把它滚到底。
+>
+> **"已收到"这条通知必须带落盘位置**（后端在 `push://done{completed}` 里给 `dest`）：
+> 只说"收到了"的通知，点完「知道了」就再也找不到东西在哪。
+>
+> **层叠顺序（面板内，定死）**：`.ctx`（根层级）> `.overlay` **90**（对话框）> `.sheet` **85**
+> （设置面板）> `.panel-bottom` **70**（通知浮层）> 正文/tab/footer。模态必须压过通知浮层 ——
+> 反过来的后果是"弹窗开着，气泡盖在对话框按钮上，点下去被气泡接走"。
+>
+> **左侧「端口 · 本机 IP」**（F-09）：IP 由 `local_addresses` 命令给出（`server::local_ipv4_addresses`
+> 枚举网卡，私有网段优先），点一下复制 `IP:端口`；多网卡时只显示首个、悬停列全 —— 一块 footer
+> 装不下三四个地址。
 
 ## 8. 断点续传（F-60）
 
@@ -595,6 +778,7 @@ pub fn disable_autostart() -> Result<()> { /* 清除注册表/删除 plist */ }
 | 离线判定 | 90s (3×30s) | 3 次无 pong → 标记 offline |
 | 重连尝试 | 指数退避 5-60s | 用户点过「连接」的链路断开后重连；对端处于「断开」暂停时被拒 |
 | 配对码过期清理 | 2 分钟 | 清除 PENDING 中过期的条目 |
+| 配对邀请超时 | 60s | 进来那条：没人处理 → 回执"超时未处理" + 撤掉本机界面上那条通知；发起方那条挂着的 HTTP 请求同刻以 403 收场 |
 | 推送 job 超时 | 5 分钟 | invite 后 5 分钟无 respond → 自动取消 |
 | 断点 offset 定期保存 | 每 1MB 或 5s | 写入 `resume.json` |
 
@@ -666,10 +850,18 @@ pair.rs + routes_pair.rs
 1. pair_start 本机生成码 + 前端显示（2 分钟过期，过期自动换码）
 2. B 端输入该码 → POST /pair 验证 + 生成 token + 双方存凭据文件
 3. 配对成功后刷新设备列表（设备变"已配对"；长连接由用户点「连接」建立）
-4. App 内配对 UI（弹窗同时提供：显示本机码 / 输入对方码 / 手动添加设备）
+4. App 内配对 UI（弹窗同时提供：发起邀请 / 显示本机码 / 输入对方码 / 手动添加设备；
+   底部动作是「取消」—— 它只关弹窗，不代表配对成功）
+5. 免输码那条：弹窗点「发起邀请」→ 弹窗收起 + POST /pair/invite 推到对端 → 对端面板右下角
+   一条通知（「接收/拒绝」，60s 自动作废）→ 点「接收」即配对；本机这边是一条「等待对方确认
+   配对」卡（带「取消」），对方接受/拒绝/超时都落在它身上
 ```
 
 可行验证：A 端点配对显示 6 位码，B 端输入码 → 配成；反向由 A 输入 B 的码同样配成。
+邀请那条路由 `tests/p1_integration.rs::pair_invite_swaps_tokens_without_typing_a_code` 钉住：
+点「发起邀请」→ 对端接受 → 两边各存下**同一枚** token 且**真能过对面认证**（各调一次 `/shares`）、
+没人点「接收」之前谁都不许变「已配对」、自称已配对设备却不带 token 的邀请必须 401、
+被拒的邀请不改动已有凭据、撤回后对端那条邀请自己消失。
 
 ### Step 4：推送
 
@@ -726,10 +918,17 @@ autostart.rs
 ☐ 解除配对（对端离线）：把对端进程/机器停掉 → 本机仍能对那台设备点「解除配对」（本机动作为主，`POST /unpair` 通知失败只记一条 warn）→ 本机凭据已清、行消失或回到"未绑定"；对端回来时拿旧 token 拨号被 401 拒（显示"需重新配对"）
 ☐ 设备列表排序：在线在前（长连接 → 已配对 → 未绑定）、已配对但离线的排在最下方（行内只有「解除配对」）
  需配对（token 失效）：该行给「配对」（右键「重新配对」）而不是「连接」—— 拨号必然 401；走完配对后行回到「已配对」+「连接」，不再停在「需配对」
-☐ 推送邀请（长连接设备）：A 推送 → B 通过 WS 收到通知 + 弹窗
-☐ 推送邀请（未绑定设备）：A 推送 → B 通过 HTTP 收到通知 + 弹窗，无需预先配对
-☐ 推送同意：B 点同意 → 文件流式落盘到下载目录（未绑定走一次性 download_token）
+☐ 已绑定设备推送（长连接）：A 推送 → B **不弹同意**，直接开收（通知里是"正在接收"）
+☐ 已绑定设备推送（只在线、没长连接）：同上 —— 邀请走 HTTP，仍然不问同意
+☐ 未绑定设备推送：A 推送 → B 面板**右下角**一条通知气泡（带文件名 + 接收/拒绝），无需预先配对；**没人点就不该有文件落盘**；收到通知**不会自己弹出面板**（只加悬浮球左上角的数字）
+☐ 推送同意：B 点同意 → 文件流式落盘到下载目录
 ☐ 推送拒绝：B 点拒绝 → A 收到失败提示
+☐ 收完的通知（长通知）：B 收完 → 那条"正在接收"的气泡就地变成**待确认**（写明几项、落在哪个目录），点「知道了」才消失；多条垂直堆叠、新的贴最下缘
+☐ 通知面板的形状：气泡右对齐、宽约面板 2/3（不占满）；**滚动区域正好夹在标签栏下缘与 footer 上缘两条横线之间**（左右 12px；放不下时才在组内滚且**看不到滚动条**；滚到时内容也越不过线）；展开/收起、来新的一条都有甩入/甩出动效；动画期间**没有横向滚动条**；铃铛在 footer 最右侧（版本号右边），角标 = 未处理的通知数（收起 ≠ 已读）
+☐ 发送侧进度：推送时那张「等待对方同意 → 正在发送」的卡也在**同一组**里（同一形状、同一个铃铛管、同一个角标）
+☐ 气泡阴影：收在盒子内部的留白里（`padding 5/10/10` —— 实测可见半径 上 4 / 下 9.6 / 左右 7），四条边都过渡到透明、没有被裁出硬边；阴影**点击穿透**（footer 上的铃铛、气泡之间的空隙都点得穿）
+☐ 层叠与点击：对话框/设置面板打开时**盖住**通知（点对话框按钮不会被气泡接走）；关掉模态后，面板右下角那条"阴影留白带"不吃点击（空白处点得穿）
+☐ 左下角信息条：显示 `端口 · 本机内网 IP`；多网卡时只显示首选那个、悬停列出全部；点一下复制「IP:端口」；取不到地址时只显示端口
 ☐ 推送离线：B 离线 → A 收到"对方离线"提示，不排队
 ☐ 推送进度条：A 端实时看到传输进度
 ☐ 断点续传：中断后重新同意 → 从断处继续

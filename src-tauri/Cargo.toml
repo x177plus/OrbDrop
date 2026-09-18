@@ -25,6 +25,9 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors"] }
 mdns-sd = "0.13"
+# 本机网卡地址枚举（mdns-sd 本来就带着它，这里直接用同一份，不额外多编一份）：左下角
+# 「端口 · 本机 IP」要显示内网地址，多网卡时还得把其余几个列出来。
+if-addrs = "0.13"
 sha2 = "0.10"
 notify = "7"
 quick-xml = "0.37"

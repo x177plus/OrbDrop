@@ -163,7 +163,7 @@
           <span class="f-icon">{@html share.isDir ? ICON_FOLDER : ICON_FILE}</span>
           <div class="s-main">
             <div class="s-name">{share.name}</div>
-            <div class="s-meta"><span class="num">来自 {device.name}</span></div>
+            <div class="s-meta"><span class="num">来自「{device.name}」</span></div>
           </div>
         </div>
 

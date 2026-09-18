@@ -40,6 +40,21 @@ pub fn set_rect(window: &WebviewWindow, rect: Rect) -> Result<(), String> {
     imp::set_rect(window, rect)
 }
 
+/// 开始拖动悬浮球窗口：先把抓取锚点校正回按下点，再当场把拖动交给 OS。
+///
+/// OS 的窗口拖动（`WM_NCLBUTTONDOWN`/HTCAPTION 模态循环）是**一次性**把窗口钉在指针上的：
+/// `start_dragging` 那一刻「指针在窗口里的位置」就成了整个拖动过程的不变量。于是从按下点走到
+/// 那一刻的位移永久丢失 —— 球在指针旁边偏着走，松手时指针落在球上的相对位置也不是按下时那个。
+/// （按住面板头部拖动没有这个问题：那条路径在 mousedown 当场上交，锚点天然就是按下点。）
+///
+/// 校正与起拖**必须在同一次调用里**完成：中间哪怕只多回一趟前端，指针就又走了一段，那段同样
+/// 会偏掉。指针位置也在这里现读（`imp::drag_align`），不用前端事件里的坐标 —— pointermove
+/// 最多滞后一帧，高速拖动时那一帧就是十几个像素，而 OS 锚定时读的是物理指针位置。
+pub fn drag_start(window: &WebviewWindow, press_x: f64, press_y: f64) -> Result<(), String> {
+    imp::drag_align(window, press_x, press_y)?;
+    window.start_dragging().map_err(|e| format!("start_dragging 失败: {e}"))
+}
+
 /// 鼠标主键此刻是否按下。
 ///
 /// 拖动悬浮球走的是 OS 的模态移动循环：窗口一直在动，但页面收不到 mouseup（被拖拽
@@ -125,13 +140,15 @@ pub fn strip_os_frame(window: &WebviewWindow) -> Result<(), String> {
 mod imp {
     use super::{Rect, ScreenMetrics};
     use tauri::WebviewWindow;
-    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Foundation::{POINT, RECT};
     use windows::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MonitorFromWindow, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+        ClientToScreen, GetMonitorInfoW, MonitorFromWindow, MONITOR_DEFAULTTONEAREST, MONITORINFO,
     };
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE,
+    };
 
     fn to_rect(r: RECT) -> Rect {
         Rect { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top }
@@ -170,6 +187,42 @@ mod imp {
         unsafe {
             SetWindowPos(hwnd, None, rect.x, rect.y, rect.w, rect.h, SWP_NOACTIVATE | SWP_NOZORDER)
                 .map_err(|e| format!("SetWindowPos 失败: {e}"))
+        }
+    }
+
+    /// 把窗口挪到「按下点仍在指针底下」的位置：锚点该是按下点，而 OS 锚定时读的是此刻的指针
+    /// 位置，所以这里现读指针、当场把窗口平移过去（见外层 `drag_start` 的说明）。
+    pub fn drag_align(window: &WebviewWindow, press_x: f64, press_y: f64) -> Result<(), String> {
+        let hwnd = window.hwnd().map_err(|e| format!("取窗口句柄失败: {e}"))?;
+        unsafe {
+            // 指针在窗口内的位置必须相对**客户端区**算：Windows 上外框带 DWM 阴影余量，
+            // 外框比客户端大一圈（实测 90 → 136），拿外框原点算会整体偏进来。
+            let mut origin = POINT::default();
+            if !ClientToScreen(hwnd, &mut origin).as_bool() {
+                return Err("ClientToScreen 失败".into());
+            }
+            let mut cur = POINT::default();
+            GetCursorPos(&mut cur).map_err(|e| format!("GetCursorPos 失败: {e}"))?;
+            // 外框位置只用来当平移基准（要挪的是外框），所以这里可以用 GetWindowRect
+            let mut outer = RECT::default();
+            GetWindowRect(hwnd, &mut outer).map_err(|e| format!("GetWindowRect 失败: {e}"))?;
+            let dpi = GetDpiForWindow(hwnd);
+            let sf = if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 };
+            let sx = f64::from(cur.x - origin.x) - press_x * sf;
+            let sy = f64::from(cur.y - origin.y) - press_y * sf;
+            if sx.round() == 0.0 && sy.round() == 0.0 {
+                return Ok(());
+            }
+            SetWindowPos(
+                hwnd,
+                None,
+                outer.left + sx.round() as i32,
+                outer.top + sy.round() as i32,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE,
+            )
+            .map_err(|e| format!("SetWindowPos 失败: {e}"))
         }
     }
 
@@ -232,6 +285,16 @@ mod imp {
     pub fn set_rect(window: &WebviewWindow, rect: Rect) -> Result<(), String> {
         window.set_position(PhysicalPosition::new(rect.x, rect.y)).map_err(|e| e.to_string())?;
         window.set_size(PhysicalSize::new(rect.w.max(1) as u32, rect.h.max(1) as u32)).map_err(|e| e.to_string())
+    }
+
+    /// 把窗口挪到「按下点仍在指针底下」的位置（非 Windows 用 Tauri 的窗口内指针位置）。
+    pub fn drag_align(window: &WebviewWindow, press_x: f64, press_y: f64) -> Result<(), String> {
+        let sf = window.scale_factor().map_err(|e| e.to_string())?;
+        let pos = window.outer_position().map_err(|e| e.to_string())?;
+        let cur = window.cursor_position().map_err(|e| e.to_string())?;
+        let x = pos.x + (cur.x - press_x * sf).round() as i32;
+        let y = pos.y + (cur.y - press_y * sf).round() as i32;
+        window.set_position(PhysicalPosition::new(x, y)).map_err(|e| e.to_string())
     }
 }
 
