@@ -2,6 +2,7 @@
   import type { PeerDevice } from '$lib/types';
   import { getDevices, loadDevices } from '$lib/stores/devices.svelte';
   import { connectPeer, disconnectPeer } from '$lib/api';
+  import Hint from '$lib/components/Hint.svelte';
   import { onMount } from 'svelte';
 
   let {
@@ -208,7 +209,16 @@
 </button>
 
 <div class="list-label">
-  <span>局域网设备</span>
+  <span>局域网设备<Hint>
+    <p>
+      <span class="hl">未绑定</span>设备可点击「推送」直接发送（接收方需同意）；
+      <span class="hl">已配对</span>设备点「连接」建立长连接（配对本身不建链）；
+      处于<span class="hl">长连接</span>的设备会自动收到你拖入悬浮球文件的广播，无需逐条操作；
+      关机时连着长连接的设备，下次启动 OrbDrop 时会自动接回来（点过「断开」的不会）。
+      <span class="hl">已配对但离线</span>的设备排在列表下方（在线的在上），可以「解除配对」
+      —— 解除是本机动作，不需要对方在线。
+    </p>
+  </Hint></span>
   <span class="num" id="devCount">{devCountStr}</span>
 </div>
 
@@ -271,12 +281,3 @@
     {/each}
   </ul>
 {/if}
-
-<p style="margin:14px 2px 0; font-size:var(--fs-xs); color:var(--muted); line-height:1.6;">
-  <span class="hl">未绑定</span>设备可点击「推送」直接发送（接收方需同意）；
-  <span class="hl">已配对</span>设备点「连接」建立长连接（配对本身不建链）；
-  处于<span class="hl">长连接</span>的设备会自动收到你拖入悬浮球文件的广播，无需逐条操作；
-  关机时连着长连接的设备，下次启动 OrbDrop 时会自动接回来（点过「断开」的不会）。
-  <span class="hl">已配对但离线</span>的设备排在列表下方（在线的在上），可以「解除配对」
-  —— 解除是本机动作，不需要对方在线。
-</p>

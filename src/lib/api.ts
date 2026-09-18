@@ -39,6 +39,14 @@ export function getActualPort(): Promise<number> {
   return invoke('get_actual_port');
 }
 
+/**
+ * 本机内网 IPv4 地址（左下角「端口 · IP」用）。`primary` 是界面显示的那一个，
+ * `all` 含其余几块网卡的地址 —— 多网卡时悬停提示要把它列全。
+ */
+export function localAddresses(): Promise<{ primary: string | null; all: string[] }> {
+  return invoke('local_addresses');
+}
+
 export function listDevices(): Promise<PeerDevice[]> {
   return invoke('list_devices');
 }
@@ -84,9 +92,36 @@ export function pairConfirm(peerId: string, code: string): Promise<string> {
   return invoke('pair_confirm', { peerId, code });
 }
 
+/**
+ * 发起配对邀请（F-12 免配对码）：对端在它自己的通知里点「接收」即可配对，谁都不用输码。
+ * 返回邀请 id；对方接受后走 `pair://completed`，拒绝/超时/撤回走 `pair://invite_failed`。
+ */
+export function pairInvite(peerId: string): Promise<string> {
+  return invoke('pair_invite', { peerId });
+}
+
+/** 撤回一条还没被处理的配对邀请（对端界面上那条通知跟着撤掉）。 */
+export function cancelPairInvite(inviteId: string): Promise<void> {
+  return invoke('cancel_pair_invite', { inviteId });
+}
+
+/** 接收方：接受一条配对邀请（通知里的「接收」），返回对方设备名。 */
+export function acceptPairInvite(inviteId: string): Promise<string> {
+  return invoke('accept_pair_invite', { inviteId });
+}
+
+/** 接收方：拒绝一条配对邀请。 */
+export function rejectPairInvite(inviteId: string): Promise<void> {
+  return invoke('reject_pair_invite', { inviteId });
+}
+
 // Push (F-50 ~ F-54)
-export function pushInvite(shareId: string, path: string, peerId: string): Promise<string> {
-  return invoke('push_invite', { shareId, path, peerId });
+/**
+ * 推送本机一批文件/目录给某台设备；返回邀请 id（对方同意与否走 push:// 事件）。
+ * 多选走**同一条**推送：对端只弹一张卡、只同意一次。
+ */
+export function pushPaths(paths: string[], peerId: string): Promise<string> {
+  return invoke('push_paths', { paths, peerId });
 }
 
 export function acceptPush(inviteId: string): Promise<void> {
@@ -103,10 +138,6 @@ export function cancelPush(inviteId: string): Promise<void> {
 
 export function cancelReceive(inviteId: string): Promise<void> {
   return invoke('cancel_receive', { inviteId });
-}
-
-export function pushJobStatus(inviteId: string): Promise<string | null> {
-  return invoke('push_job_status', { inviteId });
 }
 
 // BeyondCompare 比较（本机 / 长连接设备的共享项）。四个命令都返回最新 BcStatus，
@@ -165,6 +196,17 @@ export function orbScreenMetrics(): Promise<ScreenMetrics> {
 
 export function orbSetRect(rect: ScreenRect): Promise<void> {
   return invoke('orb_set_rect', { x: rect.x, y: rect.y, w: rect.w, h: rect.h });
+}
+
+/**
+ * 开始拖动悬浮球窗口：先按按下点校正抓取锚点，再当场把拖动交给 OS。
+ *
+ * `pressX/pressY` 是按下点在窗口里的位置（CSS px）。校正与起拖必须在同一瞬间完成 ——
+ * OS 是在起拖那一刻把窗口钉在指针上的，中间多一次往返，指针就又走了一段（见
+ * `App.beginOrbDrag`）。
+ */
+export function orbDragStart(pressX: number, pressY: number): Promise<void> {
+  return invoke('orb_drag_start', { pressX, pressY });
 }
 
 /** 鼠标主键是否仍按着：拖动悬浮球期间页面收不到 mouseup，贴边落位靠它等松手 */

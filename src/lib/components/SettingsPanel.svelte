@@ -2,6 +2,8 @@
   import { onMount } from 'svelte';
   import { open as openDialog } from '@tauri-apps/plugin-dialog';
   import { wipeCredentials } from '$lib/api';
+  import Hint from '$lib/components/Hint.svelte';
+  import Logo from '$lib/components/Logo.svelte';
   import { getSettings, loadSettings, updateSettings } from '$lib/stores/settings.svelte';
 
   let {
@@ -114,7 +116,7 @@
 <section class="sheet" class:open aria-label="设置">
   <header class="sheet-head">
     <span class="panel-brand" style="margin-right:auto">
-      <span class="mark-sm"><i></i></span>设置
+      <Logo size={20} />设置
     </span>
     <button class="icon-btn" onclick={cancel} aria-label="关闭设置">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
@@ -128,12 +130,14 @@
       <input class="input" id="deviceName" bind:value={deviceName} />
     </div>
     <div class="field">
-      <label for="downloadDir">下载目录</label>
+      <label for="downloadDir">下载目录<Hint>
+        手动「下载到本地」和对端「推送」接收都存这里；推送落在 <strong>发送方名</strong>
+        目录下，按你选中的那些项各自的名字展开（不会和下载的文件混在一层）。
+      </Hint></label>
       <div class="path-input">
         <input class="input" id="downloadDir" value={downloadDir} readonly />
         <button class="btn btn-secondary btn-sm" onclick={pickDownloadDir}>选择</button>
       </div>
-      <p style="margin:2px 0 0; font-size:var(--fs-xs); color:var(--muted);">手动「下载到本地」和对端「推送」接收都存这里；推送会按 发送方/推送名 建子目录，不会和下载的文件混在一层。</p>
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
@@ -150,14 +154,14 @@
       </div>
     </div>
     <div class="field">
-      <label for="port">服务端口</label>
+      <label for="port">服务端口<Hint>被占用时自动 +1 探测，实际端口显示在底部状态栏。</Hint></label>
       <input class="input num" id="port" type="number" bind:value={port} />
-      <p style="margin:2px 0 0; font-size:var(--fs-xs); color:var(--muted);">被占用时自动 +1 探测，实际端口显示在底部状态栏。</p>
     </div>
     <div class="field">
-      <label for="bcExePath">BC 可执行文件路径</label>
+      <label for="bcExePath">BC 可执行文件路径<Hint>
+        用于右键菜单里的「用 BeyondCompare 比较」，例如 BCompare.exe 的完整路径。
+      </Hint></label>
       <input class="input" id="bcExePath" bind:value={bcExePath} placeholder="留空 = 自动探测" />
-      <p style="margin:2px 0 0; font-size:var(--fs-xs); color:var(--muted);">用于右键菜单里的「用 BeyondCompare 比较」，例如 BCompare.exe 的完整路径。</p>
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
@@ -172,11 +176,10 @@
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
-      <label>配对凭据</label>
-      <p style="margin:2px 0 6px; font-size:var(--fs-xs); color:var(--muted);">
+      <label>配对凭据<Hint>
         全部设备的 token 存在本机数据目录的一个文件里（仅遮挡、非加密）。这里是唯一的删除入口：
         清空后所有设备回到「未配对」需重新配对，已写进 Beyond Compare 的 WebDAV profile 也一并清掉。
-      </p>
+      </Hint></label>
       {#if wipeArmed}
         <div style="display:flex; align-items:center; gap:8px;">
           <span style="font-size:var(--fs-sm); color:var(--muted);">确认清空？所有设备需重新配对</span>

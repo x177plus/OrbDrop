@@ -144,7 +144,7 @@ impl DragStore {
                     .insert(ticket.clone(), Entry { at: Instant::now(), staged: Staged::Preparing });
                 let (task_state, task_req, task_peer, id) =
                     (state.clone(), req.clone(), peer_id.clone(), ticket.clone());
-                let spawned = task::spawn("drag prepare", async move {
+                task::spawn("drag prepare", async move {
                     let result = walk_peer_item(&task_state, &task_req, &task_peer).await;
                     match &result {
                         Ok(items) => info!(ticket = %id, items = items.len(), "拖拽元数据已备好"),
@@ -152,11 +152,6 @@ impl DragStore {
                     }
                     task_state.drag.finish(&id, result);
                 });
-                // 没有 Tokio 运行时就永远不会有进度（`task::spawn` 只记日志不干活）：
-                // 当场把票据判失败，让界面立刻看到原因，而不是干等到超时。
-                if spawned.is_none() {
-                    self.finish(&ticket, Err("内部错误：当前上下文没有异步运行时，读不了对端目录".into()));
-                }
                 Ok(DragTicket { ticket, name: req.name, ready: false })
             }
             None => {
@@ -1438,9 +1433,13 @@ mod tests {
     }
 
     /// 对端项在**没有 Tokio 运行时**的上下文里登记（同步 Tauri 命令踩过这个坑）：
-    /// 必须当场判失败，不能留一张永远停在「准备中」的票据让界面干等。
+    /// 后台活儿必须**真的跑起来**，不许被无声丢掉，也不许把票据永远留在「准备中」。
+    ///
+    /// 以前这里断言"当场判失败"—— 那是 `task::spawn` 在没运行时时"记日志跳过"的产物：
+    /// 用户点一下什么都没发生。现在它会退到 Tauri 的全局运行时，所以对端项照常去拉；
+    /// 这个用例里对端是编的地址，于是任务很快就会以"连不上"收尾 —— 关键是它**动了**。
     #[test]
-    fn peer_prepare_without_runtime_fails_instead_of_hanging() {
+    fn peer_prepare_without_runtime_still_runs_the_task() {
         let root = std::env::temp_dir().join(format!("orbdrop-drag-rt-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let mut config = crate::config::Config::default();
@@ -1449,12 +1448,28 @@ mod tests {
 
         let req = request(Some("device-nowhere"), "");
         let ticket = state.drag.prepare(&state, &req).expect("登记不该失败");
-        assert!(!ticket.ready, "对端项要先走一遍目录");
-        let err = state
-            .drag
-            .payload(&ticket.ticket)
-            .expect_err("没有运行时必须当场判失败（不是停在准备中）");
-        assert!(!err.is_empty(), "失败要带一句能看懂的原因");
+        assert!(
+            matches!(state.drag.payload(&ticket.ticket), Ok(None)),
+            "刚登记时票据就该是「准备中」"
+        );
+
+        // 任务真的在跑：几秒内它必须自己收尾（对端地址是编的 → 连不上 → 判失败）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match state.drag.payload(&ticket.ticket) {
+                Ok(None) => {}                     // 还在走目录：正常
+                Ok(Some(_)) => panic!("对端地址是编的，不可能备好"),
+                Err(msg) => {
+                    assert!(!msg.is_empty(), "失败要带一句能看懂的原因");
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "票据不能永远停在「准备中」——那说明后台任务被丢掉了"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -17,6 +17,11 @@ pub struct FileEntry {
     pub size: u64,
 }
 
+/// 「这次推送了几项」的缺省值：老对端不带这个字段时按"一项"算。
+fn one_item() -> usize {
+    1
+}
+
 /// Wire protocol for the peer WebSocket channel (server-to-server, WS /events).
 ///
 /// Every variant is valid in both directions; the receiving side interprets
@@ -40,7 +45,12 @@ pub enum WsEvent {
         name: String,
         /// Total size in bytes; 0 for directories (sum of files instead).
         size: u64,
+        /// 清单是否权威（按 `files` 逐条取；单文件推送为 false）。
         is_dir: bool,
+        /// 发送方这次选了几项（>1 = 多选合并成的一条推送）。
+        /// `default` 是为了容忍不认识这个字段的旧对端。
+        #[serde(default = "one_item")]
+        count: usize,
         /// Directory manifest; empty for single-file pushes.
         files: Vec<FileEntry>,
     },
@@ -100,6 +110,13 @@ pub mod ui {
     pub const PEER_OFFLINE: &str = "peer://offline";
     pub const DEVICES_CHANGED: &str = "devices://changed";
     pub const PAIR_COMPLETED: &str = "pair://completed";
+    /// 收到一条配对邀请（F-12 免配对码）：界面挂一条带「接收/拒绝」的通知。
+    pub const PAIR_INVITE: &str = "pair://invite";
+    /// 一条挂着/等着的配对邀请作废了（超时 / 对端撤回）：两端的界面都凭它收手。
+    pub const PAIR_INVITE_CLOSED: &str = "pair://invite_closed";
+    /// 本机发起的配对邀请没成（对端拒绝 / 不在网上 / 撤回）：只有发起方收这条。
+    pub const PAIR_INVITE_FAILED: &str = "pair://invite_failed";
+    pub const PUSH_SENT: &str = "push://sent";
     pub const PUSH_INVITE: &str = "push://invite";
     pub const PUSH_RESPONSE: &str = "push://response";
     pub const PUSH_PROGRESS: &str = "push://progress";

@@ -41,6 +41,11 @@
      当前阴影实测可见半径（离主体边缘、残差降到 ≤1/255 的距离）左右 12px / 上 7px / 下 17px，
      因此需要 PANEL_SLACK ≥ 17、折叠态 ORB_INSET ≥ 12 —— 改这里就必须同步这两处。 */
   --shadow: 0 5px 16px -5px oklch(18% 0.012 250 / 0.22), 0 1px 3px -1px oklch(18% 0.012 250 / 0.12);
+  /* 通知浮层里气泡/提示自己用的阴影：**比面板的更紧**，因为它住在面板右下角，只有 12px 的
+     余量就碰到面板边（面板 `overflow: hidden` 会把超出部分裁掉）。实测可见半径（同上的量法）：
+     左右 6.4 / 7.2，下 9.6，上 4 —— 正好收进 `.notif-group` 的 padding（上 5 / 下 10 / 右 10），
+     所以既不会被裁、也不用为它把滚动区域顶到横线外面去。改这几个数之前先重新量一遍。 */
+  --shadow-bubble: 0 3px 10px -3px oklch(18% 0.012 250 / 0.22), 0 1px 2px -1px oklch(18% 0.012 250 / 0.12);
 }
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -118,7 +123,6 @@ input { font: inherit; }
 .orb:hover { box-shadow: 0 6px 18px -6px oklch(18% 0.012 250 / 0.30), 0 1px 3px -1px oklch(18% 0.012 250 / 0.14); }
 .orb:active { transform: scale(0.94); }
 .orb .mark { position: relative; width: 30px; height: 30px; pointer-events: none; }
-.orb .mark svg { width: 100%; height: 100%; }
 .orb .pulse {
   position: absolute; inset: -6px; border-radius: 50%;
   border: 1px solid var(--accent); opacity: 0; pointer-events: none;
@@ -145,11 +149,14 @@ input { font: inherit; }
   pointer-events: none;
 }
 .orb-badge[hidden] { display: none; }
+/* 左上角的通知数：与右上角的「长连接设备数」对称。黄色 = 有要你处理的事
+   （黄在这套配色里专门表示"要处理"，见 device states 那段注释）。 */
+.orb-badge.notif { left: -4px; right: auto; background: color-mix(in oklch, var(--warn) 82%, black); }
 .orb-stage.live .orb .pulse { border-color: var(--ok); } /* 有长连接设备时脉冲转绿，节奏不变 */
 @keyframes orb-pulse {
-  /* 起始半径对齐内圈：脉冲框 42px（half 21px），0.643×21 − 1px 边框中心自身 0.5px ≈ 13px
-     = 内圈 SVG 圆的半径 13px → 波从内圈原地起，而非内圈外侧 6px 起 */
-  0% { transform: scale(0.643); opacity: 0.55; }
+  /* 起始半径对齐 logo 圆盘外沿：脉冲框 42px（half 21px），0.622×21 − 1px 边框中心自身 0.5px
+     ≈ 12.56px = 30px 盒子里 logo 的外半径（13.4/32×30）→ 波从圆盘边缘原地起，而非盘外 6px 起 */
+  0% { transform: scale(0.622); opacity: 0.55; }
   70%, 100% { transform: scale(1.55); opacity: 0; }
 }
 .orb-stage.drag .orb {
@@ -181,16 +188,7 @@ input { font: inherit; }
   padding: 12px 16px;
   border-bottom: 1px solid var(--border);
 }
-.grip { display: grid; grid-template-columns: repeat(3, 3px); gap: 3px; margin-right: 2px; }
-.grip i { width: 3px; height: 3px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 18%, transparent); }
 .panel-brand { display: flex; align-items: center; gap: 8px; font-family: var(--font-display); font-weight: 650; letter-spacing: -0.01em; font-size: var(--fs-md); }
-.panel-brand .mark-sm {
-  width: 20px; height: 20px; border-radius: 50%;
-  background: var(--accent-soft);
-  border: 1px solid color-mix(in oklch, var(--accent) 30%, transparent);
-  display: grid; place-items: center;
-}
-.panel-brand .mark-sm i { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
 .panel-head-right { margin-left: auto; display: flex; align-items: center; gap: var(--gap-xs); }
 .ch-inst { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--muted); padding: 4px 8px; border: 1px solid var(--border); border-radius: 999px; }
 .dot { width: 6px; height: 6px; border-radius: 50%; }
@@ -204,6 +202,21 @@ input { font: inherit; }
 }
 .icon-btn:hover { background: var(--fg-soft); color: var(--fg); }
 .icon-btn svg { width: 16px; height: 16px; }
+/* 通知铃铛：展开/收起右下角那组通知气泡。角标 = 未处理的通知数（含在途），
+   与悬浮球左上角那个黄标是同一个数 —— 收起 ≠ 已读，角标照旧挂着。 */
+.icon-btn.bell { position: relative; }
+.icon-btn.bell.active { background: var(--accent-soft); color: var(--accent); }
+.icon-btn.bell .bell-badge {
+  position: absolute; top: -4px; right: -4px;
+  min-width: 16px; height: 16px; padding: 0 4px;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--warn) 82%, black);
+  color: var(--surface);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 700; line-height: 1;
+  border: 2px solid var(--surface);
+  pointer-events: none;
+}
 
 /* ─── tabs ──────────────────────────────────────────────────── */
 /* 设备标签会随长连接设备增加：横向滚动，别把标签压成省略号 */
@@ -407,28 +420,26 @@ input { font: inherit; }
   border-top: 1px solid var(--border);
   font-size: var(--fs-xs); color: var(--muted);
 }
+/* 左半边：端口 + 本机内网 IP（IP 点一下复制「IP:端口」——手动添加设备要用；
+   多网卡时这里只显示首选那个，悬停列出全部）。 */
+.foot-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.foot-addr { padding: 1px 6px; border-radius: 999px; border: 1px solid transparent; color: var(--muted); font-size: var(--fs-xs); }
+.foot-addr:hover { color: var(--fg); background: var(--fg-soft); border-color: var(--border); }
+/* 右半边：版本号 + 通知铃铛（铃铛在最右下角、版本号右边）。 */
+.foot-right { display: flex; align-items: center; gap: 8px; }
+.panel-foot .icon-btn.bell { width: 22px; height: 22px; }
+.panel-foot .icon-btn.bell svg { width: 14px; height: 14px; }
+.panel-foot .bell-badge { min-width: 14px; height: 14px; padding: 0 3px; font-size: 9px; border-width: 1.5px; }
 
-/* ─── push card ─────────────────────────────────────────────── */
-.push-card {
-  position: absolute; left: 12px; right: 12px; bottom: 56px;
-  padding: 12px 14px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow);
-  transform: translateY(16px); opacity: 0; pointer-events: none;
-  transition: transform 0.24s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.2s ease;
-  z-index: 5;
-}
-.push-card.show { transform: translateY(0); opacity: 1; pointer-events: auto; }
+/* ─── 进度条 / 元信息行（气泡内部件：接收中、发送中的那张卡都用）───────── */
 .p-top { display: flex; align-items: center; justify-content: space-between; gap: var(--gap-md); font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500; }
-.p-top .p-per { color: var(--muted); font-size: var(--fs-xs); }
 .p-bar { height: 4px; margin-top: 10px; border-radius: 999px; background: var(--fg-soft); overflow: hidden; }
 .p-bar i { display: block; height: 100%; width: 0; border-radius: 999px; background: var(--accent); transition: width 0.1s linear; }
 .p-meta { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; font-size: var(--fs-xs); color: var(--muted); }
-.push-card.done .p-bar i { background: var(--ok); }
+/* 传完了把进度条转绿（和接收侧那条"已收到"一个意思）。 */
+.notif-bubble.done .p-bar i { background: var(--ok); }
 
-/* ─── device states: 未绑定 / 已配对 / 长连接 ──────────────── */
+/* ─── device states: 未绑定 / 已配对 / 长连接 ─────────────── */
 .state-chip {
   display: inline-flex; align-items: center; gap: 5px;
   padding: 1px 8px; border-radius: 999px;
@@ -473,11 +484,51 @@ input { font: inherit; }
 .consent-info .f-icon { width: 16px; height: 16px; color: var(--warn); flex: none; }
 .consent-info .f-icon svg { width: 16px; height: 16px; }
 .consent-info .c-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: var(--font-display); font-weight: 500; }
-.consent-info .c-size { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); flex: none; }
-.consent-acts { display: flex; gap: 8px; margin-top: 12px; }
-.consent-acts .btn { flex: 1; height: 32px; }
 
-.sheet { position: absolute; inset: 0; z-index: 10; background: var(--surface); transform: translateX(100%); transition: transform 0.28s cubic-bezier(0.2, 0.8, 0.2, 1); display: flex; flex-direction: column; }
+/* ─── 通知：面板右下角的整组气泡（邀请 / 接收中 / 发送中 / 已收到 / 失败）───
+   统一形状：右对齐 + 固定 2/3 面板宽（448 × 2/3 ≈ 300），**不占满** —— 一组气泡
+   右对齐成一条边才像"堆在角上"，所以宽度写死而不是 fit-content。
+   多条垂直堆叠（新的贴最下缘，App 每次滚到底）；收起/展开由 footer 最右侧的铃铛控制。
+   `overflow-x: hidden` 是必须的：气泡甩入时会先落在组外，否则这一轴会算成 auto，
+   动画期间冒出一条横向滚动条。
+   **盒子的四条边就是"剪裁边界"**（滚动容器按 padding box 裁剪）：上下两条边就贴在
+   上/下两条横线上（标签栏下缘 → footer 上缘），所以滚动时内容永远越不过线去。
+   阴影的余量全部在**盒子内部**留：`padding-top 5px` / `padding-bottom 10px`（= `--shadow-bubble`
+   实测的可见半径：上 4 / 下 9.6）—— padding 在盒内，不会把剪裁边界撑到线外。
+   右侧没有横线，所以右边用 `padding-right: 10px` + 等量负 margin 把边界往面板边借 10px，
+   好让气泡右缘仍是 12px、右阴影又不被裁。 */
+.notif-group {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
+  /* 可用高度由 App 量出来 = 标签栏下缘 → footer 上缘（盒子的上下边就是这两条线）：
+     不写死数字 —— 标签栏会随长连接设备增减、footer 会随 IP 换行变高。 */
+  max-height: var(--notif-max-h, 320px);
+  overflow-y: auto; overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: none;              /* 不显示滚动条：滚轮/自动滚到底照常，只是不画那一条 */
+  padding: 5px 10px 10px 0;
+  margin: 0 -10px 0 0;
+}
+.notif-group::-webkit-scrollbar { width: 0; height: 0; }  /* WebView2 走 Chromium 这套 */
+.notif-group > * { flex: none; }
+.notif-bubble {
+  width: 300px; max-width: 100%;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-bubble);   /* 紧一号：右/下各只有 12px 余量，见 :root 的说明 */
+}
+.notif-bubble.fail { border-color: color-mix(in oklch, var(--warn) 40%, var(--border)); }
+.notif-bubble .p-top { align-items: flex-start; gap: 10px; }
+.nb-title { min-width: 0; overflow-wrap: anywhere; }
+.nb-size { flex: none; font-size: var(--fs-xs); color: var(--muted); }
+.nb-body { margin: 6px 0 0; font-size: var(--fs-xs); color: var(--muted); overflow-wrap: anywhere; }
+.notif-bubble.fail .nb-body { color: color-mix(in oklch, var(--warn) 75%, black); }
+.nb-acts { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+/* 气泡里的按钮比卡上的小一号；两个（拒绝/接收）时等宽，单个（知道了/取消）就自然宽度。 */
+.nb-acts .btn { height: 28px; min-width: 76px; }
+
+.sheet { position: absolute; inset: 0; z-index: 85; background: var(--surface); transform: translateX(100%); transition: transform 0.28s cubic-bezier(0.2, 0.8, 0.2, 1); display: flex; flex-direction: column; }
 .sheet.open { transform: translateX(0); }
 .sheet-head { display: flex; align-items: center; gap: var(--gap-md); padding: 13px 16px; border-bottom: 1px solid var(--border); }
 .sheet-head h3 { margin: 0; font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
@@ -499,11 +550,35 @@ input { font: inherit; }
 .radio .r-label { flex: 1; }
 .radio .r-sub { font-size: var(--fs-xs); color: var(--muted); display: block; cursor: default; }
 .sheet-foot { display: flex; justify-content: flex-end; gap: var(--gap-sm); padding: 12px 16px; border-top: 1px solid var(--border); }
-.overlay { position: absolute; inset: 0; z-index: 12; background: color-mix(in oklch, var(--fg) 22%, transparent); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); display: grid; place-items: center; opacity: 0; pointer-events: none; transition: opacity 0.2s ease; }
+
+/* ─── hint（圆圈 ? + 悬停说明）──────────────────────────────── */
+/* 说明都收进这颗 14px 的圈里，指针悬停 / 键盘聚焦才出气泡。圈里的「?」用正文字体并
+   清掉字距与大小写变换 —— `.list-label` 是等宽 + 大写 + 字距，被它带走的「?」会又宽又偏。 */
+.hint { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; flex: none; margin-left: 5px; border: 1px solid color-mix(in oklch, var(--fg) 24%, transparent); border-radius: 50%; color: var(--muted); font-family: var(--font-body); font-size: 9px; font-weight: 600; line-height: 1; letter-spacing: 0; text-transform: none; vertical-align: middle; cursor: help; transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease; }
+.hint:hover, .hint:focus-visible { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+/* 气泡：由 `HintLayer` 统一画在 `.orb-stage` 之外（`position: fixed`，left/top 由它按窗口
+   尺寸避让边缘后传入）—— 画在触发点旁边会被 `.panel`（overflow: hidden）/ `.panel-body`、
+   `.sheet-body`（overflow: auto）/ `.overlay`（backdrop-filter）逐层裁掉或改坐标系。
+   `pointer-events: none`：指针始终留在触发点上，气泡既不截走点击，也不会把 mouseleave
+   抢过去变成一闪一闪。用紧一号的 `--shadow-bubble`：它可能贴到窗口边（透明），
+   `--shadow` 的可见半径比 `HintLayer` 让出的边距大，会被硬裁出切线。 */
+.hint-tip { position: fixed; z-index: 100; max-width: 264px; padding: 9px 11px; border-radius: var(--radius); background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-bubble); font-size: var(--fs-xs); color: var(--muted); line-height: 1.65; pointer-events: none; }
+.hint-tip p { margin: 0; }
+
+/* ─── 面板内的层叠顺序（定死，别随手改）─────────────────────────────
+     `.hint-tip` 100（悬停说明）> `.ctx`（根层级）> `.overlay` 90（对话框）
+       > `.sheet` 85（设置面板）> `.panel-bottom` 70（通知浮层）> 正文 / tab 栏 / footer
+   模态**必须**压过通知浮层：反过来的后果是"推送选择框开着，气泡正盖在对话框按钮上，
+   点下去被气泡接走"（气泡是 `pointer-events: auto`，看得见就一定点得到）。
+   设置面板同理 —— 它是整面板覆盖，理应在通知之上。
+   右键菜单 `.ctx` 挂在 `.orb-stage` **之外**，跨层叠上下文永远在最上，不受这里影响。 */
+.overlay { position: absolute; inset: 0; z-index: 90; background: color-mix(in oklch, var(--fg) 22%, transparent); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); display: grid; place-items: center; opacity: 0; pointer-events: none; transition: opacity 0.2s ease; }
 .overlay.open { opacity: 1; pointer-events: auto; }
 .dialog { width: min(340px, calc(100% - 32px)); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); padding: 22px; transform: translateY(10px) scale(0.98); transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1); }
 .overlay.open .dialog { transform: none; }
 .dialog h3 { margin: 0 0 6px; font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
+/* 说明已收进标题旁的「?」（`.hint`）：没有 `.d-desc` 那行了，标题自己把间距留出来 */
+.dialog h3.d-head { margin-bottom: 16px; }
 .dialog .d-desc { margin: 0 0 16px; font-size: var(--fs-sm); color: var(--muted); }
 .code { display: flex; gap: 8px; justify-content: center; padding: 16px; border-radius: var(--radius-lg); background: var(--fg-soft); font-family: var(--font-mono); font-size: 26px; font-weight: 600; letter-spacing: 0.18em; color: var(--fg); }
 .code b { font-weight: 600; }
@@ -515,6 +590,9 @@ input { font: inherit; }
 .dialog .d-err { margin: 10px 0 0; font-size: var(--fs-xs); color: color-mix(in oklch, var(--warn) 75%, black); }
 .dialog .d-acts { display: flex; gap: var(--gap-sm); margin-top: 18px; }
 .dialog .d-acts .btn { flex: 1; }
+/* 对话框里的一个勾选项（如推送的「允许多选」）：整行可点，别只在小方块上有反馈。 */
+.dialog .d-check { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: var(--fs-sm); color: var(--fg); cursor: pointer; }
+.dialog .d-check input { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
 .ctx { position: fixed; z-index: 60; min-width: 172px; padding: 5px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); opacity: 0; transform: scale(0.96); pointer-events: none; transform-origin: top left; transition: opacity 0.12s ease, transform 0.12s ease; }
 .ctx.show { opacity: 1; transform: scale(1); pointer-events: auto; }
 .ctx-item { display: flex; align-items: center; gap: 9px; width: 100%; padding: 7px 10px; border-radius: 7px; font-size: var(--fs-sm); color: var(--fg); text-align: left; }
@@ -523,10 +601,20 @@ input { font: inherit; }
 .ctx-item.danger { color: color-mix(in oklch, var(--warn) 75%, black); }
 .ctx-item.danger:hover { background: color-mix(in oklch, var(--warn) 12%, transparent); }
 .ctx-sep { height: 1px; margin: 5px 6px; background: var(--border); }
-/* 提示层挂在面板内（不是视口）：面板收起即不可见，且随面板圆角/overflow 一起裁。
-   bottom 14px = 面板底缘往上，与「面板外 34px」在视觉上是同一个位置（面板四周余量 20px）。 */
-.toast-layer { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 70; display: flex; flex-direction: column; gap: 8px; align-items: center; }
-.toast { padding: 9px 16px; background: color-mix(in oklch, var(--fg) 92%, transparent); color: var(--surface); border-radius: 999px; font-size: var(--fs-sm); box-shadow: var(--shadow); display: flex; align-items: center; gap: 8px; max-width: 100%; text-align: center; animation: toast-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1); }
+/* 面板底部的堆叠层：通知组（通知 + 发送进度卡）与提示共用一列，谁也不盖谁。
+   `column-reverse` 下**DOM 里靠前的元素贴底** —— App 里通知组写在最前，所以它永远
+   落在最下缘；提示往上叠。
+   底边 = **footer 上缘那条横线**（`--foot-h` 是 App 量出来的 footer 实际高度，这里不留余量）：
+   通知组的盒子底边就压在这条线上，滚动区域因此"在两条横线中间"，内容不会溜到线下面。
+   气泡向下 9.6px 的阴影余量由组自己的 `padding-bottom` 在盒内让出，不占位置也不越线。 */
+.panel-bottom { position: absolute; left: 12px; right: 12px; bottom: var(--foot-h, 40px); z-index: 70; display: flex; flex-direction: column-reverse; gap: 8px; pointer-events: none; }
+/* 浮层里**只有真正可点的东西吃指针**：容器与滚动容器的内边距/空白一律放过。
+   给阴影留的那层 padding（上 5 / 下 10 / 右 10）若也算点击区，面板右下角就会多出
+   一条看不见的"点击黑洞"。（代价：组内滚动条拖不动了 —— 滚轮悬停在气泡上照常滚整组。） */
+.panel-bottom > * { pointer-events: none; }
+.notif-bubble, .toast { pointer-events: auto; }
+.toast-stack { display: flex; flex-direction: column; gap: 8px; align-items: center; padding-bottom: 10px; }
+.toast { padding: 9px 16px; background: color-mix(in oklch, var(--fg) 92%, transparent); color: var(--surface); border-radius: 999px; font-size: var(--fs-sm); box-shadow: var(--shadow-bubble); display: flex; align-items: center; gap: 8px; max-width: 100%; text-align: center; animation: toast-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1); }
 .toast svg { width: 14px; height: 14px; color: color-mix(in oklch, var(--surface) 80%, transparent); }
 .toast.leaving { opacity: 0; transform: translateY(6px); transition: opacity 0.25s ease, transform 0.25s ease; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
@@ -535,6 +623,11 @@ input { font: inherit; }
 .empty .e-sub { font-size: var(--fs-xs); max-width: 240px; }
 .empty svg { width: 26px; height: 26px; opacity: 0.5; margin-bottom: 4px; }
 .d-target { text-align: center; font-size: var(--fs-xs); color: var(--muted); margin: -8px 0 12px; }
+/* 配对弹窗里的「发起邀请」（整宽主按钮）与它下面那行「或：输入到…」。
+   `.d-target` 的 -8px 上边距是给"紧跟在说明句之后"用的 —— 前面换成按钮后，
+   负边距会把它压到按钮上（重叠），所以这里清零并自己留出间距。 */
+.dialog .pair-invite { margin: 0 0 14px; }
+.dialog .pair-invite + .d-target { margin-top: 0; }
 @media (prefers-reduced-motion: reduce) {
-  .orb-stage, .panel, .orb, .toast, .ctx, .push-card, #consentCard, .sheet, .dialog, .tree, .chev, .p-bar i, .pulse, .state-chip .dot, .overlay { transition: none !important; animation: none !important; }
+  .orb-stage, .panel, .orb, .toast, .ctx, .sheet, .dialog, .tree, .chev, .p-bar i, .pulse, .state-chip .dot, .overlay { transition: none !important; animation: none !important; }
 }

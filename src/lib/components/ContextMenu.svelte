@@ -149,7 +149,7 @@
   {#if kind === 'peer'}
     <button class="ctx-item" onclick={() => handleItem(onPeerDownload)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
-      下载到本地{peerName ? ` · 来自${peerName}` : ''}
+      下载到本地{peerName ? ` · 来自「${peerName}」` : ''}
     </button>
     {@render bcSection()}
   {:else if kind === 'share'}
@@ -202,7 +202,7 @@
     {#if deviceOnline}
       <button class="ctx-item" onclick={() => handleItem(onPush)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
-        推送文件
+        推送…
       </button>
     {/if}
     {#if deviceState !== 'unbound'}

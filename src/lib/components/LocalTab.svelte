@@ -92,7 +92,7 @@
 {#if connectedDevices.length > 0}
   <p class="bcast-hint">
     <span class="dot ok"></span>
-    <span>拖入文件将自动广播至 {connectedDevices.map(d => d.name).join('、')}</span>
+    <span>拖入文件将自动广播至 {connectedDevices.map(d => `「${d.name}」`).join('、')}</span>
   </p>
 {/if}
 
@@ -133,7 +133,7 @@
             <div class="s-meta">
               <span class="num">{share.path}</span>
               {#if connectedDevices.length > 0 && share.broadcastEnabled}
-                <span class="bcast-chip" title="自动广播至 {connectedDevices.map(d => d.name).join('、')}">
+                <span class="bcast-chip" title="自动广播至 {connectedDevices.map(d => `「${d.name}」`).join('、')}">
                   <span class="dot ok"></span>{connectedDevices.length}台设备
                 </span>
               {/if}

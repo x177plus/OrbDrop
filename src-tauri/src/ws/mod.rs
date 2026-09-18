@@ -580,13 +580,9 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
         }
     };
 
-    // 拨号任务必须有 Tokio 运行时。Tauri 的**同步**命令跑在主线程（没有 reactor），
-    // 直接 tokio::spawn 会 panic 掉整个进程（用户侧表现为点「连接」闪退），
-    // 所以走统一收口：没有运行时就不拨号（用户再点一次「连接」即可），绝不 panic。
-    let handle = match crate::task::spawn("outbound ws link", body) {
-        Some(h) => h,
-        None => return,
-    };
+    // 拨号任务的启动收口见 `task::spawn`：同步命令（主线程、没有 reactor）会退到 Tauri 的
+    // 全局运行时，所以这里不再有"起不来"的分支。
+    let handle = crate::task::spawn("outbound ws link", body);
     // peer_id was moved into the async block; register via the pre-cloned id.
     state_reg.ws.register_task(&pid_for_register, handle);
 }

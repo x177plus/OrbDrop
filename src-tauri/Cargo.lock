@@ -2929,6 +2929,7 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "futures-util",
+ "if-addrs",
  "keyring",
  "mdns-sd",
  "notify",

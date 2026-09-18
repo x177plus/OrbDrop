@@ -7,7 +7,6 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::config::PeerDevice;
 use crate::credential;
 use crate::pair;
 use crate::state::AppState;
@@ -136,11 +135,6 @@ pub async fn pair_handshake(
 
     let token = pair::generate_token();
 
-    // Store in our keyring under the remote's peer id.
-    if let Err(e) = credential::set_peer(&peer_id, &token) {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("凭据存储失败: {e}")));
-    }
-
     // The caller's address: TCP source address plus the port it reports for its
     // own server. This side may be the one that owes the outbound link (smaller
     // device id) and it has usually never seen the caller over mDNS — without
@@ -163,32 +157,115 @@ pub async fn pair_handshake(
         .or_else(|| known.as_ref().map(|p| p.port).filter(|p| *p != 0))
         .unwrap_or(0);
 
-    // Upsert into the address book (persists, so the address survives a restart)
-    // and mark paired.
-    state.mark_paired(&PeerDevice {
-        id: peer_id.clone(),
-        name,
-        ip,
-        port,
-        online: true,
-        paired: true,
-        // 刚配对：还没长连接，没有要恢复的东西。
-        auto_connect: false,
-    });
+    // 落库这一步与邀请那条路共用（写凭据 + 写地址簿 + 预写 BC profile + 广播事件）。
+    let grant = pair::mint_grant(&state);
+    pair::commit_pairing(
+        &state,
+        pair::PairedPeer { id: peer_id.clone(), name, ip, port },
+        &token,
+        None,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // 配对只到"已配对"为止：不在这里建长连接，等本机用户点「连接」再拨号。
-    let own_id = state.config.lock().device_id.clone();
-    let own_name = state.config.lock().device_name.clone();
-    // 刚拿到 token：把 BC 的 WebDAV profile 预写好（BC 只在启动时登记 profile 文件，
-    // 所以要抢在用户下次启动 BC 之前落盘）。
-    let written = crate::bc::provision_profiles(&state);
-    info!(peer_id, written, "配对完成，已预写 BC profile");
-    ws::emit_ui(&state, ui::PAIR_COMPLETED, &serde_json::json!({
-        "peerId": peer_id,
+    info!(%peer_id, "pairing completed");
+    Ok(Json(PairResponse { token, peer_id: grant.peer_id, peer_name: grant.peer_name }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairInviteRequest {
+    /// 邀请 id：发起方生成，只用来把两边的这一条邀请对上号。
+    pub invite_id: String,
+    /// 发起方的身份（自报）——配对成后本机按它登记凭据与设备行。
+    pub peer_id: String,
+    pub peer_name: String,
+    /// 发起方的服务端口（自报）：地址簿要拿它回连/调用本机。
+    pub port: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairInviteWithdraw {
+    pub invite_id: String,
+}
+
+/// POST /pair/invite —— 免输入配对码那条路（发起方点「发起邀请」，F-12）。
+///
+/// 与 `POST /push/invite` 同一个形状：这是个**同步**接口，请求一直挂着，直到本机用户在
+/// 右下角通知里点「接收/拒绝」、或 60 秒没人处理自动作废 —— 决定一下来就作为响应回给
+/// 发起方。响应体与 `POST /pair` 完全一样（`PairResponse`），两条路给发起方的是同一样东西。
+///
+/// 安全靠两点：① 同意制（没人点「接收」就不会交换 token）；② 若发起方自称的是本机
+/// **已配对**的设备，就必须出示那枚 token —— 否则谁都能自称你的老搭档，用户点一次
+/// 「接收」就把那台设备的 token 换成了对面手里的那枚（与 `push_invite_handler` 同一道关）。
+pub async fn pair_invite_handler(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<PairInviteRequest>,
+) -> Result<Json<PairResponse>, (StatusCode, String)> {
+    if req.peer_id.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "缺少 peerId".into()));
+    }
+    if req.port == 0 {
+        return Err((StatusCode::BAD_REQUEST, "缺少对方服务端口".into()));
+    }
+    let paired = state.get_peer(&req.peer_id).is_some_and(|p| p.paired);
+    if paired {
+        let claimed = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .and_then(|t| crate::ws::session::peer_id_from_token(&state, t));
+        if claimed.as_deref() != Some(req.peer_id.as_str()) {
+            info!(peer = %req.peer_id, "配对邀请被拒：自称已配对设备但 token 不认");
+            return Err((StatusCode::UNAUTHORIZED, "身份校验失败".into()));
+        }
+    }
+
+    let invite_id = req.invite_id.clone();
+    // 地址只信 TCP 来源：邀请体里的地址谁都能填。
+    let peer = pair::PairedPeer {
+        id: req.peer_id.clone(),
+        name: req.peer_name.clone(),
+        ip: addr.ip().to_string(),
+        port: req.port,
+    };
+    info!(%invite_id, peer = %req.peer_name, paired, "inbound pair invite (http)");
+    crate::ws::emit_ui(&state, ui::PAIR_INVITE, &serde_json::json!({
+        "inviteId": invite_id,
+        "peerId": req.peer_id,
         "peerName": req.peer_name,
     }));
-    ws::emit_ui(&state, ui::DEVICES_CHANGED, &serde_json::json!({}));
 
-    info!(%peer_id, "pairing completed");
-    Ok(Json(PairResponse { token, peer_id: own_id, peer_name: own_name }))
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .pair
+        .insert_invite(pair::PendingInvite::new(invite_id.clone(), peer, tx));
+    pair::schedule_invite_timeout(state.clone(), invite_id.clone());
+
+    // 等用户在通知里做决定（到点由超时任务先回一个原因）。
+    match tokio::time::timeout(pair::INVITE_TTL + std::time::Duration::from_secs(15), rx).await {
+        Ok(Ok(Ok(grant))) => Ok(Json(PairResponse {
+            token: grant.token,
+            peer_id: grant.peer_id,
+            peer_name: grant.peer_name,
+        })),
+        Ok(Ok(Err(reason))) => Err((StatusCode::FORBIDDEN, reason)),
+        // oneshot 断了（本机正在关停之类）：按"没接受"回。
+        _ => Err((StatusCode::FORBIDDEN, "配对邀请已作废".into())),
+    }
+}
+
+/// POST /pair/invite/withdraw —— 发起方点了「取消」，把它挂在本机界面上的邀请撤掉。
+///
+/// 不认人、也不回错误：邀请 id 本身就是一次性的能力（只在这条邀请里出现过），
+/// 撤不成就让 TTL 兜底。
+pub async fn pair_invite_withdraw_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PairInviteWithdraw>,
+) -> StatusCode {
+    pair::withdraw_incoming_invite(&state, &req.invite_id);
+    StatusCode::NO_CONTENT
 }
