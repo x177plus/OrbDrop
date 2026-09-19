@@ -5,6 +5,59 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>OrbDrop · 局域网文件传送 — 交互原型</title>
 <style>
+/* OD-LAYOUT-PRIMITIVES v1 — structure only: display, flex/grid, overflow, wrapping, ratio.
+   Put this @layer first; product CSS outside the layer always wins. */
+@layer od-layout {
+  :where(.od-stack,.od-row,.od-row-top,.od-cluster,.od-grid,.od-field,.od-stat,.od-cell,.od-tile) > :where(*) { min-width: 0; }
+
+  /* containers */
+  .od-stack   { display: flex; flex-direction: column; gap: var(--od-gap, 8px); }
+  .od-row     { display: flex; align-items: center; gap: var(--od-gap, 8px); }
+  .od-row-top { display: flex; align-items: flex-start; gap: var(--od-gap, 8px); }
+  .od-cluster { display: flex; flex-wrap: wrap; align-items: center; gap: var(--od-gap, 8px); }
+  .od-fill    { flex: 1 1 0; min-width: 0; }
+  .od-fixed   { flex: none; }
+  .od-grid    { display: grid; gap: var(--od-gap, 12px); grid-template-columns: repeat(var(--od-cols, 3), minmax(0, 1fr)); }
+
+  /* stacked information: each piece is its own line — never sibling inline spans */
+  .od-stat, .od-field, .od-cell { display: grid; gap: var(--od-gap, 2px); }
+  :where(.od-stat,.od-field,.od-cell) > :where(*) { display: block; }
+  .od-tile { display: grid; grid-template-rows: auto 1fr; }
+  :where(.od-tile) > :where(*) { display: block; }
+
+  /* media keeps its intrinsic ratio by default; never a distorted or cropped
+     cover by accident. height:auto lets the ratio win over an <img height="…">
+     attribute. Cropping to a uniform box is an explicit opt-in: set --od-ratio
+     AND add .od-media-cover together (per the core rule, only where a crop is
+     deliberate — tile thumbs, decorative fills — never on full-frame content). */
+  .od-media { display: block; width: 100%; height: auto; aspect-ratio: var(--od-ratio, auto); }
+  .od-media-cover { object-fit: cover; }
+
+  /* data text only — authored copy is rewritten to its budget instead */
+  .od-truncate { display: block; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .od-clamp-2, .od-clamp-3 { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+  .od-clamp-2 { -webkit-line-clamp: 2; }
+  .od-clamp-3 { -webkit-line-clamp: 3; }
+  .od-lines-2 { min-height: calc(2 * 1.4em); }   /* block-level reservation for a shared baseline */
+  .od-nowrap  { white-space: nowrap; }           /* 数字+单位 · 价格+起 · 日期+星期 */
+  .od-keep    { word-break: keep-all; overflow-wrap: anywhere; } /* CJK labels break at spaces / <wbr> first */
+
+  /* screen skeleton (optional): bars take their own space, the middle scrolls — no padding guessed for chrome */
+  .od-screen { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; height: 100%; }
+  .od-scroll { overflow-y: auto; overscroll-behavior: contain; min-height: 0; }
+
+  /* horizontal rail: the next item peeks at the edge; trailing room survives overflow */
+  .od-rail { display: flex; gap: var(--od-gap, 8px); overflow-x: auto; scroll-snap-type: x proximity; scrollbar-width: none;
+             padding-inline: var(--od-rail-pad, 16px); scroll-padding-inline: var(--od-rail-pad, 16px); }
+  .od-rail::-webkit-scrollbar { display: none; }
+  :where(.od-rail) > :where(*) { flex: none; scroll-snap-align: start; }
+  :where(.od-rail) > :where(:last-child) { margin-inline-end: var(--od-rail-pad, 16px); }
+
+  .od-spacer { flex: none; visibility: hidden; pointer-events: none; }
+  .od-touch  { min-width: 44px; min-height: 44px; }
+}
+/* /OD-LAYOUT-PRIMITIVES v1 */
+
   :root {
     --bg:      oklch(99% 0.002 240);
     --surface: oklch(100% 0 0);
@@ -15,8 +68,6 @@
 
     --ok:      oklch(58% 0.16 158);
     --warn:    oklch(62% 0.15 60);
-    /* 「关系出问题」才用的红：对端点过「断开」（重拨被拒）/ 对端不认本机 token。 */
-    --danger:  oklch(58% 0.2 25);
 
     --accent-soft:  color-mix(in oklch, var(--accent) 13%, transparent);
     --fg-soft:      color-mix(in oklch, var(--fg) 6%, transparent);
@@ -41,7 +92,6 @@
 
     --radius: 8px;
     --radius-lg: 14px;
-    --control-h: 38px;  /* 主操作控件统一高度：添加设备配对码按钮 / 本机拖入框 */
     --shadow: 0 24px 64px -24px oklch(18% 0.012 250 / 0.22), 0 2px 8px -2px oklch(18% 0.012 250 / 0.10);
   }
 
@@ -140,13 +190,9 @@ font-family: var(--font-body);
   .orb:hover { box-shadow: 0 26px 70px -26px oklch(18% 0.012 250 / 0.30), 0 2px 8px -2px oklch(18% 0.012 250 / 0.10); }
   .orb:active { transform: scale(0.94); }
   .orb .mark { position: relative; width: 30px; height: 30px; }
-  .orb .pulse {
-    position: absolute; inset: -6px; border-radius: 50%;
-    border: 1px solid var(--accent); opacity: 0;
-    animation: orb-pulse 3.2s ease-out infinite; /* 常驻脉冲：无设备连接时也持续扩散 */
-  }
+  .orb .mark svg { width: 100%; height: 100%; }
+  .orb .pulse { position: absolute; inset: -6px; border-radius: 50%; border: 1px solid var(--accent); opacity: 0; }
   .orb-stage.open .orb { transform: scale(0.5); opacity: 0; pointer-events: none; }
-  .orb-stage.open .orb .pulse { animation-play-state: paused; }
   .orb-badge {
     position: absolute;
     top: -4px; right: -4px;
@@ -160,10 +206,12 @@ font-family: var(--font-body);
     box-shadow: 0 2px 6px -2px oklch(18% 0.012 250 / 0.35);
   }
   .orb-badge[hidden] { display: none; }
-  .orb-stage.live .orb .pulse { border-color: var(--ok); } /* 有长连接设备时脉冲转绿，节奏不变 */
+  .orb-stage.live .orb .pulse {
+    border-color: var(--ok);
+    animation: orb-pulse 3.2s ease-out infinite;
+  }
   @keyframes orb-pulse {
-    /* 起始半径对齐 logo 圆盘外沿：脉冲框 42px（half 21px），0.622×21 − 0.5px ≈ 12.56px = 圆盘外半径 */
-    0% { transform: scale(0.622); opacity: 0.55; }
+    0% { transform: scale(0.9); opacity: 0.55; }
     70%, 100% { transform: scale(1.55); opacity: 0; }
   }
   .orb-stage.drag .orb {
@@ -196,7 +244,16 @@ font-family: var(--font-body);
     padding: 12px 16px;
     border-bottom: 1px solid var(--border);
   }
+  .grip { display: grid; grid-template-columns: repeat(3, 3px); gap: 3px; margin-right: 2px; }
+  .grip i { width: 3px; height: 3px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 18%, transparent); }
   .panel-brand { display: flex; align-items: center; gap: 8px; font-family: var(--font-display); font-weight: 650; letter-spacing: -0.01em; font-size: var(--fs-md); }
+  .panel-brand .mark-sm {
+    width: 20px; height: 20px; border-radius: 50%;
+    background: var(--accent-soft);
+    border: 1px solid color-mix(in oklch, var(--accent) 30%, transparent);
+    display: grid; place-items: center;
+  }
+  .panel-brand .mark-sm i { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
   .panel-head-right { margin-left: auto; display: flex; align-items: center; gap: var(--gap-xs); }
   .ch-inst { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--muted); padding: 4px 8px; border: 1px solid var(--border); border-radius: 999px; }
   .dot { width: 6px; height: 6px; border-radius: 50%; }
@@ -212,26 +269,16 @@ font-family: var(--font-body);
   .icon-btn svg { width: 16px; height: 16px; }
 
   /* ─── tabs ──────────────────────────────────────────────────── */
-  /* 设备标签会随长连接设备增加：横向滚动，别把标签压成省略号 */
-  .tabs {
-    display: flex; gap: 2px; padding: 6px 14px 0;
-    border-bottom: 1px solid var(--border);
-    overflow-x: auto; overflow-y: hidden;
-    scrollbar-width: none;
-  }
-  .tabs::-webkit-scrollbar { display: none; }
+  .tabs { display: flex; gap: 2px; padding: 6px 14px 0; border-bottom: 1px solid var(--border); }
   .tab {
     position: relative;
     display: inline-flex; align-items: center; gap: 7px;
-    flex: none;
     padding: 9px 4px 11px;
     margin-right: 18px;
     font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500;
     color: var(--muted);
     transition: color 0.15s ease;
-    white-space: nowrap;
   }
-  .tab.peer-tab { max-width: 132px; overflow: hidden; text-overflow: ellipsis; }
   .tab::after {
     content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
     border-radius: 2px 2px 0 0;
@@ -254,12 +301,10 @@ font-family: var(--font-body);
   .panel-body::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg) 14%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: content-box; }
 
   /* ─── dropzone ──────────────────────────────────────────────── */
-  /* 高度与「添加设备 · 配对码」按钮一致（同为主操作控件，同一 --control-h） */
   .dropzone {
     width: 100%;
-    height: var(--control-h);
     display: flex; align-items: center; justify-content: center; gap: 8px;
-    padding: 0 12px;
+    padding: 12px;
     border: 1px dashed var(--border);
     border-radius: var(--radius);
     color: var(--muted);
@@ -369,17 +414,6 @@ font-family: var(--font-body);
   .d-ip { margin-top: 1px; font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .auto-tag { display:none; align-items:center; gap:3px; margin-left:2px; padding:0 6px; font-size:10px; line-height:1.6; color:var(--muted); background:var(--fg-soft); border-radius:999px; white-space:nowrap; }
   .device-row[data-state="connected"] .auto-tag { display:inline-flex; }
-
-  /* ── peer browse tab（对端设备标签）───────────────────────────── */
-  /* 顶部设备条：来自哪台设备 + 连接状态 + 手动刷新兜底（F-33）。 */
-  .peer-head {
-    display: flex; align-items: center; gap: var(--gap-sm);
-    padding: 10px 10px 10px 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--surface);
-  }
-  .peer-head .icon-btn { flex: none; }
   .d-acts { display: flex; align-items: center; gap: 6px; flex: none; }
   .d-acts .btn { white-space: nowrap; flex: none; }
   .d-acts .btn-primary { min-width: 84px; }
@@ -442,24 +476,8 @@ font-family: var(--font-body);
   }
   .state-chip .dot { width: 5px; height: 5px; box-shadow: none; }
   .state-chip.connected { color: color-mix(in oklch, var(--ok) 70%, black); border-color: color-mix(in oklch, var(--ok) 38%, transparent); background: var(--ok-soft); }
-  /* 已配对 = 蓝色（项目主色）：关系正常、随时可用。 */
-  .state-chip.paired { color: color-mix(in oklch, var(--accent) 70%, black); border-color: color-mix(in oklch, var(--accent) 34%, transparent); background: var(--accent-soft); }
-  /* 未绑定 = 局域网设备的常态（不配对也能推送），不是告警：中性灰，暖色只留给"要处理"。 */
-  .state-chip.unbound { color: var(--muted); border-color: var(--border); }
-  /* 关系出问题（对端点过「断开」/ token 失效）：红。这两档才是真正"出事了"。 */
-  .state-chip.danger { color: color-mix(in oklch, var(--danger) 72%, black); border-color: color-mix(in oklch, var(--danger) 32%, transparent); background: color-mix(in oklch, var(--danger) 8%, transparent); }
-  .dot.danger { background: var(--danger); }
-  /* 呼吸：只给绿（链路活着）与琥珀（正在重试）；红/灰是静止的。 */
-  @keyframes chip-breathe {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.4; transform: scale(0.72); }
-  }
-  .state-chip.connected .dot,
-  .state-chip.pending .dot { animation: chip-breathe 1.9s ease-in-out infinite; }
+  .state-chip.unbound { color: color-mix(in oklch, var(--warn) 70%, black); border-color: color-mix(in oklch, var(--warn) 40%, transparent); background: color-mix(in oklch, var(--warn) 12%, transparent); }
   .dot.warn { background: var(--warn); }
-  /* 已配对但离线的行：仍列在在线设备下方，只提供「解除配对」。 */
-  .state-chip.offline { border-style: dashed; }
-  .device-row:not(.online) .d-name { color: var(--muted); }
   .bcast-hint { display: flex; align-items: center; gap: 6px; margin: 8px 2px 0; font-size: var(--fs-xs); color: var(--muted); }
   .bcast-hint .dot { width: 5px; height: 5px; }
   .hl { color: var(--fg); font-weight: 500; }
@@ -482,9 +500,9 @@ font-family: var(--font-body);
   .field > label { font-size: var(--fs-xs); color: var(--muted); }
   .input { width: 100%; height: 36px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--fg); font-size: var(--fs-sm); }
   .input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
-  .path-input { display: flex; gap: 8px; align-items: stretch; }
+  .path-input { display: flex; gap: 8px; }
   .path-input .input { flex: 1; color: var(--muted); font-family: var(--font-mono); font-size: var(--fs-xs); }
-  .path-input .btn { flex: none; height: auto; }
+  .path-input .btn { flex: none; }
   .radio-group { display: flex; flex-direction: column; gap: 8px; }
   .radio { display: flex; align-items: center; gap: 9px; padding: 9px 11px; border: 1px solid var(--border); border-radius: var(--radius); cursor: pointer; font-size: var(--fs-sm); transition: border-color 0.15s ease, background 0.15s ease; }
   .radio:hover { background: var(--fg-soft); }
@@ -523,8 +541,103 @@ font-family: var(--font-body);
   .empty svg { width: 26px; height: 26px; opacity: 0.5; margin-bottom: 4px; }
   .d-target { text-align: center; font-size: var(--fs-xs); color: var(--muted); margin: -8px 0 12px; }
   @media (max-width: 560px) { .menubar .mb-right { display: none; } .orb-stage.open { max-width: calc(100vw - 24px); } }
+  /* ─── file picker · files + folders in one dialog ───────────── */
+  .picker-layer {
+    position: absolute; inset: 0; z-index: 14;
+    display: flex;
+    background: color-mix(in oklch, var(--fg) 22%, transparent);
+    backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+    opacity: 0; visibility: hidden; pointer-events: none;
+    transition: opacity 0.2s ease, visibility 0.2s ease;
+  }
+  .picker-layer.open { opacity: 1; visibility: visible; pointer-events: auto; }
+  .picker {
+    flex: 1; margin: 44px 10px 10px; min-height: 0;
+    display: flex; flex-direction: column;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    transform: translateY(10px) scale(0.99);
+    transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .picker-layer.open .picker { transform: none; }
+
+  .picker-head { display: flex; align-items: center; gap: var(--gap-xs); padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  .picker-head h3 { flex: 0 1 auto; min-width: 0; margin: 0; font-family: var(--font-display); font-size: var(--fs-md); font-weight: 650; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .picker-head #pickerCloseBtn { margin-left: auto; }
+  .picker-help { width: 22px; height: 22px; flex: none; display: grid; place-items: center; border-radius: 999px; color: var(--muted); cursor: help; }
+  .picker-help:hover { color: var(--fg); background: var(--fg-soft); }
+  .picker-help svg { width: 15px; height: 15px; }
+
+  .picker-places { border-bottom: 1px solid var(--border); }
+  .picker-places .od-rail { padding-block: 9px 10px; }
+  .place { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); color: var(--muted); font-size: var(--fs-xs); }
+  .place:hover { color: var(--fg); border-color: color-mix(in oklch, var(--fg) 30%, transparent); }
+  .place.active { color: color-mix(in oklch, var(--accent) 75%, black); border-color: color-mix(in oklch, var(--accent) 38%, transparent); background: var(--accent-soft); }
+  .place svg { width: 13px; height: 13px; }
+
+  .picker-crumbs { display: flex; align-items: center; gap: 4px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  .crumb-up { width: 24px; height: 24px; flex: none; display: grid; place-items: center; border-radius: 6px; color: var(--muted); }
+  .crumb-up:hover:not(:disabled) { background: var(--fg-soft); color: var(--fg); }
+  .crumb-up:disabled { opacity: 0.35; cursor: default; }
+  .crumb-up svg { width: 13px; height: 13px; }
+  .crumb-trail { flex: 1; min-width: 0; display: flex; align-items: center; gap: 1px; overflow: hidden; }
+  .crumb { padding: 3px 6px; border-radius: 6px; font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; }
+  .crumb:hover { color: var(--fg); background: var(--fg-soft); }
+  .crumb.current { color: var(--fg); font-weight: 500; }
+  .crumb-sep { flex: none; color: color-mix(in oklch, var(--fg) 28%, transparent); font-size: var(--fs-xs); }
+
+  .picker-body { flex: 1; min-height: 0; overflow-y: auto; padding: 8px; overscroll-behavior: contain; }
+  .picker-body::-webkit-scrollbar { width: 10px; }
+  .picker-body::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg) 14%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: content-box; }
+  .picker-list { display: flex; flex-direction: column; gap: 2px; outline: none; }
+  .picker-row {
+    display: flex; align-items: center; gap: var(--gap-sm);
+    padding: 7px 9px; border-radius: 7px;
+    border: 1px solid transparent;
+    cursor: pointer;
+  }
+  .picker-row:hover { background: color-mix(in oklch, var(--fg) 5%, transparent); }
+  .picker-row[aria-selected="true"] { background: var(--accent-soft); border-color: color-mix(in oklch, var(--accent) 30%, transparent); }
+  .picker-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .picker-row[aria-disabled="true"] { opacity: 0.45; cursor: default; }
+  .picker-row[aria-disabled="true"]:hover { background: transparent; }
+  .pr-check { width: 16px; height: 16px; flex: none; display: grid; place-items: center; border-radius: 5px; border: 1.5px solid color-mix(in oklch, var(--fg) 26%, transparent); }
+  .pr-check svg { width: 11px; height: 11px; color: var(--surface); opacity: 0; }
+  .picker-row[aria-selected="true"] .pr-check { background: var(--accent-deep); border-color: var(--accent-deep); }
+  .picker-row[aria-selected="true"] .pr-check svg { opacity: 1; }
+  .picker-row .f-icon { width: 16px; height: 16px; }
+  .picker-row .f-icon svg { width: 16px; height: 16px; }
+  .picker-row.folder .f-icon { color: var(--warn); }
+  .pr-name { display: block; font-family: var(--font-display); font-size: var(--fs-sm); color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pr-meta { display: block; font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pr-enter { width: 22px; height: 22px; flex: none; display: grid; place-items: center; border-radius: 6px; color: var(--muted); }
+  .pr-enter:hover { background: color-mix(in oklch, var(--fg) 9%, transparent); color: var(--fg); }
+  .pr-enter svg { width: 13px; height: 13px; }
+  .picker-group { display: block; padding: 10px 9px 4px; font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  .picker-group:first-child { padding-top: 2px; }
+  .picker-row.drive .f-icon { color: var(--accent); }
+  .pr-bar { display: block; height: 3px; max-width: 180px; margin-top: 4px; border-radius: 999px; background: var(--fg-soft); overflow: hidden; }
+  .pr-bar i { display: block; height: 100%; border-radius: 999px; background: var(--accent); }
+  .picker-empty-fav { display: inline-flex; align-items: center; height: 28px; font-size: var(--fs-xs); color: var(--muted); }
+
+  .picker-state { display: flex; flex-direction: column; align-items: center; gap: 7px; padding: 40px 18px; text-align: center; color: var(--muted); }
+  .picker-state svg { width: 26px; height: 26px; opacity: 0.5; }
+  .picker-state p { margin: 0; font-size: var(--fs-sm); }
+  .picker-state .ps-sub { font-size: var(--fs-xs); max-width: 250px; line-height: 1.6; }
+  @keyframes pk-spin { to { transform: rotate(360deg); } }
+  .pk-spin { transform-origin: 50% 50%; animation: pk-spin 0.9s linear infinite; }
+
+  .picker-foot { display: flex; align-items: center; gap: var(--gap-sm); padding: 9px 12px; border-top: 1px solid var(--border); }
+  .picker-sel { flex: 1; min-width: 0; min-height: 1.4em; font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .picker-sel b { color: var(--fg); font-weight: 600; }
+  .picker-foot .btn { flex: none; }
+
   @media (prefers-reduced-motion: reduce) {
-    .orb-stage, .panel, .orb, .toast, .ctx, .push-card, #consentCard, .sheet, .dialog, .tree, .chev, .p-bar i, .pulse, .overlay { transition: none !important; animation: none !important; }
+    .orb-stage, .panel, .orb, .toast, .ctx, .push-card, #consentCard, .sheet, .dialog, .tree, .chev, .p-bar i, .pulse, .overlay,
+    .picker-layer, .picker, .pk-spin { transition: none !important; animation: none !important; }
   }
 </style>
 </head>
@@ -564,8 +677,10 @@ font-family: var(--font-body);
     <button class="orb" id="orbBtn" aria-label="展开 OrbDrop 面板" aria-expanded="false">
       <span class="mark">
         <span class="pulse"></span>
-        <svg viewBox="0 0 32 32" width="30" height="30" fill="none" aria-hidden="true">
-          <path fill-rule="evenodd" clip-rule="evenodd" d="M16 2.6A13.4 13.4 0 1 0 16 29.4A13.4 13.4 0 1 0 16 2.6ZM13 9.4H16.4A6.6 6.6 0 0 1 16.4 22.6H13Z" fill="var(--accent)"/>
+        <svg viewBox="0 0 30 30" fill="none" aria-hidden="true">
+          <circle cx="15" cy="15" r="13" stroke="var(--accent)" stroke-opacity="0.28" stroke-width="1.4"/>
+          <circle cx="15" cy="15" r="5" fill="var(--accent)"/>
+          <path d="M15 9.5 10.5 14M15 9.5l4.5 4.5" stroke="var(--surface)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
       </span>
       <span class="orb-badge num" id="orbBadge" hidden>0</span>
@@ -573,7 +688,8 @@ font-family: var(--font-body);
 
     <section class="panel" id="panel" data-od-id="main-panel" aria-label="OrbDrop 主面板">
       <header class="panel-head">
-        <span class="panel-brand"><svg viewBox="0 0 32 32" width="20" height="20" fill="none" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M16 2.6A13.4 13.4 0 1 0 16 29.4A13.4 13.4 0 1 0 16 2.6ZM13 9.4H16.4A6.6 6.6 0 0 1 16.4 22.6H13Z" fill="var(--accent)"/></svg>OrbDrop</span>
+        <span class="grip" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></span>
+        <span class="panel-brand"><span class="mark-sm"><i></i></span>OrbDrop</span>
         <div class="panel-head-right">
           <span class="ch-inst" id="connPill"><span class="dot ok"></span><span>在线 · 长连接 1</span></span>
           <button class="icon-btn" id="settingsBtn" aria-label="打开设置">
@@ -588,10 +704,6 @@ font-family: var(--font-body);
       <nav class="tabs" data-od-id="tabs" role="tablist">
         <button class="tab active" role="tab" aria-selected="true" data-tab="local">本机 <span class="count">4</span></button>
         <button class="tab" role="tab" aria-selected="false" data-tab="devices">设备 <span class="count">3</span></button>
-        <!-- 每台长连接设备一个浏览标签（F-24 / F-30）：内容 = 该设备广播给本机的共享项 -->
-        <button class="tab peer-tab" role="tab" aria-selected="false" data-tab="peer" title="MacBook · 192.168.1.20:3890 · 长连接">
-          <span class="dot ok"></span>MacBook
-        </button>
       </nav>
 
       <div class="panel-body">
@@ -614,6 +726,7 @@ font-family: var(--font-body);
                 </div>
                 <div class="s-acts">
                   <label class="switch" title="向设备广播"><input type="checkbox" checked data-broadcast><span class="track"></span></label>
+                  <button class="icon-btn" data-ctx aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
                 </div>
               </div>
               <div class="tree">
@@ -636,6 +749,7 @@ font-family: var(--font-body);
                 </div>
                 <div class="s-acts">
                   <label class="switch" title="向设备广播"><input type="checkbox" data-broadcast><span class="track"></span></label>
+                  <button class="icon-btn" data-ctx aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
                 </div>
               </div>
               <div class="tree">
@@ -656,6 +770,7 @@ font-family: var(--font-body);
                 </div>
                 <div class="s-acts">
                   <label class="switch" title="向设备广播"><input type="checkbox" data-broadcast><span class="track"></span></label>
+                  <button class="icon-btn" data-ctx aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
                 </div>
               </div>
             </li>
@@ -670,6 +785,7 @@ font-family: var(--font-body);
                 </div>
                 <div class="s-acts">
                   <label class="switch" title="向设备广播"><input type="checkbox" data-broadcast><span class="track"></span></label>
+                  <button class="icon-btn" data-ctx aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
                 </div>
               </div>
             </li>
@@ -677,12 +793,12 @@ font-family: var(--font-body);
         </section>
 
         <section id="tab-devices" data-od-id="tab-devices" role="tabpanel" hidden>
-          <button class="btn btn-secondary btn-block" id="pairBtn" style="height:var(--control-h)">
+          <button class="btn btn-secondary btn-block" id="pairBtn" style="height:38px">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
             添加设备 · 配对码
           </button>
 
-          <div class="list-label"><span>局域网设备</span><span class="num" id="devCount">4 台 · 1 长连接 · 1 离线</span></div>
+          <div class="list-label"><span>局域网设备</span><span class="num" id="devCount">3 台 · 1 长连接</span></div>
           <ul class="device-list" id="deviceList">
             <li class="device-row online" data-id="d1" data-state="connected" data-ip="192.168.1.6:3890">
               <span class="d-avatar">B</span>
@@ -698,7 +814,7 @@ font-family: var(--font-body);
             <li class="device-row online" data-id="d2" data-state="paired" data-ip="192.168.1.4:3891">
               <span class="d-avatar">M</span>
               <div class="d-main">
-                <div class="d-name">MacBook Pro <span class="state-chip paired"><span class="dot off"></span>已配对</span></div>
+                <div class="d-name">MacBook Pro <span class="state-chip"><span class="dot off"></span>已配对</span></div>
                 <div class="d-ip">192.168.1.4:3891</div>
               </div>
               <div class="d-acts">
@@ -709,24 +825,12 @@ font-family: var(--font-body);
             <li class="device-row online" data-id="d3" data-state="unbound" data-ip="192.168.1.9:3890">
               <span class="d-avatar">C</span>
               <div class="d-main">
-                <div class="d-name">PC-C <span class="state-chip unbound"><span class="dot off"></span>未绑定</span></div>
+                <div class="d-name">PC-C <span class="state-chip unbound"><span class="dot warn"></span>未绑定</span></div>
                 <div class="d-ip">192.168.1.9:3890</div>
               </div>
               <div class="d-acts">
                 <button class="btn btn-primary btn-sm" data-pair>配对</button>
                 <button class="btn btn-ghost btn-sm" data-push>推送</button>
-              </div>
-            </li>
-            <!-- 已配对但对方不在网上：排在最下方，唯一能做的事情就是「解除配对」
-                 （本机动作，不需要对方在线）。 -->
-            <li class="device-row" data-id="d4" data-state="paired" data-online="false" data-ip="192.168.1.7:3890">
-              <span class="d-avatar">W</span>
-              <div class="d-main">
-                <div class="d-name">Workstation <span class="state-chip offline" title="对方此刻不在网上：这一行留着是为了让你能解除配对"><span class="dot off"></span>离线</span></div>
-                <div class="d-ip">192.168.1.7:3890</div>
-              </div>
-              <div class="d-acts">
-                <button class="btn btn-ghost btn-sm" data-unpair>解除配对</button>
               </div>
             </li>
           </ul>
@@ -738,60 +842,6 @@ font-family: var(--font-body);
           <p style="margin:14px 2px 0; font-size:var(--fs-xs); color:var(--muted); line-height:1.6;">
             <span class="hl">未绑定</span>设备可点击「推送」直接发送（接收方需同意）；<span class="hl">已配对</span>设备可点击「建立长连接」；
             处于<span class="hl">长连接</span>的设备会自动收到你拖入悬浮球文件的广播，无需逐条操作。          </p>
-        </section>
-
-        <!-- 对端设备标签：对方广播给本机的共享项 + 懒加载树（F-30/F-31/F-33）。
-             零拷贝：内容实时读对方的磁盘，本机只拿到 name/isDir/大小/时间。 -->
-        <section id="tab-peer" data-od-id="tab-peer" role="tabpanel" hidden>
-          <div class="peer-head">
-            <span class="d-avatar">M</span>
-            <div class="d-main">
-              <div class="d-name">MacBook</div>
-              <div class="d-ip num">192.168.1.20:3890</div>
-            </div>
-            <span class="state-chip connected"><span class="dot ok"></span>长连接</span>
-            <button class="icon-btn" aria-label="刷新共享项" title="刷新共享项"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5"/></svg></button>
-          </div>
-
-          <div class="list-label"><span>共享项</span><span class="num">2 项</span></div>
-
-          <ul class="share-list">
-            <li class="share-item folder open">
-              <div class="share-row">
-                <button class="chev" aria-label="展开"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
-                <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg></span>
-                <div class="s-main">
-                  <div class="s-name">设计稿</div>
-                  <div class="s-meta"><span class="num">来自 MacBook</span></div>
-                </div>
-              </div>
-              <div class="tree">
-                <div class="tree-inner">
-                  <div class="node">
-                    <button class="chev" style="width:18px; height:18px; flex:none; margin-left:-22px" aria-label="展开"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
-                    <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg></span>
-                    <span class="n-name">首页-v3</span>
-                    <span class="n-meta num">12 个文件</span>
-                  </div>
-                  <div class="node">
-                    <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span>
-                    <span class="n-name">notes.txt</span>
-                    <span class="n-meta num">2.0 KB</span>
-                  </div>
-                </div>
-              </div>
-            </li>
-            <li class="share-item">
-              <div class="share-row">
-                <button class="chev" style="visibility:hidden"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
-                <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span>
-                <div class="s-main">
-                  <div class="s-name">report.pdf</div>
-                  <div class="s-meta"><span class="num">来自 MacBook</span></div>
-                </div>
-              </div>
-            </li>
-          </ul>
         </section>
       </div>
 
@@ -821,7 +871,7 @@ font-family: var(--font-body);
 
       <section class="sheet" id="settingsSheet" data-od-id="settings" aria-label="设置">
         <header class="sheet-head">
-          <span class="panel-brand" style="margin-right:auto"><svg viewBox="0 0 32 32" width="20" height="20" fill="none" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M16 2.6A13.4 13.4 0 1 0 16 29.4A13.4 13.4 0 1 0 16 2.6ZM13 9.4H16.4A6.6 6.6 0 0 1 16.4 22.6H13Z" fill="var(--accent)"/></svg>设置</span>
+          <span class="panel-brand" style="margin-right:auto"><span class="mark-sm"><i></i></span>设置</span>
           <button class="icon-btn" id="closeSettingsBtn" aria-label="关闭设置"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
         </header>
         <div class="sheet-body">
@@ -833,14 +883,21 @@ font-family: var(--font-body);
             <label for="downloadDir">下载目录</label>
             <div class="path-input">
               <input class="input" id="downloadDir" value="~/Desktop/OrbDrop" readonly />
-              <button class="btn btn-secondary btn-sm" data-browse>选择</button>
+              <button class="btn btn-secondary btn-sm" data-browse="download">选择</button>
             </div>
           </div>
           <div class="field">
             <label>下载模式</label>
             <div class="radio-group">
               <label class="radio"><input type="radio" name="dlMode" checked /><span class="r-label">直接下载<span class="r-sub">收下文件并保存到下载目录</span></span></label>
-              <label class="radio"><input type="radio" name="dlMode" /><span class="r-label">每次询问<span class="r-sub">手动下载时每次弹窗选保存位置</span></span></label>
+              <label class="radio"><input type="radio" name="dlMode" /><span class="r-label">每次询问<span class="r-sub">收到文件时先征求确认</span></span></label>
+            </div>
+          </div>
+          <div class="field">
+            <label for="inboxDir">收件目录</label>
+            <div class="path-input">
+              <input class="input" id="inboxDir" value="~/Desktop/OrbDrop/收件箱" readonly />
+              <button class="btn btn-secondary btn-sm" data-browse="inbox">选择</button>
             </div>
           </div>
           <div class="field">
@@ -875,10 +932,46 @@ font-family: var(--font-body);
           </div>
         </div>
       </div>
+
+      <div class="picker-layer" id="pickerLayer" aria-hidden="true">
+        <section class="picker" role="dialog" aria-modal="true" aria-labelledby="pickerTitle">
+          <header class="picker-head">
+            <h3 id="pickerTitle">选择文件或文件夹</h3>
+            <button class="picker-help" id="pickerHelp" type="button" aria-label="说明：文件与文件夹都可以选择，双击文件夹进入" title="文件与文件夹都可以选择，双击文件夹进入">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.7 9.3a2.4 2.4 0 0 1 4.6.9c0 1.6-2.3 1.9-2.3 3.1"/><path d="M12 17h.01"/></svg>
+            </button>
+            <button class="icon-btn" id="pickerCloseBtn" aria-label="关闭选择框">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+            </button>
+          </header>
+
+          <div class="picker-places">
+            <div class="od-rail" id="pickerPlaces" aria-label="常用位置"></div>
+          </div>
+
+          <div class="picker-crumbs">
+            <button class="crumb-up" id="pickerUp" aria-label="返回上一级">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 6-6 6 6 6"/></svg>
+            </button>
+            <div class="crumb-trail" id="pickerCrumbs"></div>
+          </div>
+
+          <div class="picker-body">
+            <div class="picker-list" id="pickerList" role="listbox" aria-label="当前位置内容" tabindex="-1"></div>
+          </div>
+
+          <footer class="picker-foot">
+            <div class="picker-sel" id="pickerSel">未选择任何项目</div>
+            <button class="btn btn-secondary btn-sm" id="pickerCancelBtn">取消</button>
+            <button class="btn btn-primary btn-sm" id="pickerConfirmBtn" disabled>选择</button>
+          </footer>
+        </section>
+      </div>
     </section>
   </aside>
 
   <div class="ctx" id="ctxMenu" data-od-id="context-menu"></div>
+  <div class="ctx" id="pickerCtx" data-od-id="picker-context-menu"></div>
 
   <div class="toast-layer" id="toastLayer"></div>
 
@@ -895,7 +988,7 @@ font-family: var(--font-body);
   function setOpen(v) {
     stage.classList.toggle('open', v);
     orbBtn.setAttribute('aria-expanded', String(v));
-    if (!v) { closeSheet(); closePair(); hideCtx(); }
+    if (!v) { closeSheet(); closePair(); hideCtx(); closePicker(); }
   }
 
   orbBtn.addEventListener('click', function () { setOpen(true); });
@@ -910,7 +1003,6 @@ font-family: var(--font-body);
       });
       $('#tab-local').hidden = t.dataset.tab !== 'local';
       $('#tab-devices').hidden = t.dataset.tab !== 'devices';
-      $('#tab-peer').hidden = t.dataset.tab !== 'peer';
     });
   });
 
@@ -956,15 +1048,6 @@ font-family: var(--font-body);
     }
     if (device) {
       var st = device.dataset.state;
-      if (device.dataset.online === 'false') {
-        // 离线设备：连接/推送都够不到对端，只剩「解除配对」。
-        return '<button class="ctx-item danger" data-act="unpair">' + ICON_TRASH + '解除配对</button>';
-      }
-      if (st === 'unbound') {
-        // 未绑定：只做两件事 —— 配对，或直接推送（推送不需要预先配对）。
-        return '<button class="ctx-item" data-act="pair">' + ICON_LINK + '配对</button>' +
-          '<button class="ctx-item" data-act="push">' + ICON_PUSH + '推送文件</button>';
-      }
       return (st === 'connected'
           ? '<button class="ctx-item" data-act="disconnect">' + ICON_LINKOFF + '断开长连接</button>'
           : '<button class="ctx-item" data-act="connect">' + ICON_LINK + '建立长连接</button>') +
@@ -991,6 +1074,10 @@ font-family: var(--font-body);
     showCtx(e.clientX, e.clientY, target);
   }
 
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest('[data-ctx]');
+    if (b) { e.stopPropagation(); openCtxFor(e, b); }
+  });
   $$('.share-row').forEach(function (row) {
     row.addEventListener('contextmenu', function (e) { e.preventDefault(); e.stopPropagation(); openCtxFor(e, row); });
   });
@@ -1027,7 +1114,6 @@ font-family: var(--font-body);
         toast('已移除共享项「' + name + '」');
         break;
       case 'connect': connectDevice(drow); break;
-      case 'pair': openPair(drow); break;
       case 'disconnect': disconnectDevice(drow); break;
       case 'push': requestPush(drow); break;
       case 'unpair':
@@ -1046,39 +1132,74 @@ font-family: var(--font-body);
 
   /* add share item */
   var addedCount = 0;
-  function addShareItem(withBroadcast) {
-    var names = ['宣传视频.mp4', '会议纪要-周会.md', '报价单2026Q3.xlsx'];
-    var name = names[addedCount % names.length];
-    addedCount++;
+  var ICO_FOLDER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>';
+  var ICO_FILE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg>';
+  var ICO_DOTS = '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>';
+  var ICO_DRIVE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><rect x="3" y="5" width="18" height="6" rx="2"/><rect x="3" y="13" width="18" height="6" rx="2"/><path d="M7 8h.01M7 16h.01"/></svg>';
+  function addShareItem(withBroadcast, name, isFolder, node, silent) {
+    if (!name) {
+      var names = ['宣传视频.mp4', '会议纪要-周会.md', '报价单2026Q3.xlsx'];
+      name = names[addedCount % names.length];
+      addedCount++;
+    }
+    var folder = !!isFolder;
+    var kids = (folder && node && node.children) ? node.children : [];
+    var treeHtml = '';
+    if (folder) {
+      var inner = kids.slice(0, 4).map(function (c) {
+        return '<div class="node"><span class="f-icon">' + (c.type === 'folder' ? ICO_FOLDER : ICO_FILE) + '</span>' +
+          '<span class="n-name"></span><span class="n-meta num"></span></div>';
+      }).join('');
+      if (!inner) inner = '<div class="node"><span class="n-name" style="padding-left:0;color:var(--muted)">空文件夹</span></div>';
+      treeHtml = '<div class="tree"><div class="tree-inner">' + inner + '</div></div>';
+    }
     var li = document.createElement('li');
-    li.className = 'share-item';
+    li.className = 'share-item' + (folder ? ' folder' : '');
     li.style.animation = 'toast-in .25s cubic-bezier(.2,.8,.2,1)';
     li.innerHTML =
       '<div class="share-row">' +
-      '<button class="chev" style="visibility:hidden"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>' +
-      '<span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span>' +
+      '<button class="chev"' + (folder ? '' : ' style="visibility:hidden"') + ' aria-label="展开"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>' +
+      '<span class="f-icon">' + (folder ? ICO_FOLDER : ICO_FILE) + '</span>' +
       '<div class="s-main"><div class="s-name"></div><div class="s-meta"><span class="num">刚刚 · 已加入共享项</span></div></div>' +
-      '<div class="s-acts"><label class="switch" title="向设备广播"><input type="checkbox" data-broadcast><span class="track"></span></label></div></div>';
+      '<div class="s-acts"><label class="switch" title="向设备广播"><input type="checkbox" data-broadcast><span class="track"></span></label>' +
+      '<button class="icon-btn" data-ctx aria-label="更多操作">' + ICO_DOTS + '</button></div></div>' + treeHtml;
     li.querySelector('.s-name').textContent = name;
+    if (folder) {
+      var childNodes = $$('.node', li);
+      kids.slice(0, 4).forEach(function (c, i) {
+        var n = childNodes[i];
+        if (!n) return;
+        var nm = $('.n-name', n);
+        var mt = $('.n-meta', n);
+        if (nm) nm.textContent = c.name;
+        if (mt) mt.textContent = c.type === 'folder' ? (c.children && c.children.length ? c.children.length + ' 项' : '空') : (c.size || '');
+      });
+    }
     $('#shareList').prepend(li);
+    var chev = $('.chev', li);
+    if (chev) chev.addEventListener('click', function (e) {
+      e.stopPropagation();
+      li.classList.toggle('open');
+    });
     li.querySelector('input[data-broadcast]').addEventListener('change', function (e) {
       var l = e.target.closest('.share-item');
       var b = $('[data-bcast]', l);
       if (b) b.hidden = !e.target.checked;
     });
-
+    li.querySelector('[data-ctx]').addEventListener('click', function (ev) {
+      ev.stopPropagation(); openCtxFor(ev, li.querySelector('[data-ctx]'));
+    });
     var live = deviceRows.filter(function (r) { return r.parentNode && r.dataset.state === 'connected'; });
     if (live.length && withBroadcast !== false) {
       var bNames = live.map(devName).join('、');
       li.querySelector('.s-meta').insertAdjacentHTML('beforeend', '<span class="bcast-chip" data-bcast title="自动广播至 ' + bNames + '"><span class="dot ok"></span>' + live.length + '台设备</span>');
-      toast('已拖入「' + name + '」并自动广播至 ' + bNames);
+      if (!silent) toast('已添加「' + name + '」并自动广播至 ' + bNames);
     } else if (withBroadcast === false) {
-      toast('没有长连接设备，文件仅加入共享项');
+      if (!silent) toast('没有长连接设备，「' + name + '」仅加入共享项');
     } else {
-      toast('已添加共享项「' + name + '」');
+      if (!silent) toast('已添加共享项「' + name + '」');
     }
   }
-  $('#addShareBtn').addEventListener('click', function () { addShareItem(); });
 
   /* drag files onto the orb → auto-broadcast to connected devices */
   var dragDepth = 0;
@@ -1182,20 +1303,16 @@ font-family: var(--font-body);
     if (!chip) return;
     var st = devState(row);
     var cls = 'state-chip', label, dot;
-    if (row.dataset.online === 'false') { cls += ' offline'; label = '离线'; dot = 'off'; }
-    else if (st === 'connected') { cls += ' connected'; label = '长连接'; dot = 'ok'; }
-    else if (st === 'unbound') { cls += ' unbound'; label = '未绑定'; dot = 'off'; }
-    else { cls += ' paired'; label = '已配对'; dot = 'off'; }
+    if (st === 'connected') { cls += ' connected'; label = '长连接'; dot = 'ok'; }
+    else if (st === 'unbound') { cls += ' unbound'; label = '未绑定'; dot = 'warn'; }
+    else { label = '已配对'; dot = 'off'; }
     chip.className = cls;
     chip.innerHTML = '<span class="dot ' + dot + '"></span>' + label;
   }
   function renderDeviceActions(row) {
     var acts = $('.d-acts', row);
     var st = devState(row);
-    if (row.dataset.online === 'false') {
-      // 离线设备：连接/推送的目标都不在网上，只有「解除配对」是本机动作。
-      acts.innerHTML = '<button class="btn btn-ghost btn-sm" data-unpair>解除配对</button>';
-    } else if (st === 'connected') {
+    if (st === 'connected') {
       acts.innerHTML = '<button class="btn btn-ghost btn-sm" data-disconnect>断开</button>' +
         '<button class="btn btn-ghost btn-sm" data-push>推送</button>';
     } else if (st === 'paired') {
@@ -1220,10 +1337,7 @@ font-family: var(--font-body);
       hint.hidden = true;
     }
     var c = $('#devCount');
-    if (c) {
-      var offline = live.filter(function (r) { return r.dataset.online === 'false'; }).length;
-      c.textContent = live.length + ' 台 · ' + n + ' 长连接' + (offline ? ' · ' + offline + ' 离线' : '');
-    }
+    if (c) c.textContent = live.length + ' 台 · ' + n + ' 长连接';
     var empty = $('#devEmpty');
     if (empty) empty.hidden = live.length > 0;
     var badge = $('#orbBadge');
@@ -1330,6 +1444,556 @@ font-family: var(--font-body);
   $('input[data-autostart]').addEventListener('change', function () {
     toast(this.checked ? '开机自启已开启' : '开机自启已关闭');
   });
+
+  /* ── file picker: files + folders in one dialog ── */
+  var PICKER_FS = {
+    name: '此电脑', type: 'folder', path: '', children: [
+      {
+        name: 'Windows (C:)', type: 'folder', drive: true, abs: 'C:', total: '512 GB', free: '128 GB', children: [
+          { name: 'Users', type: 'folder', children: [
+            { name: '王磊', type: 'folder', children: [
+              { name: 'Desktop', type: 'folder', children: [
+                { name: '项目设计稿', type: 'folder', children: [
+                  { name: 'assets', type: 'folder', children: [
+                    { name: 'logo复刻.png', type: 'file', size: '320 KB' },
+                    { name: '色板.png', type: 'file', size: '96 KB' }
+                  ] },
+                  { name: '主页-v3.fig', type: 'file', size: '4.2 MB' },
+                  { name: '组件库.sketch', type: 'file', size: '2.8 MB' },
+                  { name: '设计说明.md', type: 'file', size: '24 KB' }
+                ] },
+                { name: '产品文档', type: 'folder', children: [
+                  { name: 'PRD-v0.5.md', type: 'file', size: '48 KB' },
+                  { name: '接口清单.xlsx', type: 'file', size: '1.1 MB' }
+                ] },
+                { name: '会议纪要-周会.md', type: 'file', size: '18 KB' },
+                { name: '报价单2026Q3.xlsx', type: 'file', size: '1.2 MB' }
+              ] },
+              { name: 'Documents', type: 'folder', children: [
+                { name: '需求说明v0.5.md', type: 'file', size: '48 KB' },
+                { name: '归档', type: 'folder', children: [] }
+              ] },
+              { name: 'Downloads', type: 'folder', children: [
+                { name: '宣传视频.mp4', type: 'file', size: '212 MB' },
+                { name: 'OrbDrop-0.5.0.dmg', type: 'file', size: '9.4 MB' }
+              ] },
+              { name: 'Pictures', type: 'folder', children: [
+                { name: '截图-2026-09-14.png', type: 'file', size: '640 KB' }
+              ] },
+              { name: 'Music', type: 'folder', children: [] },
+              { name: 'Videos', type: 'folder', children: [] }
+            ] }
+          ] },
+          { name: 'Program Files', type: 'folder', children: [] },
+          { name: 'Windows', type: 'folder', restricted: true, children: [] }
+        ]
+      },
+      {
+        name: '数据 (D:)', type: 'folder', drive: true, abs: 'D:', total: '1 TB', free: '640 GB', children: [
+          { name: '项目', type: 'folder', children: [
+            { name: 'orbdrop', type: 'folder', children: [
+              { name: 'src', type: 'folder', children: [
+                { name: 'App.svelte', type: 'file', size: '6 KB' },
+                { name: 'main.ts', type: 'file', size: '1 KB' }
+              ] },
+              { name: 'src-tauri', type: 'folder', children: [
+                { name: 'Cargo.toml', type: 'file', size: '2 KB' },
+                { name: 'lib.rs', type: 'file', size: '12 KB' }
+              ] },
+              { name: 'README.md', type: 'file', size: '8 KB' }
+            ] },
+            { name: '设计稿', type: 'folder', children: [
+              { name: '主页-v3.fig', type: 'file', size: '4.2 MB' }
+            ] }
+          ] },
+          { name: '素材', type: 'folder', children: [
+            { name: '演示视频.mp4', type: 'file', size: '1.4 GB' },
+            { name: '字体', type: 'folder', children: [] }
+          ] },
+          { name: '备份', type: 'folder', children: [] }
+        ]
+      },
+      { name: '新加卷 (E:)', type: 'folder', drive: true, removable: true, abs: 'E:', total: '32 GB', free: '30.2 GB', children: [] }
+    ]
+  };
+
+  /* 「此电脑」只列驱动器和它下面的真实目录；用户目录不再单列「文件夹」组，
+     需要时用右键把任意目录 pin 到顶部「常用」，或从 C:\\Users\\<用户名>\\ 进入。 */
+
+  var pickerLayer = $('#pickerLayer');
+  var pickerList = $('#pickerList');
+  var pickerState = {
+    title: '选择文件或文件夹', sub: '', mode: 'both', multi: false, confirmLabel: '选择',
+    cwd: [], selection: [], items: [], onConfirm: null, lastFocus: null, loading: false
+  };
+  var pickerLoadTimer = null;
+
+  function pkEsc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+  function pkNode(segs) {
+    var n = PICKER_FS;
+    for (var i = 0; i < segs.length; i++) {
+      var f = null;
+      (n.children || []).forEach(function (c) { if (c.name === segs[i]) f = c; });
+      if (!f) return null;
+      n = f;
+    }
+    return n;
+  }
+  function pkPath(segs) {
+    if (!segs.length) return '此电脑';
+    var root = pkNode([segs[0]]);
+    if (root && root.abs) return root.abs + (segs.length > 1 ? '/' + segs.slice(1).join('/') : '');
+    return '此电脑/' + segs.join('/');
+  }
+  function pkSelected(path) {
+    return pickerState.selection.some(function (s) { return s.path === path; });
+  }
+
+  /* favorites — right-click a folder to pin it to the quick bar, right-click a chip to unpin.
+     No favorites by default; the bar starts empty and shows a hint. */
+  var FAV_KEY = 'orbdrop.picker.favorites.v3';
+  function pkPct(free, total) {
+    function n(s) { var m = String(s).match(/[\d.]+/); return m ? parseFloat(m[0]) : 0; }
+    var f = n(free), t = n(total);
+    if (t <= 0) return 0;
+    return Math.max(0, Math.min(100, Math.round((1 - f / t) * 100)));
+  }
+  function pkDriveLetter(name) {
+    var m = String(name).match(/\(([A-Za-z]):\)/);
+    return m ? m[1].toUpperCase() : 'ZZ';
+  }
+  function pkDefaultFavs() {
+    return [
+      { name: '桌面', segs: ['Windows (C:)', 'Users', '王磊', 'Desktop'] },
+      { name: '文档', segs: ['Windows (C:)', 'Users', '王磊', 'Documents'] },
+      { name: '下载', segs: ['Windows (C:)', 'Users', '王磊', 'Downloads'] },
+      { name: '项目', segs: ['数据 (D:)', '项目'] }
+    ].map(function (f) { return { name: f.name, segs: f.segs, path: pkPath(f.segs) }; });
+  }
+  function pkLoadFavs() {
+    try {
+      var raw = window.localStorage.getItem(FAV_KEY);
+      if (raw) {
+        var arr = JSON.parse(raw);
+        if (Array.isArray(arr)) return arr.filter(function (f) { return f && f.path && Array.isArray(f.segs); });
+      }
+    } catch (e) {}
+    return pkDefaultFavs();
+  }
+  function pkSaveFavs() { try { window.localStorage.setItem(FAV_KEY, JSON.stringify(pickerFavorites)); } catch (e) {} }
+  var pickerFavorites = pkLoadFavs();
+  function pkFavIndex(path) {
+    for (var i = 0; i < pickerFavorites.length; i++) if (pickerFavorites[i].path === path) return i;
+    return -1;
+  }
+  function pkAddFav(item) {
+    if (!item || item.type !== 'folder' || pkFavIndex(item.path) > -1) return;
+    pickerFavorites.push({ name: item.name, segs: item.segs.slice(), path: item.path });
+    pkSaveFavs();
+    pkRender();
+    toast('已添加到常用「' + item.name + '」');
+  }
+  function pkRemoveFav(path) {
+    var i = pkFavIndex(path);
+    if (i < 0) return;
+    var name = pickerFavorites[i].name;
+    pickerFavorites.splice(i, 1);
+    pkSaveFavs();
+    pkRender();
+    toast('已从常用移除「' + name + '」');
+  }
+  function pkRenderFavorites() {
+    var box = $('#pickerPlaces');
+    if (!pickerFavorites.length) {
+      box.innerHTML = '<span class="picker-empty-fav">还没有常用位置 · 右键目录即可添加到常用</span>';
+      return;
+    }
+    box.innerHTML = pickerFavorites.map(function (f) {
+      var on = pkPath(pickerState.cwd) === f.path;
+      return '<button class="place' + (on ? ' active' : '') + '" data-fav="' + pkEsc(f.path) + '" title="' + pkEsc(f.path) + ' · 右键可移出常用">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>' +
+        pkEsc(f.name) + '</button>';
+    }).join('');
+  }
+  function pkState(kind, title, sub) {
+    var ico = kind === 'lock'
+      ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>'
+      : kind === 'empty'
+        ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>'
+        : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>';
+    return '<div class="picker-state">' + ico + '<p>' + pkEsc(title) + '</p><p class="ps-sub">' + pkEsc(sub) + '</p></div>';
+  }
+  function pkLoading() {
+    return '<div class="picker-state"><svg class="pk-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9"/></svg><p>正在读取…</p></div>';
+  }
+
+  function pkRender() {
+    var node = pkNode(pickerState.cwd);
+    $('#pickerTitle').textContent = pickerState.title || '选择文件或文件夹';
+    var helpText = pickerState.sub || (pickerState.mode === 'folder' ? '只能选择文件夹' : '文件与文件夹都可以选择，双击文件夹进入');
+    var helpBtn = $('#pickerHelp');
+    if (helpBtn) { helpBtn.title = helpText; helpBtn.setAttribute('aria-label', '说明：' + helpText); }
+    $('#pickerConfirmBtn').textContent = pickerState.confirmLabel;
+
+    pkRenderFavorites();
+
+    var trail = '';
+    for (var i = 0; i <= pickerState.cwd.length; i++) {
+      var label = i === 0 ? '此电脑' : pickerState.cwd[i - 1];
+      var cur = i === pickerState.cwd.length;
+      trail += (i ? '<span class="crumb-sep">/</span>' : '') +
+        '<button class="crumb' + (cur ? ' current' : '') + '" data-go="' + i + '">' + pkEsc(label) + '</button>';
+    }
+    $('#pickerCrumbs').innerHTML = trail;
+    $('#pickerUp').disabled = pickerState.cwd.length === 0;
+
+    pickerState.items = [];
+    function pushRow(node, segs) {
+      var path = pkPath(segs);
+      var isDrive = !!node.drive;
+      var childCount = (node.children || []).length;
+      var item = { name: node.name, type: node.type, path: path, segs: segs, children: node.children, drive: isDrive };
+      var idx = pickerState.items.push(item) - 1;
+      var dis = pickerState.mode === 'folder' && node.type === 'file';
+      var sel = pkSelected(path);
+      var meta;
+      if (isDrive) {
+        meta = (node.removable ? '可移动磁盘' : '本地磁盘') +
+          (node.free ? ' · ' + node.free + ' 可用' : '') + (node.total ? ' / ' + node.total : '');
+      } else if (node.type === 'folder') {
+        meta = '文件夹' + (childCount ? ' · ' + childCount + ' 项' : ' · 空');
+      } else {
+        meta = '文件' + (node.size ? ' · ' + node.size : '');
+      }
+      var tip = node.type === 'folder' ? (pkFavIndex(path) > -1 ? '右键移出常用' : '右键添加到常用') : '';
+      var bar = (isDrive && node.total && node.free)
+        ? '<span class="pr-bar"><i style="width:' + pkPct(node.free, node.total) + '%"></i></span>'
+        : '';
+      return '<div class="picker-row' + (node.type === 'folder' ? ' folder' : '') + (isDrive ? ' drive' : '') + '" role="option" aria-selected="' + (sel ? 'true' : 'false') + '"' +
+        (dis ? ' aria-disabled="true" tabindex="-1"' : ' tabindex="0"') + ' data-idx="' + idx + '"' +
+        (tip ? ' title="' + tip + '"' : '') + '>' +
+        (pickerState.multi ? '<span class="pr-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 5 5 9-9"/></svg></span>' : '') +
+        '<span class="f-icon">' + (isDrive ? ICO_DRIVE : (node.type === 'folder' ? ICO_FOLDER : ICO_FILE)) + '</span>' +
+        '<span class="od-fill pr-main"><span class="pr-name">' + pkEsc(item.name) + '</span><span class="pr-meta">' + pkEsc(meta) + '</span>' + bar + '</span>' +
+        (node.type === 'folder' ? '<span class="pr-enter" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></span>' : '') +
+        '</div>';
+    }
+    var listHtml;
+    if (pickerState.loading) {
+      listHtml = pkLoading();
+    } else if (!node) {
+      listHtml = pkState('folder-x', '找不到这个位置', '请返回上一级后重试。');
+    } else if (node.restricted) {
+      listHtml = pkState('lock', '无权访问', '这个文件夹需要更高的系统权限，请选择一个你有权限的文件夹。');
+    } else {
+      var kids = (node.children || []).slice().sort(function (a, b) {
+        if (a.type !== b.type) return a.type === 'folder' ? -1 : 1;
+        return a.name.localeCompare(b.name, 'zh');
+      });
+      if (!kids.length) {
+        listHtml = pkState('empty', '这个文件夹是空的', '返回上一级，或选择其他文件夹。');
+      } else if (pickerState.cwd.length === 0) {
+        var drives = kids.filter(function (c) { return c.drive; }).sort(function (a, b) {
+          return pkDriveLetter(a.name).localeCompare(pkDriveLetter(b.name));
+        });
+        listHtml = drives.map(function (c) { return pushRow(c, [c.name]); }).join('');
+        if (drives.length) listHtml = '<div class="picker-group" role="presentation">设备和驱动器</div>' + listHtml;
+      } else {
+        listHtml = kids.map(function (c) { return pushRow(c, pickerState.cwd.concat([c.name])); }).join('');
+      }
+    }
+    pickerList.innerHTML = listHtml;
+    pkUpdateFooter();
+  }
+
+  function pkSyncSelectionRows() {
+    $$('.picker-row', pickerList).forEach(function (row) {
+      var it = pickerState.items[+row.dataset.idx];
+      if (!it) return;
+      row.setAttribute('aria-selected', pkSelected(it.path) ? 'true' : 'false');
+    });
+  }
+  function pkUpdateFooter() {
+    var sel = pickerState.selection;
+    var plain, html;
+    if (!sel.length) {
+      plain = pickerState.mode === 'folder' ? '未选择文件夹' : '未选择任何项目';
+      html = plain;
+    } else if (sel.length === 1) {
+      plain = '已选择 ' + sel[0].name + ' · ' + (sel[0].type === 'folder' ? '文件夹' : '文件') + ' · ' + sel[0].path;
+      html = '已选择 <b>' + pkEsc(sel[0].name) + '</b> · ' + (sel[0].type === 'folder' ? '文件夹' : '文件') + ' · ' + pkEsc(sel[0].path);
+    } else {
+      plain = '已选择 ' + sel.length + ' 个项目';
+      html = '已选择 <b>' + sel.length + '</b> 个项目';
+    }
+    var el = $('#pickerSel');
+    el.innerHTML = html;
+    el.title = plain;
+    $('#pickerConfirmBtn').disabled = sel.length === 0;
+  }
+
+  function pkFocusFirst() {
+    var first = $('.picker-row[tabindex="0"]', pickerLayer);
+    if (first) first.focus(); else pickerList.focus();
+  }
+  function pkOpen(opts) {
+    pickerState.title = opts.title;
+    pickerState.sub = opts.sub;
+    pickerState.mode = opts.mode || 'both';
+    pickerState.multi = !!opts.multi;
+    pickerState.confirmLabel = opts.confirmLabel || '选择';
+    pickerState.onConfirm = opts.onConfirm || null;
+    pickerState.cwd = opts.start ? opts.start.slice() : [];
+    pickerState.selection = [];
+    pickerState.loading = false;
+    pickerState.lastFocus = document.activeElement;
+    pkHideCtx();
+    pkRender();
+    pickerLayer.classList.add('open');
+    pickerLayer.setAttribute('aria-hidden', 'false');
+    requestAnimationFrame(pkFocusFirst);
+  }
+  function closePicker() {
+    pkHideCtx();
+    pickerLayer.classList.remove('open');
+    pickerLayer.setAttribute('aria-hidden', 'true');
+    pickerState.onConfirm = null;
+    if (pickerState.lastFocus && pickerState.lastFocus.focus) pickerState.lastFocus.focus();
+  }
+  function pkConfirm() {
+    if (!pickerState.selection.length) return;
+    var cb = pickerState.onConfirm;
+    var sel = pickerState.selection.slice();
+    pickerLayer.classList.remove('open');
+    pickerLayer.setAttribute('aria-hidden', 'true');
+    pickerState.onConfirm = null;
+    if (cb) cb(sel);
+  }
+  function pkGo(segs) {
+    pkHideCtx();
+    pickerState.cwd = segs.slice();
+    pickerState.loading = true;
+    pkRender();
+    pkFocusFirst();
+    clearTimeout(pickerLoadTimer);
+    pickerLoadTimer = setTimeout(function () {
+      pickerState.loading = false;
+      pkRender();
+      pkFocusFirst();
+    }, 150);
+  }
+  function pkUp() { if (pickerState.cwd.length) pkGo(pickerState.cwd.slice(0, -1)); }
+  function pkEnter(item) { if (item && item.type === 'folder') pkGo(item.segs); }
+  function pkToggle(item) {
+    if (!item) return;
+    if (item.type === 'file' && pickerState.mode === 'folder') return;
+    var idx = -1;
+    for (var i = 0; i < pickerState.selection.length; i++) {
+      if (pickerState.selection[i].path === item.path) { idx = i; break; }
+    }
+    if (idx > -1) pickerState.selection.splice(idx, 1);
+    else if (pickerState.multi) pickerState.selection.push(item);
+    else pickerState.selection = [item];
+    pkSyncSelectionRows();
+    pkUpdateFooter();
+  }
+
+  pickerList.addEventListener('click', function (e) {
+    var row = e.target.closest('.picker-row');
+    if (!row) return;
+    var item = pickerState.items[+row.dataset.idx];
+    if (e.target.closest('.pr-enter')) { pkEnter(item); return; }
+    if (row.getAttribute('aria-disabled') === 'true') return;
+    pkToggle(item);
+  });
+  pickerList.addEventListener('dblclick', function (e) {
+    var row = e.target.closest('.picker-row');
+    if (row) pkEnter(pickerState.items[+row.dataset.idx]);
+  });
+  pickerList.addEventListener('keydown', function (e) {
+    var rows = $$('.picker-row[tabindex="0"]', pickerList);
+    var at = rows.indexOf(document.activeElement);
+    if (e.key === 'ArrowDown') { e.preventDefault(); (rows[Math.min(rows.length - 1, at + 1)] || rows[0] || pickerList).focus(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); (rows[Math.max(0, at - 1)] || rows[0] || pickerList).focus(); }
+    else if (e.key === 'Home') { e.preventDefault(); if (rows[0]) rows[0].focus(); }
+    else if (e.key === 'End') { e.preventDefault(); if (rows.length) rows[rows.length - 1].focus(); }
+    else if (e.key === ' ' || e.key === 'Spacebar') {
+      var r = e.target.closest('.picker-row');
+      if (r) { e.preventDefault(); pkToggle(pickerState.items[+r.dataset.idx]); }
+    } else if (e.key === 'Enter') {
+      var r2 = e.target.closest('.picker-row');
+      if (r2) {
+        var it = pickerState.items[+r2.dataset.idx];
+        if (it && it.type === 'folder') pkEnter(it); else pkConfirm();
+      }
+    } else if (e.key === 'Backspace') { e.preventDefault(); pkUp(); }
+  });
+  $('#pickerCrumbs').addEventListener('click', function (e) {
+    var b = e.target.closest('[data-go]');
+    if (b) pkGo(pickerState.cwd.slice(0, +b.dataset.go));
+  });
+  $('#pickerPlaces').addEventListener('click', function (e) {
+    var b = e.target.closest('[data-fav]');
+    if (!b) return;
+    var fav = pickerFavorites[pkFavIndex(b.getAttribute('data-fav'))];
+    if (fav) pkGo(fav.segs);
+  });
+  $('#pickerUp').addEventListener('click', pkUp);
+  $('#pickerCloseBtn').addEventListener('click', closePicker);
+  $('#pickerCancelBtn').addEventListener('click', closePicker);
+  $('#pickerConfirmBtn').addEventListener('click', pkConfirm);
+
+  /* picker context menu — 右键目录：进入 / 添加到常用；右键常用芯片：进入 / 移出常用 */
+  var pickerCtx = $('#pickerCtx');
+  var pickerCtxTarget = null;
+  var ICON_STAR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4l2.4 4.9 5.4.8-3.9 3.8.9 5.4-4.8-2.5-4.8 2.5.9-5.4L4.2 9.7l5.4-.8L12 4Z"/></svg>';
+  function pkHideCtx() { pickerCtx.classList.remove('show'); pickerCtxTarget = null; }
+  function pkShowCtx(x, y, html, target) {
+    pickerCtxTarget = target;
+    pickerCtx.innerHTML = html;
+    pickerCtx.classList.remove('show');
+    pickerCtx.style.left = x + 'px';
+    pickerCtx.style.top = y + 'px';
+    requestAnimationFrame(function () {
+      var r = pickerCtx.getBoundingClientRect();
+      if (r.right > innerWidth - 8) pickerCtx.style.left = Math.max(8, innerWidth - r.width - 8) + 'px';
+      if (r.bottom > innerHeight - 8) pickerCtx.style.top = Math.max(8, innerHeight - r.height - 8) + 'px';
+      pickerCtx.classList.add('show');
+    });
+  }
+  pickerList.addEventListener('contextmenu', function (e) {
+    var row = e.target.closest('.picker-row');
+    if (!row) { pkHideCtx(); return; }
+    e.preventDefault(); e.stopPropagation();
+    var item = pickerState.items[+row.dataset.idx];
+    if (!item) return;
+    var html;
+    if (item.type === 'folder') {
+      html = '<button class="ctx-item" data-pk="enter">' + ICON_OPEN + '进入此文件夹</button>' +
+        '<div class="ctx-sep"></div>' +
+        ((pkFavIndex(item.path) > -1)
+          ? '<button class="ctx-item danger" data-pk="unfav">' + ICON_TRASH + '从常用中移除</button>'
+          : '<button class="ctx-item" data-pk="fav">' + ICON_STAR + '添加到常用</button>');
+    } else if (pickerState.mode !== 'folder') {
+      html = '<button class="ctx-item" data-pk="pick">' + ICON_DOWN + '选择此文件</button>';
+    } else {
+      return;
+    }
+    pkShowCtx(e.clientX, e.clientY, html, item);
+  });
+  $('#pickerPlaces').addEventListener('contextmenu', function (e) {
+    var chip = e.target.closest('[data-fav]');
+    if (!chip) return;
+    e.preventDefault(); e.stopPropagation();
+    var path = chip.getAttribute('data-fav');
+    var i = pkFavIndex(path);
+    if (i < 0) return;
+    var fav = pickerFavorites[i];
+    pkShowCtx(e.clientX, e.clientY,
+      '<button class="ctx-item" data-pk="enterfav">' + ICON_OPEN + '进入「' + pkEsc(fav.name) + '」</button>' +
+      '<div class="ctx-sep"></div>' +
+      '<button class="ctx-item danger" data-pk="unfav">' + ICON_TRASH + '从常用中移除</button>',
+      { favPath: path });
+  });
+  pickerCtx.addEventListener('click', function (e) {
+    var act = e.target.closest('[data-pk]');
+    if (!act) return;
+    var target = pickerCtxTarget;
+    var kind = act.dataset.pk;
+    pkHideCtx();
+    if (kind === 'enter' && target) pkGo(target.segs);
+    else if (kind === 'fav' && target) pkAddFav(target);
+    else if (kind === 'unfav' && target) pkRemoveFav(target.path || target.favPath);
+    else if (kind === 'enterfav' && target && target.favPath) {
+      var i = pkFavIndex(target.favPath);
+      if (i > -1) pkGo(pickerFavorites[i].segs);
+    } else if (kind === 'pick' && target) {
+      pickerState.selection = [target];
+      pkRender();
+    }
+  });
+  document.addEventListener('click', function (e) { if (!pickerCtx.contains(e.target)) pkHideCtx(); });
+  window.addEventListener('resize', pkHideCtx);
+  pickerLayer.addEventListener('scroll', pkHideCtx, true);
+  pickerLayer.addEventListener('contextmenu', function (e) {
+    if (e.target.closest('.picker-row') || e.target.closest('[data-fav]')) return;
+    e.preventDefault();
+    pkHideCtx();
+  });
+
+  pickerLayer.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      if (pickerCtx.classList.contains('show')) { pkHideCtx(); return; }
+      closePicker();
+      return;
+    }
+    if (e.key !== 'Tab') return;
+    var f = $$('button:not([disabled]), .picker-row[tabindex="0"]', pickerLayer).filter(function (el) { return el.offsetParent !== null; });
+    if (!f.length) return;
+    var first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
+
+  /* entry · 添加共享项：文件与文件夹混合多选 */
+  $('#addShareBtn').addEventListener('click', function () {
+    pkOpen({
+      mode: 'both', multi: true, confirmLabel: '添加共享项',
+      title: '添加共享项', sub: '文件与文件夹都可多选；双击文件夹进入',
+      onConfirm: function (items) {
+        var folders = items.filter(function (i) { return i.type === 'folder'; }).length;
+        items.forEach(function (it) { addShareItem(true, it.name, it.type === 'folder', it, true); });
+        toast(items.length === 1
+          ? '已添加共享项「' + items[0].name + '」'
+          : '已添加 ' + items.length + ' 个共享项' + (folders ? '（含 ' + folders + ' 个文件夹）' : ''));
+      }
+    });
+  });
+
+  /* entry · 设置中的目录选择：仅文件夹 */
+  $$('[data-browse]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var which = btn.getAttribute('data-browse');
+      var label = which === 'download' ? '下载目录' : '收件目录';
+      pkOpen({
+        mode: 'folder', multi: false, confirmLabel: '选择此文件夹',
+        title: '选择' + label, sub: '只能选择文件夹',
+        onConfirm: function (items) {
+          var it = items[0];
+          if (!it) return;
+          var input = document.getElementById(which === 'download' ? 'downloadDir' : 'inboxDir');
+          if (input) input.value = it.path;
+          toast(label + '已设为 ' + it.path);
+        }
+      });
+    });
+  });
+
+  /* ── Public API ───────────────────────────────────────────────
+     整个原型的文件选择都走这一个入口，后续新增入口无需改选择框本身：
+       OrbDropPicker.open({
+         mode: 'both' | 'folder',        // both = 文件+文件夹；folder = 仅文件夹
+         multi: false,                    // 是否多选
+         title, sub, confirmLabel,        // 文案
+         start: ['桌面'],                  // 初始目录（分段名）
+         onConfirm: function (items) {}   // items: { name, type, path, segs, children, drive }
+       })
+     OrbDropPicker.favorites.add/remove/list 可读写常用位置。 */
+  window.OrbDropPicker = {
+    open: pkOpen,
+    close: closePicker,
+    isOpen: function () { return pickerLayer.classList.contains('open'); },
+    favorites: {
+      list: function () { return pickerFavorites.slice(); },
+      add: function (item) { pkAddFav(item); },
+      remove: function (path) { pkRemoveFav(path); }
+    }
+  };
 
 })();
 </script>

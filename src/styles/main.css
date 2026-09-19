@@ -227,6 +227,14 @@ input { font: inherit; }
   scrollbar-width: none;
 }
 .tabs::-webkit-scrollbar { display: none; }
+/* 光标：标签栏用默认箭头，不要小手、也不要抓手（拖动横滚照旧，只是不改光标）。
+   标签是 <button>，会被全局 `button { cursor: pointer }`（本文件顶部）带上手型，
+   这里显式盖回来 —— 只作用于标签栏，别处的按钮不受影响。
+   拖动中把文字选中也一并禁掉（手势在 TabBar.svelte）。
+   滚动条依旧不画：方向由拖动和滚轮表达，多一条横杠只会挤掉下边框的对齐。 */
+.tabs,
+.tabs .tab { cursor: default; }
+.tabs.dragging { user-select: none; }
 .tab {
   position: relative;
   display: inline-flex; align-items: center; gap: 7px;
@@ -566,11 +574,13 @@ input { font: inherit; }
 .hint-tip p { margin: 0; }
 
 /* ─── 面板内的层叠顺序（定死，别随手改）─────────────────────────────
-     `.hint-tip` 100（悬停说明）> `.ctx`（根层级）> `.overlay` 90（对话框）
+     `.hint-tip` 100（悬停说明）> `.ctx`（根层级）> `.overlay` / `.picker-layer` 90
        > `.sheet` 85（设置面板）> `.panel-bottom` 70（通知浮层）> 正文 / tab 栏 / footer
    模态**必须**压过通知浮层：反过来的后果是"推送选择框开着，气泡正盖在对话框按钮上，
    点下去被气泡接走"（气泡是 `pointer-events: auto`，看得见就一定点得到）。
    设置面板同理 —— 它是整面板覆盖，理应在通知之上。
+   文件选择框（`.picker-layer`）与对话框同一层：两者不会同时开（选择框是推送给它的下一步），
+   谁多一层都没有意义。
    右键菜单 `.ctx` 挂在 `.orb-stage` **之外**，跨层叠上下文永远在最上，不受这里影响。 */
 .overlay { position: absolute; inset: 0; z-index: 90; background: color-mix(in oklch, var(--fg) 22%, transparent); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); display: grid; place-items: center; opacity: 0; pointer-events: none; transition: opacity 0.2s ease; }
 .overlay.open { opacity: 1; pointer-events: auto; }
@@ -601,6 +611,125 @@ input { font: inherit; }
 .ctx-item.danger { color: color-mix(in oklch, var(--warn) 75%, black); }
 .ctx-item.danger:hover { background: color-mix(in oklch, var(--warn) 12%, transparent); }
 .ctx-sep { height: 1px; margin: 5px 6px; background: var(--border); }
+
+/* ─── 本机文件选择框（文件和文件夹混选）─────────────────────────────
+   为什么自绘：系统原生选择框在 Windows/Linux 上只能二选一（Win32 只有 FOS_PICKFOLDERS
+   这个开关），而推送要的正是"文件 + 文件夹混选"。详见 src-tauri/src/fs_browse.rs。
+   与对话框同一层（90）：两者不会同时开。卡片上方留 44px = 被压暗的面板头，滑动入场的
+   幅度与 `.dialog` 一致（translateY(10px)）。 */
+.picker-layer { position: absolute; inset: 0; z-index: 90; display: flex; background: color-mix(in oklch, var(--fg) 22%, transparent); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 0.2s ease, visibility 0.2s ease; }
+.picker-layer.open { opacity: 1; visibility: visible; pointer-events: auto; }
+.picker { flex: 1; margin: 44px 10px 10px; min-height: 0; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); overflow: hidden; transform: translateY(10px); transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1); }
+.picker-layer.open .picker { transform: none; }
+
+.picker-head { display: flex; align-items: center; gap: var(--gap-xs); padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.picker-head h3 { flex: 0 1 auto; min-width: 0; margin: 0; font-family: var(--font-display); font-size: var(--fs-md); font-weight: 650; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.picker-head .icon-btn { margin-left: auto; }
+.picker-head .hint { margin-left: 0; }
+
+/* 常用位置：一条横向轨道，放不下就横向滚（屏上不给它换行 —— 换行会把列表挤下去） */
+.picker-places { border-bottom: 1px solid var(--border); }
+.picker-rail { display: flex; gap: 8px; overflow-x: auto; padding: 9px 12px 10px; scrollbar-width: none; }
+.picker-rail::-webkit-scrollbar { display: none; }
+.picker-rail > * { flex: none; }
+.place { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); color: var(--muted); font-size: var(--fs-xs); }
+.place:hover { color: var(--fg); border-color: color-mix(in oklch, var(--fg) 30%, transparent); }
+.place.active { color: color-mix(in oklch, var(--accent) 75%, black); border-color: color-mix(in oklch, var(--accent) 38%, transparent); background: var(--accent-soft); }
+.place .f-icon, .place .f-icon svg { width: 13px; height: 13px; }
+.picker-empty-fav { display: inline-flex; align-items: center; height: 28px; font-size: var(--fs-xs); color: var(--muted); }
+
+/* 面包屑：「此电脑」在最前，之后是当前路径的每一段（段路径由后端给，前端不拼路径） */
+.picker-crumbs { display: flex; align-items: center; gap: 4px; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+.crumb-up { width: 24px; height: 24px; flex: none; display: grid; place-items: center; border-radius: 6px; color: var(--muted); }
+.crumb-up:hover:not(:disabled) { background: var(--fg-soft); color: var(--fg); }
+.crumb-up:disabled { opacity: 0.35; cursor: default; }
+.crumb-up svg { width: 13px; height: 13px; }
+.crumb-trail { flex: 1; min-width: 0; display: flex; align-items: center; gap: 1px; overflow: hidden; }
+.crumb { padding: 3px 6px; border-radius: 6px; font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; }
+.crumb:hover { color: var(--fg); background: var(--fg-soft); }
+.crumb.current { color: var(--fg); font-weight: 500; }
+.crumb-sep { flex: none; color: color-mix(in oklch, var(--fg) 28%, transparent); font-size: var(--fs-xs); }
+
+.picker-body { flex: 1; min-height: 0; overflow-y: auto; padding: 8px; overscroll-behavior: contain; }
+.picker-body::-webkit-scrollbar { width: 10px; }
+.picker-body::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg) 14%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: content-box; }
+.picker-list { display: flex; flex-direction: column; gap: 2px; outline: none; }
+.picker-row { display: flex; align-items: center; gap: var(--gap-sm); padding: 7px 9px; border-radius: 7px; border: 1px solid transparent; cursor: pointer; }
+.picker-row:hover { background: color-mix(in oklch, var(--fg) 5%, transparent); }
+.picker-row[aria-selected="true"] { background: var(--accent-soft); border-color: color-mix(in oklch, var(--accent) 30%, transparent); }
+.picker-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* 勾选框常显：这个框一律多选（挑一个 = 单发，没有额外操作成本） */
+.pr-check { width: 16px; height: 16px; flex: none; display: grid; place-items: center; border-radius: 5px; border: 1.5px solid color-mix(in oklch, var(--fg) 26%, transparent); }
+.pr-check svg { width: 11px; height: 11px; color: var(--surface); opacity: 0; }
+.picker-row[aria-selected="true"] .pr-check { background: var(--accent-deep); border-color: var(--accent-deep); }
+.picker-row[aria-selected="true"] .pr-check svg { opacity: 1; }
+.picker-row .f-icon, .picker-row .f-icon svg { width: 16px; height: 16px; }
+.picker-row.folder .f-icon { color: var(--warn); }
+.picker-row.drive .f-icon { color: var(--accent); }
+.pr-main { flex: 1; min-width: 0; display: block; }
+.pr-name { display: block; font-family: var(--font-display); font-size: var(--fs-sm); color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pr-meta { display: block; font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 行尾的箭头 = 「进去」（点行本身是「选它」）：键盘上等价于在目录上按回车 */
+.pr-enter { width: 22px; height: 22px; flex: none; display: grid; place-items: center; border-radius: 6px; color: var(--muted); cursor: pointer; }
+.pr-enter:hover { background: color-mix(in oklch, var(--fg) 9%, transparent); color: var(--fg); }
+.pr-enter svg { width: 13px; height: 13px; }
+.picker-group { display: block; padding: 4px 9px; font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.pr-bar { display: block; height: 3px; max-width: 180px; margin-top: 4px; border-radius: 999px; background: var(--fg-soft); overflow: hidden; }
+.pr-bar i { display: block; height: 100%; border-radius: 999px; background: var(--accent); }
+
+.picker-state { display: flex; flex-direction: column; align-items: center; gap: 7px; padding: 40px 18px; text-align: center; color: var(--muted); }
+.picker-state svg { width: 26px; height: 26px; opacity: 0.5; }
+.picker-state p { margin: 0; font-size: var(--fs-sm); }
+.picker-state .ps-sub { font-size: var(--fs-xs); max-width: 250px; line-height: 1.6; }
+@keyframes pk-spin { to { transform: rotate(360deg); } }
+.pk-spin { transform-origin: 50% 50%; animation: pk-spin 0.9s linear infinite; }
+
+.picker-foot { display: flex; align-items: center; gap: var(--gap-sm); padding: 9px 12px; border-top: 1px solid var(--border); }
+/* 空车那一格（有选中项时换成角标，见 `.cart-btn`） */
+.picker-sel { flex: 1; min-width: 0; font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.picker-foot .btn { flex: none; }
+
+/* ─── 购物车（选中集的唯一呈现处）─────────────────────────────────
+   展开的那块**占布局高度**：上面的 `.picker-body` 是 `flex: 1`，自己让位。不做浮在列表上的
+   弹层 —— 会盖住最后几行；而 `.picker` 是 `overflow: hidden`，挂到框外还会被裁掉。
+   前缀用 `cart-`（`ps-` 被 `.picker-state` 的副标题占了）。 */
+.cart-btn { flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; padding: 3px 8px; border-radius: 7px; border: 1px solid transparent; color: var(--muted); text-align: left; }
+.cart-btn:hover { background: var(--fg-soft); color: var(--fg); }
+.cart-btn.open { background: var(--accent-soft); border-color: color-mix(in oklch, var(--accent) 30%, transparent); }
+.cart-badge { flex: none; min-width: 18px; height: 18px; padding: 0 5px; display: grid; place-items: center; border-radius: 999px; background: var(--accent-deep); color: var(--surface); font-size: var(--fs-xxs); font-weight: 700; line-height: 1; }
+.cart-label { flex: 1; min-width: 0; font-size: var(--fs-xs); color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cart-etc { margin-left: 5px; color: var(--muted); }
+.cart-caret { flex: none; display: grid; place-items: center; transition: transform 0.15s ease; }
+/* 车往上开：收起时箭头朝上（点它往上长），展开时朝下 */
+.cart-caret svg { width: 12px; height: 12px; transform: rotate(-90deg); }
+.cart-btn.open .cart-caret svg { transform: rotate(90deg); }
+
+.picker-cart { border-top: 1px solid var(--border); }
+.cart-head { display: flex; align-items: center; gap: var(--gap-sm); padding: 7px 12px 3px; }
+.cart-count { flex: 1; min-width: 0; font-size: var(--fs-xs); color: var(--muted); }
+.cart-count b { color: var(--fg); font-weight: 600; }
+.cart-clear { flex: none; padding: 2px 6px; border-radius: 6px; font-size: var(--fs-xs); color: var(--muted); }
+.cart-clear:hover { color: color-mix(in oklch, var(--warn) 75%, black); background: color-mix(in oklch, var(--warn) 12%, transparent); }
+.cart-list { max-height: 132px; overflow-y: auto; padding: 0 8px 8px; overscroll-behavior: contain; }
+.cart-list::-webkit-scrollbar { width: 10px; }
+.cart-list::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg) 14%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: content-box; }
+.cart-row { display: flex; align-items: center; gap: var(--gap-sm); padding: 5px 9px; border-radius: 7px; }
+.cart-row:hover { background: color-mix(in oklch, var(--fg) 5%, transparent); }
+.cart-row .f-icon, .cart-row .f-icon svg { width: 15px; height: 15px; }
+.cart-row.folder .f-icon { color: var(--warn); }
+.cart-name { flex: 1; min-width: 0; font-family: var(--font-display); font-size: var(--fs-sm); color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 「在哪选的」每行都带（只在跨目录时才显示就没法解释同名文件了） */
+.cart-from { flex: none; max-width: 40%; padding: 1px 7px; border-radius: 999px; background: var(--fg-soft); font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cart-meta { flex: none; font-size: var(--fs-xs); color: var(--muted); }
+.cart-x { width: 20px; height: 20px; flex: none; display: grid; place-items: center; border-radius: 6px; color: var(--muted); }
+.cart-x:hover { background: color-mix(in oklch, var(--warn) 12%, transparent); color: color-mix(in oklch, var(--warn) 75%, black); }
+.cart-x svg { width: 12px; height: 12px; }
+
+/* 选择框里的右键菜单：**绝对定位**在层内 —— `.picker-layer` 的 backdrop-filter 会把
+   `position: fixed` 的参照系改成它自己（见上方层叠说明），用 clientX/clientY 直接定 fixed
+   会整体偏掉一个面板内边距。坐标在 FilePicker.svelte 里减过层的原点。 */
+.picker-ctx { position: absolute; }
+
 /* 面板底部的堆叠层：通知组（通知 + 发送进度卡）与提示共用一列，谁也不盖谁。
    `column-reverse` 下**DOM 里靠前的元素贴底** —— App 里通知组写在最前，所以它永远
    落在最下缘；提示往上叠。
@@ -629,5 +758,5 @@ input { font: inherit; }
 .dialog .pair-invite { margin: 0 0 14px; }
 .dialog .pair-invite + .d-target { margin-top: 0; }
 @media (prefers-reduced-motion: reduce) {
-  .orb-stage, .panel, .orb, .toast, .ctx, .sheet, .dialog, .tree, .chev, .p-bar i, .pulse, .state-chip .dot, .overlay { transition: none !important; animation: none !important; }
+  .orb-stage, .panel, .orb, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin { transition: none !important; animation: none !important; }
 }

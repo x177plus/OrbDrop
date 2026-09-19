@@ -90,6 +90,17 @@ pub enum BcTarget {
     },
 }
 
+/// 文件选择框顶部「常用」的一条（F-50）：用户右键目录攒出来的快捷入口。
+///
+/// 存**名字 + 绝对路径**：名字是加进来那一刻的目录名，只当标签用（目录此后改名不回头改它）；
+/// 路径才是身份 —— 去重、跳转全按它。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickerFavorite {
+    pub name: String,
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -172,6 +183,13 @@ pub struct Config {
     /// 悬浮球落位（F-74「窗口位置」）：`None` = 还没记过（首启 / 旧配置），启动时按居中显示。
     #[serde(default)]
     pub orb_pos: Option<OrbPos>,
+    /// 文件选择框的「常用」列表（F-50）：**默认空**，全靠用户右键目录攒。
+    ///
+    /// 放配置文件里而不是 webview 的 localStorage：它跟共享项一样是**用户数据** ——
+    /// 该和其余状态躺在同一个数据目录（备份/迁移/清理都是一个动作），也不该因为
+    /// 清一次站点数据就凭空消失。
+    #[serde(default)]
+    pub picker_favorites: Vec<PickerFavorite>,
 }
 
 fn default_port() -> u16 {
@@ -201,6 +219,31 @@ impl Config {
                 .unwrap_or_default(),
         }
     }
+
+    /// 写入选择框「常用」：**整份替换**（界面给的就是它此刻显示的那份）。
+    ///
+    /// 顺手规整：丢掉空条目、按 `path` 去重（同一条加两次只留一条；不同路径同名是两条）。
+    /// 返回**真正存下去的那份**，让界面以后端为准 —— 否则界面上的列表和配置里的列表会慢慢
+    /// 分叉（比如重复项在界面上看得见、重启后却少一条）。
+    pub fn set_picker_favorites(&mut self, items: Vec<PickerFavorite>) -> Vec<PickerFavorite> {
+        let mut kept: Vec<PickerFavorite> = Vec::new();
+        for item in items {
+            let name = item.name.trim();
+            let path = item.path.trim();
+            if path.is_empty() {
+                continue;
+            }
+            if kept.iter().any(|k| k.path == path) {
+                continue;
+            }
+            kept.push(PickerFavorite {
+                name: if name.is_empty() { path.to_string() } else { name.to_string() },
+                path: path.to_string(),
+            });
+        }
+        self.picker_favorites = kept.clone();
+        kept
+    }
 }
 
 impl Default for Config {
@@ -218,6 +261,7 @@ impl Default for Config {
             device_id: new_device_id(),
             peers: Vec::new(),
             orb_pos: None,
+            picker_favorites: Vec::new(),
         }
     }
 }
@@ -405,6 +449,10 @@ mod tests {
             }),
             bc_right: None,
             orb_pos: Some(OrbPos { x: -1280, y: 40 }),
+            picker_favorites: vec![
+                PickerFavorite { name: "桌面".into(), path: "C:/Users/t/Desktop".into() },
+                PickerFavorite { name: "项目".into(), path: "D:/项目".into() },
+            ],
             shares: vec![ShareItem {
                 id: "share-1".into(),
                 name: "Projects".into(),
@@ -431,6 +479,14 @@ mod tests {
         assert_eq!(loaded.shares[0].name, "Projects");
         assert_eq!(loaded.shares[0].path, PathBuf::from("C:/Projects"));
         assert_eq!(loaded.shares[0].broadcast_enabled, true);
+        assert_eq!(
+            loaded.picker_favorites,
+            vec![
+                PickerFavorite { name: "桌面".into(), path: "C:/Users/t/Desktop".into() },
+                PickerFavorite { name: "项目".into(), path: "D:/项目".into() },
+            ],
+            "选择框「常用」要跨重启保留（用户攒的那几条）"
+        );
         assert_eq!(
             loaded.bc_exe_path,
             Some(PathBuf::from("D:/Tools/BCompare/BCompare.exe")),
@@ -503,6 +559,36 @@ mod tests {
         assert_eq!(config.orb_pos, None);
         assert_eq!(config.port, 3895);
         assert_eq!(config.device_id, "device-1");
+    }
+
+    /// 选择框「常用」默认是空的：老配置（没有这一节）解析出来就是空表，界面不会凭空冒出
+    /// 几个"默认常用目录"来。
+    #[test]
+    fn picker_favorites_default_to_empty() {
+        let config: Config = toml::from_str("deviceId = \"device-1\"\n").unwrap();
+        assert!(config.picker_favorites.is_empty());
+    }
+
+    /// 写回「常用」时规整：空路径丢掉、同路径只留一条、空名字用路径顶上。
+    #[test]
+    fn set_picker_favorites_dedupes_and_drops_blanks() {
+        let mut config = Config::default();
+        let stored = config.set_picker_favorites(vec![
+            PickerFavorite { name: "桌面".into(), path: "C:/Users/t/Desktop".into() },
+            PickerFavorite { name: "桌面（重复）".into(), path: "C:/Users/t/Desktop".into() },
+            PickerFavorite { name: "空的".into(), path: "   ".into() },
+            PickerFavorite { name: "  ".into(), path: "D:/项目".into() },
+        ]);
+
+        assert_eq!(
+            stored,
+            vec![
+                PickerFavorite { name: "桌面".into(), path: "C:/Users/t/Desktop".into() },
+                PickerFavorite { name: "D:/项目".into(), path: "D:/项目".into() },
+            ]
+        );
+        // 存下去的就是返回的那份：界面以后端为准，两边不会分叉
+        assert_eq!(config.picker_favorites, stored);
     }
 
     /// S-01: same-name downloads get "xxx (1).ext" style renames.

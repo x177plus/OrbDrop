@@ -68,6 +68,9 @@ windows = { version = "0.61", features = [
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    # 盘符类型常量（DRIVE_FIXED / DRIVE_REMOVABLE / …）：本机选择框要按类型说
+    # 「本地磁盘 / 可移动磁盘」，光有 Win32_Storage_FileSystem 里的 GetDriveTypeW 拿不到名字。
+    "Win32_System_WindowsProgramming",
     "Win32_System_SystemServices",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
