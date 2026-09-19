@@ -9,6 +9,7 @@
     devices = [],
     onToast,
     onRequestPush,
+    onAddShare,
     onOpenPair,
     onUnpair,
   }: {
@@ -17,6 +18,8 @@
     devices?: PeerDevice[];
     onToast: (msg: string) => void;
     onRequestPush?: (device: PeerDevice) => void;
+    /** 本机标签的「添加共享项」：开文件选择框挑本机内容。 */
+    onAddShare: () => void;
     onOpenPair?: (device: PeerDevice | null) => void;
     onUnpair?: (device: PeerDevice) => void;
   } = $props();
@@ -29,7 +32,7 @@
 </script>
 
 {#if tab.kind === 'local'}
-  <LocalTab {onToast} />
+  <LocalTab {onToast} {onAddShare} />
 {:else if tab.kind === 'devices'}
   <DeviceTab {onToast} {onRequestPush} {onOpenPair} {onUnpair} />
 {:else if peer}

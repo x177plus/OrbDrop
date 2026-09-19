@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { ctxPlacement } from '$lib/ctxPlacement';
 
   let {
     x, y,
@@ -96,17 +97,12 @@
     };
   });
 
-  // Adjust position to stay within viewport
-  let style = $derived(() => {
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    let left = x;
-    let top = y;
-    // rough adjustment — the ctx menu is ~200px wide, ~200px tall max
-    if (left + 200 > vw) left = Math.max(8, vw - 200 - 8);
-    if (top + 250 > vh) top = Math.max(8, vh - 250 - 8);
-    return `left:${left}px; top:${top}px`;
-  });
+  /**
+   * 菜单是 `position: fixed` 且挂在 `.orb-stage` 之外（跨层叠上下文永远在最上），
+   * 参照系就是视口；面板窗口本身即视口，所以直接量 `innerWidth/innerHeight`。
+   * 每次打开都是一次新挂载，所以这个值跟着当前窗口大小走。
+   */
+  const bounds = { width: window.innerWidth, height: window.innerHeight };
 </script>
 
 <!-- BeyondCompare 菜单区：本机共享项与对端共享项共用同一份结构 -->
@@ -145,7 +141,7 @@
 {/snippet}
 
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-<div class="ctx show" bind:this={root} style={style()} role="menu" tabindex="-1" onclick={onClose} oncontextmenu={(e) => e.preventDefault()}>
+<div class="ctx show" bind:this={root} use:ctxPlacement={{ x, y, bounds }} role="menu" tabindex="-1" onclick={onClose}>
   {#if kind === 'peer'}
     <button class="ctx-item" onclick={() => handleItem(onPeerDownload)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>

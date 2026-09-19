@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, BcTarget, BcStatus, DragOutSource, DragTicket } from './types';
+import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, PickerFavorite } from './types';
 import type { ScreenMetrics, ScreenRect } from './orbLayout';
 
 // Share management
@@ -113,6 +113,29 @@ export function acceptPairInvite(inviteId: string): Promise<string> {
 /** 接收方：拒绝一条配对邀请。 */
 export function rejectPairInvite(inviteId: string): Promise<void> {
   return invoke('reject_pair_invite', { inviteId });
+}
+
+// 本机文件浏览（推送选择框 `FilePicker.svelte` 用）：
+// 自绘选择框的存在理由见 `src-tauri/src/fs_browse.rs` —— 系统原生选择框不能把
+// "选文件"和"选目录"合进同一个对话框，而推送要的正是两者混选。
+/** 选择框「常用」：随配置持久化（`config.toml`），重启后还在。默认是空的。 */
+export function listPickerFavorites(): Promise<PickerFavorite[]> {
+  return invoke('list_picker_favorites');
+}
+
+/** 整份写回；返回后端规整过的那份（去重后），界面以后端为准。 */
+export function setPickerFavorites(items: PickerFavorite[]): Promise<PickerFavorite[]> {
+  return invoke('set_picker_favorites', { items });
+}
+
+/** 设备与驱动器（「此电脑」下面那一组）。「常用」默认是空的，全靠右键加。 */
+export function fsDrives(): Promise<FsDrive[]> {
+  return invoke('fs_drives');
+}
+
+/** 列一层目录。失败时 reject 的是整个 `FsError`（按 `kind` 选状态页）。 */
+export function fsList(path: string): Promise<FsListing> {
+  return invoke('fs_list', { path });
 }
 
 // Push (F-50 ~ F-54)

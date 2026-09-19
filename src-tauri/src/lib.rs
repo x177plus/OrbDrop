@@ -4,6 +4,7 @@ pub mod config;
 pub mod credential;
 pub mod discover;
 pub mod drag;
+pub mod fs_browse;
 pub mod log;
 pub mod orb_window;
 pub mod pair;
@@ -23,7 +24,7 @@ use tauri_plugin_opener::OpenerExt;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use config::{AppSettings, BcTarget, DownloadMode, OrbPos, PeerDevice, ShareItem};
+use config::{AppSettings, BcTarget, DownloadMode, OrbPos, PeerDevice, PickerFavorite, ShareItem};
 use state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -97,6 +98,25 @@ async fn add_share(path: String, state: State<'_, Arc<AppState>>) -> Result<Shar
     notify_shares_changed(state.inner());
     info!(path, "share added");
     Ok(dto)
+}
+
+/// 选择框「常用」列表（F-50）：用户右键目录攒出来的快捷入口，随配置持久化。
+#[tauri::command]
+fn list_picker_favorites(state: State<'_, Arc<AppState>>) -> Vec<PickerFavorite> {
+    state.config.lock().picker_favorites.clone()
+}
+
+/// 整份写回「常用」（界面给的就是它此刻显示的那份）；返回后端规整过的那份（去重后），
+/// 界面以后端为准。**写完立刻落盘**：这几条是用户手动的选择，不能在退出时才写。
+#[tauri::command]
+fn set_picker_favorites(
+    items: Vec<PickerFavorite>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<PickerFavorite>, String> {
+    let mut config = state.config.lock();
+    let stored = config.set_picker_favorites(items);
+    config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
+    Ok(stored)
 }
 
 #[tauri::command]
@@ -1124,6 +1144,10 @@ pub fn run() {
             connect_peer,
             disconnect_peer,
             wipe_credentials,
+            fs_browse::fs_drives,
+            fs_browse::fs_list,
+            list_picker_favorites,
+            set_picker_favorites,
             push_paths,
             accept_push,
             reject_push,

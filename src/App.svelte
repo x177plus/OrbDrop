@@ -10,10 +10,10 @@
   import { loadSettings } from '$lib/stores/settings.svelte';
   import { getBcStatus, loadBcStatus, setBcSide, clearSide, compare } from '$lib/stores/bc.svelte';
   import { getActualPort, startHttpServer, acceptPush, rejectPush, cancelPush, cancelReceive, pushPaths, localAddresses, orbScreenMetrics, orbSetRect, orbDragStart, orbMouseDown, orbSavePos, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer } from '$lib/api';
-  import { open as openDialog } from '@tauri-apps/plugin-dialog';
-  import type { PushInvite, PeerDevice, TabKey, BcTarget, OrbDragInfo } from '$lib/types';
+  import type { PushInvite, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick } from '$lib/types';
   import { planExpansion, planCollapse, planDock, type DockPlan, type ScreenRect } from '$lib/orbLayout';
   import Orb from '$lib/components/Orb.svelte';
+  import FilePicker from '$lib/components/FilePicker.svelte';
   import Logo from '$lib/components/Logo.svelte';
   import TabBar from '$lib/components/TabBar.svelte';
   import TabContent from '$lib/components/TabContent.svelte';
@@ -115,10 +115,14 @@
   let notices = $state<PushNotice[]>([]);
   // 铃铛：展开/收起右下角那组"等你确认"的气泡。收起 ≠ 已读 —— 角标照旧挂着。
   let notifOpen = $state(true);
-  // 「推送到 X」的选择框：系统选择框一次只能挑一种（文件 / 文件夹是两种对话框），
-  // 所以先在这一层问一句要哪种，再弹原生框。
-  // 选择框一律允许多选：多选也能只挑一个，没有额外操作成本（挑一个 = 单发）。
-  let pushPicker = $state<{ device: PeerDevice } | null>(null);
+  // 文件选择框的请求：标题/说明/确认按钮文案 + 确认动作。推送与「添加共享项」都用它 ——
+  // 同一个选择框只该有一套开关方式，所以这里存的是**要开成什么样**，而不是某个具体用途。
+  let picker = $state<{
+    title: string;
+    sub: string;
+    confirmLabel: string;
+    onConfirm: (items: LocalPick[]) => void;
+  } | null>(null);
   // Pair dialog state: we display our own code (issued by the backend) and
   // accept the code the other side displays in the same dialog.
   type PairDialog = {
@@ -444,7 +448,7 @@
     expanded = false;
     showSettings = false;
     ctxState = null;
-    pushPicker = null;    // 选择框和右键菜单一样属于面板：收起即作废
+    picker = null;        // 选择框和右键菜单一样属于面板：收起即作废
     toasts = [];          // 提示是面板上的浮层：收起即作废，别等下次展开又冒出来
     holdOrb = true;
     if (foldTimer) clearTimeout(foldTimer);
@@ -508,50 +512,78 @@
   }
 
   /**
-   * 点「推送」：先问一句推文件还是文件夹，再弹原生选择框。
+   * 点「推送」：直接开选择框（文件与文件夹混选、可跨目录累积）。
    *
-   * 系统的选择框一次只能挑一种（Windows/macOS 的文件与文件夹是两种对话框，rfd 也只给
-   * `pick_file(s) / pick_folder(s)` 四个入口，没有"文件或文件夹"混合模式），所以这层询问
-   * 是省不掉的 —— 与其把一个箭标塞进设备行，不如把两个选择都摆在这一层里。
+   * 以前这里还有一层"先问推文件还是文件夹"——那是原生框的能力限制逼出来的：Windows 的
+   * `IFileOpenDialog` 只有 `FOS_PICKFOLDERS` 一个开关（非此即彼），rfd 也只给
+   * `pick_file(s) / pick_folder(s)`，没有混合模式。选择框自绘之后这一层就不需要了，
+   * 用户可以先把一个文件勾上、再进另一层目录把整个文件夹勾上，一次推过去。
    */
   function requestPush(device: PeerDevice) {
     if (!device.online) {
       toast(`「${device.name}」不在网上，推送未发送`);
       return;
     }
-    pushPicker = { device };
+    picker = {
+      title: `推送到「${device.name}」`,
+      sub: '文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。对方同意后开始传输，多项合并成一条推送，只需同意一次。',
+      confirmLabel: '推送',
+      onConfirm: (items) => void pushPicked(items, device),
+    };
   }
 
-  function closePushPicker() {
-    pushPicker = null;
+  function closePicker() {
+    picker = null;
   }
 
-  /** 弹出原生选择框，把挑中的路径交给后端去送。`directory` = 选文件夹。 */
-  async function pickAndPush(directory: boolean) {
-    const device = pushPicker?.device;
-    closePushPicker();
-    if (!device) return;
-    let picked: string[] = [];
-    try {
-      const sel = await openDialog({
-        // 一律允许多选：挑一个就是单发，挑多个合并成一条推送（对方一次同意）。
-        multiple: true,
-        directory,
-        title: `选择要推送给「${device.name}」的${directory ? '文件夹' : '文件'}`,
-      });
-      if (Array.isArray(sel)) picked = sel;
-      else if (typeof sel === 'string') picked = [sel];
-    } catch (e) {
-      toast(`打开选择框失败：${e}`);
-      return;
-    }
-    if (picked.length === 0) return;   // 用户取消
+  /** 推送确认：关框 → 把那批路径交给后端去送（取消时这里根本不会调到）。 */
+  async function pushPicked(items: LocalPick[], device: PeerDevice) {
+    closePicker();
+    if (items.length === 0) return;
     try {
       // 多选合并成**一条**推送：对端一张卡、一次同意、一条进度。
-      await pushPaths(picked, device.id);
+      await pushPaths(items.map((i) => i.path), device.id);
     } catch (e) {
       toast(String(e));    // 对方离线等：就地失败，不排队（F-53）
     }
+  }
+
+  /** 本机页点「拖入文件或文件夹，点击添加共享项」：开同一个选择框挑本机内容（F-20）。 */
+  function requestAddShare() {
+    picker = {
+      title: '添加共享项',
+      sub: '文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。登记后可在本机标签里对每项开关广播。',
+      confirmLabel: '添加共享项',
+      onConfirm: (items) => {
+        closePicker();
+        void addShares(items.map((i) => i.path));
+      },
+    };
+  }
+
+  /**
+   * 一批本机路径登记成共享项：**拖入悬浮球与「添加共享项」选择框共用这一个落点**
+   * —— 两条路各写一套的话，失败处理、列表刷新、提示文案迟早会分叉。
+   *
+   * 返回真正登记上的条数：坏路径（不存在、已被删）吞在这一层并进控制台，
+   * 一条坏的没道理让整批一起消失。
+   */
+  async function addShares(paths: string[]): Promise<number> {
+    const settled = await Promise.all(
+      paths.map((p) =>
+        addShare(p).then(
+          () => true,
+          (e) => {
+            console.error('添加共享项失败:', p, e);
+            return false;
+          },
+        ),
+      ),
+    );
+    const added = settled.filter(Boolean).length;
+    if (added === 0) toast('没有添加任何共享项');
+    else toast(`已添加 ${added} 个共享项`);
+    return added;
   }
 
   async function cancelSending(inviteId: string) {
@@ -904,7 +936,7 @@
     if (device) openPair(device);
   }
 
-  /** 右键「推送」：与设备行同一个入口（先问文件还是文件夹）。 */
+  /** 右键「推送」：与设备行同一个入口（同一个文件选择框）。 */
   function ctxPush() {
     const deviceId = ctxState?.deviceId;
     hideCtx();
@@ -1019,17 +1051,7 @@
       } else if (event.payload.type === 'drop') {
         dragging = false;
         const paths = event.payload.paths;
-        if (paths.length > 0) {
-          for (const p of paths) {
-            addShare(p).catch((e) => console.error('添加共享项失败:', e));
-          }
-          const connected = getDevices().filter(d => d.connected);
-          if (connected.length > 0) {
-            toast(`已拖入文件并自动广播至 ${connected.map(d => `「${d.name}」`).join('、')}`);
-          } else {
-            toast('已添加共享项');
-          }
-        }
+        if (paths.length > 0) void addShares(paths);
       }
     });
 
@@ -1202,6 +1224,14 @@
     };
     document.addEventListener('od:ctx', handleCtx);
 
+    // 右键全局兜底：webview 自带一份**默认右键菜单**（wry 打开 WebView2 的
+    // AreDefaultContextMenusEnabled；dev 构建里还带「检查」），任何没被拦下的 contextmenu
+    // 都会把它叫出来。这里一律 preventDefault 把它关掉 —— 需要右键的地方（设备行/共享项/
+    // 树节点/通知条）各自在自己的处理里 preventDefault + 开菜单，走的是同一份事件，不受影响。
+    // 用捕获阶段：这些行会 stopPropagation，冒泡阶段兜不到。
+    const killDefaultCtx = (e: Event) => e.preventDefault();
+    document.addEventListener('contextmenu', killDefaultCtx, true);
+
     // 子组件要提示（拖拽下载的准备进度/失败原因）时冒上来：浮层只有这一层有。
     const handleToast = (e: Event) => {
       const msg = (e as CustomEvent<string>).detail;
@@ -1225,6 +1255,7 @@
       unPairInviteClosed.then(fn => fn());
       unPairInviteFailed.then(fn => fn());
       document.removeEventListener('od:ctx', handleCtx);
+      document.removeEventListener('contextmenu', killDefaultCtx, true);
       document.removeEventListener('od:toast', handleToast);
     };
   });
@@ -1281,7 +1312,7 @@
     />
 
     <div class="panel-body" bind:this={bodyEl}>
-      <TabContent tab={activeTab} devices={getDevices()} onToast={toast} onRequestPush={requestPush} onOpenPair={openPair} onUnpair={(d) => void unpairDevice(d.id)} />
+      <TabContent tab={activeTab} devices={getDevices()} onToast={toast} onRequestPush={requestPush} onAddShare={requestAddShare} onOpenPair={openPair} onUnpair={(d) => void unpairDevice(d.id)} />
     </div>
 
     <footer class="panel-foot" bind:this={footEl}>
@@ -1494,24 +1525,16 @@
       </div>
     {/if}
 
-    <!-- 推送：先问推文件还是文件夹（系统选择框一次只能挑一种），再弹原生选择框 -->
-    {#if pushPicker}
-      <div class="overlay open" id="pushPicker">
-        <div class="dialog">
-          <h3 class="d-head">
-            推送到「{pushPicker.device.name}」<Hint>
-              选择要发送的文件或文件夹（可多选）—— 对方同意后开始传输；多项会合并成一条推送，对方只需同意一次。
-            </Hint>
-          </h3>
-          <div class="d-acts">
-            <button class="btn btn-secondary" onclick={() => void pickAndPush(false)}>选择文件…</button>
-            <button class="btn btn-secondary" onclick={() => void pickAndPush(true)}>选择文件夹…</button>
-          </div>
-          <div class="d-acts">
-            <button class="btn btn-ghost" onclick={closePushPicker}>取消</button>
-          </div>
-        </div>
-      </div>
+    <!-- 文件选择框：文件与文件夹在同一个框里混选、选中项跨目录累积。推送与「添加共享项」
+         都用它 —— 开成什么样由 `picker` 这个请求对象决定（`closePicker` 关掉它）。 -->
+    {#if picker}
+      <FilePicker
+        title={picker.title}
+        sub={picker.sub}
+        confirmLabel={picker.confirmLabel}
+        onConfirm={picker.onConfirm}
+        onClose={closePicker}
+      />
     {/if}
 
   </section>

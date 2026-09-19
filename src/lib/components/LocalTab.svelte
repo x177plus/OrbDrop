@@ -12,8 +12,11 @@
 
   let {
     onToast,
+    onAddShare,
   }: {
     onToast: (msg: string) => void;
+    /** 点那一大块「拖入文件或文件夹，点击添加共享项」：开文件选择框挑本机内容（F-20）。 */
+    onAddShare: () => void;
   } = $props();
 
   interface TreeState { expanded: boolean; entries: TreeEntry[]; loaded: boolean; loading: boolean; error: string | null; }
@@ -82,17 +85,19 @@
   const ICON_FILE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg>';
 </script>
 
-<button class="dropzone" onclick={() => onToast('请将文件或文件夹拖入悬浮球')}>
+<button class="dropzone" onclick={onAddShare}>
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
     <path d="M12 3v12M6 9l6 6 6-6M5 19h14"/>
   </svg>
   拖入文件或文件夹，点击添加共享项
 </button>
 
+<!-- 文案按**实际行为**写：`add_share` 落盘时 `broadcastEnabled` 是 false（`config.rs` 的
+     `ShareItem::new`），所以"添加即自动广播"是不成立的 —— 要让人看到得自己打开那一项的开关。 -->
 {#if connectedDevices.length > 0}
   <p class="bcast-hint">
     <span class="dot ok"></span>
-    <span>拖入文件将自动广播至 {connectedDevices.map(d => `「${d.name}」`).join('、')}</span>
+    <span>{connectedDevices.map(d => `「${d.name}」`).join('、')} 已连接：在共享项上打开广播开关，对端才能看到</span>
   </p>
 {/if}
 

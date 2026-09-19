@@ -80,6 +80,59 @@ export interface TreeResponse {
   entries: TreeEntry[];
 }
 
+/** 选择框顶部「常用」的一条（配置里的 `pickerFavorites`）：用户右键目录攒的快捷入口。 */
+export interface PickerFavorite {
+  name: string;
+  path: string;
+}
+
+/** 「设备与驱动器」里的一项（后端 `FsDrive`）。 */
+export interface FsDrive {
+  name: string;
+  path: string;
+  /** 可移动磁盘（U 盘、移动硬盘）。 */
+  removable: boolean;
+  /** 总容量 / 可用空间（字节）。取不到时为 0，界面据此不画占用条。 */
+  total: number;
+  free: number;
+}
+
+export interface FsEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  /** 文件夹固定 0：列一层不读它的子项。 */
+  size: number;
+}
+
+/** 面包屑的一段：`path` 是点它要跳到的绝对路径。 */
+export interface FsCrumb {
+  name: string;
+  path: string;
+}
+
+/** 一层目录的内容（后端 `fs_list`）。遍历一律走 `crumbs` + `entries` 的 `path`，前端不拼路径。 */
+export interface FsListing {
+  path: string;
+  crumbs: FsCrumb[];
+  entries: FsEntry[];
+}
+
+/** 列举失败（后端 `FsError`）：`kind` 选状态页，`crumbs` 保证失败时面包屑也是对的。 */
+export interface FsError {
+  kind: 'denied' | 'missing' | 'notDir' | 'other';
+  message: string;
+  crumbs: FsCrumb[];
+}
+
+/** 选择框里选中并交给调用方的一项（推送直接拿 `path` 拼一批路径）。 */
+export interface LocalPick {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number;
+}
+
 /**
  * 拖拽下载的源（F-46）：本机共享项（省略 `peerId`）或对端共享项。
  * `path` 是共享项内相对路径（'' = 共享项根），`name` 是拖出去那一项的名字 ——
