@@ -116,7 +116,10 @@ pub mod ui {
     pub const PAIR_INVITE_CLOSED: &str = "pair://invite_closed";
     /// 本机发起的配对邀请没成（对端拒绝 / 不在网上 / 撤回）：只有发起方收这条。
     pub const PAIR_INVITE_FAILED: &str = "pair://invite_failed";
-    pub const PUSH_SENT: &str = "push://sent";
+    /// 一批推送（= 界面上一张卡片）的快照：创建、进度、成功/失败/取消都走它。
+    /// 它是**发送侧卡片唯一的数据来源** —— 单台推送也是一批（只有一条目标），
+    /// 所以"等待对方同意 → 传输中 → 已发送"和"3 台里成了几台"共用同一条事件。
+    pub const PUSH_BATCH: &str = "push://batch";
     pub const PUSH_INVITE: &str = "push://invite";
     pub const PUSH_RESPONSE: &str = "push://response";
     pub const PUSH_PROGRESS: &str = "push://progress";
@@ -128,4 +131,6 @@ pub mod ui {
     pub const SERVER_ERROR: &str = "server://error";
     /// 第二份进程被启动 → 本实例被调到前台，悬浮球面板展开。
     pub const ORB_SHOW: &str = "orb://show";
+    /// 本机「在线 / 离线」变了（面板右上角状态框）：界面更新那个框。载荷 `{ online: bool }`。
+    pub const LOCAL_ONLINE: &str = "local://online";
 }

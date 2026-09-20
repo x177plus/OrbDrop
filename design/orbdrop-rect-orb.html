@@ -1,0 +1,820 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OrbDrop · 圆角矩形悬浮球 · 新方案原型</title>
+<style>
+/* OD-LAYOUT-PRIMITIVES v1 — structure only: display, flex/grid, overflow, wrapping, ratio.
+   Put this @layer first; product CSS outside the layer always wins. */
+@layer od-layout {
+  :where(.od-stack,.od-row,.od-row-top,.od-cluster,.od-grid,.od-field,.od-stat,.od-cell,.od-tile) > :where(*) { min-width: 0; }
+
+  /* containers */
+  .od-stack   { display: flex; flex-direction: column; gap: var(--od-gap, 8px); }
+  .od-row     { display: flex; align-items: center; gap: var(--od-gap, 8px); }
+  .od-row-top { display: flex; align-items: flex-start; gap: var(--od-gap, 8px); }
+  .od-cluster { display: flex; flex-wrap: wrap; align-items: center; gap: var(--od-gap, 8px); }
+  .od-fill    { flex: 1 1 0; min-width: 0; }
+  .od-fixed   { flex: none; }
+  .od-grid    { display: grid; gap: var(--od-gap, 12px); grid-template-columns: repeat(var(--od-cols, 3), minmax(0, 1fr)); }
+
+  /* stacked information: each piece is its own line — never sibling inline spans */
+  .od-stat, .od-field, .od-cell { display: grid; gap: var(--od-gap, 2px); }
+  :where(.od-stat,.od-field,.od-cell) > :where(*) { display: block; }
+  .od-tile { display: grid; grid-template-rows: auto 1fr; }
+  :where(.od-tile) > :where(*) { display: block; }
+
+  /* media keeps its intrinsic ratio by default; never a distorted or cropped
+     cover by accident. height:auto lets the ratio win over an <img height="…">
+     attribute. Cropping to a uniform box is an explicit opt-in: set --od-ratio
+     AND add .od-media-cover together (per the core rule, only where a crop is
+     deliberate — tile thumbs, decorative fills — never on full-frame content). */
+  .od-media { display: block; width: 100%; height: auto; aspect-ratio: var(--od-ratio, auto); }
+  .od-media-cover { object-fit: cover; }
+
+  /* data text only — authored copy is rewritten to its budget instead */
+  .od-truncate { display: block; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .od-clamp-2, .od-clamp-3 { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+  .od-clamp-2 { -webkit-line-clamp: 2; }
+  .od-clamp-3 { -webkit-line-clamp: 3; }
+  .od-lines-2 { min-height: calc(2 * 1.4em); }   /* block-level reservation for a shared baseline */
+  .od-nowrap  { white-space: nowrap; }           /* 数字+单位 · 价格+起 · 日期+星期 */
+  .od-keep    { word-break: keep-all; overflow-wrap: anywhere; } /* CJK labels break at spaces / <wbr> first */
+
+  /* screen skeleton (optional): bars take their own space, the middle scrolls — no padding guessed for chrome */
+  .od-screen { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; height: 100%; }
+  .od-scroll { overflow-y: auto; overscroll-behavior: contain; min-height: 0; }
+
+  /* horizontal rail: the next item peeks at the edge; trailing room survives overflow */
+  .od-rail { display: flex; gap: var(--od-gap, 8px); overflow-x: auto; scroll-snap-type: x proximity; scrollbar-width: none;
+             padding-inline: var(--od-rail-pad, 16px); scroll-padding-inline: var(--od-rail-pad, 16px); }
+  .od-rail::-webkit-scrollbar { display: none; }
+  :where(.od-rail) > :where(*) { flex: none; scroll-snap-align: start; }
+  :where(.od-rail) > :where(:last-child) { margin-inline-end: var(--od-rail-pad, 16px); }
+
+  .od-spacer { flex: none; visibility: hidden; pointer-events: none; }
+  .od-touch  { min-width: 44px; min-height: 44px; }
+}
+/* /OD-LAYOUT-PRIMITIVES v1 */
+:root {
+    /* ─── 沿用 orbdrop-app-prototype.html 的 modern-minimal 令牌 ─── */
+    --bg:      oklch(99% 0.002 240);
+    --surface: oklch(100% 0 0);
+    --fg:      oklch(18% 0.012 250);
+    --muted:   oklch(54% 0.012 250);
+    --border:  oklch(92% 0.005 250);
+    --accent:  oklch(58% 0.18 255);
+    --ok:      oklch(58% 0.16 158);
+    --warn:    oklch(62% 0.15 60);
+    --yellow:  oklch(62% 0.15 95);
+
+    --accent-soft: color-mix(in oklch, var(--accent) 13%, transparent);
+    --fg-soft:     color-mix(in oklch, var(--fg) 6%, transparent);
+    --ok-soft:     color-mix(in oklch, var(--ok) 13%, transparent);
+    --accent-deep: color-mix(in oklch, var(--accent) 82%, black);
+
+    --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+    --font-body:    -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+    --font-mono:    ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+    --fs-xxs: 11px;
+    --fs-xs: 12px;
+    --fs-sm: 13px;
+    --fs-md: 14px;
+    --fs-lg: 16px;
+
+    --radius: 8px;
+    --radius-lg: 14px;
+    --shadow: 0 24px 64px -24px oklch(18% 0.012 250 / 0.22), 0 2px 8px -2px oklch(18% 0.012 250 / 0.10);
+
+    /* ─── 圆角矩形悬浮球令牌 ─────────────────────────────────────
+       可视区恰好 2 整行 + 第 3 行露出边边（2.5 行）：
+       2.5 × 行高 + 2 × 行间距 + 上下留白                                 */
+    --rq-w: 176px; /* 内容基准宽：两列各容纳 图标 + 约 5 个字（超出右端渐隐）；IP 更宽时由脚本撑开 */
+    --rq-row-h: 30px;
+    --rq-row-gap: 3px;
+    --rq-col-gap: 2px;
+    --rq-pad: 8px;
+    --rq-head-h: 29px;
+    --rq-gap: 5px;
+    --rq-scroll-pad: 3px; /* 列表内容上下留白，首/末行的 hover 圆角不贴边被裁 */
+    --rq-viewport-h: calc(2.5 * var(--rq-row-h) + 2 * var(--rq-row-gap) + var(--rq-scroll-pad));
+    --rq-card-h: calc(var(--rq-pad) * 2 + var(--rq-head-h) + var(--rq-gap) + var(--rq-viewport-h));
+    --rq-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+    --rq-flip: 400ms;
+    --rq-fade: 200ms;
+
+    /* ─── 悬浮球角标（宽体圆角矩形）──────────────────────────────
+       高度自卡片上沿下探到设备名底部；宽度按悬浮卡自身的宽高比推导
+       （卡片 176 : 134 ≈ 1.31），数字随之放大到 13px              */
+    --rq-badge-h: 28px;
+    --rq-badge-w: calc(var(--rq-badge-h) * 1.31);
+    --rq-badge-r: 12px;
+    --rq-badge-fs: 13px;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-body);
+    font-size: var(--fs-md);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    user-select: none;
+  }
+  img, svg { display: block; }
+  button { font: inherit; cursor: pointer; color: inherit; background: none; border: 0; padding: 0; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+
+  .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .rq-sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+  /* ─── 桌面场景（沿用原型的场景语汇，仅作环境） ─────────────── */
+  .scene {
+    position: fixed; inset: 0;
+    background:
+      radial-gradient(1100px 520px at 12% -10%, color-mix(in oklch, var(--accent) 5%, transparent), transparent 60%),
+      var(--bg);
+    overflow: hidden;
+  }
+  .menubar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 30;
+    height: 30px;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 18px;
+    font-size: var(--fs-xs);
+    color: var(--muted);
+    background: color-mix(in oklch, var(--bg) 86%, transparent);
+    backdrop-filter: blur(14px) saturate(1.4);
+    -webkit-backdrop-filter: blur(14px) saturate(1.4);
+    border-bottom: 1px solid var(--border);
+  }
+  .menubar .brand { font-family: var(--font-display); color: var(--fg); font-weight: 600; letter-spacing: -0.01em; margin-right: 20px; }
+  .menubar .mb-left { display: flex; align-items: center; gap: 18px; }
+  .menubar .mb-item { color: var(--muted); }
+
+  .desk-window {
+    position: absolute;
+    background: color-mix(in oklch, var(--surface) 88%, var(--bg));
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 1px 0 0 var(--surface);
+  }
+  .desk-window::before {
+    content: ""; display: block; height: 30px;
+    background: color-mix(in oklch, var(--fg) 3%, transparent);
+    border-bottom: 1px solid var(--border);
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  }
+  .desk-window .traffic { position: absolute; top: 9px; left: 12px; display: flex; gap: 6px; }
+  .desk-window .traffic i { width: 9px; height: 9px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 12%, transparent); }
+  .desk-window .fake-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
+  .desk-window .line { height: 7px; border-radius: 4px; background: color-mix(in oklch, var(--fg) 7%, transparent); }
+  .desk-window .line.short { width: 46%; }
+  .desk-window .line.med { width: 72%; }
+  .dw-code { left: 6%; top: 13%; width: 40%; max-width: 500px; }
+  .dw-misc { right: 30%; top: 46%; width: 27%; max-width: 360px; }
+  @media (max-width: 920px) { .desk-window { display: none; } }
+/* ─── 圆角矩形悬浮球 ──────────────────────────────────────── */
+  .rq-stage { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 20; }
+  .rq-wrap { display: flex; align-items: stretch; gap: 10px; }
+
+  /* 除右侧分页点外，整个圆角矩形就是一张卡片；切换设备时整卡淡入飞入并盖住上一张卡 */
+  .rq-stack { position: relative; width: var(--rq-w); height: var(--rq-card-h); }
+  .rq-card {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; gap: var(--rq-gap);
+    padding: var(--rq-pad);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    box-shadow: var(--shadow);
+    overflow: hidden; /* 卡片内容裁到圆角；角标在卡片外层的 .rq-stack 上，不受影响 */
+    visibility: hidden; pointer-events: none;
+    opacity: 0;
+    transform: translateY(30%);
+    transform-origin: 50% 100%;
+    transition: transform var(--rq-flip) var(--rq-ease), opacity 150ms var(--rq-ease);
+    will-change: transform, opacity;
+  }
+  .rq-card.is-active { visibility: visible; pointer-events: auto; opacity: 1; transform: none; z-index: 3; }
+  /* 旧卡先原地保持不动、被新卡扫过，最后才淡出——这样才看得见"被盖住" */
+  .rq-card.is-leaving-next { visibility: visible; opacity: 0; transform: translateY(-3%) scale(0.98); z-index: 1; transition: transform 260ms var(--rq-ease), opacity 200ms var(--rq-ease) 190ms; }
+  .rq-card.is-leaving-prev { visibility: visible; opacity: 0; transform: translateY(3%) scale(0.98); z-index: 1; transition: transform 260ms var(--rq-ease), opacity 200ms var(--rq-ease) 190ms; }
+  /* 新卡从牌堆方向被"抽出"：略小、带一点倾斜，抽出到位后铺平盖住旧卡 */
+  .rq-card.from-next { transform: translateY(28%) scale(0.92) rotate(-1.5deg); opacity: 0; }
+  .rq-card.from-prev { transform: translateY(-28%) scale(0.92) rotate(1.5deg); opacity: 0; }
+
+  /* 顶部：设备名一行；IP 与可见项数一行 */
+  .rq-head { display: grid; gap: 1px; min-height: var(--rq-head-h); padding: 0 2px; }
+  /* 设备名左右各让出角标压住的那一段：角标内侧侵占宽度 = 角标宽 − 5px 出格，再留 5px 间距 */
+  .rq-headtop { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 0 calc(var(--rq-badge-w) - 10px); }
+  .rq-devname { flex: 1 1 0; min-width: 0; font-family: var(--font-display); font-size: var(--fs-xs); font-weight: 600; letter-spacing: -0.005em; line-height: 1.2; }
+  .rq-headmeta { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .rq-ip { min-width: 0; font-size: 10px; line-height: 1.2; color: var(--muted); }
+  .rq-count { flex: none; font-size: 10px; line-height: 1.2; color: var(--muted); }
+
+  /* 全局角标：固定骑在整机（.rq-stack）两个上角，不随设备翻页
+     同一家族（宽体圆角矩形、2px 卡片底色描边、等宽数字），左右同为实底+投影：
+     右上＝通知数（实底 accent，要处理的事，0 时隐藏）；左上＝长连接设备数（实底黄色） */
+  .rq-shellbadge {
+    position: absolute; top: -5px; z-index: 5;
+    width: var(--rq-badge-w); height: var(--rq-badge-h);
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: var(--rq-badge-r);
+    font-size: var(--rq-badge-fs); font-weight: 700; line-height: 1;
+    border: 2px solid var(--surface);
+    pointer-events: none;
+  }
+  .rq-shellbadge[hidden] { display: none; }
+  .rq-shellbadge.is-devices {
+    left: -5px;
+    /* 与右侧同款：实底（黄色压暗保证白字对比度）＋同阴影 */
+    background: color-mix(in oklch, var(--yellow) 72%, black);
+    color: var(--surface);
+    box-shadow: 0 3px 10px -3px oklch(18% 0.012 250 / 0.4);
+  }
+  .rq-shellbadge.is-alert {
+    right: -5px;
+    background: color-mix(in oklch, var(--accent) 72%, black);
+    color: var(--surface);
+    box-shadow: 0 3px 10px -3px oklch(18% 0.012 250 / 0.4);
+  }
+  /* 计数是全局值，不随设备翻页改变；翻页时做一次轻微"呼吸"，让这两枚固定角标与翻页动作产生关联 */
+  .rq-shellbadge.is-ticking { animation: rq-badge-tick 280ms var(--rq-ease); }
+  @keyframes rq-badge-tick {
+    0%   { transform: scale(1); }
+    30%  { transform: scale(1.12); }
+    60%  { transform: scale(0.98); }
+    100% { transform: scale(1); }
+  }
+  /* 中部：两列目录 / 文件，可视 2.5 行 */
+  .rq-viewport { position: relative; height: var(--rq-viewport-h); overflow: hidden; }
+  /* 不再加底部渐隐遮罩：它会盖住最后一行 hover 的圆角；"还能滚动"的提示由露出边边的第 3 行承担 */
+  .rq-scroll {
+    position: absolute; inset: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: none;
+    padding: var(--rq-scroll-pad) 0;
+  }
+  .rq-scroll::-webkit-scrollbar { display: none; }
+
+  .rq-grid {
+    list-style: none; margin: 0; padding: 0;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--rq-row-gap) var(--rq-col-gap);
+    align-content: start;
+  }
+  .rq-item {
+    min-width: 0;
+    height: var(--rq-row-h);
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    gap: 4px;
+    padding: 1px 2px;
+    border-radius: 5px;
+    transition: background var(--rq-fade) ease;
+  }
+  @media (hover: hover) { .rq-item:hover { background: color-mix(in oklch, var(--fg) 5%, transparent); } }
+  .rq-ic { flex: none; color: var(--muted); }
+  .rq-ic svg { width: 12px; height: 12px; }
+  .rq-item.is-folder .rq-ic { color: var(--warn); }
+  .rq-itxt { display: grid; gap: 1px; min-width: 0; }
+  .rq-iname {
+    display: block; font-family: var(--font-display);
+    font-size: var(--fs-xxs); font-weight: 500; letter-spacing: -0.005em;
+    line-height: 1.2; min-width: 0;
+    text-overflow: clip;
+  }
+  /* 文字超出时不加省略号，改用右端渐隐：既看得到后续文字，又和第二列自然分隔 */
+  .rq-iname.is-clipped {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 12px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 12px), transparent);
+  }
+  .rq-imeta { display: block; font-family: var(--font-mono); font-size: 10px; line-height: 1.2; color: var(--muted); }
+
+  .rq-empty {
+    height: 100%;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+    padding: 6px; text-align: center; color: var(--muted);
+  }
+  .rq-empty svg { width: 16px; height: 16px; opacity: 0.5; }
+  .rq-empty p { margin: 0; font-size: 11px; line-height: 1.4; }
+  .rq-empty .rq-empty-sub { font-size: 10px; max-width: 100px; line-height: 1.35; }
+/* 矩形外部右侧：分页点（设备多时渐隐渐显） */
+  .rq-dots {
+    position: relative;
+    width: 20px;
+    overflow: hidden;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14%, #000 86%, transparent 100%);
+    mask-image: linear-gradient(to bottom, transparent 0, #000 14%, #000 86%, transparent 100%);
+  }
+  .rq-dotlist {
+    position: absolute; left: 50%; top: 50%;
+    transform: translate(-50%, -50%) translateY(var(--rq-dot-shift, 0px));
+    display: flex; flex-direction: column; align-items: center; gap: 1px;
+    transition: transform var(--rq-flip) var(--rq-ease);
+  }
+  .rq-dot {
+    position: relative;
+    width: 18px; height: 16px;
+    color: color-mix(in oklch, var(--fg) 26%, transparent);
+    transition: opacity var(--rq-fade) ease, color var(--rq-fade) ease;
+  }
+  .rq-dot::after {
+    content: "";
+    position: absolute; left: 50%; top: 50%;
+    width: 6px; height: 6px; margin: -3px 0 0 -3px;
+    border-radius: 999px;
+    background: currentColor;
+    transition: transform var(--rq-fade) var(--rq-ease), box-shadow var(--rq-fade) ease;
+  }
+  @media (hover: hover) { .rq-dot:hover { color: color-mix(in oklch, var(--fg) 60%, transparent); } }
+  .rq-dot.is-current { color: var(--accent); }
+  .rq-dot.is-current::after { transform: scale(1.5); box-shadow: 0 0 0 3px var(--accent-soft); }
+  @media (pointer: coarse) { .rq-dot { height: 34px; } }
+
+  @media (max-width: 560px) {
+    .rq-wrap { gap: 8px; }
+    .rq-stack { width: min(var(--rq-w), calc(100vw - 64px)); }
+    .rq-dots { width: 20px; }
+    .menubar .mb-right { display: none; }
+    .menubar .mb-left { gap: 12px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .rq-card, .rq-dotlist, .rq-dot { transition: none !important; }
+    .rq-shellbadge { animation: none !important; }
+  }
+</style>
+</head>
+<body>
+<div class="scene" aria-hidden="true">
+  <div class="desk-window dw-code">
+    <div class="traffic"><i></i><i></i><i></i></div>
+    <div class="fake-body">
+      <div class="line short"></div>
+      <div class="line"></div>
+      <div class="line med"></div>
+      <div class="line"></div>
+      <div class="line short"></div>
+    </div>
+  </div>
+  <div class="desk-window dw-misc">
+    <div class="traffic"><i></i><i></i><i></i></div>
+    <div class="fake-body">
+      <div class="line med"></div>
+      <div class="line"></div>
+    </div>
+  </div>
+</div>
+
+<header class="menubar" aria-hidden="true">
+  <div class="mb-left">
+    <span class="brand">OrbDrop</span>
+    <span class="mb-item">文件</span>
+    <span class="mb-item">编辑</span>
+    <span class="mb-item">设备</span>
+    <span class="mb-item">帮助</span>
+  </div>
+  <div class="mb-right num">周一 9月14日 · 10:24</div>
+</header>
+
+<aside class="rq-stage" aria-label="圆角矩形悬浮球方案">
+  <div class="rq-wrap">
+
+    <div class="rq-stack" id="rqStack">
+      <span class="rq-shellbadge is-devices num" id="rqDeviceBadge" role="img"></span>
+      <span class="rq-shellbadge is-alert num" id="rqAlertBadge" role="img"></span>
+    </div>
+
+    <nav class="rq-dots" id="rqDots" aria-label="设备分页">
+      <div class="rq-dotlist" id="rqDotList"></div>
+    </nav>
+
+  </div>
+</aside>
+
+<p class="rq-sr" id="rqStatus" aria-live="polite"></p>
+<script>
+/* 示例设备与共享项：沿用 OrbDrop 的设备命名与广播模型 */
+  var RAW_DEVICES = [
+    ['PC-B', '192.168.1.6:3890', 'connected', [
+      ['项目设计稿', 'folder', '23 项'],
+      ['产品文档', 'folder', '9 项'],
+      ['前端源码', 'folder', '312 项'],
+      ['品牌资源', 'folder', '48 项'],
+      ['主页-v3.fig', 'file', '4.2 MB'],
+      ['组件库.sketch', 'file', '2.8 MB'],
+      ['需求说明v0.5.md', 'file', '48 KB'],
+      ['Q3 排期表.xlsx', 'file', '1.2 MB'],
+      ['接口清单.xlsx', 'file', '1.1 MB'],
+      ['设计说明.md', 'file', '24 KB'],
+      ['用户访谈记录.docx', 'file', '860 KB'],
+      ['竞品分析-2026Q3.pdf', 'file', '3.4 MB'],
+      ['logo-final.svg', 'file', '12 KB'],
+      ['发布清单.md', 'file', '9 KB']
+    ]],
+    ['MacBook Pro', '192.168.1.4:3891', 'connected', [
+      ['项目设计稿', 'folder', '23 项'],
+      ['产品文档', 'folder', '9 项'],
+      ['主页-v3.fig', 'file', '4.2 MB'],
+      ['组件库.sketch', 'file', '2.8 MB'],
+      ['需求说明v0.5.md', 'file', '48 KB'],
+      ['用户访谈记录.docx', 'file', '860 KB'],
+      ['会议纪要-0912.md', 'file', '18 KB'],
+      ['埋点方案.xlsx', 'file', '96 KB'],
+      ['数据看板.fig', 'file', '6.1 MB'],
+      ['设计规范.pdf', 'file', '5.3 MB']
+    ]],
+    ['PC-C', '192.168.1.9:3890', 'connected', [
+      ['测试用例', 'folder', '86 项'],
+      ['回归报告', 'folder', '12 项'],
+      ['需求说明v0.5.md', 'file', '48 KB'],
+      ['接口清单.xlsx', 'file', '1.1 MB'],
+      ['Q3 排期表.xlsx', 'file', '1.2 MB'],
+      ['缺陷清单.xlsx', 'file', '420 KB'],
+      ['自动化脚本.py', 'file', '36 KB'],
+      ['测试环境说明.md', 'file', '22 KB'],
+      ['压测报告.pdf', 'file', '2.7 MB'],
+      ['用例v2.xlsx', 'file', '780 KB'],
+      ['冒烟清单.md', 'file', '8 KB'],
+      ['日志-0914.log', 'file', '6.4 MB']
+    ]],
+    ['设计部 iMac', '192.168.1.12:3890', 'connected', [
+      ['品牌资源', 'folder', '48 项'],
+      ['插画素材', 'folder', '120 项'],
+      ['动效源文件', 'folder', '31 项'],
+      ['logo-final.svg', 'file', '12 KB'],
+      ['主页-v3.fig', 'file', '4.2 MB'],
+      ['组件库.sketch', 'file', '2.8 MB'],
+      ['图标集.svg', 'file', '96 KB'],
+      ['字体授权.txt', 'file', '4 KB'],
+      ['配色规范.pdf', 'file', '1.8 MB'],
+      ['大屏方案.fig', 'file', '7.6 MB'],
+      ['海报-A1.psd', 'file', '142 MB'],
+      ['启动页.ae', 'file', '38 MB'],
+      ['插画-空状态.svg', 'file', '64 KB'],
+      ['品牌手册.pdf', 'file', '12.4 MB'],
+      ['视觉走查.md', 'file', '27 KB'],
+      ['切图-20260914.zip', 'file', '68 MB']
+    ]],
+['会议室投屏', '192.168.1.21:3890', 'connected', []],
+    ['王磊的 iPhone', '192.168.1.33:3891', 'connected', [
+      ['项目设计稿', 'folder', '23 项'],
+      ['主页-v3.fig', 'file', '4.2 MB'],
+      ['需求说明v0.5.md', 'file', '48 KB'],
+      ['Q3 排期表.xlsx', 'file', '1.2 MB'],
+      ['会议纪要-0912.md', 'file', '18 KB'],
+      ['名片扫描.pdf', 'file', '2.6 MB'],
+      ['截图-0914.png', 'file', '1.4 MB'],
+      ['语音备忘.m4a', 'file', '3.8 MB'],
+      ['待办清单.md', 'file', '6 KB']
+    ]],
+    ['备份 NAS', '192.168.1.7:3890', 'connected', [
+      ['项目归档', 'folder', '420 项'],
+      ['产品文档', 'folder', '9 项'],
+      ['设计稿归档', 'folder', '560 项'],
+      ['数据库备份', 'folder', '64 项'],
+      ['项目设计稿.tar', 'file', '128 MB'],
+      ['前端源码.zip', 'file', '46 MB'],
+      ['品牌资源.zip', 'file', '88 MB'],
+      ['用户数据备份.sql', 'file', '212 MB'],
+      ['日志归档-2026Q2.zip', 'file', '64 MB'],
+      ['证书与密钥.zip', 'file', '2.1 MB'],
+      ['发布包-v2.4.0.zip', 'file', '33 MB'],
+      ['发布包-v2.3.1.zip', 'file', '31 MB'],
+      ['源码快照-0901.zip', 'file', '44 MB'],
+      ['素材库-历史.zip', 'file', '156 MB'],
+      ['监控数据.csv', 'file', '18 MB'],
+      ['巡检记录.md', 'file', '36 KB'],
+      ['机房台账.xlsx', 'file', '2.4 MB'],
+      ['恢复说明.md', 'file', '12 KB']
+    ]]
+  ];
+
+  /* 悬浮球只展示处于长连接（connected）的设备 */
+  var DEVICES = RAW_DEVICES.map(function (d) {
+    return { name: d[0], ip: d[1], state: d[2], items: d[3] };
+  }).filter(function (d) {
+    return d.state === 'connected';
+  });
+(function () {
+  var REDUCED = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  var STATE_TEXT = { connected: '长连接', paired: '已配对', unbound: '未绑定' };
+  var ICON_FOLDER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>';
+  var ICON_FILE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg>';
+
+  /* 卡片宽度以下限为基础；IP 更长时按实测宽度撑开，保证 IP 不被截断 */
+  function fitCardWidth() {
+    var longest = DEVICES.reduce(function (a, d) { return d.ip.length > a.length ? d.ip : a; }, '');
+    var probe = document.createElement('span');
+    probe.className = 'rq-ip num';
+    probe.style.position = 'absolute';
+    probe.style.left = '-9999px';
+    probe.style.top = '0';
+    probe.style.whiteSpace = 'nowrap';
+    probe.textContent = longest;
+    document.body.appendChild(probe);
+    var w = probe.getBoundingClientRect().width;
+    document.body.removeChild(probe);
+    var root = getComputedStyle(document.documentElement);
+    var pad = parseFloat(root.getPropertyValue('--rq-pad')) || 8;
+    var base = parseFloat(root.getPropertyValue('--rq-w')) || 0;
+    var need = Math.ceil(w + pad * 2 + 2);
+    if (w > 0 && need > base) document.documentElement.style.setProperty('--rq-w', need + 'px');
+  }
+
+  var stack = document.getElementById('rqStack');
+  var dotList = document.getElementById('rqDotList');
+  var statusEl = document.getElementById('rqStatus');
+
+  var cards = [], scrollers = [], dots = [];
+  var current = 0, acc = 0, lastDir = 0, locking = false, scrollTarget = 0, rafId = null;
+  var FLIP_MS = 400, FLIP_AT = 40, LOCK_MS = 520;
+
+  var cs = getComputedStyle(document.documentElement);
+  var ROW_STEP = (parseFloat(cs.getPropertyValue('--rq-row-h')) || 46) + (parseFloat(cs.getPropertyValue('--rq-row-gap')) || 6);
+
+  /* 全局角标：连接设备数＝设备页数（左上，软底）；通知数量为示例数据（右上，实底） */
+  var NOTIFICATIONS = 3;
+  function updateCounts() {
+    var elDev = document.getElementById('rqDeviceBadge');
+    var elAlert = document.getElementById('rqAlertBadge');
+    elDev.textContent = String(DEVICES.length);
+    elDev.setAttribute('aria-label', '长连接设备 ' + DEVICES.length + ' 台');
+    elAlert.textContent = String(NOTIFICATIONS);
+    elAlert.setAttribute('aria-label', '待处理通知 ' + NOTIFICATIONS + ' 条');
+    elAlert.hidden = NOTIFICATIONS === 0;
+  }
+
+  /* 翻页时给两枚固定角标一个同步的轻微反馈：计数是全局值不会变，这一步只说明"页面换了" */
+  function pulseBadges() {
+    if (REDUCED) return;
+    ['rqDeviceBadge', 'rqAlertBadge'].forEach(function (id) {
+      var b = document.getElementById(id);
+      if (!b) return;
+      b.classList.remove('is-ticking');
+      void b.offsetWidth;
+      b.classList.add('is-ticking');
+    });
+  }
+
+  /* 每台设备构建一整张卡片：顶部设备名 + 角标、中部两列列表，整卡作为翻页动画单元 */
+  function buildCards() {
+    DEVICES.forEach(function (dev) {
+      var card = document.createElement('article');
+      card.className = 'rq-card is-' + dev.state;
+      card.setAttribute('aria-label', dev.name + '，' + (STATE_TEXT[dev.state] || '') + '，' + dev.items.length + ' 个共享项');
+
+      var head = document.createElement('header');
+      head.className = 'rq-head';
+      head.innerHTML =
+        '<div class="rq-headtop">' +
+          '<span class="rq-devname od-truncate"></span>' +
+        '</div>' +
+        '<div class="rq-headmeta">' +
+          '<span class="rq-ip num od-truncate"></span>' +
+          '<span class="rq-count num"></span>' +
+        '</div>';
+      var elName = head.querySelector('.rq-devname');
+      elName.textContent = dev.name;
+      elName.setAttribute('title', dev.name);
+      head.querySelector('.rq-ip').textContent = dev.ip;
+      head.querySelector('.rq-count').textContent = dev.items.length + ' 项';
+      card.appendChild(head);
+
+      var vp = document.createElement('div');
+      vp.className = 'rq-viewport';
+      var scroller = document.createElement('div');
+      scroller.className = 'rq-scroll';
+      scroller.tabIndex = 0;
+      scroller.setAttribute('role', 'group');
+      scroller.setAttribute('aria-label', dev.name + ' 的共享目录与文件：上下方向键滚动列表，滚动到底后继续即翻页');
+      scroller.addEventListener('keydown', onKeydown);
+
+      if (dev.items.length === 0) {
+        scroller.innerHTML = '<div class="rq-empty">' +
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="3" width="16" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>' +
+          '<p>暂无可见共享项</p>' +
+          '<p class="rq-empty-sub">拖入文件并开启广播</p></div>';
+      } else {
+        var ul = document.createElement('ul');
+        ul.className = 'rq-grid';
+        dev.items.forEach(function (it) {
+          var li = document.createElement('li');
+          li.className = 'rq-item ' + (it[1] === 'folder' ? 'is-folder' : 'is-file');
+          li.setAttribute('title', it[0] + ' · ' + it[2]);
+          li.innerHTML = '<span class="rq-ic" aria-hidden="true">' + (it[1] === 'folder' ? ICON_FOLDER : ICON_FILE) + '</span>' +
+            '<span class="rq-itxt"><span class="rq-iname od-truncate"></span><span class="rq-imeta od-nowrap"></span></span>';
+          li.querySelector('.rq-iname').textContent = it[0];
+          li.querySelector('.rq-imeta').textContent = it[2];
+          ul.appendChild(li);
+        });
+        scroller.appendChild(ul);
+      }
+      vp.appendChild(scroller);
+      card.appendChild(vp);
+      stack.appendChild(card);
+      cards.push(card);
+      scrollers.push(scroller);
+    });
+  }
+
+  function buildDots() {
+    DEVICES.forEach(function (dev, i) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'rq-dot';
+      b.setAttribute('aria-label', '切换到 ' + dev.name);
+      b.addEventListener('click', function () { goto(i, i > current ? 1 : -1); });
+      dotList.appendChild(b);
+      dots.push(b);
+    });
+    updateDots();
+  }
+
+  function updateStatus() {
+    var dev = DEVICES[current];
+    statusEl.textContent = dev.name + '，第 ' + (current + 1) + ' 台，共 ' + DEVICES.length + ' 台，' + dev.items.length + ' 个共享项';
+  }
+
+  function centerDots() {
+    var active = dots[current];
+    if (!active) return;
+    var shift = (dotList.offsetHeight / 2) - (active.offsetTop + active.offsetHeight / 2);
+    dotList.style.setProperty('--rq-dot-shift', shift.toFixed(1) + 'px');
+  }
+
+  function updateDots() {
+    dots.forEach(function (d, i) {
+      var dist = Math.abs(i - current);
+      var op = dist === 0 ? 1 : dist === 1 ? 0.6 : dist === 2 ? 0.34 : dist === 3 ? 0.16 : 0.07;
+      d.style.opacity = String(op);
+      if (i === current) { d.classList.add('is-current'); d.setAttribute('aria-current', 'true'); }
+      else { d.classList.remove('is-current'); d.removeAttribute('aria-current'); }
+    });
+    centerDots();
+  }
+
+  function goto(next, dir) {
+    if (next < 0 || next >= DEVICES.length || next === current) return;
+    var out = cards[current];
+    var inp = cards[next];
+    current = next;
+    if (rafId !== null) { window.cancelAnimationFrame(rafId); rafId = null; }
+    scrollTarget = scrollers[current].scrollTop;
+    if (REDUCED) {
+      out.classList.remove('is-active');
+      inp.classList.add('is-active');
+    } else {
+      var inCls = dir > 0 ? 'from-next' : 'from-prev';
+      var outCls = dir > 0 ? 'is-leaving-next' : 'is-leaving-prev';
+      /* 先关闭过渡，把新卡瞬间放到正确的起始方向（向下滚从下方、向上滚从上方）并提交，再开始过渡动画 */
+      inp.style.transition = 'none';
+      inp.classList.add(inCls);
+      void inp.offsetWidth;
+      inp.style.transition = '';
+      inp.classList.remove(inCls);
+      inp.classList.add('is-active');
+      out.classList.remove('is-active');
+      out.classList.add(outCls);
+      window.setTimeout(function () {
+        out.classList.remove(outCls);
+        out.style.visibility = '';
+        inp.style.visibility = '';
+      }, FLIP_MS + 80);
+    }
+    updateDots();
+    updateStatus();
+    pulseBadges();
+  }
+
+  /* 同一张卡片内部滚动：缓动到目标位置，滚动过程可见动画 */
+  function maxScroll(p) { return Math.max(0, p.scrollHeight - p.clientHeight); }
+
+  function animateScroll() {
+    var p = scrollers[current];
+    var diff = scrollTarget - p.scrollTop;
+    if (Math.abs(diff) < 0.5) {
+      p.scrollTop = scrollTarget;
+      rafId = null;
+      return;
+    }
+    p.scrollTop += diff * 0.24;
+    rafId = window.requestAnimationFrame(animateScroll);
+  }
+
+  function scrollPageBy(d) {
+    var p = scrollers[current];
+    var max = maxScroll(p);
+    scrollTarget = Math.min(max, Math.max(0, scrollTarget + d));
+    if (REDUCED) { p.scrollTop = scrollTarget; return; }
+    if (rafId === null) rafId = window.requestAnimationFrame(animateScroll);
+  }
+
+  /* 滚轮：先带动画滚内部列表，滚到底 / 到顶后继续滚才翻页 */
+  function pageAtEdge(dir) {
+    var p = scrollers[current];
+    var max = maxScroll(p);
+    if (dir > 0) return scrollTarget >= max - 0.5 && p.scrollTop >= max - 1.5;
+    return scrollTarget <= 0.5 && p.scrollTop <= 1.5;
+  }
+
+  function queueFlip(dir, raw) {
+    if (dir > 0 && current >= DEVICES.length - 1) { acc = 0; lastDir = 0; return; }
+    if (dir < 0 && current <= 0) { acc = 0; lastDir = 0; return; }
+    if (dir !== lastDir) { acc = 0; lastDir = dir; }
+    acc += Math.abs(raw);
+    if (locking) return;
+    if (acc >= FLIP_AT) {
+      acc = 0;
+      locking = true;
+      window.setTimeout(function () { locking = false; }, LOCK_MS);
+      goto(current + dir, dir);
+    }
+  }
+
+  function normDelta(e) {
+    if (e.deltaMode === 1) return e.deltaY * 16;
+    if (e.deltaMode === 2) return e.deltaY * scrollers[current].clientHeight;
+    return e.deltaY;
+  }
+
+  stack.addEventListener('wheel', function (e) {
+    if (e.deltaY === 0) return;
+    e.preventDefault();
+    var d = normDelta(e);
+    var dir = d > 0 ? 1 : -1;
+    if (!pageAtEdge(dir)) {
+      /* 仍在内部列表内：带动画把列表滚到底 / 到顶 */
+      scrollPageBy(d);
+      acc = 0;
+      lastDir = 0;
+      return;
+    }
+    /* 已到底 / 到顶，继续同向滚动累积后翻页 */
+    queueFlip(dir, d);
+  }, { passive: false });
+
+  document.getElementById('rqDots').addEventListener('wheel', function (e) {
+    if (e.deltaY === 0) return;
+    e.preventDefault();
+    queueFlip(e.deltaY > 0 ? 1 : -1, normDelta(e));
+  }, { passive: false });
+
+  function onKeydown(e) {
+    switch (e.key) {
+      case 'ArrowDown':
+        e.preventDefault();
+        if (!pageAtEdge(1)) scrollPageBy(ROW_STEP);
+        else goto(current + 1, 1);
+        break;
+      case 'ArrowUp':
+        e.preventDefault();
+        if (!pageAtEdge(-1)) scrollPageBy(-ROW_STEP);
+        else goto(current - 1, -1);
+        break;
+      case 'PageDown': case 'ArrowRight': e.preventDefault(); goto(current + 1, 1); break;
+      case 'PageUp': case 'ArrowLeft': e.preventDefault(); goto(current - 1, -1); break;
+      case 'Home': e.preventDefault(); goto(0, -1); break;
+      case 'End': e.preventDefault(); goto(DEVICES.length - 1, 1); break;
+    }
+  }
+
+  /* 文件名/目录名超出时打标，改用右端渐隐（不使用省略号） */
+  function markClippedNames() {
+    cards.forEach(function (card) {
+      Array.prototype.forEach.call(card.querySelectorAll('.rq-iname'), function (el) {
+        el.classList.toggle('is-clipped', el.scrollWidth > el.clientWidth + 0.5);
+      });
+    });
+  }
+
+  window.addEventListener('resize', function () { centerDots(); markClippedNames(); });
+
+  buildCards();
+  fitCardWidth();
+  markClippedNames();
+  updateCounts();
+  scrollers.forEach(function (s) {
+    s.addEventListener('scroll', function () {
+      if (rafId === null && s === scrollers[current]) scrollTarget = s.scrollTop;
+    });
+  });
+  buildDots();
+  cards[0].classList.add('is-active');
+  updateDots();
+  updateStatus();
+})();
+</script>
+</body>
+</html>

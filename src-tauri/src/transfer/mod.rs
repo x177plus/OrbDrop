@@ -3,7 +3,7 @@ pub mod resume;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
@@ -49,6 +49,9 @@ pub struct PushSource {
     pub is_dir: bool,
     /// 用户这次选中了几项（1 = 单文件/单目录；>1 = 多选）。
     pub count: usize,
+    /// 清单里**被跳过的项数**（链接、读不到的项）。>0 时界面必须说出来 —— 清单少了东西却
+    /// 不说，用户会以为"就这些"然后推漏（同一份道理见 `fs_browse::list_dir`）。
+    pub skipped: usize,
 }
 
 /// 把用户选中的一批文件/目录整理成推送清单。
@@ -74,14 +77,30 @@ pub async fn manifest_for_paths(paths: &[PathBuf]) -> Result<PushSource, String>
     let mut files: Vec<FileEntry> = Vec::new();
     let mut sources: Vec<(String, PathBuf)> = Vec::new();
     let mut total = 0u64;
+    let mut skipped = 0usize;
     let mut used: Vec<String> = Vec::new();
     let mut single_file = false;
+    // 算一次：`data_dir()` 要读环境变量，别在走查里每个文件项都问一遍。
+    let own_data_dir = crate::config::data_dir();
 
     for path in paths {
-        let meta = tokio::fs::metadata(path)
+        let base = file_name_of(path);
+        // 顶层源是用户**明确点的**：链接/系统目录/自家数据目录一律**当场报错**，不静默跳过 ——
+        // 静默跳到最后一个文件都不剩，用户只会看到一句"没有可推送的文件"，根本不知道自己
+        // 做错了什么。（走查里遇到的那些才跳过 + 计数：那是清单少一项，不是选错了源。）
+        // 用 `symlink_metadata`：必须分辨"这一项本身是链接"，`metadata` 会跟过去看目标。
+        let meta = tokio::fs::symlink_metadata(path)
             .await
             .map_err(|e| format!("无法访问 {}: {e}", path.display()))?;
-        let base = file_name_of(path);
+        if crate::unsendable::is_link(&meta.file_type()) {
+            return Err(format!("「{base}」是一个链接，不能作为推送源"));
+        }
+        if crate::unsendable::is_system_name(&base, crate::unsendable::sits_in_volume_root(path)) {
+            return Err(format!("「{base}」是系统自己的目录/文件，不能推送"));
+        }
+        if crate::unsendable::is_own_data_dir(path, &own_data_dir) {
+            return Err("OrbDrop 自己的数据目录不能推送（里面是本机的设置与凭据）".into());
+        }
         // 同名去重：`C:\a\报告.txt` 与 `D:\b\报告.txt` 不能在清单里撞成同一条路径
         // （Windows 的文件名比较本来就大小写不敏感，比对时照此办理）。
         let mut prefix = base.clone();
@@ -98,7 +117,8 @@ pub async fn manifest_for_paths(paths: &[PathBuf]) -> Result<PushSource, String>
             sources.push((prefix, path.clone()));
             total += meta.len();
         } else {
-            let (sub, sub_total) = collect_dir_manifest(path).await?;
+            let (sub, sub_total, sub_skipped) = collect_dir_manifest(path).await?;
+            skipped += sub_skipped;
             for f in sub {
                 let rel = format!("{prefix}/{}", f.path);
                 sources.push((rel.clone(), path.join(&f.path)));
@@ -117,6 +137,7 @@ pub async fn manifest_for_paths(paths: &[PathBuf]) -> Result<PushSource, String>
         // 这就是 `is_dir` 的真正含义：**清单是否权威**。
         is_dir: !single_file,
         count: paths.len(),
+        skipped,
     })
 }
 
@@ -144,57 +165,121 @@ fn common_parent_name(paths: &[PathBuf]) -> Option<String> {
     first.file_name().map(|s| s.to_string_lossy().to_string())
 }
 
-/// 一个目录下的**非空文件**清单（相对该目录，'/' 分隔）。
-async fn collect_dir_manifest(dir: &Path) -> Result<(Vec<FileEntry>, u64), String> {
+/// 一个目录下的**非空文件**清单（相对该目录，'/' 分隔）+ 总字节 + **跳过的项数**。
+///
+/// 跳过谁、为什么不整条失败：
+/// - **链接**（符号链接/junction）：会回环（`%LOCALAPPDATA%\Application Data` 指向自己的
+///   父目录，几百层地重复同一棵树），也会把同一份内容按两条路径列两遍；
+/// - **读不到的项**（ACL 拒绝、正好被删、网络盘中途掉线）：一个子目录挡不住整批。
+///
+/// 这两类都**计数**回报给界面 —— 清单少了东西却不说，用户会以为"就这些"然后推漏（这就是
+/// `list_dir` 那条"静默少几项比报错更坏"的另一面）。计数的是**项**：一个链接、一个读不到的
+/// 目录各算一项，不是它里面有多少个文件。
+///
+/// 系统自己的名字（`System Volume Information`、`pagefile.sys`…）**不进这个计数**：选择框
+/// 里本来就不列它们，用户没指望过；推 `C:\` 时天天弹一句"跳过了 20 项"只会把真话淹掉。
+/// 顶层源撞上它们则是另一回事 —— 那是用户明确点的，`manifest_for_paths` 当场报错。
+///
+/// **根目录自己**读不到仍然整条失败：那是用户点的那个源，界面得说出"这个目录读不了"。
+async fn collect_dir_manifest(dir: &Path) -> Result<(Vec<FileEntry>, u64, usize), String> {
     let mut files = Vec::new();
     let mut total = 0u64;
+    let mut skipped = 0usize;
+    let own_data_dir = crate::config::data_dir();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
-        let mut rd = tokio::fs::read_dir(&current).await.map_err(|e| format!("读取目录失败: {e}"))?;
-        while let Some(entry) = rd.next_entry().await.map_err(|e| format!("读取目录失败: {e}"))? {
-            let path = entry.path();
-            let meta = entry.metadata().await.map_err(|e| format!("元数据失败: {e}"))?;
-            if meta.is_dir() {
-                stack.push(path);
-            } else {
-                let rel = path
-                    .strip_prefix(dir)
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_default();
-                total += meta.len();
-                files.push(FileEntry { path: rel, size: meta.len() });
+        let mut rd = match tokio::fs::read_dir(&current).await {
+            Ok(rd) => rd,
+            Err(e) if current == dir => return Err(format!("读取目录失败: {e}")),
+            Err(_) => {
+                skipped += 1;
+                continue;
             }
+        };
+        // 这一层先收在局部，成功了再并进总表：中途列举失败 = 这一层整个不可信，已经收到的
+        // 那半份宁可全丢（当作整层跳过）—— 交出一份"少了一半"的清单正是上面要防的事。
+        let mut local: Vec<FileEntry> = Vec::new();
+        let mut local_total = 0u64;
+        let mut subdirs: Vec<PathBuf> = Vec::new();
+        let mut intact = true;
+        loop {
+            let entry = match rd.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(_) => {
+                    intact = false;
+                    break;
+                }
+            };
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(ft) = entry.file_type().await else {
+                skipped += 1;
+                continue;
+            };
+            if crate::unsendable::is_link(&ft) || crate::unsendable::is_own_data_dir(&path, &own_data_dir) {
+                skipped += 1;
+                continue;
+            }
+            if crate::unsendable::is_system_name(&name, crate::unsendable::sits_in_volume_root(&path)) {
+                continue;
+            }
+            if ft.is_dir() {
+                subdirs.push(path);
+                continue;
+            }
+            let Ok(meta) = entry.metadata().await else {
+                skipped += 1;
+                continue;
+            };
+            let rel = path
+                .strip_prefix(dir)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            local_total += meta.len();
+            local.push(FileEntry { path: rel, size: meta.len() });
         }
+        if !intact {
+            skipped += 1;
+            continue;
+        }
+        files.extend(local);
+        total += local_total;
+        stack.extend(subdirs);
     }
-    Ok((files, total))
+    Ok((files, total, skipped))
 }
 
 // ---------------------------------------------------------------------------
 // Sender side
 // ---------------------------------------------------------------------------
 
-/// 发送方：把本机某个文件/目录推给某台设备（F-50）。
+/// 发送方：把本机一批文件/目录推给**一台或多台**设备（F-50）。
 ///
-/// 通道按对端状态选（`docs/p1-implementation.md` §7）：
-/// - 长连接 → WS 事件 `push_invite`；
-/// - 其余在线设备（已配对未连、未绑定）→ HTTP `POST /push/invite`。
+/// 一次操作 = 一批，只多两件事，其余与单台推送完全一致：
+/// - **清单只建一次**（目录只走一遍，各台拿到的清单与同名去重编号一模一样）；
+/// - 每台各有一条独立的邀请/job —— 接收侧因此毫无差别（已配对不问同意、未绑定弹卡等点头、
+///   60s 超时、双向取消、断点续传全部照旧），批次只多一张聚合卡片 + **失败隔离**
+///   （一台送不到不影响其余几台；但一台都送不到时整批就地失败，等价于单台那条 F-53）。
 ///
-/// 推送**不要求预先配对**：邀请就是一次普通 HTTP 请求，接收方同意才传输，
-/// 同意制兜底安全（未绑定时下载端点靠邀请 id 本身当能力，见 `routes_push`）。
+/// 通道按对端状态逐台选（`docs/p1-implementation.md` §7）：
+/// - 长连接 → WS 事件 `push_invite`；其余在线设备（已配对未连、未绑定）→ HTTP `POST /push/invite`。
 ///
-/// 返回邀请 id；对方同意与否走 `push://response` / `push://done` 事件回来 ——
-/// 两条通道对界面是同一个形状，UI 不需要知道邀请是怎么送出去的。
+/// 返回整批快照；界面同时还会收到 `push://batch` —— 同一份数据，界面按 `batchId` 合并。
 pub async fn push_paths(
     state: Arc<AppState>,
     paths: Vec<String>,
-    peer_id: &str,
-) -> Result<String, String> {
-    let peer = state
-        .get_peer(peer_id)
-        .ok_or_else(|| format!("设备不存在: {peer_id}"))?;
-    // F-53：目标不在网上就地失败，不排队。
-    if !peer.online || peer.ip.is_empty() || peer.port == 0 {
-        return Err(format!("「{}」不在网上，推送未发送", peer.name));
+    peer_ids: Vec<String>,
+) -> Result<push_job::BatchView, String> {
+    // 同一台设备勾两次只发一条（保持勾选顺序）。
+    let mut ids: Vec<String> = Vec::new();
+    for id in peer_ids {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Err("没有选择目标设备".into());
     }
 
     let roots: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
@@ -203,89 +288,175 @@ pub async fn push_paths(
         return Err("没有可推送的文件".into());
     }
 
-    let invite_id = uuid::Uuid::new_v4().to_string();
     let (device_id, self_name) = {
         let config = state.config.lock();
         (config.device_id.clone(), config.device_name.clone())
     };
     let server_port = state.server_port.load(std::sync::atomic::Ordering::SeqCst);
-    let paired = peer.paired;
+    let batch_id = uuid::Uuid::new_v4().to_string();
 
-    state.push.insert_job(PushJob::new(
-        invite_id.clone(),
-        peer_id.to_string(),
-        peer.name.clone(),
-        source.name.clone(),
-        source.is_dir,
-        source.files.clone(),
-        source.sources.clone(),
-        source.total,
-        paired,
-    ));
+    // 先给每台定一行：不在网上的这台**就地失败、不排队**（F-53），能派的进 `pending` 去发邀请。
+    let mut targets: Vec<push_job::BatchTarget> = Vec::new();
+    let mut pending: Vec<(crate::config::PeerDevice, String)> = Vec::new();
+    let mut first_reason: Option<String> = None;
+    for peer_id in &ids {
+        let Some(peer) = state.get_peer(peer_id) else {
+            let reason = format!("设备不存在: {peer_id}");
+            first_reason.get_or_insert(reason.clone());
+            targets.push(push_job::BatchTarget {
+                peer_id: peer_id.clone(),
+                peer_name: peer_id.clone(),
+                invite_id: String::new(),
+                paired: false,
+                state: push_job::TargetState::Failed,
+                received: 0,
+                error: Some(reason),
+            });
+            continue;
+        };
+        if !peer.online || peer.ip.is_empty() || peer.port == 0 {
+            let reason = format!("「{}」不在网上，推送未发送", peer.name);
+            first_reason.get_or_insert(reason.clone());
+            targets.push(push_job::BatchTarget {
+                peer_id: peer.id.clone(),
+                peer_name: peer.name.clone(),
+                invite_id: String::new(),
+                paired: peer.paired,
+                state: push_job::TargetState::Failed,
+                received: 0,
+                error: Some(reason),
+            });
+            continue;
+        }
+        let invite_id = uuid::Uuid::new_v4().to_string();
+        state.push.insert_job(PushJob::new(
+            invite_id.clone(),
+            batch_id.clone(),
+            peer.id.clone(),
+            peer.name.clone(),
+            source.name.clone(),
+            source.is_dir,
+            source.sources.clone(),
+            peer.paired,
+        ));
+        targets.push(push_job::BatchTarget {
+            peer_id: peer.id.clone(),
+            peer_name: peer.name.clone(),
+            invite_id: invite_id.clone(),
+            paired: peer.paired,
+            state: push_job::TargetState::Invited,
+            received: 0,
+            error: None,
+        });
+        pending.push((peer, invite_id));
+    }
 
-    ws::emit_ui(&state, ws::events::ui::PUSH_SENT, &serde_json::json!({
-        "inviteId": invite_id,
-        "peerId": peer_id,
-        "target": peer.name,
-        "name": source.name,
-        "total": source.total,
-        "isDir": source.is_dir,
-        "count": source.count,
-    }));
+    if pending.is_empty() {
+        // 一台都派不出去 = 单台推送那条"就地失败"（F-53）：界面弹一条提示，不建卡片。
+        // 单台时沿用原来那句原话，多台时给一句能概括的。
+        return Err(if ids.len() == 1 {
+            first_reason.unwrap_or_else(|| "推送未发送".into())
+        } else {
+            format!("所选 {} 台设备都收不了（不在网上或设备不存在），推送未发送", ids.len())
+        });
+    }
 
-    let event = WsEvent::PushInvite {
-        invite_id: invite_id.clone(),
-        sender: PeerInfo { id: device_id, name: self_name },
+    let view = state.push.insert_batch(push_job::PushBatch {
+        id: batch_id.clone(),
         name: source.name.clone(),
-        size: source.total,
-        is_dir: source.is_dir,
         count: source.count,
-        files: source.files.clone(),
-    };
+        skipped: source.skipped,
+        per_target_total: source.total,
+        targets,
+        last_emit: Instant::now(),
+    });
+    if let Ok(value) = serde_json::to_value(&view) {
+        ws::emit_ui(&state, ws::events::ui::PUSH_BATCH, &value);
+    }
 
-    let state2 = state.clone();
-    let id2 = invite_id.clone();
+    for (peer, invite_id) in pending {
+        let event = WsEvent::PushInvite {
+            invite_id: invite_id.clone(),
+            sender: PeerInfo { id: device_id.clone(), name: self_name.clone() },
+            name: source.name.clone(),
+            size: source.total,
+            is_dir: source.is_dir,
+            count: source.count,
+            files: source.files.clone(),
+        };
+        spawn_invite_delivery(state.clone(), peer, invite_id, event, server_port);
+    }
+
+    Ok(view)
+}
+
+/// 把一条邀请送出去：长连接走 WS，其余在线设备走 HTTP `POST /push/invite`。
+///
+/// 一台一条任务：任何一台的失败都只落在它自己那一行上（`batch_set(.., Failed, ..)`），
+/// 牵不动整批 —— 推 5 台、其中 1 台掉线，另外 4 台照走。
+fn spawn_invite_delivery(
+    state: Arc<AppState>,
+    peer: crate::config::PeerDevice,
+    invite_id: String,
+    event: WsEvent,
+    server_port: u16,
+) {
+    let peer_id = peer.id.clone();
     let peer_name = peer.name.clone();
-    let peer_id = peer_id.to_string();
+    let paired = peer.paired;
     crate::task::spawn("push invite", async move {
-        if state2.ws.has_connection(&peer_id) {
-            if state2.ws.send(&peer_id, event) {
-                schedule_ws_invite_timeout(state2.clone(), id2.clone());
+        if state.ws.has_connection(&peer_id) {
+            if state.ws.send(&peer_id, event) {
+                schedule_ws_invite_timeout(state.clone(), invite_id.clone());
             } else {
-                fail_invite(&state2, &id2, "对方离线");
+                fail_invite(&state, &invite_id, "对方离线");
             }
             return;
         }
         match deliver_invite_http(&peer, server_port, &event, paired).await {
             Ok(true) => {
-                state2.push.update_status(&id2, PushStatus::Accepted);
-                ws::emit_ui(&state2, ws::events::ui::PUSH_RESPONSE, &serde_json::json!({
-                    "inviteId": id2,
+                state.push.update_status(&invite_id, PushStatus::Accepted);
+                ws::emit_ui(&state, ws::events::ui::PUSH_RESPONSE, &serde_json::json!({
+                    "inviteId": invite_id,
                     "accepted": true,
                 }));
             }
             Ok(false) => {
-                state2.push.remove_job(&id2);
-                ws::emit_ui(&state2, ws::events::ui::PUSH_RESPONSE, &serde_json::json!({
-                    "inviteId": id2,
+                state.push.remove_job(&invite_id);
+                push_job::batch_set(
+                    &state,
+                    &invite_id,
+                    push_job::TargetState::Rejected,
+                    None,
+                    Some("对方拒绝了这次推送".into()),
+                    true,
+                );
+                ws::emit_ui(&state, ws::events::ui::PUSH_RESPONSE, &serde_json::json!({
+                    "inviteId": invite_id,
                     "accepted": false,
                 }));
-                ws::emit_ui(&state2, ws::events::ui::PUSH_DONE, &serde_json::json!({
-                    "inviteId": id2,
+                ws::emit_ui(&state, ws::events::ui::PUSH_DONE, &serde_json::json!({
+                    "inviteId": invite_id,
                     "status": "failed",
                     "reason": format!("「{peer_name}」拒绝了这次推送"),
                 }));
             }
-            Err(reason) => fail_invite(&state2, &id2, &reason),
+            Err(reason) => fail_invite(&state, &invite_id, &reason),
         }
     });
-
-    Ok(invite_id)
 }
 
-/// 邀请没能送到（对方不在网上/请求失败）：清掉 job 并让界面给出失败提示。
+/// 邀请没能送到（对方不在网上/请求失败）：清掉 job 并把这一台标成失败。
 fn fail_invite(state: &AppState, invite_id: &str, reason: &str) {
     state.push.remove_job(invite_id);
+    push_job::batch_set(
+        state,
+        invite_id,
+        push_job::TargetState::Failed,
+        None,
+        Some(reason.to_string()),
+        true,
+    );
     ws::emit_ui(state, ws::events::ui::PUSH_DONE, &serde_json::json!({
         "inviteId": invite_id,
         "status": "failed",
@@ -300,6 +471,14 @@ fn schedule_ws_invite_timeout(state: Arc<AppState>, invite_id: String) {
         if state.push.job_status(&invite_id).as_deref() == Some("invited") {
             info!(%invite_id, "invite timed out, cancelling");
             state.push.remove_job(&invite_id);
+            push_job::batch_set(
+                &state,
+                &invite_id,
+                push_job::TargetState::Failed,
+                None,
+                Some("对方未响应（5 分钟超时）".into()),
+                true,
+            );
             ws::emit_ui(&state, ws::events::ui::PUSH_DONE, &serde_json::json!({
                 "inviteId": invite_id,
                 "status": "failed",
@@ -369,6 +548,14 @@ pub fn cancel_push(state: &AppState, invite_id: &str) -> Result<(), String> {
         .job(invite_id)
         .ok_or_else(|| "推送不存在".to_string())?;
     state.push.remove_job(invite_id);
+    push_job::batch_set(
+        state,
+        invite_id,
+        push_job::TargetState::Cancelled,
+        None,
+        Some("已取消".into()),
+        true,
+    );
     notify_peer(state, &job.peer_id, WsEvent::PushDone {
         invite_id: invite_id.to_string(),
         status: "cancelled".into(),
@@ -378,6 +565,23 @@ pub fn cancel_push(state: &AppState, invite_id: &str) -> Result<(), String> {
         "inviteId": invite_id,
         "status": "cancelled",
     }));
+    Ok(())
+}
+
+/// 发送方：取消一整批推送 —— 每台各撤一条（两个阶段各自的理由见 `cancel_push`）。
+///
+/// 单台的失败（对端已经不在网上、这条早就结束了）**不该挡住其余几台的取消**，
+/// 所以逐台各自尽力、结果不带出来（对端那条邀请照样会因为它自己的 60s 超时作废）。
+pub fn cancel_push_batch(state: &AppState, batch_id: &str) -> Result<(), String> {
+    let targets = state
+        .push
+        .batch_targets(batch_id)
+        .ok_or_else(|| "推送不存在".to_string())?;
+    for target in targets {
+        if target.state.is_waiting() {
+            let _ = cancel_push(state, &target.invite_id);
+        }
+    }
     Ok(())
 }
 
@@ -509,4 +713,145 @@ pub fn cancel_receive(state: &AppState, invite_id: &str) {
         "status": "cancelled",
     }));
     warn!(%invite_id, "receive cancelled; resume record kept");
+}
+
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("orbdrop_manifest_{tag}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 链接不进去、也不数它里面有多少东西：junction 回环会让走查把同一棵树翻几百遍
+    /// （`%LOCALAPPDATA%\Application Data` 就是指向自己父目录的那种），
+    /// 而"跳过了 N 项"里的 N 数的是**项**（这个链接本身），不是它背后的文件数。
+    #[tokio::test]
+    async fn links_are_skipped_not_followed() {
+        let dir = temp_dir("link");
+        std::fs::create_dir_all(dir.join("真").join("深")).unwrap();
+        std::fs::write(dir.join("真").join("深").join("a.txt"), b"hi").unwrap();
+        std::fs::write(dir.join("散.txt"), b"xy").unwrap();
+        let link = dir.join("回环");
+        // 指向自己的父目录 = 真正的回环：跟随它，走查就永远走不完。
+        if !crate::unsendable::make_link_for_test(&link, &dir) {
+            eprintln!("这台机器造不出链接，跳过这条");
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+
+        let (files, total, skipped) = collect_dir_manifest(&dir).await.unwrap();
+        let mut names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["散.txt", "真/深/a.txt"], "只该有真实文件，没有回环翻出来的副本");
+        assert_eq!(total, 4);
+        assert_eq!(skipped, 1, "跳过的是那个链接本身");
+
+        std::fs::remove_dir(&link).unwrap_or_else(|_| std::fs::remove_file(&link).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 顶层源是用户**明确点的**：是链接就当场报错，别静默跳成一个空清单
+    /// （那样用户只会看到"没有可推送的文件"，根本不知道自己选错了什么）。
+    #[tokio::test]
+    async fn top_level_link_source_is_refused() {
+        let dir = temp_dir("toplink");
+        std::fs::create_dir_all(dir.join("真")).unwrap();
+        let link = dir.join("链接");
+        if !crate::unsendable::make_link_for_test(&link, &dir.join("真")) {
+            eprintln!("这台机器造不出链接，跳过这条");
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+
+        let Err(err) = manifest_for_paths(&[link.clone()]).await else {
+            panic!("顶层是链接的源必须当场拒绝");
+        };
+        assert!(err.contains("链接"), "该说清是链接的问题，实际：{err}");
+
+        std::fs::remove_dir(&link).unwrap_or_else(|_| std::fs::remove_file(&link).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 卷根上的系统文件（`pagefile.sys`…）不能被当成推送源 —— 它读不了，也不该送。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn root_level_system_file_is_refused() {
+        let pagefile = PathBuf::from("C:\\pagefile.sys");
+        if tokio::fs::symlink_metadata(&pagefile).await.is_err() {
+            return; // 这台机器关掉了分页文件：没有可测的
+        }
+        let Err(err) = manifest_for_paths(&[pagefile]).await else {
+            panic!("卷根上的系统文件必须当场拒绝");
+        };
+        assert!(err.contains("系统"), "该说清是系统自己的东西，实际：{err}");
+    }
+
+    /// 读不到的项**跳过 + 计数**，不能把整批拖垮：用户的目录树里有一个打不开的
+    /// 子目录是常事（权限、刚好被删），为此拒绝整批等于什么都传不了。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_subdir_is_skipped_and_counted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("denied");
+        std::fs::create_dir_all(dir.join("看得见")).unwrap();
+        std::fs::write(dir.join("看得见").join("a.txt"), b"x").unwrap();
+        let shut = dir.join("打不开");
+        std::fs::create_dir_all(&shut).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (files, _, skipped) = collect_dir_manifest(&dir).await.unwrap();
+        assert_eq!(files.len(), 1, "看得见的那份照常进清单");
+        assert_eq!(skipped, 1, "打不开的那个子目录算一项");
+
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 但**用户点的那个源**读不到仍然整条失败：界面得说出"这个目录读不了"，
+    /// 而不是推一个空清单出去。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_root_still_fails_the_whole_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("denied_root");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let Err(err) = manifest_for_paths(&[dir.clone()]).await else {
+            panic!("源目录读不到必须整条失败");
+        };
+        assert!(err.contains("读取目录失败"), "实际：{err}");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 清单的形状：目录里混着链接、读不到的项时，**计数照实回到 `PushSource`** ——
+    /// 卡片上"已跳过 N 项"读的就是它，数字错了用户就不知道清单少了什么。
+    #[tokio::test]
+    async fn skipped_survives_into_the_source() {
+        let dir = temp_dir("count");
+        std::fs::create_dir_all(dir.join("子")).unwrap();
+        std::fs::write(dir.join("子").join("a.txt"), b"x").unwrap();
+        let link = dir.join("链接");
+        if !crate::unsendable::make_link_for_test(&link, &dir.join("子")) {
+            eprintln!("这台机器造不出链接，跳过这条");
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+
+        let source = manifest_for_paths(&[dir.clone()]).await.unwrap();
+        assert_eq!(source.skipped, 1);
+        assert_eq!(source.files.len(), 1);
+        assert!(source.is_dir, "有清单的推送才是目录语义");
+
+        std::fs::remove_dir(&link).unwrap_or_else(|_| std::fs::remove_file(&link).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

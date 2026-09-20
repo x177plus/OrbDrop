@@ -16,6 +16,7 @@ use crate::ws;
 
 mod auth;
 mod routes_dav;
+mod routes_discover;
 mod routes_file;
 mod routes_pair;
 mod routes_push;
@@ -105,6 +106,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/unpair", axum::routing::post(routes_pair::unpair))
         .route("/file", axum::routing::get(routes_file::file_handler))
         .route("/shares", axum::routing::get(routes_shares::shares_handler))
+        // 跨网段发现（F-10 延伸）：已配对对端来取「本机这一段里在线的设备」。
+        .route(
+            "/discover",
+            axum::routing::get(routes_discover::discover),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,
@@ -140,7 +146,32 @@ fn build_router(state: Arc<AppState>) -> Router {
             auth::auth_middleware,
         ));
 
-    http_routes.merge(dav_routes).with_state(state)
+    http_routes.merge(dav_routes)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            presence_middleware,
+        ))
+        .with_state(state)
+}
+
+/// 本机切到「离线」（隐身）时，对**一切**入站请求回 503。
+///
+/// 这是"隐身"的另一半：mDNS 那边已经注销广播（对端发现不到本机），但对端每 5 秒还在
+/// 打本机的 `/pair/info` 探活 —— 只要还应答，它就把本机当"在线"（`error_for_status`
+/// 之外的任何 200 都算）。所以整条链路一起关：REST、DAV、推送、配对邀请、WS 升级
+/// （`/events` 也在这张路由表里，层在最外面，升级之前就被拦下）。
+///
+/// 服务器**不停**：切回在线要立刻可用，而 503 与"连不上"对调用方是两种信号 ——
+/// 非 200 即离线（`state::probe_step`），够用。
+async fn presence_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !state.is_online() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Offline").into_response();
+    }
+    next.run(req).await
 }
 
 /// WS upgrade handler — validates the token in the query string before

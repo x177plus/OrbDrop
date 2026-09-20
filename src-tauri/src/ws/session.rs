@@ -180,12 +180,13 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
         }
         WsEvent::PushResponse { invite_id, accepted } => {
             info!(%invite_id, accepted, "push response");
-            use transfer::push_job::PushStatus;
+            use transfer::push_job::{batch_set, PushStatus, TargetState};
             if accepted {
                 state.push.update_status(&invite_id, PushStatus::Accepted);
             } else {
                 // 拒绝：发送方不能再等下去 —— 清掉 job，并让界面把"等待对方同意"那张卡收掉。
                 state.push.remove_job(&invite_id);
+                batch_set(state, &invite_id, TargetState::Rejected, None, Some("对方拒绝了这次推送".into()), true);
             }
             emit_ui(state, ui::PUSH_RESPONSE, &serde_json::json!({
                 "inviteId": invite_id,
@@ -200,8 +201,10 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             }
         }
         WsEvent::PushProgress { invite_id, received, total } => {
-            use transfer::push_job::PushStatus;
+            use transfer::push_job::{batch_set, PushStatus, TargetState};
             state.push.update_status(&invite_id, PushStatus::Downloading { received, total });
+            // 纯进度：按 REPORT_INTERVAL 合并（状态跃迁才立刻发，见 `batch_set`）。
+            batch_set(state, &invite_id, TargetState::Sending, Some(received), None, false);
             emit_ui(state, ui::PUSH_PROGRESS, &serde_json::json!({
                 "inviteId": invite_id,
                 "received": received,
@@ -210,7 +213,7 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
         }
         WsEvent::PushDone { invite_id, status, reason } => {
             info!(%invite_id, %status, "push done");
-            use transfer::push_job::PushStatus;
+            use transfer::push_job::{batch_set, PushStatus, TargetState};
             // 发送方撤销时这条邀请可能还挂在通知列表里（对方还没点同意）：
             // 一并撤掉 —— 界面收到下面这条 push://done 就会把卡片收走。
             state.push.remove_invite(&invite_id);
@@ -219,6 +222,13 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             } else {
                 PushStatus::Failed(reason.clone().unwrap_or_default())
             });
+            // 批次那一格的终态先落定，再清 job（`batch_set` 只认批次自己那份状态）。
+            let target_state = match status.as_str() {
+                "completed" => TargetState::Done,
+                "cancelled" => TargetState::Cancelled,
+                _ => TargetState::Failed,
+            };
+            batch_set(state, &invite_id, target_state, None, reason.clone(), true);
             state.push.remove_job(&invite_id);
             emit_ui(state, ui::PUSH_DONE, &serde_json::json!({
                 "inviteId": invite_id,

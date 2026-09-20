@@ -9,6 +9,7 @@
     devices = [],
     onToast,
     onRequestPush,
+    onRequestPushMany,
     onAddShare,
     onOpenPair,
     onUnpair,
@@ -18,6 +19,8 @@
     devices?: PeerDevice[];
     onToast: (msg: string) => void;
     onRequestPush?: (device: PeerDevice) => void;
+    /** 设备页多选之后一次推给多台：只开一次选择框，同一份内容分头发出去。 */
+    onRequestPushMany?: (devices: PeerDevice[]) => void;
     /** 本机标签的「添加共享项」：开文件选择框挑本机内容。 */
     onAddShare: () => void;
     onOpenPair?: (device: PeerDevice | null) => void;
@@ -34,7 +37,7 @@
 {#if tab.kind === 'local'}
   <LocalTab {onToast} {onAddShare} />
 {:else if tab.kind === 'devices'}
-  <DeviceTab {onToast} {onRequestPush} {onOpenPair} {onUnpair} />
+  <DeviceTab {onToast} {onRequestPush} {onRequestPushMany} {onOpenPair} {onUnpair} />
 {:else if peer}
   {#key peer.id}
     <PeerTab device={peer} {onToast} />

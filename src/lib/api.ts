@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, PickerFavorite } from './types';
+import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, PickerFavorite } from './types';
 import type { ScreenMetrics, ScreenRect } from './orbLayout';
 
 // Share management
@@ -53,6 +53,17 @@ export function listDevices(): Promise<PeerDevice[]> {
 
 export function startHttpServer(): Promise<number> {
   return invoke('start_http_server');
+}
+
+/**
+ * 本机「在线 / 离线」（面板右上角状态框）：`false` = 隐身。
+ *
+ * 离线 = 不广播 mDNS + 断开全部长连接 + 拒收一切入站请求（对端的探活因此判本机离线）；
+ * 配对关系、token、共享项、地址簿里的长连接记忆都保留，切回在线即恢复广播并接回链路。
+ * 跨重启有效（写在配置里）。返回落地后的值。
+ */
+export function setOnline(online: boolean): Promise<boolean> {
+  return invoke('set_online', { online });
 }
 
 // Peer management
@@ -140,11 +151,17 @@ export function fsList(path: string): Promise<FsListing> {
 
 // Push (F-50 ~ F-54)
 /**
- * 推送本机一批文件/目录给某台设备；返回邀请 id（对方同意与否走 push:// 事件）。
- * 多选走**同一条**推送：对端只弹一张卡、只同意一次。
+ * 推送本机一批文件/目录给**一台或多台**设备；返回整批快照。
+ * 一次操作只开一次文件选择框：多选的文件合并成**每台一条**推送（对端只弹一张卡、只同意一次），
+ * 各台独立推进 —— 谁成谁败、还差几台，看 `push://batch` 事件推进的那张卡片。
  */
-export function pushPaths(paths: string[], peerId: string): Promise<string> {
-  return invoke('push_paths', { paths, peerId });
+export function pushPaths(paths: string[], peerIds: string[]): Promise<PushBatch> {
+  return invoke('push_paths', { paths, peerIds });
+}
+
+/** 发送方取消一整批推送（各台各撤一条）。 */
+export function cancelPushBatch(batchId: string): Promise<void> {
+  return invoke('cancel_push_batch', { batchId });
 }
 
 export function acceptPush(inviteId: string): Promise<void> {
@@ -192,6 +209,12 @@ export function downloadFromPeer(peerId: string, shareId: string, pathInShare: s
 
 export function downloadAndOpen(shareId: string, pathInShare: string): Promise<string> {
   return invoke('download_and_open', { shareId, pathInShare });
+}
+
+/** 用系统默认方式打开一个路径：目录就落在文件管理器里（收完推送那条通知的「打开目录」）。
+ *  路径不在了会 reject —— 调用方据此把通知留住。 */
+export function openPath(path: string): Promise<void> {
+  return invoke('open_path', { path });
 }
 
 // 拖拽下载（F-46）：把树里的任意文件/目录拖到资源管理器里，落在拖到的那个目录。

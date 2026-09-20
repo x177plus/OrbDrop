@@ -12,7 +12,9 @@ pub mod server;
 pub mod share;
 pub mod state;
 pub mod task;
+pub mod tray;
 pub mod transfer;
+pub mod unsendable;
 pub mod ws;
 
 use std::path::{Path, PathBuf};
@@ -216,13 +218,11 @@ async fn update_settings(
         }
     }
 
-    // Device name changed → re-register mDNS (drop existing daemon, re-register)
-    if req.device_name != old_name {
-        *state.mdns_daemon.lock() = None; // drop old
-        let device_id = state.config.lock().device_id.clone();
-        if let Some(daemon) = discover::register(req.port, &req.device_name, &device_id) {
-            *state.mdns_daemon.lock() = Some(daemon);
-        }
+    // Device name changed → re-register mDNS (drop existing daemon, re-register).
+    // 离线时**不**重新注册：现在的状态就是"没有广播"（`set_online` 已经把 daemon 丢掉了），
+    // 重注册等于替用户改回在线。
+    if req.device_name != old_name && state.is_online() {
+        register_mdns(state.inner(), req.port);
     }
 
     // Port changed → restart HTTP server
@@ -361,6 +361,100 @@ async fn start_http_server(state: State<'_, Arc<AppState>>) -> Result<u16, Strin
     server::ensure_server(arc_state).await
 }
 
+// ---------------------------------------------------------------------------
+// 本机「在线 / 离线」（面板右上角状态框）
+// ---------------------------------------------------------------------------
+
+/// 本机实际在听的 HTTP 端口：被占用时服务器从配置端口往上试到 +10，所以两者可能不同
+/// （mDNS 记录里播的必须是**实际**端口，否则对端拿到一个没人听的地址）。
+fn bound_port(state: &AppState) -> u16 {
+    match state.server_port.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => state.config.lock().port,
+        p => p,
+    }
+}
+
+/// 本机切到「离线」后，所有**对外**动作一律挡在门口。
+///
+/// 不是安全边界，是**诚实**：这些动作都要对端能回连本机（WS 升级、HTTP 回执、探活），
+/// 而离线时本机对一切入站请求回 503 —— 放出去只会卡到超时、或者更糟，在对端留下一个
+/// "本机在线"的假象。错误文案直接告诉用户切回「在线」。
+fn ensure_online(state: &AppState) -> Result<(), String> {
+    if state.is_online() {
+        Ok(())
+    } else {
+        Err("本机处于「离线」，先在上方状态框切回「在线」".to_string())
+    }
+}
+
+/// 重新挂上 mDNS 广播：设备名/端口改了之后要重注册，切回「在线」时也要。
+///
+/// 注册的记录里带着端口与设备名，所以每次都是"丢掉旧 daemon、按新参数再注册一个"。
+fn register_mdns(state: &Arc<AppState>, port: u16) {
+    *state.mdns_daemon.lock() = None;
+    let (device_name, device_id) = {
+        let cfg = state.config.lock();
+        (cfg.device_name.clone(), cfg.device_id.clone())
+    };
+    if let Some(daemon) = discover::register(port, &device_name, &device_id) {
+        *state.mdns_daemon.lock() = Some(daemon);
+    }
+}
+
+/// 注销 mDNS 广播（离线 = 隐身）。
+///
+/// 必须按**服务全名**精确注销：只把 daemon 丢掉，对端缓存里那条记录要等 TTL（约 2 分钟）
+/// 自然过期才消失 —— 那两分钟里它照旧看得见本机。`unregister` 会立刻发一条 TTL=0 的告别包。
+fn unregister_mdns(state: &Arc<AppState>) {
+    let Some(daemon) = state.mdns_daemon.lock().take() else {
+        return;
+    };
+    let fullname = discover::service_fullname(&state.config.lock().device_name);
+    match daemon.unregister(&fullname) {
+        Ok(_) => info!(%fullname, "mDNS service unregistered (offline)"),
+        Err(e) => warn!("mDNS unregister failed: {e}"),
+    }
+}
+
+/// 切本机「在线 / 离线」（面板右上角状态框）。
+///
+/// **离线 = 隐身**，三件事一起做：注销 mDNS 广播（对端发现不到本机）、掐掉全部长连接与
+/// 拨号循环、由 `server::presence_middleware` 拒收一切入站请求（对端的 5s 探活因此把它
+/// 判成离线）。**其余一律不动**：配对关系、token、共享项、地址簿里的长连接记忆全保留，
+/// 所以切回「在线」就是"重新广播 + 按记忆把链路接回来"（F-16 那条路）。
+///
+/// 状态落盘（`Config::online`）：用户选了离线就一直离线，重启也是。
+#[tauri::command]
+fn set_online(online: bool, state: State<'_, Arc<AppState>>, app: AppHandle) -> Result<bool, String> {
+    let arc = state.inner().clone();
+    if arc.is_online() == online {
+        return Ok(online);
+    }
+    arc.set_local_online(online);
+
+    if online {
+        register_mdns(&arc, bound_port(&arc));
+        ws::restore_links_on_startup(&arc);
+    } else {
+        unregister_mdns(&arc);
+        arc.ws.drop_all();
+        // 离线期间一个动作也做不成（连接/推送都会被拒），绿色的「在线」pill 留着只会
+        // 让人以为还能操作。切回在线后 5s 探活会把这些行纠正回来，所以这里只是显示层。
+        let ids: Vec<String> = arc.peers.lock().iter().map(|p| p.id.clone()).collect();
+        for id in ids {
+            arc.set_peer_online(&id, false);
+        }
+    }
+
+    arc.emit_devices_changed();
+    let _ = app.emit(
+        ws::events::ui::LOCAL_ONLINE,
+        serde_json::json!({ "online": online }),
+    );
+    info!(online, "local presence changed");
+    Ok(online)
+}
+
 #[tauri::command]
 fn get_peer_token(peer_id: String) -> Result<Option<String>, String> {
     credential::get_peer_token(&peer_id).map_err(|e| e.to_string())
@@ -377,6 +471,7 @@ fn get_peer_token(peer_id: String) -> Result<Option<String>, String> {
 /// `task::spawn` 退到 Tauri 的全局运行时（能跑，但多绕一层）。
 #[tauri::command]
 async fn connect_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    ensure_online(&state)?;
     if state.get_peer(&peer_id).is_none() {
         return Err("设备不存在".to_string());
     }
@@ -513,6 +608,7 @@ async fn wipe_credentials(state: State<'_, Arc<AppState>>) -> Result<usize, Stri
 /// token exchanged. Codes live 2 minutes and are single-use.
 #[tauri::command]
 fn pair_start(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    ensure_online(&state)?;
     if state.get_peer(&peer_id).is_none() {
         return Err("设备不存在".to_string());
     }
@@ -523,6 +619,7 @@ fn pair_start(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<String
 /// and hands back the token we store for it.
 #[tauri::command]
 async fn pair_confirm(peer_id: String, code: String, state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    ensure_online(&state)?;
     let peer = state.get_peer(&peer_id).ok_or_else(|| "设备不存在".to_string())?;
     let own_id = state.config.lock().device_id.clone();
     let own_name = state.config.lock().device_name.clone();
@@ -530,10 +627,7 @@ async fn pair_confirm(peer_id: String, code: String, state: State<'_, Arc<AppSta
     let url = format!("http://{}:{}/pair", peer.ip, peer.port);
     // Our own HTTP port: the peer we post to may be the side that dials the WS
     // link (smaller device id) and it has no other way to learn our address.
-    let own_port = match state.server_port.load(std::sync::atomic::Ordering::SeqCst) {
-        0 => state.config.lock().port,
-        p => p,
-    };
+    let own_port = bound_port(&state);
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
@@ -584,6 +678,7 @@ async fn pair_confirm(peer_id: String, code: String, state: State<'_, Arc<AppSta
 /// 返回邀请 id；对方接受与否走 `pair://completed` / `pair://invite_failed` 事件回来。
 #[tauri::command]
 async fn pair_invite(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    ensure_online(&state)?;
     pair::invite_peer(state.inner().clone(), &peer_id).await
 }
 
@@ -611,18 +706,31 @@ fn reject_pair_invite(invite_id: String, state: State<'_, Arc<AppState>>) {
 // Push commands (F-50 ~ F-54)
 // ---------------------------------------------------------------------------
 
-/// 推送本机文件/目录（用户在文件选择框里挑的，可多选）给某台设备（F-50）。
+/// 推送本机文件/目录（用户在文件选择框里挑的，可多选）给**一台或多台**设备（F-50）。
 ///
 /// 目标可以是任何在线设备：长连接、已配对未连、未绑定都能推（未绑定走 HTTP 邀请）。
-/// 多选合并成**一条**推送：对端只弹一张卡、只同意一次、一条进度。
-/// 返回邀请 id；对方同意与否由 `push://response` / `push://done` 事件回来。
+/// 一次选择只开一次文件选择框；多选的文件合并成**每台一条**推送：对端只弹一张卡、
+/// 只同意一次、一条进度。
+///
+/// 一次操作 = 一批：清单只建一次，每台各有一条独立的邀请（接收侧与单台推送完全一致）；
+/// 不在网上的那几台**就地失败、不排队**（F-53），但一台都派不出去时整体报错
+/// （界面弹一条提示，不建卡片 —— 与原来单台那条路一模一样）。
+///
+/// 返回整批快照；界面的卡片由 `push://batch` 事件推进（同一个 `batchId`，按它合并）。
 #[tauri::command]
 async fn push_paths(
     paths: Vec<String>,
-    peer_id: String,
+    peer_ids: Vec<String>,
     state: State<'_, Arc<AppState>>,
-) -> Result<String, String> {
-    transfer::push_paths(state.inner().clone(), paths, &peer_id).await
+) -> Result<transfer::push_job::BatchView, String> {
+    ensure_online(&state)?;
+    transfer::push_paths(state.inner().clone(), paths, peer_ids).await
+}
+
+/// 发送方取消一整批推送：逐台走 `cancel_push`（两个阶段为什么都要通知对端，见那里）。
+#[tauri::command]
+async fn cancel_push_batch(batch_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    transfer::cancel_push_batch(&state, &batch_id)
 }
 
 /// 接收方点「同意接收」：起下载任务。
@@ -771,6 +879,21 @@ async fn download_and_open(
         error!("Failed to reveal item: {e}");
     }
     Ok(path)
+}
+
+/// 用系统默认方式打开一个路径：目录就落在文件管理器里。收完推送那条通知上的「打开目录」
+/// 走这里（`dest` 是 `<下载目录>/<发送方名>`，是个目录）。
+///
+/// 路径已被移走/删掉时 `open_path` 会真的报错（先做一次 `metadata()` 探活）—— 不当成
+/// 静默成功：界面要据此把那条通知**留住**，否则"东西落在哪"就随着气泡一起没了。
+///
+/// 不用 `reveal_item_in_dir`：那是"在父目录里高亮这一项"（还要再点一下才进去），
+/// 而这里按的就是"打开目录"。
+#[tauri::command]
+async fn open_path(path: String, app: AppHandle) -> Result<(), String> {
+    app.opener()
+        .open_path(path, None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -933,16 +1056,16 @@ fn setup_server_task(app: &AppHandle) {
             match server::ensure_server(arc_state.clone()).await {
                 Ok(port) => {
                     info!(port, "HTTP server started");
-                    let device_name = arc_state.config.lock().device_name.clone();
-                    let device_id = arc_state.config.lock().device_id.clone();
-                    if let Some(daemon) = discover::register(port, &device_name, &device_id) {
-                        *arc_state.mdns_daemon.lock() = Some(daemon);
+                    // 上次退出时是「离线」就照旧不广播（`Config::online` 跨重启有效）：
+                    // 服务器照常起（切回在线要立刻可用），只是不进 mDNS。
+                    if arc_state.is_online() {
+                        register_mdns(&arc_state, port);
                     }
                     let _ = handle.emit(ws::events::ui::SERVER_STARTED, port);
 
                     // Spawn mDNS scanner.
                     let (mdns_tx, mut mdns_rx) = mpsc::channel::<discover::PeerEvent>(64);
-                    let own_id = device_id.clone();
+                    let own_id = arc_state.config.lock().device_id.clone();
                     tokio::spawn(discover::scan(mdns_tx, own_id));
 
                     // Forward mDNS events to the state + UI.
@@ -957,6 +1080,13 @@ fn setup_server_task(app: &AppHandle) {
                             .build()
                             .unwrap_or_default();
                         while let Some(event) = mdns_rx.recv().await {
+                            // 离线 = 隐身：本机不参与局域网。发现结果一概不登记（也不按
+                            // "对端回来了"接回长连接）—— 离线期间设备列表就该是"谁都不在线"
+                            // （`set_online` 已经把现有行标记成离线），切回在线后由 5s 探活
+                            // 与 mDNS 重新解析纠正。
+                            if !s2.is_online() {
+                                continue;
+                            }
                             match event {
                                 PeerEvent::Online { id, name, ip, port } => {
                                     let is_paired = credential::has_peer(&id);
@@ -1038,6 +1168,11 @@ fn setup_server_task(app: &AppHandle) {
                             .unwrap_or_default();
                         loop {
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            // 离线（隐身）期间不发探活：本机对入站一律 503，探活只会把
+                            // 一个"能回话的对端"反复标成在线，与状态框自相矛盾。
+                            if !probe_state.is_online() {
+                                continue;
+                            }
                             state::probe_peers_once(&probe_state, &client).await;
                         }
                     });
@@ -1149,6 +1284,7 @@ pub fn run() {
             list_picker_favorites,
             set_picker_favorites,
             push_paths,
+            cancel_push_batch,
             accept_push,
             reject_push,
             cancel_push,
@@ -1156,9 +1292,11 @@ pub fn run() {
             download_from_peer,
             download_file,
             download_and_open,
+            open_path,
             prepare_drag_out,
             start_drag_out,
             start_http_server,
+            set_online,
             get_app_state,
             orb_screen_metrics,
             orb_set_rect,
@@ -1179,6 +1317,13 @@ pub fn run() {
                     Err(e) => warn!("抹掉系统窗口边框失败: {e}"),
                 },
                 None => warn!("未找到 main 窗口，跳过系统边框处理"),
+            }
+
+            // 窗口不在任务栏露面了，托盘是唯一的窗口外入口 —— 菜单得在这里就位，
+            // 晚一步（比如等前端起来再挂）用户手上就有个没有出口的进程。
+            match tray::setup(app.handle()) {
+                Ok(()) => info!("托盘菜单已就绪（右键可退出）"),
+                Err(e) => warn!("托盘菜单挂载失败: {e}"),
             }
 
             // 悬浮球回到上次的位置；没有记录（首启）就放到默认落位（右上 1/3）

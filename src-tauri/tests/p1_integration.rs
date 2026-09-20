@@ -6,6 +6,7 @@
 //! - 推送：已绑定（已配对）设备**不经同意**直接收（token 就是那份信任）；未绑定的仍是
 //!   "邀请 → 同意 → 流式下载" → 文件落盘下载目录（F-50~F-52；收件目录已并入下载目录）
 //! - 推送进度事件（F-54 进度数据）
+//! - 多设备推送（F-57）：一份清单分头发给多台、逐台失败隔离、批次快照的实时计数
 //!
 //! 注：凭据落在数据目录的 `credentials.dat`（P1 时曾是系统凭据库）。测试用临时 device id，
 //! 结束清理，不污染真实配对；**读路径不做迁移**（迁移只在应用启动时显式发生），
@@ -13,7 +14,7 @@
 //! 走 `ORBDROP_DATA_DIR` + 一次性 keyring 服务名，见 `tests/credentials_vault.rs`。
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use orbdrop_lib::credential;
 use orbdrop_lib::state::AppState;
@@ -209,8 +210,9 @@ async fn pairing_then_push_transfers_file_to_receiver() {
     // B 是**已绑定**（已配对）设备 → 这条推送不需要它点同意：整条链路里没有一处调用
     // `accept_invite`，下面"文件真的落了盘"就是"自动收下"的证明（下载循环唯一的入口
     // 就是它 —— 界面点「接收」，或已绑定设备在收到邀请时自动放行）。
-    let invite_id = transfer::push_paths(state_a.clone(), vec![root.to_string_lossy().to_string()], "device-b").await
-        .expect("invite sent over WS");
+    let invite_id = push_invite(state_a.clone(), vec![root.to_string_lossy().to_string()], "device-b").await
+        .expect("invite sent over WS")
+        .targets[0].invite_id.clone();
 
     // Wait for completion: file appears under the receiver's save dir, in the
     // <发送方名>/<推送名>/ 子目录.
@@ -296,9 +298,10 @@ async fn push_to_unpaired_peer_rides_http() {
     assert!(!state_a.ws.has_connection("device-ub"), "前提：没有长连接");
     assert!(!credential::has_peer("device-ub"), "前提：没有配对 token");
 
-    let invite_id = transfer::push_paths(state_a.clone(), vec![src.to_string_lossy().to_string()], "device-ub")
+    let invite_id = push_invite(state_a.clone(), vec![src.to_string_lossy().to_string()], "device-ub")
         .await
-        .expect("推送应该直接发出去（HTTP 邀请）");
+        .expect("推送应该直接发出去（HTTP 邀请）")
+        .targets[0].invite_id.clone();
 
     // B 的界面上收到了邀请卡片，请求还挂在那儿等它决定。
     wait_until("B 收到推送邀请", || state_b.push.inbound.lock().contains_key(&invite_id)).await;
@@ -322,9 +325,10 @@ async fn push_to_unpaired_peer_rides_http() {
     // ---- 重新推一次（这次真传）----
     let big = src.join("big.bin");
     std::fs::write(&big, vec![0x5Au8; 32 * 1024 * 1024]).unwrap();
-    let invite_id = transfer::push_paths(state_a.clone(), vec![src.to_string_lossy().to_string()], "device-ub")
+    let invite_id = push_invite(state_a.clone(), vec![src.to_string_lossy().to_string()], "device-ub")
         .await
-        .expect("再推一次");
+        .expect("再推一次")
+        .targets[0].invite_id.clone();
     wait_until("B 收到第二次邀请", || state_b.push.inbound.lock().contains_key(&invite_id)).await;
 
     transfer::accept_invite(state_b.clone(), &invite_id).expect("B 同意");
@@ -417,9 +421,10 @@ async fn paired_push_without_a_long_connection_skips_consent_http() {
     });
     assert!(!state_a.ws.has_connection("device-phb"), "前提：没有长连接（走 HTTP 那条路）");
 
-    let invite_id = transfer::push_paths(state_a.clone(), vec![src.to_string_lossy().to_string()], "device-phb")
+    let invite_id = push_invite(state_a.clone(), vec![src.to_string_lossy().to_string()], "device-phb")
         .await
-        .expect("已绑定设备的邀请应该直接发出去");
+        .expect("已绑定设备的邀请应该直接发出去")
+        .targets[0].invite_id.clone();
     // 同前：没有任何一处调用 `accept_invite`，落盘即"自动收下"。
     let name = src.file_name().unwrap().to_string_lossy().to_string();
     let expected = save_dir.join("PC-PHA").join(&name).join("hello.txt");
@@ -444,6 +449,175 @@ async fn paired_push_without_a_long_connection_skips_consent_http() {
     credential::remove_peer("device-phb").ok();
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&save_dir);
+}
+
+/// n 个互不相同的空闲端口（每次分配都会立刻放掉）。
+fn free_ports(n: usize) -> Vec<u16> {
+    let mut out = Vec::new();
+    while out.len() < n {
+        let p = free_port();
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// 多设备推送（F-50）：一次选择、**一份清单**、每台各有一条邀请。
+///
+/// 与单台推送的区别只有三件事，这里盯的正是它们：
+/// - **失败隔离**：一台离线就地失败（F-53，不排队），另外两台照走；
+/// - **一份清单**：两台收到的邀请内容一字不差（不是各建一份，落盘路径也就一致）；
+/// - **整批的实时状态**：每台的成败/在途都落在同一批快照里，批次活到最后一台结束。
+///
+/// "还差几台"这件事靠**按住 C 的同意**测：C 未绑定，不点同意就不开始 —— 于是
+/// "B 成了、C 还在等"这一刻是确定性的窗口，快照里的 成功/等待/失败 三个数可以逐一对上。
+#[tokio::test]
+async fn multi_device_push_isolates_targets_and_shares_one_manifest() {
+    let src = temp_share_dir("MD");
+    let big = src.join("big.bin");
+    let big_len: u64 = 32 * 1024 * 1024;
+    std::fs::write(&big, vec![0x5Au8; big_len as usize]).unwrap();
+    let save_b = std::env::temp_dir().join(format!("orbdrop_it_mdb_{}", uuid::Uuid::new_v4()));
+    let save_c = std::env::temp_dir().join(format!("orbdrop_it_mdc_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&save_b).unwrap();
+    std::fs::create_dir_all(&save_c).unwrap();
+
+    let ports = free_ports(3);
+    let (port_a, port_b, port_c) = (ports[0], ports[1], ports[2]);
+    let state_a = make_state(port_a, "device-mda", "PC-MDA", save_b.clone());
+    let state_b = make_state(port_b, "device-mdb", "PC-MDB", save_b.clone());
+    let state_c = make_state(port_c, "device-mdc", "PC-MDC", save_c.clone());
+    let port_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    let port_c = orbdrop_lib::server::start_server(state_c.clone(), port_c).await.expect("C server");
+
+    // B 已配对（收到就收，不问人）、C 未绑定（要它自己点头）、D 已配对但离线。
+    const SHARED_TOKEN: &str = "fedcba9876543210fedcba9876543210";
+    credential::set_peer("device-mdb", SHARED_TOKEN).unwrap();
+    credential::set_peer("device-mda", SHARED_TOKEN).unwrap();
+    let peer = |id: &str, name: &str, port: u16, online: bool, paired: bool| PeerDevice {
+        id: id.into(),
+        name: name.into(),
+        ip: if online { "127.0.0.1".into() } else { String::new() },
+        port: if online { port } else { 0 },
+        online,
+        paired,
+        auto_connect: false,
+    };
+    state_a.add_peer_book(peer("device-mdb", "PC-MDB", port_b, true, true));
+    state_a.add_peer_book(peer("device-mdc", "PC-MDC", port_c, true, false));
+    state_a.add_peer_book(peer("device-mdd", "PC-MDD", 0, false, true));
+    state_b.add_peer_book(peer("device-mda", "PC-MDA", port_a, true, true));
+    state_c.add_peer_book(peer("device-mda", "PC-MDA", port_a, true, false));
+    assert!(!state_a.ws.has_connection("device-mdb"), "前提：走 HTTP 那条路（这条用例不测 WS 通道）");
+
+    // 同一台勾两次只发一条：4 个 ptr 里有一个重复项，落成 3 台。
+    let paths = vec![src.to_string_lossy().to_string()];
+    let view = transfer::push_paths(
+        state_a.clone(),
+        paths,
+        vec!["device-mdb".into(), "device-mdb".into(), "device-mdc".into(), "device-mdd".into()],
+    )
+    .await
+    .expect("两台在线：整批该发出去");
+    let batch_id = view.batch_id.clone();
+
+    // ── 每台各有独立状态：离线那台当场失败（F-53），其余两台在等 ──
+    assert_eq!((view.targets.len(), view.waiting, view.failed), (3, 2, 1), "3 台目标：2 台在等、1 台离线失败");
+    let offline = view.targets.iter().find(|t| t.peer_id == "device-mdd").expect("离线那一行还在");
+    assert_eq!(offline.state, "failed");
+    assert!(
+        offline.error.as_deref().unwrap_or("").contains("不在网上"),
+        "失败原因要说清是离线：{:?}",
+        offline.error
+    );
+    let invite_b = view.targets.iter().find(|t| t.peer_id == "device-mdb").unwrap().invite_id.clone();
+    let invite_c = view.targets.iter().find(|t| t.peer_id == "device-mdc").unwrap().invite_id.clone();
+    assert!(!invite_b.is_empty() && !invite_c.is_empty() && invite_b != invite_c, "每台各有一条邀请");
+    assert_eq!(state_a.push.batch_id_of(&invite_b).as_deref(), Some(batch_id.as_str()), "邀请反查得到自己那一批");
+    assert_eq!(state_a.push.batch_id_of(&invite_c).as_deref(), Some(batch_id.as_str()), "两台归在同一批");
+
+    // ── 一份清单：两台收到的邀请内容一字不差（此刻 B 还在传、C 还没点头，两条邀请都在） ──
+    wait_until("C 收到邀请", || state_c.push.inbound.lock().contains_key(&invite_c)).await;
+    let name = src.file_name().unwrap().to_string_lossy().to_string();
+    let manifest = |state: &Arc<AppState>, invite: &str| {
+        state
+            .push
+            .inbound
+            .lock()
+            .get(invite)
+            .map(|inv| (inv.name.clone(), inv.files.len(), inv.total_bytes()))
+    };
+    let mb = manifest(&state_b, &invite_b);
+    let mc = manifest(&state_c, &invite_c);
+    assert!(mb.is_some(), "B 那条邀请还在（下载循环拿它当'没被取消'的标志）");
+    assert_eq!(mb, mc, "两台收到的清单必须完全一致（清单只建一次）");
+
+    // ── 传输中：整批快照里出现"传输中"那一档（界面那张卡的实时数字就是它） ──
+    let mut saw_sending = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if let Some(shot) = state_a.push.batch_snapshot(&batch_id) {
+            if shot.targets.iter().any(|t| t.state == "sending") {
+                assert_eq!((shot.done, shot.waiting, shot.failed), (0, 2, 1), "传的过程中：成功 0 · 等待 2 · 失败 1");
+                assert!(shot.received > 0 && shot.total > 0, "聚合进度该往前走");
+                saw_sending = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(saw_sending, "整批快照里应出现'传输中'（不是传完才跳一下）");
+
+    // ── B 传完、C 仍在等：计数行就是"成功 1 · 等待 1 · 失败 1"（C 不点头它就一直等着） ──
+    let expected_b = save_b.join("PC-MDA").join(&name).join("big.bin");
+    wait_until("B 自动收下整份目录", || {
+        std::fs::metadata(&expected_b).map(|m| m.len() == big_len).unwrap_or(false)
+    })
+    .await;
+    wait_until("快照里 B 已成功、C 还在等", || {
+        state_a
+            .push
+            .batch_snapshot(&batch_id)
+            .map(|shot| (shot.done, shot.waiting, shot.failed) == (1, 1, 1))
+            .unwrap_or(false)
+    })
+    .await;
+
+    // ── C 点头（未绑定设备的同意制在批次里照旧）→ 也传完 ──
+    transfer::accept_invite(state_c.clone(), &invite_c).expect("C 同意");
+    let expected_c = save_c.join("PC-MDA").join(&name).join("hello.txt");
+    wait_until("C 也收下整份目录", || {
+        std::fs::read(&expected_c).map(|c| c == b"hello world from A").unwrap_or(false)
+    })
+    .await;
+    assert!(
+        std::fs::read(save_c.join("PC-MDA").join(&name).join("sub").join("nested.txt")).is_ok(),
+        "目录结构照旧完整保留"
+    );
+
+    // ── 整批的最后一步：没有一台还在路上，批次就丢掉（界面手里那份快照已经是全量） ──
+    wait_until("整批结束后批次被丢掉", || state_a.push.batch_snapshot(&batch_id).is_none()).await;
+
+    // ── 一台都派不出去 = 单台那条"就地失败"（F-53）：整体报错，界面弹提示、不建卡片 ──
+    let err = transfer::push_paths(
+        state_a.clone(),
+        vec![src.to_string_lossy().to_string()],
+        vec!["device-mdd".into(), "device-missing".into()],
+    )
+    .await
+    .expect_err("都收不了就不该建卡片");
+    assert!(err.contains("都收不了"), "错误要说清是「没一台能收」：{err}");
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    orbdrop_lib::server::stop_server(&state_c).await;
+    credential::remove_peer("device-mda").ok();
+    credential::remove_peer("device-mdb").ok();
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&save_b);
+    let _ = std::fs::remove_dir_all(&save_c);
 }
 
 /// 多选推送（F-50）：选中的几项合并成**一条**推送 —— 对端只收到一张邀请卡、只同意一次，
@@ -486,9 +660,10 @@ async fn multi_select_push_is_one_job_with_one_consent() {
         .iter()
         .map(|p| p.to_string_lossy().to_string())
         .collect();
-    let invite_id = transfer::push_paths(state_a.clone(), picks, "device-ub")
+    let invite_id = push_invite(state_a.clone(), picks, "device-ub")
         .await
-        .expect("多选也该直接发出去");
+        .expect("多选也该直接发出去")
+        .targets[0].invite_id.clone();
     wait_until("B 收到邀请", || state_b.push.inbound.lock().contains_key(&invite_id)).await;
 
     // 多选**不套**"推送名"那一层：直接传多文件就是多文件，不是在目录里。
@@ -512,9 +687,10 @@ async fn multi_select_push_is_one_job_with_one_consent() {
         .iter()
         .map(|p| p.to_string_lossy().to_string())
         .collect();
-    let invite_id = transfer::push_paths(state_a.clone(), picks, "device-ub")
+    let invite_id = push_invite(state_a.clone(), picks, "device-ub")
         .await
-        .expect("第二批");
+        .expect("第二批")
+        .targets[0].invite_id.clone();
     wait_until("B 收到第二批邀请", || state_b.push.inbound.lock().contains_key(&invite_id)).await;
     let manifest_len = state_b
         .push
@@ -541,6 +717,18 @@ async fn multi_select_push_is_one_job_with_one_consent() {
     orbdrop_lib::server::stop_server(&state_b).await;
     let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::remove_dir_all(&save_dir);
+}
+
+/// 单台推送 = 一批只有一台的推送：测试要的是那条邀请 id（`BatchView.targets[0]`）。
+///
+/// 多设备推送（一批 N 台）的行为在 `push_paths` 自己那儿由 `BatchView` 全量给出，
+/// 这里只是把"一台"这件常见事收敛成一句。
+async fn push_invite(
+    state: Arc<AppState>,
+    paths: Vec<String>,
+    peer_id: &str,
+) -> Result<transfer::push_job::BatchView, String> {
+    transfer::push_paths(state, paths, vec![peer_id.to_string()]).await
 }
 
 /// 「同意 → 等这批文件全部落地 → 等发送方收到完成回执」——多选用例的两批都走这一套。
@@ -598,9 +786,10 @@ async fn a_single_pushed_file_lands_as_a_file() {
         auto_connect: false,
     });
 
-    let invite_id = transfer::push_paths(state_a.clone(), vec![file.to_string_lossy().to_string()], "device-ub")
+    let invite_id = push_invite(state_a.clone(), vec![file.to_string_lossy().to_string()], "device-ub")
         .await
-        .expect("邀请发出去");
+        .expect("邀请发出去")
+        .targets[0].invite_id.clone();
     wait_until("B 收到邀请", || state_b.push.inbound.lock().contains_key(&invite_id)).await;
     transfer::accept_invite(state_b.clone(), &invite_id).expect("B 同意");
 
@@ -642,9 +831,10 @@ async fn accepting_a_push_from_a_sync_context_still_downloads() {
         auto_connect: false,
     });
 
-    let invite_id = transfer::push_paths(state_a.clone(), vec![src.to_string_lossy().to_string()], "device-ub")
+    let invite_id = push_invite(state_a.clone(), vec![src.to_string_lossy().to_string()], "device-ub")
         .await
-        .expect("邀请发出去");
+        .expect("邀请发出去")
+        .targets[0].invite_id.clone();
     wait_until("B 收到邀请", || state_b.push.inbound.lock().contains_key(&invite_id)).await;
 
     // 「同意接收」：在一个**没有 reactor** 的普通线程上调用 —— 同步 Tauri 命令就是这个上下文。
@@ -1841,4 +2031,233 @@ async fn pair_invite_swaps_tokens_without_typing_a_code() {
     let _ = std::fs::remove_dir_all(&save_dir);
     let _ = std::fs::remove_file(&state_a.config_path);
     let _ = std::fs::remove_file(&state_b.config_path);
+}
+
+/// 「离线」（隐身）把**一切**入站请求挡在门外，切回在线立刻恢复。
+///
+/// 这条是隐身能不能成立的关键：对端每 5 秒打一次 `/pair/info` 探活，只要还应答，它就把
+/// 本机当"在线"（`state::probe_step` 认的是 200）——只注销 mDNS 瞒得住发现、瞒不住状态。
+/// WS 升级（`/events`）同样在公开路由上，也必须在升级之前被拦下。
+#[tokio::test]
+async fn offline_refuses_every_inbound_request() {
+    let save_dir = std::env::temp_dir().join(format!("orbdrop_it_off_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&save_dir).unwrap();
+    let state = make_state(4190, "device-off", "PC-Off", save_dir.clone());
+    let port = orbdrop_lib::server::start_server(state.clone(), 4190)
+        .await
+        .expect("server");
+    let client = reqwest::Client::new();
+    let info = format!("http://127.0.0.1:{port}/pair/info");
+    let events = format!("http://127.0.0.1:{port}/events?token=whatever");
+
+    assert_eq!(client.get(&info).send().await.unwrap().status(), 200, "默认在线");
+
+    state.set_local_online(false);
+    assert_eq!(
+        client.get(&info).send().await.unwrap().status(),
+        503,
+        "离线：探活不许再回 200，否则对端一直当本机在线"
+    );
+    assert_eq!(
+        client.get(&events).send().await.unwrap().status(),
+        503,
+        "离线：WS 升级也要在升级之前被拦下"
+    );
+    assert_eq!(
+        state.config.lock().online,
+        false,
+        "离线要落盘（跨重启有效）"
+    );
+
+    state.set_local_online(true);
+    assert_eq!(client.get(&info).send().await.unwrap().status(), 200, "切回在线立刻恢复");
+
+    let _ = std::fs::remove_dir_all(&save_dir);
+    let _ = std::fs::remove_file(&state.config_path);
+}
+
+/// 跨网段发现（F-10 延伸）的服务端契约：已配对的对端来问「你这一段里在线的设备」，
+/// 只回**它拨过来的那个地址所在网段**、且此刻在线的；呼叫方自己、本机自己、别网段的、
+/// 离线的，一个都不回。
+#[tokio::test]
+async fn discover_reports_only_the_dialled_segment_and_needs_a_paired_token() {
+    let Some(lan_ip) = local_lan_ip() else {
+        eprintln!("跳过：本机没有局域网地址，模拟不出「来自另一台设备」的请求");
+        return;
+    };
+    let save_dir = std::env::temp_dir().join(format!("orbdrop_it_disc_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&save_dir).unwrap();
+
+    // 凭据库是**全局共享**的（一个数据目录一份），而测试是并行跑的：id 必须带 uuid，
+    // 否则和别的测试互相清键，谁的 token 都活不到被用上那一刻。
+    let uniq = uuid::Uuid::new_v4().to_string();
+    let tag = &uniq[..8];
+    let b_id = format!("disc-b-{tag}");
+    let a_id = format!("disc-a-{tag}");
+    let c_id = format!("disc-c-{tag}");
+    let far_id = format!("disc-far-{tag}");
+    let sleep_id = format!("disc-sleep-{tag}");
+
+    let state_b = make_state(4390, &b_id, "PC-B", save_dir.clone());
+    let add = |id: &str, ip: String, port: u16, online: bool, paired: bool| {
+        state_b.add_peer_book(PeerDevice {
+            id: id.into(),
+            name: id.to_uppercase(),
+            ip,
+            port,
+            online,
+            paired,
+            auto_connect: false,
+        });
+    };
+    // 本机这一段里在线的设备 —— 这是唯一该出现在表里的东西。
+    add(&c_id, lan_ip.to_string(), 4391, true, false);
+    // 另一段的设备（本机可能正是它自己内网的那扇门）：A 沿这条路根本到不了它。
+    add(&far_id, "198.51.100.7".into(), 4392, true, false);
+    // 呼叫方自己：表里不该回显它（A 已经知道自己是谁）。
+    add(&a_id, lan_ip.to_string(), 4393, true, true);
+    // 离线的同段设备：这一层只回答"此刻有谁在"。
+    add(&sleep_id, lan_ip.to_string(), 4394, false, false);
+
+    let port_b = orbdrop_lib::server::start_server(state_b.clone(), 4390)
+        .await
+        .expect("B server");
+
+    let token = format!("tok-{}", uuid::Uuid::new_v4());
+    // B 手里那条：键是 A 的 id —— 它据此才知道"带这个 token 的是 A"。
+    credential::set_peer(&a_id, &token).unwrap();
+
+    let client = reqwest::Client::new();
+    let url = format!("http://{lan_ip}:{port_b}/discover");
+
+    // 没带 / 带错 token：拿不到表。这就是"匹配上之后才发现"那道门。
+    assert_eq!(
+        client.get(&url).send().await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "没配对不许看本机认识谁"
+    );
+    assert_eq!(
+        client.get(&url).bearer_auth("not-a-token").send().await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    let body: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send().await.unwrap()
+        .json().await.unwrap();
+    assert_eq!(body["id"], b_id.as_str());
+    assert_eq!(
+        body["port"].as_u64(),
+        Some(u64::from(port_b)),
+        "报的必须是实际监听的端口（配置端口被占时会顺延）"
+    );
+
+    let ids: Vec<&str> = body["peers"]
+        .as_array()
+        .expect("peers 数组")
+        .iter()
+        .filter_map(|p| p["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&c_id.as_str()),
+        "同段在线的设备要在表里: {ids:?}"
+    );
+    assert!(!ids.contains(&far_id.as_str()), "别的网段的不许回: {ids:?}");
+    assert!(!ids.contains(&a_id.as_str()), "呼叫方自己不许回: {ids:?}");
+    assert!(
+        !ids.contains(&sleep_id.as_str()),
+        "同段但离线的不回: {ids:?}"
+    );
+    assert!(!ids.contains(&b_id.as_str()), "本机自己不许回: {ids:?}");
+
+    orbdrop_lib::server::stop_server(&state_b).await;
+    credential::remove_peer(&a_id).ok();
+    let _ = std::fs::remove_dir_all(&save_dir);
+}
+
+/// 探活那条 5 秒的循环顺手把「对端那一段在线的设备」学过来：学来的行是临时的
+/// （不写地址簿、不被再探活），而且**存活跟着担保人走** —— 担保人不再提到它，超时收走。
+#[tokio::test]
+async fn probe_learns_the_peers_segment_and_sweeps_it_when_the_voucher_goes_quiet() {
+    let Some(lan_ip) = local_lan_ip() else {
+        eprintln!("跳过：本机没有局域网地址，模拟不出「来自另一台设备」的请求");
+        return;
+    };
+    let save_dir = std::env::temp_dir().join(format!("orbdrop_it_learn_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&save_dir).unwrap();
+
+    // 凭据库全局共享、测试并行跑：id 带 uuid，别和别的测试互相清键（同上）。
+    let uniq = uuid::Uuid::new_v4().to_string();
+    let tag = &uniq[..8];
+    let b_id = format!("learn-b-{tag}");
+    let a_id = format!("learn-a-{tag}");
+    let c_id = format!("learn-c-{tag}");
+
+    let state_b = make_state(4395, &b_id, "PC-B", save_dir.clone());
+    state_b.add_peer_book(PeerDevice {
+        id: c_id.clone(),
+        name: "PC-C".into(),
+        ip: lan_ip.to_string(),
+        port: 4396,
+        online: true,
+        paired: false,
+        auto_connect: false,
+    });
+    let port_b = orbdrop_lib::server::start_server(state_b.clone(), 4395)
+        .await
+        .expect("B server");
+
+    let state_a = make_state(4397, &a_id, "PC-A", save_dir.clone());
+    let token = format!("tok-{}", uuid::Uuid::new_v4());
+    credential::set_peer(&a_id, &token).unwrap(); // B 认这个 token 是 A 的
+    credential::set_peer(&b_id, &token).unwrap(); // A 手里有 B 的 token
+    state_a.add_peer_book(PeerDevice {
+        id: b_id.clone(),
+        name: "PC-B".into(),
+        ip: lan_ip.to_string(),
+        port: port_b,
+        online: true,
+        paired: true,
+        auto_connect: false,
+    });
+
+    orbdrop_lib::state::probe_peers_once(&state_a, &reqwest::Client::new()).await;
+
+    let learned = state_a.get_peer(&c_id).expect("A 学到了 B 那一段的设备");
+    assert!(learned.online, "担保人说它在线，就是在线");
+    assert!(!learned.paired, "学来的设备跟本机没有任何关系");
+    assert!(state_a.is_learned(&c_id));
+
+    assert!(
+        !state_a.config.lock().peers.iter().any(|p| p.id == c_id),
+        "学来的条目是临时的：不许写进地址簿"
+    );
+
+    // 担保人不再报它了。本机**不会**去拨它 —— 那不是本机发现的关系，多拨一次就是多余
+    // 的一跳；所以它不该被探活判成离线，而是继续按"担保人最近说过它在"活着。
+    state_b.config.lock().peers.retain(|p| p.id != c_id);
+    state_b.peers.lock().retain(|p| p.id != c_id);
+    orbdrop_lib::state::probe_peers_once(&state_a, &reqwest::Client::new()).await;
+    assert!(
+        state_a.get_peer(&c_id).map(|p| p.online).unwrap_or(false),
+        "学来的行不参与探活：担保人没再提它也仍是在线（只有超时才收走）"
+    );
+
+    // 担保人不再提到它（超时）→ 收走。把时间戳拨回去模拟"20 秒没人再担保"。
+    state_a
+        .learned
+        .lock()
+        .insert(c_id.clone(), Instant::now() - Duration::from_secs(600));
+    state_a.sweep_learned();
+    assert!(
+        state_a.get_peer(&c_id).is_none(),
+        "没人再担保的行必须从列表里消失"
+    );
+    assert!(!state_a.is_learned(&c_id));
+
+    orbdrop_lib::server::stop_server(&state_b).await;
+    credential::remove_peer(&a_id).ok();
+    credential::remove_peer(&b_id).ok();
+    let _ = std::fs::remove_dir_all(&save_dir);
 }

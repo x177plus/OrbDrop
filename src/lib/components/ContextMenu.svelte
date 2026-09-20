@@ -10,6 +10,7 @@
     deviceOnline = true,
     deviceNeedsPair = false,
     peerName,
+    bcAvailable = true,
     bcLeftLabel = null,
     bcRightLabel = null,
     bcCompareLabel = '',
@@ -43,6 +44,8 @@
     /** token 已失效（对端不认我们）：这一档的动作是「配对」，不是「连接」。 */
     deviceNeedsPair?: boolean;
     peerName?: string;
+    /** 本机是否探测到 BeyondCompare（后端 `bc_status.exePath` 非空）；false = 整个 BC 菜单区不显示。 */
+    bcAvailable?: boolean;
     /** 已在比较位上的项（null = 空），文案由后端给的 label 提供。 */
     bcLeftLabel?: string | null;
     bcRightLabel?: string | null;
@@ -147,7 +150,7 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
       下载到本地{peerName ? ` · 来自「${peerName}」` : ''}
     </button>
-    {@render bcSection()}
+    {#if bcAvailable}{@render bcSection()}{/if}
   {:else if kind === 'share'}
     <button class="ctx-item" onclick={() => handleItem(onDownload)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
@@ -166,7 +169,7 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
       移除共享项
     </button>
-    {@render bcSection()}
+    {#if bcAvailable}{@render bcSection()}{/if}
   {:else}
     {#if !deviceOnline}
       <!-- 离线设备：连接/推送的目标都不在网上（拨号只会空转、推送邀请是 HTTP 直达），
