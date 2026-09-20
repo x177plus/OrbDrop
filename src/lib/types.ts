@@ -45,6 +45,11 @@ export interface AppSettings {
   autoStart: boolean;
   /** BeyondCompare 可执行文件路径；'' = 自动探测。 */
   bcExePath: string;
+  /**
+   * 本机「在线 / 离线」（面板右上角状态框）。`false` = 隐身：不广播 mDNS、断开全部
+   * 长连接、拒收一切入站请求。落盘、跨重启有效。
+   */
+  online: boolean;
 }
 
 /**
@@ -166,6 +171,44 @@ export interface PushInvite {
    * 不再问用户一次）。界面据此直接显示"正在接收"，不放「接收/拒绝」。
    */
   auto?: boolean;
+}
+
+/** 一台目标设备在一批推送里的状态（后端 `TargetState`）。 */
+export type PushTargetState = 'invited' | 'sending' | 'done' | 'cancelled' | 'rejected' | 'failed';
+
+/** 一批推送里的一台目标设备（卡片上的一行，后端 `BatchTargetView`）。 */
+export interface PushTarget {
+  peerId: string;
+  /** 设备名。 */
+  target: string;
+  inviteId: string;
+  /** 已配对 = 对方不问同意直接收：行文案别说「等待对方同意」。 */
+  paired: boolean;
+  state: PushTargetState;
+  received: number;
+  error: string | null;
+}
+
+/**
+ * 一次推送操作（= 界面上一张卡片，后端 `BatchView`）。单台推送也是一批（只有一条目标），
+ * 所以"等待对方同意 → 传输中 → 已发送"和"3 台里成了几台"是同一条数据。
+ */
+export interface PushBatch {
+  batchId: string;
+  /** 清单的显示名（"推的是什么"），不参与落盘路径。 */
+  name: string;
+  /** 这次选了几项（>1 = 多选合并成的一条推送）。 */
+  count: number;
+  /** 清单里被跳过的项数（链接 / 读不到的项）。>0 时卡片要说出来，别再让用户以为"就这些"。 */
+  skipped: number;
+  /** 成功 / 等待（含传输中）/ 失败（含被拒、被取消）—— 卡片上「成功 x · 等待 y」那行就是它。 */
+  done: number;
+  waiting: number;
+  failed: number;
+  /** 聚合进度：分母只算还活着的台（失败/取消的整条不计），所以有台失败也能走到 100%。 */
+  received: number;
+  total: number;
+  targets: PushTarget[];
 }
 
 /**

@@ -1,7 +1,10 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU16;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use axum::http::StatusCode;
 use mdns_sd::ServiceDaemon;
 use parking_lot::Mutex;
 use tauri::AppHandle;
@@ -38,6 +41,13 @@ pub struct AppState {
     pub app_handle: Mutex<Option<AppHandle>>,
     /// File watchers keyed by share id.
     pub watchers: Mutex<std::collections::HashMap<String, notify::RecommendedWatcher>>,
+    /// 「学来的」设备（F-10 跨网段）：对端 `/discover` 表里带过来、而本机自己从没发现过的
+    /// 设备 id → 最近一次被提到的时刻。
+    ///
+    /// 为什么单开一张表而不是塞进 `PeerDevice`：这个状态**只属于本进程**（重启即忘），
+    /// 而 `PeerDevice` 是要落盘进地址簿的形状。存在这里的 id，`peers` 里对应那行就是
+    /// "临时条目"—— 不写地址簿、不被探活接管、超时由 `sweep_learned` 收走。
+    pub learned: Mutex<HashMap<String, Instant>>,
 }
 
 impl AppState {
@@ -87,6 +97,7 @@ impl AppState {
             pair: PairStore::new(),
             app_handle: Mutex::new(None),
             watchers: Mutex::new(std::collections::HashMap::new()),
+            learned: Mutex::new(HashMap::new()),
         }
     }
 
@@ -242,6 +253,27 @@ impl AppState {
         let _ = crate::config::save_config_at(&self.config_path, &config);
     }
 
+    /// 本机是否「在线」（面板右上角状态框）。离线 = 隐身，见 `Config::online`。
+    ///
+    /// 别和 `set_peer_online` 搞混：那个是**对端**是否在网上，这个是**本机自己**是否
+    /// 对局域网可见。
+    pub fn is_online(&self) -> bool {
+        self.config.lock().online
+    }
+
+    /// 记住本机「在线 / 离线」并落盘（用户意图，跨重启有效）。
+    ///
+    /// 只写配置：运行时的连带动作（注销 mDNS、断链、拒收入站请求）在 `lib.rs::set_online`，
+    /// 那里才有 daemon 与运行时。
+    pub fn set_local_online(&self, on: bool) {
+        let mut config = self.config.lock();
+        if config.online == on {
+            return;
+        }
+        config.online = on;
+        let _ = crate::config::save_config_at(&self.config_path, &config);
+    }
+
     /// Set online state. Emits only on a real change.
     pub fn set_peer_online(&self, peer_id: &str, online: bool) {
         let changed;
@@ -384,6 +416,133 @@ impl AppState {
         self.peers.lock().iter().find(|p| p.id == peer_id).cloned()
     }
 
+    // ------------------------------------------------------------------
+    // 跨网段发现：对端报来的设备（F-10 延伸）
+    // ------------------------------------------------------------------
+
+    /// 这台设备是不是「学来的」（本机自己从没发现过、由某台对端转述）。学来的行不参与
+    /// 探活：本机跟它们之间没有任何关系，存活由担保人的 `/discover` 表刷新。
+    pub fn is_learned(&self, peer_id: &str) -> bool {
+        self.learned.lock().contains_key(peer_id)
+    }
+
+    /// 把对端（担保人）报来的「它那一段在线的设备」并进列表。
+    ///
+    /// 三条规则，缺一不可：
+    ///
+    /// - **只接手没见过的 id**：已经在本机列表里的行（mDNS 发现的、手动添加的、已配对的）
+    ///   一个字都不动。那是"本机自己知道的"，不该被对端的转述改写，更不能让它被这一层
+    ///   的超时清掉 —— 否则 B 一离线，A 连自己 mDNS 看得见的设备都会掉。
+    /// - **临时**：不写地址簿、不进凭据库，重启即忘。本机没跟它们建立过任何关系。
+    /// - **存活跟着担保人**：刷新时间戳。担保人不再提到它（或担保人自己掉了、问不到了），
+    ///   超过 [`LEARNED_TTL`] 就由 [`Self::sweep_learned`] 收走。
+    pub fn learn_peers(&self, voucher_id: &str, learned: Vec<PeerDevice>) {
+        let now = Instant::now();
+        let own_id = self.config.lock().device_id.clone();
+        let mut changed = false;
+        {
+            let mut table = self.learned.lock();
+            let mut peers = self.peers.lock();
+            for l in learned {
+                // 自己、报它的那一方、以及没有地址的条目：进不了这张表。
+                if l.id.is_empty() || l.id == own_id || l.id == voucher_id {
+                    continue;
+                }
+                if l.ip.is_empty() || l.port == 0 {
+                    continue;
+                }
+                match peers.iter_mut().find(|p| p.id == l.id) {
+                    Some(existing) => {
+                        // 已经是本机自己的行（mDNS/手动/配对）：不接管它的存活，也不改它。
+                        if !table.contains_key(&l.id) {
+                            continue;
+                        }
+                        if existing.ip != l.ip || existing.port != l.port {
+                            info!(
+                                peer_id = %l.id,
+                                was = %format!("{}:{}", existing.ip, existing.port),
+                                now = %format!("{}:{}", l.ip, l.port),
+                                "学来的对端换了地址"
+                            );
+                            existing.ip = l.ip;
+                            existing.port = l.port;
+                        }
+                        existing.name = l.name;
+                        existing.online = true;
+                        table.insert(l.id.clone(), now);
+                        changed = true;
+                    }
+                    None => {
+                        peers.push(PeerDevice {
+                            id: l.id.clone(),
+                            name: l.name,
+                            ip: l.ip,
+                            port: l.port,
+                            online: true,
+                            paired: false,
+                            auto_connect: false,
+                        });
+                        table.insert(l.id, now);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            self.emit_devices_changed();
+        }
+    }
+
+    /// 收走超时的「学来的」条目：担保人最近 [`LEARNED_TTL`] 内没再提到它们。
+    ///
+    /// 已经变成"本机自己的关系"的行不归这一层管 —— 用户手动添加过（地址簿里有它），
+    /// 或者已经配对（凭据库里有 token）。那些行该由配对与探活维护，这里只把记录
+    /// 从表里摘掉，行留着。
+    pub fn sweep_learned(&self) {
+        let now = Instant::now();
+        let expired: Vec<String> = {
+            let table = self.learned.lock();
+            table
+                .iter()
+                .filter(|(_, seen)| now.duration_since(**seen) > LEARNED_TTL)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        if expired.is_empty() {
+            return;
+        }
+
+        let adopted: HashSet<String> = {
+            let config = self.config.lock();
+            let paired = crate::credential::load_peers().unwrap_or_default();
+            expired
+                .iter()
+                .filter(|id| {
+                    config.peers.iter().any(|p| &p.id == *id) || paired.contains_key(*id)
+                })
+                .cloned()
+                .collect()
+        };
+
+        let mut removed = false;
+        {
+            let mut table = self.learned.lock();
+            let mut peers = self.peers.lock();
+            for id in &expired {
+                table.remove(id);
+                if adopted.contains(id) {
+                    continue;
+                }
+                let before = peers.len();
+                peers.retain(|p| &p.id != id);
+                removed |= peers.len() != before;
+            }
+        }
+        if removed {
+            self.emit_devices_changed();
+        }
+    }
+
     pub fn emit_devices_changed(&self) {
         if let Some(app) = self.app_handle.lock().as_ref() {
             let _ = app.emit("devices://changed", serde_json::json!({}));
@@ -405,6 +564,12 @@ pub fn visible_peers(state: &Arc<AppState>, targets: &[String]) -> Vec<PeerDevic
 // ---------------------------------------------------------------------------
 // 设备身份核对（同一台设备不能有两行）
 // ---------------------------------------------------------------------------
+
+/// 「学来的」条目能活多久：担保人超过这段时间没再提到它，就当作它已经不在那一段了。
+///
+/// 取探活周期的整数倍（5s → 4 拍）：对端报来一次就够它活着，中间丢一拍不会误伤；
+/// 真的下线了，最迟 20 秒从列表里消失。
+const LEARNED_TTL: Duration = Duration::from_secs(20);
 
 /// 一个地址上现在是谁，以及它把带 token 的调用方认作谁。
 #[derive(Debug, Clone)]
@@ -448,6 +613,90 @@ pub async fn fetch_identity(
     })
 }
 
+/// [`fetch_discover`] 的三种结果。
+#[derive(Debug)]
+pub enum DiscoverOutcome {
+    /// 对端答了：它是谁 + 它那一段里在线的设备。
+    Ok {
+        identity: PeerIdentity,
+        peers: Vec<PeerDevice>,
+    },
+    /// 这一问在这台对端上得不到答案（老版本没有这个端点；或者它不认我们手里的 token）。
+    /// 退回 `/pair/info` —— 那一问不带 token 也答，能问出"它还认不认我们"。
+    Fallback,
+    /// 问不到（连不上、或对端此刻隐身/离线）。**不要再打第二遍**：对端此刻不算在线。
+    Unreachable,
+}
+
+/// 向一个地址要「你是谁 + 你这一段里在线的设备」（`/discover`，跨网段发现）。
+///
+/// `own_id` 只用来填 `paired_as`：这一问带的是本机的 token，对端**认了**（否则 401，
+/// 走 `Fallback`），所以"它把带这个 token 的调用方认作谁"的答案恒等于本机 id。
+/// 对端换过 device id 的情形不在这里 —— 那时它不认旧 token，401 退回 `/pair/info`，
+/// 由那条路去问出新的 id。
+pub async fn fetch_discover(
+    client: &reqwest::Client,
+    ip: &str,
+    port: u16,
+    token: &str,
+    own_id: &str,
+) -> DiscoverOutcome {
+    let url = format!("http://{ip}:{port}/discover");
+    let response = match client.get(&url).bearer_auth(token).send().await {
+        Ok(r) => r,
+        Err(_) => return DiscoverOutcome::Unreachable,
+    };
+
+    match response.status() {
+        s if s.is_success() => {}
+        // 401/403：这个 token 它不认（被解除配对、或对端换过 id）；404/405：老版本没有
+        // 这个端点。两种都得回到 `/pair/info` 才有答案。
+        StatusCode::UNAUTHORIZED
+        | StatusCode::FORBIDDEN
+        | StatusCode::NOT_FOUND
+        | StatusCode::METHOD_NOT_ALLOWED => return DiscoverOutcome::Fallback,
+        // 503 隐身、5xx：当作问不到，语义与探活一致（非 200 即不在网上）。
+        _ => return DiscoverOutcome::Unreachable,
+    }
+
+    let body: serde_json::Value = match response.json().await {
+        Ok(v) => v,
+        Err(_) => return DiscoverOutcome::Fallback,
+    };
+    let Some(peer_id) = body["id"].as_str().filter(|s| !s.is_empty()) else {
+        // 答得不是这个形状（中间有代理、或对端是自己拼的响应）→ 走老路，别瞎认。
+        return DiscoverOutcome::Fallback;
+    };
+
+    let peers = body["peers"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    Some(PeerDevice {
+                        id: v["id"].as_str()?.to_string(),
+                        name: v["name"].as_str().unwrap_or_default().to_string(),
+                        ip: v["ip"].as_str()?.to_string(),
+                        port: u16::try_from(v["port"].as_u64()?).ok()?,
+                        online: true,
+                        paired: false,
+                        auto_connect: false,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    DiscoverOutcome::Ok {
+        identity: PeerIdentity {
+            id: peer_id.to_string(),
+            name: body["name"].as_str().unwrap_or_default().to_string(),
+            paired_as: Some(own_id.to_string()),
+        },
+        peers,
+    }
+}
+
 /// 一次探活得出的结论。
 #[derive(Debug)]
 pub enum ProbeStep {
@@ -479,11 +728,17 @@ pub fn probe_step(expected_id: &str, seen: Option<PeerIdentity>) -> ProbeStep {
 /// 由 lib.rs 的 5s 循环调用；单独成函数是为了让"地址上现在是另一台设备"这条路径
 /// 能在测试里对着真服务器跑（见 tests/p1_integration.rs）。
 pub async fn probe_peers_once(state: &Arc<AppState>, client: &reqwest::Client) {
+    // 「学来的」行不在这里探：它们不是本机发现的，本机跟它们之间没有关系，拨过去既没有
+    // 意义（可达性由"和担保人同子网"保证），也正是这条路要避免的多余一跳。它们的存活由
+    // 担保人的 `/discover` 表刷新 —— 见 `learn_peers` / `sweep_learned`。
+    let learned: HashSet<String> = state.learned.lock().keys().cloned().collect();
+    let own_id = state.config.lock().device_id.clone();
+
     let candidates: Vec<PeerDevice> = state
         .peers
         .lock()
         .iter()
-        .filter(|p| !p.ip.is_empty() && p.port != 0)
+        .filter(|p| !p.ip.is_empty() && p.port != 0 && !learned.contains(&p.id))
         .cloned()
         .collect();
     for p in candidates {
@@ -502,7 +757,22 @@ pub async fn probe_peers_once(state: &Arc<AppState>, client: &reqwest::Client) {
                 continue;
             }
         };
-        let seen = fetch_identity(client, &p.ip, p.port, token.as_deref()).await;
+        // 有 token 就走 `/discover`：它一举两得 —— 既认出对端是谁，又把「对端那一段里
+        // 在线的设备」带回来（跨网段发现）。没有 token 的（未绑定/只手动加过）仍旧只问
+        // 身份：它们不该看到本机认识了谁。
+        let seen = match token.as_deref() {
+            Some(t) => match fetch_discover(client, &p.ip, p.port, t, &own_id).await {
+                DiscoverOutcome::Ok { identity, peers } => {
+                    state.learn_peers(&p.id, peers);
+                    Some(identity)
+                }
+                DiscoverOutcome::Fallback => {
+                    fetch_identity(client, &p.ip, p.port, token.as_deref()).await
+                }
+                DiscoverOutcome::Unreachable => None,
+            },
+            None => fetch_identity(client, &p.ip, p.port, token.as_deref()).await,
+        };
         match probe_step(&p.id, seen) {
             ProbeStep::Online => {
                 state.set_peer_online(&p.id, true);
@@ -525,6 +795,10 @@ pub async fn probe_peers_once(state: &Arc<AppState>, client: &reqwest::Client) {
             }
         }
     }
+
+    // 担保人这一轮没再提到、或担保人自己掉了的学习条目，从这里收走。放在一轮之末：
+    // 这一轮里刚被提到的都已经刷新过时间戳，不会误伤。
+    state.sweep_learned();
 }
 
 /// 向一个地址问清身份并按结果收拾旧行（探活与 mDNS 发现共用的入口）。

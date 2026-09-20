@@ -111,6 +111,8 @@ pub struct AppSettings {
     pub auto_start: bool,
     /// BeyondCompare 可执行文件路径；空 = 自动探测（注册表 / 常见安装路径）。
     pub bc_exe_path: String,
+    /// 本机「在线 / 离线」状态（面板右上角那个状态框）。见 `Config::online`。
+    pub online: bool,
 }
 
 impl Default for AppSettings {
@@ -122,6 +124,7 @@ impl Default for AppSettings {
             device_name: default_device_name(),
             auto_start: true,
             bc_exe_path: String::new(),
+            online: true,
         }
     }
 }
@@ -190,10 +193,23 @@ pub struct Config {
     /// 清一次站点数据就凭空消失。
     #[serde(default)]
     pub picker_favorites: Vec<PickerFavorite>,
+    /// 本机「在线 / 离线」（面板右上角状态框）：**离线 = 隐身**。
+    ///
+    /// 离线时本机不广播 mDNS、断开全部长连接、拒收一切入站请求（含 WS 升级与探活
+    /// `/pair/info`）—— 对端因此把本机看成"不在网上"。配对关系、token、共享项全都不动：
+    /// 切回「在线」就重新广播，并按地址簿里的长连接记忆把链路接回来（F-16）。
+    ///
+    /// 这是**用户意图**，所以落在配置文件里跨重启生效（和「断开」的记忆同一个道理）。
+    #[serde(default = "default_online")]
+    pub online: bool,
 }
 
 fn default_port() -> u16 {
     3890
+}
+
+fn default_online() -> bool {
+    true
 }
 
 fn default_auto_start() -> bool {
@@ -217,6 +233,7 @@ impl Config {
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default(),
+            online: self.online,
         }
     }
 
@@ -262,6 +279,7 @@ impl Default for Config {
             peers: Vec::new(),
             orb_pos: None,
             picker_favorites: Vec::new(),
+            online: true,
         }
     }
 }
@@ -449,6 +467,7 @@ mod tests {
             }),
             bc_right: None,
             orb_pos: Some(OrbPos { x: -1280, y: 40 }),
+            online: false,
             picker_favorites: vec![
                 PickerFavorite { name: "桌面".into(), path: "C:/Users/t/Desktop".into() },
                 PickerFavorite { name: "项目".into(), path: "D:/项目".into() },
@@ -502,6 +521,7 @@ mod tests {
             "比较位要跨重启保留"
         );
         assert_eq!(loaded.bc_right, None);
+        assert_eq!(loaded.online, false, "「离线」要跨重启保留（用户选了就一直离线）");
         assert_eq!(
             loaded.orb_pos,
             Some(OrbPos { x: -1280, y: 40 }),
@@ -589,6 +609,20 @@ mod tests {
         );
         // 存下去的就是返回的那份：界面以后端为准，两边不会分叉
         assert_eq!(config.picker_favorites, stored);
+    }
+
+    /// 「离线」跨重启有效：写进配置文件；**旧配置**（没有这一项）读出来是在线。
+    ///
+    /// 漏掉 `#[serde(default)]` 的话，旧配置会解析失败 → `load_config` 把它改名成
+    /// `.toml.bad` 再写默认值，用户升级一次就丢掉全部共享项与配对表。
+    #[test]
+    fn online_round_trips_and_defaults_to_true() {
+        let old: Config = toml::from_str("deviceId = \"device-1\"\n").unwrap();
+        assert!(old.online, "老配置没有 online：默认在线，不能默认把用户静默拉黑");
+        assert!(old.settings().online, "AppSettings（get_settings 的返回）要带上它");
+
+        let offline: Config = toml::from_str("deviceId = \"device-1\"\nonline = false\n").unwrap();
+        assert!(!offline.online);
     }
 
     /// S-01: same-name downloads get "xxx (1).ext" style renames.

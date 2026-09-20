@@ -101,6 +101,8 @@ export type DockAxis = -1 | 0 | 1;
 export type DockPlan = {
   /** 落位后的折叠态窗口矩形（物理像素；永远是工作区的子矩形） */
   window: ScreenRect;
+  /** 各轴的贴边方向：角标要按它转到「露在屏幕内」的那段球缘上（见 `Orb.svelte` 的注释） */
+  dock: { x: DockAxis; y: DockAxis };
   /** 收起（未悬停）时悬浮球在窗口内的偏移：贴边侧 = `overhang` 探出屏幕外（物理像素） */
   orb: { x: number; y: number };
   /**
@@ -121,6 +123,11 @@ export type DockPlan = {
  * 窗口边（屏幕上一条看得见的切线），而不是屏幕边。
  *
  * 未贴边的轴保持自由落位（此时距两侧边缘都 > threshold，窗口自然完整落在工作区内）。
+ *
+ * **横竖不会同时贴**：横向一旦贴边，纵向就保持自由落位 —— 四个角跟左右两边一样，球只往
+ * 左右让出屏幕（露出来的是球的一侧，那段弧约 142°，两颗角标都放得下），而不是往角上缩成
+ * 只露一个角（那样只剩约 52°，连一颗 22px 的角标都得精打细算）。于是 `dock` 只可能是
+ * `(0,0)` / `(±1,0)` / `(0,±1)`，`spinForDock` 也只需要管这几种。
  */
 export function planDock(input: {
   /** 自由落位的折叠态窗口矩形（物理像素） */
@@ -138,12 +145,13 @@ export function planDock(input: {
 }): DockPlan {
   const { ball, work, orbSize, orbInset, overhang, threshold } = input;
 
-  /** 单轴吸附：贴边方向 d、窗口该轴坐标 win、球在该轴的偏移 orb、悬停热区该轴的起点与长度 */
-  const axis = (start: number, size: number, limit: number, total: number) => {
+  /** 单轴吸附：贴边方向 d、窗口该轴坐标 win、球在该轴的偏移 orb、悬停热区该轴的起点与长度。
+   *  `allow = false`：这一轴不判吸附、保持自由落位（横向已经贴边时的纵向，见上面的说明）。 */
+  const axis = (start: number, size: number, limit: number, total: number, allow = true) => {
     const free = start + orbInset;                       // 自由落位下球在该轴上的起点
-    const d: DockAxis = free - limit <= threshold ? -1
-      : limit + total - (free + orbSize) <= threshold ? 1
-      : 0;
+    const near = free - limit <= threshold;              // 球左/上缘离工作区左/上边够近了
+    const far = limit + total - (free + orbSize) <= threshold;   // 球右/下缘离工作区右/下边够近了
+    const d: DockAxis = !allow ? 0 : near ? -1 : far ? 1 : 0;
     return {
       d,
       win: d === -1 ? limit : d === 1 ? limit + total - size : start,
@@ -156,11 +164,67 @@ export function planDock(input: {
   };
 
   const ax = axis(ball.x, ball.w, work.x, work.w);
-  const ay = axis(ball.y, ball.h, work.y, work.h);
+  const ay = axis(ball.y, ball.h, work.y, work.h, ax.d === 0);   // 横向贴了，纵向就不再贴
 
   return {
     window: { x: ax.win, y: ay.win, w: ball.w, h: ball.h },
+    dock: { x: ax.d, y: ay.d },
     orb: { x: ax.orb, y: ay.orb },
     zone: { x: ax.zone, y: ay.zone, w: ax.zoneSize, h: ay.zoneSize },
   };
+}
+/** 贴边收起时两颗角标各自绕球心的转角（度，正值 = 顺时针）：左 = 黄（通知数）、右 = 绿（长连接设备数） */
+export type BadgeSpin = { left: number; right: number };
+
+/** 角标原位：球的左上角（10:30）与右上角（1:30），即屏幕角度（0 = 3:00、90 = 6:00）225° 与 315° */
+const HOME_LEFT = 225;
+const HOME_RIGHT = 315;
+
+/**
+ * 贴边收起时两颗角标转到哪：**把它们转到「露在屏幕内那段弧」上**。
+ *
+ * 球贴边后有大半颗在屏幕外，弧外的角标整颗看不见。横向贴边（左/右）露出来的是球的**一侧**，
+ * 那段弧以 9:00 / 3:00 为中心、半宽约 71°（`DOCK_EXPOSE = 1/3` → 露出 21px，`acos(10/31) ≈ 71°`），
+ * 装得下两颗角标（角标 22px、圆心在 32.5px 处，各占约 ±20°）；纵向贴边（上/下）露出的是球的
+ * 上/下半。于是只需要管三种：横向贴、纵向贴、不贴（角上不会再出现两轴同时贴，见 `planDock`）。
+ *
+ * 转角 = 弧心方向 − 角标原位方向：
+ *   只贴右（弧心 180°）→ 两条臂都 -90（黄 225°→135° = 7:30、绿 315°→225° = 10:30，两颗都在弧内）
+ *   只贴左（弧心 0°）→ 都 +90（黄→315° = 1:30、绿→45° = 4:30，两颗都在弧内）
+ *   只贴上（弧心 90°）→ 黄 -90（→135° = 7:30）、绿 +90（→45° = 4:30）：**两条臂各自荡开**，
+ *     各留各的一侧（不是整对 180° —— 那样两颗会掉个个儿，谁是谁都看不出来了）
+ *   只贴下（弧心 270°）→ 都 0（角标原位就在球的上半，本来就露着）
+ *
+ * 横向贴边时「整对一起转」：角标原位在弧心 ±45° 上，让这对的**中线**对上弧心即可。
+ * 这些角度都是拿真机几何量出来的：`planDock` 给出球偏移，角标 22px 摆在球缘 32.5px 处，
+ * 逐个组合检查「整颗是否都落在露出的那段弧里」。改 `DOCK_EXPOSE` / 球径 / 角标尺寸都要重算。
+ */
+export function spinForDock(dock: { x: DockAxis; y: DockAxis }): BadgeSpin {
+  const arc = arcCenterFor(dock);
+  if (arc === null) return { left: 0, right: 0 };              // 未贴边：角标原位就在完整可见的球上
+  if (dock.x === 0 && dock.y === -1) {
+    // 只贴上：两条臂各自荡开 —— 黄留在左侧（弧心 +45°）、绿留在右侧（弧心 −45°）
+    return { left: normalize(arc + 45 - HOME_LEFT), right: normalize(arc - 45 - HOME_RIGHT) };
+  }
+  // 横向贴（左 / 右）或只贴下：整对扫过去 —— 两颗角标对称落在弧上，让「中线」对准弧心
+  const both = normalize(arc - PAIR_MID);
+  return { left: both, right: both };
+}
+
+/** 一对角标的中线方向：角标原位是 10:30 / 1:30，中线指 12:00 */
+const PAIR_MID = 270;
+
+/** 露出那段弧的中心方向（屏幕角度）；未贴边 = null。横竖不会同时贴，所以这里只有三种 */
+function arcCenterFor(dock: { x: DockAxis; y: DockAxis }): number | null {
+  if (dock.x === 1) return 180;    // 球被推到右边：露出的在左（9:00）
+  if (dock.x === -1) return 0;     // 球被推到左边：露出的在右（3:00）
+  if (dock.y === -1) return 90;    // 球被推上去：露出的是球的下半（6:00）
+  if (dock.y === 1) return 270;    // 球被推下去：露出的是球的上半（12:00）
+  return null;
+}
+
+/** 归一到 (-180, 180]，免得 405° 这种数进 CSS（转同样的角度，但读起来要能对上） */
+function normalize(deg: number): number {
+  const d = ((deg + 180) % 360 + 360) % 360 - 180;
+  return d === -180 ? 180 : d;
 }

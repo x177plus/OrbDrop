@@ -283,14 +283,22 @@ struct ProfileFile {
     entries: Vec<ProfileEntry>,
 }
 
-fn parse_profile_file(text: &str) -> ProfileFile {
-    use quick_xml::events::Event;
-
-    let mut file = ProfileFile {
+/// 空文件 / 文件不存在时的起点（走重建那条路时才用）。
+fn empty_profile_file() -> ProfileFile {
+    ProfileFile {
         version: "2".into(),
         min_version: "2".into(),
         ..Default::default()
-    };
+    }
+}
+
+/// 解析现有文件。**解析不了必须报错，不能退化成空表** —— 空表一旦往下走到
+/// `write_profile_file`，写出来的就是"只有我们那条"的文件，用户自己的 FTP/S3 profile
+/// 全丢。所以这里返回 `Err`，由调用方决定"放弃本次写入"（`upsert` 直接上抛）而不是重建。
+fn parse_profile_file(text: &str) -> Result<ProfileFile, String> {
+    use quick_xml::events::Event;
+
+    let mut file = empty_profile_file();
     let mut reader = quick_xml::Reader::from_str(text);
     reader.config_mut().trim_text(false);
 
@@ -302,15 +310,9 @@ fn parse_profile_file(text: &str) -> ProfileFile {
         let before = reader.buffer_position() as usize;
         let event = match reader.read_event() {
             Ok(e) => e,
-            Err(e) => {
-                // 解析不了就当作空文件重建（BC 自己那份永远是合法的，走到这里说明文件被改坏了）。
-                warn!("BCProfiles.xml 解析失败，按空文件重建: {e}");
-                return ProfileFile {
-                    version: "2".into(),
-                    min_version: "2".into(),
-                    ..Default::default()
-                };
-            }
+            // BC 自己那份永远是合法的，走到这里说明文件被改坏了/写了一半：报错，让调用方
+            // 一个字都不要写。删掉重来等于把用户自己的 profile 一起删掉。
+            Err(e) => return Err(format!("{PROFILE_FILE} 解析失败: {e}")),
         };
         match event {
             Event::Start(e) => {
@@ -358,7 +360,7 @@ fn parse_profile_file(text: &str) -> ProfileFile {
             _ => {}
         }
     }
-    file
+    Ok(file)
 }
 
 fn element_attrs(e: &quick_xml::events::BytesStart<'_>) -> Vec<(String, String)> {
@@ -438,15 +440,19 @@ pub fn upsert_webdav_profile(
     password: &str,
 ) -> Result<PathBuf, String> {
     let path = dir.join(PROFILE_FILE);
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let file = if existing.trim().is_empty() {
-        ProfileFile {
-            version: "2".into(),
-            min_version: "2".into(),
-            ..Default::default()
+    // 只有"文件不存在"或"确实是空文件"才允许重建（本来就没有别人的东西可丢）。
+    // 文件在、但读不出来（非 UTF-8 / 权限 / 损坏）时必须**放弃写入**：以前这里
+    // `unwrap_or_default()` 会把读失败当成空文件，随后重写出一份"只有我们那条"的文件，
+    // 用户的 FTP/S3 profile 就这么没了。
+    let file = match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => parse_profile_file(&text)?,
+        Ok(_) => empty_profile_file(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => empty_profile_file(),
+        Err(e) => {
+            return Err(format!(
+                "读取 {PROFILE_FILE} 失败，已放弃写入以免覆盖用户自己的 profile：{e}"
+            ))
         }
-    } else {
-        parse_profile_file(&existing)
     };
 
     let key = file
@@ -501,15 +507,24 @@ pub fn upsert_webdav_profile(
 /// 旧名字永远连不上），留着只会让 BC 拿着死凭据去撞。
 ///
 /// 没有可删的条目时**一个字都不写**：BC 可能正在跑，这个文件只在真要改内容时才碰。
+/// 文件读不出来或解析不了时同样一个字都不写（重写会把用户自己的 profile 一并抹掉）。
 ///
 /// 返回删掉的条目数。
 pub fn prune_webdav_profiles(dir: &Path, keep: &[String]) -> usize {
     let path = dir.join(PROFILE_FILE);
+    // 读不出来（不存在/空/非 UTF-8/权限）：没东西可删，碰都别碰。
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) if !text.trim().is_empty() => text,
         _ => return 0,
     };
-    let mut file = parse_profile_file(&existing);
+    // 解析不了同样一个字都不写（重写会把用户自己的 profile 一并抹掉）。
+    let mut file = match parse_profile_file(&existing) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(path = %path.display(), "清理 BC profile 跳过：{e}");
+            return 0;
+        }
+    };
     let before = file.entries.len();
     file.entries.retain(|e| {
         let ours = e.element == PROFILE_ELEMENT && attr_in_raw(&e.raw, "Username").as_deref() == Some(DAV_USER);
@@ -760,7 +775,7 @@ mod tests {
         assert!(written.contains(other.trim()), "别人的 profile 必须原样保留:\n{written}");
         assert!(written.contains(&format!("Encryption=\"{ENC_PREFIX}{}\"", b64().encode(original_key))));
 
-        let parsed = parse_profile_file(&written);
+        let parsed = parse_profile_file(&written).unwrap();
         assert_eq!(parsed.key.as_deref(), Some(original_key.as_slice()));
         let entry = parsed
             .entries
@@ -794,11 +809,12 @@ mod tests {
         let updated = fs::read_to_string(dir.join(PROFILE_FILE)).unwrap();
         assert_ne!(first, updated);
         let entry = parse_profile_file(&updated)
+            .unwrap()
             .entries
             .into_iter()
             .find(|e| e.value == args.0)
             .unwrap();
-        let key = parse_profile_file(&updated).key.unwrap();
+        let key = parse_profile_file(&updated).unwrap().key.unwrap();
         assert_eq!(
             decrypt_password(&key, &attr_in_raw(&entry.raw, "Password").unwrap()).as_deref(),
             Some("tok2")
@@ -824,13 +840,13 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         let with_ftp = text.replace("</BCProfiles>", &format!("{ftp}\n</BCProfiles>"));
         fs::write(&path, &with_ftp).unwrap();
-        let key = parse_profile_file(&with_ftp).key.unwrap();
+        let key = parse_profile_file(&with_ftp).unwrap().key.unwrap();
 
         let removed = prune_webdav_profiles(&dir, &["10.0.0.1:3890".to_string()]);
         assert_eq!(removed, 1, "只该删掉已解除配对的那一条");
 
         let written = fs::read_to_string(&path).unwrap();
-        let parsed = parse_profile_file(&written);
+        let parsed = parse_profile_file(&written).unwrap();
         let by_name = |n: &str| parsed.entries.iter().find(|e| e.value == n);
         assert!(by_name("10.0.0.1:3890").is_some(), "在册设备必须保留:\n{written}");
         assert!(by_name("10.0.0.2:3890").is_none(), "孤儿条目该被清掉:\n{written}");
@@ -860,7 +876,7 @@ mod tests {
 
         upsert_webdav_profile(&dir, "10.0.0.9:3890", "http://10.0.0.9:3890/dav/", DAV_USER, "tok-old").unwrap();
 
-        let parsed = parse_profile_file(&fs::read_to_string(dir.join(PROFILE_FILE)).unwrap());
+        let parsed = parse_profile_file(&fs::read_to_string(dir.join(PROFILE_FILE)).unwrap()).unwrap();
         let ours: Vec<&ProfileEntry> = parsed
             .entries
             .iter()
@@ -893,7 +909,7 @@ mod tests {
 
         upsert_webdav_profile(&dir, "10.2.0.1:3890", "http://10.2.0.1:3890/dav/", DAV_USER, "tok-1").unwrap();
         let written = fs::read_to_string(&path).unwrap();
-        let parsed = parse_profile_file(&written);
+        let parsed = parse_profile_file(&written).unwrap();
         assert_eq!(
             parsed.entries.iter().filter(|e| e.value == "10.2.0.1:3890").count(),
             1,
@@ -905,7 +921,7 @@ mod tests {
         // 整份文件被删：下一次比较要把文件重建出来（新密钥），不能报错
         fs::remove_file(&path).unwrap();
         upsert_webdav_profile(&dir, "10.2.0.1:3890", "http://10.2.0.1:3890/dav/", DAV_USER, "tok-1").unwrap();
-        let recreated = parse_profile_file(&fs::read_to_string(&path).unwrap());
+        let recreated = parse_profile_file(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(recreated.key.is_some(), "重建的文件也要有文件级密钥");
         assert_eq!(
             recreated.entries.iter().filter(|e| e.value == "10.2.0.1:3890").count(),
@@ -928,7 +944,7 @@ mod tests {
 
         let path = dir.join(PROFILE_FILE);
         let written = fs::read_to_string(&path).unwrap();
-        let parsed = parse_profile_file(&written);
+        let parsed = parse_profile_file(&written).unwrap();
         let ours: Vec<&str> = parsed
             .entries
             .iter()
@@ -1030,6 +1046,54 @@ mod tests {
         fs::write(&file, &with_user).unwrap();
         provision_profiles(&state);
         assert_eq!(fs::read_to_string(&file).unwrap(), with_user);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// 文件在、但**读不出来或解析不了**时必须放弃写入：这是唯一真能删掉用户自己 profile 的
+    /// 路径（旧实现把读失败/解析失败当成空文件，重写出一份"只有我们那条"的文件）。
+    /// 文件真的不存在时仍要重建（否则首次比较直接失败）。
+    #[test]
+    fn unreadable_or_corrupt_file_is_left_untouched() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_bc_bad_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PROFILE_FILE);
+        let args = ("10.0.0.1:3890", "http://10.0.0.1:3890/dav/", DAV_USER, "tok");
+
+        // ① 非 UTF-8（UTF-16 落盘的 BCProfiles.xml，带 BOM）：`read_to_string` 失败 → 放弃写入
+        let mut utf16: Vec<u8> = vec![0xFF, 0xFE];
+        utf16.extend(
+            "<?xml version=\"1.0\"?><BCProfiles><TFtpProfile Value=\"KeepMe\"/></BCProfiles>"
+                .encode_utf16()
+                .flat_map(|u| u.to_le_bytes()),
+        );
+        fs::write(&path, &utf16).unwrap();
+        assert!(fs::read_to_string(&path).is_err(), "前提：这份文件不是合法 UTF-8");
+        assert!(
+            upsert_webdav_profile(&dir, args.0, args.1, args.2, args.3).is_err(),
+            "读不出来的文件必须上抛错误，而不是重建"
+        );
+        assert_eq!(fs::read(&path).unwrap(), utf16, "读不出来时一个字节都不能改");
+        assert_eq!(prune_webdav_profiles(&dir, &[]), 0);
+        assert_eq!(fs::read(&path).unwrap(), utf16);
+
+        // ② 半截/串标签的 XML：解析失败 → 同样放弃写入
+        let broken = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                      <BCProfiles Encryption=\"BCmp|1|AAAA\" Version=\"2\">\n\
+                      \t<TFtpProfile Value=\"KeepMe\">\n\t</TWebDAVProfile>\n</BCProfiles>\n";
+        fs::write(&path, broken).unwrap();
+        assert!(
+            upsert_webdav_profile(&dir, args.0, args.1, args.2, args.3).is_err(),
+            "解析失败必须上抛错误，而不是重建"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken, "解析失败时一个字节都不能改");
+        assert_eq!(prune_webdav_profiles(&dir, &[]), 0);
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
+
+        // ③ 文件真的不存在：仍要重建（这条不能因为上面的加固而退化）
+        fs::remove_file(&path).unwrap();
+        upsert_webdav_profile(&dir, args.0, args.1, args.2, args.3).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains(args.0));
 
         let _ = fs::remove_dir_all(dir);
     }

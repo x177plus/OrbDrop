@@ -9,6 +9,18 @@ use tracing::{info, warn};
 // Registration (advertise)
 // ---------------------------------------------------------------------------
 
+/// mDNS 服务类型（`register` 与注销共用一份字面量）。
+const SERVICE_TYPE: &str = "_orbdrop._tcp.local.";
+
+/// 本机在 mDNS 上的服务全名：`register` 注册用的就是它，「离线」时按它精确注销。
+///
+/// 注销必须点名到这一条记录：只把 `ServiceDaemon` 丢掉，对端缓存里的记录要等 TTL
+/// （约 2 分钟）自然过期才消失 —— 那段时间里它仍然看得见本机。`unregister` 会立刻
+/// 发一条 TTL=0 的告别包。
+pub fn service_fullname(device_name: &str) -> String {
+    format!("OrbDrop-{}.{}", device_name, SERVICE_TYPE)
+}
+
 /// Register the OrbDrop service via mDNS so same-subnet peers can discover us.
 ///
 /// With `enable_addr_auto()`, the daemon fills in the host's non-loopback IPv4
@@ -24,7 +36,7 @@ pub fn register(port: u16, device_name: &str, device_id: &str) -> Option<Service
     };
 
     let instance_name = format!("OrbDrop-{}", device_name);
-    let service_type = "_orbdrop._tcp.local.";
+    let service_type = SERVICE_TYPE;
     let host = format!("{}.local.", device_name.replace(' ', "-"));
 
     let mut properties = HashMap::new();

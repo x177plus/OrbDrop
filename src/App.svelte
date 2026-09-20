@@ -1,17 +1,17 @@
 <script lang="ts">
   import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
   import { LogicalSize } from '@tauri-apps/api/dpi';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { fly } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
   import { listen } from '@tauri-apps/api/event';
   import { getDevices, loadDevices } from '$lib/stores/devices.svelte';
   import { getServerPort, setServerPort, loadShares, addShare, removeShare, getShares } from '$lib/stores/shares.svelte';
-  import { loadSettings } from '$lib/stores/settings.svelte';
+  import { loadSettings, getSettings } from '$lib/stores/settings.svelte';
   import { getBcStatus, loadBcStatus, setBcSide, clearSide, compare } from '$lib/stores/bc.svelte';
-  import { getActualPort, startHttpServer, acceptPush, rejectPush, cancelPush, cancelReceive, pushPaths, localAddresses, orbScreenMetrics, orbSetRect, orbDragStart, orbMouseDown, orbSavePos, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer } from '$lib/api';
-  import type { PushInvite, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick } from '$lib/types';
-  import { planExpansion, planCollapse, planDock, type DockPlan, type ScreenRect } from '$lib/orbLayout';
+  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, localAddresses, orbScreenMetrics, orbSetRect, orbDragStart, orbMouseDown, orbSavePos, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, openPath } from '$lib/api';
+  import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick } from '$lib/types';
+  import { planExpansion, planCollapse, planDock, spinForDock, type BadgeSpin, type DockPlan, type ScreenRect } from '$lib/orbLayout';
   import Orb from '$lib/components/Orb.svelte';
   import FilePicker from '$lib/components/FilePicker.svelte';
   import Logo from '$lib/components/Logo.svelte';
@@ -61,6 +61,9 @@
   // 悬停热区（窗口内偏移 + 尺寸，CSS px）：贴边时覆盖「露出的半颗」到「完整球」的并集，
   // 由 CSS :hover 触发球滑出/滑回；未贴边时就是球本身
   let orbZone = $state<ScreenRect>({ x: ORB_INSET, y: ORB_INSET, w: ORB_SIZE, h: ORB_SIZE });
+  // 贴边收起时两颗角标各自绕球心的转角（度）：左 = 黄（通知数）、右 = 绿（长连接设备数）。
+  // 数值由贴边方向定（`spinForDock`）：同号 = 整对一起扫、一正一负 = 两条臂各自荡开（贴上）
+  let badgeSpin = $state<BadgeSpin>({ left: 0, right: 0 });
   // true = 悬浮球强制隐藏（切窗口期间）；用 transition:none 立即生效，不能让它带过渡露脸
   let holdOrb = $state(false);
   let ballRect = $state<ScreenRect | null>(null);
@@ -70,22 +73,18 @@
   let opening = false;
   let settling = false;   // 落位判定进行中（含「等松手」轮询）：防止 move 事件重复起一轮
 
-  // 发送侧：一条推送从"等对方同意"到传完，全程只有这一张卡片。
-  // 是个列表而不是单张：同时在推两个目标（或同一目标的两个文件）时，两张卡各自走完，
-  // 不会被后来者顶掉 —— 顶掉等于把前一条的进度条凭空抹掉。
-  type PushCard = {
-    inviteId: string;
-    target: string;      // 目标设备名
-    name: string;        // 文件/目录名（多选时是容器名）
-    /** 这次推了几项（>1 = 多选）。 */
-    count: number;
-    total: number;       // 总字节数
-    received: number;
-    phase: 'waiting' | 'sending' | 'done';
-    /** 目标已绑定：对方**不需要点同意**，所以"等待对方同意"那一段只是短暂过场。 */
-    auto: boolean;
-  };
-  let pushCards = $state<PushCard[]>([]);
+  // 发送侧：一次推送操作（可能覆盖多台设备）= 一张卡。是个列表而不是单张：同时在推两批
+  // （或一边推一边还在等上一批）时，两张卡各自走完，不会被后来者顶掉 —— 顶掉等于把前一条
+  // 的进度条凭空抹掉。
+  //
+  // 数据全部来自后端的 `push://batch` 快照（`BatchView`）：每台的成败、还差几台、
+  // 聚合进度都是后端算好的 —— 界面不做"把 N 条邀请事件拼成一张卡"的聚合运算，
+  // 否则同一张卡就有两处真相（谁先到先算谁的）。单台推送也是一批（只有一条目标）。
+  let pushBatches = $state<PushBatch[]>([]);
+  /** 一批超过 5 台时列表先只列 4 行：展开了的批次记在这里（按 batchId）。 */
+  let expandedBatches = $state<Record<string, boolean>>({});
+  /** 已经收过尾的批次（toast/定时收起只做一次，快照可能连着来好几条终态）。 */
+  const settledBatches = new Set<string>();
   // 接收侧：待处理的通知（推送邀请 / 接收中 / 已收到待确认 / 接收失败）。
   // 悬浮球左上角的数字就是这个数组的长度 —— 卡片/气泡撤掉，数字就减。
   type PushNotice = {
@@ -115,6 +114,43 @@
   let notices = $state<PushNotice[]>([]);
   // 铃铛：展开/收起右下角那组"等你确认"的气泡。收起 ≠ 已读 —— 角标照旧挂着。
   let notifOpen = $state(true);
+  // 本机「在线 / 离线」状态框（面板右上角）：展开态 + 当前值。值来自后端（`AppSettings.online`
+  // 落盘、跨重启有效），这里只做镜像；切换时先乐观改本地、失败再翻回去（后端回话要几十毫秒，
+  // 中间那一下"点了没反应"最像卡死）。
+  let statusOpen = $state(false);
+  let statusEl = $state<HTMLElement | null>(null);
+  let localOnline = $state(true);
+
+  /**
+   * 点状态框里的一行。
+   *
+   * 点是**当前值**那一行时它是"开关"：收起时展开列表、展开时收起（不重复切状态）。
+   * 收起态下另一行是 `visibility: hidden` 的（不可点），所以这个开关只可能落在当前值那行。
+   * 点另一行就是切过去，顺带收起列表。
+   */
+  function pickOnline(on: boolean) {
+    if (on === localOnline) statusOpen = !statusOpen;
+    else void setLocalOnline(on);
+  }
+
+  /**
+   * 切「在线 / 离线」：离线 = 隐身（不广播 mDNS、断全部长连接、拒收一切入站请求），
+   * 配对关系与共享项都不动。**先收起列表再切** —— 与点图标按钮同一套手感，
+   * 也让"框长回去"和"状态变了"是同一段动画里的事。
+   */
+  async function setLocalOnline(on: boolean) {
+    statusOpen = false;
+    if (on === localOnline) return;
+    const prev = localOnline;
+    localOnline = on;
+    try {
+      await setOnline(on);
+      toast(on ? '已切回「在线」，重新对局域网可见' : '已切到「离线」，本机对局域网隐身');
+    } catch (e) {
+      localOnline = prev;
+      toast(typeof e === 'string' ? e : '切换在线状态失败');
+    }
+  }
   // 文件选择框的请求：标题/说明/确认按钮文案 + 确认动作。推送与「添加共享项」都用它 ——
   // 同一个选择框只该有一套开关方式，所以这里存的是**要开成什么样**，而不是某个具体用途。
   let picker = $state<{
@@ -149,7 +185,8 @@
   // 悬浮球左上角 / 铃铛的角标：这一组里还有几件事（通知 + 在途推送）。
   // 铃铛收起的不只是"通知"—— 发送方的进度卡也在同一组里，所以角标得一起算，
   // 否则会出现"收起后角标还在、但组里明明有东西"的错位。
-  let notifCount = $derived(notices.length + pushCards.length);
+  // **一批多设备推送算一件**：用户点一次就得到一张卡，角标自然跟着"几次操作"走。
+  let notifCount = $derived(notices.length + pushBatches.length);
   // 通知（面板右下角那组气泡）：未绑定的邀请、正在接收、已收到待确认、失败 —— **全都在
   // 这一组里**，形状统一（右对齐、2/3 面板宽，不占满）。要当场点的按钮（接收/拒绝/取消）
   // 就长在气泡里，所以它们不单独占一层。
@@ -157,6 +194,7 @@
   let notifEl = $state<HTMLDivElement | null>(null);
   $effect(() => {
     void notices.length;
+    void pushBatches.length;
     if (notifEl) notifEl.scrollTop = notifEl.scrollHeight;
   });
   // footer 的实际高度 + 通知组能用的最大高度：两个都量，不写死数字。
@@ -239,7 +277,7 @@
     return a.kind === 'peer' && b.kind === 'peer' ? a.peerId === b.peerId : true;
   }
 
-  // BC 菜单的显示条件：右键项与比较位的组合决定文案与可用性
+  // BC 菜单的显示条件：本机没装 BC（exePath 为空）时整区隐藏；装了则由右键项与比较位的组合决定文案与可用性
   let bcMenu = $derived.by(() => {
     const st = getBcStatus();
     const target = ctxState ? ctxBcTarget(ctxState) : null;
@@ -248,6 +286,7 @@
     const otherLeft = !!(target && st.left && !thisLeft);           // 对手方在左侧
     const otherRight = !!(target && st.right && !thisRight);
     return {
+      available: st.exePath !== null,
       leftLabel: st.left?.label ?? null,
       rightLabel: st.right?.label ?? null,
       compareLabel: otherLeft && otherRight ? '左右比较位' : otherLeft ? '与左侧' : otherRight ? '与右侧' : '',
@@ -304,25 +343,71 @@
     }
   }
 
-  /** 未贴边的折叠态：球居中内缩、热区就是球自己 */
+  /**
+   * 球回到「未贴边」的折叠态：居中内缩、热区就是球自己、角标不转。
+   * 两个调用点：展开失败的回退，以及**起拖那一刻**（拖动期间不能挂着上一次的贴边偏移，
+   * 见 `beginOrbDrag`）。
+   */
   function resetOrbDom() {
     orbOffset = { x: ORB_INSET, y: ORB_INSET };
     orbZone = { x: ORB_INSET, y: ORB_INSET, w: ORB_SIZE, h: ORB_SIZE };
+    badgeSpin = { left: 0, right: 0 };
+  }
+
+  /** 悬停热区（窗口内 CSS px）；贴边方向一并定下，球还没滑出去时它就先就位了 */
+  function setDockZone(plan: DockPlan, sf: number) {
+    orbZone = { x: plan.zone.x / sf, y: plan.zone.y / sf, w: plan.zone.w / sf, h: plan.zone.h / sf };
   }
 
   /**
-   * 落位到吸附结果：先把窗口（连同球的裁剪边界）挪到位，再更新球偏移与热区 ——
-   * 顺序不能反，否则球会在旧窗口里先滑一次、再随窗口跳一下。
+   * 球偏移 + 角标朝向 = 贴边收起后的最终形态。
+   * 这两样是**给人看的一段动画**（球从屏幕边缘收进去 ↔ 角标沿球缘逆时针转 90°），
+   * 时长/缓动一致，看起来是一个动作；分两个入口只是为了控制它从哪一刻开始跑：
+   * 球此刻可见（拖动落位）→ `setDockDom` 一次到位；球还藏在 `holdOrb` 里（收起）→ 见 `revealDock`。
    */
-  async function applyDock(plan: DockPlan, sf: number) {
-    await orbSetRect(plan.window);
-    setDockDom(plan, sf);
+  function setDockOrb(plan: DockPlan, sf: number) {
+    orbOffset = { x: plan.orb.x / sf, y: plan.orb.y / sf };
+    badgeSpin = spinForDock(plan.dock);   // 角标转到哪：规则与实测都在 `orbLayout` 里
   }
 
-  /** 球偏移与悬停热区（窗口内 CSS px） */
+  /** 落位结果一次性生效（拖动落位用） */
   function setDockDom(plan: DockPlan, sf: number) {
-    orbZone = { x: plan.zone.x / sf, y: plan.zone.y / sf, w: plan.zone.w / sf, h: plan.zone.h / sf };
-    orbOffset = { x: plan.orb.x / sf, y: plan.orb.y / sf };
+    setDockZone(plan, sf);
+    setDockOrb(plan, sf);
+  }
+
+  /** 把球停在「完整可见」位、角标不转：收起时先这样露面，再收进去（见 `revealDock`） */
+  function parkOrb() {
+    orbOffset = { x: ORB_INSET, y: ORB_INSET };
+    badgeSpin = { left: 0, right: 0 };
+  }
+
+  /**
+   * 逼一次样式重算（读一次布局即触发）。
+   *
+   * `holdOrb` 期间 `.orb` 是 `transition: none` —— 这一帧算出来的值，正是之后那段过渡的
+   * **起点**。不逼这一下，等会儿「解除 hold」与「改球偏移」有可能落进同一次样式重算，
+   * 起点就退回更早的旧偏移（球会从它展开时所在的那一格一路飞过来）。见 `revealDock`。
+   *
+   * 调用前要先 `await tick()`：`parkOrb` 写的是 `$state`，Svelte 的 DOM 更新排在同一段微任务里，
+   * 同步读布局读到的还是改之前的值，等于没逼。
+   */
+  function flushLayout() {
+    void document.body.offsetHeight;
+  }
+
+  /**
+   * 贴边收起那段**给人看**的动画：球从完整位滑出屏幕外（贴边侧探出 `overhang`），两个角标
+   * 同时沿球缘逆时针转 90°。
+   *
+   * 排在球露面之后（`holdOrb = false`）再等一帧：隐藏期间球的位置换了两次（展开位 → 完整位
+   * 由 `parkOrb` 落定，`flushLayout` 已把起点算出来），这一帧要先把「球完整可见」画出来，
+   * 下一帧才改偏移 —— 于是滑动是从屏幕边滑进去的，而不是瞬移。
+   */
+  async function revealDock(plan: DockPlan, sf: number) {
+    if (!plan.dock.x && !plan.dock.y) return;   // 未贴边：球本来就停在完整位
+    await new Promise(requestAnimationFrame);
+    setDockOrb(plan, sf);
   }
 
   /** 吸附判定：自由落位的折叠态窗口 → 贴边收起大半颗（未贴边的轴保持原样） */
@@ -351,10 +436,22 @@
    * 「球正在悬停滑入」那一段由 `Orb` 挡在起拖之前（等滑动结束），所以这里只需算指针那一段。
    */
   async function beginOrbDrag(info: OrbDragInfo) {
+    // 起拖当场把球放回「完整可见」位（内缩 + 角标不转），热区也收回球自己身上。
+    //
+    // 拖动期间球是跟着窗口（指针）走的，而球偏移只有落位判定（`settleDrag`）才会更新 ——
+    // 上一次贴边收起的偏移（`--orb-x` = 69 那种）会一直挂在球上：指针一旦离开球，悬停那层
+    // 遮不住，球就带着贴边偏移画到窗口外，屏幕上就是「边缘被切一刀」；松手后按新落点重新
+    // 贴边，看起来就成了「先播了一次旧方向的贴边动画，再播新方向的」（拖到上边却先出现
+    // 右侧那道裁切线，就是这么来的）。
+    // 热区收回球自己身上还消掉一个抖动源：拖动期间悬停与不悬停同形，指针相对球怎么漂都一样。
+    // 窗口对齐（`orbDragStart` → Rust 的 `drag_align`）也是按「球在完整位」算的：按下点本就
+    // 落在完整位上的球上，偏移一清，球才真钉在指针下。
+    resetOrbDom();
     try {
       await orbDragStart(info.pressX, info.pressY);
     } catch (e) {
       console.error('悬浮球起拖失败:', e);   // 起不来就是这一次拖不动，别把异常抛进事件处理里
+      void settleDrag();                     // 球已放回完整位：按当前窗口位置重判一次落位
     }
   }
 
@@ -427,22 +524,33 @@
 
   /**
    * 收起落位：先把悬浮球原矩形按窗口位移平移（球贴回面板里它原来所在的那一角），
-   * 再判吸附 —— 面板被拖到屏幕边上时，收起就是贴边收起半颗。
+   * 再判吸附 —— 面板被拖到屏幕边缘时，收起就是贴边收起半颗。
+   *
+   * 窗口（连同球的裁剪边界）与热区当场到位，**球偏移与角标转不转先押后**：它们要等球露面
+   * 之后才切（`revealDock`），否则这段动画会在 `holdOrb` 的隐藏期间跑完 —— 球一露面就已经
+   * 收进去了、角标也已经转好了，等于没做动画。
    */
-  async function settleCollapse(ball: ScreenRect, expanded: ScreenRect | null) {
+  async function settleCollapse(ball: ScreenRect, expanded: ScreenRect | null): Promise<{ plan: DockPlan; sf: number }> {
     const metrics = await orbScreenMetrics();
     const sf = metrics.scaleFactor;
     const free = expanded
       ? planCollapse({ ball, expanded, current: await appWindow.outerPosition() })
       : ball;   // 没记下展开矩形（异常路径）：按原样缩回
     const plan = dockPlan(free, sf, metrics.workArea);
-    await applyDock(plan, sf);
+    await orbSetRect(plan.window);
+    setDockZone(plan, sf);
+    parkOrb();
+    await tick();                  // 等 park 落进 DOM（`$state` 的更新在微任务里）
+    flushLayout();                 // 把「球完整可见」定成过渡起点（`holdOrb` 里 transition 是关的）
     await rememberOrbPos(plan.window);   // 收起后的落位才是球下次该出现的地方
+    return { plan, sf };
   }
 
   /**
-   * 收起：面板先折叠淡出（此时窗口未变、球也没露脸），随后把窗口与球偏移一起切到
-   * 吸附后的落位，切完才让悬浮球淡入 —— 悬浮球只在几何完全 settle 之后才可见。
+   * 收起：面板先折叠淡出（此时窗口未变、球也没露脸），随后把窗口切到吸附后的落位 ——
+   * 切完让悬浮球露面（**停在完整可见位**），露面那一帧之后才让它收进去、角标同时转 90°。
+   * 于是「收进去」这段动画是看得见的：球只在几何完全 settle 之后才可见，但可见之后的
+   * 那一段滑动/旋转留在明处，不在 `holdOrb` 的隐藏期间偷偷跑完。
    */
   function collapse() {
     expanded = false;
@@ -459,14 +567,16 @@
       ballRect = null;
       expandedRect = null;
       void (async () => {
+        let settled: { plan: DockPlan; sf: number } | null = null;
         try {
-          if (ball) await settleCollapse(ball, expanded);
+          if (ball) settled = await settleCollapse(ball, expanded);
           else resetOrbDom();   // 没记下展开矩形（异常路径）：回到未贴边的折叠态
         } catch (e) {
           console.error('收起悬浮球失败:', e);
         } finally {
-          holdOrb = false;
+          holdOrb = false;      // 几何已 settle，球可以露面了
         }
+        if (settled) await revealDock(settled.plan, settled.sf);   // 露面之后才收进去 + 转角标
       })();
     }, FOLD_MS);
   }
@@ -494,25 +604,129 @@
     return total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0;
   }
 
-  /**
-   * 发送卡的标题。
-   *
-   * 多选时**只说项数不说名字**：那个"名字"是分组用的标签（共同父目录名或「N 项」），
-   * 而落盘时它并不参与路径（见 `manifest_for_paths`）—— 写成"正在发送 · 3 项（3 项）"
-   * 是把同一件事说了两遍。
-   */
-  function pushCardTitle(c: PushCard): string {
-    if (c.count > 1) {
-      const what = `（${c.count} 项）`;
-      return c.phase === 'done' ? `已发送${what}` : c.phase === 'sending' ? `正在发送${what}` : `等待对方同意${what}`;
-    }
-    if (c.phase === 'done') return `已发送 · ${c.name}`;
-    if (c.phase === 'sending') return `正在发送 · ${c.name}`;
-    return '等待对方同意';
+  /** 这一批还有几件"在路上"（邀请挂着或正在传）—— 卡片能不能取消、要不要粘住都看它。 */
+  function batchLive(b: PushBatch): boolean {
+    return b.waiting > 0;
+  }
+
+  function batchAllDone(b: PushBatch): boolean {
+    return b.waiting === 0 && b.failed === 0;
   }
 
   /**
-   * 点「推送」：直接开选择框（文件与文件夹混选、可跨目录累积）。
+   * 有台没成、且这一批不止一台 → 卡片**粘住**，点「知道了」才消失。
+   *
+   * 一条 toast 说不清"是 3 台里的哪一台失败了"，而单台推送那条路的收尾方式（toast +
+   * 自动收掉）已经够用且是用户熟悉的 —— 所以只有多设备这一档需要留一张能逐行看的卡。
+   */
+  function batchSticky(b: PushBatch): boolean {
+    return b.targets.length > 1 && !batchLive(b) && !batchAllDone(b);
+  }
+
+  /**
+   * 发送卡的标题。
+   *
+   * 多台设备：`推送给「A」「B」等 3 台设备`（用户一眼看到"这次推给了谁、几台"），
+   * 名字超过两个就省略，完整名单在悬停里（`batchTitleFull`）。
+   *
+   * 单台：沿用原来那套标题。多选时**只说项数不说名字**：那个"名字"是分组用的标签
+   * （共同父目录名或「N 项」），而落盘时它并不参与路径（见 `manifest_for_paths`）——
+   * 写成"正在发送 · 3 项（3 项）"是把同一件事说了两遍。
+   */
+  function pushBatchTitle(b: PushBatch): string {
+    const live = batchLive(b);
+    const sending = b.targets.some((t) => t.state === 'sending');
+    if (b.targets.length > 1) {
+      const names = b.targets.map((t) => `「${t.target}」`);
+      const head = names.length <= 2 ? names.join('') : `${names[0]}${names[1]}等 ${names.length} 台设备`;
+      return `推送给${head}`;
+    }
+    if (b.count > 1) {
+      const what = `（${b.count} 项）`;
+      return !live ? `已发送${what}` : sending ? `正在发送${what}` : `等待对方同意${what}`;
+    }
+    if (!live) return `已发送 · ${b.name}`;
+    return sending ? `正在发送 · ${b.name}` : '等待对方同意';
+  }
+
+  /** 悬停里的完整名单（标题只放得下两个名字）。 */
+  function batchTitleFull(b: PushBatch): string {
+    if (b.targets.length < 3) return '';
+    return b.targets.map((t) => t.target).join('、');
+  }
+
+  /**
+   * 计数行 = 用户要的那两个数（还有失败时补一个）：成功 x · 等待 y · 失败 z。
+   * 全成时换成一句结论 —— 那时候数字已经没有信息量了。
+   */
+  function batchCounts(b: PushBatch): string {
+    if (batchAllDone(b)) {
+      return b.targets.length > 1 ? `${b.targets.length} 台全部完成` : '已发送完成';
+    }
+    const failed = b.failed > 0 ? ` · 失败 ${b.failed}` : '';
+    return `成功 ${b.done} · 等待 ${b.waiting}${failed}`;
+  }
+
+  /**
+   * 一行目标设备的行内文案。
+   *
+   * 已配对的目标**不问同意**直接收（token 就是那份信任），所以它那一行不能说
+   * 「等待对方同意」—— 对面根本没点过任何东西，说成"等同意"是在编一个没发生的事。
+   */
+  function targetLabel(t: PushTarget, total: number): string {
+    switch (t.state) {
+      case 'invited': return t.paired ? '等待开始（对方自动接收）' : '等待对方同意';
+      case 'sending': return `传输中 ${pushPercent(t.received, total)}%`;
+      case 'done': return `已发送 ${fmtBytes(t.received)}`;
+      case 'cancelled': return '已取消';
+      case 'rejected': return '对方拒绝';
+      default: return `失败：${t.error ?? '未知原因'}`;
+    }
+  }
+
+  /**
+   * 每一台的字节总量。
+   *
+   * 整批的 `total` 是所有**还在算的台**之和（失败/取消的整条不计），而各台都是同一份清单
+   * —— 除以"还在算的台数"就得到每一台的总量。分母必须用 `done + waiting`：
+   * 已经完成的那几台仍在 `total` 里，只用 `waiting` 会把它们的量摊到剩下这几台上，
+   * 于是某台传到一半却显示成 15%（实际 30%）。
+   */
+  function batchPerTarget(b: PushBatch): number {
+    const live = b.done + b.waiting;
+    return live > 0 ? Math.round(b.total / live) : 0;
+  }
+
+  /** 行首那颗点：沿用设备行那套视觉（绿=活的/成了，灰=在等，红=没成）。 */
+  function targetDot(t: PushTarget): string {
+    switch (t.state) {
+      case 'done': return 'dot ok';
+      case 'sending': return 'dot ok';
+      case 'invited': return 'dot off';
+      default: return 'dot danger';
+    }
+  }
+
+  /** 一批里现在要看的那几行：>5 台时先列 4 行，其余在「还有 N 台」后面（点开就地展开）。 */
+  function visibleTargets(b: PushBatch): PushTarget[] {
+    if (b.targets.length <= 5 || expandedBatches[b.batchId]) return b.targets;
+    return b.targets.slice(0, 4);
+  }
+
+  /** 这一条邀请属于哪一批（回执只知道邀请 id）。 */
+  function batchForInvite(inviteId: string): PushBatch | undefined {
+    return pushBatches.find((b) => b.targets.some((t) => t.inviteId === inviteId));
+  }
+
+  function dropBatch(batchId: string) {
+    // 收尾标记跟着卡片一起清：它只在"卡片还挂着、终态快照可能连着来"的那段时间有用
+    // （后端在这一批没有在路上之后就不再发事件了，所以清掉不会让谁重新收一次尾）。
+    settledBatches.delete(batchId);
+    pushBatches = pushBatches.filter((b) => b.batchId !== batchId);
+  }
+
+  /**
+   * 点「推送」（设备行 / 右键菜单）：开选择框，文件与文件夹混选、可跨目录累积。
    *
    * 以前这里还有一层"先问推文件还是文件夹"——那是原生框的能力限制逼出来的：Windows 的
    * `IFileOpenDialog` 只有 `FOS_PICKFOLDERS` 一个开关（非此即彼），rfd 也只给
@@ -520,31 +734,48 @@
    * 用户可以先把一个文件勾上、再进另一层目录把整个文件夹勾上，一次推过去。
    */
   function requestPush(device: PeerDevice) {
-    if (!device.online) {
-      toast(`「${device.name}」不在网上，推送未发送`);
+    requestPushMany([device]);
+  }
+
+  /**
+   * 多设备推送：设备页多选勾好 N 台之后走这里 —— **只开一次选择框**，
+   * 同一批文件并发给每台（各台一条邀请、各自同意、各自进度；清单只建一次）。
+   */
+  function requestPushMany(devices: PeerDevice[]) {
+    const live = devices.filter((d) => d.online);
+    if (live.length === 0) {
+      toast(devices.length === 1 ? `「${devices[0].name}」不在网上，推送未发送` : '所选设备都不在网上，推送未发送');
       return;
     }
     picker = {
-      title: `推送到「${device.name}」`,
-      sub: '文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。对方同意后开始传输，多项合并成一条推送，只需同意一次。',
-      confirmLabel: '推送',
-      onConfirm: (items) => void pushPicked(items, device),
+      title: `推送到${pushTargetsLabel(live)}`,
+      sub: '文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。同一份内容会分别发给每台设备：已配对的直接收，未绑定的各自点同意，进度与成败都记在右下角那张卡片上。',
+      confirmLabel: live.length > 1 ? `推送到 ${live.length} 台设备` : '推送',
+      onConfirm: (items) => void pushPicked(items, live),
     };
+  }
+
+  /** 「A」「B」等 3 台设备 —— 与卡片标题同一个规则（设备名一律用「」框住）。 */
+  function pushTargetsLabel(devices: PeerDevice[]): string {
+    const names = devices.map((d) => `「${d.name}」`);
+    if (names.length === 1) return names[0];
+    if (names.length === 2) return names.join('');
+    return `${names[0]}${names[1]}等 ${names.length} 台设备`;
   }
 
   function closePicker() {
     picker = null;
   }
 
-  /** 推送确认：关框 → 把那批路径交给后端去送（取消时这里根本不会调到）。 */
-  async function pushPicked(items: LocalPick[], device: PeerDevice) {
+  /** 推送确认：关框 → 把这批路径交给后端去送（取消时这里根本不会调到）。 */
+  async function pushPicked(items: LocalPick[], devices: PeerDevice[]) {
     closePicker();
     if (items.length === 0) return;
     try {
-      // 多选合并成**一条**推送：对端一张卡、一次同意、一条进度。
-      await pushPaths(items.map((i) => i.path), device.id);
+      // 同一份清单发给每台：多选合并成**每台一条**推送（对端一张卡、一次同意、一条进度）。
+      await pushPaths(items.map((i) => i.path), devices.map((d) => d.id));
     } catch (e) {
-      toast(String(e));    // 对方离线等：就地失败，不排队（F-53）
+      toast(String(e));    // 全都不可达等：就地失败，不排队（F-53）
     }
   }
 
@@ -590,6 +821,11 @@
     try { await cancelPush(inviteId); } catch (e) { toast(String(e)); }
   }
 
+  /** 取消整批（卡片上的「取消全部」）：各台各撤一条，任何一台撤不动都不影响其余几台。 */
+  async function cancelBatch(batchId: string) {
+    try { await cancelPushBatch(batchId); } catch (e) { toast(String(e)); }
+  }
+
   function dropNotice(inviteId: string) {
     notices = notices.filter((n) => n.inviteId !== inviteId);
   }
@@ -597,6 +833,24 @@
   /** 气泡上的「知道了」：只撤这一条 —— 悬浮球与铃铛上的数字跟着减。 */
   function confirmNotice(inviteId: string) {
     dropNotice(inviteId);
+  }
+
+  /**
+   * 气泡上的「打开目录」：把落盘位置交给系统（目录 = 文件管理器里打开），随后也撤掉这一条 ——
+   * 按它和按「知道了」一样是"这条我处理完了"，不会再有一条气泡挂着同一个目录。
+   *
+   * 开不起来（目录已被移走/删掉）就**留住**这条并说明原因：这条通知存在的意义就是
+   * "东西落在哪"，不能在什么都没打开的情况下把它抹掉。
+   */
+  async function openNoticeDir(n: PushNotice) {
+    const dest = n.dest;
+    if (!dest) return;
+    try {
+      await openPath(dest);
+      dropNotice(n.inviteId);
+    } catch (e) {
+      toast(`打开目录失败：${e}`);
+    }
   }
 
   /** 通知标题（与发送卡同一套规则：多项只说项数，不说那个分组标签）。 */
@@ -843,7 +1097,14 @@
   }
 
   function openSettings() { showSettings = true; }
-  function closeSettings() { showSettings = false; }
+  /**
+   * 设置面板保存/取消后都要重探一次 BC：菜单里的 BC 区跟着 `bc_status.exePath` 走，
+   * 用户刚在设置里填了 BC 路径（或清空），右键菜单必须立刻反映，不能等下次启动。
+   */
+  function closeSettings() {
+    showSettings = false;
+    void loadBcStatus();
+  }
 
   function hideCtx() { ctxState = null; }
 
@@ -1028,6 +1289,8 @@
     void (async () => {
       try {
         await Promise.all([loadSettings(), loadDevices(), loadBcStatus()]);
+        // 状态框的初始值跟着落盘的设置走（上次退出时是「离线」就还是「离线」）。
+        localOnline = getSettings()?.online ?? true;
         const port = await getActualPort();
         if (port === 0) {
           const p = await startHttpServer();
@@ -1081,24 +1344,46 @@
       }];
     });
 
-    // 邀请已发出：等对方同意（长连接与 HTTP 两条通道都是这一条事件）。
-    // 目标已绑定的话对方不会问人（后端直接收），所以这张卡上的"等待对方同意"只是一瞬。
-    const unPushSent = listen<{ inviteId: string; peerId: string; target: string; name: string; total: number; count: number }>('push://sent', (ev) => {
-      const p = ev.payload;
-      const auto = getDevices().find((d) => d.id === p.peerId)?.paired ?? false;
-      pushCards = [...pushCards, { inviteId: p.inviteId, target: p.target, name: p.name, total: p.total, received: 0, phase: 'waiting', count: p.count ?? 1, auto }];
+    // 一批推送的快照：**发送侧卡片唯一的数据来源**（创建、每台进度、成功/失败/取消）。
+    // 单台推送也是一批（只有一条目标）—— 所以这里同时要负责"单台那套收尾方式"（toast +
+    // 自动/立刻收掉，与以前一模一样）和"多台的收尾方式"（全成自动收；有失败就粘住等确认）。
+    const unPushBatch = listen<PushBatch>('push://batch', (ev) => {
+      const b = ev.payload;
+      pushBatches = pushBatches.some((x) => x.batchId === b.batchId)
+        ? pushBatches.map((x) => (x.batchId === b.batchId ? b : x))
+        : [...pushBatches, b];
+
+      // 单台那条路由 push://done 收尾（toast 文案与原来一字不差），这里不插手。
+      if (b.targets.length === 1 || settledBatches.has(b.batchId)) return;
+      if (batchLive(b)) return;
+      settledBatches.add(b.batchId);
+      if (batchAllDone(b)) {
+        toast(`已推送给 ${b.targets.length} 台设备`);
+        setTimeout(() => dropBatch(b.batchId), 3000);
+      } else if (b.targets.every((t) => t.state === 'cancelled')) {
+        // 整批取消：卡片立刻收掉（一次确认过的操作已经是终局，没有"哪台没成"要交代）。
+        toast('已取消推送');
+        dropBatch(b.batchId);
+      } else if (b.done === 0) {
+        // 一台没成：没有"部分成功"要交代，一条提示 + 收起（与单台失败同一个手感）。
+        toast(`推送未成功：${b.targets.find((t) => t.error)?.error ?? '全部失败'}`);
+        dropBatch(b.batchId);
+      } else {
+        toast(`推送完成：成功 ${b.done} · 失败 ${b.failed}`);
+        // 剩下的交给卡片上的「知道了」——一条 toast 说不清是哪几台。
+      }
     });
 
     const unPushResponse = listen<{ inviteId: string; accepted: boolean; reason?: string | null }>('push://response', (ev) => {
       const { inviteId, accepted, reason } = ev.payload;
       const notice = notices.find((n) => n.inviteId === inviteId);
-      const card = pushCards.find((c) => c.inviteId === inviteId);
       if (accepted) {
         if (notice) notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'receiving' } : n));
-        if (card) {
-          pushCards = pushCards.map((c) => (c.inviteId === inviteId ? { ...c, phase: 'sending' } : c));
+        const b = batchForInvite(inviteId);
+        if (b && b.targets.length === 1) {
           // 已绑定设备那条路上没有"对方同意"这一步，说"已同意"会让人以为对面点过。
-          toast(card.auto ? `开始向「${card.target}」传输` : `「${card.target}」已同意接收，开始传输`);
+          const t = b.targets[0];
+          toast(t.paired ? `开始向「${t.target}」传输` : `「${t.target}」已同意接收，开始传输`);
         }
         return;
       }
@@ -1121,8 +1406,7 @@
       if (total <= 0) return;
       // 接收侧：卡片就地变成"正在接收 xx%"。
       notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'receiving', received, size: total } : n));
-      // 发送侧：进度条。
-      pushCards = pushCards.map((c) => (c.inviteId === inviteId ? { ...c, received, total, phase: 'sending' } : c));
+      // 发送侧那张卡的进度由 `push://batch` 快照推进（同一份数据只有一个来源）。
     });
 
     const unPushDone = listen<{ inviteId: string; status: string; reason?: string | null; dest?: string }>('push://done', (ev) => {
@@ -1140,22 +1424,41 @@
           notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'failed', error: reason ?? '接收失败' } : n));
         }
       }
-      const card = pushCards.find((c) => c.inviteId === inviteId);
-      if (card) {
-        if (status === 'completed') {
-          pushCards = pushCards.map((c) => (c.inviteId === inviteId ? { ...c, phase: 'done', received: c.total } : c));
-          toast(`「${card.name}」已发送完成`);
-          setTimeout(() => { pushCards = pushCards.filter((c) => c.inviteId !== inviteId); }, 3000);
-        } else {
-          toast(status === 'cancelled' ? '已取消推送' : (reason ?? '推送失败'));
-          pushCards = pushCards.filter((c) => c.inviteId !== inviteId);
-        }
+      // 发送侧：**只有单台那一批**在这里收尾（toast 文案与原来一字不差）；多台的收尾
+      // 归 `push://batch`（那里才知道整批成了几台、还有没有在等的）。
+      const b = batchForInvite(inviteId);
+      if (!b || b.targets.length !== 1) return;
+      if (status === 'completed') {
+        toast(`「${b.name}」已发送完成`);
+        setTimeout(() => dropBatch(b.batchId), 3000);
+      } else {
+        toast(status === 'cancelled' ? '已取消推送' : (reason ?? '推送失败'));
+        dropBatch(b.batchId);
       }
     });
 
     const unPaired = listen('devices://changed', () => {
       loadDevices().catch(console.error);
     });
+
+    // 本机「在线 / 离线」变了：状态框是这份状态的镜像，事件到哪儿它跟到哪儿
+    // （`setOnline` 的返回路径与这里都会走同一份值，重复设置是幂等的）。
+    const unLocalOnline = listen<{ online: boolean }>('local://online', (ev) => {
+      localOnline = ev.payload.online;
+    });
+
+    // 状态框展开后，点别处 / 按 Esc 收起。用 **捕获阶段的 pointerdown**：标签栏、
+    // 列表里的按钮都可能 `stopPropagation`，冒泡阶段会漏掉一半的"点别处"。
+    const closeStatus = (e: PointerEvent) => {
+      if (!statusOpen) return;
+      if (statusEl && e.target instanceof Node && statusEl.contains(e.target)) return;
+      statusOpen = false;
+    };
+    const escStatus = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && statusOpen) statusOpen = false;
+    };
+    document.addEventListener('pointerdown', closeStatus, true);
+    document.addEventListener('keydown', escStatus);
 
     // 用户又点了一次应用图标 / 启动了第二份进程：把面板展开，而不是让新进程悄悄消失。
     const unOrbShow = listen('orb://show', () => {
@@ -1244,11 +1547,14 @@
       unMoved.then(fn => fn());
       if (moveTimer) clearTimeout(moveTimer);
       unPushInvite.then(fn => fn());
-      unPushSent.then(fn => fn());
+      unPushBatch.then(fn => fn());
       unPushResponse.then(fn => fn());
       unPushProgress.then(fn => fn());
       unPushDone.then(fn => fn());
       unPaired.then(fn => fn());
+      unLocalOnline.then(fn => fn());
+      document.removeEventListener('pointerdown', closeStatus, true);
+      document.removeEventListener('keydown', escStatus);
       unOrbShow.then(fn => fn());
       unPairDone.then(fn => fn());
       unPairInvite.then(fn => fn());
@@ -1266,9 +1572,10 @@
   class="orb-stage"
   class:open={expanded}
   class:live={connectedCount > 0}
+  class:offline={!localOnline}
   class:drag={dragging}
   class:hold={holdOrb}
-  style="--panel-slack: {PANEL_SLACK}px; --orb-inset: {ORB_INSET}px; --foot-h: {footH}px; --notif-max-h: {notifMaxH}px; --orb-x: {orbOffset.x}px; --orb-y: {orbOffset.y}px; --zone-x: {orbZone.x}px; --zone-y: {orbZone.y}px; --zone-w: {orbZone.w}px; --zone-h: {orbZone.h}px"
+  style="--panel-slack: {PANEL_SLACK}px; --orb-inset: {ORB_INSET}px; --foot-h: {footH}px; --notif-max-h: {notifMaxH}px; --orb-x: {orbOffset.x}px; --orb-y: {orbOffset.y}px; --zone-x: {orbZone.x}px; --zone-y: {orbZone.y}px; --zone-w: {orbZone.w}px; --zone-h: {orbZone.h}px; --spin-l: {badgeSpin.left}deg; --spin-r: {badgeSpin.right}deg"
 >
   <!-- 悬停热区：贴边收起半颗后，指针落在热区（露出的半颗 ~ 完整球那一带）就把球滑出来 -->
   <div class="orb-zone">
@@ -1289,10 +1596,30 @@
     <header class="panel-head" data-tauri-drag-region="deep">
       <span class="panel-brand"><Logo size={20} />OrbDrop</span>
       <div class="panel-head-right">
-        <span class="ch-inst">
-          <span class="dot ok"></span>
-          <span>在线 · 长连接 {connectedCount}</span>
-        </span>
+        <!-- 本机「在线 / 离线」（面板右上角）。点一下**向下长出**选项列表：框只动高度
+             （行数 = 选项条数），圆角一个像素都不变 —— 收起时框高 = 一行，14px 圆角正好是
+             左右半圆；展开时是高两倍的矩形、同一个 14px 圆角。展开时框盖在标签栏上，
+             面板头自己不跟着变高（框绝对定位贴着头部的上沿长）。 -->
+        <div class="ch-wrap" bind:this={statusEl}>
+          <div class="ch-inst" class:open={statusOpen} class:off={!localOnline}>
+            <div class="ch-list">
+              <button class="ch-row online" class:active={localOnline} aria-expanded={localOnline ? statusOpen : undefined} onclick={() => pickOnline(true)}>
+                <span class="dot ok"></span>
+                <span>在线</span>
+                <!-- 与改前那颗胶囊同款文案：`在线 · 长连接 N`。本机离线时那台设备一条长连接
+                     都没有，写出来只是噪音 —— 所以整段**藏起来**（`visibility`）而不是删掉：
+                     元素仍占着同样的宽度，切到离线时框不会缩一截。 -->
+                <span class="ch-meta" class:gone={!localOnline}>· 长连接 {connectedCount}</span>
+                <svg class="ch-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+              </button>
+              <button class="ch-row offline" class:active={!localOnline} aria-expanded={!localOnline ? statusOpen : undefined} onclick={() => pickOnline(false)}>
+                <span class="dot off"></span>
+                <span>离线</span>
+                <svg class="ch-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
         <!-- 通知铃铛搬到 footer 最右侧（版本号右边）—— 面板头部只留窗口级的动作。 -->
         <button class="icon-btn" onclick={openSettings} aria-label="打开设置">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1Z"/></svg>
@@ -1312,7 +1639,7 @@
     />
 
     <div class="panel-body" bind:this={bodyEl}>
-      <TabContent tab={activeTab} devices={getDevices()} onToast={toast} onRequestPush={requestPush} onAddShare={requestAddShare} onOpenPair={openPair} onUnpair={(d) => void unpairDevice(d.id)} />
+      <TabContent tab={activeTab} devices={getDevices()} onToast={toast} onRequestPush={requestPush} onRequestPushMany={requestPushMany} onAddShare={requestAddShare} onOpenPair={openPair} onUnpair={(d) => void unpairDevice(d.id)} />
     </div>
 
     <footer class="panel-foot" bind:this={footEl}>
@@ -1351,7 +1678,7 @@
            它也是右下角的一件事）—— 全都同一形状：右对齐、2/3 面板宽（不占满）。
            来一条甩入一条、收起时整组甩回右侧（`fly`）；footer 最右侧的铃铛整体收起/展开它，
            **收起 ≠ 已读**（角标照旧挂着，与悬浮球左上角黄标同一个数）。 -->
-      {#if notifOpen && (notices.length > 0 || pushCards.length > 0)}
+      {#if notifOpen && (notices.length > 0 || pushBatches.length > 0)}
         <div class="notif-group" bind:this={notifEl}>
           {#each notices as n, i (n.inviteId)}
             <div
@@ -1407,36 +1734,81 @@
               {:else}
                 <p class="nb-body">{noticeBody(n)}</p>
                 <div class="nb-acts">
+                  {#if n.dest}
+                    <button class="btn btn-secondary btn-sm" onclick={() => void openNoticeDir(n)}>打开目录</button>
+                  {/if}
                   <button class="btn btn-secondary btn-sm" onclick={() => confirmNotice(n.inviteId)}>知道了</button>
                 </div>
               {/if}
             </div>
           {/each}
 
-          <!-- 发送侧：每条在途的推送一张卡 —— 和通知同一个形状、同一组、同一个铃铛管，
-               因为它也是"右下角的一件事"（"等待对方同意"可以等很久；已绑定目标那一档
-               只是一瞬）。它排在通知前面：通知贴最下缘（要你看一眼的事优先）。 -->
-          {#each pushCards as c (c.inviteId)}
+          <!-- 发送侧：一次推送操作（可能覆盖多台设备）一张卡 —— 和通知同一个形状、同一组、
+               同一个铃铛管，因为它也是"右下角的一件事"（"等待对方同意"可以等很久；已绑定
+               目标那一档只是一瞬）。它排在通知前面：通知贴最下缘（要你看一眼的事优先）。
+
+               多台时多两样东西：**每台一行**（谁成了、谁还在等、谁没成，都逐行写清楚），
+               以及那行计数 —— 数字全部来自后端快照（见 `push://batch`），界面不算账。 -->
+          {#each pushBatches as b (b.batchId)}
             <div
               class="notif-bubble"
-              class:done={c.phase === 'done'}
+              class:done={batchAllDone(b)}
               in:fly={{ x: 32, duration: MOTION, easing: cubicOut }}
               out:fly={{ x: 32, duration: MOTION }}
             >
               <div class="p-top">
-                <span class="nb-title">{pushCardTitle(c)}</span>
-                <span class="nb-size num">{pushPercent(c.received, c.total)}%</span>
+                <span class="nb-title" title={batchTitleFull(b)}>{pushBatchTitle(b)}</span>
+                <span class="nb-size num">{pushPercent(b.received, b.total)}%</span>
               </div>
-              <div class="p-bar"><i style="width:{pushPercent(c.received, c.total)}%"></i></div>
+              <div class="p-bar"><i style="width:{pushPercent(b.received, b.total)}%"></i></div>
               <div class="p-meta">
-                <span>→「{c.target}」· 局域网</span>
-                <span class="num">{fmtBytes(c.received)} / {fmtBytes(c.total)}</span>
+                {#if b.targets.length > 1}
+                  <span>{batchCounts(b)}</span>
+                {:else}
+                  <span>→「{b.targets[0].target}」· 局域网</span>
+                {/if}
+                <span class="num">{fmtBytes(b.received)} / {fmtBytes(b.total)}</span>
               </div>
-              {#if c.phase !== 'done'}
-                <div class="nb-acts">
-                  <button class="btn btn-secondary btn-sm" onclick={() => void cancelSending(c.inviteId)}>取消</button>
+
+              <!-- 清单里少了的项（链接 / 读不到）：卡片上必须写出来 —— 清单少了东西却不说，
+                   用户会以为"就这些"然后推漏（同 `fs_browse::list_dir` 那条注释的道理）。 -->
+              {#if b.skipped > 0}
+                <div class="p-skip">已跳过 {b.skipped} 项（链接 / 读不到）</div>
+              {/if}
+
+              {#if b.targets.length > 1}
+                <div class="batch-rows">
+                  {#each visibleTargets(b) as t (t.inviteId || t.peerId)}
+                    <div class="batch-row" class:bad={t.state === 'failed' || t.state === 'rejected'}>
+                      <span class={targetDot(t)}></span>
+                      <span class="br-name" title={t.target}>{t.target}</span>
+                      <span class="br-state">{targetLabel(t, batchPerTarget(b))}</span>
+                      {#if t.state === 'invited' || t.state === 'sending'}
+                        <button
+                          class="br-x"
+                          onclick={() => void cancelSending(t.inviteId)}
+                          aria-label="取消推送给「{t.target}」"
+                          title="取消这一台（其余几台照常）">✕</button>
+                      {/if}
+                    </div>
+                  {/each}
+                  {#if b.targets.length > 5 && !expandedBatches[b.batchId]}
+                    <button class="br-more" onclick={() => (expandedBatches = { ...expandedBatches, [b.batchId]: true })}>
+                      还有 {b.targets.length - 4} 台 ▾
+                    </button>
+                  {/if}
                 </div>
               {/if}
+
+              <div class="nb-acts">
+                {#if batchLive(b)}
+                  <button class="btn btn-secondary btn-sm" onclick={() => void cancelBatch(b.batchId)}>
+                    {b.targets.length > 1 ? '取消全部' : '取消'}
+                  </button>
+                {:else if batchSticky(b)}
+                  <button class="btn btn-secondary btn-sm" onclick={() => dropBatch(b.batchId)}>知道了</button>
+                {/if}
+              </div>
             </div>
           {/each}
         </div>
@@ -1557,6 +1929,7 @@
     deviceOnline={ctxState.deviceOnline}
     deviceNeedsPair={ctxState.deviceNeedsPair}
     peerName={ctxState.peerId ? getDevices().find((d) => d.id === ctxState?.peerId)?.name : undefined}
+    bcAvailable={bcMenu.available}
     bcLeftLabel={bcMenu.leftLabel}
     bcRightLabel={bcMenu.rightLabel}
     bcCompareLabel={bcMenu.compareLabel}

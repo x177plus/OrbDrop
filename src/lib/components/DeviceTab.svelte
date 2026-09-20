@@ -8,24 +8,64 @@
   let {
     onToast,
     onRequestPush,
+    onRequestPushMany,
     onOpenPair,
     onUnpair,
   }: {
     onToast: (msg: string) => void;
     onRequestPush?: (device: PeerDevice) => void;
+    /** 多选之后一次推给多台（App 会开**一次**文件选择框，同一份内容分头发出去）。 */
+    onRequestPushMany?: (devices: PeerDevice[]) => void;
     onOpenPair?: (device: PeerDevice | null) => void;
     onUnpair?: (device: PeerDevice) => void;
   } = $props();
+
+  /**
+   * 多选推送模式。
+   *
+   * 单台推送是高频路径，「推送」按钮就长在每一行上（点一下直接开选择框）；多台推送是
+   * 低频但更重的一次操作，所以它另起一个模式：先在设备页把目标勾齐（**只在这里能勾** ——
+   * 设备候选、在线状态、能不能收都只有这个列表知道），再开一次选择框挑文件。
+   *
+   * 入口是**长按任意可勾的设备行**（见 `onRowPress`），它**只进模式、不预选长按的那一台**，
+   * 勾谁由用户接着自己点。这里刻意不摆一颗「多选」按钮：工具条那一行（`.list-label`）
+   * 常驻的东西在多选态里一件不多、一件不少（含搜索框），多出/少掉一件带 padding 与 border
+   * 的控件就会把那一行从 17.6px 顶到 23.6px，下面的列表整条跳 6px（实测值，
+   * 见 main.css 里「设备页多选」那段注释）。
+   * 勾选期间每一行的动作按钮收起来（点整行 = 勾/取消），顶部那颗块状按钮原地换成
+   * 动作条 —— 同高、不跳版，也不会被右下角那组通知气泡盖住（那块是面板底部）。
+   */
+  let selectMode = $state(false);
+  /** 勾选的设备 id，保持勾选顺序（推送顺序就是用户点的顺序）。 */
+  let selected = $state<string[]>([]);
 
   onMount(() => {
     loadDevices().catch(console.error);
   });
 
   let devices = $derived(getDevices());
+
+  /**
+   * 前端筛选（纯本地，不发请求）：局域网里设备一多，靠滚动找一台太慢。
+   * 只匹配**设备名**与 **IP**（大小写不敏感）。空串 / 纯空白 = 不过滤。
+   *
+   * 只过滤显示，不动数据：勾选集（`selected`）、右键菜单、长按判定都仍按 `devices`
+   * 查表，所以筛掉的行不会留下"看不见但已勾上"的错位 —— 已选台数由顶部动作条明示。
+   */
+  let query = $state('');
+  let filtered = $derived.by(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return devices;
+    return devices.filter((d) => d.name.toLowerCase().includes(q) || d.ip.includes(q));
+  });
+
   let connectedCount = $derived(devices.filter(d => d.connected).length);
   let offlineCount = $derived(devices.filter(d => !d.online).length);
+  /** 筛选时换成"匹配 x / 共 y 台"：一眼看出是筛剩这么多，而不是设备真的只有这么几台。 */
   let devCountStr = $derived(
-    `${devices.length} 台 · ${connectedCount} 长连接${offlineCount ? ` · ${offlineCount} 离线` : ''}`
+    query.trim()
+      ? `匹配 ${filtered.length} / ${devices.length} 台`
+      : `${devices.length} 台 · ${connectedCount} 长连接${offlineCount ? ` · ${offlineCount} 离线` : ''}`
   );
 
   function deviceInitial(name: string): string {
@@ -50,6 +90,97 @@
   function needsRepair(d: PeerDevice): boolean {
     const s = d.linkState;
     return !!s && s.kind === 'stopped' && s.reason === 'tokenRejected';
+  }
+
+  /** 能收推送的才可勾：离线的一台**就地失败、不排队**（F-53），token 失效的一台必然 401。 */
+  function selectable(d: PeerDevice): boolean {
+    return d.online && !needsRepair(d);
+  }
+
+  /**
+   * 长按进入多选 —— 这是多选**唯一**的入口。
+   *
+   * 按住不放 450ms；期间指针挪窝超过 6px 就作废（那是拖动/误触，不是长按）。
+   * 长按**只进模式，不替你勾任何一台**：谁要推是用户接下来自己点的。代价是必须吞掉
+   * 紧随其后的那一次 click —— 松手时 `selectMode` 已经是 true，整行成了开关，不拦这一下
+   * 等于"长按哪台就顺手勾上哪台"。吞掉的标记由**下一次 pointerdown** 复位：那是新一次
+   * 手势的开始（长按后松手落在列表外、根本没派发 click 的那种情况，也不会留下哑火）。
+   */
+  const LONG_PRESS_MS = 450;
+  const LONG_PRESS_SLOP = 6;
+  /** 按下点（null = 现在没有在计时）。 */
+  let pressAt: { x: number; y: number } | null = null;
+  let pressTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 长按这一下还要吞掉多少次 click（见上面的说明）。 */
+  let swallowClick = false;
+
+  function cancelPress() {
+    if (pressTimer) clearTimeout(pressTimer);
+    pressTimer = null;
+    pressAt = null;
+  }
+
+  function onRowPress(e: PointerEvent) {
+    swallowClick = false;   // 新一次按下 = 上一次手势早已结束，标记作废
+    if (selectMode || e.button !== 0) return;
+    const row = (e.target as HTMLElement).closest('.device-row') as HTMLElement | null;
+    const device = row && devices.find((d) => d.id === row.dataset.id);
+    // 不可勾的行不响应长按：从一台"离线/需配对"的设备进多选，只会让人以为它能推。
+    if (!device || !selectable(device)) return;
+    pressAt = { x: e.clientX, y: e.clientY };
+    pressTimer = setTimeout(() => {
+      pressTimer = null;
+      swallowClick = true;
+      selectMode = true;
+    }, LONG_PRESS_MS);
+  }
+
+  function onRowPressMove(e: PointerEvent) {
+    if (!pressAt) return;
+    if (Math.abs(e.clientX - pressAt.x) > LONG_PRESS_SLOP || Math.abs(e.clientY - pressAt.y) > LONG_PRESS_SLOP) {
+      cancelPress();
+    }
+  }
+
+  /** 不可勾的原因 —— 置灰的行光看状态 pill 不够，得说清"为什么不能选它"。 */
+  function unselectableReason(d: PeerDevice): string {
+    if (!d.online) return '「离线」：推送是 HTTP 直达对端，它不在网上只会就地失败（不排队）';
+    return '「需配对」：对端不认本机凭据，推送会被拒 —— 重新配对后再推';
+  }
+
+  function toggleSelect(d: PeerDevice) {
+    if (!selectable(d)) return;
+    selected = selected.includes(d.id) ? selected.filter((id) => id !== d.id) : [...selected, d.id];
+  }
+
+  function exitSelect() {
+    selectMode = false;
+    selected = [];
+    swallowClick = false;   // 模式都退出了，没有"下一次 click"要拦
+  }
+
+  /** 勾好了 → 把这几台交给下一步（选择框），列表现场归位：一步一件事。 */
+  function confirmSelect() {
+    const picks = devices.filter((d) => selected.includes(d.id));
+    if (!picks.length) return;
+    exitSelect();
+    onRequestPushMany?.(picks);
+  }
+
+  function onKeydown(e: KeyboardEvent) {
+    if (!selectMode) return;
+    if (e.key === 'Escape') {
+      e.stopPropagation();
+      exitSelect();
+      return;
+    }
+    if (e.key !== ' ' && e.key !== 'Enter') return;
+    // 空格/回车 = 勾选当前聚焦的那台（Esc 退出、Tab 在行间走 —— 都不用鼠标）。
+    const row = (e.target as HTMLElement).closest('.device-row') as HTMLElement | null;
+    const device = row && devices.find((d) => d.id === row.dataset.id);
+    if (!device) return;
+    e.preventDefault();
+    toggleSelect(device);
   }
 
   /**
@@ -161,11 +292,22 @@
   }
 
   function handleDeviceAction(e: Event) {
-    const btn = (e.target as HTMLElement).closest('button');
+    // 长按进来的那一下：还没到"勾选"这一步，先把它吃掉（否则长按哪台就顺手勾上哪台）。
+    if (swallowClick) {
+      swallowClick = false;
+      return;
+    }
     const row = (e.target as HTMLElement).closest('.device-row') as HTMLElement | null;
-    if (!btn || !row) return;
+    if (!row) return;
     const device = devices.find(d => d.id === row.dataset.id);
     if (!device) return;
+    // 多选模式下整行就是勾选开关（行里的动作按钮这时已经收起来了）。
+    if (selectMode) {
+      toggleSelect(device);
+      return;
+    }
+    const btn = (e.target as HTMLElement).closest('button');
+    if (!btn) return;
     if (btn.hasAttribute('data-unpair')) {
       onUnpair?.(device);
     } else if (btn.hasAttribute('data-connect')) {
@@ -185,6 +327,9 @@
 
   function openCtx(e: MouseEvent, d: PeerDevice) {
     e.preventDefault();
+    // 勾选期间右键菜单一律不弹：此刻每一行的含义是"勾它/取消它"，弹一份动作菜单
+    // （连接/解除配对/推送）只会让人以为多选没生效。
+    if (selectMode) return;
     const el = (e.target as HTMLElement).closest('.device-row') as HTMLElement | null;
     if (!el) return;
     document.dispatchEvent(new CustomEvent('od:ctx', {
@@ -201,15 +346,27 @@
   }
 </script>
 
-<button class="btn btn-secondary btn-block" id="pairBtn" style="height:var(--control-h)" onclick={() => onOpenPair?.(null)}>
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M12 5v14M5 12h14"/>
-  </svg>
-  添加设备 · 配对码
-</button>
+{#if selectMode}
+  <!-- 勾选期间顶部那颗块状按钮原地换成动作条（同高，不跳版；放在顶部是因为底部
+       会被右下角那组通知气泡压住）。 -->
+  <div class="dev-select-bar" style="height:var(--control-h)">
+    <span class="num">已选 <b>{selected.length}</b> 台</span>
+    <div class="d-acts">
+      <button class="btn btn-secondary btn-sm" onclick={exitSelect}>取消</button>
+      <button class="btn btn-primary btn-sm" onclick={confirmSelect} disabled={selected.length === 0}>推送…</button>
+    </div>
+  </div>
+{:else}
+  <button class="btn btn-secondary btn-block" id="pairBtn" style="height:var(--control-h)" onclick={() => onOpenPair?.(null)}>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 5v14M5 12h14"/>
+    </svg>
+    添加设备 · 配对码
+  </button>
+{/if}
 
-<div class="list-label">
-  <span>局域网设备<Hint>
+<div class="list-label dev-label">
+  <span class="ll-name"><span class="ll-text">局域网设备</span><Hint>
     <p>
       <span class="hl">未绑定</span>设备可点击「推送」直接发送（接收方需同意）；
       <span class="hl">已配对</span>设备点「连接」建立长连接（配对本身不建链）；
@@ -217,8 +374,24 @@
       关机时连着长连接的设备，下次启动 OrbDrop 时会自动接回来（点过「断开」的不会）。
       <span class="hl">已配对但离线</span>的设备排在列表下方（在线的在上），可以「解除配对」
       —— 解除是本机动作，不需要对方在线。
+      <span class="hl">多选</span>推送：长按任意设备进入多选（离线/需配对的行不响应），勾好几台再挑一次文件，
+      同一份内容分头发出去，进度与成败都记在右下角那张卡片上。
+      <span class="hl">搜索框</span>只在这里筛显示（设备名或 IP），不影响长连接与推送。
     </p>
   </Hint></span>
+  {#if devices.length > 0}
+    <!-- 纯前端筛选：只改列表显示，不发请求、不碰设备状态。type=search 自带一键清空（✕）。 -->
+    <input
+      class="dev-search"
+      type="search"
+      bind:value={query}
+      placeholder="搜索名称 / IP"
+      aria-label="搜索局域网设备（设备名或 IP）"
+      autocomplete="off"
+      autocapitalize="off"
+      spellcheck="false"
+    />
+  {/if}
   <span class="num" id="devCount">{devCountStr}</span>
 </div>
 
@@ -230,20 +403,57 @@
     <p>还没有已配对设备</p>
     <p class="e-sub">点击上方「添加设备 · 配对码」，在对方设备的 OrbDrop 中输入本机配对码即可完成配对。</p>
   </div>
+{:else if filtered.length === 0}
+  <!-- 设备在、只是没匹配上：别摆"还没有已配对设备"那张空态（会像是设备丢了）。 -->
+  <div class="empty">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>
+    </svg>
+    <p>没有匹配「{query.trim()}」的设备</p>
+    <p class="e-sub">搜索只匹配设备名与 IP（{devices.length} 台都没命中）。</p>
+    <button class="btn btn-secondary btn-sm" onclick={() => (query = '')}>清除搜索</button>
+  </div>
 {:else}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <ul class="device-list" id="deviceList" onclick={handleDeviceAction}>
-    {#each devices as d (d.id)}
+  <ul
+    class="device-list"
+    id="deviceList"
+    onclick={handleDeviceAction}
+    onkeydown={onKeydown}
+    onpointerdown={onRowPress}
+    onpointermove={onRowPressMove}
+    onpointerup={cancelPress}
+    onpointercancel={cancelPress}
+  >
+    {#each filtered as d (d.id)}
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <li
         class="device-row"
         class:online={d.online}
+        class:selecting={selectMode}
+        class:selected={selected.includes(d.id)}
+        class:locked={selectMode && !selectable(d)}
         data-id={d.id}
         data-state={d.connected ? 'connected' : d.paired ? 'paired' : 'unbound'}
         data-ip={`${d.ip}:${d.port}`}
+        role={selectMode ? 'checkbox' : undefined}
+        aria-checked={selectMode ? selected.includes(d.id) : undefined}
+        aria-disabled={selectMode && !selectable(d) ? 'true' : undefined}
+        tabindex={selectMode ? 0 : undefined}
+        title={selectMode && !selectable(d) ? unselectableReason(d) : undefined}
         oncontextmenu={(e) => openCtx(e, d)}
       >
-        <span class="d-avatar">{deviceInitial(d.name)}</span>
+        {#if selectMode}
+          <!-- 勾选框是画出来的（不是 <input>）：点整行就是开关，多一个真 input 会在
+               冒泡里被点两次，勾了又取消。尺寸与文件选择框里的那颗一致（16px），
+               但**槽位仍占头像那 34px** —— 换进来/换出去都不能挪动后面的设备名与 ip。 -->
+          <span class="d-check" class:on={selected.includes(d.id)} aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 5 5 9-9"/></svg>
+          </span>
+        {:else}
+          <span class="d-avatar">{deviceInitial(d.name)}</span>
+        {/if}
         <div class="d-main">
           <div class="d-name">
             {d.name}
@@ -269,7 +479,7 @@
               <button class="btn btn-primary btn-sm" data-pair>配对</button>
             {:else}
               <!-- 已配对：配对只确立关系，长连接要用户自己点「连接」建立 -->
-              <button class="btn btn-primary btn-sm" data-connect>连接</button>
+              <button class="btn btn-primary btn-sm" data-connect>长连接</button>
             {/if}
             <button class="btn btn-ghost btn-sm" data-push>推送</button>
           {:else}

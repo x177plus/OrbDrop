@@ -225,6 +225,30 @@ impl WsManager {
     pub fn is_paused(&self, peer_id: &str) -> bool {
         self.paused.lock().contains(peer_id)
     }
+
+    /// 本机切到「离线」（隐身）：把所有会话与拨号循环一起掐掉，**不碰暂停标记**。
+    ///
+    /// 暂停（「断开」）是"别接这台设备"的人为意图；离线是"别上网"的整体意图，两者互不
+    /// 覆盖：切回在线时该被拒绝的自动重拨还要照旧被拒绝（`auto_connect` 记忆也一样保留，
+    /// 见 `restore_links_on_startup`）。
+    pub fn drop_all(&self) {
+        let ids: HashSet<String> = {
+            let senders = self.senders.lock();
+            let tasks = self.tasks.lock();
+            let links = self.links.lock();
+            senders
+                .keys()
+                .chain(tasks.keys())
+                .chain(links.keys())
+                .cloned()
+                .collect()
+        };
+        for peer_id in ids {
+            info!(%peer_id, "dropping link (going offline)");
+            self.teardown(&peer_id);
+            self.clear_link_state(&peer_id);
+        }
+    }
 }
 
 impl Default for WsManager {
@@ -268,6 +292,11 @@ pub fn ensure_link_now(state: &Arc<AppState>, peer_id: &str) {
 /// 对端点过「断开」时照旧被拒，不替它解除暂停。设备晚点上线也没关系：自动拨号先试
 /// `AUTO_RETRY_ATTEMPTS` 次，之后转入待命，等对端被观测到在线（探活/mDNS）再动手。
 pub fn restore_links_on_startup(state: &Arc<AppState>) {
+    // 离线（隐身）时不拨号：链路必然建不起来（对端连不上本机），而且"离线"本身
+    // 就是"现在不上网"的意思。切回在线时会再走一遍这里。
+    if !state.is_online() {
+        return;
+    }
     let targets: Vec<String> = state
         .config
         .lock()

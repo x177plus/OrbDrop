@@ -6,10 +6,16 @@
 //! `pick_file(s) / pick_folder(s)` 四个入口。而推送要的正是「文件 + 文件夹混选、选中的项
 //! 还能跨目录累积」。所以选择框画在面板里，这个模块只提供它需要的枚举。
 //!
-//! 这里只过滤掉一样东西：**盘根的回收站文件夹**（`$RECYCLE.BIN`）—— 它是系统自己的
-//! 垃圾桶，不是用户放的资料，推到对端毫无意义。除此之外**不做可见性过滤**：选择框是
-//! "我要推哪些东西"，隐藏项也得能选到（`.git`、`AppData` 都在用户真正想推的范围里）
-//! —— 与 `/tree`（对端浏览，跳过点开头的项）不同。
+//! 这里要滤掉的只有**三类**（判据全在 `crate::unsendable`，与"发送时会不会跳过"是同一份 ——
+//! 列出来却推不动比不列更坏）：
+//!
+//! 1. **卷根上的系统目录/文件**（`$RECYCLE.BIN`、`System Volume Information`、`pagefile.sys`…）
+//!    —— 不是用户放的资料，点进去还多半是「拒绝访问」；
+//! 2. **链接**（符号链接 / junction）—— 会回环、会把同一份内容列两遍；
+//! 3. **OrbDrop 自己的数据目录** —— 里面装着全部设备的 token。
+//!
+//! 除此之外**不做可见性过滤**：选择框是"我要推哪些东西"，隐藏项也得能选到（`.git`、
+//! `AppData` 都在用户真正想推的范围里）—— 与 `/tree`（对端浏览，跳过点开头的项）不同。
 
 use std::path::{Path, PathBuf};
 
@@ -111,21 +117,6 @@ fn crumbs_of(path: &Path) -> Vec<FsCrumb> {
     out
 }
 
-/// 回收站：Windows 在每个盘根放一个 `$RECYCLE.BIN`（老系统叫 `RECYCLER`）。
-///
-/// 它是系统自己的垃圾桶，不是用户放的资料 —— 列出来只会让人误以为能推。按名字滤掉，
-/// 不跟"隐藏/系统属性"混在一起：这里只多滤这一个，其余隐藏项（`.git`、`AppData`）照旧可见。
-#[cfg(windows)]
-fn is_recycle_bin(name: &str) -> bool {
-    name.eq_ignore_ascii_case("$RECYCLE.BIN") || name.eq_ignore_ascii_case("RECYCLER")
-}
-
-#[cfg(not(windows))]
-fn is_recycle_bin(_name: &str) -> bool {
-    // 别的系统没有这个东西；同名的目录在那边是普通目录，不该被藏掉。
-    false
-}
-
 /// 列一层目录（同步；调用方负责放到阻塞线程上）。
 fn list_dir(raw: &str) -> Result<FsListing, FsError> {
     let path = PathBuf::from(raw);
@@ -136,6 +127,7 @@ fn list_dir(raw: &str) -> Result<FsListing, FsError> {
     }
 
     let crumbs = crumbs_of(&path);
+    let own_data_dir = crate::config::data_dir();
     let mut entries = Vec::new();
     let dir = std::fs::read_dir(&path).map_err(|e| FsError::from_io(&e, &crumbs))?;
     for entry in dir {
@@ -143,14 +135,25 @@ fn list_dir(raw: &str) -> Result<FsListing, FsError> {
         // 用户会以为"这里就这些"，然后推漏东西。
         let entry = entry.map_err(|e| FsError::from_io(&e, &crumbs))?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if is_recycle_bin(&name) {
+        // 不外露的三类（见 `unsendable`）。用 `file_type()` 不用 `metadata()`：前者不跟随
+        // 链接 —— 跟随了就判不出"这一项是链接"，junction 会装成一个普通目录。
+        let Ok(ft) = entry.file_type() else {
+            // 单项读不到类型（断掉的软链、刚好被删）跳过：列目录不是审计。
+            continue;
+        };
+        let entry_path = entry.path();
+        // 只有卷根那一层按系统名字滤（`D:\backup\Recovery` 这种用户目录不能被藏掉）。
+        let at_root = crate::unsendable::sits_in_volume_root(&entry_path);
+        if crate::unsendable::is_link(&ft)
+            || crate::unsendable::is_system_name(&name, at_root)
+            || crate::unsendable::is_own_data_dir(&entry_path, &own_data_dir)
+        {
             continue;
         }
         let Ok(meta) = entry.metadata() else {
-            // 单项读不到元数据（断掉的软链、刚好被删）跳过：列目录不是审计。
             continue;
         };
-        let is_dir = meta.is_dir();
+        let is_dir = ft.is_dir();
         entries.push(FsEntry {
             name,
             path: entry.path().to_string_lossy().to_string(),
@@ -445,21 +448,85 @@ mod tests {
     }
 
     #[test]
-    fn recycle_bin_is_filtered_out() {
-        let dir = temp_dir("recycle");
-        std::fs::create_dir_all(dir.join("$RECYCLE.BIN")).unwrap();
-        std::fs::create_dir_all(dir.join("保留")).unwrap();
+    fn links_are_not_listed() {
+        // junction / 符号链接一律不列：它们会回环（`%LOCALAPPDATA%\Application Data` 指向
+        // 自己的父目录），也会把同一份内容按两条路径列两遍。
+        let dir = temp_dir("link");
+        std::fs::create_dir_all(dir.join("真的")).unwrap();
+        let link = dir.join("链接");
+        if !crate::unsendable::make_link_for_test(&link, &dir.join("真的")) {
+            eprintln!("这台机器造不出链接，跳过这条");
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
 
         let listing = list_dir(&dir.to_string_lossy()).unwrap();
         let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
-        if cfg!(windows) {
-            assert_eq!(names, vec!["保留"], "回收站不该出现在选择框里");
-        } else {
-            // 别的系统没有回收站这东西：同名目录是普通目录，照旧列出来。
-            assert!(names.contains(&"$RECYCLE.BIN"));
-        }
+        assert_eq!(names, vec!["真的"], "链接不该出现在选择框里");
+
+        // 先摘链接再删目录：`remove_dir_all` 会跟着链接把目标里的东西也删掉。
+        std::fs::remove_dir(&link).unwrap_or_else(|_| std::fs::remove_file(&link).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 系统名字**只在卷根**生效：别处的同名目录是用户自己的东西（`D:\backup\Recovery`
+    /// 是很常见的目录名），滤掉就是把用户的数据藏起来。
+    #[test]
+    fn system_names_only_apply_at_the_volume_root() {
+        let dir = temp_dir("sysname");
+        std::fs::create_dir_all(dir.join("System Volume Information")).unwrap();
+        std::fs::write(dir.join("pagefile.sys"), b"not a real pagefile").unwrap();
+
+        let listing = list_dir(&dir.to_string_lossy()).unwrap();
+        let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"System Volume Information"), "非卷根的同名目录照旧可见：{names:?}");
+        assert!(names.contains(&"pagefile.sys"), "非卷根的同名文件照旧可见：{names:?}");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 真盘根上的系统项一个都不该露出来 —— "只要在卷根就滤"这条规则的真实验证
+    /// （临时目录永远造不出卷根，只能拿真盘来验）。
+    #[cfg(windows)]
+    #[test]
+    fn real_volume_root_hides_its_system_entries() {
+        let Ok(listing) = list_dir("C:\\") else {
+            return; // 拿不到 C:\ 就算了，不是这条测试要管的事
+        };
+        let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        for hidden in ["$RECYCLE.BIN", "System Volume Information", "pagefile.sys"] {
+            if std::fs::metadata(format!("C:\\{hidden}")).is_err() {
+                continue; // 这台机器上没有它，没什么可滤的
+            }
+            assert!(
+                !names.iter().any(|n| n.eq_ignore_ascii_case(hidden)),
+                "{hidden} 就在 C:\\ 上，却没被滤掉：{names:?}"
+            );
+        }
+        assert!(
+            names.iter().any(|n| *n == "Windows" || *n == "Users"),
+            "正常目录照常列出：{names:?}"
+        );
+    }
+
+    /// 自家数据目录（里面是 `credentials.dat` —— 全部设备的 token）不该出现在选择框里。
+    #[test]
+    fn our_own_data_dir_is_not_listed() {
+        let own = crate::config::data_dir();
+        let Some(parent) = own.parent() else {
+            return;
+        };
+        if std::fs::metadata(&own).is_err() {
+            return; // 还没建出来（全新的机器）：没得测
+        }
+        let Ok(listing) = list_dir(&parent.to_string_lossy()) else {
+            return;
+        };
+        assert!(
+            !listing.entries.iter().any(|e| Path::new(&e.path) == own.as_path()),
+            "{} 不该出现在选择框里",
+            own.display()
+        );
     }
 
     #[test]

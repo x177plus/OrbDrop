@@ -32,18 +32,22 @@ pub enum PushStatus {
     Failed(String),
 }
 
-/// Sender-side state of a push job (F-50 ~ F-52).
+/// Sender-side state of a push job (F-50 ~ F-52)：**一台设备一条**。
+///
+/// 清单里的文件表不在这里 —— 取文件只按 `sources` 查表（见 `download_target`），
+/// 而一份清单会被同批的每台设备各建一条 job：那张表多存一份就是白克隆一份
+/// （推一个几万文件的目录给 8 台设备，就是 8 份几万条的表）。
 #[derive(Clone)]
 pub struct PushJob {
     pub id: String,
+    /// 这台属于哪一批（F-50 多目标）：界面那张聚合卡片按它归拢。
+    pub batch_id: String,
     pub peer_id: String,
     pub peer_name: String,
     pub name: String,
     pub is_dir: bool,
-    pub files: Vec<FileEntry>,
     /// 清单相对路径 → 本机绝对路径（服务端按它取文件，见 `download_target`）。
     pub sources: Vec<(String, PathBuf)>,
-    pub total_size: u64,
     pub status: PushStatus,
     pub created_at: Instant,
     /// 对端是否已配对：它决定了下载端点怎么认人（见 `routes_push`）。
@@ -54,24 +58,22 @@ impl PushJob {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
+        batch_id: String,
         peer_id: String,
         peer_name: String,
         name: String,
         is_dir: bool,
-        files: Vec<FileEntry>,
         sources: Vec<(String, PathBuf)>,
-        total_size: u64,
         peer_paired: bool,
     ) -> Self {
         Self {
             id,
+            batch_id,
             peer_id,
             peer_name,
             name,
             is_dir,
-            files,
             sources,
-            total_size,
             status: PushStatus::Invited,
             created_at: Instant::now(),
             peer_paired,
@@ -125,10 +127,175 @@ pub enum DownloadTarget {
     Found { path: PathBuf, peer_paired: bool, peer_id: String },
 }
 
+// ---------------------------------------------------------------------------
+// 推送批次（F-50 多目标）：一次操作 = 一批 = 界面上一张卡片
+// ---------------------------------------------------------------------------
+
+/// 一台目标设备在一批推送里的状态。
+///
+/// `Cancelled` 不并进 `Failed`：取消是**用户自己做的事**，行文案必须是「已取消」而不是
+/// 「失败」；两者只在"这一批算不算全成"这件事上同类（卡片的收起规则见前端）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TargetState {
+    /// 邀请已发出、还没有任何回执（已配对的目标会很快转 `Sending`）。
+    Invited,
+    /// 对端正在拉数据。
+    Sending,
+    Done,
+    Cancelled,
+    Rejected,
+    Failed,
+}
+
+impl TargetState {
+    pub fn key(self) -> &'static str {
+        match self {
+            TargetState::Invited => "invited",
+            TargetState::Sending => "sending",
+            TargetState::Done => "done",
+            TargetState::Cancelled => "cancelled",
+            TargetState::Rejected => "rejected",
+            TargetState::Failed => "failed",
+        }
+    }
+
+    /// 终态只落一次：取消之后对端补报的失败不再把「已取消」改写成「失败」。
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TargetState::Done | TargetState::Cancelled | TargetState::Rejected | TargetState::Failed
+        )
+    }
+
+    /// 还在路上 —— "整批走完没有"和"还能不能取消"都看它。
+    pub fn is_waiting(self) -> bool {
+        matches!(self, TargetState::Invited | TargetState::Sending)
+    }
+}
+
+/// 一批推送里的一台目标设备（界面卡片上的一行）。
+#[derive(Clone)]
+pub struct BatchTarget {
+    pub peer_id: String,
+    pub peer_name: String,
+    /// 这一台对应的邀请 id（= 它那条 `PushJob.id`）。
+    pub invite_id: String,
+    /// 已配对 = 对方**不问同意**直接收：行文案别说「等待对方同意」（对面没点过任何东西）。
+    pub paired: bool,
+    pub state: TargetState,
+    pub received: u64,
+    pub error: Option<String>,
+}
+
+/// 一次推送操作：**一份清单、N 台设备、界面上一张卡片**。
+///
+/// 单台推送也是一批（`targets` 只有一条）—— 后端与界面都只有这一条路，不为"多设备"
+/// 分叉出第二套事件与收尾逻辑；接收侧则完全不知道批次存在（每台收到的邀请和以前一模一样，
+/// 同意规则、落盘规则、取消规则、断点续传全都不变）。
+pub struct PushBatch {
+    pub id: String,
+    /// 清单的显示名（"推的是什么"），同 `PushSource.name`，不参与落盘路径。
+    pub name: String,
+    /// 用户这次选了几项（>1 = 多选合并成的一条推送）。
+    pub count: usize,
+    /// 清单里被跳过的项数（链接 / 读不到的项）：>0 时卡片上必须说出来（见 `PushSource`）。
+    pub skipped: usize,
+    /// 每台的字节总量（各台都是同一份清单）。
+    pub per_target_total: u64,
+    pub targets: Vec<BatchTarget>,
+    /// 上次发快照的时刻：纯进度更新按 `REPORT_INTERVAL` 合并，
+    /// 状态跃迁（成功/失败/取消）不受它约束（见 `batch_set`）。
+    pub last_emit: Instant,
+}
+
+/// 一批推送的快照（`push://batch` 事件体 / `push_paths` 的返回值）。字段走 camelCase。
+#[derive(serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchView {
+    pub batch_id: String,
+    pub name: String,
+    pub count: usize,
+    /// 清单里被跳过的项数（链接 / 读不到的项）：卡片上那句"已跳过 N 项"就是它。
+    pub skipped: usize,
+    /// 成功 / 等待（含传输中）/ 失败（含被拒、被取消）—— 界面那行「成功 x · 等待 y」就是它。
+    pub done: usize,
+    pub waiting: usize,
+    pub failed: usize,
+    /// 聚合进度：分子是各台已收字节之和，分母**只算还活着的台**（失败/取消的那台整条不计），
+    /// 所以有台失败时进度条照样能走到 100%（每行自己还有百分比与状态，信息不会丢）。
+    pub received: u64,
+    pub total: u64,
+    pub targets: Vec<BatchTargetView>,
+}
+
+#[derive(serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchTargetView {
+    pub peer_id: String,
+    /// 设备名（界面那一行行首的字）。
+    pub target: String,
+    pub invite_id: String,
+    pub paired: bool,
+    pub state: &'static str,
+    pub received: u64,
+    pub error: Option<String>,
+}
+
+fn snapshot(batch: &PushBatch) -> BatchView {
+    let (mut done, mut waiting, mut failed) = (0, 0, 0);
+    let (mut received, mut total) = (0u64, 0u64);
+    for t in &batch.targets {
+        match t.state {
+            TargetState::Done => {
+                done += 1;
+                received += batch.per_target_total;
+                total += batch.per_target_total;
+            }
+            TargetState::Invited | TargetState::Sending => {
+                waiting += 1;
+                received += t.received.min(batch.per_target_total);
+                total += batch.per_target_total;
+            }
+            // 失败 / 被拒 / 被取消：整条不计入进度分母（上面那条注释）。
+            _ => failed += 1,
+        }
+    }
+    BatchView {
+        batch_id: batch.id.clone(),
+        name: batch.name.clone(),
+        count: batch.count,
+        skipped: batch.skipped,
+        done,
+        waiting,
+        failed,
+        received,
+        total,
+        targets: batch
+            .targets
+            .iter()
+            .map(|t| BatchTargetView {
+                peer_id: t.peer_id.clone(),
+                target: t.peer_name.clone(),
+                invite_id: t.invite_id.clone(),
+                paired: t.paired,
+                state: t.state.key(),
+                received: t.received,
+                error: t.error.clone(),
+            })
+            .collect(),
+    }
+}
+
 pub struct PushStore {
     pub jobs: Mutex<HashMap<String, PushJob>>,
     pub inbound: Mutex<HashMap<String, InboundInvite>>,
     pub resume: super::resume::ResumeStore,
+    /// 推送批次（= 界面上的卡片）。与 `jobs` 分开存：job 是"能不能取文件"的凭据，
+    /// 传完就清；批次要活到整批走完那一刻，卡片才一直有数可显示。
+    pub batches: Mutex<HashMap<String, PushBatch>>,
+    /// invite_id → batch_id：回执（WS / `POST /push/report`）只知道邀请 id，
+    /// 得 O(1) 找到它属于哪一批。
+    batch_of_invite: Mutex<HashMap<String, String>>,
 }
 
 impl PushStore {
@@ -137,6 +304,53 @@ impl PushStore {
             jobs: Mutex::new(HashMap::new()),
             inbound: Mutex::new(HashMap::new()),
             resume: super::resume::ResumeStore::new(),
+            batches: Mutex::new(HashMap::new()),
+            batch_of_invite: Mutex::new(HashMap::new()),
+        }
+    }
+
+    // batch
+    /// 登记一批推送，返回初始快照（每台都是"等待"）。
+    pub fn insert_batch(&self, batch: PushBatch) -> BatchView {
+        let view = snapshot(&batch);
+        let index: Vec<(String, String)> = batch
+            .targets
+            .iter()
+            // 派不出去的那几台（离线/设备不存在）没有邀请 id —— 别把空串塞进反查表。
+            .filter(|t| !t.invite_id.is_empty())
+            .map(|t| (t.invite_id.clone(), batch.id.clone()))
+            .collect();
+        // 两把锁的顺序固定为 batches → batch_of_invite（`drop_batch` 同序），别反过来。
+        self.batches.lock().insert(batch.id.clone(), batch);
+        let mut lookup = self.batch_of_invite.lock();
+        for (invite_id, batch_id) in index {
+            lookup.insert(invite_id, batch_id);
+        }
+        view
+    }
+
+    pub fn batch_id_of(&self, invite_id: &str) -> Option<String> {
+        self.batch_of_invite.lock().get(invite_id).cloned()
+    }
+
+    /// 一批里各台的状态（取消整批用）。
+    pub fn batch_targets(&self, batch_id: &str) -> Option<Vec<BatchTarget>> {
+        self.batches.lock().get(batch_id).map(|b| b.targets.clone())
+    }
+
+    /// 现在这一刻的快照（与推给界面的那份同一个算法）。
+    pub fn batch_snapshot(&self, batch_id: &str) -> Option<BatchView> {
+        self.batches.lock().get(batch_id).map(snapshot)
+    }
+
+    /// 整批走完就丢掉：界面手里那份最后的快照已经是全量。
+    pub fn drop_batch(&self, batch_id: &str) {
+        let Some(batch) = self.batches.lock().remove(batch_id) else {
+            return;
+        };
+        let mut lookup = self.batch_of_invite.lock();
+        for t in &batch.targets {
+            lookup.remove(&t.invite_id);
         }
     }
 
@@ -214,6 +428,64 @@ impl PushStore {
 
 impl Default for PushStore {
     fn default() -> Self { Self::new() }
+}
+
+// ---------------------------------------------------------------------------
+// Batch snapshots to the UI
+// ---------------------------------------------------------------------------
+
+/// 把一批里的某台目标推进到新状态，并把**整批快照**发给界面（`push://batch`）。
+///
+/// 这是发送侧卡片唯一的数据来源：调用点全部落在本来就有的状态变更处（对端回执、
+/// 邀请送不出去、超时、取消），所以"界面看到的"和"后端记着的"仍然是同一个事实
+/// （同 `report_to_sender` 那条纪律）。
+///
+/// - 终态只落一次：取消之后对端补报的失败不会把「已取消」改写成「失败」；
+/// - 纯进度（`force = false`）按 `REPORT_INTERVAL` 合并 —— 8 台设备各 5 次/秒的回报
+///   不该变成 40 条界面事件；状态跃迁一律立刻发（那正是"成功多少 / 还在等多少"要的实时性）；
+/// - 整批没有一台还在路上时，快照发完就把批次丢掉。
+pub fn batch_set(
+    state: &AppState,
+    invite_id: &str,
+    target_state: TargetState,
+    received: Option<u64>,
+    error: Option<String>,
+    force: bool,
+) {
+    let Some(batch_id) = state.push.batch_id_of(invite_id) else {
+        return; // 不是本机发出去的推送（例如接收侧的回执），与批次无关
+    };
+    let shot = {
+        let mut batches = state.push.batches.lock();
+        let Some(batch) = batches.get_mut(&batch_id) else {
+            return;
+        };
+        let per_target = batch.per_target_total;
+        let Some(target) = batch.targets.iter_mut().find(|t| t.invite_id == invite_id) else {
+            return;
+        };
+        if target.state.is_terminal() {
+            return;
+        }
+        target.state = target_state;
+        if target_state == TargetState::Done {
+            target.received = per_target;
+        } else if let Some(now) = received {
+            target.received = now.min(per_target);
+        }
+        target.error = error;
+        if !force && batch.last_emit.elapsed() < REPORT_INTERVAL {
+            return;
+        }
+        batch.last_emit = Instant::now();
+        snapshot(batch)
+    };
+    if let Ok(value) = serde_json::to_value(&shot) {
+        ws::emit_ui(state, ws::events::ui::PUSH_BATCH, &value);
+    }
+    if shot.waiting == 0 {
+        state.push.drop_batch(&batch_id);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -468,4 +740,98 @@ fn fail_download(
         "status": "failed",
         "reason": reason,
     }));
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(peer: &str, invite: &str, state: TargetState, received: u64) -> BatchTarget {
+        BatchTarget {
+            peer_id: peer.into(),
+            peer_name: peer.into(),
+            invite_id: invite.into(),
+            paired: true,
+            state,
+            received,
+            error: None,
+        }
+    }
+
+    fn batch(targets: Vec<BatchTarget>) -> PushBatch {
+        PushBatch {
+            id: "b1".into(),
+            name: "报告".into(),
+            count: 2,
+            skipped: 0,
+            per_target_total: 10 * 1024 * 1024,
+            targets,
+            last_emit: Instant::now(),
+        }
+    }
+
+    /// 快照就是界面那张卡片的全部输入，所以它的**形状**（camelCase 字段名、state 字符串）
+    /// 是一份必须钉住的契约：字段一改名，卡片的标题/计数/每行文案就静默变空。
+    #[test]
+    fn snapshot_shape_and_counts_are_the_card_contract() {
+        let value = serde_json::to_value(snapshot(&batch(vec![
+            target("PC-A", "i1", TargetState::Done, 10 * 1024 * 1024),
+            target("PC-B", "i2", TargetState::Sending, 3 * 1024 * 1024),
+            target("PC-C", "i3", TargetState::Failed, 0),
+        ])))
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "batchId": "b1",
+                "name": "报告",
+                "count": 2,
+                // 清单里被跳过几项（链接/读不到）：卡片上那句"已跳过 N 项"读的就是它。
+                "skipped": 0,
+                // 成功 1 · 等待 1 · 失败 1 —— 卡片上那两个实时数字就是它们。
+                "done": 1,
+                "waiting": 1,
+                "failed": 1,
+                // 聚合进度：分子是各台已收之和，分母**只算还活着的那两台**（失败那台整条不计），
+                // 所以有台失败时进度条也能走到 100%。
+                "received": 13 * 1024 * 1024,
+                "total": 20 * 1024 * 1024,
+                "targets": [
+                    { "peerId": "PC-A", "target": "PC-A", "inviteId": "i1", "paired": true,
+                      "state": "done", "received": 10 * 1024 * 1024, "error": null },
+                    { "peerId": "PC-B", "target": "PC-B", "inviteId": "i2", "paired": true,
+                      "state": "sending", "received": 3 * 1024 * 1024, "error": null },
+                    { "peerId": "PC-C", "target": "PC-C", "inviteId": "i3", "paired": true,
+                      "state": "failed", "received": 0, "error": null },
+                ],
+            })
+        );
+    }
+
+    /// 刚建出来那一批：每台都在等（界面第一眼看到的是"等待 N"），进度分母是各台之和。
+    #[test]
+    fn a_fresh_batch_waits_on_every_target() {
+        let mut b = batch(vec![
+            target("PC-A", "i1", TargetState::Invited, 0),
+            target("PC-B", "i2", TargetState::Invited, 0),
+            target("PC-C", "i3", TargetState::Cancelled, 0),
+        ]);
+        b.skipped = 3;
+        let value = serde_json::to_value(snapshot(&b)).unwrap();
+        assert_eq!(
+            value["skipped"].as_u64(),
+            Some(3),
+            "跳过的项数得原样带到卡片上 —— 数字对不上用户就不知道清单少了什么"
+        );
+        assert_eq!(
+            (
+                value["done"].as_u64(),
+                value["waiting"].as_u64(),
+                value["failed"].as_u64(),
+                value["received"].as_u64(),
+                value["total"].as_u64(),
+            ),
+            (Some(0), Some(2), Some(1), Some(0), Some(20 * 1024 * 1024)),
+            "取消的那台不算在路上：等待 2 台，进度分母也只有它俩"
+        );
+    }
 }

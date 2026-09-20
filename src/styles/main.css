@@ -133,6 +133,11 @@ input { font: inherit; }
 /* 切换窗口期间强制隐藏：transition 必须为 none，否则淡出/淡入过程里它会带着
    旧偏移露脸 —— 那正是「切到左边展开时球闪在窗口最左侧」的来源。 */
 .orb-stage.hold .orb { transition: none; transform: scale(0.5); opacity: 0; pointer-events: none; }
+/* 切窗口期间角标也要「立即生效」：球是 `transition: none` 直接跳到位，臂与角标若不跟着跳，
+   会在这段看不见的时间里自己转完一整遍（`--spin-l/r` 一变就跑 0.22s），等球露面时它已经
+   在半路甚至终点 —— 那一下就不是「从默认位开始转」，而是从中途接上的。 */
+.orb-stage.hold .orb-arm,
+.orb-stage.hold .orb-badge { transition: none; }
 .orb-stage.open .orb .pulse,
 .orb-stage.hold .orb .pulse { animation-play-state: paused; } /* 不可见时停脉冲，省电 */
 .orb-badge {
@@ -152,7 +157,43 @@ input { font: inherit; }
 /* 左上角的通知数：与右上角的「长连接设备数」对称。黄色 = 有要你处理的事
    （黄在这套配色里专门表示"要处理"，见 device states 那段注释）。 */
 .orb-badge.notif { left: -4px; right: auto; background: color-mix(in oklch, var(--warn) 82%, black); }
+/* ─── 贴边收起：两颗角标沿球缘转到「露在屏幕内」的那段弧上 ───
+   每个角标挂在自己的臂上（`.orb-arm`，`inset: 0` 铺满球的 padding box）：臂的转心就是球心，
+   所以「绕球心转多少度」只写一个数 —— App 按贴边方向算好（`spinForDock`），经 `--spin-l` /
+   `--spin-r` 传进来。两个数同号 = 整对一起扫过去（贴左 / 贴右）；一正一负 = 两条臂各自荡开
+   （贴上：黄标留在左侧、绿标留在右侧，各自落到球的下缘）。
+   角标自己反向转同样的角度（`--arm-spin` 从所在那条臂继承下来，转心是角标自己的圆心）——
+   角标是正圆，反向转只影响里面的数字，于是数字全程正立，转的只有位置。
+   时长/缓动与球的 `left`/`top` 滑动一致，看起来是同一个动作。 */
+.orb-arm {
+  position: absolute;
+  inset: 0;                 /* 铺满球的 padding box：转心 = 球心 */
+  pointer-events: none;
+  transform: rotate(var(--arm-spin, 0deg));
+  transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.orb-arm.notif { --arm-spin: var(--spin-l, 0deg); }   /* 球左上角那颗（黄 = 通知数） */
+.orb-arm.count { --arm-spin: var(--spin-r, 0deg); }   /* 球右上角那颗（绿 = 长连接设备数） */
+.orb-badge {
+  transform: rotate(calc(-1 * var(--arm-spin, 0deg)));
+  transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+/* 悬停把球滑回完整可见时（`.orb-zone:hover .orb`），臂与角标一起转回默认位（0°）。
+   贴边这一档「收进去 ↔ 沿球缘转」本来就是同一个动作的两半：球收进屏幕边时转、球滑回来时
+   转回去。少了这一条，球滑回来时角标会停在贴边那一档的朝向上 —— 对着完整的球读不出因果，
+   而且下一段动画（指针离开）开始时角标已经转完了，看起来就是「先转完、再收进去」。
+   转回去必须**和球的滑动同时开始**，所以它跟着同一个 `:hover` 走，时长/缓动也一致。
+   选择器多一层 `:hover`（权重更高），不靠书写顺序压过上面两条。 */
+.orb-stage .orb-zone:hover .orb-arm,
+.orb-stage .orb-zone:hover .orb-badge { transform: rotate(0deg); }
 .orb-stage.live .orb .pulse { border-color: var(--ok); } /* 有长连接设备时脉冲转绿，节奏不变 */
+/* 本机切到「离线」（面板右上角那个状态框）：球心 logo 转灰、脉冲整条停掉。
+   离线时本机对局域网隐身、也没有长连接可扩散，脉冲这时是个假信号 —— 它声称"有东西在外面活着"。
+   只停动画不停 `opacity`：`.orb .pulse` 的静态透明度本来就是 0，波消失得干净，不留一圈淡环。
+   切回在线时两条一起恢复（脉冲动画从 0% 重新起，正是"恢复"该有的样子）；
+   灰色用 `--muted`（与面板里离线设备名同一档灰），因此跟随主题。 */
+.orb-stage.offline .orb svg path { fill: var(--muted); }
+.orb-stage.offline .orb .pulse { animation: none; }
 @keyframes orb-pulse {
   /* 起始半径对齐 logo 圆盘外沿：脉冲框 42px（half 21px），0.622×21 − 1px 边框中心自身 0.5px
      ≈ 12.56px = 30px 盒子里 logo 的外半径（13.4/32×30）→ 波从圆盘边缘原地起，而非盘外 6px 起 */
@@ -190,7 +231,61 @@ input { font: inherit; }
 }
 .panel-brand { display: flex; align-items: center; gap: 8px; font-family: var(--font-display); font-weight: 650; letter-spacing: -0.01em; font-size: var(--fs-md); }
 .panel-head-right { margin-left: auto; display: flex; align-items: center; gap: var(--gap-xs); }
-.ch-inst { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--muted); padding: 4px 8px; border: 1px solid var(--border); border-radius: 999px; }
+/* ─── 本机「在线 / 离线」状态框 ───────────────────────────────
+   收起 = 现在的单行胶囊：一行高、圆角 = 框高的一半（26px 的行 + 上下各 1px 边框 = 28px
+   高，圆角 14px —— 与原来的 `999px` **渲染结果完全一致**：999px 会被按框的大小等比缩
+   到 14px，左右仍是半圆）。
+   展开 = 同一个圆角 + 行数那么多行（这里是 2 行，= 选项条数）：只动 `height`，圆角一个
+   像素都不变，所以看到的是"半圆跟着长高成圆角矩形"，而不是棱角忽然变方。
+
+   向下长、且不顶动面板头：`.ch-wrap` 只占**收起时那一行**的位置（面板头的高度因此固定），
+   框自己绝对定位贴着它上沿，长出来的部分盖在标签栏上（z-index 高于 in-flow 内容）。
+   右边缘对齐 = 框向左长（`right: 0`）。 */
+.ch-wrap { --ch-row-h: 26px; position: relative; height: calc(var(--ch-row-h) + 2px); }
+.ch-inst {
+  position: absolute; top: 0; right: 0;
+  width: max-content;                 /* 绝对定位 + 外层宽度为 0：不写死会缩成一条线 */
+  height: calc(var(--ch-row-h) + 2px);
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: calc(var(--ch-row-h) / 2 + 1px);
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  z-index: 30;
+  transition: height 0.2s cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 0.2s ease;
+}
+/* 展开：两行高 + 抬一级阴影（浮在标签栏上要有边界；收起时不加，免得改掉现在这颗胶囊的样子） */
+.ch-inst.open { height: calc(var(--ch-row-h) * 2 + 2px); box-shadow: var(--shadow-bubble); }
+.ch-list { display: flex; flex-direction: column; }
+/* 选项顺序：**当前值永远在第一行**（`order`）。收起时它就是框里露出的那一行，展开时它就是
+   最上面那条 —— 两种状态共用同一份排布，不需要再为"当前值是第二行"单独挪列表。
+   在线那一行要排在后面，只有在离线时才成立。 */
+.ch-inst.off .ch-row.online { order: 1; }
+
+.ch-row {
+  display: flex; align-items: center; gap: 6px;
+  height: var(--ch-row-h);
+  padding: 0 8px;   /* 与改前 `padding: 4px 8px` 的左右一致：收起时的样子不变 */
+  white-space: nowrap;
+  color: var(--muted);
+  transition: background 0.15s ease, color 0.15s ease;
+}
+/* 当前项在**展开的列表里**才加深一档（一眼看出选的是哪条）；收起时整框与改前一样是 muted ——
+   「现在的样子」是这次改动要保住的东西。 */
+.ch-inst.open .ch-row.active { color: var(--fg); }
+.ch-row:not(.active):hover { background: var(--fg-soft); }
+.ch-meta { color: var(--muted); font-variant-numeric: tabular-nums; }
+/* 离线时藏起长连接数，但**占着那份宽度**：`visibility: hidden` 仍参与布局，只是不画。 */
+.ch-meta.gone { visibility: hidden; }
+.ch-caret { width: 12px; height: 12px; margin-left: auto; opacity: 0.7; }
+/* 箭头长在**每一行**上，只把非当前项那颗藏起来（`visibility` 保留占位）：这样两种状态下
+   两行是同一套格子，框的宽度只随文字变、不随"箭头在哪一行"变。 */
+.ch-row:not(.active) .ch-caret { visibility: hidden; }
+/* 收起时另一行**只藏不塌**：`visibility: hidden` 的行照样参与 max-content 宽度计算
+   （框的宽度因此在两种状态下完全一致，收起来时不会缩一下），也不可点、不可聚焦。
+   行高保持 `--ch-row-h`：两行始终是同一套格子，展开/收起只是框的窗口变高变矮。 */
+.ch-inst:not(.open) .ch-row:not(.active) { visibility: hidden; }
 .dot { width: 6px; height: 6px; border-radius: 50%; }
 .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
 .dot.off { background: color-mix(in oklch, var(--fg) 22%, transparent); }
@@ -227,13 +322,14 @@ input { font: inherit; }
   scrollbar-width: none;
 }
 .tabs::-webkit-scrollbar { display: none; }
-/* 光标：标签栏用默认箭头，不要小手、也不要抓手（拖动横滚照旧，只是不改光标）。
-   标签是 <button>，会被全局 `button { cursor: pointer }`（本文件顶部）带上手型，
-   这里显式盖回来 —— 只作用于标签栏，别处的按钮不受影响。
-   拖动中把文字选中也一并禁掉（手势在 TabBar.svelte）。
+/* 光标：标签是可点对象，跟别处按钮同款小手 —— 由全局 `button { cursor: pointer }`
+   （本文件顶部）带上，不额外覆盖。抓手也照样不用：拖动横滚只是顺带的手势，
+   拖着光标变抓会让人以为标签本身能拖走（手势在 TabBar.svelte）。
+   容器 `.tabs` 是可拖动轨道、不是可点对象，显式回默认箭头，
+   免得标签之间那 18px 空隙也摆出可点的手型。
+   拖动中把文字选中也一并禁掉。
    滚动条依旧不画：方向由拖动和滚轮表达，多一条横杠只会挤掉下边框的对齐。 */
-.tabs,
-.tabs .tab { cursor: default; }
+.tabs { cursor: default; }
 .tabs.dragging { user-select: none; }
 .tab {
   position: relative;
@@ -291,6 +387,52 @@ input { font: inherit; }
   letter-spacing: 0.06em; text-transform: uppercase;
   color: var(--muted);
 }
+
+/* 设备页工具条：搜索框常驻在「局域网设备 ?」右侧（设备一多就得靠它找）。
+   它把这一行从 17.6px 顶到 24px —— 可它**普通态与多选态都在**，所以下面列表不会跳版
+   （多选那条注释担心的正是"只在一种状态里多出一件带 padding/border 的东西"）。
+   搜索框只在这里出现，其他两个页面共用 `.list-label` 不受影响。 */
+.dev-label { gap: 8px; }
+.dev-label .ll-name { flex: none; display: inline-flex; align-items: center; }
+/* 光学对齐：这一行是「一列中文字 + 一个圆 + 一个输入框 + 一串中英混排」。圆和输入框的
+   盒子**正好在行中线上**（实测 12.0 / 12.0），可 11px 那行字的**墨迹**不在 —— 中日韩字
+   在字体盒里天然偏上（雅黑的 descent 里给 CJK 留了一截空：`ascent+descent` 13px 的盒子里
+   那 10px 墨迹的中心在盒中心上方 0.7px），加上行盒本身又偏上 0.3px，合计**墨迹中心比行
+   中心高 1px**（实测：6px 在上、8px 在下）。所以「局域网设备」和右边的台数都要往
+   下压 1px 才和圆/输入框同心 —— 用 `top: 1px`（只挪绘制、不改布局，整数像素在 dpr 1
+   也保持清晰），**不要**去动 line-height：墨迹在行盒里的偏移跟 line-height 无关，
+   改它没用（实测）。`.ll-text` 单独包一层就是为了只挪字、不挪紧挨着的那个圆。 */
+.dev-label .ll-text, .dev-label .num { position: relative; top: 1px; }
+/* 台数交给 `margin-left: auto` 顶到最右（auto 外边距先吃掉剩余空间，`justify-content`
+   这时已经不起作用）—— 剩下的空白于是落在**搜索框右侧**，而不是被搜索框吃光。
+   宽度固定 120px：它是个筛子，不是这一行的主角（占满整条会让工具条看着像一张表单），
+   台数一变长也先缩它、不挤别的。 */
+.dev-label .num { flex: none; margin-left: auto; }
+/* `.list-label` 是等宽 + 大写 + 字距：输入框里的字与占位符得把这套全部清掉，
+   否则占位符会被拆成"分得很开的字"。
+   圆角用 `--radius`（8px）= 全应用**输入框**的统一圆角（`.input` 同款），不是胶囊 ——
+   胶囊在这套配色里是「标签/状态」（`.place`、`.bcast-chip`、`.ch-inst`）的形状，
+   而且它就贴在 14px 的圆形「?」旁边，再圆一个会读成第二颗圆形徽标。
+   收缩留 1：台数很长（"24 台 · 6 长连接 · 18 离线"）时先缩搜索框，一行永远不折行。
+   垂直：这一行字与光标是 **UA 按字体度量居中**的，不归 CSS 管 —— 实测 `line-height`
+   换 12 / 14 / 16 / 19.2（继承的 1.6）/ 22px，字与光标的落点**一个像素都不动**
+   （`<input>` 的内部行框不吃 line-height）。实测落点（dpr 1 与 1.25，像素级量的）：
+   占位符（= 打进去的字，同一个基线，已对比）墨迹中心在盒中心下方 0.5–0.8px、光标
+   （高 15–16px = YaHei 的 1.33em）在下方 0.4–0.5px，**两者同心、都不偏上**。
+   "看着高"来自光标比 CJK 墨迹（0.87em ≈ 11px）高一截，它的两端探进了上下各 8px 的圆角区。
+   真要用 CSS 挪只能拿 `padding-top/bottom` 硬推（每 1px 移 0.5px），推了必有一头不居中 ——
+   没有两全的解，别照"感觉"盲调。 */
+.dev-search {
+  flex: 0 1 120px; min-width: 0; height: 24px; padding: 0 8px;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); color: var(--fg);
+  font-family: var(--font-body); font-size: var(--fs-xs);
+  letter-spacing: 0; text-transform: none;
+}
+.dev-search::placeholder { color: color-mix(in oklch, var(--muted) 72%, transparent); }
+.dev-search:hover { border-color: color-mix(in oklch, var(--fg) 22%, transparent); }
+.dev-search:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.dev-search::-webkit-search-cancel-button { cursor: pointer; }
 
 /* ─── share items ───────────────────────────────────────────── */
 .share-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
@@ -400,6 +542,50 @@ input { font: inherit; }
 .d-acts .btn-primary { min-width: 84px; }
 .d-acts .btn-ghost.btn-sm { min-width: 52px; }
 
+/* ─── 设备页多选（一次推给多台）───────────────────────────────── */
+/* 入口是长按设备行（DeviceTab 的 onRowPress），这里没有可见的按钮。
+   这一行的常驻内容（`.list-label` 的 11px 等宽、右侧那串台数、以及搜索框）**两种状态下
+   完全一样**，所以多选进/出这一行的行高逐像素相同 —— 一条规矩：谁要在多选态里多塞
+   一件带 padding/border 的东西（或让它唯独在多选态消失），下面的列表就会整条跳版
+   （实测 23.59px vs 17.59px）。 */
+/* 勾选期间顶部那颗块状按钮原地换成动作条：同高、不跳版，且不会被右下角那组通知气泡压住
+   （气泡是面板底部那一层，压不到顶部）。 */
+.dev-select-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--gap-sm);
+  padding: 0 4px 0 12px;
+  border: 1px solid color-mix(in oklch, var(--accent) 32%, var(--border));
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+  font-family: var(--font-display); font-size: var(--fs-sm); color: var(--fg);
+}
+.dev-select-bar .num { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); }
+.dev-select-bar b { color: var(--fg); }
+/* 勾选期间每一行 = 一个开关：点整行勾/取消，行里的动作按钮收起来（留着会让"点哪儿算勾"
+   变得含糊）。 */
+.device-row.selecting { cursor: pointer; }
+.device-row.selecting .d-acts { display: none; }
+.device-row.selected { background: var(--accent-soft); }
+.device-row.locked { opacity: 0.55; cursor: default; }
+/* 勾选框：**盒子和头像同一个槽位（34px），真正画出来的方框只有 16px** ——
+   与文件选择框里那颗同尺寸（`.pr-check`：5px 圆角 / 1.5px 描边 / accent-deep 填色）；
+   槽位保持 34px 是另一半要求：换进来/换出去都不能挪动后面的设备名与 ip。
+   方框走 ::before、勾走 svg，两者叠在同一个网格单元里居中。 */
+.d-check {
+  width: 34px; height: 34px; flex: none;
+  display: grid; place-items: center;
+  color: var(--surface);
+}
+.d-check::before, .d-check svg { grid-area: 1 / 1; }
+.d-check::before {
+  content: ''; width: 16px; height: 16px;
+  border: 1.5px solid color-mix(in oklch, var(--fg) 26%, transparent); border-radius: 5px;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.d-check svg { width: 11px; height: 11px; opacity: 0; }
+.d-check.on::before { background: var(--accent-deep); border-color: var(--accent-deep); }
+.d-check.on svg { opacity: 1; }
+.device-row:not(.online) .d-check::before { border-style: dashed; }
+
 /* ─── buttons ───────────────────────────────────────────────── */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
@@ -444,6 +630,9 @@ input { font: inherit; }
 .p-bar { height: 4px; margin-top: 10px; border-radius: 999px; background: var(--fg-soft); overflow: hidden; }
 .p-bar i { display: block; height: 100%; width: 0; border-radius: 999px; background: var(--accent); transition: width 0.1s linear; }
 .p-meta { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; font-size: var(--fs-xs); color: var(--muted); }
+/* 清单里少了的项（链接/读不到）：用警示色，别混进上面那行灰字里 ——
+   它是"你推的东西不完整"，不是普通的元信息。 */
+.p-skip { margin-top: 6px; font-size: var(--fs-xs); color: var(--warn); }
 /* 传完了把进度条转绿（和接收侧那条"已收到"一个意思）。 */
 .notif-bubble.done .p-bar i { background: var(--ok); }
 
@@ -536,6 +725,38 @@ input { font: inherit; }
 /* 气泡里的按钮比卡上的小一号；两个（拒绝/接收）时等宽，单个（知道了/取消）就自然宽度。 */
 .nb-acts .btn { height: 28px; min-width: 76px; }
 
+/* ─── 一批多台：卡片里那一列目标行 ─────────────────────────────
+   一行一台：绿点=成了/在传、灰点=在等、红点=没成。卡片本身不滚（滚动归 `.notif-group`，
+   两条滚动条会打架），所以台数多了先只列 4 行、「还有 N 台 ▾」就地展开。 */
+.batch-rows {
+  margin-top: 8px; padding-top: 8px;
+  border-top: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 4px;
+}
+.batch-row { display: flex; align-items: center; gap: 8px; font-size: var(--fs-xs); color: var(--muted); }
+.batch-row .dot { flex: none; }
+.batch-row .br-name {
+  flex: none; max-width: 96px;
+  color: var(--fg); font-family: var(--font-display); font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.batch-row .br-state { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 没成的那一行，行内文案也换成暖色：光靠一颗红点，一眼扫过去还是分不出是哪台。 */
+.batch-row.bad .br-state { color: color-mix(in oklch, var(--warn) 75%, black); }
+.br-x {
+  flex: none; width: 18px; height: 18px; padding: 0;
+  display: grid; place-items: center;
+  border: none; border-radius: 6px; background: transparent;
+  color: var(--muted); cursor: pointer; font-size: 11px; line-height: 1;
+}
+.br-x:hover { color: var(--fg); background: var(--fg-soft); }
+.br-more {
+  align-self: flex-start; margin-top: 2px; padding: 2px 0;
+  border: none; background: transparent; cursor: pointer;
+  color: var(--muted); font-size: var(--fs-xs);
+}
+.br-more:hover { color: var(--fg); }
+
 .sheet { position: absolute; inset: 0; z-index: 85; background: var(--surface); transform: translateX(100%); transition: transform 0.28s cubic-bezier(0.2, 0.8, 0.2, 1); display: flex; flex-direction: column; }
 .sheet.open { transform: translateX(0); }
 .sheet-head { display: flex; align-items: center; gap: var(--gap-md); padding: 13px 16px; border-bottom: 1px solid var(--border); }
@@ -562,7 +783,12 @@ input { font: inherit; }
 /* ─── hint（圆圈 ? + 悬停说明）──────────────────────────────── */
 /* 说明都收进这颗 14px 的圈里，指针悬停 / 键盘聚焦才出气泡。圈里的「?」用正文字体并
    清掉字距与大小写变换 —— `.list-label` 是等宽 + 大写 + 字距，被它带走的「?」会又宽又偏。 */
-.hint { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; flex: none; margin-left: 5px; border: 1px solid color-mix(in oklch, var(--fg) 24%, transparent); border-radius: 50%; color: var(--muted); font-family: var(--font-body); font-size: 9px; font-weight: 600; line-height: 1; letter-spacing: 0; text-transform: none; vertical-align: middle; cursor: help; transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease; }
+.hint { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; flex: none; margin-left: 5px; border: 1px solid color-mix(in oklch, var(--fg) 24%, transparent); border-radius: 50%; color: var(--muted); font-family: var(--font-body); /* 字号与行盒都是为了让那颗「?」在 14px 圈里真正居中（都是实测出来的，别凭感觉改）：
+   ① `line-height: 12px` = 圈的内空（14 − 2×1px 边框）——写成整数行盒，`align-items: center`
+      的居中量才是整数 0；`line-height: 1`（9px）会留下 (12−9)/2 = 1.5px 的**半像素**偏移。
+   ② `font-size: 11px`：9px 的「?」墨迹只有 7px 高，在 12px 内空里 (12−7)/2 = 2.5 —— 半像素
+      是躲不掉的；11px 的墨迹正好 8px，上下各 3px，dpr 1 与 1.25 实测都**正好居中**
+      （9px：上 3 下 4；10px：上 2 下 4）。顺带和工具条那行 11px 的字同号。 */ font-size: 11px; font-weight: 600; line-height: 12px; letter-spacing: 0; text-transform: none; vertical-align: middle; cursor: help; transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease; }
 .hint:hover, .hint:focus-visible { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 /* 气泡：由 `HintLayer` 统一画在 `.orb-stage` 之外（`position: fixed`，left/top 由它按窗口
    尺寸避让边缘后传入）—— 画在触发点旁边会被 `.panel`（overflow: hidden）/ `.panel-body`、
@@ -758,5 +984,5 @@ input { font: inherit; }
 .dialog .pair-invite { margin: 0 0 14px; }
 .dialog .pair-invite + .d-target { margin-top: 0; }
 @media (prefers-reduced-motion: reduce) {
-  .orb-stage, .panel, .orb, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin { transition: none !important; animation: none !important; }
+  .orb-stage, .panel, .orb, .orb-arm, .orb-badge, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin { transition: none !important; animation: none !important; }
 }

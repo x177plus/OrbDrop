@@ -24,7 +24,8 @@
         "minHeight": 90,
         "center": true,
         "resizable": false,
-        "dragDropEnabled": true
+        "dragDropEnabled": true,
+        "skipTaskbar": true
       }
     ],
     "security": {

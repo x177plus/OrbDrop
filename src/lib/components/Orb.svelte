@@ -116,8 +116,21 @@
     <span class="pulse"></span>
     <Logo size={30} />
   </span>
-  <span class="orb-badge num" hidden={badgeCount === 0}>{badgeCount}</span>
-  <!-- 左上角 = 待处理的通知数（推送邀请等），与右上角的「长连接设备数」对称；
-       黄色是"要你看一眼"，灰绿是"当前有多少条链路"。 -->
-  <span class="orb-badge notif num" hidden={notifCount === 0}>{notifCount}</span>
+  <!-- 角标臂：两颗角标分别挂在一条「臂」上（臂 `inset: 0` 铺满球的 padding box，转心就是球心）。
+       为什么要这一层：贴边收起后球有大半颗在屏幕外，角标得绕球心转到**露在屏幕内的那段弧**上
+       （转到哪由 App 的 `spinForDock` 按贴边方向算好，经 `--spin-l` / `--spin-r` 传给 CSS）。
+       有臂才有「绕球心的自然转心」—— 否则每颗角标都得写一个手算的 `transform-origin`
+       （角标中心到球心的偏移），球径/角标尺寸一改就全错。臂铺满球的 padding box，与角标原来
+       相对的那个盒子是同一个，所以角标的 left/top 坐标一个像素都不用改。
+       臂里那颗角标自己反向转同样的角度（转心是它自己的圆心，角度从所在臂继承）——
+       角标是正圆，反向转只影响里面的数字，于是数字全程正立，转的只有位置。
+       `notif` = 球的左上角那颗（黄，通知数）；`count` = 右上角那颗（绿，长连接设备数）。 -->
+  <span class="orb-arm notif">
+    <!-- 左上角 = 待处理的通知数（推送邀请等），与右上角的「长连接设备数」对称；
+         黄色是"要你看一眼"，灰绿是"当前有多少条链路"。 -->
+    <span class="orb-badge notif num" hidden={notifCount === 0}>{notifCount}</span>
+  </span>
+  <span class="orb-arm count">
+    <span class="orb-badge num" hidden={badgeCount === 0}>{badgeCount}</span>
+  </span>
 </button>
