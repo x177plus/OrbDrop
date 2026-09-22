@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-check --tsconfig ./tsconfig.json --watch",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "commit": "omp commit -c \"摘要首词用英文过去式动词（Added、Fixed、Updated），其余摘要与全部明细用简体中文\"",
+    "commit:dry": "npm run commit -- --dry-run"
   },
   "license": "MIT",
   "dependencies": {
