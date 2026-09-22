@@ -10,6 +10,7 @@
   import { loadSettings, getSettings } from '$lib/stores/settings.svelte';
   import { getPeerSharesState, loadPeerShares } from '$lib/stores/peers.svelte';
   import { getBcStatus, loadBcStatus, setBcSide, clearSide, compare } from '$lib/stores/bc.svelte';
+  import * as chat from '$lib/stores/chat.svelte';
   import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, localAddresses, orbScreenMetrics, orbSetRect, orbDragStart, orbMouseDown, orbSaveCenter, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, openPath, fetchTree, peerTree } from '$lib/api';
   import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape } from '$lib/types';
   import { shareMeta } from '$lib/types';
@@ -23,6 +24,8 @@
   import TabContent from '$lib/components/TabContent.svelte';
   import SettingsPanel from '$lib/components/SettingsPanel.svelte';
   import ContextMenu from '$lib/components/ContextMenu.svelte';
+  import ConvoPanel from '$lib/components/ConvoPanel.svelte';
+  import RecipientDialog from '$lib/components/RecipientDialog.svelte';
   import Hint from '$lib/components/Hint.svelte';
   import HintLayer from '$lib/components/HintLayer.svelte';
 
@@ -204,15 +207,19 @@
   let toasts = $state<{ id: number; msg: string; leaving: boolean }[]>([]);
   let toastId = $state(0);
   // Context menu
-  type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer'; el?: HTMLElement; shareId?: string; path?: string; isDir?: boolean; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; peerName?: string; name?: string };
+  type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer' | 'chat' | 'convo'; el?: HTMLElement; shareId?: string; path?: string; isDir?: boolean; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; peerName?: string; name?: string; chatId?: string; chatFull?: string; chatSel?: string; convoBrowse?: boolean };
   let ctxState = $state<CtxState | null>(null);
 
   let connectedCount = $derived(getDevices().filter(d => d.connected).length);
-  // 悬浮球左上角 / 铃铛的角标：这一组里还有几件事（通知 + 在途推送）。
+  // 铃铛的角标：面板右下角那组气泡里还有几件事（通知 + 在途推送）。
   // 铃铛收起的不只是"通知"—— 发送方的进度卡也在同一组里，所以角标得一起算，
   // 否则会出现"收起后角标还在、但组里明明有东西"的错位。
   // **一批多设备推送算一件**：用户点一次就得到一张卡，角标自然跟着"几次操作"走。
   let notifCount = $derived(notices.length + pushBatches.length);
+  // 悬浮球左上角那颗角标：**同一组东西再加上会话未读**。未读消息也是"有事等你"，而面板收着
+  // 的时候，那颗球是唯一还看得见的提示（铃铛只数它自己那组气泡里的东西 —— 会话不进那一组，
+  // 所以铃铛角标跟着涨就会「说 3 件、点开只有 2 件」）。打开那个会话即已读，数自己就掉。
+  let orbNotifCount = $derived(notifCount + chat.unreadTotal());
   // 通知（面板右下角那组气泡）：未绑定的邀请、正在接收、已收到待确认、失败 —— **全都在
   // 这一组里**，形状统一（右对齐、2/3 面板宽，不占满）。要当场点的按钮（接收/拒绝/取消）
   // 就长在气泡里，所以它们不单独占一层。
@@ -942,6 +949,9 @@
     showSettings = false;
     ctxState = null;
     picker = null;        // 选择框和右键菜单一样属于面板：收起即作废
+    chat.setChatOpen(false);
+    chat.closeRecipients();
+    chat.closeBatch();
     toasts = [];          // 提示是面板上的浮层：收起即作废，别等下次展开又冒出来
     holdOrb = true;
     if (foldTimer) clearTimeout(foldTimer);
@@ -1112,20 +1122,14 @@
   }
 
   /**
-   * 点「推送」（设备行 / 右键菜单）：开选择框，文件与文件夹混选、可跨目录累积。
+   * 推送（唯一入口：会话里那颗「＋」）：给这个会话的每台各开一条 —— **只开一次选择框**
+   * （文件与文件夹混选、可跨目录累积），同一批文件并发给每台（各台一条邀请、各自同意、
+   * 各自进度；清单只建一次）。1:1 会话就是单台推送。
    *
    * 以前这里还有一层"先问推文件还是文件夹"——那是原生框的能力限制逼出来的：Windows 的
    * `IFileOpenDialog` 只有 `FOS_PICKFOLDERS` 一个开关（非此即彼），rfd 也只给
    * `pick_file(s) / pick_folder(s)`，没有混合模式。选择框自绘之后这一层就不需要了，
    * 用户可以先把一个文件勾上、再进另一层目录把整个文件夹勾上，一次推过去。
-   */
-  function requestPush(device: PeerDevice) {
-    requestPushMany([device]);
-  }
-
-  /**
-   * 多设备推送：设备页多选勾好 N 台之后走这里 —— **只开一次选择框**，
-   * 同一批文件并发给每台（各台一条邀请、各自同意、各自进度；清单只建一次）。
    */
   function requestPushMany(devices: PeerDevice[]) {
     const live = devices.filter((d) => d.online);
@@ -1159,7 +1163,10 @@
     if (items.length === 0) return;
     try {
       // 同一份清单发给每台：多选合并成**每台一条**推送（对端一张卡、一次同意、一条进度）。
-      await pushPaths(items.map((i) => i.path), devices.map((d) => d.id));
+      const batch = await pushPaths(items.map((i) => i.path), devices.map((d) => d.id));
+      // 会话里也留一条（文件消息就是这次推送的状态行）—— 推了哪些项、走到哪一步，
+      // 落点只有一个：会话。
+      chat.noteOutgoingFiles(devices.map((d) => d.id), items, batch.batchId);
     } catch (e) {
       toast(String(e));    // 全都不可达等：就地失败，不排队（F-53）
     }
@@ -1221,6 +1228,132 @@
   /** 取消整批（卡片上的「取消全部」）：各台各撤一条，任何一台撤不动都不影响其余几台。 */
   async function cancelBatch(batchId: string) {
     try { await cancelPushBatch(batchId); } catch (e) { toast(String(e)); }
+  }
+
+  // ── 会话（聊天）：面板底栏那颗入口、会话里的文件发送、会话菜单 ────────────
+  // 会话记录在后端（`stores/chat` 拿着那份快照），这里只做"面板级"的事：开合浮层、
+  // 开文件选择框、画右键菜单、把右下角那条推送通知同步进会话。
+
+  /** 底栏那颗「会话」：开合浮层。展开时拉一次快照 —— 收起期间收到的消息得补上。 */
+  function toggleChat() {
+    const next = !chat.isChatOpen();
+    chat.setChatOpen(next);
+    if (next) {
+      void chat.refresh();
+    } else {
+      chat.closeRecipients();
+      chat.closeBatch();
+    }
+  }
+
+  /**
+   * 设备页的「发消息」（行上的按钮与右键菜单同一条路）：开一台设备的会话 ——
+   * 设备不在了就说清楚，别开出一个空会话。
+   */
+  function openDeviceChat(peerId: string) {
+    if (!getDevices().some((d) => d.id === peerId)) {
+      toast('该设备已被移除');
+      return;
+    }
+    chat.openConversation(peerId);
+  }
+
+  /** 会话里「＋」：选文件就是推送（`requestPushMany` 那条路，一次选、分头发）。 */
+  function chatSendFiles(peerIds: string[]) {
+    requestPushMany(getDevices().filter((d) => peerIds.includes(d.id)));
+  }
+
+  /** 会话菜单的「查看该设备文件」：切到那台设备的浏览标签（标签只给长连接设备开）。 */
+  function chatOpenDeviceFiles(peerId: string) {
+    activeTab = { kind: 'peer', peerId };
+  }
+
+  function openMessageCtx(x: number, y: number, id: string, full: string, sel: string) {
+    ctxState = { x, y, kind: 'chat', chatId: id, chatFull: full, chatSel: sel };
+  }
+
+  function openConvoCtx(x: number, y: number) {
+    const peerId = chat.getOpenPeer();
+    if (!peerId) return;
+    // 「查看该设备文件」要有对方的**浏览标签**才成立（那个标签只给长连接设备开）：
+    // 没长连接时挂上去只是个点了没反应的项。
+    const browse = getDevices().find((d) => d.id === peerId)?.connected === true;
+    ctxState = { x, y, kind: 'convo', peerId, convoBrowse: browse };
+  }
+
+  /** 消息菜单：复制整条 / 只复制选中的那段（与别处复制同一套：剪贴板 API + 失败提示）。 */
+  function ctxChatCopy(which: 'all' | 'sel') {
+    const c = ctxState;
+    hideCtx();
+    const text = (which === 'sel' ? c?.chatSel : c?.chatFull) ?? '';
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(
+      () => toast(which === 'sel' ? '已复制所选文字' : '已复制整条消息'),
+      () => toast('复制失败，请手动选中文字后复制'),
+    );
+  }
+
+  /** 设备菜单的「发消息」：把 ctxState 里那台设备的会话开出来。 */
+  function ctxMessage() {
+    const id = ctxState?.deviceId;
+    hideCtx();
+    if (id) openDeviceChat(id);
+  }
+
+  /** 会话菜单的「查看该设备文件」：切到那台设备的浏览标签。 */
+  function ctxConvoFiles() {
+    const id = ctxState?.peerId;
+    hideCtx();
+    if (id) chatOpenDeviceFiles(id);
+  }
+
+  /** 会话菜单的「清空聊天记录」：只清这一台那条记录，别的设备那份不受影响。 */
+  async function ctxConvoExit() {
+    const peerId = ctxState?.peerId;
+    const title = peerId ? chat.deviceNameOf(peerId) : '';
+    hideCtx();
+    if (!peerId) return;
+    try {
+      await chat.clearPeer(peerId);
+    } catch (e) {
+      toast(String(e));
+      return;
+    }
+    chat.backToList();
+    toast(`已清空与「${title}」的聊天记录`);
+  }
+
+  /**
+   * 会话里那张卡上的「接收 / 拒绝」：右下角那条通知还在就交给同一条处理路径
+   * （两条路各写一套的话，"接收中"的进度与成败会各说各的），通知已经被处理过就只调后端。
+   */
+  async function chatAcceptInvite(inviteId: string) {
+    const notice = notices.find((n) => n.inviteId === inviteId);
+    if (notice) {
+      await acceptNotice(notice);
+      return;
+    }
+    try {
+      await acceptPush(inviteId);
+      chat.noteInviteAccepted(inviteId);
+    } catch (e) {
+      toast(String(e));
+      chat.noteInviteDone(inviteId, 'failed');
+    }
+  }
+
+  async function chatRejectInvite(inviteId: string) {
+    const notice = notices.find((n) => n.inviteId === inviteId);
+    if (notice) {
+      await rejectNotice(notice);
+      return;
+    }
+    try {
+      await rejectPush(inviteId);
+    } catch (e) {
+      toast(String(e));
+    }
+    chat.noteInviteDone(inviteId, 'rejected');
   }
 
   function dropNotice(inviteId: string) {
@@ -1293,10 +1426,12 @@
       return;
     }
     notices = notices.map((x) => (x.inviteId === n.inviteId ? { ...x, kind: 'receiving' } : x));
+    chat.noteInviteAccepted(n.inviteId);
   }
 
   async function rejectNotice(n: PushNotice) {
     dropNotice(n.inviteId);
+    chat.noteInviteDone(n.inviteId, 'rejected');
     try { await rejectPush(n.inviteId); } catch (e) { toast(String(e)); }
   }
 
@@ -1594,14 +1729,6 @@
     if (device) openPair(device);
   }
 
-  /** 右键「推送」：与设备行同一个入口（同一个文件选择框）。 */
-  function ctxPush() {
-    const deviceId = ctxState?.deviceId;
-    hideCtx();
-    const device = deviceId ? getDevices().find((d) => d.id === deviceId) : undefined;
-    if (device) requestPush(device);
-  }
-
   /** 放入比较位：side 是 'left' | 'right'，文案沿用同一套。 */
   async function ctxBcPlace(side: 'left' | 'right') {
     const c = ctxState;
@@ -1744,6 +1871,8 @@
         count: inv.count ?? 1,
         received: 0,
       }];
+      // 会话里也落一张卡（同一件事的另一处呈现：右下角是"顺带看一眼"，会话是"跟这台设备的往来"）。
+      chat.noteInboundInvite(inv);
     });
 
     // 一批推送的快照：**发送侧卡片唯一的数据来源**（创建、每台进度、成功/失败/取消）。
@@ -1754,6 +1883,8 @@
       pushBatches = pushBatches.some((x) => x.batchId === b.batchId)
         ? pushBatches.map((x) => (x.batchId === b.batchId ? b : x))
         : [...pushBatches, b];
+      // 会话里那几条文件消息的进度与成败，抄的就是这张快照（唯一的进度来源）。
+      chat.noteBatch(b);
 
       // 单台那条路由 push://done 收尾（toast 文案与原来一字不差），这里不插手。
       if (b.targets.length === 1 || settledBatches.has(b.batchId)) return;
@@ -1780,6 +1911,7 @@
       const { inviteId, accepted, reason } = ev.payload;
       const notice = notices.find((n) => n.inviteId === inviteId);
       if (accepted) {
+        chat.noteInviteAccepted(inviteId);
         if (notice) notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'receiving' } : n));
         const b = batchForInvite(inviteId);
         if (b && b.targets.length === 1) {
@@ -1793,6 +1925,7 @@
       // 的那条通知必须撤掉，否则它会一直留在那儿，点「接收」才发现邀请早就没了（后面那种
       // 情况下 kind 已经是 'receiving' —— 后端这时补一条 accepted:false 回来）。
       // 发送方那张进度卡由随后的 push://done 收尾（两条通道都会跟一条）。
+      chat.noteInviteDone(inviteId, 'rejected');
       if (notice && (notice.kind === 'invite' || notice.kind === 'receiving')) {
         dropNotice(inviteId);
         toast(
@@ -1808,11 +1941,13 @@
       if (total <= 0) return;
       // 接收侧：卡片就地变成"正在接收 xx%"。
       notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'receiving', received, size: total } : n));
+      chat.noteInviteProgress(inviteId, received, total);
       // 发送侧那张卡的进度由 `push://batch` 快照推进（同一份数据只有一个来源）。
     });
 
     const unPushDone = listen<{ inviteId: string; status: string; reason?: string | null; dest?: string }>('push://done', (ev) => {
       const { inviteId, status, reason, dest } = ev.payload;
+      chat.noteInviteDone(inviteId, status === 'completed' ? 'received' : 'failed');
       const notice = notices.find((n) => n.inviteId === inviteId);
       if (notice) {
         if (status === 'completed') {
@@ -1861,6 +1996,18 @@
     };
     document.addEventListener('pointerdown', closeStatus, true);
     document.addEventListener('keydown', escStatus);
+
+    // Esc 的层级：收件人选择框 → 会话菜单 → 会话浮层（原型同款顺序）。
+    // 会话菜单那一下必须由这里先处理：菜单自己的 Esc 监听是**后挂**的（组件随菜单挂载），
+    // 它只会把菜单关掉；先一步把菜单关掉并 return，就不会连带把浮层也关了。
+    const escChat = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      if (chat.getRecipientReq()) { chat.closeRecipients(); return; }
+      if (chat.getBatch()) { chat.closeBatch(); return; }
+      if (ctxState?.kind === 'chat' || ctxState?.kind === 'convo') { hideCtx(); return; }
+      if (chat.isChatOpen()) chat.setChatOpen(false);
+    };
+    document.addEventListener('keydown', escChat);
 
     // 用户又点了一次应用图标 / 启动了第二份进程：把面板展开，而不是让新进程悄悄消失。
     const unOrbShow = listen('orb://show', () => {
@@ -1957,6 +2104,7 @@
       unLocalOnline.then(fn => fn());
       document.removeEventListener('pointerdown', closeStatus, true);
       document.removeEventListener('keydown', escStatus);
+      document.removeEventListener('keydown', escChat);
       unOrbShow.then(fn => fn());
       unPairDone.then(fn => fn());
       unPairInvite.then(fn => fn());
@@ -2000,7 +2148,7 @@
       <RectOrb
         pages={rectPages}
         deviceCount={connectedCount}
-        notifCount={notifCount}
+        notifCount={orbNotifCount}
         {expanded}
         docked={rectDock !== 0}
         onToggle={() => setOpen(!expanded)}
@@ -2019,7 +2167,7 @@
     {:else}
       <Orb
         badgeCount={connectedCount}
-        notifCount={notifCount}
+        notifCount={orbNotifCount}
         expanded={expanded}
         onToggle={() => setOpen(!expanded)}
         onDragStart={beginOrbDrag}
@@ -2078,11 +2226,25 @@
     />
 
     <div class="panel-body" bind:this={bodyEl}>
-      <TabContent tab={activeTab} devices={getDevices()} onToast={toast} onRequestPush={requestPush} onRequestPushMany={requestPushMany} onAddShare={requestAddShare} onOpenPair={openPair} onUnpair={(d) => void unpairDevice(d.id)} />
+      <TabContent tab={activeTab} devices={getDevices()} onToast={toast} onMessage={(d) => openDeviceChat(d.id)} onAddShare={requestAddShare} onOpenPair={openPair} onUnpair={(d) => void unpairDevice(d.id)} />
     </div>
 
     <footer class="panel-foot" bind:this={footEl}>
       <span class="foot-left">
+        <!-- 会话入口：常驻、不遮挡内容（原型 `.foot-msg`）。角标 = 未读总数（与页签上那颗点
+             同一个数）——「收起 ≠ 已读」：收起浮层不清未读，只有真打开那个会话才算读过。 -->
+        <button
+          class="foot-msg"
+          class:open={chat.isChatOpen()}
+          type="button"
+          aria-label={chat.unreadTotal() > 0 ? `会话，${chat.unreadTotal()} 条未读` : '会话'}
+          aria-expanded={chat.isChatOpen()}
+          onclick={toggleChat}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.75" y="5.25" width="16.5" height="13.5" rx="4.25"/><circle cx="8.6" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="15.4" cy="12" r="1.15" fill="currentColor" stroke="none"/></svg>
+          <span>会话</span>
+          {#if chat.unreadTotal() > 0}<span class="msg-fab-badge num">{chat.unreadTotal() > 99 ? '99+' : chat.unreadTotal()}</span>{/if}
+        </button>
         {#if localAddrs.primary}
           <!-- 本机内网「IP:端口」：多网卡时只显示首个，悬停列出全部（跨网段手动添加要用）；点一下整串复制。 -->
           <button class="foot-addr num" onclick={copyAddr} title={addrTitle}>{localAddrs.primary}:{serverPortVal || 3890}</button>
@@ -2337,6 +2499,22 @@
       </div>
     {/if}
 
+    <!-- 会话浮层（左下角展开）与收件人选择框：与设置、配对、选择框同一套层叠，都在面板里 ——
+         面板收起时整块跟着消失（浮层由 `collapse()` 一起关掉）。会话记录在后端，
+         这里只画；浮层内部自己管列表 ↔ 详情两屏。 -->
+    <ConvoPanel
+      pickedId={ctxState?.kind === 'chat' ? ctxState.chatId ?? null : null}
+      onToast={toast}
+      onSendFiles={chatSendFiles}
+      onAcceptInvite={chatAcceptInvite}
+      onRejectInvite={chatRejectInvite}
+      onConvoCtx={openConvoCtx}
+      onMessageCtx={openMessageCtx}
+    />
+    {#if chat.getRecipientReq()}
+      <RecipientDialog />
+    {/if}
+
     <!-- 文件选择框：文件与文件夹在同一个框里混选、选中项跨目录累积。推送与「添加共享项」
          都用它 —— 开成什么样由 `picker` 这个请求对象决定（`closePicker` 关掉它）。 -->
     {#if picker}
@@ -2375,6 +2553,8 @@
     bcCompareLabel={bcMenu.compareLabel}
     bcCompareEnabled={bcMenu.compareEnabled}
     bcThisStaged={bcMenu.thisStaged}
+    chatSel={!!ctxState.chatSel}
+    convoBrowse={ctxState.convoBrowse === true}
     onClose={hideCtx}
     onToast={toast}
     onDownload={ctxDownload}
@@ -2385,7 +2565,10 @@
     onDisconnect={ctxDisconnect}
     onPair={ctxPair}
     onUnpair={ctxUnpair}
-    onPush={ctxPush}
+    onMessage={ctxMessage}
+    onChatCopy={ctxChatCopy}
+    onConvoFiles={ctxConvoFiles}
+    onConvoExit={() => void ctxConvoExit()}
     onPeerDownload={ctxPeerDownload}
     onBcCompare={ctxBcCompare}
     onBcAddLeft={() => ctxBcPlace('left')}

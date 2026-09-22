@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, PickerFavorite } from './types';
+import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, PickerFavorite, ChatSnapshot } from './types';
 import type { ScreenMetrics, ScreenRect } from './orbLayout';
 
 // Share management
@@ -178,6 +178,33 @@ export function cancelPush(inviteId: string): Promise<void> {
 
 export function cancelReceive(inviteId: string): Promise<void> {
   return invoke('cancel_receive', { inviteId });
+}
+
+// 会话（聊天）：文本消息走长连接（后端 `chat.rs` / `WsEvent::ChatText` + `ChatRead`），
+// 会话记录落在 `chat.json` 里。命令一律返回**整份会话状态** —— 界面不做增量演算。
+/** 整份会话状态（面板打开时拉一次，之后由 `chat://changed` 事件推进）。 */
+export function chatSnapshot(): Promise<ChatSnapshot> {
+  return invoke('chat_snapshot');
+}
+
+/**
+ * 发一条文本消息给一台或多台设备（多台 = 界面上的「群发」框；每台一份副本、同一个消息 id）。
+ *
+ * 除了整份快照还带回这条消息的 `id`：界面据此**逐台读状态**（谁送到了、谁没送到），
+ * 不用去猜"哪条是刚发出去的"。
+ */
+export function chatSend(peerIds: string[], text: string): Promise<{ id: string; snapshot: ChatSnapshot }> {
+  return invoke('chat_send', { peerIds, text });
+}
+
+/** 界面读过这些设备的会话：推进本地已读水位，并给对端回一条已读回执。 */
+export function chatMarkRead(peerIds: string[]): Promise<ChatSnapshot> {
+  return invoke('chat_mark_read', { peerIds });
+}
+
+/** 清空与一台设备的聊天记录（会话菜单里的「清空聊天记录」）。 */
+export function chatClear(peerId: string): Promise<ChatSnapshot> {
+  return invoke('chat_clear', { peerId });
 }
 
 // BeyondCompare 比较（本机 / 长连接设备的共享项）。四个命令都返回最新 BcStatus，

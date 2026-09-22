@@ -8,8 +8,7 @@
     tab,
     devices = [],
     onToast,
-    onRequestPush,
-    onRequestPushMany,
+    onMessage,
     onAddShare,
     onOpenPair,
     onUnpair,
@@ -18,9 +17,8 @@
     /** 设备标签靠它取到 ip/port 与长连接状态。 */
     devices?: PeerDevice[];
     onToast: (msg: string) => void;
-    onRequestPush?: (device: PeerDevice) => void;
-    /** 设备页多选之后一次推给多台：只开一次选择框，同一份内容分头发出去。 */
-    onRequestPushMany?: (devices: PeerDevice[]) => void;
+    /** 设备页行上的「发消息」：打开与这台设备的会话。 */
+    onMessage?: (device: PeerDevice) => void;
     /** 本机标签的「添加共享项」：开文件选择框挑本机内容。 */
     onAddShare: () => void;
     onOpenPair?: (device: PeerDevice | null) => void;
@@ -37,7 +35,7 @@
 {#if tab.kind === 'local'}
   <LocalTab {onToast} {onAddShare} />
 {:else if tab.kind === 'devices'}
-  <DeviceTab {onToast} {onRequestPush} {onRequestPushMany} {onOpenPair} {onUnpair} />
+  <DeviceTab {onToast} {onMessage} {onOpenPair} {onUnpair} />
 {:else if peer}
   {#key peer.id}
     <PeerTab device={peer} {onToast} />

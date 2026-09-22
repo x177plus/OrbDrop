@@ -564,6 +564,8 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
                     let (tx, mut rx) = mpsc::unbounded_channel::<WsEvent>();
                     let gen = state.ws.register(&peer_id, tx);
                     state.emit_devices_changed();
+                    // 同 `run_inbound_session`：链路上来了补一次已读回执。
+                    crate::chat::flush_read_receipt(&state, &peer_id);
 
                     let mut ping_interval = interval(Duration::from_secs(30));
                     let mut missed = 0u32;

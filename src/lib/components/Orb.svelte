@@ -10,6 +10,7 @@
     onDragStart,
   }: {
     badgeCount?: number;
+    /** 左上角那颗待处理数（面板里那组通知与在途推送，**加上会话未读**）。 */
     notifCount?: number;
     expanded?: boolean;
     onToggle: () => void;
@@ -132,7 +133,8 @@
        角标是正圆，反向转只影响里面的数字，于是数字全程正立，转的只有位置。
        `notif` = 球的左上角那颗（黄，通知数）；`count` = 右上角那颗（绿，长连接设备数）。 -->
   <span class="orb-arm notif">
-    <!-- 左上角 = 待处理的通知数（推送邀请等），与右上角的「长连接设备数」对称；
+    <!-- 左上角 = 待处理数：面板里那组通知与在途推送，**再加上会话未读**（未读消息也是"有事
+         等你"，面板收着的时候这颗球是唯一还看得见的提示）。与右上角的「长连接设备数」对称；
          黄色是"要你看一眼"，灰绿是"当前有多少条链路"。 -->
     <span class="orb-badge notif num" hidden={notifCount === 0}>{notifCount}</span>
   </span>

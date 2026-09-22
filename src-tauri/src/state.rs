@@ -61,6 +61,8 @@ pub struct AppState {
     pub drag: crate::drag::DragStore,
     /// Pairing code store.
     pub pair: PairStore,
+    /// 会话（聊天）记录：文本消息的落盘 + 界面快照（`chat.json`）。
+    pub chat: crate::chat::ChatStore,
     /// Tauri handle for emitting UI events.
     pub app_handle: Mutex<Option<AppHandle>>,
     /// File watchers keyed by share id.
@@ -120,6 +122,14 @@ impl AppState {
             );
         }
 
+        // 会话记录（`chat.json`）放在 config.toml **旁边**，不写死全局数据目录：
+        // 它和配置一样是"这个实例的用户数据"，实例换了个家（便携部署 / 测试指向临时目录），
+        // 会话记录就该跟着走。
+        let chat_path = match config_path.parent() {
+            Some(dir) => dir.join("chat.json"),
+            None => crate::config::data_dir().join("chat.json"),
+        };
+
         Self {
             config_path,
             config: Mutex::new(config),
@@ -132,6 +142,7 @@ impl AppState {
             push: PushStore::new(),
             drag: crate::drag::DragStore::new(),
             pair: PairStore::new(),
+            chat: crate::chat::ChatStore::with_path(chat_path),
             app_handle: Mutex::new(None),
             watchers: Mutex::new(std::collections::HashMap::new()),
             learned: Mutex::new(HashMap::new()),

@@ -2,6 +2,7 @@
   import type { PeerDevice, TabKey } from '$lib/types';
   import { tabKeyEquals } from '$lib/types';
   import { scrollRail } from '$lib/scrollRail';
+  import { unreadForPeer } from '$lib/stores/chat.svelte';
 
   let {
     localCount = 0,
@@ -86,6 +87,9 @@
     >
       <span class="dot ok"></span>
       {device.name}
+      {#if unreadForPeer(device.id) > 0}
+        <span class="tab-dot" title={`${unreadForPeer(device.id)} 条未读消息`}></span>
+      {/if}
     </button>
   {/each}
 </div>

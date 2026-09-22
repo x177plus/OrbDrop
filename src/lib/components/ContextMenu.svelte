@@ -16,6 +16,8 @@
     bcCompareLabel = '',
     bcCompareEnabled = true,
     bcThisStaged = false,
+    chatSel = false,
+    convoBrowse = false,
     onClose,
     onToast,
     onDownload,
@@ -26,15 +28,19 @@
     onDisconnect,
     onPair,
     onUnpair,
-    onPush,
     onPeerDownload,
     onBcCompare,
     onBcAddLeft,
     onBcAddRight,
     onBcClear,
+    onChatCopy,
+    onConvoFiles,
+    onConvoExit,
+    onMessage,
   }: {
     x: number; y: number;
-    kind: 'share' | 'device' | 'peer';
+    /** `chat` = 会话里那条消息（复制）；`convo` = 会话本身的菜单（查看该设备文件 / 清空或退出）。 */
+    kind: 'share' | 'device' | 'peer' | 'chat' | 'convo';
     shareId?: string;
     path?: string;
     isDir?: boolean;
@@ -54,6 +60,10 @@
     bcCompareEnabled?: boolean;
     /** 当前右键的这一项是否已在某个比较位上。 */
     bcThisStaged?: boolean;
+    /** 消息右键时选区里那段可复制的文字（空 = 不显示「复制所选文字」）。 */
+    chatSel?: boolean;
+    /** 会话菜单：「查看该设备文件」只在对方**正处在长连接**时给 —— 对端浏览标签只存在于长连接设备。 */
+    convoBrowse?: boolean;
     onClose: () => void;
     onToast: (msg: string) => void;
     onDownload: () => void;
@@ -64,12 +74,19 @@
     onDisconnect: () => void;
     onPair: () => void;
     onUnpair: () => void;
-    onPush: () => void;
     onPeerDownload: () => void;
     onBcCompare: () => void;
     onBcAddLeft: () => void;
     onBcAddRight: () => void;
     onBcClear: () => void;
+    /** 复制会话里的一条消息：`all` = 整条，`sel` = 只复制选中的那段。 */
+    onChatCopy: (which: 'all' | 'sel') => void;
+    /** 会话菜单：切到那台设备的文件标签页。 */
+    onConvoFiles: () => void;
+    /** 会话菜单：清空聊天记录（一对一）/ 退出会话（群）。 */
+    onConvoExit: () => void;
+    /** 设备菜单：打开与这台设备的会话。 */
+    onMessage: () => void;
   } = $props();
 
   function handleItem(fn: () => void) {
@@ -145,7 +162,29 @@
 
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div class="ctx show" bind:this={root} use:ctxPlacement={{ x, y, bounds }} role="menu" tabindex="-1" onclick={onClose}>
-  {#if kind === 'peer'}
+  {#if kind === 'chat'}
+    {#if chatSel}
+      <button class="ctx-item" onclick={() => handleItem(() => onChatCopy('sel'))}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11v13H4z"/><path d="M8 4h12v12"/></svg>
+        复制所选文字
+      </button>
+    {/if}
+    <button class="ctx-item" onclick={() => handleItem(() => onChatCopy('all'))}>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11v13H4z"/><path d="M8 4h12v12"/></svg>
+      复制整条消息
+    </button>
+  {:else if kind === 'convo'}
+    {#if convoBrowse}
+      <button class="ctx-item" onclick={() => handleItem(onConvoFiles)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>
+        查看该设备文件
+      </button>
+    {/if}
+    <button class="ctx-item danger" onclick={() => handleItem(onConvoExit)}>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
+      清空聊天记录
+    </button>
+  {:else if kind === 'peer'}
     <button class="ctx-item" onclick={() => handleItem(onPeerDownload)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
       下载到本地{peerName ? ` · 来自「${peerName}」` : ''}
@@ -172,8 +211,8 @@
     {#if bcAvailable}{@render bcSection()}{/if}
   {:else}
     {#if !deviceOnline}
-      <!-- 离线设备：连接/推送的目标都不在网上（拨号只会空转、推送邀请是 HTTP 直达），
-           只有「解除配对」是本机动作，所以这里什么都不给。 -->
+      <!-- 离线设备：连接与发消息的目标都不在网上（拨号只会空转；消息写在长连接上，
+           写不进去只会落「未送达」），只有「解除配对」是本机动作，所以这里什么都不给。 -->
     {:else if deviceState === 'connected'}
       <button class="ctx-item" onclick={() => handleItem(onDisconnect)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/><path d="M3 3l18 18"/></svg>
@@ -186,7 +225,8 @@
         重新配对
       </button>
     {:else if deviceState === 'unbound'}
-      <!-- 未绑定：只做两件事 —— 配对，或直接推送（推送邀请不需要预先配对）。
+      <!-- 未绑定：只做两件事 —— 配对，或开会话发消息（消息走长连接，未建链时发出去
+           会落「未送达」）；推送在会话里那颗「＋」，这里不再重复摆一份。
            没有「立即连接」（未配对拨不动），也没有「解除配对」（没有关系可解）。 -->
       <button class="ctx-item" onclick={() => handleItem(onPair)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
@@ -199,9 +239,9 @@
       </button>
     {/if}
     {#if deviceOnline}
-      <button class="ctx-item" onclick={() => handleItem(onPush)}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
-        推送…
+      <button class="ctx-item" onclick={() => handleItem(onMessage)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22 11 13 2 9 22 2Z"/></svg>
+        发消息
       </button>
     {/if}
     {#if deviceState !== 'unbound'}
