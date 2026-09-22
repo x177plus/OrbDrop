@@ -22,9 +22,15 @@ export async function loadShares() {
   }
 }
 
-export async function addShare(path: string) {
-  await api.addShare(path);
+/**
+ * 登记一条共享项。返回后端那一份 —— **重复登记同一条路径时返回的是已经存在的那一项**
+ * （`add_share` 按路径去重，见其注释）：调用方靠"回来的 id 是不是本来就有的"区分
+ * 「已添加」与「已在共享项里」。
+ */
+export async function addShare(path: string): Promise<ShareItem> {
+  const item = await api.addShare(path);
   await loadShares();
+  return item;
 }
 
 export async function removeShare(id: string) {

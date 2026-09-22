@@ -18,6 +18,30 @@ use crate::pair::PairStore;
 use crate::transfer::push_job::PushStore;
 use crate::ws::WsManager;
 
+/// 长连接意图（F-16）：`PeerDevice::auto_connect` / `PeerDevice::paused` 这对字段的语义，
+/// 也是它们的唯一写点 [`AppState::set_link_intent`] 的入参。
+///
+/// 两个字段**互斥**（同一个意图的两面：本机要不要拨 / 接不接对端的自动重拨），所以
+/// 它们不该被分头写 —— 一边写"不拨"、另一边忘了写"不接"，就得到那条自相矛盾的状态：
+/// 本机安静，却被对端的记忆把链路接回来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkIntent {
+    /// 要这条链：点过「连接」，或链路已经建起来（被拨号的一端同样算）。
+    Wanted,
+    /// 点过「断开」：本机不主动拨，也拒绝对端的自动重拨（403）。
+    Paused,
+}
+
+impl LinkIntent {
+    /// 落到地址簿的那对字段：(本机主动拨, 拒绝对端的自动重拨)。
+    fn fields(self) -> (bool, bool) {
+        match self {
+            LinkIntent::Wanted => (true, false),
+            LinkIntent::Paused => (false, true),
+        }
+    }
+}
+
 /// Application-wide shared state, accessible from Tauri commands and the HTTP server.
 pub struct AppState {
     pub config_path: PathBuf,
@@ -76,11 +100,24 @@ impl AppState {
                     port: 0,
                     online: false,
                     paired: true,
-                    auto_connect: false,
+                    auto_connect: false, paused: false,
                 });
             } else if let Some(p) = peers.iter_mut().find(|p| &p.id == id) {
                 p.paired = true;
             }
+        }
+
+        // 「断开」的暂停标记从地址簿读回来（F-16）：它和 `auto_connect` 是同一个意图的
+        // 两面，重启后必须一起生效。少了这一半，本机是不主动拨了，却会照收对端记忆里
+        // 的那次拨号 —— 用户看到的就是"点了断开、退出重开又自己连上了"。
+        // 顺带把理由摆到设备行上（`linkState`），界面才说得出"为什么它不自动连"。
+        let ws = WsManager::new();
+        for p in peers.iter().filter(|p| p.paused) {
+            ws.set_paused(&p.id, true);
+            ws.set_link_state(
+                &p.id,
+                crate::ws::LinkState::Stopped { reason: crate::ws::StopReason::LocalDisconnected },
+            );
         }
 
         Self {
@@ -91,7 +128,7 @@ impl AppState {
             server_shutdown: Mutex::new(None),
             server_task: Mutex::new(None),
             mdns_daemon: Mutex::new(None),
-            ws: WsManager::new(),
+            ws,
             push: PushStore::new(),
             drag: crate::drag::DragStore::new(),
             pair: PairStore::new(),
@@ -229,27 +266,38 @@ impl AppState {
         self.emit_devices_changed();
     }
 
-    /// 记住/忘掉"这台设备处于长连接"（F-16 跨重启恢复）。
+    /// 记下这台设备的长连接意图（F-16）。
     ///
-    /// 写点在**链路建立的那一刻**、而不是退出时：进程被强杀、断电、任务管理器结束都
-    /// 不会漏掉这次长连接。用户点「断开」时清零 —— 那个意图跨重启一样算数，重启后不会
-    /// 自动连回来。只对地址簿（`config.peers`）里的设备落盘：纯发现条目没有可恢复的
-    /// 身份，重启后本来也不会出现在列表里。
-    pub fn set_auto_connect(&self, peer_id: &str, on: bool) {
+    /// 这是 `auto_connect` / `paused` 这一对字段的**唯一写点**（落盘 + 同步运行时的
+    /// 暂停标记）。分开写两个字段迟早会写出"本机不拨、却照收对端的自动重拨"—— 那正是
+    /// 「断开」被对端记忆悄悄撤销的样子。
+    ///
+    /// - `Wanted`：点过「连接」，或链路已经建起来（两侧都算，见 `ws::session`）——
+    ///   写点在**链路建立那一刻**而不是退出时，所以进程被强杀、断电也不会漏掉这次长连接。
+    /// - `Paused`：用户点过「断开」——本机不拨，也不接对端的自动重拨；重启照样算数
+    ///   （`AppState::new` 把它读回内存，`server::events_ws_handler` 照旧回 403）。
+    ///
+    /// 只对地址簿（`config.peers`）里的设备落盘：纯发现条目没有可恢复的身份，重启后
+    /// 本来也不会出现在列表里（也不会有链接可拒 —— WS 升级本来就要 token）。
+    pub fn set_link_intent(&self, peer_id: &str, intent: LinkIntent) {
+        let (auto_connect, paused) = intent.fields();
+        self.ws.set_paused(peer_id, paused);
         {
             let mut peers = self.peers.lock();
             if let Some(p) = peers.iter_mut().find(|p| p.id == peer_id) {
-                p.auto_connect = on;
+                p.auto_connect = auto_connect;
+                p.paused = paused;
             }
         }
         let mut config = self.config.lock();
         let Some(p) = config.peers.iter_mut().find(|p| p.id == peer_id) else {
             return;
         };
-        if p.auto_connect == on {
+        if p.auto_connect == auto_connect && p.paused == paused {
             return;
         }
-        p.auto_connect = on;
+        p.auto_connect = auto_connect;
+        p.paused = paused;
         let _ = crate::config::save_config_at(&self.config_path, &config);
     }
 
@@ -332,11 +380,16 @@ impl AppState {
             .collect()
     }
 
-    /// 把一台设备的行换个 id，其余照旧（配对状态、地址、"长连接"记忆都保留）。
+    /// 把一台设备的行换个 id，其余照旧（配对状态、地址、长连接意图都保留）。
     ///
     /// 用在对端被重置过、但配对凭据还在（系统凭据库里那一条没跟着清）的场合：关系
     /// 还活着，只是对端的 id 变了。列表里**只留一行** —— 新 id 那行（mDNS 刚发现的）
     /// 并进这一行，不是并排出现两行。
+    ///
+    /// `to` 只提供**新 id 那一行的观察值**（名字/地址/在线）。`auto_connect` /
+    /// `paused` 是用户意图、不属于新发现的这一行：照搬 `to` 的会把刚点过「断开」的
+    /// 设备在新 id 上重新变成"要这条链"（`to` 是发现形状的行，两个字段恒为 false）。
+    /// 意图跟着这一行走，不跟着 `to` 走。
     pub fn rekey_peer(&self, from: &str, to: &PeerDevice) {
         {
             let mut peers = self.peers.lock();
@@ -351,7 +404,6 @@ impl AppState {
             row.port = to.port;
             row.online = to.online;
             row.paired = to.paired;
-            row.auto_connect = to.auto_connect;
             peers.push(row);
         }
         {
@@ -365,7 +417,6 @@ impl AppState {
                 row.port = to.port;
                 row.online = to.online;
                 row.paired = to.paired;
-                row.auto_connect = to.auto_connect;
                 config.peers.push(row);
                 let _ = crate::config::save_config_at(&self.config_path, &config);
             }
@@ -480,7 +531,7 @@ impl AppState {
                             port: l.port,
                             online: true,
                             paired: false,
-                            auto_connect: false,
+                            auto_connect: false, paused: false,
                         });
                         table.insert(l.id, now);
                         changed = true;
@@ -680,7 +731,7 @@ pub async fn fetch_discover(
                         port: u16::try_from(v["port"].as_u64()?).ok()?,
                         online: true,
                         paired: false,
-                        auto_connect: false,
+                        auto_connect: false, paused: false,
                     })
                 })
                 .collect()
@@ -888,7 +939,9 @@ pub fn apply_identity_reconcile(
                 port: stale.port,
                 online: true,
                 paired: true,
-                auto_connect: stale.auto_connect,
+                // 这一行只是观察值：配对状态与地址从旧行搬（见 `rekey_peer`），长连接
+                // 意图（`auto_connect` / `paused`）同样跟着旧行走，不在这里填。
+                ..Default::default()
             },
         );
         if stale.auto_connect && !was_paused {

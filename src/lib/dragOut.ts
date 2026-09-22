@@ -28,6 +28,11 @@ export function dragOut(node: HTMLElement, params: DragOutParams) {
     if (e.button !== 0) return;
     // 行内的按钮/开关有自己的点击语义（展开箭头、广播开关），别让它们变成拖拽把手。
     if ((e.target as HTMLElement | null)?.closest('button, input, label, a')) return;
+    /* **必须抓指针捕获**：拖出的判定（越过 6px 阈值）靠这一格自己的 pointermove 事件，而
+       事件只送给"指针底下那个元素"。甩得快的时候第一个 move 就已经落在这一格之外了 ——
+       那一趟事件谁都没收到，这一次拖出**整趟不成立**（用户看到的正是"拖一下没反应，
+       再慢慢拖一次就行"）。捕获之后，不管指针甩到哪儿，move 都还是先送到起手这一格。 */
+    node.setPointerCapture(e.pointerId);
     down = { x: e.clientX, y: e.clientY };
     fired = false;
   }
@@ -38,11 +43,16 @@ export function dragOut(node: HTMLElement, params: DragOutParams) {
     const dy = e.clientY - down.y;
     if (dx * dx + dy * dy < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX) return;
     fired = true;
+    // 交给 OS 之前放掉捕获（与 `RectOrb`/`Orb` 起拖窗口同一条理由）：`start_drag_out` 之后
+    // 页面再也收不到 pointerup，捕获就没法释放了 —— 而**留着的捕获 = 留着的 hover**，
+    // 指针移开这一格也还亮着。
+    if (node.hasPointerCapture(e.pointerId)) node.releasePointerCapture(e.pointerId);
     void fire(current);
   }
 
-  function onPointerUp() {
+  function onPointerUp(e: PointerEvent) {
     down = null;
+    if (node.hasPointerCapture(e.pointerId)) node.releasePointerCapture(e.pointerId);
   }
 
   async function fire(p: DragOutParams) {
@@ -50,7 +60,9 @@ export function dragOut(node: HTMLElement, params: DragOutParams) {
     try {
       const ticket = await prepareDragOut(src);
       if (!ticket.ready) {
-        p.onMessage?.(`正在准备「${ticket.name}」…（对端只读名字和大小，内容在落下时才传）`);
+        // 对端项：小项会先下到暂存目录再起拖（只认 CF_HDROP 的应用才收得到），大项只走元数据。
+        // 无论哪种，起拖都跟着**按住的主键**走 —— 所以这句必须提醒"按住不放"。
+        p.onMessage?.(`正在准备「${ticket.name}」…（可能要下到暂存目录，请按住不放）`);
       }
       await startDragOut(ticket.ticket);
     } catch (err) {

@@ -4,6 +4,12 @@ export interface ShareItem {
   path: string;
   createdAt: string;
   broadcastEnabled: boolean;
+  /** 真元数据（后端 `ShareItemDto.isDir`），不再按路径猜。 */
+  isDir: boolean;
+  /** 文件大小；目录是 null。 */
+  size: number | null;
+  /** 目录的**直接**子项数；文件是 null。 */
+  itemCount: number | null;
 }
 
 /** 对端设备标签里看到的共享项：只有展示所需的字段（没有对端本机绝对路径）。 */
@@ -13,6 +19,9 @@ export interface PeerShareItem {
   createdAt: string;
   /** 目录才能展开。 */
   isDir: boolean;
+  /** 老版本对端不带这两个字段（那时是 `undefined`）。 */
+  size?: number | null;
+  itemCount?: number | null;
 }
 
 /** 没连着的时候"为什么"（后端 `LinkState`）。`connected` 为真时忽略它。 */
@@ -50,7 +59,22 @@ export interface AppSettings {
    * 长连接、拒收一切入站请求。落盘、跨重启有效。
    */
   online: boolean;
+  /**
+   * 折叠态悬浮形态：`circle` = 62px 圆球（`Orb.svelte`）；`rect` = 圆角矩形悬浮框
+   * （`RectOrb.svelte`，`design/orbdrop-rect-orb.html`）。落盘、跨重启有效。
+   */
+  orbShape: OrbShape;
+  /**
+   * 新添加的目录/文件是否**默认开播**（设置里的「添加后自动共享」，默认 `false`）。
+   *
+   * 只作用于之后新登记的共享项：后端 `add_share`（`add_share_impl`）建条目时把这个值抄进
+   * `broadcastEnabled` 的初值，已经在列表里的开关一个都不动。
+   */
+  autoBroadcastNew: boolean;
 }
+
+/** 折叠态悬浮形态：圆球 / 圆角矩形悬浮框（后端 `config::OrbShape` 的同一套小写字面量）。 */
+export type OrbShape = 'circle' | 'rect';
 
 /**
  * BeyondCompare 比较的一端：本机共享项 / 长连接设备的共享项。
@@ -151,7 +175,7 @@ export interface DragOutSource {
   isDir: boolean;
 }
 
-/** 拖拽票据：`ready` = false 表示后端还在把对端内容下到暂存目录。 */
+/** 拖拽票据：`ready` = false 表示后端还在准备对端项（走目录，必要时先下到暂存目录）。 */
 export interface DragTicket {
   ticket: string;
   name: string;
@@ -222,6 +246,59 @@ export interface OrbDragInfo {
   pressY: number;
 }
 
+/** 圆角矩形悬浮框里的一格：一台设备的共享项（或钻入子目录后的一个子项）在卡上的样子。 */
+export interface RectSlot {
+  /** 共享项 id：拖出（`DragOutSource.shareId`）与打开（`openPath` / `download_from_peer`）都用它定位。 */
+  id: string;
+  /** 共享项内的相对路径（`''` = 共享项根）：拖出与打开都按「共享项 + 相对路径」定位。 */
+  path: string;
+  name: string;
+  isDir: boolean;
+  /** 第二行的等宽小字（卡上只放得下很短的一段）。 */
+  meta: string;
+}
+
+/**
+ * 列表头上那枚「↰ 上一级」（只有钻进了子目录才在）：双击 = 回上一层，名字是**父目录**
+ * 的名字（回根那一层时是共享项自己的名字）。
+ */
+export interface RectUp {
+  name: string;
+  /** 第二行小字，固定说清这一格是干什么的。 */
+  meta: string;
+}
+
+/**
+ * 圆角矩形悬浮框的一页：**第一页永远是本机**，其后每台长连接设备一页。
+ *
+ * 设备页只有长连接设备才有：对端的共享项**只有在本机与它保持长连接时才对本机可见**
+ * （F-25 的广播范围），离线/未配对的设备根本没有可列的东西。本机页则一直在，
+ * 内容就是「本机」标签页那份共享项清单。
+ */
+export interface RectPage {
+  /** 稳定 key：本机页 = `'local'`，设备页 = peerId。 */
+  id: string;
+  /** 这一页是谁：本机的共享项 / 一台设备对本机可见的共享项。 */
+  kind: 'local' | 'peer';
+  /** 头部第一行。本机页固定是「本机」（不写设置里那个设备名，见 `App.rectPages` 的说明）。 */
+  name: string;
+  /** `ip:port`：卡片头部第二行的左半（本机页是自己那个地址；取不到时为空）。 */
+  ip: string;
+  /** 这一页还在拉取中（设备页首屏那一瞬）。 */
+  loading: boolean;
+  /** 拉取失败的原因（未配对 / 对端不可达）：卡片里说清楚，而不是显示成一个空列表。 */
+  error: string | null;
+  /**
+   * 钻入子目录后**现在在哪**：`label` 是给 176px 宽的卡片量过的显示串（长了从头上砍，
+   * 尾巴才是"我在哪"），`full` 给悬停 `title`。`null` = 这一页在看共享项清单，
+   * 头部第二行照旧说 `ip:port`。
+   */
+  dir: { label: string; full: string } | null;
+  /** 「↰ 上一级」那一格（`null` = 没钻入）。**不算进 `items`**：项数说的是"这里有几项"。 */
+  up: RectUp | null;
+  items: RectSlot[];
+}
+
 /** 一级标签栏的标签：本机 / 设备（关系管理） / 每台长连接设备一个浏览标签（F-24、F-30）。 */
 export type TabKey =
   | { kind: 'local' }
@@ -237,10 +314,28 @@ export function tabKeyId(tab: TabKey): string {
   return tab.kind === 'peer' ? `peer:${tab.peerId}` : tab.kind;
 }
 
+/**
+ * 共享项第二行（卡片格、「本机」/设备标签页）那一段小字：目录给「N 项」，文件给大小。
+ *
+ * 两个数都由后端问一次文件系统得来（本机 `ShareItemDto`、对端 `/shares`），拿不到时是
+ * `null` —— 那时只说「文件夹 / 文件」：**宁可不说，也不报一个没根据的数字**（上一版这里显示
+ * 的是共享项的登记日期，连对端看到的都是"别人哪天加进来的"）。
+ *
+ * 本机共享项与对端共享项共用这一份：同一批共享项不该在两处长得不一样。
+ */
+export function shareMeta(
+  isDir: boolean,
+  itemCount: number | null | undefined,
+  size: number | null | undefined,
+): string {
+  if (isDir) return typeof itemCount === 'number' ? `${itemCount} 项` : '文件夹';
+  return typeof size === 'number' ? formatFileSize(size) : '文件';
+}
+
 export function formatFileSize(bytes: number): string {
-  if (bytes === 0) return '0 B';
+  if (bytes <= 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
   return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
 }
 

@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { TreeEntry } from '$lib/types';
+  import { formatFileSize } from '$lib/types';
   import { untrack } from 'svelte';
   import { fetchTree, fetchPeerTree } from '$lib/api';
   import { getServerPort } from '$lib/stores/shares.svelte';
@@ -100,14 +101,6 @@
   const ICON_FOLDER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>';
   const ICON_FILE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg>';
   const ICON_CHEVRON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>';
-
-  function formatSize(bytes: number): string {
-    if (bytes <= 0) return '';
-    const units = ['B', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    const v = bytes / Math.pow(1024, i);
-    return `${v.toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
-  }
 </script>
 
 {#if entry.isDir}
@@ -118,7 +111,6 @@
     </button>
     <span class="f-icon">{@html ICON_FOLDER}</span>
     <span class="n-name">{entry.name}</span>
-    <span class="n-meta num">{entry.size > 0 ? `${entry.size} 个文件` : ''}</span>
   </div>
   {#if expanded}
     <div style="padding-left:16px">
@@ -140,6 +132,6 @@
   <div class="node" class:sub={level > 1} oncontextmenu={openCtx} use:dragOut={{ source: dragSource, onMessage: notify }}>
     <span class="f-icon">{@html ICON_FILE}</span>
     <span class="n-name">{entry.name}</span>
-    <span class="n-meta num">{formatSize(entry.size)}</span>
+    <span class="n-meta num">{formatFileSize(entry.size)}</span>
   </div>
 {/if}

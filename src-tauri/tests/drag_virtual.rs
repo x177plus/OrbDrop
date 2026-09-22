@@ -1,4 +1,7 @@
-//! 拖拽下载（F-46）的对端准备：**只走元数据**（`/tree` + `/stat`），内容等到落下那一刻才拉。
+//! 拖拽下载（F-46）的对端准备：先只走元数据（`/tree` + `/stat`）；**小到兜得住**的项
+//! （单文件 ≤ 100 MB、目录总量 ≤ 500 MB）顺手下到暂存目录，按 `CF_HDROP` **真实路径**
+//! 拖出去（只认路径的应用——微信这类从不问虚拟文件的——只有这条路能收到）；
+//! 超过上限的退回虚拟文件（秒起拖、不落暂存盘），内容等落下那一刻才按需拉。
 //!
 //! 走真 HTTP：本机起一个实例、地址簿里把自己当成对端，于是 `/tree` 递归、名字清洗、
 //! 单文件走 `/stat`、越界拒绝全都被真的走一遍。
@@ -50,7 +53,7 @@ async fn wait_payload(state: &Arc<AppState>, ticket: &str) -> Payload {
 }
 
 #[tokio::test]
-async fn peer_directory_walk_yields_virtual_items_with_metadata() {
+async fn peer_small_tree_is_staged_to_real_paths() {
     let root = remote_share_dir();
     let state = make_state(3997);
     let share = ShareItem::new(root.clone());
@@ -69,11 +72,11 @@ async fn peer_directory_walk_yields_virtual_items_with_metadata() {
         port,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
     credential::set_peer(&peer, "drag-test-token").unwrap();
 
-    // ---- 拖目录：清单里要有目录本身、子目录、两个文件（名字按相对落点的 `\` 路径）----
+    // ---- 拖小目录：阈值以内 → **提前转存**，交出去的是真实路径 ----
     let req = DragOutRequest {
         peer_id: Some(peer.clone()),
         share_id: share_id.clone(),
@@ -82,73 +85,20 @@ async fn peer_directory_walk_yields_virtual_items_with_metadata() {
         is_dir: true,
     };
     let ticket = state.drag.prepare(&state, &req).expect("登记拖拽");
-    assert!(!ticket.ready, "对端项要先走一遍目录");
-    let Payload::Virtual(items) = wait_payload(&state, &ticket.ticket).await else {
-        panic!("对端项应该是虚拟文件");
+    assert!(!ticket.ready, "对端项要先走一遍目录（外加可能的转存）");
+    let Payload::RealPaths(paths) = wait_payload(&state, &ticket.ticket).await else {
+        panic!("阈值以内的小目录应该提前转存成真实路径");
     };
-    let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
-    assert_eq!(
-        names.len(),
-        4,
-        "目录本身 + 子目录 + 两个文件，清单: {names:?}"
-    );
-    assert!(names.contains(&"远端目录"), "目录自己也是一条: {names:?}");
-    assert!(names.contains(&"远端目录\\子目录"), "清单: {names:?}");
-    assert!(names.contains(&"远端目录\\顶层.txt"), "清单: {names:?}");
-    assert!(names.contains(&"远端目录\\子目录\\深层.txt"), "清单: {names:?}");
-    // 不变式：任何一条的父目录都要排在它前面（资源管理器照这个顺序建目录）
-    for (index, item) in items.iter().enumerate() {
-        if let Some((parent, _)) = item.name.rsplit_once('\\') {
-            let parent_at = names.iter().position(|n| *n == parent).expect("父目录必须在清单里");
-            assert!(parent_at < index, "父目录 {parent} 必须排在自己前面");
-        }
-    }
-
-    let by_name = |name: &str| items.iter().find(|i| i.name == name).expect("清单里有这条");
-    assert!(by_name("远端目录").is_dir && by_name("远端目录").source.is_none(), "目录项没有内容来源");
-    assert_eq!(by_name("远端目录\\顶层.txt").size, 3, "文件大小来自 /tree，落下时用于显示进度");
-    assert!(by_name("远端目录\\顶层.txt").mtime.is_some(), "修改时间要带上（才知道该不该写 FD_WRITESTIME）");
-    let src = by_name("远端目录\\子目录\\深层.txt").source.as_ref().expect("文件要有来源");
-    assert_eq!(src.share_id, share_id);
-    assert_eq!(src.path, "子目录/深层.txt", "来源路径用 `/` 分隔");
-
-    // ---- 拖单个文件：走 /stat（`/tree` 只列目录，这条路没有别的尺寸来源）----
-    let file_req = DragOutRequest {
-        path: "子目录/深层.txt".into(),
-        name: "深层.txt".into(),
-        is_dir: false,
-        ..req.clone()
-    };
-    let file_ticket = state.drag.prepare(&state, &file_req).expect("登记文件拖拽");
-    let Payload::Virtual(files) = wait_payload(&state, &file_ticket.ticket).await else {
-        panic!("对端项应该是虚拟文件");
-    };
-    assert_eq!(files.len(), 1, "单个文件就是清单里的一条");
-    assert_eq!(files[0].name, "深层.txt");
-    assert_eq!(files[0].size, 4, "大小来自 /stat");
-    assert!(!files[0].is_dir);
-
-    // ---- 落下时拉内容：直接从服务端取这一段字节，内容就是源文件 ----
-    let fetched = reqwest::Client::new()
-        .get(format!("http://127.0.0.1:{port}/file"))
-        .query(&[("share", share_id.as_str()), ("path", "子目录/深层.txt"), ("offset", "0"), ("len", "4")])
-        .bearer_auth("drag-test-token")
-        .send()
-        .await
-        .expect("取内容");
-    assert_eq!(fetched.bytes().await.unwrap().as_ref(), b"deep");
-    // 只要一半时服务端按 len 截断：短读 = 到末尾（流的结束判据）
-    let half = reqwest::Client::new()
-        .get(format!("http://127.0.0.1:{port}/file"))
-        .query(&[("share", share_id.as_str()), ("path", "子目录/深层.txt"), ("offset", "2"), ("len", "99")])
-        .bearer_auth("drag-test-token")
-        .send()
-        .await
-        .expect("取后半段");
-    assert_eq!(half.bytes().await.unwrap().as_ref(), b"ep");
+    // 一整棵树交给资源管理器的只有**根那一条**：`CF_HDROP` 由它自己去递归
+    assert_eq!(paths.len(), 1, "拖一棵树只交根路径: {paths:?}");
+    let staged = &paths[0];
+    assert_eq!(staged.file_name().unwrap(), "远端目录", "落点里那一项还是原来的名字");
+    assert!(staged.is_dir(), "树根还原成目录: {staged:?}");
+    assert_eq!(std::fs::read(staged.join("顶层.txt")).unwrap(), b"top");
+    assert_eq!(std::fs::read(staged.join("子目录").join("深层.txt")).unwrap(), b"deep");
 
     // ---- 越界路径下不来 ----
-    let escape = DragOutRequest { path: "../outside.txt".into(), ..file_req.clone() };
+    let escape = DragOutRequest { path: "../outside.txt".into(), ..req.clone() };
     let escape_ticket = state.drag.prepare(&state, &escape).expect("登记");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -165,8 +115,77 @@ async fn peer_directory_walk_yields_virtual_items_with_metadata() {
     }
 
     credential::remove_peer(&peer).ok();
+    let _ = std::fs::remove_dir_all(staged.parent().unwrap_or(staged)); // 本次的暂存目录
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_file(&state.config_path);
+    orbdrop_lib::server::stop_server(&state).await;
+}
+
+/// **共享项根就是一个文件**（界面拖整行 → `path` 为空）——对端拖拽曾经栽在这一档：
+/// `/file` 少了空路径判断，`share_root.join("")` 带上结尾分隔符，`canonicalize` 直接失败
+/// （`ERROR_INVALID_NAME`），于是回 403、内容一个字节都下不来。
+#[tokio::test]
+async fn peer_file_root_share_is_staged_with_contents() {
+    let dir = std::env::temp_dir().join(format!("orbdrop_fileroot_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("单文件.txt");
+    std::fs::write(&file, b"file root content").unwrap();
+
+    // 共享项根指向那个文件本身
+    let (state, share_id, peer, cfg) = state_with_share(3986, &file, 3986).await;
+    orbdrop_lib::server::start_server(state.clone(), 3986).await.expect("起服务");
+
+    let req = DragOutRequest {
+        peer_id: Some(peer.clone()),
+        share_id,
+        path: String::new(), // 共享项根：界面拖的就是整行
+        name: "单文件.txt".into(),
+        is_dir: false,
+    };
+    let ticket = state.drag.prepare(&state, &req).expect("登记拖拽");
+    let Payload::RealPaths(paths) = wait_payload(&state, &ticket.ticket).await else {
+        panic!("单个小文件应该提前转存成真实路径");
+    };
+    assert_eq!(paths[0].file_name().unwrap(), "单文件.txt");
+    assert_eq!(std::fs::read(&paths[0]).unwrap(), b"file root content");
+
+    credential::remove_peer(&peer).ok();
+    let _ = std::fs::remove_dir_all(paths[0].parent().unwrap_or(&paths[0]));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&cfg);
+    orbdrop_lib::server::stop_server(&state).await;
+}
+
+/// 超过上限的项**不转存**：退回虚拟文件（秒起拖、不落暂存盘），代价是只有支持虚拟文件的
+/// 目标能收。这里用 `set_len` 造一个 101 MB 的文件（只改元数据、不写内容）。
+#[tokio::test]
+async fn peer_oversized_item_stays_virtual() {
+    let dir = std::env::temp_dir().join(format!("orbdrop_bigitem_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let big = dir.join("大文件.bin");
+    std::fs::File::create(&big).unwrap().set_len(101 * 1024 * 1024).unwrap();
+
+    let (state, share_id, peer, cfg) = state_with_share(3987, &big, 3987).await;
+    orbdrop_lib::server::start_server(state.clone(), 3987).await.expect("起服务");
+
+    let req = DragOutRequest {
+        peer_id: Some(peer.clone()),
+        share_id,
+        path: String::new(),
+        name: "大文件.bin".into(),
+        is_dir: false,
+    };
+    let ticket = state.drag.prepare(&state, &req).expect("登记拖拽");
+    let Payload::Virtual(items) = wait_payload(&state, &ticket.ticket).await else {
+        panic!("超过单文件上限就不该转存");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].size, 101 * 1024 * 1024, "大小来自 /stat（描述符拿它显示进度）");
+    assert!(items[0].size_known, "大小是问到的，不是猜的");
+
+    credential::remove_peer(&peer).ok();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&cfg);
     orbdrop_lib::server::stop_server(&state).await;
 }
 
@@ -251,7 +270,7 @@ async fn state_with_share(port: u16, root: &std::path::Path, peer_port: u16) -> 
         port: peer_port,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
     credential::set_peer(&peer, "t").unwrap();
     let cfg = state.config_path.clone();
@@ -314,7 +333,7 @@ async fn peer_metadata_overrides_a_stale_is_dir_flag() {
     let (state, share_id, peer, cfg) = state_with_share(3994, &root, 3994).await;
     let port = orbdrop_lib::server::start_server(state.clone(), 3994).await.expect("起服务");
 
-    // (1) 目录被说成文件：必须还是按目录走（清单里要有子目录那一条）
+    // (1) 目录被说成文件：必须还是按目录走 —— 转存出来的是一个**目录**，里面有那个子文件
     let as_file = DragOutRequest {
         peer_id: Some(peer.clone()),
         share_id: share_id.clone(),
@@ -323,11 +342,12 @@ async fn peer_metadata_overrides_a_stale_is_dir_flag() {
         is_dir: false, // 过时的判断
     };
     let ticket = state.drag.prepare(&state, &as_file).unwrap();
-    let Payload::Virtual(items) = wait_payload(&state, &ticket.ticket).await else {
-        panic!("应该是虚拟文件清单");
+    let Payload::RealPaths(paths) = wait_payload(&state, &ticket.ticket).await else {
+        panic!("应该是提前转存的真实路径");
     };
-    assert!(items[0].is_dir, "对端说它是目录");
-    assert!(items.iter().any(|i| i.name.ends_with(r"子目录\a.txt")), "目录要展开: {items:?}");
+    assert!(paths[0].is_dir(), "对端说它是目录，转存出来就必须是目录: {paths:?}");
+    assert_eq!(std::fs::read(paths[0].join("a.txt")).unwrap(), b"data");
+    let staged_1 = paths[0].parent().unwrap().to_path_buf();
 
     // (2) 文件被说成目录：退化成单文件，而不是报一句 "Path is not a directory"
     let as_dir = DragOutRequest {
@@ -338,17 +358,18 @@ async fn peer_metadata_overrides_a_stale_is_dir_flag() {
         is_dir: true, // 过时的判断（老版本 /shares 的扩展名猜测就是这样）
     };
     let ticket = state.drag.prepare(&state, &as_dir).unwrap();
-    let Payload::Virtual(items) = wait_payload(&state, &ticket.ticket).await else {
-        panic!("应该是虚拟文件清单");
+    let Payload::RealPaths(paths) = wait_payload(&state, &ticket.ticket).await else {
+        panic!("应该是提前转存的真实路径");
     };
-    assert_eq!(items.len(), 1, "一个文件就一条: {items:?}");
-    assert!(!items[0].is_dir);
-    assert_eq!(items[0].size, 12, "大小来自 /stat");
-    assert!(items[0].source.is_some());
+    assert!(paths[0].is_file(), "对端说它是文件: {paths:?}");
+    assert_eq!(std::fs::read(&paths[0]).unwrap(), b"file-content");
+    let staged_2 = paths[0].parent().unwrap().to_path_buf();
 
     let _ = port;
     let _ = PathBuf::new();
     credential::remove_peer(&peer).ok();
+    let _ = std::fs::remove_dir_all(&staged_1);
+    let _ = std::fs::remove_dir_all(&staged_2);
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_file(&cfg);
     orbdrop_lib::server::stop_server(&state).await;

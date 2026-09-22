@@ -52,7 +52,18 @@ pub fn set_rect(window: &WebviewWindow, rect: Rect) -> Result<(), String> {
 /// 最多滞后一帧，高速拖动时那一帧就是十几个像素，而 OS 锚定时读的是物理指针位置。
 pub fn drag_start(window: &WebviewWindow, press_x: f64, press_y: f64) -> Result<(), String> {
     imp::drag_align(window, press_x, press_y)?;
+    ensure_foreground(window)?;
     window.start_dragging().map_err(|e| format!("start_dragging 失败: {e}"))
+}
+
+/// 起拖之前先确保窗口在前台。
+///
+/// OS 的两条拖拽路径（窗口的模态移动循环、OLE 的 `DoDragDrop`）都只在窗口是**前台窗口**时
+/// 才真正吃住指针。而"点击把窗口带到前台"是异步的：指针动得快的时候，起拖请求可能赶在
+/// 激活落地之前交出去 —— 那一次拖拽安静地不成立，用户看到的正是"第一次拖没用，再拖一次就好"。
+/// 点击本来就会把窗口带到前台，这里只是把它**提前到交出去之前**，不改变用户能观察到的东西。
+pub fn ensure_foreground(window: &WebviewWindow) -> Result<(), String> {
+    imp::ensure_foreground(window)
 }
 
 /// 鼠标主键此刻是否按下。
@@ -147,7 +158,8 @@ mod imp {
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetCursorPos, GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE,
+        GetCursorPos, GetForegroundWindow, GetWindowRect, SetForegroundWindow, SetWindowPos,
+        SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE,
     };
 
     fn to_rect(r: RECT) -> Rect {
@@ -157,6 +169,19 @@ mod imp {
     pub fn mouse_down() -> bool {
         // 高位 = 当前是否按下（低位是「自上次调用以来按过」，这里不关心）
         unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000 != 0 }
+    }
+
+    pub fn ensure_foreground(window: &WebviewWindow) -> Result<(), String> {
+        let hwnd = window.hwnd().map_err(|e| format!("取窗口句柄失败: {e}"))?;
+        unsafe {
+            if GetForegroundWindow() == hwnd {
+                return Ok(());
+            }
+            // 用户刚点过我们，前台权限就在本进程手上，这一下一般都会成功；
+            // 失败也不报错：拖拽那一步自己会以"没动"告终，不该为此弹一条错。
+            let _ = SetForegroundWindow(hwnd);
+        }
+        Ok(())
     }
 
     pub fn metrics(window: &WebviewWindow) -> Result<ScreenMetrics, String> {
@@ -269,6 +294,11 @@ mod imp {
     /// 非 Windows 拿不到全局键状态：一律当作「没按住」，落位判定退回按 move 事件间隔触发。
     pub fn mouse_down() -> bool {
         false
+    }
+
+    /// 非 Windows 用 Tauri 自己的前台请求（macOS 上是 `makeKeyAndOrderFront` 那一套）。
+    pub fn ensure_foreground(window: &WebviewWindow) -> Result<(), String> {
+        window.set_focus().map_err(|e| e.to_string())
     }
 
     pub fn metrics(window: &WebviewWindow) -> Result<ScreenMetrics, String> {

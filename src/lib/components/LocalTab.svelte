@@ -33,12 +33,6 @@
   let shares = $derived(getShares());
   let connectedDevices = $derived(getDevices().filter(d => d.connected));
   let totalShares = $derived(shares.length);
-  let totalSize = $derived('22.1 MB'); // demo placeholder
-
-  function isDir(share: ShareItem): boolean {
-    const p = share.path;
-    return p.endsWith('\\') || p.endsWith('/') || !/\.[^/\\]+$/.test(p);
-  }
 
   function treeState(shareId: string): TreeState {
     return shareTreeStates[shareId] ?? EMPTY_TREE_STATE;
@@ -103,7 +97,7 @@
 
 <div class="list-label">
   <span>共享项</span>
-  <span class="num">{totalShares} 项 · {totalSize}</span>
+  <span class="num">{totalShares} 项</span>
 </div>
 
 {#if totalShares === 0}
@@ -117,7 +111,7 @@
 {:else}
   <ul class="share-list">
     {#each shares as share (share.id)}
-      {@const dir = isDir(share)}
+      {@const dir = share.isDir}
       {@const ts = treeState(share.id)}
       <li
         class="share-item"

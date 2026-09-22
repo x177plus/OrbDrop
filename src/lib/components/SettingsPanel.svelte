@@ -5,6 +5,37 @@
   import Hint from '$lib/components/Hint.svelte';
   import Logo from '$lib/components/Logo.svelte';
   import { getSettings, loadSettings, updateSettings } from '$lib/stores/settings.svelte';
+  import type { OrbShape, RectPage } from '$lib/types';
+  import Orb from '$lib/components/Orb.svelte';
+  import RectOrb from '$lib/components/RectOrb.svelte';
+
+  /**
+   * 缩略图里的骨架数据：**只有形状，没有内容** —— 名字 / 地址 / 元信息一律空串，卡片上那些
+   * 位置由预览样式画成灰条（见 main.css 的「悬浮形态缩略图」一节）；项数与角标数字是组件自己
+   * 生成的，也一并隐掉。看的人只需要认出"这是张卡片，里面有图标和文字位，右边有分页点"。
+   * 三页是因为**只有一页时分页点整列不画**：要看全分页点，缩略图就得有得翻。
+   */
+  const PREVIEW_PAGES: RectPage[] = [
+    {
+      id: 'preview-1', kind: 'peer', name: '', ip: '', loading: false, error: null, dir: null, up: null,
+      // 前两格当目录、其余当文件：骨架里两种图标（文件夹 / 文件）都能看到
+      items: [
+        { id: 'preview-1-a', path: '', name: '', isDir: true, meta: '' },
+        { id: 'preview-1-b', path: '', name: '', isDir: true, meta: '' },
+        { id: 'preview-1-c', path: '', name: '', isDir: false, meta: '' },
+        { id: 'preview-1-d', path: '', name: '', isDir: false, meta: '' },
+        { id: 'preview-1-e', path: '', name: '', isDir: false, meta: '' },
+      ],
+    },
+    {
+      id: 'preview-2', kind: 'peer', name: '', ip: '', loading: false, error: null, dir: null, up: null,
+      items: [
+        { id: 'preview-2-a', path: '', name: '', isDir: true, meta: '' },
+        { id: 'preview-2-b', path: '', name: '', isDir: false, meta: '' },
+      ],
+    },
+    { id: 'preview-3', kind: 'peer', name: '', ip: '', loading: false, error: null, dir: null, up: null, items: [] },
+  ];
 
   let {
     open = false,
@@ -22,7 +53,14 @@
   let downloadMode = $state<'Direct' | 'AskEachTime'>('Direct');
   let deviceName = $state('');
   let autoStart = $state(true);
+  /**
+   * 新添加的目录/文件默认开播（后端 `AppSettings.autoBroadcastNew`，默认关）。
+   * 只影响之后新登记的共享项，已在列表里的开关不受影响。
+   */
+  let autoBroadcastNew = $state(false);
   let bcExePath = $state('');
+  /** 折叠态悬浮形态：圆球（现有的 62px 球）/ 圆角矩形悬浮框（设备分页卡片）。 */
+  let orbShape = $state<OrbShape>('circle');
   let saving = $state(false);
   /** 「清空全部凭据」的二次确认：点一下变成确认条，再点才真删。 */
   let wipeArmed = $state(false);
@@ -72,7 +110,9 @@
         downloadMode = s.downloadMode;
         deviceName = s.deviceName;
         autoStart = s.autoStart;
+        autoBroadcastNew = s.autoBroadcastNew;
         bcExePath = s.bcExePath ?? '';
+        orbShape = s.orbShape;
       }
     });
   });
@@ -86,7 +126,9 @@
         downloadMode,
         deviceName,
         autoStart,
+        autoBroadcastNew,
         bcExePath,
+        orbShape,
       });
       onClose();
       onToast('设置已保存');
@@ -107,7 +149,9 @@
       downloadMode = s.downloadMode;
       deviceName = s.deviceName;
       autoStart = s.autoStart;
+      autoBroadcastNew = s.autoBroadcastNew;
       bcExePath = s.bcExePath ?? '';
+      orbShape = s.orbShape;
     }
     onClose();
   }
@@ -157,6 +201,52 @@
       <label for="port">服务端口<Hint>被占用时自动 +1 探测，实际端口显示在底部状态栏。</Hint></label>
       <input class="input num" id="port" type="number" bind:value={port} />
     </div>
+    <!-- svelte-ignore a11y_label_has_associated_control -->
+    <div class="field">
+      <label id="orbShapeLabel">悬浮形态<Hint>
+        收起后常驻屏幕上的那件东西长什么样。缩略图就是实物外观（角标、分页点都在），
+        里面的名字是示意用的骨架。<br />
+        <strong>圆球</strong>：62px 的球，贴边会收进屏幕边缘、悬停滑回来。<br />
+        <strong>圆角矩形悬浮框</strong>：一张卡片，第一页是本机、其后每台长连接设备一页，
+        列出各自对本机可见的共享项；贴边会收起成一条竖条（图标 + 设备名 + ip:port），
+        悬停滑回来；直接拖动卡片里的条目可以拖到资源管理器里（与面板里一样），
+        滚轮/点右侧小点换页。
+      </Hint></label>
+      <div class="shape-picker" role="radiogroup" aria-labelledby="orbShapeLabel">
+        <label class="shape-opt" title="圆球：贴边收起半颗，悬停滑回来">
+          <input type="radio" name="orbShape" bind:group={orbShape} value="circle" aria-label="圆球" />
+          <!-- 缩略图 = **真组件 + 骨架数据**（同一套 CSS/DOM，件件与实物一致），外面套一层
+               缩放框（`--s`/`--w`/`--h` = 缩放比与含角标出格在内的视觉外框）。
+               圆球那一档放大到与卡片同高（两个缩略图并排，等高才像同一层级的两个选择），
+               卡片那一档缩到 0.78 才装得进半栏。
+               整块 `inert`：缩略图不吃指针、不进 Tab 序，也不会被拖出去。
+               说明文字不放在图下面（只留两张图）：两档各自是什么，看上方那颗「?」。 -->
+          <span class="so-frame" style="--s:1.5; --w:72px; --h:72px" inert>
+            <span class="so-scale">
+              <Orb badgeCount={3} notifCount={3} expanded={false} onToggle={() => {}} onDragStart={() => {}} />
+            </span>
+          </span>
+        </label>
+        <label class="shape-opt" title="圆角矩形悬浮框：设备分页卡片，贴边收起成竖条，可直接拖出共享项">
+          <input type="radio" name="orbShape" bind:group={orbShape} value="rect" aria-label="圆角矩形悬浮框" />
+          <span class="so-frame" style="--s:0.78; --w:211px; --h:139px" inert>
+            <span class="so-scale">
+              <RectOrb
+                pages={PREVIEW_PAGES}
+                deviceCount={PREVIEW_PAGES.length}
+                notifCount={3}
+                expanded={false}
+                onToggle={() => {}}
+                onDragStart={() => {}}
+                onActivate={() => {}}
+                onUp={() => {}}
+                onToast={() => {}}
+              />
+            </span>
+          </span>
+        </label>
+      </div>
+    </div>
     <div class="field">
       <label for="bcExePath">BC 可执行文件路径<Hint>
         用于右键菜单里的「用 BeyondCompare 比较」，例如 BCompare.exe 的完整路径。
@@ -170,6 +260,22 @@
         <span style="font-size:var(--fs-sm); color:var(--muted);">登录后自动启动 OrbDrop</span>
         <label class="switch">
           <input type="checkbox" bind:checked={autoStart} data-autostart />
+          <span class="track"></span>
+        </label>
+      </div>
+    </div>
+    <!-- svelte-ignore a11y_label_has_associated_control -->
+    <div class="field">
+      <label>添加后自动共享<Hint>
+        <strong>打开时</strong>：新添加的目录 / 文件自动打开广播开关，当场就对长连接设备可见
+        （与每一项自己那个开关是同一个东西，加完随时可以单独关掉）。<br />
+        <strong>默认关闭</strong>，只作用于<strong>之后</strong>添加的：已在列表里的共享项开关
+        一个都不动 —— 手动改过的不会被这里翻回来。
+      </Hint></label>
+      <div style="display:flex; align-items:center; justify-content:space-between;">
+        <span style="font-size:var(--fs-sm); color:var(--muted);">新添加的目录/文件自动开启共享</span>
+        <label class="switch">
+          <input type="checkbox" bind:checked={autoBroadcastNew} data-autobroadcast />
           <span class="track"></span>
         </label>
       </div>
