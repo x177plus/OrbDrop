@@ -1,5 +1,6 @@
 pub mod autostart;
 pub mod bc;
+pub mod chat;
 pub mod config;
 pub mod credential;
 pub mod discover;
@@ -894,6 +895,67 @@ async fn cancel_receive(invite_id: String, state: State<'_, Arc<AppState>>) -> R
 }
 
 // ---------------------------------------------------------------------------
+// 会话（聊天）
+// ---------------------------------------------------------------------------
+
+/// 会话的整份状态。面板打开时拉一次，之后由 `chat://changed` 推进（载荷是同一个形状）。
+#[tauri::command]
+fn chat_snapshot(state: State<'_, Arc<AppState>>) -> chat::Snapshot {
+    state.chat.snapshot()
+}
+
+/// 发一条文本消息给一台或多台设备（多台 = 界面上那个「群发」框）；返回整份会话快照。
+///
+/// 一台设备存一份副本（**同一个消息 id**，各带各的送达状态）：群发给 B、C 之后，会话列表里
+/// 就是「与 B」「与 C」两条，各自带着这条消息；"送到了几台"由同一个 id 的几份副本拼出来。
+/// **没有群这个实体** —— 对端收到的是一条普通消息，回复各自回到与发送方的 1:1。
+///
+/// 落账与逐台投递都在 `chat::send_text`（集成测试与这里共用同一条路）。
+#[tauri::command]
+fn chat_send(
+    peer_ids: Vec<String>,
+    text: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<chat::SendResult, String> {
+    ensure_online(&state)?;
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("消息为空".to_string());
+    }
+    // 去重 + 只认本机设备表里有的 id（设备刚被移除时界面可能还捏着它）。
+    let mut targets: Vec<String> = Vec::new();
+    for id in peer_ids {
+        if state.get_peer(&id).is_none() || targets.contains(&id) {
+            continue;
+        }
+        targets.push(id);
+    }
+    if targets.is_empty() {
+        return Err("收件人不存在".to_string());
+    }
+    let (snapshot, id) = chat::send_text(&state, &targets, &text);
+    ws::emit_ui(&state, ws::events::ui::CHAT_CHANGED, &chat::snapshot_value(&snapshot));
+    Ok(chat::SendResult { id, snapshot })
+}
+
+/// 界面读过这些设备的会话：推进本地已读水位，并给对端回一条已读回执。
+#[tauri::command]
+fn chat_mark_read(peer_ids: Vec<String>, state: State<'_, Arc<AppState>>) -> chat::Snapshot {
+    chat::mark_read(&state, &peer_ids);
+    let snap = state.chat.snapshot();
+    ws::emit_ui(&state, ws::events::ui::CHAT_CHANGED, &chat::snapshot_value(&snap));
+    snap
+}
+
+/// 清空与一台设备的聊天记录（会话菜单里的「清空聊天记录」）。
+#[tauri::command]
+fn chat_clear(peer_id: String, state: State<'_, Arc<AppState>>) -> chat::Snapshot {
+    let snap = state.chat.clear_peer(&peer_id);
+    ws::emit_ui(&state, ws::events::ui::CHAT_CHANGED, &chat::snapshot_value(&snap));
+    snap
+}
+
+// ---------------------------------------------------------------------------
 // 对端浏览（前端不再直连对端）
 // ---------------------------------------------------------------------------
 
@@ -1537,6 +1599,10 @@ pub fn run() {
             reject_push,
             cancel_push,
             cancel_receive,
+            chat_snapshot,
+            chat_send,
+            chat_mark_read,
+            chat_clear,
             download_from_peer,
             download_file,
             download_and_open,

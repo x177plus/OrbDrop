@@ -2393,3 +2393,144 @@ async fn probe_learns_the_peers_segment_and_sweeps_it_when_the_voucher_goes_quie
     credential::remove_peer(&b_id).ok();
     let _ = std::fs::remove_dir_all(&save_dir);
 }
+
+// ---------------------------------------------------------------------------
+// 会话（聊天）：文本消息与已读回执走的就是那条长连接
+// ---------------------------------------------------------------------------
+
+/// 一台设备的两个"家"：config.toml 与会话记录（chat.json）都落在它自己的目录里。
+///
+/// 会话记录跟 config.toml 走（见 `AppState::new`），所以两台设备必须各占一个目录 ——
+/// 共用一个的话，两边会把同一份 chat.json 互相覆盖（真实部署里这就是两台机器）。
+fn chat_state(
+    port: u16,
+    device_id: &str,
+    device_name: &str,
+    root: &std::path::Path,
+) -> (Arc<AppState>, std::path::PathBuf) {
+    let dir = root.join(device_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut config = Config::default();
+    config.port = port;
+    config.device_id = device_id.to_string();
+    config.device_name = device_name.to_string();
+    config.download_dir = dir.clone();
+    config.bc_exe_path = Some(hermetic_bc_exe());
+    let config_path = dir.join("config.toml");
+    (Arc::new(AppState::new(config, config_path)), dir)
+}
+
+#[tokio::test]
+async fn chat_messages_and_read_receipts_travel_over_the_long_connection() {
+    use orbdrop_lib::chat::{self, Delivery};
+
+    let root = std::env::temp_dir().join(format!("orbdrop_it_chat_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+
+    let (port_a, port_b) = two_free_ports();
+    let (state_a, dir_a) = chat_state(port_a, "device-chat-a", "PC-CA", &root);
+    let (state_b, dir_b) = chat_state(port_b, "device-chat-b", "PC-CB", &root);
+
+    let server_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
+    let server_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+
+    // ---- 配对结果（两侧各存一枚 token）+ 用户点「连接」 ----
+    credential::remove_peer("device-chat-a").ok();
+    credential::remove_peer("device-chat-b").ok();
+    let token = format!("t-chat-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    credential::set_peer("device-chat-a", &token).unwrap();
+    credential::set_peer("device-chat-b", &token).unwrap();
+    state_a.mark_paired(&PeerDevice {
+        id: "device-chat-b".into(), name: "PC-CB".into(), ip: "127.0.0.1".into(), port: port_b,
+        online: true, paired: true, auto_connect: false, paused: false,
+    });
+    state_b.mark_paired(&PeerDevice {
+        id: "device-chat-a".into(), name: "PC-CA".into(), ip: "127.0.0.1".into(), port: port_a,
+        online: true, paired: true, auto_connect: false, paused: false,
+    });
+    orbdrop_lib::ws::ensure_link_now(&state_a, "device-chat-b");
+    wait_until("长连接建立", || {
+        state_a.ws.has_connection("device-chat-b") && state_b.ws.has_connection("device-chat-a")
+    })
+    .await;
+
+    // ---- A 发一条文本 ----
+    let text = "在吗？帮我传一下「Q3 排期表」。";
+    let (snap, sent_id) = chat::send_text(&state_a, &["device-chat-b".to_string()], text);
+    assert!(!sent_id.is_empty(), "发出去的消息带回它的 id（界面据此逐台读状态）");
+    let convo = snap.convos.iter().find(|c| c.peer_id == "device-chat-b").expect("A 侧有一条会话");
+    assert_eq!(convo.messages.len(), 1);
+    let sent = &convo.messages[0];
+    assert!(sent.from_me);
+    assert_eq!(sent.text, text);
+    assert_eq!(sent.targets, vec!["device-chat-b".to_string()]);
+    assert_eq!(sent.delivery, Delivery::Sent, "写进长连接就算送达");
+    assert_eq!(snap.unread, 0, "自己发的不算未读");
+
+    // ---- B 收到（未读 +1），发件人名字取自**B 自己的设备表** ----
+    wait_until("B 收到那条消息", || state_b.chat.inbound_watermark("device-chat-a") > 0).await;
+    let snap_b = state_b.chat.snapshot();
+    assert_eq!(snap_b.unread, 1);
+    let convo_b = snap_b.convos.iter().find(|c| c.peer_id == "device-chat-a").expect("B 侧有一条会话");
+    let got = &convo_b.messages[0];
+    assert!(!got.from_me);
+    assert_eq!(got.text, text);
+    assert_eq!(got.from_name, "PC-CA", "发件人名字以本机设备表为准");
+    assert_eq!(got.delivery, Delivery::Received);
+
+    // ---- B 打开会话 → 本地未读清零 + 回执回去 → A 那条变「已读」 ----
+    chat::mark_read(&state_b, &["device-chat-a".to_string()]);
+    assert_eq!(state_b.chat.snapshot().unread, 0);
+    wait_until("A 看到「已读」", || {
+        state_a
+            .chat
+            .snapshot()
+            .convos
+            .iter()
+            .find(|c| c.peer_id == "device-chat-b")
+            .and_then(|c| c.messages.first())
+            .is_some_and(|m| m.delivery == Delivery::Read)
+    })
+    .await;
+
+    // ---- 对端断开：消息**不排队**，就地落一条未送达（下次连上也照旧） ----
+    state_b.ws.pause("device-chat-a");
+    wait_until("B 侧链路断开", || !state_a.ws.has_connection("device-chat-b")).await;
+    let (snap, _) = chat::send_text(&state_a, &["device-chat-b".to_string()], "这条送不出去");
+    let convo = snap.convos.iter().find(|c| c.peer_id == "device-chat-b").unwrap();
+    assert_eq!(convo.messages.last().unwrap().delivery, Delivery::Failed);
+
+    // ---- 群发：每台各一份（同一个 id），**没有群实体** —— 世界里只多出"与每台的两条会话" ----
+    // 一台有链路、一台（没配对过的 id）根本没有会话：逐台成败各算各的。
+    let (snap, fan_id) = chat::send_text(
+        &state_a,
+        &["device-chat-b".to_string(), "device-chat-ghost".to_string()],
+        "群发一句",
+    );
+    let fan_b = snap.convos.iter().find(|c| c.peer_id == "device-chat-b").unwrap();
+    let fan_ghost = snap.convos.iter().find(|c| c.peer_id == "device-chat-ghost").expect("另一台也有自己那条");
+    assert_eq!(fan_b.messages.last().unwrap().id, fan_id);
+    assert_eq!(fan_ghost.messages.last().unwrap().id, fan_id, "同一个 id：逐台状态靠它拼");
+    assert_eq!(
+        fan_b.messages.last().unwrap().delivery,
+        Delivery::Failed,
+        "链路断着，这条也没送出去"
+    );
+    assert_eq!(fan_ghost.messages.last().unwrap().delivery, Delivery::Failed);
+    assert_eq!(snap.convos.len(), 2, "群发不产生第三条「群会话」，就是两台各一条");
+
+    // ---- 两侧都落了盘：重开一份 store 还能读到（会话记录是用户数据） ----
+    let reopened_a = chat::ChatStore::with_path(dir_a.join("chat.json"));
+    assert_eq!(reopened_a.snapshot().convos[0].messages.len(), 3);
+    let reopened_b = chat::ChatStore::with_path(dir_b.join("chat.json"));
+    let kept = &reopened_b.snapshot().convos[0].messages[0];
+    assert_eq!(kept.text, text);
+    assert_eq!(reopened_b.read_watermark("device-chat-a"), kept.at, "已读水位也落盘");
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    credential::remove_peer("device-chat-a").ok();
+    credential::remove_peer("device-chat-b").ok();
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = (server_a, server_b);   // 端口号不是句柄：服务器由 `stop_server` 收
+}

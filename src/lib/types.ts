@@ -236,6 +236,50 @@ export interface PushBatch {
 }
 
 /**
+ * 会话（聊天）里一条消息在一台设备上的状态（后端 `chat::Delivery`）。
+ *
+ * `sent` = 已写进那条长连接；`read` = 对端回执说它读过了；`failed` = 发出去的时候对端没有
+ * 长连接（**不排队重发**：会话里的话过期补发没有意义）；`received` = 收到的消息 ——
+ * 本机视角没有"送达"可言。
+ */
+export type ChatDelivery = 'sent' | 'read' | 'failed' | 'received';
+
+/**
+ * 会话里的一条文本消息。
+ *
+ * 群发时**每台设备各存一份副本、共用同一个 `id`**（各自落在与该设备的 1:1 会话里）：
+ * "送到了几台"就是对着 `targets` 逐台看副本的 `delivery`。
+ */
+export interface ChatMessage {
+  id: string;
+  /** 本机发出的 = true（气泡靠右）；对端发来的 = false（靠左，`fromName` 说明是谁说的）。 */
+  fromMe: boolean;
+  /** 对端消息的发送方名字；本机发出的为空串。 */
+  fromName: string;
+  text: string;
+  /** 发送方的墙上时间（epoch 毫秒）：排序与已读水位都按它。 */
+  at: number;
+  delivery: ChatDelivery;
+  targets: string[];
+}
+
+/** 一台设备的会话：会话就是**与这台设备**的那一条（没有群实体，群发只是每台各存一份）。 */
+export interface ChatPeerConvo {
+  peerId: string;
+  messages: ChatMessage[];
+  /** 本机已读水位（epoch 毫秒）：`at <= readAt` 的对端消息算读过。 */
+  readAt: number;
+  unread: number;
+}
+
+/** 整份会话状态：`chat_snapshot` 命令的返回，也是 `chat://changed` 事件的载荷。 */
+export interface ChatSnapshot {
+  convos: ChatPeerConvo[];
+  /** 全部未读（底栏那颗角标 / 悬浮球左上角那颗）。 */
+  unread: number;
+}
+
+/**
  * 悬浮球起拖那一刻的按下点（CSS px，窗口坐标 = 折叠态窗口的视口坐标）。
  *
  * `App.beginOrbDrag` 把它交给后端：后端按它把窗口的抓取锚点校正回按下点，再当场起拖。

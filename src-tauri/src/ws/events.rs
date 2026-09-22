@@ -86,6 +86,22 @@ pub enum WsEvent {
     Unpair {
         peer_id: String,
     },
+    /// 会话：Sender → Receiver 的一条文本消息。
+    ///
+    /// `id` 由发送方生成，接收方原样存下来 —— 接收方的回执（`ChatRead`）按 `at` 比水位，
+    /// 而 `id` 是"这条到底是哪一条"的凭据（重复投递、重连补发都靠它认）。
+    ChatText {
+        id: String,
+        text: String,
+        /// 发送方的墙上时间（epoch 毫秒）：接收方原样存，回执按它比水位。
+        at: u64,
+    },
+    /// 会话：Receiver → Sender 的已读回执。`up_to` 是接收方**见到过的、你发来的最大 `at`**。
+    ///
+    /// 一条回执覆盖一批消息（不是逐条 ack）：人是一屏一屏读的，回执也该一屏一次。
+    ChatRead {
+        up_to: u64,
+    },
 }
 
 impl WsEvent {
@@ -100,6 +116,8 @@ impl WsEvent {
             WsEvent::ShareChanged { .. } => "share_changed",
             WsEvent::SharesChanged => "shares_changed",
             WsEvent::Unpair { .. } => "unpair",
+            WsEvent::ChatText { .. } => "chat_text",
+            WsEvent::ChatRead { .. } => "chat_read",
         }
     }
 }
@@ -133,4 +151,9 @@ pub mod ui {
     pub const ORB_SHOW: &str = "orb://show";
     /// 本机「在线 / 离线」变了（面板右上角状态框）：界面更新那个框。载荷 `{ online: bool }`。
     pub const LOCAL_ONLINE: &str = "local://online";
+    /// 会话状态变了（收到消息 / 自己发出 / 送达状态推进 / 已读 / 建群退群）。
+    ///
+    /// 载荷是**整份会话快照**（和 `chat_snapshot` 命令同一个形状）：会话是人的打字速度，
+    /// 增量事件的收益抵不过"两份状态各自演算、迟早对不上"的风险 —— 与 `PUSH_BATCH` 同一个取舍。
+    pub const CHAT_CHANGED: &str = "chat://changed";
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::credential;
 use crate::state::{AppState, LinkIntent};
@@ -33,6 +33,8 @@ pub async fn run_inbound_session(state: Arc<AppState>, peer_id: String, ws: WebS
     let (tx_events, mut rx_events) = mpsc::unbounded_channel::<WsEvent>();
     let gen = state.ws.register(&peer_id, tx_events);
     state.emit_devices_changed();
+    // 链路上来了：把上一次没送出去的「已读」补一次（回执丢了，对端那条消息就永远只是「已送达」）。
+    crate::chat::flush_read_receipt(&state, &peer_id);
 
     loop {
         tokio::select! {
@@ -256,6 +258,24 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             state.ws.drop_peer(&who);
             state.unpair(&who);
             emit_ui(state, ui::DEVICES_CHANGED, &serde_json::json!({}));
+        }
+        WsEvent::ChatText { id, text, at } => {
+            // 名字以**本机设备表**为准：长连接是 token 换来的身份，载荷里没有自称的名字。
+            let name = state
+                .get_peer(peer_id)
+                .map(|p| p.name)
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| peer_id.to_string());
+            debug!(%id, %peer_id, "inbound chat text");
+            let snap = state.chat.record_inbound(peer_id, &name, &id, &text, at);
+            emit_ui(state, ui::CHAT_CHANGED, &crate::chat::snapshot_value(&snap));
+            // 界面是不是**正开着**这个会话，只有界面知道（它自己会来 `chat_mark_read`）；
+            // 这里不回已读回执 —— 收到 ≠ 读过。
+        }
+        WsEvent::ChatRead { up_to } => {
+            debug!(%peer_id, up_to, "inbound chat read receipt");
+            let snap = state.chat.mark_read_by_peer(peer_id, up_to);
+            emit_ui(state, ui::CHAT_CHANGED, &crate::chat::snapshot_value(&snap));
         }
     }
 }

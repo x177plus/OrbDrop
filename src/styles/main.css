@@ -10,7 +10,8 @@
 
   --ok:      oklch(58% 0.16 158);
   --warn:    oklch(62% 0.15 60);
-  /* 「待处理」角标的橙：悬浮球/悬浮框左上那颗通知数与 footer 的铃铛角标都用它。
+  /* 「待处理」角标的橙：悬浮球/悬浮框左上那颗待处理数（通知 + 在途推送 + 会话未读）
+     与 footer 的铃铛角标都用它。
      与 `--warn` 分开：`--warn` 是那支琥珀色，给文案/图标用；直接把它压到 22px 的圆点上
      会发闷（`color-mix(warn 82%, black)` = #975100，看着是棕的）。这一档把明度与饱和度
      顶到 sRGB 橙的边界（#ba5702），小圆点上才跳得出来，且白字对比 4.7:1 仍过 WCAG AA。
@@ -354,7 +355,7 @@ input { font: inherit; }
     top 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 .rq-shellbadge[hidden] { display: none; }
-/* 左上＝待处理通知数（0 时隐藏）：与悬浮球左上那颗同色（`--notif`）＋同阴影 */
+/* 左上＝待处理数（0 时隐藏）：与悬浮球左上那颗同色（`--notif`）＋同阴影 */
 .rq-shellbadge.is-alert {
   left: -5px; right: auto;
   background: var(--notif);
@@ -371,7 +372,7 @@ input { font: inherit; }
 /* ─── 贴边收起：两枚角标换到卡片贴边那一侧 ───────────────────────────────
    与圆球"贴边后把角标转到露在屏幕内那段弧上"是同一条规则：都落到**贴边那一侧的对面**
    （＝露在屏内、不被屏幕边切的那一侧），次序不变 ——
-   贴右 → 左上是长连接设备数、左下是待处理通知数；贴左 → 右上是通知数、右下是设备数。
+   贴右 → 左上是长连接设备数、左下是待处理数；贴左 → 右上是待处理数、右下是设备数。
    （圆球贴右：黄 225°→135°＝7:30 左下、绿 315°→225°＝10:30 左上；贴左：黄→315°＝1:30 右上、
    绿→45°＝4:30 右下 —— 与这两条逐项对应。）
    **横向**：角标里侧那条边落在 **ip 列的左缘**（贴左镜像）—— 这是不压到 ip 的极限，
@@ -993,50 +994,6 @@ input { font: inherit; }
 .d-acts .btn-primary { min-width: 84px; }
 .d-acts .btn-ghost.btn-sm { min-width: 52px; }
 
-/* ─── 设备页多选（一次推给多台）───────────────────────────────── */
-/* 入口是长按设备行（DeviceTab 的 onRowPress），这里没有可见的按钮。
-   这一行的常驻内容（`.list-label` 的 11px 等宽、右侧那串台数、以及搜索框）**两种状态下
-   完全一样**，所以多选进/出这一行的行高逐像素相同 —— 一条规矩：谁要在多选态里多塞
-   一件带 padding/border 的东西（或让它唯独在多选态消失），下面的列表就会整条跳版
-   （实测 23.59px vs 17.59px）。 */
-/* 勾选期间顶部那颗块状按钮原地换成动作条：同高、不跳版，且不会被右下角那组通知气泡压住
-   （气泡是面板底部那一层，压不到顶部）。 */
-.dev-select-bar {
-  display: flex; align-items: center; justify-content: space-between; gap: var(--gap-sm);
-  padding: 0 4px 0 12px;
-  border: 1px solid color-mix(in oklch, var(--accent) 32%, var(--border));
-  border-radius: var(--radius);
-  background: var(--accent-soft);
-  font-family: var(--font-display); font-size: var(--fs-sm); color: var(--fg);
-}
-.dev-select-bar .num { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); }
-.dev-select-bar b { color: var(--fg); }
-/* 勾选期间每一行 = 一个开关：点整行勾/取消，行里的动作按钮收起来（留着会让"点哪儿算勾"
-   变得含糊）。 */
-.device-row.selecting { cursor: pointer; }
-.device-row.selecting .d-acts { display: none; }
-.device-row.selected { background: var(--accent-soft); }
-.device-row.locked { opacity: 0.55; cursor: default; }
-/* 勾选框：**盒子和头像同一个槽位（34px），真正画出来的方框只有 16px** ——
-   与文件选择框里那颗同尺寸（`.pr-check`：5px 圆角 / 1.5px 描边 / accent-deep 填色）；
-   槽位保持 34px 是另一半要求：换进来/换出去都不能挪动后面的设备名与 ip。
-   方框走 ::before、勾走 svg，两者叠在同一个网格单元里居中。 */
-.d-check {
-  width: 34px; height: 34px; flex: none;
-  display: grid; place-items: center;
-  color: var(--surface);
-}
-.d-check::before, .d-check svg { grid-area: 1 / 1; }
-.d-check::before {
-  content: ''; width: 16px; height: 16px;
-  border: 1.5px solid color-mix(in oklch, var(--fg) 26%, transparent); border-radius: 5px;
-  transition: background 0.12s ease, border-color 0.12s ease;
-}
-.d-check svg { width: 11px; height: 11px; opacity: 0; }
-.d-check.on::before { background: var(--accent-deep); border-color: var(--accent-deep); }
-.d-check.on svg { opacity: 1; }
-.device-row:not(.online) .d-check::before { border-style: dashed; }
-
 /* ─── buttons ───────────────────────────────────────────────── */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
@@ -1309,7 +1266,10 @@ input { font: inherit; }
 
 /* ─── 面板内的层叠顺序（定死，别随手改）─────────────────────────────
      `.hint-tip` 100（悬停说明）> `.ctx`（根层级）> `.overlay` / `.picker-layer` 90
-       > `.sheet` 85（设置面板）> `.panel-bottom` 70（通知浮层）> 正文 / tab 栏 / footer
+       > `.sheet` 85（设置面板）> `.convo-pop` 75（会话浮层）> `.panel-bottom` 70（通知浮层）
+       > 正文 / tab 栏 / footer
+   会话浮层压在通知浮层之上：两者都从下缘长出来，会话是**用户自己开的一块工作区**
+   （要能一直用完），而通知气泡是"顺带看一眼"的东西 —— 被盖住时缩在右下角也不挡操作。
    模态**必须**压过通知浮层：反过来的后果是"推送选择框开着，气泡正盖在对话框按钮上，
    点下去被气泡接走"（气泡是 `pointer-events: auto`，看得见就一定点得到）。
    设置面板同理 —— 它是整面板覆盖，理应在通知之上。
@@ -1334,9 +1294,6 @@ input { font: inherit; }
 .dialog .d-err { margin: 10px 0 0; font-size: var(--fs-xs); color: color-mix(in oklch, var(--warn) 75%, black); }
 .dialog .d-acts { display: flex; gap: var(--gap-sm); margin-top: 18px; }
 .dialog .d-acts .btn { flex: 1; }
-/* 对话框里的一个勾选项（如推送的「允许多选」）：整行可点，别只在小方块上有反馈。 */
-.dialog .d-check { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: var(--fs-sm); color: var(--fg); cursor: pointer; }
-.dialog .d-check input { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
 .ctx { position: fixed; z-index: 60; min-width: 172px; padding: 5px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); opacity: 0; transform: scale(0.96); pointer-events: none; transform-origin: top left; transition: opacity 0.12s ease, transform 0.12s ease; }
 .ctx.show { opacity: 1; transform: scale(1); pointer-events: auto; }
 .ctx-item { display: flex; align-items: center; gap: 9px; width: 100%; padding: 7px 10px; border-radius: 7px; font-size: var(--fs-sm); color: var(--fg); text-align: left; }
@@ -1491,6 +1448,184 @@ input { font: inherit; }
    负边距会把它压到按钮上（重叠），所以这里清零并自己留出间距。 */
 .dialog .pair-invite { margin: 0 0 14px; }
 .dialog .pair-invite + .d-target { margin-top: 0; }
+/* ─── 会话（聊天）───────────────────────────────────────────────
+   结构照原型 `design/orbdrop-app-prototype.html`：底栏那颗「会话」入口 → 面板左下角展开的
+   `.convo-pop`（列表 ↔ 详情两屏，同一块浮层里换）。会话记录本身在后端（`chat.json`），
+   这里只管画 —— 尺寸、圆角、间距、动画曲线都按原型量过的那套来。 */
+.foot-msg {
+  position: relative; flex: none;
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 26px; padding: 0 10px 0 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  font-family: var(--font-display); font-size: var(--fs-xs); font-weight: 500;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.foot-msg svg { width: 17px; height: 17px; flex: none; }
+.foot-msg:hover, .foot-msg.open { background: var(--accent-soft); border-color: color-mix(in oklch, var(--accent) 34%, transparent); color: var(--accent); }
+/* 未读角标：与铃铛那颗同一个形状，只是底色用主色（会话未读是"有人跟你说话"，不是通知） */
+.msg-fab-badge {
+  position: absolute; top: -4px; right: -4px; min-width: 18px; height: 18px; padding: 0 5px;
+  border-radius: 999px; background: var(--accent); color: var(--surface);
+  font-family: var(--font-mono); font-size: 10px; font-weight: 700; line-height: 1;
+  display: grid; place-items: center; border: 2px solid var(--surface);
+  pointer-events: none;
+}
+
+/* 未读那一点（原型 `.tab .tab-dot`）：长连接那个绿点说的是"链路活着"，这一点说的是
+   "有人在跟你说话"——两者同时出现时靠颜色区分（绿 = 链接，蓝 = 未读）。 */
+.tab .tab-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+
+/* 浮层：左下角展开（原型的位置与缩放原点）。`bottom` 贴 footer 上缘 —— App 量出的
+   `--foot-h` 与 `.panel-bottom` 用的是同一条线，两者不会各自算各自的。*/
+.convo-pop {
+  position: absolute; left: 16px; bottom: calc(var(--foot-h, 40px) + 12px); z-index: 75;
+  width: min(320px, calc(100% - 32px));
+  height: min(420px, calc(100% - var(--foot-h, 40px) - 92px));
+  display: flex; flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 26px 64px -26px oklch(18% 0.012 250 / 0.30), 0 2px 8px -2px oklch(18% 0.012 250 / 0.12);
+  overflow: hidden;
+  transform-origin: 32px calc(100% - 29px);
+  transform: scale(0.2);
+  opacity: 0; pointer-events: none;
+  transition: transform 0.3s cubic-bezier(0.2, 0.9, 0.25, 1.08), opacity 0.18s ease;
+}
+.convo-pop.open { transform: none; opacity: 1; pointer-events: auto; }
+
+/* ── 会话列表 ── */
+.convos-list-view { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.convos-head { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 14px 10px; }
+.convos-title { font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
+.convos-head-acts { display: flex; align-items: center; gap: 6px; }
+.convo-list { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 2px 10px 14px; display: flex; flex-direction: column; gap: 2px; }
+.convo-list::-webkit-scrollbar { width: 10px; }
+.convo-list::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg) 14%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: content-box; }
+.convo-item { display: flex; align-items: center; gap: 10px; padding: 10px; border-radius: var(--radius); text-align: left; transition: background 0.15s ease; }
+.convo-item:hover { background: var(--fg-soft); }
+.convo-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.convo-avs { display: flex; flex: none; }
+/* 头像叠加（群会话最多画两颗）：同一个 `.d-avatar`，负外边距错开 + 白色描边分界 */
+.convo-avs .d-avatar { width: 34px; height: 34px; border-radius: 10px; font-size: var(--fs-sm); color: var(--fg); background: var(--accent-soft); border: 2px solid var(--surface); margin-left: -10px; }
+.convo-avs .d-avatar:first-child { margin-left: 0; }
+.convo-main { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.convo-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.convo-name { flex: 0 1 auto; min-width: 0; font-family: var(--font-display); font-size: var(--fs-md); font-weight: 500; letter-spacing: -0.005em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.convo-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 26%, transparent); }
+.convo-dot.ok { background: var(--ok); }
+.convo-dot.warn { background: var(--warn); }
+.convo-time { margin-left: auto; flex: none; font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); }
+.convo-prev { font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.convo-unread { flex: none; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; background: var(--accent); color: var(--surface); font-family: var(--font-mono); font-size: 10px; font-weight: 700; line-height: 1; display: grid; place-items: center; }
+
+/* ── 会话详情 ── */
+.convo-detail { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; }
+.conv-top { flex: none; display: flex; align-items: center; gap: 6px; padding: 7px 8px 7px 10px; border-bottom: 1px solid var(--border); }
+.conv-back { flex: none; width: 28px; height: 28px; border-radius: 7px; display: grid; place-items: center; color: var(--muted); transition: background 0.15s ease, color 0.15s ease; }
+.conv-back:hover { background: var(--fg-soft); color: var(--fg); }
+.conv-back svg { width: 16px; height: 16px; }
+.conv-title { flex: 0 1 auto; min-width: 0; font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 600; letter-spacing: -0.005em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conv-status { flex: none; width: 7px; height: 7px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 26%, transparent); }
+.conv-status.ok { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+.conv-status.warn { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in oklch, var(--warn) 16%, transparent); }
+.conv-count { flex: none; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+.conv-acts { margin-left: auto; flex: none; display: flex; align-items: center; gap: 2px; }
+
+/* ── 收件人栏（一对一 / 群发共用一行）── */
+.recip { flex: none; display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.recip-label { flex: none; font-family: var(--font-mono); font-size: var(--fs-xxs); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.recip-chips { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.recip-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 168px; height: 24px; padding: 0 4px 0 5px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); font-size: var(--fs-xs); color: var(--fg); }
+.recip-chip .rc-av { flex: none; width: 15px; height: 15px; border-radius: 5px; display: grid; place-items: center; font-family: var(--font-display); font-weight: 650; font-size: 9px; color: var(--accent); background: var(--accent-soft); }
+.recip-chip .rc-name { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.recip-chip .rc-st { flex: none; width: 6px; height: 6px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 26%, transparent); }
+.recip-chip .rc-st.ok { background: var(--ok); }
+.recip-chip .rc-x { flex: none; width: 16px; height: 16px; border-radius: 50%; display: grid; place-items: center; color: var(--muted); }
+.recip-chip .rc-x:hover { background: var(--fg-soft); color: var(--fg); }
+.recip-chip .rc-x svg { width: 10px; height: 10px; }
+.recip-add { flex: none; display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 10px; border-radius: 999px; border: 1px dashed color-mix(in oklch, var(--fg) 24%, transparent); color: var(--muted); font-size: var(--fs-xs); }
+.recip-add:hover { color: var(--fg); border-color: color-mix(in oklch, var(--fg) 42%, transparent); }
+.recip-add svg { width: 12px; height: 12px; }
+
+/* ── 收件人选择对话框（挂在面板上的那份 overlay 里）── */
+.recip-tools { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 8px; }
+.recip-tools .num { font-size: var(--fs-xs); color: var(--muted); }
+.recip-list { display: flex; flex-direction: column; gap: 4px; max-height: 236px; overflow-y: auto; margin-bottom: 4px; }
+.recip-list::-webkit-scrollbar { width: 8px; }
+.recip-list::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg) 14%, transparent); border-radius: 999px; border: 2px solid transparent; background-clip: content-box; }
+.recip-row { display: flex; align-items: center; gap: 9px; padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius); cursor: pointer; transition: background 0.15s ease, border-color 0.15s ease; }
+.recip-row:hover { background: var(--fg-soft); }
+.recip-row:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.recip-row input { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; flex: none; }
+.recip-row .d-avatar { width: 28px; height: 28px; border-radius: 9px; font-size: var(--fs-sm); flex: none; }
+.recip-row .rr-main { flex: 1; min-width: 0; display: grid; gap: 1px; }
+.recip-row .rr-name { font-family: var(--font-display); font-size: var(--fs-md); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.recip-row .rr-ip { font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.recip-row .state-chip { flex: none; }
+
+/* ── 消息流 ── */
+.chat-log { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 14px 14px 10px; display: flex; flex-direction: column; gap: 8px; }
+.chat-log::-webkit-scrollbar { width: 8px; }
+.chat-log::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg) 14%, transparent); border-radius: 999px; border: 2px solid transparent; background-clip: content-box; }
+.chat-empty { margin: auto; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 18px 12px; text-align: center; color: var(--muted); }
+.chat-empty svg { width: 22px; height: 22px; opacity: 0.5; }
+.chat-empty p { margin: 0; font-size: var(--fs-xs); }
+.chat-empty .ce-sub { font-size: 10px; line-height: 1.5; max-width: 170px; }
+.chat-msg { display: flex; flex-direction: column; max-width: 86%; user-select: text; -webkit-user-select: text; animation: chat-in 0.2s cubic-bezier(0.2, 0.8, 0.2, 1); }
+@keyframes chat-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.chat-msg.me { align-self: flex-end; align-items: flex-end; }
+.chat-msg.peer { align-self: flex-start; align-items: flex-start; }
+.chat-bubble { max-width: 100%; padding: 7px 10px; border-radius: 12px; font-size: var(--fs-sm); line-height: 1.55; overflow-wrap: anywhere; }
+.chat-msg.peer .chat-bubble { background: color-mix(in oklch, var(--fg) 6%, transparent); color: var(--fg); border-bottom-left-radius: 4px; }
+.chat-msg.me .chat-bubble { background: var(--accent-deep); color: var(--surface); border-bottom-right-radius: 4px; }
+/* 右键菜单指着的那一条：给个同色系的圈，别用"选中态"那种实心变化（消息是只读的） */
+.chat-msg.picked .chat-bubble { box-shadow: 0 0 0 2px color-mix(in oklch, var(--accent) 45%, transparent); }
+.chat-text { display: block; white-space: pre-wrap; }
+.chat-meta { margin-top: 3px; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+.chat-bubble-file { display: flex; align-items: center; gap: 8px; }
+.cf-ico { flex: none; display: grid; place-items: center; }
+.cf-ico svg { width: 16px; height: 16px; }
+.cf-main { min-width: 0; max-width: 148px; display: grid; gap: 1px; }
+.cf-name { display: block; font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cf-size { display: block; font-family: var(--font-mono); font-size: 10px; opacity: 0.8; }
+.cf-status { display: block; font-family: var(--font-mono); font-size: 10px; opacity: 0.85; }
+/* 传输进度条：颜色跟着气泡的字色走（自己的气泡是深蓝底、对端是浅灰底） */
+.cf-bar { display: block; height: 3px; margin-top: 5px; border-radius: 999px; background: color-mix(in oklch, currentColor 22%, transparent); overflow: hidden; }
+.cf-bar i { display: block; height: 100%; width: 0; border-radius: 999px; background: currentColor; transition: width 0.1s linear; }
+.chat-msg.me .cf-bar { color: var(--surface); }
+
+/* ── 会话里的「接收 / 拒绝」卡（对端推过来的那条邀请）── */
+.invite-card { display: flex; flex-direction: column; gap: 9px; max-width: 100%; padding: 11px 12px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); box-shadow: 0 2px 8px -4px oklch(18% 0.012 250 / 0.14); }
+.ic-row { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.ic-row .f-icon { width: 18px; height: 18px; flex: none; color: var(--warn); }
+.ic-row .f-icon svg { width: 18px; height: 18px; }
+.ic-main { flex: 1; min-width: 0; display: grid; gap: 1px; }
+.ic-name { font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ic-size { font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+.ic-sub { font-size: var(--fs-xs); color: var(--muted); }
+.ic-acts { display: flex; gap: 8px; }
+.ic-acts .btn { flex: 1; height: 30px; }
+.ic-done { display: flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--muted); }
+
+/* ── 输入行 ── */
+.chat-compose { flex: none; display: flex; align-items: center; gap: 6px; padding: 9px 12px; border-top: 1px solid var(--border); }
+.chat-plus, .chat-send { flex: none; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; transition: background 0.15s ease, color 0.15s ease, transform 0.06s ease, opacity 0.15s ease; }
+.chat-plus { background: var(--fg-soft); color: var(--muted); }
+.chat-plus:hover { background: color-mix(in oklch, var(--accent) 14%, transparent); color: var(--accent); }
+.chat-send { background: var(--accent-deep); color: var(--surface); }
+.chat-send:hover { background: var(--accent-deeper); }
+.chat-send:disabled { opacity: 0.38; cursor: default; }
+.chat-plus:active, .chat-send:not(:disabled):active { transform: scale(0.94); }
+.chat-plus svg { width: 16px; height: 16px; }
+.chat-send svg { width: 15px; height: 15px; }
+.chat-input { flex: 1; min-width: 0; height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--fg); font-size: var(--fs-sm); user-select: text; -webkit-user-select: text; }
+.chat-input::placeholder { color: var(--muted); }
+.chat-input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+
 @media (prefers-reduced-motion: reduce) {
-  .orb-stage, .panel, .orb, .orb-arm, .orb-badge, .rq, .rq-card, .rq-dock, .rq-dots, .rq-dotlist, .rq-dot, .rq-shellbadge, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin { transition: none !important; animation: none !important; }
+  .orb-stage, .panel, .orb, .orb-arm, .orb-badge, .rq, .rq-card, .rq-dock, .rq-dots, .rq-dotlist, .rq-dot, .rq-shellbadge, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin, .chat-msg, .convo-pop, .foot-msg, .cf-bar i { transition: none !important; animation: none !important; }
 }
