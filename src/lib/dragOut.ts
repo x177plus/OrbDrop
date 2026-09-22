@@ -60,9 +60,9 @@ export function dragOut(node: HTMLElement, params: DragOutParams) {
     try {
       const ticket = await prepareDragOut(src);
       if (!ticket.ready) {
-        // 对端项：小项会先下到暂存目录再起拖（只认 CF_HDROP 的应用才收得到），大项只走元数据。
-        // 无论哪种，起拖都跟着**按住的主键**走 —— 所以这句必须提醒"按住不放"。
-        p.onMessage?.(`正在准备「${ticket.name}」…（可能要下到暂存目录，请按住不放）`);
+        // 对端项：两种实现都在这里等（镜像只需问一次元数据就建好占位符；旧路可能要先把内容
+        // 下到暂存目录）。无论哪种，起拖都跟着**按住的主键**走 —— 所以这句必须提醒"按住不放"。
+        p.onMessage?.(`正在准备「${ticket.name}」…（请按住不放）`);
       }
       await startDragOut(ticket.ticket);
     } catch (err) {

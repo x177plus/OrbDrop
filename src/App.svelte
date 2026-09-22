@@ -1199,6 +1199,10 @@
   async function addShares(paths: string[]): Promise<number> {
     const known = new Set(getShares().map((s) => s.id));
     const seen = new Set<string>();
+    // 失败原因留一份：一条坏的没道理让整批一起消失（下面照旧只算成功的），但**一条都没成**时
+    // 必须说清为什么 —— 比如"镜像目录不能添加为共享项"（`unsendable::is_mirror_path`）。
+    // 只说"没有添加任何共享项"等于让用户对着一次沉默的拒绝发呆。
+    const failures: string[] = [];
     const results = await Promise.all(
       paths.map(async (p) => {
         try {
@@ -1208,6 +1212,7 @@
           return 'added' as const;
         } catch (e) {
           console.error('添加共享项失败:', p, e);
+          failures.push(e instanceof Error ? e.message : String(e));
           return 'failed' as const;
         }
       }),
@@ -1217,6 +1222,8 @@
     if (added > 0 && skipped > 0) toast(`已添加 ${added} 个共享项（${skipped} 项已在共享项里）`);
     else if (added > 0) toast(`已添加 ${added} 个共享项`);
     else if (skipped > 0) toast(skipped === 1 ? '这项已经在共享项里了' : `这 ${skipped} 项已经在共享项里了`);
+    else if (failures.length > 0)
+      toast(failures.length === 1 ? failures[0] : `${failures.length} 项没能添加：${failures[0]}`);
     else toast('没有添加任何共享项');
     return added;
   }

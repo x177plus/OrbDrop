@@ -82,6 +82,10 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
+    # CFAPI（云文件占位符）：拖出去的本地真实路径 + 水合时按需从对端拉，见 src/mirror/。
+    "Win32_Storage_CloudFilters",
+    # CF_CALLBACK_INFO / CF_OPERATION_INFO 里有 CORRELATION_VECTOR 字段，这一族必须一起开。
+    "Win32_System_CorrelationVector",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",

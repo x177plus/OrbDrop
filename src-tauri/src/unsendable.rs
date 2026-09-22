@@ -158,6 +158,49 @@ pub fn is_own_data_dir(path: &Path, own: &Path) -> bool {
     same_path(path, own)
 }
 
+/// 是不是数据目录**里的东西**（数据目录本身，或它下面的任何一层）。
+///
+/// 与 [`is_own_data_dir`] 的分工：那个只管"数据目录**这一项**本身"（列目录时不外露它），
+/// 这个管"里面的东西一律不能共享/推送"。为什么非要细分：`credentials.dat`（**全部设备
+/// token**）就在里面，它既不是数据目录本身、也不在镜像里 —— 只查那两条会把它放过去，而它
+/// 一旦变成共享项、走推送那条路，就等于把整台机器的配对凭据交给对端。
+pub fn is_own_data_path(path: &Path, own: &Path) -> bool {
+    is_equal_or_under(path, own)
+}
+
+/// 是不是**镜像里的东西**（镜像根本身，或它下面的任何一层）。
+///
+/// 镜像里放的是**占位符**：它不是真文件，内容只在我们进程活着的时候才读得出来。所以它既不该
+/// 当共享项（对端拿到的是一个读不出内容的空壳），也不该当推送源。实机踩过：把镜像里的文件拖回
+/// 面板，它就成了一条共享项，接着 `share::watcher` 还去挂 watcher（占位符挂不上，日志里一行
+/// 警告）。
+///
+/// 它落在数据目录里面，所以 [`is_own_data_path`] 其实也会挡住它 —— 留这一条是为了**把话说具体**：
+/// 用户是刚从镜像里拖了个文件回来，提示里出现"镜像"两个字才对得上他刚才做的事。
+///
+/// `mirror` 由调用方算一次传进来（与 `is_own_data_dir` 同一条理由：`data_dir()` 要读环境变量）。
+pub fn is_mirror_path(path: &Path, mirror: &Path) -> bool {
+    is_equal_or_under(path, mirror)
+}
+
+/// `path` 等于 `root`，或者落在 `root` 下面。
+fn is_equal_or_under(path: &Path, root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        // 大小写不敏感（与 `same_path` 同一套判据）。只比字节前缀，所以再确认一次边界是分隔符 ——
+        // 否则 `…\mirror-x` 会被误判成在 `…\mirror` 下面。
+        let p = path.to_string_lossy();
+        let r = root.to_string_lossy();
+        let r = r.trim_end_matches(['\\', '/']);
+        p.get(..r.len()).is_some_and(|head| head.eq_ignore_ascii_case(r))
+            && matches!(p.as_bytes().get(r.len()), None | Some(b'\\') | Some(b'/'))
+    }
+    #[cfg(not(windows))]
+    {
+        path == root || path.starts_with(root)
+    }
+}
+
 /// Windows 的路径大小写不敏感：用户从 `c:\users\…` 那一侧进来时，逐字节比较认不出来。
 #[cfg(windows)]
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -282,5 +325,47 @@ mod tests {
         assert!(is_own_data_dir(&own, &own));
         assert!(!is_own_data_dir(&own.join("logs"), &own), "只挡数据目录本身，别挡它外面的世界");
         assert!(!is_own_data_dir(Path::new("/definitely/not/orbdrop"), &own));
+    }
+
+    #[test]
+    fn the_whole_data_dir_subtree_is_refused() {
+        let own = crate::config::data_dir();
+        assert!(is_own_data_path(&own, &own));
+        // 这条是真正的靶子：`credentials.dat` 里是全部设备的 token，它既不是数据目录本身、
+        // 也不在镜像里 —— 只查那两条会把它放过去。
+        assert!(is_own_data_path(&own.join("credentials.dat"), &own));
+        assert!(is_own_data_path(&own.join("logs").join("orbdrop.log"), &own));
+        assert!(is_own_data_path(&own.join("mirror").join("p").join("s"), &own), "镜像也在里面");
+        // 别误伤数据目录外面的东西（包括同名的另一棵树）
+        assert!(!is_own_data_path(Path::new("/definitely/not/orbdrop"), &own));
+        assert!(!is_own_data_path(&own.with_extension("old"), &own));
+    }
+
+    #[test]
+    fn the_whole_mirror_subtree_is_refused() {
+        let mirror = crate::mirror::root();
+        assert!(is_mirror_path(&mirror, &mirror), "镜像根自己");
+        assert!(
+            is_mirror_path(&mirror.join("peer").join("share").join("a.bin"), &mirror),
+            "镜像里放的东西（这才是实机踩到的那一下：把镜像里的文件拖回面板当共享项）"
+        );
+        // 相邻目录不能被误伤
+        assert!(!is_mirror_path(&crate::config::data_dir().join("logs"), &mirror));
+        assert!(!is_mirror_path(&crate::config::data_dir(), &mirror));
+        assert!(!is_mirror_path(Path::new("/definitely/not/orbdrop"), &mirror));
+    }
+
+    #[test]
+    fn mirror_prefix_must_end_on_a_separator() {
+        let mirror = Path::new(r"C:\data\mirror");
+        assert!(!is_mirror_path(Path::new(r"C:\data\mirror-x\a.bin"), mirror), "同前缀不同目录");
+        assert!(!is_mirror_path(Path::new(r"C:\data\mirror2"), mirror));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mirror_match_ignores_case() {
+        let mirror = Path::new(r"C:\Data\Mirror");
+        assert!(is_mirror_path(Path::new(r"c:\data\mirror\p\s\a.bin"), mirror));
     }
 }
