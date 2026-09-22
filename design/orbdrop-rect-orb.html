@@ -67,7 +67,8 @@
     --accent:  oklch(58% 0.18 255);
     --ok:      oklch(58% 0.16 158);
     --warn:    oklch(62% 0.15 60);
-    --yellow:  oklch(62% 0.15 95);
+    /* 「待处理」角标的橙：见 src/styles/main.css 的 `--notif` 注释（与悬浮球那颗同值） */
+    --notif:   oklch(57% 0.15 50);
 
     --accent-soft: color-mix(in oklch, var(--accent) 13%, transparent);
     --fg-soft:     color-mix(in oklch, var(--fg) 6%, transparent);
@@ -104,6 +105,9 @@
     --rq-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
     --rq-flip: 400ms;
     --rq-fade: 200ms;
+    /* 分页点轨道：高 = 卡片 1/2（134/2 = 67），两端渐隐带 8px */
+    --rq-track-h: 67px;
+    --rq-track-fade: 8px;
 
     /* ─── 悬浮球角标（宽体圆角矩形）──────────────────────────────
        高度自卡片上沿下探到设备名底部；宽度按悬浮卡自身的宽高比推导
@@ -213,15 +217,25 @@
   /* 顶部：设备名一行；IP 与可见项数一行 */
   .rq-head { display: grid; gap: 1px; min-height: var(--rq-head-h); padding: 0 2px; }
   /* 设备名左右各让出角标压住的那一段：角标内侧侵占宽度 = 角标宽 − 5px 出格，再留 5px 间距 */
-  .rq-headtop { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 0 calc(var(--rq-badge-w) - 10px); }
+  /* 左上角这一格是**常驻位**：没通知时是项目 logo，有通知时让位给数字。通知角标
+     （`.rq-shellbadge.is-alert`：`top/left: -5px`、28 高 × 1.31 宽、圆角 12）正落在设备名
+     行左边那段让位里 —— 角标一出现就**整个盖住** logo，这是刻意的，不是 bug。
+     所以 logo 只能取 12px 再上提 1px：行盒（实测 y 9–24.2、高 15.2）的中心比角标矩形
+     （y −5–23）低，12px 直接居中的话右下角会切进角标的右下圆弧 0.06px；上提 1px 后四角
+     都落在圆弧内（余量 0.9px），角标下缘一丝都不露。 */
+  .rq-headtop { position: relative; display: flex; align-items: center; gap: 6px; min-width: 0; padding: 0 calc(var(--rq-badge-w) - 10px); }
+  .rq-logo { position: absolute; left: 0; top: calc(50% - 1px); transform: translateY(-50%); display: flex; pointer-events: none; }
   .rq-devname { flex: 1 1 0; min-width: 0; font-family: var(--font-display); font-size: var(--fs-xs); font-weight: 600; letter-spacing: -0.005em; line-height: 1.2; }
-  .rq-headmeta { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  /* 2026-09-21：项数**贴卡片右缘**（`space-between`）—— 收起态定尺后头部右侧本来就有余量，
+     IP 短时项数挂左边会读成"和 ip 连在一起"。IP 顶住时仍是它先省略，项数不让位。 */
+  .rq-headmeta { display: flex; align-items: center; justify-content: space-between; gap: 6px; min-width: 0; }
   .rq-ip { min-width: 0; font-size: 10px; line-height: 1.2; color: var(--muted); }
   .rq-count { flex: none; font-size: 10px; line-height: 1.2; color: var(--muted); }
 
   /* 全局角标：固定骑在整机（.rq-stack）两个上角，不随设备翻页
-     同一家族（宽体圆角矩形、2px 卡片底色描边、等宽数字），左右同为实底+投影：
-     右上＝通知数（实底 accent，要处理的事，0 时隐藏）；左上＝长连接设备数（实底黄色） */
+     同一家族（宽体圆角矩形、2px 卡片底色描边、等宽数字），左右同为实底+投影。
+     含义、角位、配色都与悬浮球逐项一致：左上＝待处理通知数（实底橙 `--notif`，同
+     `.orb-badge.notif`）；右上＝长连接设备数（实底绿，同 `.orb-badge`，0 时隐藏） */
   .rq-shellbadge {
     position: absolute; top: -5px; z-index: 5;
     width: var(--rq-badge-w); height: var(--rq-badge-h);
@@ -232,16 +246,17 @@
     pointer-events: none;
   }
   .rq-shellbadge[hidden] { display: none; }
-  .rq-shellbadge.is-devices {
+  .rq-shellbadge.is-alert {
     left: -5px;
-    /* 与右侧同款：实底（黄色压暗保证白字对比度）＋同阴影 */
-    background: color-mix(in oklch, var(--yellow) 72%, black);
+    /* 与悬浮球左上那颗同色（`--notif`）＋同阴影 */
+    background: var(--notif);
     color: var(--surface);
     box-shadow: 0 3px 10px -3px oklch(18% 0.012 250 / 0.4);
   }
-  .rq-shellbadge.is-alert {
+  .rq-shellbadge.is-devices {
     right: -5px;
-    background: color-mix(in oklch, var(--accent) 72%, black);
+    /* 与悬浮球右上那颗同色（`--ok` 压暗保证白字对比度） */
+    background: color-mix(in oklch, var(--ok) 72%, black);
     color: var(--surface);
     box-shadow: 0 3px 10px -3px oklch(18% 0.012 250 / 0.4);
   }
@@ -309,13 +324,45 @@
   .rq-empty svg { width: 16px; height: 16px; opacity: 0.5; }
   .rq-empty p { margin: 0; font-size: 11px; line-height: 1.4; }
   .rq-empty .rq-empty-sub { font-size: 10px; max-width: 100px; line-height: 1.35; }
-/* 矩形外部右侧：分页点（设备多时渐隐渐显） */
+/* 矩形外部右侧：分页点列的轨道 —— 承载分页点的竖胶囊（上下半圆、与卡片同料同阴影）。
+     点列本来没有自己的底衬，直接画在桌面上：深灰点在深色壁纸上等于没有，主色蓝落在黑壁纸上
+     是一颗发光的蓝点。轨道补上底衬后，点永远落在 `--surface` 上。
+     宽 = 列宽 20，高 = 卡片的 1/2（`--rq-track-h`）、垂直居中 —— 它是卡片旁边的一枚小指示器，
+     不跟卡片等高。轨道右缘的阴影比卡片多伸，窗口余量要相应让出（`orbShape.ts` 的
+     `RECT_SLACK_RIGHT.withDots`）。
+     **静止不显示，hover 才淡入**：悬浮框是桌面常驻物，这枚胶囊是第二件有实体有阴影的东西；
+     点只在"你在第几页"这点信息上，而"一共几台设备"右上角绿角标已经常显。隐藏时必须
+     `pointer-events: none`（否则点在没有东西的透明窗口上会把页码点跳），触发面是整个
+     `.rq-wrap`（卡片 + 间距 + 点列），这样指针从卡片移到点上不会把它闪没。 */
   .rq-dots {
     position: relative;
     width: 20px;
+    align-self: center;
+    height: var(--rq-track-h);
     overflow: hidden;
-    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14%, #000 86%, transparent 100%);
-    mask-image: linear-gradient(to bottom, transparent 0, #000 14%, #000 86%, transparent 100%);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    box-shadow: var(--shadow);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--rq-fade) ease;
+  }
+  /* hover 进来、或键盘焦点（`:focus-visible`）进来才显示。不能用 `:focus-within`：
+     鼠标在 button 上按下时 Chromium 会给它焦点，胶囊就会在点过一次分页点后永远挂着。 */
+  .rq-wrap:hover .rq-dots,
+  .rq-wrap .rq-dots:has(.rq-dot:focus-visible) { opacity: 1; pointer-events: auto; }
+  /* 两端渐隐：**渐隐的是点，不是胶囊**（胶囊是不透明白 + 描边 + 阴影，不能淡）。
+     用 `--surface` 覆盖层在端头盖住点，免得被 `overflow: hidden` 切成半颗圆。 */
+  .rq-dots::after {
+    content: "";
+    position: absolute; inset: 0;
+    border-radius: inherit;
+    background: linear-gradient(to bottom,
+      var(--surface) 0, var(--surface) calc(var(--rq-track-fade) / 2),
+      transparent var(--rq-track-fade), transparent calc(100% - var(--rq-track-fade)),
+      var(--surface) calc(100% - var(--rq-track-fade) / 2), var(--surface) 100%);
+    pointer-events: none;
   }
   .rq-dotlist {
     position: absolute; left: 50%; top: 50%;
@@ -338,8 +385,9 @@
     transition: transform var(--rq-fade) var(--rq-ease), box-shadow var(--rq-fade) ease;
   }
   @media (hover: hover) { .rq-dot:hover { color: color-mix(in oklch, var(--fg) 60%, transparent); } }
-  .rq-dot.is-current { color: var(--accent); }
-  .rq-dot.is-current::after { transform: scale(1.5); box-shadow: 0 0 0 3px var(--accent-soft); }
+  /* 当前页不带色相：1.5× 实心 `--fg` 对 26% 灰。卡上已有黄/橙/绿三支彩色，不再加主色蓝 */
+  .rq-dot.is-current { color: var(--fg); }
+  .rq-dot.is-current::after { transform: scale(1.5); }
   @media (pointer: coarse) { .rq-dot { height: 34px; } }
 
   @media (max-width: 560px) {
@@ -392,8 +440,8 @@
   <div class="rq-wrap">
 
     <div class="rq-stack" id="rqStack">
-      <span class="rq-shellbadge is-devices num" id="rqDeviceBadge" role="img"></span>
       <span class="rq-shellbadge is-alert num" id="rqAlertBadge" role="img"></span>
+      <span class="rq-shellbadge is-devices num" id="rqDeviceBadge" role="img"></span>
     </div>
 
     <nav class="rq-dots" id="rqDots" aria-label="设备分页">
@@ -512,6 +560,9 @@
   var STATE_TEXT = { connected: '长连接', paired: '已配对', unbound: '未绑定' };
   var ICON_FOLDER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>';
   var ICON_FILE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg>';
+  /* 与 `src/lib/components/Logo.svelte` 同一枚（圆盘挖出 D，色取 `--accent`）：卡片左上角
+     那一格常驻位。12px + 上提 1px 是实测值 —— 见 `.rq-logo` 的注释（大了会从角标下缘漏出来）。 */
+  var LOGO_SVG = '<svg viewBox="0 0 32 32" width="12" height="12" fill="none" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M16 2.6A13.4 13.4 0 1 0 16 29.4A13.4 13.4 0 1 0 16 2.6ZM13 9.4H16.4A6.6 6.6 0 0 1 16.4 22.6H13Z" fill="var(--accent)"/></svg>';
 
   /* 卡片宽度以下限为基础；IP 更长时按实测宽度撑开，保证 IP 不被截断 */
   function fitCardWidth() {
@@ -544,7 +595,7 @@
   var cs = getComputedStyle(document.documentElement);
   var ROW_STEP = (parseFloat(cs.getPropertyValue('--rq-row-h')) || 46) + (parseFloat(cs.getPropertyValue('--rq-row-gap')) || 6);
 
-  /* 全局角标：连接设备数＝设备页数（左上，软底）；通知数量为示例数据（右上，实底） */
+  /* 全局角标：通知数量为示例数据（左上，橙实底）；连接设备数＝设备页数（右上，绿实底） */
   var NOTIFICATIONS = 3;
   function updateCounts() {
     var elDev = document.getElementById('rqDeviceBadge');
@@ -579,6 +630,7 @@
       head.className = 'rq-head';
       head.innerHTML =
         '<div class="rq-headtop">' +
+          '<span class="rq-logo">' + LOGO_SVG + '</span>' +
           '<span class="rq-devname od-truncate"></span>' +
         '</div>' +
         '<div class="rq-headmeta">' +

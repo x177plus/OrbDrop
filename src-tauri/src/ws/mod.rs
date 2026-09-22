@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::credential;
-use crate::state::AppState;
+use crate::state::{AppState, LinkIntent};
 use crate::ws::events::WsEvent;
 
 // ---------------------------------------------------------------------------
@@ -77,6 +77,10 @@ pub struct WsManager {
     /// are turned away (403) until the user hits 「连接」 here or the peer asks to
     /// connect with its own 「连接」. Without this the peer's retry a second later
     /// would silently undo the click and the "断开" button would be a lie.
+    ///
+    /// 这是地址簿里 `PeerDevice::paused` 的**内存镜像**（启动时由 `AppState::new`
+    /// 读回）：只活在本进程里的暂停拦不住重启后的对端拨号 —— 对方还记着上次的长连接，
+    /// 本机这边却已经把"拒收"忘了。
     paused: Mutex<HashSet<String>>,
     /// Why a peer currently has no link（[`LinkState`]）. Absent = 没有拨号意图
     /// （比如只有长连接记忆但对端从没连过、或被解除配对清过）——界面什么都不用说。
@@ -207,9 +211,22 @@ impl WsManager {
         self.clear_link_state(peer_id);
     }
 
+    /// 记下/清掉「断开」的暂停标记。
+    ///
+    /// 这只是**内存里的那一半**：落盘那份在地址簿的 `PeerDevice::paused`，由
+    /// `AppState::set_link_intent` 一处写、`AppState::new` 在启动时读回（见那里的说明）。
+    /// 直接改这里而不经过 `set_link_intent`，重启后这一台就又能被对端拨上来。
+    pub fn set_paused(&self, peer_id: &str, paused: bool) {
+        if paused {
+            self.paused.lock().insert(peer_id.to_string());
+        } else {
+            self.paused.lock().remove(peer_id);
+        }
+    }
+
     /// User hit "断开": drop the link and turn away this peer's retries.
     pub fn pause(&self, peer_id: &str) {
-        self.paused.lock().insert(peer_id.to_string());
+        self.set_paused(peer_id, true);
         self.teardown(peer_id);
         self.set_link_state(
             peer_id,
@@ -219,7 +236,7 @@ impl WsManager {
 
     /// User hit "连接" — or the peer asked to connect with its own: let it dial.
     pub fn resume(&self, peer_id: &str) {
-        self.paused.lock().remove(peer_id);
+        self.set_paused(peer_id, false);
     }
 
     pub fn is_paused(&self, peer_id: &str) -> bool {
@@ -247,6 +264,15 @@ impl WsManager {
             info!(%peer_id, "dropping link (going offline)");
             self.teardown(&peer_id);
             self.clear_link_state(&peer_id);
+        }
+        // 暂停标记不动（那是每台设备的人为意图），**理由也一起留着**：切回在线后设备行
+        // 还得说得出"为什么本机不接它的拨号"，否则用户只看到一行"已配对"（见 `LinkState`）。
+        let paused: Vec<String> = self.paused.lock().iter().cloned().collect();
+        for peer_id in paused {
+            self.set_link_state(
+                &peer_id,
+                LinkState::Stopped { reason: StopReason::LocalDisconnected },
+            );
         }
     }
 }
@@ -511,7 +537,8 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
                     info!(%peer_id, "outbound WS linked");
                     state.set_peer_online(&peer_id, true);
                     // 长连接意图落盘（F-16）：链路一建立就记下，重启后自动接回来。
-                    state.set_auto_connect(&peer_id, true);
+                    // 这一次写入同时清掉「断开」的暂停（`LinkIntent` 是同一个意图的两面）。
+                    state.set_link_intent(&peer_id, LinkIntent::Wanted);
                     state.ws.set_link_state(&peer_id, LinkState::Connected);
                     backoff = 5;
                     // 连上了就把失败计数清零：下次掉线重新享受完整的退避+重试预算。

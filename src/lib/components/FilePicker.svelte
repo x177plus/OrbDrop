@@ -2,6 +2,7 @@
   import { onMount, tick } from 'svelte';
   import { fsDrives, fsList, listPickerFavorites, setPickerFavorites } from '$lib/api';
   import type { FsCrumb, FsDrive, FsEntry, FsError, LocalPick, PickerFavorite } from '$lib/types';
+  import { formatFileSize } from '$lib/types';
   import { scrollRail } from '$lib/scrollRail';
   import { ctxPlacement } from '$lib/ctxPlacement';
   import Hint from '$lib/components/Hint.svelte';
@@ -213,22 +214,15 @@
     if (r.drive) {
       const kind = r.drive.removable ? '可移动磁盘' : '本地磁盘';
       if (r.drive.total <= 0) return kind;
-      return `${kind} · ${formatSize(r.drive.free)} 可用 / ${formatSize(r.drive.total)}`;
+      return `${kind} · ${formatFileSize(r.drive.free)} 可用 / ${formatFileSize(r.drive.total)}`;
     }
-    return r.isDir ? '文件夹' : `文件 · ${formatSize(r.size)}`;
+    return r.isDir ? '文件夹' : `文件 · ${formatFileSize(r.size)}`;
   }
 
   /** 盘占用条：画"已用"的比例（与原型一致）。 */
   function usedPct(d: FsDrive): number {
     if (d.total <= 0) return 0;
     return Math.max(0, Math.min(100, Math.round((1 - d.free / d.total) * 100)));
-  }
-
-  function formatSize(bytes: number): string {
-    if (bytes <= 0) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
-    return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
   }
 
   // ── 常用位置 ────────────────────────────────────────────────────────────
@@ -554,7 +548,7 @@
               <span class="f-icon">{@html s.isDir ? ICON_FOLDER : ICON_FILE}</span>
               <span class="cart-name">{s.name}</span>
               <span class="cart-from" title={s.from}>{s.fromName}</span>
-              <span class="cart-meta">{s.isDir ? '文件夹' : formatSize(s.size)}</span>
+              <span class="cart-meta">{s.isDir ? '文件夹' : formatFileSize(s.size)}</span>
               <button
                 class="cart-x"
                 onclick={() => removePick(s.path, i)}

@@ -1,9 +1,11 @@
 /**
  * 悬浮球展开布局：纯几何，全部用物理像素。
  *
- * 折叠态窗口就是悬浮球本身，展开态窗口是「面板 + 四周阴影余量」。展开时悬浮球在
- * 屏幕上的位置保持不变，面板朝空间足够的一侧长出；任何情况下展开窗口都在显示器
- * 工作区内夹取，保证框完整可见、不被任务栏/屏幕边缘裁掉。
+ * 参考点只有一个：折叠态**悬浮体（球 / 卡片）的左上角**（不是 OS 窗口的左上角 —— 窗口 =
+ * 悬浮体 + 四周阴影/角标余量，两种形态的余量与尺寸都不同，见 `planExpansion`）。
+ * 展开时这个点在屏幕上的位置保持不变，面板朝空间足够的一侧长出；任何情况下展开窗口都在
+ * 显示器工作区内夹取，保证框完整可见、不被任务栏/屏幕边缘裁掉。收起时按窗口位移把这个点
+ * 平移回去，再由调用方按**当前形态**换算成折叠态窗口左上角。
  */
 
 export type ScreenRect = { x: number; y: number; w: number; h: number };
@@ -20,79 +22,87 @@ export type ExpansionPlan = {
   /** 展开后的窗口矩形（物理像素） */
   window: ScreenRect;
   /**
-   * 悬浮球在展开窗口内的偏移（物理像素；转 CSS 需除以 scaleFactor）。
+   * 悬浮体（球 / 卡片）在展开窗口内的偏移（物理像素；转 CSS 需除以 scaleFactor）。
    * 用绝对偏移而不是「贴角 + inset」：绝对 left/top 不受 CSS 视口尺寸影响，
    * 而贴 right/bottom 会依赖视口宽度/高度 —— WebView2 的视口尺寸比 OS 窗口
-   * 变化滞后 1~2 帧，贴角方案会因此把悬浮球画偏。
+   * 变化滞后 1~2 帧，贴角方案会因此把悬浮体画偏。
    */
   orbOffset: { x: number; y: number };
 };
 
+/**
+ * 展开布局：**以悬浮体的左上角为唯一参考点**，不是以 OS 窗口的矩形。
+ *
+ * 为什么不能拿窗口算：窗口 = 悬浮体 + 四周阴影/角标余量，而两种形态的余量与**尺寸**都不同
+ * （圆球：窗口 90×90、球内缩 14；悬浮框：窗口 236×162、卡片内缩 14/10）。同一个悬浮体位置，
+ * 两种形态的窗口左/右缘差 236 − 90 = 146px —— 拿窗口判方向、算落位，同一个悬浮体位置展开
+ * 出来的面板就是两个地方（切形态再展开，面板会横跳一百多像素）。只看**一个点**则两种形态
+ * 逐像素同解。
+ *
+ * 面板贴着这个点展开：朝右 = `[点, 点 + 面板宽]`、朝左 = `[点 − 面板宽, 点]`；上下同理。
+ * 面板因此会盖住悬浮体自己那一块 —— 展开态悬浮体本来就不画（`main.css` 的
+ * `.orb-stage.open .orb` / `.rq` 都是 `opacity: 0`），盖着看不见。
+ */
 export function planExpansion(input: {
-  /** 悬浮球窗口当前矩形 */
-  ball: ScreenRect;
-  /** 悬浮球所在显示器的工作区（不含任务栏/Dock） */
+  /** 折叠态悬浮体（球 / 卡片）的左上角（屏幕物理像素） */
+  orb: { x: number; y: number };
+  /** 悬浮体所在显示器的工作区（不含任务栏/Dock） */
   work: ScreenRect;
   /** 展开窗口目标尺寸 */
   expanded: { w: number; h: number };
-  /** 折叠态悬浮球在窗口内的内缩 = (窗口边长 - 球直径) / 2 */
-  orbInset: number;
   /** 展开窗口与工作区边缘的最小间距 */
   margin: number;
 }): ExpansionPlan {
-  const { ball, work, expanded, orbInset, margin } = input;
+  const { orb, work, expanded, margin } = input;
 
   // 工作区放不下目标尺寸时先收窗口（面板随之收缩），「完整可见」优先于标称尺寸
   const w = Math.min(expanded.w, Math.max(1, work.w - margin * 2));
   const h = Math.min(expanded.h, Math.max(1, work.h - margin * 2));
 
-  const spaceRight = work.x + work.w - (ball.x + ball.w);
-  const spaceLeft = ball.x - work.x;
-  const spaceDown = work.y + work.h - (ball.y + ball.h);
-  const spaceUp = ball.y - work.y;
+  // 参考点到工作区各边的余量：面板要整个装进其中一边
+  const spaceRight = work.x + work.w - orb.x;
+  const spaceLeft = orb.x - work.x;
+  const spaceDown = work.y + work.h - orb.y;
+  const spaceUp = orb.y - work.y;
 
   // 哪边装得下就朝哪边；两边都不够时朝空间更大的一边
   const openRight = spaceRight >= w ? true : spaceLeft >= w ? false : spaceRight >= spaceLeft;
   const openDown = spaceDown >= h ? true : spaceUp >= h ? false : spaceDown >= spaceUp;
 
   const x = Math.min(
-    Math.max(openRight ? ball.x : ball.x + ball.w - w, work.x + margin),
+    Math.max(openRight ? orb.x : orb.x - w, work.x + margin),
     work.x + work.w - w - margin,
   );
   const y = Math.min(
-    Math.max(openDown ? ball.y : ball.y + ball.h - h, work.y + margin),
+    Math.max(openDown ? orb.y : orb.y - h, work.y + margin),
     work.y + work.h - h - margin,
   );
   const win: ScreenRect = { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) };
 
   return {
     window: win,
-    orbOffset: { x: ball.x - win.x + orbInset, y: ball.y - win.y + orbInset },
+    orbOffset: { x: orb.x - win.x, y: orb.y - win.y },
   };
 }
 
-/**
- * 收起布局：把悬浮球原矩形按窗口的位移整体平移。
+/** 收起布局：把悬浮体的参考点（左上角）按窗口的位移整体平移。
  *
- * 展开态下用户拖动窗口（标题栏拖动）时，悬浮球相对窗口的偏移不变，所以收起后的
- * 窗口 = 悬浮球原位置 + 窗口位移 —— 球仍贴在面板里它原来所在的那一角，而不是跳回
- * 展开前那块屏幕坐标。落位后再交给 `planDock` 判吸附。
+ * 展开态下用户拖动窗口（标题栏拖动）时，悬浮体相对窗口的偏移不变，所以收起后的参考点 =
+ * 展开时的参考点 + 窗口位移 —— 悬浮体仍落在面板里它原来所在的那一角，而不是跳回
+ * 展开前那块屏幕坐标。落位由调用方接着算：按**当前形态**把参考点换算成折叠态窗口左上角
+ * （`App.svelte` 的 `windowFromBody`），再交给 `planDock`（圆球）/ `planRectDock`（悬浮框）判吸附
+ * —— 面板开着时改过形态，也只会挪窗口，悬浮体一动不动。
  */
 export function planCollapse(input: {
-  /** 展开时记下的悬浮球窗口矩形（物理像素） */
-  ball: ScreenRect;
+  /** 展开时记下的悬浮体（球 / 卡片）左上角（屏幕物理像素） */
+  orb: { x: number; y: number };
   /** 展开时记下的展开窗口位置（物理像素） */
   expanded: { x: number; y: number };
   /** 展开窗口当前位置（拖动后与 expanded 不同；物理像素） */
   current: { x: number; y: number };
-}): ScreenRect {
-  const { ball, expanded, current } = input;
-  return {
-    x: ball.x + current.x - expanded.x,
-    y: ball.y + current.y - expanded.y,
-    w: ball.w,
-    h: ball.h,
-  };
+}): { x: number; y: number } {
+  const { orb, expanded, current } = input;
+  return { x: orb.x + current.x - expanded.x, y: orb.y + current.y - expanded.y };
 }
 
 /** 贴边方向：-1 = 贴左/上，1 = 贴右/下，0 = 不贴边 */
@@ -170,7 +180,80 @@ export function planDock(input: {
     window: { x: ax.win, y: ay.win, w: ball.w, h: ball.h },
     dock: { x: ax.d, y: ay.d },
     orb: { x: ax.orb, y: ay.orb },
-    zone: { x: ax.zone, y: ay.zone, w: ax.zoneSize, h: ay.zoneSize },
+    zone: { x: ax.zone, y: ay.zone, w: ax.zoneSize, h: ax.zoneSize },
+  };
+}
+
+/**
+ * 圆角矩形悬浮框的吸附布局：**只贴左右两条边** —— 窗口贴住工作区左/右边，悬浮框横向平移
+ * 出窗口，露在屏幕内的正好是一条**竖条**（宽 = `peek`，里面竖排着图标 / 设备名 / ip:port）。
+ *
+ * 与圆球同一套语义：窗口永远整个留在工作区内（"大半张卡在屏幕外"靠把悬浮框滑到窗口外、
+ * 被窗口裁掉实现），贴边点必须落在工作区边缘上；悬停时悬浮框滑回完整位（`--orb-inset`）。
+ * 只有**观感**不同：卡片不"滑回来"，而是内容交叉淡入淡出（见 `main.css` 的 `.rq-dock`）。
+ *
+ * 竖条钉在悬浮框**贴边那一端**（贴右钉在左端、贴左钉在右端，位置由 `RECT_DOCK_INSET` 定），
+ * 于是露出的那 `peek` 宽正是卡片贴边侧的那一竖条 —— 竖条与它占同一块屏幕区域。
+ *
+ * 竖向不贴（与圆球不同）：卡片是横幅，贴上边露的是列表尾部、贴左边露的是分页点列 ——
+ * 收起态读不出东西的贴边位不如不要；上下两条边按 `margin` 夹进工作区就算了。
+ *
+ * 判吸附按**悬浮框**（卡片 + 右侧点列，也就是窗口围绕的那个盒子）的左右缘算，与圆球按
+ * 球缘算是同一条规则 —— 圆球那一档球就是悬浮框。**不能按卡片算**：贴右边时窗口贴住工作区
+ * 右缘，卡片（在窗口内只占左边 14 + 176）离屏边还有 30 + 16 = 46px，照卡片复判一次就会掉回
+ * 未贴边，而复原只存左上角、靠"同一个矩形再判一次得到同一结果"（`planDock` 里那条）——
+ * 形态会在重启后丢掉。按悬浮框算则贴边后余量正好是 `RECT_SLACK.left` / `.right`（14 / 16，
+ * 都小于 `threshold`），复判幂等。
+ */
+export function planRectDock(input: {
+  /** 自由落位的折叠态窗口矩形（物理像素） */
+  window: ScreenRect;
+  /** 悬浮框所在显示器的工作区（物理像素） */
+  work: ScreenRect;
+  /** 露出的竖条宽度 = 吸附后仍留在屏内的宽度（物理像素） */
+  peek: number;
+  /** 悬浮框（卡片 + 点列）在窗口内的矩形（物理像素） */
+  widget: ScreenRect;
+  /** 卡片本身（不含右侧点列）的宽度（物理像素）：竖条的落位与热区按它算 */
+  cardW: number;
+  /** 吸附阈值：悬浮框边缘距工作区边缘 ≤ 该值即贴边（物理像素） */
+  threshold: number;
+  /** 未贴边时窗口与工作区边缘的最小间距（物理像素） */
+  margin: number;
+}): DockPlan {
+  const { window: win, work, peek, widget, cardW, threshold, margin } = input;
+  // 工作区比窗口还小（极小屏 / 极端 DPI）时 max < min：宁可让窗口朝外溢出一截，
+  // 也别把它推到工作区另一侧去（那样卡片会整张跑到屏幕外，拖都拖不回来）。
+  const clamp = (v: number, min: number, max: number) =>
+    Math.round(max < min ? min : Math.min(Math.max(v, min), max));
+
+  const left = win.x + widget.x;
+  const near = left - work.x <= threshold;                          // 悬浮框左缘离工作区左边够近了
+  const far = work.x + work.w - (left + widget.w) <= threshold;     // 悬浮框右缘离工作区右边够近了
+  const dock: DockAxis = near ? -1 : far ? 1 : 0;
+
+  return {
+    window: {
+      x: dock === -1 ? work.x
+        : dock === 1 ? work.x + work.w - win.w
+        : clamp(win.x, work.x + margin, work.x + work.w - win.w - margin),
+      y: clamp(win.y, work.y + margin, work.y + work.h - win.h - margin),
+      w: win.w,
+      h: win.h,
+    },
+    dock: { x: dock, y: 0 },
+    // 贴边：竖条钉到贴边那一端（贴右 = 窗口最右 `peek`，贴左 = 最左 `peek`）；未贴边：悬浮框原位
+    orb: {
+      x: dock === -1 ? -(cardW - peek) : dock === 1 ? win.w - peek : widget.x,
+      y: widget.y,
+    },
+    // 热区 = 「露出的竖条」∪「悬停后的完整卡片」，两者都在贴边那一侧；未贴边就是悬浮框本身
+    zone: {
+      x: dock === -1 ? 0 : widget.x,
+      y: widget.y,
+      w: dock === -1 ? widget.x + cardW : dock === 1 ? win.w - widget.x : widget.w,
+      h: widget.h,
+    },
   };
 }
 /** 贴边收起时两颗角标各自绕球心的转角（度，正值 = 顺时针）：左 = 黄（通知数）、右 = 绿（长连接设备数） */

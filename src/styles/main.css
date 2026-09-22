@@ -10,6 +10,12 @@
 
   --ok:      oklch(58% 0.16 158);
   --warn:    oklch(62% 0.15 60);
+  /* 「待处理」角标的橙：悬浮球/悬浮框左上那颗通知数与 footer 的铃铛角标都用它。
+     与 `--warn` 分开：`--warn` 是那支琥珀色，给文案/图标用；直接把它压到 22px 的圆点上
+     会发闷（`color-mix(warn 82%, black)` = #975100，看着是棕的）。这一档把明度与饱和度
+     顶到 sRGB 橙的边界（#ba5702），小圆点上才跳得出来，且白字对比 4.7:1 仍过 WCAG AA。
+     刻意不取红：红在这套配色里已经被「关系出问题」占用（见 `--danger`）。 */
+  --notif:   oklch(57% 0.15 50);
   /* 「关系出问题」才用的红：对端点过「断开」（重拨被拒）/ 对端不认本机 token。 */
   --danger:  oklch(58% 0.2 25);
 
@@ -117,7 +123,7 @@ input { font: inherit; }
 /* 悬停：滑回完整可见（未贴边的轴 --orb-x/y 与 --orb-inset 相同，因此原地不动） */
 .orb-zone:hover .orb {
   left: calc(var(--orb-inset, 14px) - var(--zone-x, 14px));
-  top: calc(var(--orb-inset, 14px) - var(--zone-y, 14px));
+  top: calc(var(--orb-inset-y, 14px) - var(--zone-y, 14px));
 }
 /* 悬停加深一档（几何与 --shadow 同量级，球是圆的、可见半径更小，仍落在折叠态余量内） */
 .orb:hover { box-shadow: 0 6px 18px -6px oklch(18% 0.012 250 / 0.30), 0 1px 3px -1px oklch(18% 0.012 250 / 0.14); }
@@ -154,14 +160,14 @@ input { font: inherit; }
   pointer-events: none;
 }
 .orb-badge[hidden] { display: none; }
-/* 左上角的通知数：与右上角的「长连接设备数」对称。黄色 = 有要你处理的事
-   （黄在这套配色里专门表示"要处理"，见 device states 那段注释）。 */
-.orb-badge.notif { left: -4px; right: auto; background: color-mix(in oklch, var(--warn) 82%, black); }
+/* 左上角的通知数：与右上角的「长连接设备数」对称。橙色是"要你看一眼"
+   （橙在这套配色里专门表示"要处理"，见 device states 那段注释；色值见 `--notif`）。 */
+.orb-badge.notif { left: -4px; right: auto; background: var(--notif); }
 /* ─── 贴边收起：两颗角标沿球缘转到「露在屏幕内」的那段弧上 ───
    每个角标挂在自己的臂上（`.orb-arm`，`inset: 0` 铺满球的 padding box）：臂的转心就是球心，
    所以「绕球心转多少度」只写一个数 —— App 按贴边方向算好（`spinForDock`），经 `--spin-l` /
    `--spin-r` 传进来。两个数同号 = 整对一起扫过去（贴左 / 贴右）；一正一负 = 两条臂各自荡开
-   （贴上：黄标留在左侧、绿标留在右侧，各自落到球的下缘）。
+   （贴上：橙标留在左侧、绿标留在右侧，各自落到球的下缘）。
    角标自己反向转同样的角度（`--arm-spin` 从所在那条臂继承下来，转心是角标自己的圆心）——
    角标是正圆，反向转只影响里面的数字，于是数字全程正立，转的只有位置。
    时长/缓动与球的 `left`/`top` 滑动一致，看起来是同一个动作。 */
@@ -172,7 +178,7 @@ input { font: inherit; }
   transform: rotate(var(--arm-spin, 0deg));
   transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
-.orb-arm.notif { --arm-spin: var(--spin-l, 0deg); }   /* 球左上角那颗（黄 = 通知数） */
+.orb-arm.notif { --arm-spin: var(--spin-l, 0deg); }   /* 球左上角那颗（橙 = 通知数） */
 .orb-arm.count { --arm-spin: var(--spin-r, 0deg); }   /* 球右上角那颗（绿 = 长连接设备数） */
 .orb-badge {
   transform: rotate(calc(-1 * var(--arm-spin, 0deg)));
@@ -205,6 +211,451 @@ input { font: inherit; }
   box-shadow: 0 0 0 5px var(--accent-soft), var(--shadow);
   transform: scale(1.07);
 }
+
+/* ─── 圆角矩形悬浮框（收起态的另一档形态）─────────────────────
+   逐值取自 design/orbdrop-rect-orb.html：卡片 176×134、两列列表可视 2.5 行、名字超出时右端
+   渐隐（不用省略号）、右侧分页点列、翻页 400ms 的「抽出 / 被扫过」。只换令牌与定位方式：
+   原型 `:root` 上的 `--rq-*` 挪到这个组件的根上（只有它在用），定位改用 `.orb` 那套
+   `--orb-x/y` − `--zone-*`（窗口内绝对偏移，见 App.svelte）。窗口多大、悬浮框在窗口里的
+   哪一块由 `src/lib/orbShape.ts` 算。 */
+.orb-stage .rq {
+  position: absolute;
+  left: calc(var(--orb-x, 14px) - var(--zone-x, 14px));
+  top: calc(var(--orb-y, 14px) - var(--zone-y, 14px));
+  z-index: 1;
+  display: flex; align-items: stretch; gap: 10px;   /* gap = orbShape.ts 的 RECT_DOTS_GAP */
+  /* left/top 的过渡 = 贴边收起 / 悬停滑回完整位的那次横向平移（与 `.orb` 同一条缓动与时长）。
+     贴边时悬浮框被推到窗口外（窗口贴住工作区边缘，于是它就是被屏幕边裁掉的那一截），
+     悬停时滑回 `--orb-inset`；两处偏移都由 App 经 `--orb-x` / `--zone-*` 给。 */
+  transition: left 0.22s cubic-bezier(0.2, 0.8, 0.2, 1), top 0.22s cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 0.15s ease;
+
+  /* ── 原型 `--rq-*` 令牌 ────────────────────────────────────
+     可视区恰好 2 整行 + 第 3 行露出边边（2.5 行） */
+  --rq-w: 176px;            /* 内容宽（定尺）；组件用 `orbShape.ts` 的 RECT_CARD_W 写回同一个值 */
+  --rq-row-h: 30px;
+  --rq-row-gap: 3px;
+  --rq-col-gap: 2px;
+  --rq-pad: 8px;
+  --rq-head-h: 29px;
+  --rq-gap: 5px;
+  --rq-scroll-pad: 3px;     /* 列表内容上下留白，首/末行的 hover 圆角不贴边被裁 */
+  --rq-viewport-h: calc(2.5 * var(--rq-row-h) + 2 * var(--rq-row-gap) + var(--rq-scroll-pad));
+  --rq-card-h: calc(var(--rq-pad) * 2 + var(--rq-head-h) + var(--rq-gap) + var(--rq-viewport-h));
+  --rq-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --rq-flip: 400ms;
+  --rq-fade: 200ms;
+  /* 右侧分页点轨道的尺寸：高 = 卡片的 1/2（134 / 2 = 67），点在上面垂直居中。
+     不跟卡片等高是刻意的 —— 那是卡片旁边的一枚小指示器，等高就会读成第二张卡。
+     渐隐带 8 = "两端各淡 8px"（实色到 4、淡完在 8）：67 高装得下约 4 格点（点距 17），
+     两端各让 8 之后干净区还有 51px，够当前页 + 上下各一颗邻点都完整可读。 */
+  --rq-track-h: 67px;
+  --rq-track-fade: 8px;
+  /* 角标（宽体圆角矩形）：高度自卡片上沿下探到设备名底部，宽度按卡片宽高比推导（176:134） */
+  --rq-badge-h: 28px;
+  --rq-badge-w: calc(var(--rq-badge-h) * 1.31);
+  --rq-badge-r: 12px;
+  --rq-badge-fs: 13px;
+  /* 贴边收起态那两列的宽度与间距（`.rq-dock`：**图标 + 设备名同一列** / `ip:port` 一列）：
+     竖排一列只占一个行高，所以都是定值 —— 露出宽度 = 1 + 6 + 16 + 4 + 13 + 6 + 1 = 47
+     （`RECT_DOCK_W`），角标的横向落点也从这几个数算（见下面 `.docked-*` 那一段）。
+     三条留白都是**这一档自己的**（不跟卡片共用 `--rq-pad`）：收起态要的是尽量窄的一条。 */
+  --rq-dock-pad: 6px;
+  --rq-dock-gap: 4px;
+  --rq-dock-name-w: 16px;
+  --rq-dock-ip-w: 13px;
+  /* 图标与设备名之间的间距（竖着量）：角标带在卡片内占到 y 23，内容框从 y 9 起，所以这个名字
+     从"图标 14 + 本值"之后开始起排；名字那一列的封顶跟着它走（见 `.rq-dock-name`）。 */
+  --rq-dock-id-gap: 8px;
+  /* 角标里侧那条边落在哪：**ip 列的左缘** —— 这是不压到 ip 的极限（再往右就让角标盖住
+     `ip:port` 的头尾几个字了；ip 是一串不容截断的东西）。于是角标把"图标 + 设备名"这一列
+     整个罩住，露在屏内那一条也几乎只剩它自己探出去的那一点。 */
+  --rq-dock-badge-in: calc(1px + var(--rq-dock-pad) + var(--rq-dock-name-w) + var(--rq-dock-gap));
+}
+/* 展开态隐藏（窗口已放大，悬浮框不再参与交互）；切窗口期间用 `transition: none` 立即生效，
+   免得它带着旧偏移露脸（与 `.orb` 同一条理由）。 */
+.orb-stage.open .rq { opacity: 0; pointer-events: none; }
+.orb-stage.hold .rq { transition: none; opacity: 0; pointer-events: none; }
+
+/* 除右侧分页点外，整张卡就是翻页动画单元：切换设备时新卡淡入飞入并盖住上一张 */
+.rq-stack { position: relative; width: var(--rq-w); height: var(--rq-card-h); }
+.rq-card {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; gap: var(--rq-gap);
+  padding: var(--rq-pad);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  box-shadow: var(--shadow);
+  overflow: hidden; /* 卡片内容裁到圆角；角标在卡片外层的 .rq-stack 上，不受影响 */
+  visibility: hidden; pointer-events: none;
+  opacity: 0;
+  transform: translateY(30%);
+  transform-origin: 50% 100%;
+  transition: transform var(--rq-flip) var(--rq-ease), opacity 150ms var(--rq-ease);
+  will-change: transform, opacity;
+}
+.rq-card.is-active { visibility: visible; pointer-events: auto; opacity: 1; transform: none; z-index: 3; }
+/* 旧卡先原地保持不动、被新卡扫过，最后才淡出——这样才看得见"被盖住" */
+.rq-card.is-leaving-next { visibility: visible; opacity: 0; transform: translateY(-3%) scale(0.98); z-index: 1; transition: transform 260ms var(--rq-ease), opacity 200ms var(--rq-ease) 190ms; }
+.rq-card.is-leaving-prev { visibility: visible; opacity: 0; transform: translateY(3%) scale(0.98); z-index: 1; transition: transform 260ms var(--rq-ease), opacity 200ms var(--rq-ease) 190ms; }
+/* 新卡从牌堆方向被"抽出"：略小、带一点倾斜，抽出到位后铺平盖住旧卡。
+   起点这一档必须 `transition: none`（否则它会自己缓缓飘过来，而不是"被抽出来"）；
+   换成 `is-active` 的那一次样式重算里，after-change 样式带着 400ms 过渡，所以起点仍然
+   从这一格算起 —— 组件里的 `await tick()` + 读一次 `offsetWidth` 就是为了把这一格定死。 */
+.rq-card.from-next { transform: translateY(28%) scale(0.92) rotate(-1.5deg); opacity: 0; transition: none; }
+.rq-card.from-prev { transform: translateY(-28%) scale(0.92) rotate(1.5deg); opacity: 0; transition: none; }
+
+/* 顶部：设备名一行；IP 与可见项数一行 */
+.rq-head { display: grid; gap: 1px; min-height: var(--rq-head-h); padding: 0 2px; }
+/* 设备名左右各让出角标压住的那一段：角标内侧侵占宽度 = 角标宽 − 5px 出格，再留 5px 间距 */
+/* 左上角那一格是**常驻位**：没通知时是项目 logo，有通知时让位给数字。通知角标
+   （`.rq-shellbadge.is-alert`：`top/left: -5px`、28 高 × 1.31 宽、圆角 12）正落在设备名行左边
+   那段让位里 —— 角标一出现就**整个盖住** logo，这是刻意的，不是 bug。
+   所以 logo 只能取 12px 再上提 1px：行盒（实测 y 9–24.2、高 15.2）的中心比角标矩形
+   （y −5–23）低，12px 直接居中的话右下角会切进角标的右下圆弧 0.06px；上提 1px 后四角
+   都落在圆弧内（余量 0.9px），角标下缘一丝都不露（已验证：四角全部在角标轮廓内）。 */
+.rq-headtop { position: relative; display: flex; align-items: center; gap: 6px; min-width: 0; padding: 0 calc(var(--rq-badge-w) - 10px); }
+.rq-logo { position: absolute; left: 0; top: calc(50% - 1px); transform: translateY(-50%); display: flex; pointer-events: none; }
+.rq-devname {
+  flex: 1 1 0; min-width: 0;
+  font-family: var(--font-display); font-size: var(--fs-xs); font-weight: 600;
+  letter-spacing: -0.005em; line-height: 1.2;
+  display: block; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+/* 头部第二行：`ip:port` 在左、**项数贴卡片右内边距**（`space-between`）。`gap: 6px` 是两者的
+   最小间隔 —— IP 长到顶住时先由它自己省略号收尾，项数不让位（它是定宽的几个字，"23 项" 被截成
+   "2…" 比 IP 被截还难读）。定尺之后头部右侧本来就有余量；项数贴的是**头部那行**的右端（头部
+   自己还有 `padding: 0 2px`，所以比列表右端内 2px）。 */
+.rq-headmeta { display: flex; align-items: center; justify-content: space-between; gap: 6px; min-width: 0; }
+.rq-ip {
+  min-width: 0; font-size: 10px; line-height: 1.2; color: var(--muted);
+  display: block; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.rq-count { flex: none; font-size: 10px; line-height: 1.2; color: var(--muted); }
+
+/* 全局角标：固定骑在整张卡的两个上角，不随设备翻页
+   同一家族（宽体圆角矩形、2px 卡片底色描边、等宽数字），左右同为实底+投影。
+   角标含义与配色都跟悬浮球**逐项一致**（左上通知 = 橙 `--notif`，右上设备数 = 绿 `--ok`
+   压暗）：收起态从球换成这张卡时，同一个数还在同一个角、还是同一个颜色，只是外壳从
+   圆球变成卡片。 */
+.rq-shellbadge {
+  position: absolute; top: -5px; z-index: 5;
+  width: var(--rq-badge-w); height: var(--rq-badge-h);
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: var(--rq-badge-r);
+  font-size: var(--rq-badge-fs); font-weight: 700; line-height: 1;
+  border: 2px solid var(--surface);
+  pointer-events: none;
+  /* 贴边收起时，两枚角标要换到竖条的另外两条边上（见下面的 `.docked-*` 那一段）：位置的四样
+     里有两样会变（横向锚点值与纵向的 `top`），所以过渡要把 `left`/`right`/`top` 都带上 ——
+     角标是跟竖条**一起**换过去的，不是闪过去的。时长/缓动与悬浮框的平移一致。 */
+  transition: left 0.22s cubic-bezier(0.2, 0.8, 0.2, 1), right 0.22s cubic-bezier(0.2, 0.8, 0.2, 1),
+    top 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.rq-shellbadge[hidden] { display: none; }
+/* 左上＝待处理通知数（0 时隐藏）：与悬浮球左上那颗同色（`--notif`）＋同阴影 */
+.rq-shellbadge.is-alert {
+  left: -5px; right: auto;
+  background: var(--notif);
+  color: var(--surface);
+  box-shadow: 0 3px 10px -3px oklch(18% 0.012 250 / 0.4);
+}
+/* 右上＝长连接设备数（0 时隐藏）：与悬浮球右上那颗同色（`--ok` 压暗保证白字对比度） */
+.rq-shellbadge.is-devices {
+  right: -5px; left: auto;
+  background: color-mix(in oklch, var(--ok) 72%, black);
+  color: var(--surface);
+  box-shadow: 0 3px 10px -3px oklch(18% 0.012 250 / 0.4);
+}
+/* ─── 贴边收起：两枚角标换到卡片贴边那一侧 ───────────────────────────────
+   与圆球"贴边后把角标转到露在屏幕内那段弧上"是同一条规则：都落到**贴边那一侧的对面**
+   （＝露在屏内、不被屏幕边切的那一侧），次序不变 ——
+   贴右 → 左上是长连接设备数、左下是待处理通知数；贴左 → 右上是通知数、右下是设备数。
+   （圆球贴右：黄 225°→135°＝7:30 左下、绿 315°→225°＝10:30 左上；贴左：黄→315°＝1:30 右上、
+   绿→45°＝4:30 右下 —— 与这两条逐项对应。）
+   **横向**：角标里侧那条边落在 **ip 列的左缘**（贴左镜像）—— 这是不压到 ip 的极限，
+   于是角标把"图标 + 设备名"这一列整个罩住（图标顶在角标带里、名字靠封顶 86 让开）。
+   横向一律用**同一个锚**（黄只动 `left`、绿只动 `right`，值都是数）：悬停滑回卡片上角时
+   锚点不换，四样位置才能插值 —— 有一头是 `auto` 就只能"跳"过去。 */
+.orb-stage.docked-right .rq-shellbadge.is-alert {
+  left: calc(var(--rq-dock-badge-in) - var(--rq-badge-w)); right: auto;
+  top: calc(var(--rq-card-h) - var(--rq-badge-h) + 5px);
+}
+.orb-stage.docked-right .rq-shellbadge.is-devices {
+  right: calc(var(--rq-w) - var(--rq-dock-badge-in)); left: auto;
+  top: -5px;
+}
+.orb-stage.docked-left .rq-shellbadge.is-alert {
+  left: calc(var(--rq-w) - var(--rq-dock-badge-in)); right: auto;
+  top: -5px;
+}
+.orb-stage.docked-left .rq-shellbadge.is-devices {
+  right: calc(var(--rq-dock-badge-in) - var(--rq-badge-w)); left: auto;
+  top: calc(var(--rq-card-h) - var(--rq-badge-h) + 5px);
+}
+/* 悬停滑回完整卡片：两枚都回到卡片上角（贴边那一档的角位只属于贴边那一档）。 */
+.orb-stage.docked-right .orb-zone.reveal .rq-shellbadge.is-alert,
+.orb-stage.docked-left .orb-zone.reveal .rq-shellbadge.is-alert { left: -5px; right: auto; top: -5px; }
+.orb-stage.docked-right .orb-zone.reveal .rq-shellbadge.is-devices,
+.orb-stage.docked-left .orb-zone.reveal .rq-shellbadge.is-devices { left: auto; right: -5px; top: -5px; }
+/* 计数是全局值，不随翻页改变；翻页时做一次轻微"呼吸"，让这两枚固定角标与翻页动作产生关联 */
+.rq-shellbadge.is-ticking { animation: rq-badge-tick 280ms var(--rq-ease); }
+@keyframes rq-badge-tick {
+  0%   { transform: scale(1); }
+  30%  { transform: scale(1.12); }
+  60%  { transform: scale(0.98); }
+  100% { transform: scale(1); }
+}
+
+/* ─── 贴边收起：卡片滑出屏幕，被屏幕边裁掉 ──────────────────────────────
+   机制与圆球逐条一致（`orbLayout.planRectDock`）：窗口贴住工作区左/右边、悬浮框横向平移出窗口
+   被裁掉 —— **卡片整张在屏幕外，只留靠边那一条**；吸附阈值 / 拖动期间的"等松手" / 幂等复原
+   也全是同一套。
+   **动画就是卡片自己平移**：没有第二条"竖条"淡入淡出 —— 露在屏内的是卡片本体，所以那一侧的
+   两个角是卡片自己的圆角（左上左下），另一侧是屏幕边切出来的直角（右上右下）。
+   屏内那一条里画的是 `.rq-dock`（在卡片**里面**，见 RectOrb.svelte）：**两列** ——
+   图标 + 设备名同一列（图标在这一列顶端）/ `ip:port` 一列，都竖排
+   （`writing-mode: vertical-rl` + `text-orientation: sideways`：**所有字形一起转 90°**，
+   汉字也转，两列朝向一致）。横向锚在卡片贴边那一端（贴右排起于左，贴左 `row-reverse` 镜像）；
+   贴左时两列文字再转 180° —— 于是"右侧隐藏顺时针、左侧隐藏逆时针"，图标不转。
+   露出的宽度 = 1 + 6 + 16 + 4 + 13 + 6 + 1 = **47**（`orbShape.RECT_DOCK_W` 同一个数）。 */
+/* 卡片里的头与列表在贴边时让位给那两列（两边交叉淡入淡出 = "信息渐隐渐显"；
+   卡片的位移是另一半，见 `.rq` 的 left/top 过渡）。 */
+.rq-head, .rq-viewport { transition: opacity var(--rq-fade) ease; }
+.orb-stage.docked .rq-head,
+.orb-stage.docked .rq-viewport { opacity: 0; }
+.orb-stage.docked .orb-zone.reveal .rq-head,
+.orb-stage.docked .orb-zone.reveal .rq-viewport { opacity: 1; }
+.rq-dock {
+  position: absolute; inset: 0;
+  z-index: 2;                  /* 盖住让位中的头与列表 */
+  display: flex; align-items: center; justify-content: flex-start;
+  gap: var(--rq-dock-gap);
+  padding: var(--rq-dock-pad);   /* 这一档自己的留白（不跟卡片共用 `--rq-pad`）：越窄越好 */
+  opacity: 0;
+  pointer-events: none;        /* 它是**读数**不是控件：悬停那一层是 `.orb-zone` */
+  transition: opacity var(--rq-fade) ease;
+}
+.orb-stage.docked .rq-dock { opacity: 1; }
+.orb-stage.docked .orb-zone.reveal .rq-dock { opacity: 0; }
+/* 贴左：整块镜像 —— 图标落到右上角、两列从右端起（与"卡片向左滑出、露出右半边"配套）。
+   注意 `row-reverse` 下轴是反的：`flex-start` 才是右端（写成 `flex-end` 会把它甩到屏幕外）。 */
+.orb-stage.docked-left .rq-dock { flex-direction: row-reverse; }
+/* 竖排一列只占一个行高 —— 宽度写死，字库换了也不会把露出宽度撑开；高度才随内容变。
+   `text-orientation: sideways` 是关键：`vertical-rl` 默认（`mixed`）只把拉丁字母转 90°，
+   汉字照旧正立 —— 名字（常是汉字）与 ip 看起来就是两种朝向。改成 sideways 之后**所有字形
+   一起转**，两列朝向一致（贴左再 `rotate(180deg)`，见下面）。 */
+.rq-dock-name, .rq-dock-ip { writing-mode: vertical-rl; text-orientation: sideways; }
+/* 第一列 = 图标 + 设备名：图标在这一列**顶端**（贴边那一侧的角上，正好落在角标带里被盖住），
+   名字在它下面 `--rq-dock-id-gap` 处起排。整列在行里**顶对齐**（`align-self: flex-start`）：
+   图标那一头必须贴到内容框顶端，才落在角标带里 —— 居中会让它露出来半截。
+   名字那一列**封顶 = 88 − 间距**：卡片的 y 23 是上面那条角标带的下沿、y 111 是下面那条的上沿，
+   内容框从 y 9 起 → 名字最多排到 111，而它从"9 + 图标 14 + 间距"起排，
+   所以上限 = 111 − 23 − 间距 = 88 − 间距（写成算式，改间距时不用再手算一遍）。 */
+.rq-dock-id {
+  display: flex; flex-direction: column; align-items: center;
+  align-self: flex-start;
+  width: var(--rq-dock-name-w);
+  gap: var(--rq-dock-id-gap);
+}
+.rq-dock-ic { display: flex; flex: none; }
+.rq-dock-name {
+  width: var(--rq-dock-name-w); max-height: calc(88px - var(--rq-dock-id-gap));
+  font-family: var(--font-display); font-size: var(--fs-xs); font-weight: 600;
+  letter-spacing: -0.005em;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.rq-dock-ip {
+  flex: none;
+  width: var(--rq-dock-ip-w); max-height: calc(var(--rq-card-h) - 2px);
+  font-size: 10px; color: var(--muted);
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+/* 贴左：两列文字转 180°（`vertical-rl` 本身是顺时针，转过来就是逆时针、从下往上读）。
+   图标不跟着转 —— 它是标记，不是字。 */
+.orb-stage.docked-left .rq-dock-name,
+.orb-stage.docked-left .rq-dock-ip { transform: rotate(180deg); }
+/* 悬停：滑回完整位。与圆球是同一条规则（`--orb-inset` 就是悬浮框在窗口内的原位）——
+   贴边时它把悬浮框从窗口外拉回来，卡片这才整个落在屏内；点列那 30px 与右侧余量留在卡片右边，
+   所以贴右滑回之后卡片并不贴着屏幕边（这正是点列的位置）。
+   走 `.reveal` 而不是 `:hover`：落位那一刻指针本来就压在上面，照 `:hover` 显示的话
+   "贴到边上"这一步看不到结果（见 `App.setDockOrb` 的 `zoneHold`）。
+   两轴各用各的内缩（`--orb-inset` / `--orb-inset-y`）：圆角矩形悬浮框上下是 10、左右是 14，
+   拿左右那个值去算 `top` 会让它悬停时往下跳 4px。未贴边时两者与 `--orb-x/y` 相等，是空操作。 */
+.orb-zone.reveal .rq {
+  left: calc(var(--orb-inset, 14px) - var(--zone-x, 14px));
+  top: calc(var(--orb-inset-y, 14px) - var(--zone-y, 14px));
+}
+/* 收起态：卡片**不再整张淡出**（露在屏内那一条就是卡片本体），只把头与列表让位给那两列；
+   但收起态它不吃指针（读数不是控件），悬停滑回来才恢复可点。 */
+.orb-stage.docked .rq-card { pointer-events: none; }
+.orb-stage.docked .orb-zone.reveal .rq-card.is-active { pointer-events: auto; }
+
+/* 拖入（Explorer → 悬浮框）：沿用球的拖入语言（`.orb-stage.drag`），整卡描一圈主色。
+   落下 = 登记为本机共享项（F-20），与拖到球上是同一条路。 */
+.orb-stage.drag .rq-card.is-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 5px var(--accent-soft), var(--shadow);
+}
+
+/* 中部：两列目录 / 文件，可视 2.5 行 */
+.rq-viewport { position: relative; height: var(--rq-viewport-h); overflow: hidden; }
+/* 不加底部渐隐遮罩：它会盖住最后一行 hover 的圆角；"还能滚动"的提示由露出边边的第 3 行承担 */
+.rq-scroll {
+  position: absolute; inset: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+  padding: var(--rq-scroll-pad) 0;
+}
+.rq-scroll::-webkit-scrollbar { display: none; }
+
+.rq-grid {
+  list-style: none; margin: 0; padding: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--rq-row-gap) var(--rq-col-gap);
+  align-content: start;
+}
+.rq-item {
+  min-width: 0;
+  height: var(--rq-row-h);
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 4px;
+  padding: 1px 2px;
+  border-radius: 5px;
+  transition: background var(--rq-fade) ease;
+}
+@media (hover: hover) { .rq-item:hover { background: color-mix(in oklch, var(--fg) 5%, transparent); } }
+.rq-ic { flex: none; color: var(--muted); }
+.rq-ic svg { width: 12px; height: 12px; }
+.rq-item.is-folder .rq-ic { color: var(--warn); }
+.rq-itxt { display: grid; gap: 1px; min-width: 0; }
+/* 名字这一格必须自己裁：原型靠 `od-truncate`（`overflow: hidden; white-space: nowrap;
+   max-width: 100%`）把超出的字裁掉，再由下面那条 mask 在右端渐隐。少了裁切，溢出的字会
+   直接压到第二列上（mask 只盖住元素自己的盒子，管不到溢出的部分）。 */
+.rq-iname {
+  display: block; font-family: var(--font-display);
+  font-size: var(--fs-xxs); font-weight: 500; letter-spacing: -0.005em;
+  line-height: 1.2; min-width: 0;
+  max-width: 100%; overflow: hidden; white-space: nowrap;
+  text-overflow: clip;
+}
+/* 文字超出时不加省略号，改用右端渐隐：既看得到后续文字，又和第二列自然分隔 */
+.rq-iname.is-clipped {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 12px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 12px), transparent);
+}
+.rq-imeta { display: block; font-family: var(--font-mono); font-size: 10px; line-height: 1.2; color: var(--muted); white-space: nowrap; }
+/* 「↰ 上一级」那格：与内容格同形、同高度，但它是**动作**不是条目 —— 双击回上一层（单击无效果）。
+   图标是朝上的箭头（靠形状与文件夹/文件分开，不再往卡上添第四支彩色），名字是父目录的名字。 */
+.rq-item.is-up .rq-ic { color: var(--fg); }
+/* 空目录里那格说明文字：不是条目，不吃指针、不参与 hover（`.rq-item:hover` 会给它上底色）。 */
+.rq-item.is-void { color: var(--muted); pointer-events: none; }
+@media (hover: hover) { .rq-item.is-void:hover { background: none; } }
+/* 头部第二行的路径：等宽小字（同 `.rq-ip`），只是内容长这样 —— 显示串在 App 里裁过
+   （从头上砍，尾巴才是"我在哪"），这里只当兜底。 */
+.rq-ip.is-path { color: var(--muted); }
+
+.rq-empty {
+  height: 100%;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+  padding: 6px; text-align: center; color: var(--muted);
+}
+.rq-empty svg { width: 16px; height: 16px; opacity: 0.5; }
+.rq-empty p { margin: 0; font-size: 11px; line-height: 1.4; }
+.rq-empty .rq-empty-sub { font-size: 10px; max-width: 100px; line-height: 1.35; }
+
+/* 卡片外部右侧：分页点列的**轨道** —— 承载分页点的那条竖胶囊（上下半圆、与卡片同料同阴影）
+   为什么要有它：这一列是全应用**唯一没有自己底衬**的东西，它贴在卡片右边、直接画在桌面上
+   （实测 `.rq-dots` / `.rq-dotlist` 的 background 都是 transparent）。于是深灰点落在深色
+   壁纸上等于没有（`--fg` 26% 压到黑底上是 #040506，对比 1.05:1），主色蓝落在黑壁纸上就是
+   一颗发光的蓝点。补上轨道后点永远落在 `--surface` 上，任何壁纸下都等同于"白底那一档"。
+   形状：`--surface` + 同描边 + 同 `--shadow`，宽 = 列宽 20，高见 `--rq-track-h`（= 卡片的
+   1/2，垂直居中）—— 它是卡片旁边的一枚小指示器，不跟卡片等高，免得抢成第二张卡；
+   `align-self: center` 让它不再被 flex 的 stretch 拉满卡片高。
+   尺寸的账：轨道右缘实测可见半径 13~14px（比卡片多，因为它窄），而这 30px 的"间距 + 点列"区
+   已经吃不下它 —— `orbShape.ts` 的 `RECT_SLACK.right` 因此 6 → 16，窗口 236×162。这 30px
+   与那笔余量**常占**（收起态定尺）：只有一页时点列一颗都不画，但列宽照旧留着，窗口不缩。
+   底部不动：轨道下缘的阴影落到卡片下沿**以上** ~30px，比卡片自己的 17px 近，占主导的仍是
+   卡片那一笔。少一像素，阴影会被窗口边硬裁成一条切线。
+   ── 静止不显示，hover 才淡入 ──────────────────────────────
+   悬浮框是桌面上的常驻物，而这枚胶囊是**第二件有实体、有阴影的东西**；点表达的信息（"你在
+   第几页 / 还能翻"）是次要且瞬时的，而"一共几台设备"右上角的绿角标已经常显了 —— 不值得它
+   在静止时也占一块实体。hover 显隐是桌面端的常规语汇（滚动条、窗口控件、缩放手柄都是这套）。
+   两个必须写对的点：
+   1. 隐藏时必须 `pointer-events: none` —— 否则点在没有东西的透明窗口上会把页码点跳了；
+   2. 触发面是**整个 `.rq`**（卡片 + 10px 间距 + 点列那 30px），不是只有卡片 —— 指针从卡片
+      移到点上时不能把它闪没了。键盘用户靠 `:focus-within`（点本身是 button）。 */
+.rq-dots {
+  position: relative;
+  width: 20px;                 /* = orbShape.ts 的 RECT_DOTS_W */
+  align-self: center;          /* 不撑满卡片高：轨道比卡片矮得多 */
+  height: var(--rq-track-h);
+  overflow: hidden;            /* 点多了裁在胶囊里，靠下面那条渐隐收口 */
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: var(--shadow);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--rq-fade) ease;
+}
+/* hover 进来、或**键盘焦点**进来才显示。焦点只认 `:focus-visible`：鼠标在 button 上按下时
+   Chromium 会给它焦点，用普通的 `:focus-within` 会让胶囊在"点过一次分页点"之后永远挂着
+   （focus 不会自己跑掉）。`:has()` 在这里是安全的 —— 本表已经在用 `color-mix(in oklch, …)`
+   （Chromium 111+），而 `:has()` 从 105 起就有。 */
+.rq:hover .rq-dots,
+.rq-dots:has(.rq-dot:focus-visible) { opacity: 1; pointer-events: auto; }
+/* 两端渐隐 —— 注意**渐隐的是点，不是胶囊**：胶囊本体是不透明白 + 描边 + 阴影，它不能淡
+   （淡了就不再是"与卡片同料"的那一枚，阴影也会跟着断掉）。这条覆盖层只是在本该实色的地方
+   用 `--surface` 把点盖住、再往中间淡出，所以柔化的只有靠近端头的点。
+   为什么必须柔化：超出胶囊的点由 `overflow: hidden` 裁掉，不柔化就会在端头留下一颗被切掉
+   半边的圆点 —— 白胶囊上那读起来像渲染坏了，而不像"后面还有页"。渐变带按 `--rq-track-fade`
+   走（实色到一半、淡完在一整条处）：写死老那条 12/20 的话，干净区就不剩几个像素了。 */
+.rq-dots::after {
+  content: "";
+  position: absolute; inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(to bottom,
+    var(--surface) 0, var(--surface) calc(var(--rq-track-fade) / 2),
+    transparent var(--rq-track-fade), transparent calc(100% - var(--rq-track-fade)),
+    var(--surface) calc(100% - var(--rq-track-fade) / 2), var(--surface) 100%);
+  pointer-events: none;        /* 点还得能点：分页点单击 = 跳页 */
+}
+.rq-dotlist {
+  position: absolute; left: 50%; top: 50%;
+  transform: translate(-50%, -50%) translateY(var(--rq-dot-shift, 0px));
+  display: flex; flex-direction: column; align-items: center; gap: 1px;
+  transition: transform var(--rq-flip) var(--rq-ease);
+}
+.rq-dot {
+  position: relative;
+  width: 18px; height: 16px;
+  color: color-mix(in oklch, var(--fg) 26%, transparent);
+  transition: opacity var(--rq-fade) ease, color var(--rq-fade) ease;
+}
+.rq-dot::after {
+  content: "";
+  position: absolute; left: 50%; top: 50%;
+  width: 6px; height: 6px; margin: -3px 0 0 -3px;
+  border-radius: 999px;
+  background: currentColor;
+  transition: transform var(--rq-fade) var(--rq-ease), box-shadow var(--rq-fade) ease;
+}
+@media (hover: hover) { .rq-dot:hover { color: color-mix(in oklch, var(--fg) 60%, transparent); } }
+/* 当前页：**不带色相**，靠"更大 + 更深"区分（1.5× 实心 `--fg` 对 26% 灰）。
+   这张 176×134 的卡上已经有黄（文件夹）、橙（通知角标）、绿（设备角标）三支彩色，
+   再加一支主色蓝就是四种色相，小卡片会散；蓝也是卡上唯一的冷色，本来就不属于这里。
+   原来那圈 `--accent-soft` 光晕一并去掉：深色实心与尺寸已经说清了"你在这一页"，少一圈少一层噪。 */
+.rq-dot.is-current { color: var(--fg); }
+.rq-dot.is-current::after { transform: scale(1.5); }
+
+/* 翻页结果的朗读文本（视觉上不存在，见 RectOrb.svelte 的 aria-live）。 */
+.rq-sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 
 /* ─── main panel ────────────────────────────────────────────── */
 /* 只做 opacity 过渡、不做 transform：面板带 1px 边框，动画期间若被提升为
@@ -298,14 +749,14 @@ input { font: inherit; }
 .icon-btn:hover { background: var(--fg-soft); color: var(--fg); }
 .icon-btn svg { width: 16px; height: 16px; }
 /* 通知铃铛：展开/收起右下角那组通知气泡。角标 = 未处理的通知数（含在途），
-   与悬浮球左上角那个黄标是同一个数 —— 收起 ≠ 已读，角标照旧挂着。 */
+   与悬浮球左上角那个橙标是同一个数 —— 收起 ≠ 已读，角标照旧挂着，颜色也跟着它（`--notif`）。 */
 .icon-btn.bell { position: relative; }
 .icon-btn.bell.active { background: var(--accent-soft); color: var(--accent); }
 .icon-btn.bell .bell-badge {
   position: absolute; top: -4px; right: -4px;
   min-width: 16px; height: 16px; padding: 0 4px;
   border-radius: 999px;
-  background: color-mix(in oklch, var(--warn) 82%, black);
+  background: var(--notif);
   color: var(--surface);
   display: flex; align-items: center; justify-content: center;
   font-size: 10px; font-weight: 700; line-height: 1;
@@ -614,7 +1065,7 @@ input { font: inherit; }
   border-top: 1px solid var(--border);
   font-size: var(--fs-xs); color: var(--muted);
 }
-/* 左半边：端口 + 本机内网 IP（IP 点一下复制「IP:端口」——手动添加设备要用；
+/* 左半边：本机内网「IP:端口」（点一下复制整串——手动添加设备要用；
    多网卡时这里只显示首选那个，悬停列出全部）。 */
 .foot-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .foot-addr { padding: 1px 6px; border-radius: 999px; border: 1px solid transparent; color: var(--muted); font-size: var(--fs-xs); }
@@ -778,6 +1229,63 @@ input { font: inherit; }
 .radio:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
 .radio .r-label { flex: 1; }
 .radio .r-sub { font-size: var(--fs-xs); color: var(--muted); display: block; cursor: default; }
+
+/* ─── 设置里的「悬浮形态」缩略图 ────────────────────────────────
+   两个选项就是**两张图**（没有文字）：里面是真组件（`Orb` / `RectOrb`）+ 骨架数据
+   （见 SettingsPanel.svelte 的 `PREVIEW_PAGES`），所以形状、圆角、角标、分页点、字级
+   都与收起态的实物一致 —— 不另画一套"示意图"，就不会和实物跑偏。
+   外面套一层缩放框：`--w`/`--h` 是含角标出格（-5px）在内的视觉外框，`--s` 是缩放比；
+   `.so-scale` 再把组件原点往里推 5px × `--s`（角标出格那一截正好落在框的左/上边缘，
+   右下角也刚好收进框里）。
+   整块 `inert`（在模板上），缩略图既不吃指针、也不进 Tab 序。 */
+.shape-picker { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap-sm); }
+.shape-opt {
+  position: relative;
+  display: grid; justify-items: center;
+  padding: 12px 10px;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.shape-opt:hover { background: var(--fg-soft); }
+.shape-opt:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+/* 输入框盖满整格：点哪儿都算选中，聚焦环也正好落在这一格上（视觉状态交给 :has） */
+.shape-opt input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.so-frame { position: relative; display: block; width: calc(var(--w) * var(--s)); height: calc(var(--h) * var(--s)); overflow: hidden; }
+.so-scale { position: absolute; left: calc(5px * var(--s)); top: calc(5px * var(--s)); transform: scale(var(--s)); transform-origin: 0 0; }
+/* 缩略图里剥掉两样东西：
+   ① 收起态/切窗口那几条隐藏规则（设置面板本来就是面板开着时看的，`.orb-stage.open` 正命中）——
+      写成三层选择器（0,3,0）与 `.orb-stage.open .orb` 同权重，靠写在后面取胜；
+   ② 投影（`--shadow`）——在缩略图里它要占掉四周 12/7/17px 的余量才不被框裁出硬边，
+      而缩略图是示意图：留边框、去投影，框才能贴着实物往外框。 */
+.shape-picker .so-scale .orb,
+.shape-picker .so-scale .rq { opacity: 1; transform: none; pointer-events: none; }
+.shape-picker .so-scale .orb,
+.shape-picker .so-scale .rq-card,
+.shape-picker .so-scale .rq-shellbadge { box-shadow: none; }
+.shape-picker .so-scale .orb .pulse { display: none; }
+/* 骨架：数据侧给的是空串，卡片上"有字的地方"在这里画成灰条 —— 名/址/元信息各占一条，
+   宽度错开一点（同宽会像一堵砖墙），图标（文件夹 / 文件）保留：一眼能看出这一格是什么。
+   `.rq-devname` 是 flex 项且 `flex: 1 1 0`，不改成 `flex: none` 的话宽度会被拉满整行。 */
+.shape-picker .so-scale .rq-devname,
+.shape-picker .so-scale .rq-ip,
+.shape-picker .so-scale .rq-count,
+.shape-picker .so-scale .rq-iname,
+.shape-picker .so-scale .rq-imeta {
+  background: color-mix(in oklch, var(--fg) 11%, transparent);
+  border-radius: 3px;
+}
+.shape-picker .so-scale .rq-devname { flex: none; width: 52px; height: 8px; }
+.shape-picker .so-scale .rq-ip { width: 62px; height: 6px; }
+.shape-picker .so-scale .rq-count { width: 18px; height: 6px; }
+.shape-picker .so-scale .rq-iname { width: 46px; height: 7px; }
+.shape-picker .so-scale .rq-item:nth-child(2n) .rq-iname { width: 38px; }
+.shape-picker .so-scale .rq-item:nth-child(3n) .rq-iname { width: 42px; }
+.shape-picker .so-scale .rq-imeta { width: 24px; height: 5px; background: color-mix(in oklch, var(--fg) 7%, transparent); }
+/* 项数与角标数字是组件自己生成的文字：`font-size: 0` 只隐数字、形状（胶囊/圆）原样保留 */
+.shape-picker .so-scale .rq-count,
+.shape-picker .so-scale .rq-shellbadge,
+.shape-picker .so-scale .orb-badge { font-size: 0; }
 .sheet-foot { display: flex; justify-content: flex-end; gap: var(--gap-sm); padding: 12px 16px; border-top: 1px solid var(--border); }
 
 /* ─── hint（圆圈 ? + 悬停说明）──────────────────────────────── */
@@ -984,5 +1492,5 @@ input { font: inherit; }
 .dialog .pair-invite { margin: 0 0 14px; }
 .dialog .pair-invite + .d-target { margin-top: 0; }
 @media (prefers-reduced-motion: reduce) {
-  .orb-stage, .panel, .orb, .orb-arm, .orb-badge, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin { transition: none !important; animation: none !important; }
+  .orb-stage, .panel, .orb, .orb-arm, .orb-badge, .rq, .rq-card, .rq-dock, .rq-dots, .rq-dotlist, .rq-dot, .rq-shellbadge, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin { transition: none !important; animation: none !important; }
 }

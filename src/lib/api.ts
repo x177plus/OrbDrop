@@ -30,7 +30,7 @@ export function getSettings(): Promise<AppSettings> {
   return invoke('get_settings');
 }
 
-export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; downloadMode: string; deviceName: string; autoStart: boolean; bcExePath: string }): Promise<AppSettings> {
+export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; downloadMode: string; deviceName: string; autoStart: boolean; bcExePath: string; autoBroadcastNew: boolean }): Promise<AppSettings> {
   return invoke('update_settings', { req: s });
 }
 
@@ -40,7 +40,7 @@ export function getActualPort(): Promise<number> {
 }
 
 /**
- * 本机内网 IPv4 地址（左下角「端口 · IP」用）。`primary` 是界面显示的那一个，
+ * 本机内网 IPv4 地址（左下角「IP:端口」用）。`primary` 是界面显示的那一个，
  * `all` 含其余几块网卡的地址 —— 多网卡时悬停提示要把它列全。
  */
 export function localAddresses(): Promise<{ primary: string | null; all: string[] }> {

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use axum::extract::{Extension, Query, State};
 use axum::response::Json;
+use orbdrop_lib::add_share_impl;
 use orbdrop_lib::config::{Config, ShareItem};
 use orbdrop_lib::credential;
 use orbdrop_lib::server::{file_handler, shares_handler, tree_handler, Caller};
@@ -244,4 +245,50 @@ fn local_lan_ip() -> Option<std::net::IpAddr> {
     } else {
         Some(ip)
     }
+}
+
+/// 「添加后自动共享」（设置里的开关，**默认关**）：新登记的共享项**初值跟着设置走** ——
+/// 开着时对端在长连接上当场看得见，关着（默认）时新加的默认不共享；而**已经在列表里的那条
+/// 永不被翻动**（走早返回，开关始终是用户在界面上设的那个）。
+#[tokio::test]
+async fn new_share_inherits_auto_broadcast_setting() {
+    let root = temp_share_dir(); // 目录里那条共享项还没登记，留给测试自己加
+    let mut config = Config::default();
+    config.bc_exe_path = Some(hermetic_bc_exe());
+    let config_path =
+        std::env::temp_dir().join(format!("orbdrop_vis_cfg_{}.toml", uuid::Uuid::new_v4()));
+    let state = Arc::new(AppState::new(config, config_path));
+    // `peer-a` 的长连接：**接收端要活到测试结束** —— 登记共享项会通知在线的对端，
+    // 通道那头一断，发送失败就会把这条连接摘掉（判可见性时 `has_connection` 就成假了）。
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    state.ws.register("peer-a", tx);
+    assert!(
+        !state.config.lock().auto_broadcast_new,
+        "默认关：`Config::default` 与老配置（没有这一项）都是关"
+    );
+
+    // 默认关 → 新加的目录不共享，对端看不到
+    let added = root.join("added");
+    std::fs::create_dir_all(&added).unwrap();
+    let dto = add_share_impl(&state, added.to_string_lossy().to_string()).await.unwrap();
+    assert!(!dto.broadcast_enabled, "默认关：新登记的共享项就是不开播状态");
+    assert!(shares_seen_by(&state, peer_a()).await.is_empty(), "默认关：对端看不到新加的那条");
+
+    // 打开设置 → 新加的当场开播；早先那条**不受影响**
+    state.config.lock().auto_broadcast_new = true;
+    let added2 = root.join("added2");
+    std::fs::create_dir_all(&added2).unwrap();
+    let dto2 = add_share_impl(&state, added2.to_string_lossy().to_string()).await.unwrap();
+    assert!(dto2.broadcast_enabled, "打开之后新加的自动开播");
+    let seen = shares_seen_by(&state, peer_a()).await;
+    assert_eq!(seen.len(), 1, "对端当场看得见新加的那条；设置改动不回头动已经加好的");
+    assert_eq!(seen[0]["id"], dto2.id.as_str());
+
+    // 同一条路径再登记一次：回来的还是库里那条，手动关掉的开关不被设置翻回来
+    state.config.lock().auto_broadcast_new = false;
+    let again = add_share_impl(&state, added2.to_string_lossy().to_string()).await.unwrap();
+    assert_eq!(again.id, dto2.id, "同一条路径不新增");
+    assert!(again.broadcast_enabled, "已登记项的开关不被设置改动翻动");
+
+    let _ = std::fs::remove_dir_all(root);
 }

@@ -56,8 +56,14 @@
   }
 
   /** 起拖：锚点校正与「交给 OS」都在后端一次做完（见 `App.beginOrbDrag`） */
-  function startWindowDrag() {
+  function startWindowDrag(pointerId: number) {
     started = true;
+    /* 交给 OS 之前**必须放掉指针捕获**。`start_dragging` 之后页面再也收不到 pointerup
+       （见文件头那段），捕获就没法在 `handlePointerUp` 里释放了 —— 而**留着的捕获 = 留着的
+       hover**：Chromium 把捕获目标当作"指针正悬停在它上面"，于是 `.orb-zone:hover .orb` /
+       `.orb:hover` 不再随指针离开而消失（贴边收起的球会一直停在滑出位）。捕获的用处只在
+       阈值判定之前（那时任务已经完成），移交之后一点用都没有。 */
+    if (orbEl?.hasPointerCapture(pointerId)) orbEl.releasePointerCapture(pointerId);
     onDragStart({ pressX: downX, pressY: downY });
   }
 
@@ -80,7 +86,7 @@
       moved = true;   // 到此为止这一按已经算拖动，松手不再当单击
     }
     if (isSliding()) return;   // 球还在滑：这一帧先不起拖，滑动结束后的下一次移动补上
-    startWindowDrag();
+    startWindowDrag(e.pointerId);
   }
 
   function handlePointerUp(e: OrbPointerEvent) {

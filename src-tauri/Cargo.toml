@@ -72,6 +72,8 @@ windows = { version = "0.61", features = [
     # 「本地磁盘 / 可移动磁盘」，光有 Win32_Storage_FileSystem 里的 GetDriveTypeW 拿不到名字。
     "Win32_System_WindowsProgramming",
     "Win32_System_SystemServices",
+    # 拖放诊断要认"光标下那个窗口属于哪个进程"：OpenProcess + QueryFullProcessImageNameW。
+    "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",

@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info};
 
-use crate::state::AppState;
+use crate::state::{AppState, LinkIntent};
 use crate::ws;
 
 mod auth;
@@ -205,6 +205,9 @@ async fn events_ws_handler(
         if manual {
             info!(%peer_id, "peer asked to connect, clearing local pause");
             state.ws.resume(&peer_id);
+            // 暂停的那一份也要从地址簿里清掉：只清内存的话，本机下次启动又会拒绝它
+            // （对端那边已经按了「连接」，双方却对同一件事有两种记忆）。
+            state.set_link_intent(&peer_id, LinkIntent::Wanted);
         } else {
             info!(%peer_id, "link refused: locally paused (断开)");
             return (StatusCode::FORBIDDEN, "Paused").into_response();
@@ -432,6 +435,10 @@ mod tests {
         let items = json["shares"].as_array().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["isDir"], true);
+        // 卡片副标题那两个数：目录给**直接**子项数（fixture 是 `hello.txt` + `sub` 两项 ——
+        // 递归数会得到 3，这个断言就是为了挡住"顺手递归"），大小则不给（那要遍历整棵树）。
+        assert_eq!(items[0]["itemCount"], 2);
+        assert_eq!(items[0]["size"], serde_json::Value::Null);
         assert!(
             items[0].get("path").is_none(),
             "本机绝对路径不下发：本机 UI 走 list_shares 命令，对端只要 name/isDir"

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use orbdrop_lib::credential;
-use orbdrop_lib::state::AppState;
+use orbdrop_lib::state::{AppState, LinkIntent};
 use orbdrop_lib::transfer;
 use orbdrop_lib::ws::{LinkState, StopReason};
 use orbdrop_lib::config::{Config, PeerDevice, ShareItem};
@@ -130,7 +130,7 @@ async fn pairing_then_push_transfers_file_to_receiver() {
         port: port_b,
         online: true,
         paired: false,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
     let code = state_a.pair.create_code();
     assert_eq!(code.len(), 6, "6-digit pairing code");
@@ -183,7 +183,7 @@ async fn pairing_then_push_transfers_file_to_receiver() {
         port: port_a,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     // 4. Pairing stops at "已配对" — it never dials. A's user hits 「连接」 here
@@ -293,7 +293,7 @@ async fn push_to_unpaired_peer_rides_http() {
         port: port_b,
         online: true,
         paired: false,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
     assert!(!state_a.ws.has_connection("device-ub"), "前提：没有长连接");
     assert!(!credential::has_peer("device-ub"), "前提：没有配对 token");
@@ -408,7 +408,7 @@ async fn paired_push_without_a_long_connection_skips_consent_http() {
         port: port_b,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
     state_b.add_peer_book(PeerDevice {
         id: "device-pha".into(),
@@ -417,7 +417,7 @@ async fn paired_push_without_a_long_connection_skips_consent_http() {
         port: port_a,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
     assert!(!state_a.ws.has_connection("device-phb"), "前提：没有长连接（走 HTTP 那条路）");
 
@@ -503,7 +503,7 @@ async fn multi_device_push_isolates_targets_and_shares_one_manifest() {
         port: if online { port } else { 0 },
         online,
         paired,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     };
     state_a.add_peer_book(peer("device-mdb", "PC-MDB", port_b, true, true));
     state_a.add_peer_book(peer("device-mdc", "PC-MDC", port_c, true, false));
@@ -652,7 +652,7 @@ async fn multi_select_push_is_one_job_with_one_consent() {
         port: port_b,
         online: true,
         paired: false,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     // ---- 第一批：一个目录 + 一个散文件（两个源）—— 各以自己的名字平铺在 <发送方>/ 下 ----
@@ -783,7 +783,7 @@ async fn a_single_pushed_file_lands_as_a_file() {
         port: port_b,
         online: true,
         paired: false,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     let invite_id = push_invite(state_a.clone(), vec![file.to_string_lossy().to_string()], "device-ub")
@@ -828,7 +828,7 @@ async fn accepting_a_push_from_a_sync_context_still_downloads() {
         port: port_b,
         online: true,
         paired: false,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     let invite_id = push_invite(state_a.clone(), vec![src.to_string_lossy().to_string()], "device-ub")
@@ -928,7 +928,7 @@ async fn unpair_clears_both_sides_and_keeps_the_device_listed() {
         port: port_a,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     // 配对不再自己建链：A 点「连接」（镜像 connect_peer）才有链路。
@@ -1046,7 +1046,7 @@ fn button_tasks_without_a_tokio_runtime_do_not_panic() {
         port: 1,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     // 「连接」
@@ -1113,7 +1113,7 @@ async fn pairing_stops_at_paired_until_the_user_clicks_connect() {
         port: port_a,
         online: true,
         paired: false,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     let resp = reqwest::Client::new()
@@ -1138,7 +1138,7 @@ async fn pairing_stops_at_paired_until_the_user_clicks_connect() {
         port: port_a,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     // A 从配对请求里学到了 B 的地址（来源 IP + B 自报端口）并落库 —— 有地址也不自己拨。
@@ -1288,7 +1288,7 @@ async fn long_connection_is_restored_after_a_restart() {
         port: port_b,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
     state_b.mark_paired(&orbdrop_lib::config::PeerDevice {
         id: "device-ra".into(),
@@ -1297,7 +1297,7 @@ async fn long_connection_is_restored_after_a_restart() {
         port: 3995,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     // 用户点「连接」（A 侧）→ 链路建立。
@@ -1342,7 +1342,7 @@ async fn long_connection_is_restored_after_a_restart() {
 
     // ---- 反向：点过「断开」的设备，重启后不许自己连回来 ----
     state_a2.ws.pause("device-rb");
-    state_a2.set_auto_connect("device-rb", false); // 镜像 disconnect_peer 的两步
+    state_a2.set_link_intent("device-rb", LinkIntent::Paused); // 镜像 disconnect_peer 的两步
     wait_until("断开 must drop", || !state_b.ws.has_connection("device-ra")).await;
 
     let state_a3 = Arc::new(AppState::new(read_config(&config_path), config_path.clone()));
@@ -1363,6 +1363,135 @@ async fn long_connection_is_restored_after_a_restart() {
     credential::remove_peer("device-rb").ok();
     let _ = std::fs::remove_dir_all(&save_dir);
     let _ = std::fs::remove_file(&config_path);
+}
+
+// ---------------------------------------------------------------------------
+// 「断开」被对端记忆撤销的那条路（重启后）
+// ---------------------------------------------------------------------------
+
+/// F-16 回归：本机点过「断开」，**重启后仍要拒绝对端的自动重拨**。
+///
+/// 用户实际遇到的那条路：本机点「断开」→ 退出 → 重开。本机这边确实不再主动拨
+/// （`auto_connect` 已清），但对端**没点过断开**、它还记着这次长连接：它一看见本机
+/// 回到网上就拨过来。原来"拒绝对端的重拨"只活在内存里（`WsManager::paused`），重启
+/// 把它一起带走了 —— 本机照收那条拨号，双方界面回到「长连接」，而且被拨号的一端顺手
+/// 把 `auto_connect` 写回来，从此每次重启都自己连（用户看到的："主动断开、退出重开
+/// 又连上了"）。
+///
+/// 所以这里验三件事：暂停**落盘**（`paused`）、重启后被读回并挡住对端的自动拨号
+/// （403），以及"对端的人真的点了「连接」"这条正路照旧通（`manual=1` 结束本机暂停）。
+#[tokio::test]
+async fn a_disconnect_also_survives_a_restart_against_the_peers_memory() {
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let id_a = format!("d-hb-a-{tag}");
+    let id_b = format!("d-hb-b-{tag}");
+
+    let save_dir = std::env::temp_dir().join(format!("orbdrop_hb_save_dir_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&save_dir).unwrap();
+    let (port_a, port_b) = two_free_ports();
+    let state_a = make_state(port_a, &id_a, "PC-HBA", save_dir.clone());
+    let state_b = make_state(port_b, &id_b, "PC-HBB", save_dir.clone());
+    let config_path_a = state_a.config_path.clone();
+    let config_path_b = state_b.config_path.clone();
+
+    credential::remove_peer(&id_a).ok();
+    credential::remove_peer(&id_b).ok();
+    let token = format!("t-hb-{tag}");
+    credential::set_peer(&id_a, &token).unwrap();
+    credential::set_peer(&id_b, &token).unwrap();
+
+    // 两边都得起服务：重启后要验的正是**入站闸门**（对端拨过来时被 403 挡掉），
+    // 没有服务就没有那个闸门可验。
+    let port_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    state_a.mark_paired(&PeerDevice {
+        id: id_b.clone(), name: "PC-HBB".into(), ip: "127.0.0.1".into(), port: port_b,
+        online: true, paired: true, auto_connect: false, paused: false,
+    });
+    state_b.mark_paired(&PeerDevice {
+        id: id_a.clone(), name: "PC-HBA".into(), ip: "127.0.0.1".into(), port: port_a,
+        online: true, paired: true, auto_connect: false, paused: false,
+    });
+
+    // A 点「连接」→ 链路建立，两侧都记下这次长连接。
+    orbdrop_lib::ws::ensure_link_now(&state_a, &id_b);
+    wait_until("点连接建立链路", || {
+        state_a.ws.has_connection(&id_b) && state_b.ws.has_connection(&id_a)
+    })
+    .await;
+    assert!(
+        read_config(&config_path_b)
+            .peers
+            .iter()
+            .find(|p| p.id == id_a)
+            .expect("B 的地址簿里有 A")
+            .auto_connect,
+        "被拨号的一端也记着这次长连接 —— 这正是下面「重启后它还会拨过来」的前提"
+    );
+
+    // ---- A 点「断开」（镜像 `disconnect_peer`），然后退出 ----
+    state_a.ws.pause(&id_b);
+    state_a.set_link_intent(&id_b, LinkIntent::Paused);
+    wait_until("断开后链路消失", || !state_b.ws.has_connection(&id_a)).await;
+    let row = read_config(&config_path_a);
+    let row = row.peers.iter().find(|p| p.id == id_b).expect("A 的地址簿里有 B");
+    assert!(
+        !row.auto_connect && row.paused,
+        "「断开」的两个方向都要落盘：本机不拨（auto_connect=false）、也拒绝对端的拨（paused=true）"
+    );
+
+    // ---- 重启 A：服务也随进程换掉（新 state 起在同一个端口上）----
+    orbdrop_lib::server::stop_server(&state_a).await;
+    let state_a2 = Arc::new(AppState::new(read_config(&config_path_a), config_path_a.clone()));
+    assert!(
+        state_a2.ws.is_paused(&id_b),
+        "暂停标记要从地址簿读回来 —— 它要是只活在内存里，重启就等于把「断开」撤了"
+    );
+    let port_a2 = orbdrop_lib::server::start_server(state_a2.clone(), port_a).await.expect("A server (restarted)");
+    assert_eq!(port_a2, port_a, "重启后端口不变，对端存的地址才还能用");
+    orbdrop_lib::ws::restore_links_on_startup(&state_a2);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(!state_a2.ws.has_connection(&id_b), "本机不主动拨（这条没变过）");
+
+    // ---- 对端还记着这次长连接：它看见本机回到网上就拨过来（真机上由探活/mDNS 触发）----
+    orbdrop_lib::ws::redial_if_remembered(&state_b, &id_a);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !state_a2.ws.has_connection(&id_b) && !state_b.ws.has_connection(&id_a),
+        "重启后「断开」仍然有效：对端的自动重拨必须被拒（403），链路不许自己接回来"
+    );
+    assert!(
+        !read_config(&config_path_a)
+            .peers
+            .iter()
+            .find(|p| p.id == id_b)
+            .expect("A 的地址簿里有 B")
+            .auto_connect,
+        "被拨号的一端不该顺手把「要这条链」写回来"
+    );
+
+    // ---- 正路照旧：对端的人点「连接」→ `manual=1` → 本机的暂停结束 ----
+    orbdrop_lib::ws::ensure_link_now(&state_b, &id_a);
+    wait_until("对端点「连接」→ 恢复链路", || {
+        state_a2.ws.has_connection(&id_b) && state_b.ws.has_connection(&id_a)
+    })
+    .await;
+    assert!(!state_a2.ws.is_paused(&id_b), "对端显式请求连接 → 本机的暂停结束");
+    let row = read_config(&config_path_a);
+    let row = row.peers.iter().find(|p| p.id == id_b).expect("A 的地址簿里有 B");
+    assert!(
+        row.auto_connect && !row.paused,
+        "这条链是有人点「连接」要的：意图落盘，重启后该自动接回来"
+    );
+
+    // ---- Cleanup ----
+    orbdrop_lib::server::stop_server(&state_a2).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    credential::remove_peer(&id_a).ok();
+    credential::remove_peer(&id_b).ok();
+    let _ = std::fs::remove_dir_all(&save_dir);
+    let _ = std::fs::remove_file(&config_path_a);
+    let _ = std::fs::remove_file(&config_path_b);
 }
 
 // ---------------------------------------------------------------------------
@@ -1403,7 +1532,7 @@ async fn auto_restore_connects_once_the_peer_shows_up() {
         port: dead_port,
         online: false,
         paired: true,
-        auto_connect: true,
+        auto_connect: true, paused: false,
     });
     state_b.mark_paired(&orbdrop_lib::config::PeerDevice {
         id: id_a.clone(),
@@ -1412,7 +1541,7 @@ async fn auto_restore_connects_once_the_peer_shows_up() {
         port: 0,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     // 「重启」A：它照记忆自动拨，但对端不在 → 先连不上。
@@ -1435,7 +1564,7 @@ async fn auto_restore_connects_once_the_peer_shows_up() {
         port: port_b,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     wait_until("对端上线后自动接回（无需点「连接」）", || {
@@ -1487,7 +1616,7 @@ async fn a_peer_that_said_disconnect_stops_the_retry_loop() {
         port: port_b,
         online: true,
         paired: true,
-        auto_connect: true,
+        auto_connect: true, paused: false,
     });
     state_b.mark_paired(&orbdrop_lib::config::PeerDevice {
         id: id_a.clone(),
@@ -1496,7 +1625,7 @@ async fn a_peer_that_said_disconnect_stops_the_retry_loop() {
         port: 0,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     // B 先点「断开」：它的 `events_ws_handler` 会把 A 的重拨一律 403。
@@ -1571,7 +1700,7 @@ async fn a_peer_that_rejects_our_token_stops_the_retry_loop() {
         port: port_b,
         online: true,
         paired: true,
-        auto_connect: true,
+        auto_connect: true, paused: false,
     });
     state_b.mark_paired(&orbdrop_lib::config::PeerDevice {
         id: id_a.clone(),
@@ -1580,7 +1709,7 @@ async fn a_peer_that_rejects_our_token_stops_the_retry_loop() {
         port: 0,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     orbdrop_lib::ws::restore_links_on_startup(&state_a);
@@ -1671,7 +1800,7 @@ async fn probe_hides_a_row_whose_address_answers_with_another_device_id() {
         port: port_b,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     orbdrop_lib::state::probe_peers_once(&state_a, &reqwest::Client::new()).await;
@@ -1713,7 +1842,7 @@ fn peer_reset_with_surviving_credential_migrates_the_row_to_the_new_id() {
         port: 3890,
         online: true,
         paired: true,
-        auto_connect: true,
+        auto_connect: true, paused: false,
     });
     // mDNS 已经发现了它对端的新身份：同一地址、另一个 id、未绑定。
     state.upsert_peer(&PeerDevice {
@@ -1723,7 +1852,7 @@ fn peer_reset_with_surviving_credential_migrates_the_row_to_the_new_id() {
         port: 3890,
         online: true,
         paired: false,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     let seen = orbdrop_lib::state::PeerIdentity {
@@ -1798,7 +1927,7 @@ fn peer_reset_without_our_credential_hides_the_stale_row() {
         port: 3890,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
     state.upsert_peer(&PeerDevice {
         id: new_id.clone(),
@@ -1807,7 +1936,7 @@ fn peer_reset_without_our_credential_hides_the_stale_row() {
         port: 3890,
         online: true,
         paired: false,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     let seen = orbdrop_lib::state::PeerIdentity {
@@ -1876,7 +2005,7 @@ fn re_pairing_clears_the_stale_stop_reason() {
         port: 3890,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     };
     state.upsert_peer(&dead);
     state
@@ -1933,7 +2062,7 @@ async fn pair_invite_swaps_tokens_without_typing_a_code() {
         port: port_b,
         online: true,
         paired: false,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     // ---- A 点「发起邀请」----
@@ -2107,7 +2236,7 @@ async fn discover_reports_only_the_dialled_segment_and_needs_a_paired_token() {
             port,
             online,
             paired,
-            auto_connect: false,
+            auto_connect: false, paused: false,
         });
     };
     // 本机这一段里在线的设备 —— 这是唯一该出现在表里的东西。
@@ -2202,7 +2331,7 @@ async fn probe_learns_the_peers_segment_and_sweeps_it_when_the_voucher_goes_quie
         port: 4396,
         online: true,
         paired: false,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
     let port_b = orbdrop_lib::server::start_server(state_b.clone(), 4395)
         .await
@@ -2219,7 +2348,7 @@ async fn probe_learns_the_peers_segment_and_sweeps_it_when_the_voucher_goes_quie
         port: port_b,
         online: true,
         paired: true,
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
 
     orbdrop_lib::state::probe_peers_once(&state_a, &reqwest::Client::new()).await;

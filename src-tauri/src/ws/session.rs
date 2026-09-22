@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::credential;
-use crate::state::AppState;
+use crate::state::{AppState, LinkIntent};
 use crate::transfer;
 use crate::ws::events::{ui, PeerInfo, WsEvent};
 use crate::ws::emit_ui;
@@ -25,7 +25,8 @@ pub async fn run_inbound_session(state: Arc<AppState>, peer_id: String, ws: WebS
     info!(%peer_id, "inbound WS session starting");
     state.set_peer_online(&peer_id, true);
     // 被拨号的一端同样是"处于长连接"（F-16）：重启后这一侧也要能自动接回来。
-    state.set_auto_connect(&peer_id, true);
+    // 同一次写入清掉「断开」的暂停 —— 能走到这里，就说明本机不是暂停态（闸门放行了）。
+    state.set_link_intent(&peer_id, LinkIntent::Wanted);
     state.ws.set_link_state(&peer_id, crate::ws::LinkState::Connected);
 
     let (mut sink, mut stream) = ws.split();
@@ -117,7 +118,7 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 port: 0,
                 online: true,
                 paired: true,
-                auto_connect: false,
+                auto_connect: false, paused: false,
             });
             emit_ui(state, ui::DEVICES_CHANGED, &serde_json::json!({}));
         }

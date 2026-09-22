@@ -32,6 +32,27 @@ impl Default for DownloadMode {
     }
 }
 
+/// 折叠态悬浮形态：圆球（现在的 62px 球）或圆角矩形悬浮框（设备分页卡片）。
+///
+/// 字面量跟**前端同一套**：`types.ts` 的 `'circle' | 'rect'` 联合类型、
+/// `UpdateSettingsRequest` 的同名字段都是小写。`rename_all = "camelCase"` 落在枚举上
+/// 改的是**变体名**（`Circle` → `"circle"`、`Rect` → `"rect"`），正好对上。
+///
+/// `serde(default)` 对**旧配置**是必须的：没有这一项时解析失败会让 `load_config` 把
+/// 配置文件改名成 `.toml.bad` 再写默认值 —— 用户升级一次就丢掉全部共享项与配对表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OrbShape {
+    Circle,
+    Rect,
+}
+
+impl Default for OrbShape {
+    fn default() -> Self {
+        Self::Circle
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareItem {
@@ -44,7 +65,10 @@ pub struct ShareItem {
     pub broadcast_enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 注：`u16`/`String`/`bool` 各有 Default，`PeerDevice` 因此可以 `..Default::default()`
+/// 补齐 —— 只在"这一行只是观察值、意图字段不由构造方决定"的地方用（如对端换 id 时
+/// 迁行的输入，见 `AppState::rekey_peer`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerDevice {
     pub id: String,
@@ -61,6 +85,19 @@ pub struct PeerDevice {
     /// 的长连接意图抹掉。
     #[serde(default)]
     pub auto_connect: bool,
+    /// 「断开」的另一半（F-16）：**拒绝对端的自动重拨**（`server::events_ws_handler`
+    /// 对不带 `manual=1` 的升级回 403）。
+    ///
+    /// 必须落盘，否则「断开」只在**本进程**里算数：本机是安静了，可对端还记着这次长
+    /// 连接（`auto_connect` 在它那侧照旧），它一看见本机回到网上就拨过来 —— 而本机的
+    /// 暂停标记已随进程消失，于是照收那条链接，双方界面回到「长连接」，用户按的那一下
+    /// 等于没按。更糟的是被拨号的一端还会顺势把 `auto_connect` 写回来，从此每次重启都
+    /// 自己连（用户这边看到的就是"主动断开、退出重开又连上了"）。
+    ///
+    /// 与 `auto_connect` 是同一个意图的两面（本机拨不拨 / 接不接对端的拨），
+    /// 唯一写点是 `AppState::set_link_intent`：分开写早晚会出现"不拨但照收"。
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// BeyondCompare 的"比较位"目标（F-41）：本机共享项，或长连接设备上的共享项。
@@ -113,6 +150,10 @@ pub struct AppSettings {
     pub bc_exe_path: String,
     /// 本机「在线 / 离线」状态（面板右上角那个状态框）。见 `Config::online`。
     pub online: bool,
+    /// 折叠态悬浮形态（设置里的「悬浮形态」）。见 `OrbShape`。
+    pub orb_shape: OrbShape,
+    /// 新添加的目录/文件是否默认开播（设置里的「添加后自动共享」，默认关）。见 `Config::auto_broadcast_new`。
+    pub auto_broadcast_new: bool,
 }
 
 impl Default for AppSettings {
@@ -125,6 +166,8 @@ impl Default for AppSettings {
             auto_start: true,
             bc_exe_path: String::new(),
             online: true,
+            orb_shape: OrbShape::default(),
+            auto_broadcast_new: false,
         }
     }
 }
@@ -186,6 +229,9 @@ pub struct Config {
     /// 悬浮球落位（F-74「窗口位置」）：`None` = 还没记过（首启 / 旧配置），启动时按居中显示。
     #[serde(default)]
     pub orb_pos: Option<OrbPos>,
+    /// 折叠态悬浮形态（设置里的「悬浮形态」）：圆球 / 圆角矩形悬浮框。见 `OrbShape`。
+    #[serde(default)]
+    pub orb_shape: OrbShape,
     /// 文件选择框的「常用」列表（F-50）：**默认空**，全靠用户右键目录攒。
     ///
     /// 放配置文件里而不是 webview 的 localStorage：它跟共享项一样是**用户数据** ——
@@ -202,6 +248,16 @@ pub struct Config {
     /// 这是**用户意图**，所以落在配置文件里跨重启生效（和「断开」的记忆同一个道理）。
     #[serde(default = "default_online")]
     pub online: bool,
+    /// 新添加的目录/文件**默认是否开播**（设置里的「添加后自动共享」，**默认关**）。
+    ///
+    /// 只作用于**之后新登记**的共享项：`lib.rs::add_share_impl` 建条目时把这个值抄进
+    /// `ShareItem::broadcast_enabled`，已在列表里的项一个都不动 —— 用户手动关掉的开关
+    /// 不会因为这里开着而被翻回来（早先登记的项永不受影响）。
+    ///
+    /// 落在配置文件里跨重启有效：它是**用户意图**（"以后加的东西要不要默认给长连接设备看"），
+    /// 和「在线 / 离线」「开机自启」同一个道理。
+    #[serde(default)]
+    pub auto_broadcast_new: bool,
 }
 
 fn default_port() -> u16 {
@@ -234,6 +290,8 @@ impl Config {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default(),
             online: self.online,
+            orb_shape: self.orb_shape,
+            auto_broadcast_new: self.auto_broadcast_new,
         }
     }
 
@@ -278,8 +336,10 @@ impl Default for Config {
             device_id: new_device_id(),
             peers: Vec::new(),
             orb_pos: None,
+            orb_shape: OrbShape::default(),
             picker_favorites: Vec::new(),
             online: true,
+            auto_broadcast_new: false,
         }
     }
 }
@@ -347,28 +407,36 @@ fn default_device_name() -> String {
 // ---------------------------------------------------------------------------
 
 pub fn load_config() -> Config {
-    let path = config_file_path();
+    load_config_at(&config_file_path())
+}
+
+/// 读一份配置（路径可给，便于测试）。文件不存在时落一份默认配置；损坏时改名成 `.toml.bad`
+/// 再落一份默认 —— 两条都保住设备身份，也绝不静默丢掉旧文件。
+///
+/// 读进来后按路径**收一次重复的共享项**（早先版本允许重复登记），收掉了就当场写回：
+/// 用户看到的列表与 `config.toml` 里躺着的是一致的，不会"每次启动都清一遍"。
+pub fn load_config_at(path: &Path) -> Config {
     if !path.exists() {
         // First run: keep the generated identity. Peers key their address book
         // and pairing codes off our device id, so it must not be re-minted on
         // every start (that showed up as a duplicate device row per restart).
         let config = Config::default();
-        if let Err(e) = save_config_at(&path, &config) {
+        if let Err(e) = save_config_at(path, &config) {
             eprintln!("Failed to persist initial config: {e}");
         }
         return config;
     }
-    match std::fs::read_to_string(&path) {
+    let mut config = match std::fs::read_to_string(path) {
         Ok(content) => toml::from_str(&content).unwrap_or_else(|e| {
             eprintln!("Failed to parse config, using defaults: {e}");
             // Keep our identity across a corrupt file instead of minting a new
             // device id on each launch — but never silently drop the old file.
             let backup = path.with_extension("toml.bad");
-            if let Err(e) = std::fs::rename(&path, &backup) {
+            if let Err(e) = std::fs::rename(path, &backup) {
                 eprintln!("Failed to back up config to {backup:?}: {e}");
             }
             let config = Config::default();
-            if let Err(e) = save_config_at(&path, &config) {
+            if let Err(e) = save_config_at(path, &config) {
                 eprintln!("Failed to rewrite config: {e}");
             }
             config
@@ -377,7 +445,13 @@ pub fn load_config() -> Config {
             eprintln!("Failed to read config, using defaults: {e}");
             Config::default()
         }
+    };
+    if dedupe_shares(&mut config.shares) {
+        if let Err(e) = save_config_at(path, &config) {
+            eprintln!("Failed to persist config without duplicate shares: {e}");
+        }
     }
+    config
 }
 
 /// Write a config to an arbitrary path. Used by production code and tests.
@@ -388,6 +462,68 @@ pub fn save_config_at(path: &Path, config: &Config) -> Result<()> {
     let content = toml::to_string_pretty(config).context("Failed to serialize config")?;
     std::fs::write(path, content).context("Failed to write config file")?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 共享项去重（F-21）
+// ---------------------------------------------------------------------------
+
+/// 共享项里**已经登记过**这条路径的那一项（重复登记同一个目录/文件没有意义）。
+///
+/// 判据是**路径本身**，不是名字：改过名不影响、同一个目录换个写法（结尾多个 `\`、大小写不同、
+/// 中间夹个 `.`、符号链接）都算同一条。能 `canonicalize` 就按它的结果比 —— Windows 上顺带解决
+/// 大小写、分隔符、8.3 短名；路径取不到（刚被删、权限不够）时退回「去掉尾分隔符 + 小写」的
+/// 字符串比较：宁可宽松，也不在一个"要不要插一条"的判断上抛错。
+pub fn find_share_by_path<'a>(shares: &'a [ShareItem], path: &Path) -> Option<&'a ShareItem> {
+    let want = path.canonicalize().ok();
+    shares.iter().find(|s| match (&want, s.path.canonicalize()) {
+        (Some(a), Ok(b)) => *a == b,
+        _ => normalize_path(&s.path) == normalize_path(path),
+    })
+}
+
+/// 上面那条兜底比较用的形式：`/` 统一成 `\`、去掉尾分隔符；大小写**只在大小写不敏感的文件系统上**
+/// 折叠（Windows / macOS）—— 在 Linux 上 `/tmp/A` 与 `/tmp/a` 是两个目录，折了会把用户的共享项
+/// 误合成一条（真实存在的路径根本走不到这一步：那时按 `canonicalize` 的结果比）。
+fn normalize_path(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_string();
+    if cfg!(any(windows, target_os = "macos")) {
+        s.to_lowercase()
+    } else {
+        s
+    }
+}
+
+/// 登记一条共享项（F-21）：**同一条路径只留一条** —— 已经在列表里就原样返回库里那一条
+/// （id 不变、名字改过也不动、广播开关不重置），否则把它插进去。返回 `(是否新增, 库里那一条)`。
+///
+/// 查重与插入在同一个函数里完成：并发来的两笔（一批登记走 `Promise.all`）不会在"查一次、
+/// 再插一次"之间互相漏过去。调用方负责把这一步放进同一次持锁里（见 `lib.rs::add_share`）。
+pub fn register_share(shares: &mut Vec<ShareItem>, item: ShareItem) -> (bool, ShareItem) {
+    match find_share_by_path(shares, &item.path) {
+        Some(existing) => (false, existing.clone()),
+        None => {
+            shares.push(item.clone());
+            (true, item)
+        }
+    }
+}
+
+/// 把共享项里**同一路径的重复**整条丢掉（读配置时收一次）：早先版本允许重复登记，重复那些是
+/// 历史遗留，各带各的 id/名字/广播开关，留着只会在列表里多出几行一样的。
+///
+/// **保留最先登记的那一条**：名字可能被用户改过、广播开关是用户设的，都挂在最早那条身上。
+/// 返回是否真的丢掉了东西（调用方据此决定要不要立刻写回文件）。
+fn dedupe_shares(shares: &mut Vec<ShareItem>) -> bool {
+    let before = shares.len();
+    let mut kept: Vec<ShareItem> = Vec::with_capacity(before);
+    for item in shares.drain(..) {
+        if find_share_by_path(&kept, &item.path).is_none() {
+            kept.push(item);
+        }
+    }
+    *shares = kept;
+    shares.len() != before
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +580,181 @@ impl ShareItem {
 mod tests {
     use super::*;
 
+    /// 共享项按路径去重（F-21）：同一条路径换个写法（结尾 `\`、中间夹 `.`、Windows 上的大小写）
+    /// 仍算**同一条** —— 否则拖回卡片、选择框里重复挑就会在列表里堆出第二份。
+    /// 而父目录与子目录是两条不同的共享项，不能误判成重复。
+    #[test]
+    fn find_share_by_path_dedupes_by_path_not_spelling() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_dedupe_{}", Uuid::new_v4()));
+        let inner = dir.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let shares = vec![ShareItem {
+            id: "s1".into(),
+            name: "inner".into(),
+            path: inner.clone(),
+            created_at: Utc::now(),
+            broadcast_enabled: false,
+        }];
+
+        assert!(find_share_by_path(&shares, &inner).is_some(), "同一条路径");
+        assert!(find_share_by_path(&shares, &&inner).is_some(), "多写一个 & 也还是它");
+        assert!(
+            find_share_by_path(&shares, &inner.join(".")).is_some(),
+            "路径中间带 `.`：canonicalize 之后是同一条"
+        );
+        assert!(
+            find_share_by_path(&shares, &inner.join("child").join("..")).is_some(),
+            "绕一圈回来还是它"
+        );
+        assert!(find_share_by_path(&shares, &dir).is_none(), "父目录是另一条共享项");
+        assert!(find_share_by_path(&shares, &dir.join("other")).is_none(), "不存在的别的路径");
+        #[cfg(windows)]
+        assert!(
+            find_share_by_path(&shares, &dir.join("INNER")).is_some(),
+            "Windows 上大小写不同也是同一条（用户从资源管理器复制来的路径大小写常不一样）"
+        );
+
+        // 路径已经不在磁盘上（刚被删、权限不够）：退回字符串比较，同样不能凭空造第二条。
+        let gone = dir.join("gone");
+        let stale = vec![ShareItem {
+            id: "s2".into(),
+            name: "gone".into(),
+            path: gone.clone(),
+            created_at: Utc::now(),
+            broadcast_enabled: false,
+        }];
+        assert!(find_share_by_path(&stale, &gone).is_some(), "取不到 canonicalize 也要认出来");
+        assert!(find_share_by_path(&stale, &dir.join("other")).is_none());
+        assert!(
+            find_share_by_path(&stale, &PathBuf::from(format!("{}\\", gone.display()))).is_some(),
+            "结尾多个分隔符是同一条"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 老配置里躺着同一条路径的两份（早先版本允许重复登记）：**读进来只留最先那一条**，
+/// 名字（用户可能改过）与广播开关都保持原样，并且**当场写回** —— `config.toml` 里也不会
+/// 再留着那几条重复。
+    #[test]
+    fn load_config_drops_duplicate_share_paths() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_dupshares_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "deviceId = \"device-1\"\n\
+             \n\
+             [[shares]]\n\
+             id = \"first\"\n\
+             name = \"projects\"\n\
+             path = 'C:/Projects'\n\
+             broadcastEnabled = true\n\
+             createdAt = \"2026-09-01T00:00:00Z\"\n\
+             \n\
+             [[shares]]\n\
+             id = \"dup-trailing-sep\"\n\
+             name = \"projects（又拖了一次）\"\n\
+             path = 'C:/Projects/'\n\
+             broadcastEnabled = false\n\
+             createdAt = \"2026-09-21T00:00:00Z\"\n\
+             \n\
+             [[shares]]\n\
+             id = \"other\"\n\
+             name = \"其他\"\n\
+             path = 'C:/Other'\n\
+             broadcastEnabled = false\n\
+             createdAt = \"2026-09-21T00:00:00Z\"\n",
+        )
+        .unwrap();
+
+        let config = load_config_at(&path);
+        assert_eq!(config.shares.len(), 2, "重复那条丢了，别的照旧");
+        assert_eq!(config.shares[0].id, "first", "留下的是最先登记的那一条");
+        assert_eq!(config.shares[0].name, "projects", "名字不被后来那条顶掉");
+        assert!(config.shares[0].broadcast_enabled, "广播开关保持原样");
+        assert_eq!(config.shares[1].id, "other", "不同的路径一条都不动");
+        assert_eq!(config.device_id, "device-1", "配置的其余部分不受影响");
+
+        // 写回了：再读一次文件本身，里面也不该有那两条重复
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("dup-trailing-sep"), "重复项已经从文件里消失");
+        assert!(on_disk.contains("id = \"first\"") && on_disk.contains("id = \"other\""));
+        let reread: Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(reread.shares.len(), 2);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 没有重复时不写回：`load_config_at` 不会每启动一次就重写一遍用户的配置文件。
+    #[test]
+    fn load_config_leaves_clean_shares_untouched() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_cleanshares_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let original = "deviceId = \"device-1\"\n\n[[shares]]\nid = \"only\"\nname = \"one\"\npath = 'C:/One'\nbroadcastEnabled = false\ncreatedAt = \"2026-09-01T00:00:00Z\"\n";
+        std::fs::write(&path, original).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let config = load_config_at(&path);
+        assert_eq!(config.shares.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "文件一个字节都没动");
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), before);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 登记按路径去重（F-21）：第二次登记同一条路径**不动库里那一条** —— id、名字（可能被改过）、
+    /// 广播开关都保持原样。用户看到的是"没有多出一项"，而不是"多出一项、还把旧的顶掉"。
+    #[test]
+    fn register_share_keeps_the_first_entry_and_reports_not_created() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_reg_{}", Uuid::new_v4()));
+        let path = dir.join("p");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let mut shares = Vec::new();
+        let first = ShareItem {
+            id: "keep".into(),
+            name: "旧名字".into(),
+            path: path.clone(),
+            created_at: Utc::now(),
+            broadcast_enabled: true,
+        };
+        let (created, stored) = register_share(&mut shares, first.clone());
+        assert!(created, "第一次登记是新增");
+        assert_eq!(stored.id, "keep");
+
+        let again = ShareItem {
+            id: "new".into(),
+            name: "新名字".into(),
+            path: path.clone(),
+            created_at: Utc::now(),
+            broadcast_enabled: false,
+        };
+        let (created, stored) = register_share(&mut shares, again);
+        assert!(!created, "同一条路径不该再插一条");
+        assert_eq!(shares.len(), 1, "库里只有一条");
+        assert_eq!(stored.id, "keep", "回来的还是原来那一条");
+        assert_eq!(shares[0].name, "旧名字", "登记时改过的名字不动");
+        assert!(shares[0].broadcast_enabled, "广播开关不被重置");
+
+        // 同一个目录换个写法（结尾多一个分隔符）同样不新增
+        let (created, _) = register_share(
+            &mut shares,
+            ShareItem {
+                id: "x".into(),
+                name: "x".into(),
+                path: PathBuf::from(format!("{}\\", path.display())),
+                created_at: Utc::now(),
+                broadcast_enabled: false,
+            },
+        );
+        assert!(!created);
+        assert_eq!(shares.len(), 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Round-trip: save a config with a share, load it back, and check equality.
     /// This is the persistence contract behind "重启后共享项/设置恢复".
     #[test]
@@ -467,7 +778,9 @@ mod tests {
             }),
             bc_right: None,
             orb_pos: Some(OrbPos { x: -1280, y: 40 }),
+            orb_shape: OrbShape::Rect,
             online: false,
+            auto_broadcast_new: true,
             picker_favorites: vec![
                 PickerFavorite { name: "桌面".into(), path: "C:/Users/t/Desktop".into() },
                 PickerFavorite { name: "项目".into(), path: "D:/项目".into() },
@@ -526,6 +839,15 @@ mod tests {
             loaded.orb_pos,
             Some(OrbPos { x: -1280, y: 40 }),
             "悬浮球位置要跨重启保留（F-74）：负坐标是左边那块显示器"
+        );
+        assert_eq!(
+            loaded.orb_shape,
+            OrbShape::Rect,
+            "悬浮形态要跨重启保留（用户在设置里选了哪一档，下次还得是那一档）"
+        );
+        assert_eq!(
+            loaded.auto_broadcast_new, true,
+            "「添加后自动共享」要跨重启保留（开着就一直开着）"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -623,6 +945,44 @@ mod tests {
 
         let offline: Config = toml::from_str("deviceId = \"device-1\"\nonline = false\n").unwrap();
         assert!(!offline.online);
+    }
+
+    /// 悬浮形态跨重启有效；**旧配置**（没有这一项）读出来是圆球。
+    ///
+    /// 漏掉 `#[serde(default)]` 的后果与 `online` 那条一样重：解析失败 → 配置文件被改名成
+    /// `.toml.bad` → 用户的共享项与配对表全丢。字面量也要钉死（前端的联合类型是
+    /// `'circle' | 'rect'`，落盘与 IPC 上必须是同一套小写）。
+    #[test]
+    fn orb_shape_round_trips_and_defaults_to_circle() {
+        let old: Config = toml::from_str("deviceId = \"device-1\"\n").unwrap();
+        assert_eq!(old.orb_shape, OrbShape::Circle, "老配置没有 orbShape：默认圆球");
+        assert_eq!(old.settings().orb_shape, OrbShape::Circle, "AppSettings 要带上它");
+
+        let rect: Config = toml::from_str("deviceId = \"device-1\"\norbShape = \"rect\"\n").unwrap();
+        assert_eq!(rect.orb_shape, OrbShape::Rect);
+
+        assert_eq!(serde_json::to_string(&OrbShape::Circle).unwrap(), "\"circle\"");
+        assert_eq!(serde_json::to_string(&OrbShape::Rect).unwrap(), "\"rect\"");
+    }
+
+    /// 「添加后自动共享」跨重启有效；**旧配置**（没有这一项）读出来是**关**。
+    ///
+    /// 漏掉 `#[serde(default)]` 的后果和 `online` 那条一样重：解析失败 → 配置文件被改名成
+    /// `.toml.bad` → 用户的共享项与配对表全丢。缺省值本身是**关**（`bool` 的默认，见
+    /// `Config::auto_broadcast_new` 的说明）。
+    #[test]
+    fn auto_broadcast_new_defaults_to_false_and_round_trips() {
+        let old: Config = toml::from_str("deviceId = \"device-1\"\n").unwrap();
+        assert!(!old.auto_broadcast_new, "老配置没有这一项：默认关");
+        assert!(
+            !old.settings().auto_broadcast_new,
+            "AppSettings（get_settings 的返回）要带上它"
+        );
+
+        let on: Config =
+            toml::from_str("deviceId = \"device-1\"\nautoBroadcastNew = true\n").unwrap();
+        assert!(on.auto_broadcast_new);
+        assert!(on.settings().auto_broadcast_new);
     }
 
     /// S-01: same-name downloads get "xxx (1).ext" style renames.

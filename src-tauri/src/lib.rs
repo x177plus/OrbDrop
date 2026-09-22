@@ -26,8 +26,8 @@ use tauri_plugin_opener::OpenerExt;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use config::{AppSettings, BcTarget, DownloadMode, OrbPos, PeerDevice, PickerFavorite, ShareItem};
-use state::AppState;
+use config::{AppSettings, BcTarget, DownloadMode, OrbPos, OrbShape, PeerDevice, PickerFavorite, ShareItem};
+use state::{AppState, LinkIntent};
 
 // ---------------------------------------------------------------------------
 // Tauri command payloads
@@ -41,16 +41,65 @@ pub struct ShareItemDto {
     pub path: String,
     pub created_at: String,
     pub broadcast_enabled: bool,
+    /// 真去问文件系统，不按路径猜 —— 老前端那条 `shareIsDir`（"没有扩展名就算目录"）
+    /// 会把 `D:\MyFolder.v2` 当文件，图标与展开箭头跟着错。
+    pub is_dir: bool,
+    /// 文件大小；目录永远是 `None`（那是递归遍历，不在列清单这条路上做）。
+    pub size: Option<u64>,
+    /// 目录的**直接**子项数；文件永远是 `None`。卡片副标题就显示它。
+    pub item_count: Option<u64>,
 }
 
-impl From<&ShareItem> for ShareItemDto {
-    fn from(s: &ShareItem) -> Self {
+/// 共享项在文件系统上的样子。卡片副标题那两个数（「N 项」/ 大小）只能问文件系统，
+/// 所以一次问清、一起带出去。
+#[derive(Debug, Clone, Copy)]
+struct ShareProbe {
+    is_dir: bool,
+    size: Option<u64>,
+    item_count: Option<u64>,
+}
+
+/// 问一次文件系统（同步；调用方负责放到阻塞线程上）。
+fn probe_share(path: &Path) -> ShareProbe {
+    let Ok(meta) = std::fs::metadata(path) else {
+        // 被删 / 无权限：连类型都不猜，两个数都给 `None`，界面退回「文件」这种中性说法。
+        return ShareProbe { is_dir: false, size: None, item_count: None };
+    };
+    if meta.is_dir() {
+        ShareProbe { is_dir: true, size: None, item_count: count_children(path) }
+    } else {
+        ShareProbe { is_dir: false, size: Some(meta.len()), item_count: None }
+    }
+}
+
+/// 目录的直接子项数。**跳过 `.` 开头的项**：展开共享项走的是 `/tree`，那里也只有这一条过滤
+/// —— 两个数对不上，用户会以为列表漏了东西。
+///
+/// 中途读错（权限、掉盘）返回 `None`：少一个数比报一个错的数好（同 `fs_browse::list_dir`
+/// "静默少几项比报错更坏" 的另一面 —— 这里能安全地说"不知道"）。
+fn count_children(path: &Path) -> Option<u64> {
+    let dir = std::fs::read_dir(path).ok()?;
+    let mut n = 0u64;
+    for entry in dir {
+        let Ok(entry) = entry else { return None };
+        if !entry.file_name().to_string_lossy().starts_with('.') {
+            n += 1;
+        }
+    }
+    Some(n)
+}
+
+impl ShareItemDto {
+    fn new(s: &ShareItem, probe: ShareProbe) -> Self {
         Self {
             id: s.id.clone(),
             name: s.name.clone(),
             path: s.path.to_string_lossy().to_string(),
             created_at: s.created_at.to_rfc3339(),
             broadcast_enabled: s.broadcast_enabled,
+            is_dir: probe.is_dir,
+            size: probe.size,
+            item_count: probe.item_count,
         }
     }
 }
@@ -75,6 +124,13 @@ pub struct UpdateSettingsRequest {
     /// BeyondCompare 可执行文件路径；空串 = 自动探测。
     #[serde(default)]
     pub bc_exe_path: String,
+    /// 折叠态悬浮形态（设置里的「悬浮形态」）。见 `config::OrbShape`。
+    #[serde(default)]
+    pub orb_shape: OrbShape,
+    /// 新添加的目录/文件默认开播（设置里的「添加后自动共享」，默认关）。缺省 `false`：
+    /// 字段缺失 = 沿用 `Config` 的缺省（关），不是替用户打开。
+    #[serde(default)]
+    pub auto_broadcast_new: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -83,23 +139,60 @@ pub struct UpdateSettingsRequest {
 
 #[tauri::command]
 async fn add_share(path: String, state: State<'_, Arc<AppState>>) -> Result<ShareItemDto, String> {
+    add_share_impl(state.inner(), path).await
+}
+
+/// `add_share` 的全部动作，命令层只做参数解包。抽出来是因为 tauri 命令要 `State`，集成测试
+/// 里造不出来 —— 而"新加的共享项开不开播"这条规则值得直接驱动一遍（见 `tests/share_visibility.rs`）。
+pub async fn add_share_impl(state: &Arc<AppState>, path: String) -> Result<ShareItemDto, String> {
     let p = PathBuf::from(&path);
     if !p.exists() {
         return Err(format!("路径不存在: {path}"));
     }
-    let item = ShareItem::new(p);
-    let dto = ShareItemDto::from(&item);
-    let item_clone = item.clone();
-    {
+    // **同一条路径只登记一次**（F-21）：拖回卡片、选择框里又挑到同一项、同一个目录换个写法
+    // （结尾多个 `\`、大小写不同）都落到这里。已经登记过就**原样返回那一项** —— id 不变、
+    // 名字（可能被改过）不动、广播开关不重置、不重新挂 watcher（重复挂会多出一条 watcher）。
+    // 界面靠"回来的 id 是不是本来就有的"区分「已添加」与「已在共享项里」（见 `App.addShares`）。
+    let existing = config::find_share_by_path(&state.config.lock().shares, &p).cloned();
+    if let Some(existing) = existing {
+        info!(path, "share already registered");
+        return share_dto(&existing).await;
+    }
+    let mut item = ShareItem::new(p);
+    // 新登记的共享项按设置里的「添加后自动共享」定初值（`Config::auto_broadcast_new`，默认关）。
+    // **只作用于新条目**：已经在列表里的那条在上面就早返回了，开关不会被这里翻动 —— 用户自己
+    // 设过的开关不会因为设置改动而被翻回来。
+    item.broadcast_enabled = state.config.lock().auto_broadcast_new;
+    let dto = share_dto(&item).await?;
+    // 查重与插入在**同一次持锁**里完成（`config::register_share`）：一批登记是并发来的
+    // （`Promise.all`），分成"查一次、再插一次"两步的话，两条一样的路径会在两次持锁之间漏过去。
+    let (created, share) = {
         let mut config = state.config.lock();
-        config.shares.push(item);
-        config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
+        let (created, share) = config::register_share(&mut config.shares, item);
+        if created {
+            config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
+        }
+        (created, share)
+    };
+    if !created {
+        info!(path, "share already registered");
+        return share_dto(&share).await;
     }
     // Watch the new share
-    share::watcher::watch_share(state.inner(), &item_clone.id, item_clone.path);
-    notify_shares_changed(state.inner());
+    share::watcher::watch_share(state, &share.id, share.path);
+    notify_shares_changed(state);
     info!(path, "share added");
     Ok(dto)
+}
+
+/// 共享项 → 给界面的那一份：与 `list_shares` 是同一份（`isDir` / 大小 / 子项数都由后端
+/// 问一次文件系统得来），所以返回值就是「本机」标签页与卡片马上要显示的那一项。
+async fn share_dto(item: &ShareItem) -> Result<ShareItemDto, String> {
+    let probe_path = item.path.clone();
+    let probe = tauri::async_runtime::spawn_blocking(move || probe_share(&probe_path))
+        .await
+        .map_err(|e| format!("读取共享项失败：{e}"))?;
+    Ok(ShareItemDto::new(item, probe))
 }
 
 /// 选择框「常用」列表（F-50）：用户右键目录攒出来的快捷入口，随配置持久化。
@@ -121,10 +214,17 @@ fn set_picker_favorites(
     Ok(stored)
 }
 
+/// 共享项清单。**必须 async**：每一项都要问一次文件系统（目录要数一层），而同步命令跑在
+/// 主线程上 —— 一个挂在掉线映射盘上的共享项能让整个界面僵住（同 `fs_browse::fs_drives`）。
 #[tauri::command]
-fn list_shares(state: State<'_, Arc<AppState>>) -> Result<Vec<ShareItemDto>, String> {
-    let config = state.config.lock();
-    Ok(config.shares.iter().map(ShareItemDto::from).collect())
+async fn list_shares(state: State<'_, Arc<AppState>>) -> Result<Vec<ShareItemDto>, String> {
+    // 先锁一下配置把清单抄出来就放锁：`MutexGuard` 不是 `Send`，抱着它进不了阻塞线程。
+    let shares = state.config.lock().shares.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        shares.iter().map(|s| ShareItemDto::new(s, probe_share(&s.path))).collect()
+    })
+    .await
+    .map_err(|e| format!("读取共享项失败：{e}"))
 }
 
 #[tauri::command]
@@ -206,6 +306,8 @@ async fn update_settings(
         config.auto_start = req.auto_start;
         config.bc_exe_path = Some(PathBuf::from(req.bc_exe_path.trim()))
             .filter(|p| !p.as_os_str().is_empty());
+        config.orb_shape = req.orb_shape;
+        config.auto_broadcast_new = req.auto_broadcast_new;
         config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
     }
 
@@ -416,7 +518,7 @@ fn unregister_mdns(state: &Arc<AppState>) {
     }
 }
 
-/// 切本机「在线 / 离线」（面板右上角状态框）。
+/// 切本机「在线 / 离线」（面板右上角状态框、托盘右键菜单两个入口共用这一份实现）。
 ///
 /// **离线 = 隐身**，三件事一起做：注销 mDNS 广播（对端发现不到本机）、掐掉全部长连接与
 /// 拨号循环、由 `server::presence_middleware` 拒收一切入站请求（对端的 5s 探活因此把它
@@ -424,19 +526,24 @@ fn unregister_mdns(state: &Arc<AppState>) {
 /// 所以切回「在线」就是"重新广播 + 按记忆把链路接回来"（F-16 那条路）。
 ///
 /// 状态落盘（`Config::online`）：用户选了离线就一直离线，重启也是。
-#[tauri::command]
-fn set_online(online: bool, state: State<'_, Arc<AppState>>, app: AppHandle) -> Result<bool, String> {
-    let arc = state.inner().clone();
+///
+/// **必须是唯一入口**：副作用有 mDNS 注销、断链、落盘三样，多一份实现就必然漏一样。
+/// 命令（前端）与托盘菜单都走这里；状态没变时早退，所以重复调用是安全的。
+pub(crate) fn apply_online(
+    arc: &Arc<AppState>,
+    app: &AppHandle,
+    online: bool,
+) -> Result<bool, String> {
     if arc.is_online() == online {
         return Ok(online);
     }
     arc.set_local_online(online);
 
     if online {
-        register_mdns(&arc, bound_port(&arc));
-        ws::restore_links_on_startup(&arc);
+        register_mdns(arc, bound_port(arc));
+        ws::restore_links_on_startup(arc);
     } else {
-        unregister_mdns(&arc);
+        unregister_mdns(arc);
         arc.ws.drop_all();
         // 离线期间一个动作也做不成（连接/推送都会被拒），绿色的「在线」pill 留着只会
         // 让人以为还能操作。切回在线后 5s 探活会把这些行纠正回来，所以这里只是显示层。
@@ -453,6 +560,11 @@ fn set_online(online: bool, state: State<'_, Arc<AppState>>, app: AppHandle) -> 
     );
     info!(online, "local presence changed");
     Ok(online)
+}
+
+#[tauri::command]
+fn set_online(online: bool, state: State<'_, Arc<AppState>>, app: AppHandle) -> Result<bool, String> {
+    apply_online(state.inner(), &app, online)
 }
 
 #[tauri::command]
@@ -476,6 +588,9 @@ async fn connect_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Resul
         return Err("设备不存在".to_string());
     }
     state.ws.resume(&peer_id);
+    // 暂停在**地址簿**里也要清：只清内存那份的话，重启后本机又会拒绝这条链
+    // （用户明明点过「连接」）。`Wanted` 同时把"要这条链"记下 —— 拨号失败/强杀也不丢。
+    state.set_link_intent(&peer_id, LinkIntent::Wanted);
     ws::ensure_link_now(state.inner(), &peer_id);
     Ok(())
 }
@@ -483,15 +598,17 @@ async fn connect_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Resul
 /// Drop the long connection and keep it down (auto-connect stays off) until the
 /// user here reconnects, or the peer asks to connect with its own 「连接」.
 ///
-/// 「断开」的意图也跨重启有效：把地址簿里的长连接标记一起清掉，否则下次启动会照着
-/// 上次的记忆（F-16 重启恢复）把它自动连回来。
+/// 「断开」的意图也跨重启有效，而且**两个方向都要**：本机不主动拨（`auto_connect`
+/// 清零），也拒绝对端的自动重拨（`paused` 落盘 —— 这一半要是只留在内存里，重启后
+/// 对端照旧记着这次长连接，它一看见本机上线就拨过来、本机一收，双方又回到「长连接」，
+/// 用户按的这一下等于没按）。
 #[tauri::command]
 fn disconnect_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     if state.get_peer(&peer_id).is_none() {
         return Err("设备不存在".to_string());
     }
     state.ws.pause(&peer_id);
-    state.set_auto_connect(&peer_id, false);
+    state.set_link_intent(&peer_id, LinkIntent::Paused);
     state.emit_devices_changed();
     Ok(())
 }
@@ -508,7 +625,7 @@ async fn add_peer(ip: String, port: u16, state: State<'_, Arc<AppState>>) -> Res
     let info: serde_json::Value = resp.json().await.map_err(|e| format!("响应异常: {e}"))?;
     let id = info["id"].as_str().unwrap_or("").to_string();
     let name = info["name"].as_str().unwrap_or(&ip).to_string();
-    let peer = PeerDevice { id, name, ip, port, online: true, paired: false, auto_connect: false };
+    let peer = PeerDevice { id, name, ip, port, online: true, paired: false, ..Default::default() };
     state.add_peer_book(peer.clone());
     Ok(peer)
 }
@@ -1002,7 +1119,17 @@ fn place_orb_on_startup(app: &AppHandle) {
         warn!("未找到 main 窗口，跳过悬浮球落位");
         return;
     };
-    let saved = app.state::<Arc<AppState>>().config.lock().orb_pos;
+    let (shape, saved) = {
+        let state = app.state::<Arc<AppState>>();
+        let config = state.config.lock();
+        (config.orb_shape, config.orb_pos)
+    };
+    // 折叠态尺寸先按形态定下来：tauri.conf 里只写了圆球那一档（90×90），圆角矩形悬浮框是
+    // 236×162。等界面起来再改尺寸，悬浮框会先以 90×90 露出半张卡再跳大。
+    let (width, height) = collapsed_logical(&app.config(), shape);
+    if let Err(e) = win.set_size(tauri::LogicalSize::new(width, height)) {
+        warn!("按形态设置折叠态窗口尺寸失败: {e}");
+    }
     let (x, y) = match saved {
         // 上次那块显示器没了 / 分辨率变小：留在居中，否则球落到屏幕外、用户拖不回来
         // （透明无边框窗口没有标题栏）
@@ -1011,7 +1138,7 @@ fn place_orb_on_startup(app: &AppHandle) {
             return;
         }
         Some(pos) => (pos.x, pos.y),
-        None => match orb_window::default_pos(&win, collapsed_logical(&app.config())) {
+        None => match orb_window::default_pos(&win, width) {
             Ok(p) => p,
             Err(e) => {
                 warn!("算默认悬浮球落位失败，保持居中: {e}");
@@ -1026,18 +1153,20 @@ fn place_orb_on_startup(app: &AppHandle) {
     }
 }
 
-/// 折叠态窗口的标称边长（逻辑像素，即 tauri.conf 里 main 窗口的 `width`）。
+/// 折叠态窗口的标称尺寸（逻辑像素，宽 × 高）。
 ///
-/// 默认落位要用它算窗口边长：启动那一刻窗口的 `outer_size()` 还带着 DWM 阴影余量，
-/// 不是真实边长（见 `orb_window::default_pos`）。
-fn collapsed_logical(config: &tauri::Config) -> f64 {
-    config
-        .app
-        .windows
-        .iter()
-        .find(|w| w.label == "main")
-        .map(|w| w.width)
-        .unwrap_or(90.0)
+/// 圆球取 tauri.conf 里 main 窗口的 `width`/`height`（90×90）；圆角矩形悬浮框是**定尺**
+/// 236×162 —— 它由卡片 176 + 右侧分页点那 30（间距 10 + 列宽 20）+ 四周阴影/角标余量拼出来，
+/// 前端在 `src/lib/orbShape.ts` 的 `rectLayout` 里算同一个尺寸。**两处必须逐值一致**：
+/// 这里只用来定首启的默认落位与首帧尺寸，界面起来后会按自己那份重设一次。
+fn collapsed_logical(config: &tauri::Config, shape: OrbShape) -> (f64, f64) {
+    match shape {
+        OrbShape::Rect => (236.0, 162.0),
+        OrbShape::Circle => {
+            let win = config.app.windows.iter().find(|w| w.label == "main");
+            (win.map(|w| w.width).unwrap_or(90.0), win.map(|w| w.height).unwrap_or(90.0))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,9 +1237,10 @@ fn setup_server_task(app: &AppHandle) {
                                         port,
                                         online: true,
                                         paired,
-                                        // 发现条目不带长连接意图：这由链路本身
-                                        // （`set_auto_connect`）记，别在这里覆盖。
-                                        auto_connect: false,
+                                        // 发现条目不带长连接意图：这一行只是观察值，意图由
+                                        // `AppState::set_link_intent` 一处写（`upsert_peer`
+                                        // 也不合并这两个字段，别在这里覆盖）。
+                                        ..Default::default()
                                     });
                                     // mDNS is often the only source of a paired
                                     // peer's address (the credential store keeps
@@ -1329,6 +1459,10 @@ pub fn run() {
             // 悬浮球回到上次的位置；没有记录（首启）就放到默认落位（右上 1/3）
             place_orb_on_startup(app.handle());
 
+            // 上次留下的暂存副本：能删就删（拖拽落下后资源管理器可能还在异步复制，
+            // 所以运行期不删，只在启动与下次拖拽时按龄扫）。
+            drag::sweep_staging();
+
             setup_server_task(app.handle());
 
             // 尽早把 BC 的 profile 文件立起来（含所有已配对设备）：
@@ -1339,5 +1473,65 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一个临时共享项根：`a.txt` + `sub/` + 一个 `.hidden`（后者 `/tree` 与计数都跳过）。
+    ///
+    /// **每个调用各拿一个目录**：只按 pid 取名字的话，同进程里两个用它的用例并行跑会互相
+    /// `remove_dir_all`（实测：`probe_share` 那两个用例会偶发少看到文件）。
+    fn fixture_dir() -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("orbdrop_probe_{}_{}", std::process::id(), uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hello world").unwrap(); // 11 字节
+        std::fs::write(dir.join(".hidden"), b"x").unwrap();
+        dir
+    }
+
+    /// 卡片副标题的那两个数：目录给**直接**子项数（跳过 `.` 开头的项，与 `/tree` 展开后
+    /// 看到的行数一致），文件给大小；两者互斥，拿不到时是 `None`（界面退回「文件夹 / 文件」）。
+    #[test]
+    fn probe_share_counts_one_level_and_sizes_files() {
+        let dir = fixture_dir();
+        let share = ShareItem::new(dir.clone());
+
+        let probe = probe_share(&share.path);
+        assert!(probe.is_dir);
+        assert_eq!(probe.item_count, Some(2), "a.txt + sub；.hidden 不计入");
+        assert_eq!(probe.size, None, "目录不给大小：那是递归遍历");
+
+        let file_probe = probe_share(&dir.join("a.txt"));
+        assert!(!file_probe.is_dir);
+        assert_eq!(file_probe.size, Some(11));
+        assert_eq!(file_probe.item_count, None, "文件不给子项数");
+
+        let gone = probe_share(&dir.join("no-such-entry"));
+        assert_eq!(
+            (gone.is_dir, gone.size, gone.item_count),
+            (false, None, None),
+            "路径没了：不猜类型，两个数都不给"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 字段名是前端能看到的一切（`ShareItem.isDir` / `itemCount` / `size`）：改错了整张卡
+    /// 会退化成「文件」，而且不报错。
+    #[test]
+    fn share_item_dto_keeps_its_wire_field_names() {
+        let dir = fixture_dir();
+        let share = ShareItem::new(dir.clone());
+        let json = serde_json::to_value(ShareItemDto::new(&share, probe_share(&share.path))).unwrap();
+        assert_eq!(json["isDir"], true);
+        assert_eq!(json["itemCount"], 2);
+        assert!(json["size"].is_null(), "目录的大小是 null，不是 0");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 

@@ -205,7 +205,7 @@ pub fn commit_pairing(
         online: true,
         paired: true,
         // 刚配对：还没长连接，没有要恢复的东西。
-        auto_connect: false,
+        auto_connect: false, paused: false,
     });
     // 刚拿到 token：把 BC 的 WebDAV profile 预写好（BC 只在启动时登记 profile 文件，
     // 所以要抢在用户下次启动 BC 之前落盘）。
