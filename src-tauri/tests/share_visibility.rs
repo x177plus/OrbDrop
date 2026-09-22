@@ -3,8 +3,10 @@
 //! 规则只有一条，本机和三个受保护端点都走它：
 //!   可见 = 该共享项开着广播 && 该对端**此刻**处于长连接。
 //!
-//! 测试直接调用 handler 并注入 `Caller`：不依赖 keyring，也不用从非回环地址发请求，
+//! 测试直接调用 handler 并注入 `Caller`：不依赖凭据存储，也不用从非回环地址发请求，
 //! 测的就是规则本身；回环路径另用真实 HTTP 覆盖（本机必须永远全量可见）。
+//! 需要模拟"来自另一台设备"的少数用例走本机局域网地址 —— 那一跳是 TLS，
+//! 必须用 `orbdrop_lib::net::client()`（带 pinning 校验器）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -147,8 +149,12 @@ async fn unpaired_source_is_rejected() {
 
     // 非回环来源（本机 LAN 地址）不给 token：401
     let lan_ip = local_lan_ip().expect("需要一张可用网卡来模拟外部来源");
-    let url = format!("http://{lan_ip}:{port}/shares");
-    let resp = reqwest::get(&url).await.expect("request reaches server");
+    let url = format!("https://{lan_ip}:{port}/shares");
+    let resp = orbdrop_lib::net::client()
+        .get(&url)
+        .send()
+        .await
+        .expect("request reaches server");
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     // 回环（本机 UI）仍然畅通
@@ -156,7 +162,7 @@ async fn unpaired_source_is_rejected() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     // 已被删掉的 peer 可改共享项权限的端点不该复活
-    let resp = reqwest::Client::new()
+    let resp = orbdrop_lib::net::client()
         .post(format!("http://127.0.0.1:{port}/share/permissions"))
         .json(&serde_json::json!({ "shareId": "x", "targets": ["peer-a"] }))
         .send()
@@ -171,7 +177,7 @@ async fn unpaired_source_is_rejected() {
 /// 真实 HTTP + 真实中间件：token 反解出对端身份 → 可见性按「谁在看」生效。
 ///
 /// 这是「另一台设备请求本机」的最小可复现版本（同机用局域网地址当非回环来源）。
-/// 用真 keyring（与 p1_integration 同款做法），固定假设备 id 并在前后各清一次，
+/// 用真实的凭据存储（与 p1_integration 同款做法），固定假设备 id 并在前后各清一次，
 /// 避免上一次失败残留把别的测试带红。
 #[tokio::test]
 async fn peer_identity_from_token_scopes_the_share_list() {
@@ -196,11 +202,11 @@ async fn peer_identity_from_token_scopes_the_share_list() {
         .await
         .expect("server start");
     let ip = local_lan_ip().expect("需要一张可用网卡来模拟外部来源");
-    let client = reqwest::Client::new();
+    let client = orbdrop_lib::net::client();
 
     // 带 token：只看到开播的那一个，且不含本机绝对路径
     let resp = client
-        .get(format!("http://{ip}:{port}/shares"))
+        .get(format!("https://{ip}:{port}/shares"))
         .bearer_auth(TOKEN)
         .send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -211,19 +217,19 @@ async fn peer_identity_from_token_scopes_the_share_list() {
 
     // 未开播的共享项：握着有效 token 也读不到
     let resp = client
-        .get(format!("http://{ip}:{port}/tree?share={hidden_id}&path="))
+        .get(format!("https://{ip}:{port}/tree?share={hidden_id}&path="))
         .bearer_auth(TOKEN)
         .send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 
     // 不带 token：连列表都拿不到
-    let resp = client.get(format!("http://{ip}:{port}/shares")).send().await.unwrap();
+    let resp = client.get(format!("https://{ip}:{port}/shares")).send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     // 对方断开长连接：可见性立刻消失
     state.ws.drop_peer(PEER_ID);
     let resp = client
-        .get(format!("http://{ip}:{port}/shares"))
+        .get(format!("https://{ip}:{port}/shares"))
         .bearer_auth(TOKEN)
         .send().await.unwrap();
     let json: serde_json::Value = resp.json().await.unwrap();

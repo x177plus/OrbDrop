@@ -754,7 +754,8 @@ mod tests {
 
     /// BC 的 WebDAV 客户端先**裸发**一次请求，必须收到带 `WWW-Authenticate: Basic` 的 401，
     /// 它才会拿 profile 里的账号密码重试；只回 401 不带挑战头，BC 直接判定连接失败。
-    /// （回环地址走 `Caller::Local` 免认证，所以这条必须走本机局域网地址。）
+    /// （回环地址走 `Caller::Local` 免认证，所以这条必须走本机局域网地址；而对端那一跳现在
+    /// 是 TLS —— 用本机那份自签身份按 TOFU 认下来，见 `net::PinnedVerifier`。）
     #[tokio::test]
     async fn non_loopback_dav_requests_get_a_basic_challenge() {
         let (state, port, root, share_id) = serve(4100).await;
@@ -765,9 +766,9 @@ mod tests {
             return;
         };
 
-        let client = Client::new();
+        let client = crate::net::client();
         let resp = client
-            .get(format!("http://{ip}:{port}/dav/{share_id}/"))
+            .get(format!("https://{ip}:{port}/dav/{share_id}/"))
             .send()
             .await
             .unwrap();
@@ -784,11 +785,36 @@ mod tests {
 
         // 裸 URL（不带凭据）也要走同一条路：BC 的第一次探测正是这种请求
         let resp = client
-            .request(propfind(), format!("http://{ip}:{port}/dav/{share_id}/"))
+            .request(propfind(), format!("https://{ip}:{port}/dav/{share_id}/"))
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::UNAUTHORIZED);
+
+        crate::server::stop_server(&state).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// **局域网上的明文请求一律连不上**：同一个端口上明文只服务回环（`net::dispatch_conn`）。
+    /// 这条是"加密不是可选的"那半句的实现保证 —— 少了它，任何客户端都能退回明文。
+    #[tokio::test]
+    async fn plaintext_from_the_lan_is_dropped() {
+        let (state, port, root, share_id) = serve(4105).await;
+        let Some(ip) = local_lan_ip() else {
+            crate::server::stop_server(&state).await;
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        };
+
+        let plain = Client::new()
+            .get(format!("http://{ip}:{port}/dav/{share_id}/"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+        assert!(
+            plain.is_err(),
+            "局域网地址上的明文请求必须被丢掉，实际拿到 {plain:?}"
+        );
 
         crate::server::stop_server(&state).await;
         let _ = std::fs::remove_dir_all(root);
@@ -810,8 +836,8 @@ mod tests {
         let token = format!("dav-tok-{}", uuid::Uuid::new_v4());
         crate::credential::set_peer("dav-peer", &token).unwrap();
 
-        let client = Client::new();
-        let url = format!("http://{ip}:{port}/dav/{share_id}/");
+        let client = crate::net::client();
+        let url = format!("https://{ip}:{port}/dav/{share_id}/");
         let ok = client
             .get(&url)
             .basic_auth(crate::bc::DAV_USER, Some(&token))

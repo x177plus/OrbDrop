@@ -205,8 +205,17 @@ pub fn provision_profiles(state: &AppState) -> usize {
         .collect();
 
     let mut written = 0;
+    // 本机服务端口：profile 的 BaseURL 指向**本机**的 WebDAV 代理（`server::proxy`），
+    // 不再是找对端直连 —— 传输走 TLS 之后 BC 没法直连对端（它不做证书指纹校验，
+    // 而"让用户装证书"是不要的方案）。
+    let own_port = state
+        .server_port
+        .load(std::sync::atomic::Ordering::SeqCst);
     // 「现在还在册」的 profile 名：已配对且有地址的设备。prune 只删不在这个集合里的
     // 我们自己的条目（设备已解除配对，或地址漂移后留下的旧名字）。
+    //
+    // **即使写不了也要把 keep 算全**（服务没起来时 `own_port == 0`）：漏算的后果是
+    // prune 把在册设备的 profile 顺手剪掉 —— 用户下次开 BC 会发现位置全没了。
     let mut keep: Vec<String> = Vec::new();
     for (peer_id, ip, port) in peers {
         // 地址簿里可能只有 id（来自凭据库但没有 ip:端口）：写不出 profile 名，跳过。
@@ -220,7 +229,10 @@ pub fn provision_profiles(state: &AppState) -> usize {
         };
         // 先记进 keep 再写：写失败也不该让这条（仍然有效的）profile 被清掉。
         keep.push(host_port.clone());
-        let base_url = format!("http://{host_port}/dav/");
+        if own_port == 0 {
+            continue; // 服务没在跑：写出去只会指到一个没人听的端口，留给下次启动
+        }
+        let base_url = crate::server::proxy::base_url(own_port, &peer_id);
         match upsert_webdav_profile(&dir, &host_port, &base_url, DAV_USER, &token) {
             Ok(_) => written += 1,
             Err(e) => warn!(peer = %host_port, "预写 BC profile 失败: {e}"),
@@ -653,7 +665,8 @@ fn join_relative(root: &Path, rel: &str) -> PathBuf {
 /// 把比较位解析成 BC 参数：本机共享项 → 本地绝对路径；对端共享项 → `profile:<ip:port>?<shareId>/<路径>`。
 ///
 /// 对端这一路会顺手写好 WebDAV profile——每台设备一条，名字就是 `ip:port`（BC 自己的命名习惯），
-/// BaseURL 指向对端 DAV 根，密码是该设备的 token。
+/// **BaseURL 指向本机的 WebDAV 代理**（`server::proxy`，回环），密码是该设备的 token。
+/// BC 因此永远不接触对端的证书，而本机到对端那一跳是 TLS + 指纹校验。
 pub fn resolve_side(state: &AppState, exe: &Path, target: &BcTarget) -> Result<ResolvedSide, String> {
     let label = label_of(state, target);
     match target {
@@ -697,7 +710,13 @@ pub fn resolve_side(state: &AppState, exe: &Path, target: &BcTarget) -> Result<R
                 .ok_or_else(|| "未与对方配对，拿不到 token".to_string())?;
 
             let host_port = format!("{}:{}", peer.ip, peer.port);
-            let base_url = format!("http://{host_port}/dav/");
+            let own_port = state
+                .server_port
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if own_port == 0 {
+                return Err("本机服务未在运行：WebDAV 代理不可用".to_string());
+            }
+            let base_url = crate::server::proxy::base_url(own_port, peer_id);
             upsert_webdav_profile(&config_dir(exe), &host_port, &base_url, DAV_USER, &token)?;
 
             let rel = if path.is_empty() {

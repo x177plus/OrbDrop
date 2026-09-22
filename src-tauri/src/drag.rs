@@ -330,7 +330,7 @@ async fn walk_peer_item(
     let token = credential::get_peer_token(peer_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "未配对，无法读取对方的共享项".to_string())?;
-    let base = format!("http://{}:{}", peer.ip, peer.port);
+    let base = crate::net::peer_base(&peer.ip, peer.port);
 
     let source = |path: String| PeerFile {
         base: base.clone(),
@@ -415,8 +415,11 @@ const NOT_A_DIRECTORY: &str = "对端说它不是目录";
 // ---------------------------------------------------------------------------
 
 /// 问对端用的 HTTP 客户端（起拖前的元数据与提前转存共用）。
+///
+/// 走 `net::client_builder`：到对端的一切都要过 TLS 并且按钉住的指纹校验身份，
+/// 随手 `Client::new()` 会在自签证书上直接失败。
 fn peer_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::net::client_builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
         .build()
@@ -1003,7 +1006,7 @@ mod imp {
         let data: IDataObject = DragDataObject {
             payload: payload.clone(),
             handle,
-            client: reqwest::Client::builder()
+            client: crate::net::client_builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -1581,7 +1584,7 @@ mod imp {
             DragDataObject {
                 payload,
                 handle: tokio::runtime::Handle::current(),
-                client: reqwest::Client::new(),
+                client: crate::net::client(),
                 seen: Default::default(),
             }
             .into()

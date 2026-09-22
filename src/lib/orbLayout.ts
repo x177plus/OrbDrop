@@ -1,11 +1,11 @@
 /**
  * 悬浮球展开布局：纯几何，全部用物理像素。
  *
- * 参考点只有一个：折叠态**悬浮体（球 / 卡片）的左上角**（不是 OS 窗口的左上角 —— 窗口 =
- * 悬浮体 + 四周阴影/角标余量，两种形态的余量与尺寸都不同，见 `planExpansion`）。
- * 展开时这个点在屏幕上的位置保持不变，面板朝空间足够的一侧长出；任何情况下展开窗口都在
- * 显示器工作区内夹取，保证框完整可见、不被任务栏/屏幕边缘裁掉。收起时按窗口位移把这个点
- * 平移回去，再由调用方按**当前形态**换算成折叠态窗口左上角。
+ * 参考点只有一个：折叠态**悬浮体本体的中心**（球是圆心、卡片是白底中心，见 `orbShape.ts` 的
+ * `body`）。展开时面板的**可视盒角**落在这个中心上（朝左下展开 → 盒的右上角 = 中心），
+ * 面板从中心往空间足够的一侧长出；任何情况下展开窗口都在显示器工作区内夹取，保证框完整可见、
+ * 不被任务栏/屏幕边缘裁掉。收起时按窗口位移把这个中心平移回去，再由调用方按**当前形态**
+ * 换算成折叠态窗口左上角。
  */
 
 export type ScreenRect = { x: number; y: number; w: number; h: number };
@@ -22,87 +22,102 @@ export type ExpansionPlan = {
   /** 展开后的窗口矩形（物理像素） */
   window: ScreenRect;
   /**
-   * 悬浮体（球 / 卡片）在展开窗口内的偏移（物理像素；转 CSS 需除以 scaleFactor）。
+   * 参考点（悬浮体**本体中心**）在展开窗口内的偏移（物理像素；转 CSS 需除以 scaleFactor）。
    * 用绝对偏移而不是「贴角 + inset」：绝对 left/top 不受 CSS 视口尺寸影响，
    * 而贴 right/bottom 会依赖视口宽度/高度 —— WebView2 的视口尺寸比 OS 窗口
    * 变化滞后 1~2 帧，贴角方案会因此把悬浮体画偏。
    */
-  orbOffset: { x: number; y: number };
+  anchorOffset: { x: number; y: number };
 };
 
 /**
- * 展开布局：**以悬浮体的左上角为唯一参考点**，不是以 OS 窗口的矩形。
+ * 展开布局：**以悬浮体本体（球 / 卡片）的中心为唯一参考点**，面板的**可视盒角**落在这一点上。
  *
- * 为什么不能拿窗口算：窗口 = 悬浮体 + 四周阴影/角标余量，而两种形态的余量与**尺寸**都不同
- * （圆球：窗口 90×90、球内缩 14；悬浮框：窗口 236×162、卡片内缩 14/10）。同一个悬浮体位置，
- * 两种形态的窗口左/右缘差 236 − 90 = 146px —— 拿窗口判方向、算落位，同一个悬浮体位置展开
- * 出来的面板就是两个地方（切形态再展开，面板会横跳一百多像素）。只看**一个点**则两种形态
- * 逐像素同解。
+ * 规则：面板的盒（`box`）从中心往选定方向长，也就是「朝左下展开 → 盒的右上角 = 中心」，
+ * 其余方向同理。于是悬浮体永远被面板的角**切掉一半**（球心/卡片中心正好压在角的顶点上），
+ * 两形态四方向完全一致。
  *
- * 面板贴着这个点展开：朝右 = `[点, 点 + 面板宽]`、朝左 = `[点 − 面板宽, 点]`；上下同理。
- * 面板因此会盖住悬浮体自己那一块 —— 展开态悬浮体本来就不画（`main.css` 的
- * `.orb-stage.open .orb` / `.rq` 都是 `opacity: 0`），盖着看不见。
+ * 为什么参考点是中心而不是左上角、也不是悬浮体的某条边：
+ *   · 落位公式里**不出现悬浮体尺寸** → 同一个中心，球（62）与卡片（176×134）展开出的面板
+ *     **逐像素相同**（拿边算的话，位置里会带上尺寸，两形态差一个悬浮体尺寸：朝左 144px）。
+ *   · 又因为"点在悬浮体内部半个身位处"，面板天然压住悬浮体那一块 —— 不需要额外规则。
+ *
+ * 盒外的 `slack`（面板四周的阴影余量）由调用方给：窗口 = 盒 + 四周一圈 slack，所以窗口比盒大
+ * `slack` 两边、落位时也要把这一圈算进去，否则压在角上的会是窗口边（露出整条阴影余量的缝）。
+ *
+ * 装不下时（工作区比面板小）先收盒，再夹进工作区；贴边那一档把该轴 `margin` 给 0 —— 此时
+ * 中心多半已经在屏幕外（贴边收起把悬浮体推出了大半），夹取会把窗口顶在工作区边上，面板就
+ * 贴着屏幕边（正是贴边档要的效果）。
  */
 export function planExpansion(input: {
-  /** 折叠态悬浮体（球 / 卡片）的左上角（屏幕物理像素） */
-  orb: { x: number; y: number };
+  /** 折叠态悬浮体本体的中心（屏幕物理像素） */
+  center: { x: number; y: number };
   /** 悬浮体所在显示器的工作区（不含任务栏/Dock） */
   work: ScreenRect;
-  /** 展开窗口目标尺寸 */
-  expanded: { w: number; h: number };
-  /** 展开窗口与工作区边缘的最小间距 */
-  margin: number;
+  /** 面板可视盒尺寸（不含四周阴影余量） */
+  box: { w: number; h: number };
+  /** 面板四周留给阴影/投影的余量（窗口比盒大出的那一圈） */
+  slack: number;
+  /** 各轴与工作区边缘的最小间距（贴边那一档该轴给 0：窗口贴住工作区边） */
+  margin: { x: number; y: number };
 }): ExpansionPlan {
-  const { orb, work, expanded, margin } = input;
+  const { center, work, box, slack, margin } = input;
 
-  // 工作区放不下目标尺寸时先收窗口（面板随之收缩），「完整可见」优先于标称尺寸
-  const w = Math.min(expanded.w, Math.max(1, work.w - margin * 2));
-  const h = Math.min(expanded.h, Math.max(1, work.h - margin * 2));
+  // 工作区放不下目标尺寸时先收盒（面板随之收缩），「完整可见」优先于标称尺寸
+  const bw = Math.min(box.w, Math.max(1, work.w - (margin.x + slack) * 2));
+  const bh = Math.min(box.h, Math.max(1, work.h - (margin.y + slack) * 2));
+  const w = Math.round(bw + slack * 2);
+  const h = Math.round(bh + slack * 2);
 
-  // 参考点到工作区各边的余量：面板要整个装进其中一边
-  const spaceRight = work.x + work.w - orb.x;
-  const spaceLeft = orb.x - work.x;
-  const spaceDown = work.y + work.h - orb.y;
-  const spaceUp = orb.y - work.y;
+  // 参考点到工作区各边的余量：盒（连同它那一侧要占的 slack 与边距）要整个装进其中一边
+  const needX = bw + slack + margin.x;
+  const needY = bh + slack + margin.y;
+  const spaceRight = work.x + work.w - center.x;
+  const spaceLeft = center.x - work.x;
+  const spaceDown = work.y + work.h - center.y;
+  const spaceUp = center.y - work.y;
 
   // 哪边装得下就朝哪边；两边都不够时朝空间更大的一边
-  const openRight = spaceRight >= w ? true : spaceLeft >= w ? false : spaceRight >= spaceLeft;
-  const openDown = spaceDown >= h ? true : spaceUp >= h ? false : spaceDown >= spaceUp;
+  const openRight = spaceRight >= needX ? true : spaceLeft >= needX ? false : spaceRight >= spaceLeft;
+  const openDown = spaceDown >= needY ? true : spaceUp >= needY ? false : spaceDown >= spaceUp;
 
+  // 盒角落在中心上：朝右/下 → 盒的近边 = 中心；朝左/上 → 盒的远边 = 中心
+  const atX = openRight ? center.x - slack : center.x - bw - slack;
+  const atY = openDown ? center.y - slack : center.y - bh - slack;
   const x = Math.min(
-    Math.max(openRight ? orb.x : orb.x - w, work.x + margin),
-    work.x + work.w - w - margin,
+    Math.max(atX, work.x + margin.x),
+    work.x + work.w - w - margin.x,
   );
   const y = Math.min(
-    Math.max(openDown ? orb.y : orb.y - h, work.y + margin),
-    work.y + work.h - h - margin,
+    Math.max(atY, work.y + margin.y),
+    work.y + work.h - h - margin.y,
   );
-  const win: ScreenRect = { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) };
+  const win: ScreenRect = { x: Math.round(x), y: Math.round(y), w, h };
 
   return {
     window: win,
-    orbOffset: { x: orb.x - win.x, y: orb.y - win.y },
+    anchorOffset: { x: center.x - win.x, y: center.y - win.y },
   };
 }
 
-/** 收起布局：把悬浮体的参考点（左上角）按窗口的位移整体平移。
+/** 收起布局：把参考点（悬浮体本体中心）按窗口的位移整体平移。
  *
  * 展开态下用户拖动窗口（标题栏拖动）时，悬浮体相对窗口的偏移不变，所以收起后的参考点 =
  * 展开时的参考点 + 窗口位移 —— 悬浮体仍落在面板里它原来所在的那一角，而不是跳回
  * 展开前那块屏幕坐标。落位由调用方接着算：按**当前形态**把参考点换算成折叠态窗口左上角
- * （`App.svelte` 的 `windowFromBody`），再交给 `planDock`（圆球）/ `planRectDock`（悬浮框）判吸附
+ * （`App.svelte` 的 `windowFromCenter`），再交给 `planDock`（圆球）/ `planRectDock`（悬浮框）判吸附
  * —— 面板开着时改过形态，也只会挪窗口，悬浮体一动不动。
  */
 export function planCollapse(input: {
-  /** 展开时记下的悬浮体（球 / 卡片）左上角（屏幕物理像素） */
-  orb: { x: number; y: number };
+  /** 展开时记下的悬浮体本体中心（屏幕物理像素） */
+  anchor: { x: number; y: number };
   /** 展开时记下的展开窗口位置（物理像素） */
   expanded: { x: number; y: number };
   /** 展开窗口当前位置（拖动后与 expanded 不同；物理像素） */
   current: { x: number; y: number };
 }): { x: number; y: number } {
-  const { orb, expanded, current } = input;
-  return { x: orb.x + current.x - expanded.x, y: orb.y + current.y - expanded.y };
+  const { anchor, expanded, current } = input;
+  return { x: anchor.x + current.x - expanded.x, y: anchor.y + current.y - expanded.y };
 }
 
 /** 贴边方向：-1 = 贴左/上，1 = 贴右/下，0 = 不贴边 */

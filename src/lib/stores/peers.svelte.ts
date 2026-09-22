@@ -1,5 +1,5 @@
 import { listen } from '@tauri-apps/api/event';
-import type { PeerDevice, PeerShareItem } from '$lib/types';
+import type { PeerShareItem } from '$lib/types';
 import * as api from '$lib/api';
 import { getDevices } from './devices.svelte';
 
@@ -32,12 +32,11 @@ function patch(peerId: string, next: Partial<PeerSharesState>) {
   states = { ...states, [peerId]: { ...(states[peerId] ?? EMPTY), ...next } };
 }
 
-/** 对端 HTTP 入口：ip/port 都来自设备列表（mDNS/手动添加/配对请求三处合并的结果）。 */
-export function peerBaseUrl(peer: PeerDevice): string {
-  return `http://${peer.ip}:${peer.port}`;
-}
-
-/** 拉取（或刷新）某台设备对本机可见的共享项。 */
+/** 拉取（或刷新）某台设备对本机可见的共享项。
+ *
+ * 地址与 token 都在后端（`api.peerShares`）：到对端那一跳是 TLS + 自签证书，
+ * WebView 不会认我们的证书，也不该认。
+ */
 export async function loadPeerShares(peerId: string): Promise<void> {
   const peer = getDevices().find((d) => d.id === peerId);
   if (!peer) {
@@ -46,12 +45,10 @@ export async function loadPeerShares(peerId: string): Promise<void> {
   }
   patch(peerId, { loading: true, error: null });
   try {
-    const token = await api.getPeerToken(peerId);
-    if (!token) throw new Error('未配对，无法读取对方的共享项');
-    const items = await api.fetchPeerShares(peerBaseUrl(peer), token);
+    const items = await api.peerShares(peerId);
     patch(peerId, { items, loaded: true, loading: false, error: null });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : '加载失败';
+    const msg = e instanceof Error ? e.message : String(e);
     patch(peerId, { items: [], loaded: true, loading: false, error: `读取失败：${msg}` });
   }
 }

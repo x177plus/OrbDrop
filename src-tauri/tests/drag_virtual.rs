@@ -6,8 +6,9 @@
 //! 走真 HTTP：本机起一个实例、地址簿里把自己当成对端，于是 `/tree` 递归、名字清洗、
 //! 单文件走 `/stat`、越界拒绝全都被真的走一遍。
 //!
-//! 注：keyring（系统凭据库）在本机会话下可用；测试用临时 device id，结束清理，
-//! 不污染真实配对。
+//! 注：凭据落在数据目录的 `credentials.dat`（系统凭据库那条路已经删掉了）；测试用临时
+//! device id，结束清理，不污染真实配对。到对端那一跳是 TLS，所以那个"老版本对端"桩
+//! 也必须说 TLS（用应用自己那份身份起服务端）。
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -196,16 +197,26 @@ async fn peer_oversized_item_stays_virtual() {
 /// 一个"老版本对端"：**只有 `/tree`**（没有 `/stat`），用来验证退回"列父目录"那条路。
 ///
 /// 只认 ASCII 名字（直接比对原始查询串，不解码），所以喂给它的目录名用英文。
+///
+/// **必须说 TLS**：到对端那一跳现在全是加密的（客户端拿钉住的指纹校验），明文桩会在
+/// 握手阶段就被拒绝 —— 那样测的就不是"老版本没有 /stat"这件事了。服务端用应用自己那份
+/// 身份（`net::server_config`），客户端按 TOFU 认下来。
 struct OldPeer {
     port: u16,
 }
 
 impl OldPeer {
     fn start(root: PathBuf, port: u16) -> Self {
+        let identity = orbdrop_lib::net::load_or_create_identity().expect("测试身份");
+        let tls = orbdrop_lib::net::server_config(&identity);
         let listener = TcpListener::bind(("127.0.0.1", port)).expect("绑端口");
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
+                let Ok(stream) = stream else { continue };
+                let Ok(conn) = rustls::ServerConnection::new(tls.clone()) else {
+                    continue;
+                };
+                let mut stream = rustls::StreamOwned::new(conn, stream);
                 let mut buf = [0u8; 4096];
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -245,14 +256,14 @@ impl OldPeer {
                 let _ = stream.write_all(response.as_bytes());
             }
         });
-        // 等它起来
+        // 等它能把端口接起来（后面那次裸 connect 会让桩在握手上失败一次，无所谓）
         for _ in 0..50 {
             if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        OldPeer { port }
+        Self { port }
     }
 }
 

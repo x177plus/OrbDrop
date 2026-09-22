@@ -89,7 +89,9 @@
    */
   function needsRepair(d: PeerDevice): boolean {
     const s = d.linkState;
-    return !!s && s.kind === 'stopped' && s.reason === 'tokenRejected';
+    // 两种都归这里：token 它不认（清过数据/解除了配对）、证书指纹对不上（它换了机器）。
+    // 对用户是同一个动作 —— 重新配对。
+    return !!s && s.kind === 'stopped' && (s.reason === 'tokenRejected' || s.reason === 'identityChanged');
   }
 
   /** 能收推送的才可勾：离线的一台**就地失败、不排队**（F-53），token 失效的一台必然 401。 */
@@ -145,7 +147,7 @@
   /** 不可勾的原因 —— 置灰的行光看状态 pill 不够，得说清"为什么不能选它"。 */
   function unselectableReason(d: PeerDevice): string {
     if (!d.online) return '「离线」：推送是 HTTP 直达对端，它不在网上只会就地失败（不排队）';
-    return '「需配对」：对端不认本机凭据，推送会被拒 —— 重新配对后再推';
+    return '「需配对」：对端不认本机凭据（或它换了机器），推送会被拒 —— 重新配对后再推';
   }
 
   function toggleSelect(d: PeerDevice) {
@@ -240,7 +242,8 @@
           // 对端点过「断开」：**对端主动做的事，同样属于正常断开**（重拨会被它拒绝，
           // 但它随时会拨回来或本机再点「连接」）—— 也回到「已配对」，不是"意外断开"。
           case 'peerDisconnected': return null;
-          case 'tokenRejected': return '需配对';
+          case 'tokenRejected':
+          case 'identityChanged': return '需配对';
         }
     }
     // waiting 与任何未知 kind 都落到这里：不额外占一档。
@@ -270,6 +273,7 @@
         switch (s.reason) {
           case 'peerDisconnected': return '对端点过「断开」：它只是临时暂停这条链路，不是解除配对 —— 自动重拨会被暂时挡住，谁点一次「连接」就恢复';
           case 'tokenRejected': return '对端不认本机的凭据（它清过数据或已解除配对）：需要重新配对';
+          case 'identityChanged': return '对端证书与本机记住的不一致（对方重装过 / 换过机器？）：需要重新配对才连得上';
           case 'localDisconnected': return '本机点过「断开」：重启后也不会自动连，点「连接」即可恢复';
         }
     }

@@ -510,9 +510,9 @@ pub fn report_to_sender(
         warn!(%peer_id, "推送回执无处可送：既没有长连接，也没有对方地址");
         return;
     };
-    let url = format!("http://{ip}:{port}/push/report");
+    let url = format!("{}/push/report", crate::net::peer_base(&ip, port));
     crate::task::spawn("push report", async move {
-        if let Err(e) = reqwest::Client::new().post(&url).json(&event).send().await {
+        if let Err(e) = crate::net::client().post(&url).json(&event).send().await {
             warn!(%url, %e, "推送回执发送失败");
         }
     });
@@ -557,7 +557,7 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
     // 下载跑在运行时上：「同意接收」是 async 命令（`task::spawn` 另有"没有 reactor 就退到
     // Tauri 全局运行时"的兜底，见 task.rs）—— 这条任务绝不能被无声丢掉，否则两边都停在 0%。
     crate::task::spawn("push download", async move {
-        let client = reqwest::Client::new();
+        let client = crate::net::client();
         let config = state.config.lock().clone();
         // 落盘根 = 用户设的下载目录（S-01）：推送接收不再单独有「收件目录」。
         //
@@ -576,9 +576,11 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
         };
 
         let base_url = format!(
-            "http://{}:{}/push/download",
-            callback.as_ref().map(|(ip, _)| ip.clone()).unwrap_or_default(),
-            callback.as_ref().map(|(_, port)| *port).unwrap_or(0)
+            "{}/push/download",
+            crate::net::peer_base(
+                callback.as_ref().map(|(ip, _)| ip.as_str()).unwrap_or_default(),
+                callback.as_ref().map(|(_, port)| *port).unwrap_or(0),
+            )
         );
 
         for file in &files {

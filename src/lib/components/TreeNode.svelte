@@ -2,7 +2,7 @@
   import type { TreeEntry } from '$lib/types';
   import { formatFileSize } from '$lib/types';
   import { untrack } from 'svelte';
-  import { fetchTree, fetchPeerTree } from '$lib/api';
+  import { fetchTree, peerTree } from '$lib/api';
   import { getServerPort } from '$lib/stores/shares.svelte';
   import { dragOut } from '$lib/dragOut';
   import TreeNode from './TreeNode.svelte';
@@ -11,10 +11,13 @@
     shareId,
     entry,
     level = 1,
-    // Remote browsing (P1): when set, fetches from a peer's HTTP API.
-    baseUrl,
-    token,
-    /** 远程模式下的设备 id：右键菜单要按「对端的文件」而不是「本机共享项」处理。 */
+    /**
+     * 远程模式下的设备 id：右键菜单要按「对端的文件」而不是「本机共享项」处理，
+     * 也决定这一层是问对端要还是问本机要。
+     *
+     * 对端的地址与凭据**不从前端传**：到对端那一跳是 TLS + 自签证书，WebView 既不会认
+     * 我们的证书也不该认 —— 所以整件事走后端命令（`api.peerTree`）。
+     */
     peerId,
     /** 对端目录变更信号：值变化时重拉本节点已加载的那一层（F-33）。 */
     refreshSignal = 0,
@@ -28,8 +31,6 @@
     shareId: string;
     entry: TreeEntry;
     level?: number;
-    baseUrl?: string;
-    token?: string;
     peerId?: string;
     refreshSignal?: number;
     parentPath?: string;
@@ -56,8 +57,8 @@
     loading = true;
     error = null;
     try {
-      if (baseUrl && token) {
-        children = await fetchPeerTree(baseUrl, token, shareId, ownPath);
+      if (peerId) {
+        children = await peerTree(peerId, shareId, ownPath);
       } else {
         children = await fetchTree(getServerPort(), shareId, ownPath);
       }
@@ -122,7 +123,7 @@
         <div class="node sub"><span class="n-name" style="color:var(--muted)">空目录</span></div>
       {:else}
         {#each children as child (child.name)}
-          <TreeNode {shareId} entry={child} level={level + 1} parentPath={ownPath} {baseUrl} {token} {peerId} {refreshSignal} />
+          <TreeNode {shareId} entry={child} level={level + 1} parentPath={ownPath} {peerId} {refreshSignal} />
         {/each}
       {/if}
     </div>

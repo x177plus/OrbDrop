@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
-  import { fetchPeerTree, getPeerToken } from '$lib/api';
-  import { getPeerSharesState, loadPeerShares, peerBaseUrl } from '$lib/stores/peers.svelte';
+  import { peerTree } from '$lib/api';
+  import { getPeerSharesState, loadPeerShares } from '$lib/stores/peers.svelte';
   import type { PeerDevice, PeerShareItem, TreeEntry } from '$lib/types';
   import { dragOut } from '$lib/dragOut';
   import TreeNode from './TreeNode.svelte';
@@ -20,12 +20,10 @@
   // 未展开过的共享项用只读占位：渲染期只能读状态，建条目必须发生在事件处理里。
   const EMPTY_TREE: ShareTree = Object.freeze({ expanded: false, entries: [], loaded: false, loading: false, error: null });
 
-  let token = $state<string | null>(null);
   /** 每次收到对端目录变更就自增，驱动 TreeNode 重拉自己已加载的那一层（F-33）。 */
   let refreshSignal = $state(0);
 
   const shares = $derived(getPeerSharesState(device.id));
-  const baseUrl = $derived(peerBaseUrl(device));
 
   function treeState(shareId: string): ShareTree {
     return treeStates[shareId] ?? EMPTY_TREE;
@@ -35,15 +33,7 @@
     treeStates = { ...treeStates, [shareId]: { ...treeState(shareId), ...next } };
   }
 
-  async function ensureToken(): Promise<string | null> {
-    if (token) return token;
-    const t = await getPeerToken(device.id);
-    token = t;
-    return t;
-  }
-
   onMount(() => {
-    void ensureToken();
     void loadPeerShares(device.id);
 
     // 对端目录变更（F-33）：根层就地重拉，展开中的子层靠 refreshSignal 各自重拉。
@@ -62,9 +52,7 @@
     // 展开状态和子层缓存全丢，反而看不出"自动刷新"。
     patchTree(shareId, inPlace ? { error: null } : { loading: true, error: null });
     try {
-      const t = await ensureToken();
-      if (!t) throw new Error('未配对，无法读取对方的共享项');
-      const entries = await fetchPeerTree(baseUrl, t, shareId, '');
+      const entries = await peerTree(device.id, shareId, '');
       patchTree(shareId, { entries, loaded: true });
     } catch (e: unknown) {
       patchTree(shareId, { error: e instanceof Error ? e.message : '加载失败' });
@@ -83,7 +71,6 @@
 
   /** 手动刷新兜底（F-33）：重拉共享项清单 + 已加载的根层，展开状态保持不变。 */
   async function refresh() {
-    token = await getPeerToken(device.id);
     refreshSignal += 1;
     for (const [shareId, st] of Object.entries(treeStates)) {
       if (st.loaded) void loadShareRoot(shareId, true);
@@ -178,7 +165,7 @@
                 <div class="node"><span class="n-name" style="color:var(--muted)">空目录</span></div>
               {:else if ts.expanded}
                 {#each ts.entries as entry (entry.name)}
-                  <TreeNode shareId={share.id} {entry} level={1} {baseUrl} token={token ?? undefined} peerId={device.id} {refreshSignal} />
+                  <TreeNode shareId={share.id} {entry} level={1} peerId={device.id} {refreshSignal} />
                 {/each}
               {/if}
             </div>

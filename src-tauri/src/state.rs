@@ -382,7 +382,7 @@ impl AppState {
 
     /// 把一台设备的行换个 id，其余照旧（配对状态、地址、长连接意图都保留）。
     ///
-    /// 用在对端被重置过、但配对凭据还在（系统凭据库里那一条没跟着清）的场合：关系
+    /// 用在对端被重置过、但配对凭据还在（本机的凭据文件里那一条没跟着清）的场合：关系
     /// 还活着，只是对端的 id 变了。列表里**只留一行** —— 新 id 那行（mDNS 刚发现的）
     /// 并进这一行，不是并排出现两行。
     ///
@@ -613,6 +613,54 @@ pub fn visible_peers(state: &Arc<AppState>, targets: &[String]) -> Vec<PeerDevic
 }
 
 // ---------------------------------------------------------------------------
+// 证书指纹（TLS 信任）
+// ---------------------------------------------------------------------------
+
+/// 把凭据库里钉住的指纹灌进 `net::Trust`：TLS 校验器**每一次握手**读的就是那份快照。
+///
+/// 整份重建而不是增量改：地址簿与凭据库才是真相。凡是这两处变了（配对、解除配对、地址
+/// 漂移、指纹落库、对端换 id），都要跟着调一次 —— 少调一次，表现就是"刚配对好却连不上"。
+pub fn refresh_trust(state: &Arc<AppState>) {
+    let credentials = crate::credential::load_credentials().unwrap_or_default();
+    let peers = state.peers.lock();
+    let entries = peers.iter().filter_map(|peer| {
+        let pinned = credentials.get(&peer.id)?.fingerprint.clone();
+        if pinned.is_empty() || peer.ip.is_empty() {
+            return None;
+        }
+        Some((peer.ip.clone(), pinned))
+    });
+    crate::net::trust().seed(entries);
+}
+
+/// 记下这次连上对端时见到的证书指纹（TOFU 的落库那一半）。
+///
+/// 只在**本机还没有它的指纹**时写：已经有了，就说明这次握手正是拿那枚指纹校验过的，
+/// 没有别的可记。调用点都在"刚跟对端成功建立了一条 TLS 连接"的地方。
+pub fn remember_peer_fingerprint(state: &Arc<AppState>, peer_id: &str, ip: &str) {
+    if matches!(
+        crate::credential::get_peer_fingerprint(peer_id),
+        Ok(Some(_))
+    ) {
+        return;
+    }
+    let Some(observed) = crate::net::trust().observed_at(ip) else {
+        return; // 这一跳没走 TLS（回环 / 测试），没什么可记
+    };
+    match crate::credential::set_peer_fingerprint(peer_id, &observed) {
+        Ok(()) => {
+            info!(
+                %peer_id,
+                fingerprint = %crate::net::short_fingerprint(&observed),
+                "已钉住对端证书指纹"
+            );
+            refresh_trust(state);
+        }
+        Err(e) => warn!(%peer_id, "指纹落库失败: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 设备身份核对（同一台设备不能有两行）
 // ---------------------------------------------------------------------------
 
@@ -637,31 +685,64 @@ pub struct PeerIdentity {
 ///
 /// 这是**同一台设备两行**这个问题的关键一问：光"这个地址上有人答话"不足以证明
 /// 旧行存的那台设备还在，必须问出它现在的 id。
+///
+/// **`Rejected` 必须与 `Unreachable` 分开**：前者是"这个地址上的身份不是本机认的那一个"
+/// （对端换了机器 / 有人在中间），它既不是"离线"、也不是"换了 id 的另一台设备"，而是一条
+/// 明确的关系问题（界面显示「需配对」）；后者只是"这会儿问不到"，判离线、等下一轮。
+#[derive(Debug)]
+pub enum IdentityProbe {
+    Seen(PeerIdentity),
+    Rejected,
+    Unreachable,
+}
+
+pub async fn probe_identity(
+    client: &reqwest::Client,
+    ip: &str,
+    port: u16,
+    token: Option<&str>,
+) -> IdentityProbe {
+    let url = format!("{}/pair/info", crate::net::peer_base(ip, port));
+    let mut request = client.get(&url);
+    if let Some(t) = token {
+        request = request.bearer_auth(t);
+    }
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(e) => {
+            return if crate::net::is_identity_rejected(&e) {
+                IdentityProbe::Rejected
+            } else {
+                IdentityProbe::Unreachable
+            };
+        }
+    };
+    let response = match response.error_for_status() {
+        Ok(response) => response,
+        Err(_) => return IdentityProbe::Unreachable,
+    };
+    match response.json::<serde_json::Value>().await {
+        Ok(body) => IdentityProbe::Seen(PeerIdentity {
+            id: body["id"].as_str().unwrap_or_default().to_string(),
+            name: body["name"].as_str().unwrap_or_default().to_string(),
+            paired_as: body["pairedAs"].as_str().map(str::to_string),
+        }),
+        Err(_) => IdentityProbe::Unreachable,
+    }
+}
+
+/// 只要"问到了"的那一份（指纹被拒 / 问不到都折叠成 `None`）。给"问不到就不妄动"的
+/// 调用方用；需要区分原因的地方用 `probe_identity`。
 pub async fn fetch_identity(
     client: &reqwest::Client,
     ip: &str,
     port: u16,
     token: Option<&str>,
 ) -> Option<PeerIdentity> {
-    let url = format!("http://{ip}:{port}/pair/info");
-    let mut request = client.get(&url);
-    if let Some(t) = token {
-        request = request.bearer_auth(t);
+    match probe_identity(client, ip, port, token).await {
+        IdentityProbe::Seen(identity) => Some(identity),
+        _ => None,
     }
-    let body: serde_json::Value = request
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    Some(PeerIdentity {
-        id: body["id"].as_str().unwrap_or_default().to_string(),
-        name: body["name"].as_str().unwrap_or_default().to_string(),
-        paired_as: body["pairedAs"].as_str().map(str::to_string),
-    })
 }
 
 /// [`fetch_discover`] 的三种结果。
@@ -692,7 +773,7 @@ pub async fn fetch_discover(
     token: &str,
     own_id: &str,
 ) -> DiscoverOutcome {
-    let url = format!("http://{ip}:{port}/discover");
+    let url = format!("{}/discover", crate::net::peer_base(ip, port));
     let response = match client.get(&url).bearer_auth(token).send().await {
         Ok(r) => r,
         Err(_) => return DiscoverOutcome::Unreachable,
@@ -774,11 +855,30 @@ pub fn probe_step(expected_id: &str, seen: Option<PeerIdentity>) -> ProbeStep {
     }
 }
 
+/// 探活的客户端。**必须是带 pinning 的那一个**（`net::client_builder`）：到对端那一跳
+/// 是 TLS，随手 `Client::new()` 只会在自签证书上失败 —— 表现是"所有设备都离线"，
+/// 而且看不出原因。所以这个客户端不由调用方传进来，免得哪一处传错了。
+static PROBE_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    crate::net::client_builder()
+        .timeout(Duration::from_millis(1500))
+        .build()
+        .unwrap_or_default()
+});
+
+/// 身份核对用的客户端（超时比探活宽一点：这一步的回话更长，一问一答里带整段设备表）。
+static RECONCILE_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    crate::net::client_builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap_or_default()
+});
+
 /// 一轮探活：给每台"有地址"的设备问一次身份，判死活或收拾换了 id 的行。
 ///
 /// 由 lib.rs 的 5s 循环调用；单独成函数是为了让"地址上现在是另一台设备"这条路径
 /// 能在测试里对着真服务器跑（见 tests/p1_integration.rs）。
-pub async fn probe_peers_once(state: &Arc<AppState>, client: &reqwest::Client) {
+pub async fn probe_peers_once(state: &Arc<AppState>) {
+    let client = &PROBE_CLIENT;
     // 「学来的」行不在这里探：它们不是本机发现的，本机跟它们之间没有关系，拨过去既没有
     // 意义（可达性由"和担保人同子网"保证），也正是这条路要避免的多余一跳。它们的存活由
     // 担保人的 `/discover` 表刷新 —— 见 `learn_peers` / `sweep_learned`。
@@ -811,18 +911,40 @@ pub async fn probe_peers_once(state: &Arc<AppState>, client: &reqwest::Client) {
         // 有 token 就走 `/discover`：它一举两得 —— 既认出对端是谁，又把「对端那一段里
         // 在线的设备」带回来（跨网段发现）。没有 token 的（未绑定/只手动加过）仍旧只问
         // 身份：它们不该看到本机认识了谁。
-        let seen = match token.as_deref() {
+        let probe = match token.as_deref() {
             Some(t) => match fetch_discover(client, &p.ip, p.port, t, &own_id).await {
                 DiscoverOutcome::Ok { identity, peers } => {
                     state.learn_peers(&p.id, peers);
-                    Some(identity)
+                    IdentityProbe::Seen(identity)
                 }
                 DiscoverOutcome::Fallback => {
-                    fetch_identity(client, &p.ip, p.port, token.as_deref()).await
+                    probe_identity(client, &p.ip, p.port, token.as_deref()).await
                 }
-                DiscoverOutcome::Unreachable => None,
+                DiscoverOutcome::Unreachable => IdentityProbe::Unreachable,
             },
-            None => fetch_identity(client, &p.ip, p.port, token.as_deref()).await,
+            None => probe_identity(client, &p.ip, p.port, token.as_deref()).await,
+        };
+        // 指纹对不上：这个地址上的身份不是本机认的那一个。既不是"离线"（它答话了），
+        // 也不是"换了 id 的另一台设备"（那是同一台机器上的新身份，有 token 可以迁）——
+        // 这是一条明确的关系问题，界面上就该显示「需配对」。
+        if matches!(probe, IdentityProbe::Rejected) {
+            warn!(peer_id = %p.id, "对端证书指纹与钉住的不一致：需重新配对");
+            state.set_peer_online(&p.id, false);
+            state.ws.set_link_state(
+                &p.id,
+                crate::ws::LinkState::Stopped {
+                    reason: crate::ws::StopReason::IdentityChanged,
+                },
+            );
+            continue;
+        }
+        let seen = match probe {
+            IdentityProbe::Seen(identity) => {
+                // 这一问走的是 TLS：连上了就把这次见到的指纹补上（老记录、或首次连上）。
+                remember_peer_fingerprint(state, &p.id, &p.ip);
+                Some(identity)
+            }
+            _ => None,
         };
         match probe_step(&p.id, seen) {
             ProbeStep::Online => {
@@ -843,6 +965,9 @@ pub async fn probe_peers_once(state: &Arc<AppState>, client: &reqwest::Client) {
             // ——那正是列表里同一台设备两行（旧行已绑定、新行未绑定）的来源。
             ProbeStep::OtherIdentity(identity) => {
                 apply_identity_reconcile(state, &p.id, &identity);
+                // 换 id 时凭据整条（token + 指纹）跟着迁，地址簿也变了 —— Trust 那张
+                // "地址 → 指纹"的表得重灌一次，否则新 id 那条记录不会生效。
+                refresh_trust(state);
             }
         }
     }
@@ -853,11 +978,8 @@ pub async fn probe_peers_once(state: &Arc<AppState>, client: &reqwest::Client) {
 }
 
 /// 向一个地址问清身份并按结果收拾旧行（探活与 mDNS 发现共用的入口）。
-pub async fn reconcile_stale_identity(
-    state: &Arc<AppState>,
-    client: &reqwest::Client,
-    stale_id: &str,
-) {
+pub async fn reconcile_stale_identity(state: &Arc<AppState>, stale_id: &str) {
+    let client = &RECONCILE_CLIENT;
     let Some(stale) = state.get_peer(stale_id) else {
         return;
     };
@@ -883,9 +1005,9 @@ pub async fn reconcile_stale_identity(
 ///
 /// 两条路，都不会留下"同一台设备两行"：
 ///
-/// - **它还认我们**（`paired_as` = 本机 id）→ 对端被清的只是数据目录，配对凭据在
-///   系统凭据库里（那是另一处存储）。这一行**迁到新 id**：配对状态、地址、"长连接"
-///   记忆都跟着过去，凭据的键也换掉（token 值不变，两边照旧互相认）。
+/// - **它还认我们**（`paired_as` = 本机 id）→ 对端被清的只是它那边的一部分状态，本机手里
+///   那条凭据还有效。这一行**迁到新 id**：配对状态、地址、"长连接"
+///   记忆都跟着过去，凭据的键也换掉（token 与指纹不变，两边照旧互相认）。
 /// - **它不认我们** → 关系确实断了（对端的凭据库也清了）。只作废这一行的地址、标记
 ///   离线，配对记录与 token 都留着 —— 对端拿原 id 回来时这一行还能用。列表里剩下的
 ///   是它真正的新身份（mDNS 发现的那一行）。
