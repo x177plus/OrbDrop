@@ -128,6 +128,7 @@ fn list_dir(raw: &str) -> Result<FsListing, FsError> {
 
     let crumbs = crumbs_of(&path);
     let own_data_dir = crate::config::data_dir();
+    let mirror_root = crate::mirror::root();
     let mut entries = Vec::new();
     let dir = std::fs::read_dir(&path).map_err(|e| FsError::from_io(&e, &crumbs))?;
     for entry in dir {
@@ -147,6 +148,7 @@ fn list_dir(raw: &str) -> Result<FsListing, FsError> {
         if crate::unsendable::is_link(&ft)
             || crate::unsendable::is_system_name(&name, at_root)
             || crate::unsendable::is_own_data_dir(&entry_path, &own_data_dir)
+            || crate::unsendable::is_mirror_path(&entry_path, &mirror_root)
         {
             continue;
         }

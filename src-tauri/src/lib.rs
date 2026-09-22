@@ -7,9 +7,11 @@ pub mod discover;
 pub mod drag;
 pub mod fs_browse;
 pub mod log;
+pub mod mirror;
 pub mod net;
 pub mod orb_window;
 pub mod pair;
+pub mod peer_fs;
 pub mod server;
 pub mod share;
 pub mod state;
@@ -150,6 +152,16 @@ pub async fn add_share_impl(state: &Arc<AppState>, path: String) -> Result<Share
     let p = PathBuf::from(&path);
     if !p.exists() {
         return Err(format!("路径不存在: {path}"));
+    }
+    // 镜像里的东西不能当共享项（见 `unsendable::is_mirror_path`）：那里放的是**占位符**，
+    // 对端拿到的是一个读不出内容的空壳；而且它自己都没法被 watcher 挂上。
+    if crate::unsendable::is_mirror_path(&p, &crate::mirror::root()) {
+        return Err("镜像目录（拖放用的本地占位符）不能添加为共享项".into());
+    }
+    // 数据目录里的东西一律不行：`credentials.dat`（全部设备 token）、`identity.pem`、`config.toml`
+    // 都在里面。它们不只是"不该被分享" —— 一条共享项加上一次推送就等于把本机凭据交给对端。
+    if crate::unsendable::is_own_data_path(&p, &crate::config::data_dir()) {
+        return Err("OrbDrop 自己的数据目录不能共享（里面是本机的设置与凭据）".into());
     }
     // **同一条路径只登记一次**（F-21）：拖回卡片、选择框里又挑到同一项、同一个目录换个写法
     // （结尾多个 `\`、大小写不同）都落到这里。已经登记过就**原样返回那一项** —— id 不变、
@@ -1643,9 +1655,10 @@ pub fn run() {
             // 悬浮球回到上次的位置；没有记录（首启）就放到默认落位（右上 1/3）
             place_orb_on_startup(app.handle());
 
-            // 上次留下的暂存副本：能删就删（拖拽落下后资源管理器可能还在异步复制，
-            // 所以运行期不删，只在启动与下次拖拽时按龄扫）。
-            drag::sweep_staging();
+            // 镜像（拖对端项走这条路）：先按龄回收上次留下的项，再把 provider 接上
+            // （注册 + 连接）。失败只记日志 —— 拖放那条路会当场把原因报给用户。
+            mirror::sweep();
+            mirror::ensure_ready(state_arc.inner().clone());
 
             setup_server_task(app.handle());
 
@@ -1655,8 +1668,15 @@ pub fn run() {
             info!(written, "启动预写 BeyondCompare profile 完成");
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // 退出时松开镜像连接。**注册留着**：注册一次长期存在（注销是 O(N)，实测 10,100 个
+            // 占位符 1.9 s），下次启动 `mirror::ensure_ready` 只做连接；注销属于卸载路径。
+            if let tauri::RunEvent::Exit = event {
+                mirror::shutdown();
+            }
+        });
 }
 
 #[cfg(test)]

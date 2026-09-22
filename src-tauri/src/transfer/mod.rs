@@ -98,7 +98,12 @@ pub async fn manifest_for_paths(paths: &[PathBuf]) -> Result<PushSource, String>
         if crate::unsendable::is_system_name(&base, crate::unsendable::sits_in_volume_root(path)) {
             return Err(format!("「{base}」是系统自己的目录/文件，不能推送"));
         }
-        if crate::unsendable::is_own_data_dir(path, &own_data_dir) {
+        if crate::unsendable::is_mirror_path(path, &crate::mirror::root()) {
+            return Err("镜像目录（拖放用的本地占位符）不能推送".into());
+        }
+        // 数据目录**整棵子树**都不行：只挡"数据目录本身"会漏掉 `credentials.dat` 这类
+        // （见 `unsendable::is_own_data_path`），那等于直接把本机凭据推给对端。
+        if crate::unsendable::is_own_data_path(path, &own_data_dir) {
             return Err("OrbDrop 自己的数据目录不能推送（里面是本机的设置与凭据）".into());
         }
         // 同名去重：`C:\a\报告.txt` 与 `D:\b\报告.txt` 不能在清单里撞成同一条路径
@@ -217,7 +222,9 @@ async fn collect_dir_manifest(dir: &Path) -> Result<(Vec<FileEntry>, u64, usize)
                 skipped += 1;
                 continue;
             };
-            if crate::unsendable::is_link(&ft) || crate::unsendable::is_own_data_dir(&path, &own_data_dir) {
+            if crate::unsendable::is_link(&ft)
+                || crate::unsendable::is_own_data_path(&path, &own_data_dir)
+            {
                 skipped += 1;
                 continue;
             }
