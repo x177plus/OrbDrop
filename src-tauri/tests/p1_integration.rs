@@ -8,10 +8,13 @@
 //! - 推送进度事件（F-54 进度数据）
 //! - 多设备推送（F-57）：一份清单分头发给多台、逐台失败隔离、批次快照的实时计数
 //!
-//! 注：凭据落在数据目录的 `credentials.dat`（P1 时曾是系统凭据库）。测试用临时 device id，
-//! 结束清理，不污染真实配对；**读路径不做迁移**（迁移只在应用启动时显式发生），
+//! 注：凭据落在数据目录的 `credentials.dat`（P1 时曾是系统凭据库，那条路连同迁移代码
+//! 已经删掉）。测试用临时 device id，结束清理，不污染真实配对；**读路径不做迁移**，
 //! 所以跑测试不会把本机真实的配对搬走或删掉。需要完全隔离的用例（凭据文件本身的行为）
-//! 走 `ORBDROP_DATA_DIR` + 一次性 keyring 服务名，见 `tests/credentials_vault.rs`。
+//! 走 `ORBDROP_DATA_DIR`，见 `tests/credentials_vault.rs`。
+//!
+//! 到对端那一跳全是 TLS（自签证书 + 指纹 pinning）：测试里凡是打对端地址的请求都必须用
+//! `net::client()`（它带着 pinning 校验器），随手 `Client::new()` 只会在自签证书上失败。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -118,7 +121,7 @@ async fn pairing_then_push_transfers_file_to_receiver() {
     assert_eq!(port_a, 3990);
     assert_eq!(port_b, 3991);
 
-    let client = reqwest::Client::new();
+    let client = orbdrop_lib::net::client();
 
     // ---- Pairing (F-12) ----
     // 1. A initiates: it issues the 6-digit code on itself and displays it.
@@ -909,7 +912,7 @@ async fn unpair_clears_both_sides_and_keeps_the_device_listed() {
 
     // 配对：B 用 A 显示的码向 A 换取 token（A 从请求里拿到 B 的地址）。
     let code = state_a.pair.create_code();
-    let resp = reqwest::Client::new()
+    let resp = orbdrop_lib::net::client()
         .post(format!("http://127.0.0.1:{port_a}/pair"))
         .json(&serde_json::json!({
             "peerId": "device-ub",
@@ -997,8 +1000,8 @@ async fn unpair_clears_both_sides_and_keeps_the_device_listed() {
     // 旧版本对端还握着旧 token 时，连共享项列表也拿不到（Bearer 反解不出身份 → 401）。
     // 来源用本机 LAN 地址，绕开"回环 = 本机 UI"的免鉴权分支。
     if let Some(lan_ip) = local_lan_ip() {
-        let resp = reqwest::Client::new()
-            .get(format!("http://{lan_ip}:{port_a}/shares"))
+        let resp = orbdrop_lib::net::client()
+            .get(format!("https://{lan_ip}:{port_a}/shares"))
             .bearer_auth("stale-token-after-unpair")
             .send()
             .await
@@ -1116,7 +1119,7 @@ async fn pairing_stops_at_paired_until_the_user_clicks_connect() {
         auto_connect: false, paused: false,
     });
 
-    let resp = reqwest::Client::new()
+    let resp = orbdrop_lib::net::client()
         .post(format!("http://127.0.0.1:{port_a}/pair"))
         .json(&serde_json::json!({
             "peerId": "device-ab",
@@ -1744,7 +1747,7 @@ async fn pair_info_answers_who_it_recognises_the_caller_as() {
     let token = format!("tok-{}", uuid::Uuid::new_v4());
     credential::set_peer(&caller, &token).unwrap();
 
-    let client = reqwest::Client::new();
+    let client = orbdrop_lib::net::client();
     let url = format!("http://127.0.0.1:{port}/pair/info");
 
     // 带 token：回「你是谁」+「我把你认作谁」。对端换过 device id 之后，本机手里
@@ -1768,7 +1771,7 @@ async fn pair_info_answers_who_it_recognises_the_caller_as() {
     assert!(body["pairedAs"].is_null(), "认不出的 token 不算数");
 
     // 探活/发现走的就是这一问：解析出来的身份与"它把本机认作谁"要一模一样。
-    let seen = orbdrop_lib::state::fetch_identity(&client, "127.0.0.1", port, Some(&token))
+    let seen = orbdrop_lib::state::fetch_identity(&orbdrop_lib::net::client(), "127.0.0.1", port, Some(&token))
         .await
         .expect("问得到身份");
     assert_eq!((seen.id.as_str(), seen.name.as_str()), ("device-info", "PC-INFO"));
@@ -1803,7 +1806,7 @@ async fn probe_hides_a_row_whose_address_answers_with_another_device_id() {
         auto_connect: false, paused: false,
     });
 
-    orbdrop_lib::state::probe_peers_once(&state_a, &reqwest::Client::new()).await;
+    orbdrop_lib::state::probe_peers_once(&state_a).await;
 
     let stale = state_a.get_peer("device-b-old").expect("旧行还在");
     assert!(!stale.online, "旧行必须离线：界面只显示在线设备，这就是去重");
@@ -1820,8 +1823,8 @@ async fn probe_hides_a_row_whose_address_answers_with_another_device_id() {
     let _ = std::fs::remove_dir_all(&save_dir);
 }
 
-/// 对端清过数据目录、系统凭据库还在：本机两行（旧 id 已配对 + 新 id 未绑定）必须
-/// 收敛成**一行**，而且配对状态跟着新 id 走 —— 用户不用重新配对。
+/// 对端清过一部分状态、本机手里那条凭据还有效：本机两行（旧 id 已配对 + 新 id 未绑定）
+/// 必须收敛成**一行**，而且配对状态跟着新 id 走 —— 用户不用重新配对。
 #[test]
 fn peer_reset_with_surviving_credential_migrates_the_row_to_the_new_id() {
     let save_dir = std::env::temp_dir().join(format!("orbdrop_migrate_save_dir_{}", uuid::Uuid::new_v4()));
@@ -2099,7 +2102,7 @@ async fn pair_invite_swaps_tokens_without_typing_a_code() {
     assert_eq!(token_for_a.len(), 64, "32 字节 hex");
     assert_eq!(token_for_a, token_for_b, "一对设备共用一枚 token，两边都存下了它");
 
-    let client = reqwest::Client::new();
+    let client = orbdrop_lib::net::client();
     let resp = client
         .get(format!("http://127.0.0.1:{port_b}/shares"))
         .bearer_auth(&token_for_a)
@@ -2175,7 +2178,7 @@ async fn offline_refuses_every_inbound_request() {
     let port = orbdrop_lib::server::start_server(state.clone(), 4190)
         .await
         .expect("server");
-    let client = reqwest::Client::new();
+    let client = orbdrop_lib::net::client();
     let info = format!("http://127.0.0.1:{port}/pair/info");
     let events = format!("http://127.0.0.1:{port}/events?token=whatever");
 
@@ -2256,8 +2259,8 @@ async fn discover_reports_only_the_dialled_segment_and_needs_a_paired_token() {
     // B 手里那条：键是 A 的 id —— 它据此才知道"带这个 token 的是 A"。
     credential::set_peer(&a_id, &token).unwrap();
 
-    let client = reqwest::Client::new();
-    let url = format!("http://{lan_ip}:{port_b}/discover");
+    let client = orbdrop_lib::net::client();
+    let url = format!("https://{lan_ip}:{port_b}/discover");
 
     // 没带 / 带错 token：拿不到表。这就是"匹配上之后才发现"那道门。
     assert_eq!(
@@ -2351,7 +2354,7 @@ async fn probe_learns_the_peers_segment_and_sweeps_it_when_the_voucher_goes_quie
         auto_connect: false, paused: false,
     });
 
-    orbdrop_lib::state::probe_peers_once(&state_a, &reqwest::Client::new()).await;
+    orbdrop_lib::state::probe_peers_once(&state_a).await;
 
     let learned = state_a.get_peer(&c_id).expect("A 学到了 B 那一段的设备");
     assert!(learned.online, "担保人说它在线，就是在线");
@@ -2367,7 +2370,7 @@ async fn probe_learns_the_peers_segment_and_sweeps_it_when_the_voucher_goes_quie
     // 的一跳；所以它不该被探活判成离线，而是继续按"担保人最近说过它在"活着。
     state_b.config.lock().peers.retain(|p| p.id != c_id);
     state_b.peers.lock().retain(|p| p.id != c_id);
-    orbdrop_lib::state::probe_peers_once(&state_a, &reqwest::Client::new()).await;
+    orbdrop_lib::state::probe_peers_once(&state_a).await;
     assert!(
         state_a.get_peer(&c_id).map(|p| p.online).unwrap_or(false),
         "学来的行不参与探活：担保人没再提它也仍是在线（只有超时才收走）"

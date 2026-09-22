@@ -8,9 +8,9 @@
   import { getDevices, loadDevices } from '$lib/stores/devices.svelte';
   import { getServerPort, setServerPort, loadShares, addShare, removeShare, getShares } from '$lib/stores/shares.svelte';
   import { loadSettings, getSettings } from '$lib/stores/settings.svelte';
-  import { getPeerSharesState, loadPeerShares, peerBaseUrl } from '$lib/stores/peers.svelte';
+  import { getPeerSharesState, loadPeerShares } from '$lib/stores/peers.svelte';
   import { getBcStatus, loadBcStatus, setBcSide, clearSide, compare } from '$lib/stores/bc.svelte';
-  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, localAddresses, orbScreenMetrics, orbSetRect, orbDragStart, orbMouseDown, orbSavePos, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, openPath, fetchTree, fetchPeerTree, getPeerToken } from '$lib/api';
+  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, localAddresses, orbScreenMetrics, orbSetRect, orbDragStart, orbMouseDown, orbSaveCenter, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, openPath, fetchTree, peerTree } from '$lib/api';
   import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape } from '$lib/types';
   import { shareMeta } from '$lib/types';
   import { planExpansion, planCollapse, planDock, planRectDock, spinForDock, type BadgeSpin, type DockAxis, type DockPlan, type ScreenRect } from '$lib/orbLayout';
@@ -81,12 +81,15 @@
   // `zoneHot` = 指针在热区内、且这次进入允许显示；`zoneHold` = 落位之后压住的那一次。
   let zoneHot = $state(false);
   let zoneHold = $state(false);
+  // 折叠态贴边方向（最近一次落位判定的结果，`{0,0}` = 未贴边）。只有展开时用一次：
+  // 贴边那一档的中心点多半在屏幕外（悬浮体大半被推出去了），展开要改成"窗口贴住工作区边"
+  // —— 见 `expand` 里给 `planExpansion` 的 margin。
+  let dockAxis = $state<{ x: DockAxis; y: DockAxis }>({ x: 0, y: 0 });
   // true = 悬浮球强制隐藏（切窗口期间）；用 transition:none 立即生效，不能让它带过渡露脸
   let holdOrb = $state(false);
-  // 展开时记下的**悬浮体左上角**（屏幕物理像素）：展开/收起唯一的参考点。
-  // 记球/卡片的位置而不是 OS 窗口左上角 —— 窗口 = 悬浮体 + 四周余量，两种形态的余量与尺寸都
-  // 不同（见 `orbLayout.planExpansion`），记窗口的话切一次形态就把悬浮体挪了 4px、展开出来的
-  // 面板也要横跳一百多像素。
+  // 展开时记下的**悬浮体本体中心**（球心 / 卡片白底中心，屏幕物理像素）：展开/收起唯一的参考点。
+  // 面板的可视盒角落在它上面；记它而不是 OS 窗口左上角 —— 窗口 = 悬浮体 + 四周余量，两种形态的
+  // 余量与尺寸都不同，记窗口的话同一个悬浮体位置会展开出两个地方（见 `orbLayout.planExpansion`）。
   let orbAnchor = $state<{ x: number; y: number } | null>(null);
   // 展开态窗口矩形（物理像素）：收起时与「当前窗口位置」作差，得到窗口被拖动的位移
   let expandedRect = $state<ScreenRect | null>(null);
@@ -343,23 +346,16 @@
   }
 
   /**
-   * 拉一层目录的内容：本机走自己的 HTTP（`fetchTree`）、对端走它的 `/tree`（`fetchPeerTree`），
+   * 拉一层目录的内容：本机走自己的 HTTP（`fetchTree`）、对端走后端命令（`peerTree`），
    * 与面板里展开那棵树走的是同一条路（同一份后端、同一套越界防护）。
    */
   async function loadRectKids(pageId: string, loc: RectDir) {
     const key = rectKidsKey(pageId, loc);
     rectKids[key] = { loading: true, error: null, entries: [] };
     try {
-      let entries: TreeEntry[];
-      if (loc.kind === 'local') {
-        entries = await fetchTree(serverPortVal || 3890, loc.shareId, loc.rel);
-      } else {
-        const dev = getDevices().find((d) => d.id === pageId);
-        if (!dev) throw new Error('设备已不在列表里');
-        const token = await getPeerToken(pageId);
-        if (!token) throw new Error('未配对，无法读取对方的共享项');
-        entries = await fetchPeerTree(peerBaseUrl(dev), token, loc.shareId, loc.rel);
-      }
+      const entries = loc.kind === 'local'
+        ? await fetchTree(serverPortVal || 3890, loc.shareId, loc.rel)
+        : await peerTree(pageId, loc.shareId, loc.rel);
       rectKids[key] = { loading: false, error: null, entries };
     } catch (e) {
       rectKids[key] = { loading: false, error: e instanceof Error ? e.message : '读取失败', entries: [] };
@@ -564,9 +560,8 @@
    * 最后才让面板从悬浮球那一侧长出。悬浮球在切窗口期间绝不参与渲染，
    * 因此不存在「画在旧窗口坐标/旧偏移」的错位帧。
    *
-   * 方向/落位以**悬浮体左上角**为参考点（窗口左上角 + `orbOffset`），不是以窗口矩形为准：
-   * 两种形态的窗口尺寸与内缩都不同，拿窗口算会让同一个悬浮体位置展开出两个地方
-   * （见 `orbLayout.planExpansion`）。
+   * 方向/落位以**悬浮体本体中心**（球心 / 卡片白底中心）为参考点，面板的可视盒角落在它上面：
+   * 同一个中心，两种形态展开出的面板逐像素相同（见 `orbLayout.planExpansion`）。
    */
   async function expand() {
     if (opening || expanded) return;
@@ -575,22 +570,34 @@
     try {
       const sf = await appWindow.scaleFactor();
       const pos = await appWindow.outerPosition();
-      // 参考点 = 悬浮体**此刻**在屏幕上的左上角 = 窗口左上角 + 它在窗口内的偏移（`orbOffset`）。
-      // 贴边收起时那个偏移属于贴边那一档（球/卡片有大半在窗口外），参考点于是也落在贴边位上
-      // —— 展开出来的面板正好贴着露在屏内那一条。
-      const anchor = { x: pos.x + Math.round(orbOffset.x * sf), y: pos.y + Math.round(orbOffset.y * sf) };
+      // 参考点 = 悬浮体本体中心此刻在屏幕上的位置 = 窗口左上角 + 它在窗口内的偏移 + 半个本体。
+      // 偏移用 `orbOffset`（贴边收起时是贴边那一档的偏移 —— 悬浮体大半在窗口外，中心也就在
+      // 屏幕外一点；下面按贴边档给 margin 0，让面板贴住屏幕边）。
+      const center = {
+        x: pos.x + Math.round((orbOffset.x + layout.body.w / 2) * sf),
+        y: pos.y + Math.round((orbOffset.y + layout.body.h / 2) * sf),
+      };
       const metrics = await orbScreenMetrics();
       const plan = planExpansion({
-        orb: anchor,
+        center,
         work: metrics.workArea,
-        expanded: { w: Math.round(EXPANDED.width * sf), h: Math.round(EXPANDED.height * sf) },
-        margin: Math.round(WORK_MARGIN * sf),
+        box: { w: Math.round(PANEL.w * sf), h: Math.round(PANEL.h * sf) },
+        slack: Math.round(PANEL_SLACK * sf),
+        // 贴边那一档：该轴不再留边距，窗口贴住工作区边（面板因此贴着屏幕边）
+        margin: {
+          x: Math.round((dockAxis.x === 0 ? WORK_MARGIN : 0) * sf),
+          y: Math.round((dockAxis.y === 0 ? WORK_MARGIN : 0) * sf),
+        },
       });
 
       if (foldTimer) { clearTimeout(foldTimer); foldTimer = null; }
-      orbAnchor = anchor;
+      orbAnchor = center;
       expandedRect = plan.window;
-      setOrbPos({ x: plan.orbOffset.x / sf, y: plan.orbOffset.y / sf });
+      // 展开态悬浮体在窗口里的偏移（CSS 变量仍是**本体左上角**：CSS 按它定位 `.orb` / `.rq`）
+      setOrbPos({
+        x: (plan.anchorOffset.x - Math.round(layout.body.w * sf / 2)) / sf,
+        y: (plan.anchorOffset.y - Math.round(layout.body.h * sf / 2)) / sf,
+      });
       await orbSetRect(plan.window);
       await waitForViewport(EXPANDED.width, EXPANDED.height);
       expanded = true;
@@ -607,13 +614,14 @@
 
   /**
    * 悬浮体回到「未贴边」的折叠态：居中内缩、热区就是悬浮体自己、角标不转、竖条收起。
-   * 三个调用点：展开失败的回退、**起拖那一刻**（拖动期间不能挂着上一次的贴边偏移，
-   * 见 `beginOrbDrag`），以及形态/尺寸刚变过的那一次重设。
+   * 四个调用点：展开失败的回退、**起拖那一刻**（拖动期间不能挂着上一次的贴边偏移，
+   * 见 `beginOrbDrag`）、形态/尺寸刚变过的那一次重设。
    */
   function resetOrbDom() {
     setOrbPos({ x: layout.widget.x, y: layout.widget.y });
     badgeSpin = { left: 0, right: 0 };
     rectDock = 0;
+    dockAxis = { x: 0, y: 0 };
   }
 
   /** 悬浮体（球 / 卡片）在窗口内的偏移 + 热区（热区尺寸跟着形态走：圆球 62、悬浮框 卡片+点列） */
@@ -623,22 +631,30 @@
   }
 
   /**
-   * 折叠态位置在两种坐标之间换算，参考点是**悬浮体左上角**（屏幕物理像素）。
+   * 折叠态位置在两种坐标之间换算，参考点是**悬浮体本体中心**（屏幕物理像素）。
    *
-   * 展开时参考点 = 窗口左上角 + `orbOffset`（见 `expand`：贴边那一档的偏移也在里面）；
-   * 收起时反过来 —— 用**形态内缩**反推出**未贴边**的窗口矩形，再交给贴边判定复现贴边
+   * 展开时参考点 = 窗口左上角 + `--orb-x/y` + 半个本体（见 `expand`）；收起时反过来 ——
+   * 用本体中心在窗口内的偏移反推出**未贴边**的窗口矩形，再交给贴边判定复现贴边
    * （吸附幂等：同一个矩形再判一次得到同样的窗口与偏移，见 `planDock` / `planRectDock`）。
    *
-   * 悬浮体左上角是唯一参考点，窗口左上角只是它减去内缩（`orbShape.ts` 的
-   * `CollapsedLayout.widget`：球 14/14、卡片 14/10）—— 切形态时窗口跟着让位，悬浮体一动不动。
-   * 记窗口位置的话，切一次形态悬浮体就跳 4px（上下内缩的差）。
+   * 本体中心是唯一参考点，窗口左上角只是它减去"本体中心到窗口左上角"的那一段
+   * （球 45/45、卡片 102/77，由 `orbShape.ts` 的 `body` 决定）—— 切形态时窗口跟着让位，
+   * 悬浮体以中心为锚原地长大/缩小，位置本身一动不动。
    */
-  function orbInsetPx(sf: number) {
-    return { x: Math.round(layout.widget.x * sf), y: Math.round(layout.widget.y * sf) };
+  function bodyCenterInWindow() {
+    const b = layout.body;
+    return { x: b.x + b.w / 2, y: b.y + b.h / 2 };
   }
-  function windowFromBody(body: { x: number; y: number }, sf: number) {
-    const inset = orbInsetPx(sf);
-    return { x: body.x - inset.x, y: body.y - inset.y };
+  function windowFromCenter(center: { x: number; y: number }, sf: number) {
+    const c = bodyCenterInWindow();
+    return { x: center.x - Math.round(c.x * sf), y: center.y - Math.round(c.y * sf) };
+  }
+  /** 一个贴边/落位结果里的本体中心在哪（物理像素）：窗口 + 该档的偏移（贴边时大半在屏外）+ 半个本体 */
+  function centerOf(plan: DockPlan, sf: number) {
+    return {
+      x: plan.window.x + plan.orb.x + Math.round(layout.body.w * sf / 2),
+      y: plan.window.y + plan.orb.y + Math.round(layout.body.h * sf / 2),
+    };
   }
 
   /** 圆角矩形悬浮框的落位：离左右工作区边缘够近就贴边收起成一条竖条（`planRectDock`） */
@@ -676,6 +692,7 @@
    */
   function setDockOrb(plan: DockPlan, sf: number) {
     orbOffset = { x: plan.orb.x / sf, y: plan.orb.y / sf };
+    dockAxis = plan.dock;     // 展开时要知道贴边方向（贴边档不给边距，窗口贴住工作区边）
     if (orbShape === 'rect') {
       rectDock = plan.dock.x;
       badgeSpin = { left: 0, right: 0 };
@@ -701,6 +718,7 @@
     orbOffset = { x: layout.widget.x, y: layout.widget.y };
     badgeSpin = { left: 0, right: 0 };
     rectDock = 0;
+    dockAxis = { x: 0, y: 0 };
   }
 
   /**
@@ -778,15 +796,16 @@
   }
 
   /**
-   * 记录悬浮球落位（折叠态窗口左上角，物理像素）：下次启动回到这里（F-74）。
+   * 记录悬浮体本体中心（物理像素）：下次启动回到这里（F-74）。
    *
-   * 记的永远是**球**的落位，不是窗口的：折叠态窗口就是球；展开态窗口是面板，得先把球按
-   * 窗口位移算回折叠态矩形（见 `rememberBallUnderPanel`）。调用点只在「几何落定之后」：
-   * settleDrag（拖动结束、吸附判定跑完）与 settleCollapse（收起落位完）。
+   * 记的永远是**悬浮体**的位置（它的中心），不是窗口的：窗口左上角 = 中心 − 本体内缩
+   * （`windowFromCenter`），随形态与 DPI 变。调用点都在「几何落定之后」：settleDrag
+   * （拖动结束、吸附判定跑完）、settleCollapse（收起落位完）、rememberBallUnderPanel
+   * （展开态拖完面板）。
    */
-  async function rememberOrbPos(rect: ScreenRect) {
+  async function rememberOrbCenter(center: { x: number; y: number }) {
     try {
-      await orbSavePos(Math.round(rect.x), Math.round(rect.y));
+      await orbSaveCenter(Math.round(center.x), Math.round(center.y));
     } catch (e) {
       console.error('记录悬浮球位置失败:', e);   // 记不上只是下次回不到原位，不打断交互
     }
@@ -838,7 +857,7 @@
           await orbSetRect(plan.window);
         }
         setDockDom(plan, metrics.scaleFactor);
-        await rememberOrbPos(plan.window);
+        await rememberOrbCenter(centerOf(plan, metrics.scaleFactor));
         return;
       }
       const plan = dockPlan(free, metrics.scaleFactor, metrics.workArea);
@@ -846,7 +865,7 @@
         await orbSetRect(plan.window);
       }
       setDockDom(plan, metrics.scaleFactor);
-      await rememberOrbPos(plan.window);
+      await rememberOrbCenter(centerOf(plan, metrics.scaleFactor));
     } finally {
       settling = false;
     }
@@ -855,7 +874,7 @@
   /**
    * 展开态拖动面板之后：算出悬浮体现在在哪、把它下次该出现的地方记下来。
    *
-   * 与收起落位是同一套算法（`planCollapse` + `windowFromBody` + `dockPlan`），所以这里记下的
+   * 与收起落位是同一套算法（`planCollapse` + `windowFromCenter` + `dockPlan`），所以这里记下的
    * 就是「此刻点收起，悬浮体会落到哪」—— 拖完面板直接关掉应用，下次启动也在那儿
    * （否则记的还是展开前的老位置）。
    */
@@ -863,14 +882,13 @@
     if (!orbAnchor || !expandedRect) return;   // 异常路径：没有展开前的参考点，算不出球在哪
     const metrics = await orbScreenMetrics();
     const sf = metrics.scaleFactor;
-    const body = planCollapse({ orb: orbAnchor, expanded: expandedRect, current: await appWindow.outerPosition() });
-    const at = windowFromBody(body, sf);
+    const center = planCollapse({ anchor: orbAnchor, expanded: expandedRect, current: await appWindow.outerPosition() });
+    const at = windowFromCenter(center, sf);
     const free: ScreenRect = { x: at.x, y: at.y, w: Math.round(layout.size.w * sf), h: Math.round(layout.size.h * sf) };
-    await rememberOrbPos(
-      orbShape === 'rect'
-        ? rectDockPlan(free, sf, metrics.workArea).window
-        : dockPlan(free, sf, metrics.workArea).window,
-    );
+    const plan = orbShape === 'rect'
+      ? rectDockPlan(free, sf, metrics.workArea)
+      : dockPlan(free, sf, metrics.workArea);
+    await rememberOrbCenter(centerOf(plan, sf));
   }
 
   /**
@@ -884,12 +902,13 @@
   async function settleCollapse(anchor: { x: number; y: number }, expanded: ScreenRect | null): Promise<{ plan: DockPlan | null; sf: number }> {
     const metrics = await orbScreenMetrics();
     const sf = metrics.scaleFactor;
-    const body = expanded
-      ? planCollapse({ orb: anchor, expanded, current: await appWindow.outerPosition() })
+    const center = expanded
+      ? planCollapse({ anchor, expanded, current: await appWindow.outerPosition() })
       : anchor;   // 没记下展开矩形（异常路径）：按原样缩回
-    // 折叠态窗口由**当前形态**从悬浮体左上角反推（`anchor` 是展开那一刻记的：面板开着时用户
-    // 改过悬浮形态的话，它的内缩属于上一档）—— 于是切形态只挪窗口，悬浮体一动不动。
-    const at = windowFromBody(body, sf);
+    // 折叠态窗口由**当前形态**从本体中心反推（`anchor` 是展开那一刻记的：面板开着时用户改过
+    // 悬浮形态的话，它的尺寸/中心偏移属于上一档）—— 于是切形态只挪窗口，悬浮体以中心为锚
+    // 原地长大/缩小，位置一动不动。
+    const at = windowFromCenter(center, sf);
     const free: ScreenRect = { x: at.x, y: at.y, w: Math.round(layout.size.w * sf), h: Math.round(layout.size.h * sf) };
     let plan: DockPlan | null = null;
     if (orbShape === 'rect') {
@@ -898,14 +917,14 @@
       sizedShape = orbShape;      // 窗口已归到当前形态的尺寸，改尺寸那个 `$effect` 别再跑一趟
       setDockZone(plan, sf);      // 热区先按「竖条 ∪ 完整卡」就位（球/框还没滑出去时它就在了）
       parkOrb();                  // 先按"未贴边"露面：滑出去 + 卡片渐隐交给 `revealDock`
-      await rememberOrbPos(plan.window);   // 收起后的落位才是悬浮框下次该出现的地方
+      await rememberOrbCenter(centerOf(plan, sf));   // 收起后的落位才是悬浮框下次该出现的地方
     } else {
       plan = dockPlan(free, sf, metrics.workArea);
       await orbSetRect(plan.window);
       sizedShape = orbShape;
       setDockZone(plan, sf);
       parkOrb();
-      await rememberOrbPos(plan.window);
+      await rememberOrbCenter(centerOf(plan, sf));
     }
     await tick();                  // 等 park 落进 DOM（`$state` 的更新在微任务里）
     flushLayout();                 // 把「球完整可见」定成过渡起点（`holdOrb` 里 transition 是关的）

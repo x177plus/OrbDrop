@@ -40,20 +40,39 @@ rand = "0.8"
 thiserror = "1"
 anyhow = "1"
 tokio-util = "0.7"
+# 传输加密（TLS + 证书指纹 pinning）。**crypto provider 一律用 `ring`**：rustls 0.23 的默认
+# provider 是 aws-lc-rs，它要现编一份 C（Windows 上还得有 NASM/CMake），为了一个自签证书把
+# 构建链拉长不划算；ring 是纯 Rust 构建。三处（rustls / tokio-rustls / reqwest）选同一个，
+# 混用会在运行时因为"provider 未安装"直接 panic。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = "1"
+rustls-pemfile = "2"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+# 手写 accept 循环时要把 `axum::Router` 当成 hyper 的 service 调（`Service::call`）。
+tower = { version = "0.5", features = ["util"] }
 base64 = "0.22"
 aes-gcm = "0.10"
 parking_lot = "0.12"
 dirs = "5"
-reqwest = { version = "0.12", features = ["stream", "json"] }
+# `rustls-tls-no-provider`：reqwest 不自带 crypto provider 决策 —— 由本机在启动时显式安装
+# 一份（`net::install_crypto_provider`，用 `ring`），到对端那几条路再叠上装着 pinning
+# 校验器的预配置 `rustls::ClientConfig`（见 `net::client_builder`）。
+# 也因此**不再有 native-tls**：对一个只连内网自签证书的应用，系统信任库本就用不上。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-no-provider", "stream", "json"] }
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
 pathdiff = "0.2"
 
+[dev-dependencies]
+# 集成测试里那个"老版本对端"桩要自己起一个 **TLS** 服务端（对端那一跳已经全是 TLS，
+# 明文桩连不上）。直接用应用自己那份身份（`net::server_config`），免得测试里再编一套证书。
+# 版本与 features 必须和 `[dependencies]` 里那份一致：两个 rustls 会被当成不同的 crate。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+
 [target.'cfg(windows)'.dependencies]
-# 只为**迁移老数据**保留：老版本把配对 token 放在系统凭据库的一条里，启动时读它一次搬进
-# 数据目录的凭据文件（见 credential::migrate_legacy_entry）。keyring 3 不带默认 store，
-# 缺 feature 会退回进程内 mock（写成功、读为空），迁移会变成"什么都没读到"。
-keyring = { version = "3", features = ["windows-native"] }
 winreg = "0.52"
 # `#[implement(...)]` 生成的代码里写的是 `windows_core::…` 这个 crate 名，
 # 所以它必须作为**直接依赖**出现（和 `windows` 是同一份源码，不会重复编）。
@@ -79,9 +98,6 @@ windows = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3", features = ["apple-native"] }
 
 [profile.release]
 codegen-units = 1

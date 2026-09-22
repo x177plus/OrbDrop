@@ -13,7 +13,6 @@ use serde::Serialize;
 use tauri::Emitter;
 use tokio::sync::mpsc;
 use tokio::time::interval;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
@@ -63,6 +62,10 @@ pub enum StopReason {
     PeerDisconnected,
     /// 对端不认我们的 token（它清过数据 / 已经解除配对）：只能重新配对。
     TokenRejected,
+    /// 对端的**证书指纹与本机钉住的不一致**：它换了机器 / 重装过 / 清过数据目录，
+    /// 或者有人在中间冒名顶替。TLS 在 WS 握手之前就把连接拒了，所以这跟"网络抖动"
+    /// 是两回事 —— 重试不会变好。出路同样只有重新配对（那次会重新钉一遍指纹）。
+    IdentityChanged,
     /// 本机点过「断开」。
     LocalDisconnected,
 }
@@ -523,18 +526,30 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
             };
 
             // manual=1 只在第一次尝试时带上：这是一次"用户让连"的请求，不是持续声明。
-            let url = format!(
-                "ws://{}:{}/events?token={}{}",
-                peer.ip,
-                peer.port,
-                token,
-                if manual_pending { "&manual=1" } else { "" },
-            );
+            let url = crate::net::peer_ws_url(&peer.ip, peer.port, &token, manual_pending);
             manual_pending = false;
             state.ws.set_link_state(&peer_id, LinkState::Retrying);
-            match connect_async(&url).await {
-                Ok((ws_stream, _)) => {
+            // 到对端要过 TLS，而"指纹对不上"发生在 WS 握手**之前** —— `stop_reason_for`
+            // 只看得到 WS 层的错误，身份这一条只能在这里单独拦下来。
+            let dialed = match crate::net::connect_ws(&url, &peer.ip, peer.port).await {
+                Err(crate::net::DialError::IdentityRejected) => {
+                    warn!(%peer_id, "对端证书指纹与钉住的不一致：停手，需重新配对");
+                    state.ws.set_link_state(
+                        &peer_id,
+                        LinkState::Stopped {
+                            reason: StopReason::IdentityChanged,
+                        },
+                    );
+                    return;
+                }
+                other => other,
+            };
+            match dialed {
+                Ok(ws_stream) => {
                     info!(%peer_id, "outbound WS linked");
+                    // 这条链路走的是 TLS：连上了就把这次见到的证书指纹补上（老记录、
+                    // 或首次连上）。没有它，下一次拨号仍旧是"没见过这个地址"。
+                    crate::state::remember_peer_fingerprint(&state, &peer_id, &peer.ip);
                     state.set_peer_online(&peer_id, true);
                     // 长连接意图落盘（F-16）：链路一建立就记下，重启后自动接回来。
                     // 这一次写入同时清掉「断开」的暂停（`LinkIntent` 是同一个意图的两面）。
@@ -615,7 +630,11 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
                 Err(e) => {
                     // 明确拒绝（对端点过「断开」/ 不认我们的 token）：停手并留下理由，
                     // 继续拨只是每分钟往对端门口敲一次，永远不会变成连接。
-                    if let Some(reason) = stop_reason_for(&e) {
+                    let stop = match &e {
+                        crate::net::DialError::Ws(inner) => stop_reason_for(inner),
+                        _ => None,
+                    };
+                    if let Some(reason) = stop {
                         info!(%peer_id, error = %e, "link refused, giving up until the situation changes");
                         state.ws.set_link_state(&peer_id, LinkState::Stopped { reason });
                         return;

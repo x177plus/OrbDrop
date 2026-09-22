@@ -269,12 +269,15 @@ font-family: var(--font-body);
   .icon-btn svg { width: 16px; height: 16px; }
 
   /* ─── tabs ──────────────────────────────────────────────────── */
-  .tabs { display: flex; gap: 2px; padding: 6px 14px 0; border-bottom: 1px solid var(--border); }
+.tabs { display: flex; align-items: flex-end; gap: 6px; padding: 6px 12px 0; border-bottom: 1px solid var(--border); }
+  .tabs-scroll { flex: 1; min-width: 0; display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none; }
+  .tabs-scroll::-webkit-scrollbar { display: none; }
   .tab {
-    position: relative;
+    position: relative; flex: none;
     display: inline-flex; align-items: center; gap: 7px;
     padding: 9px 4px 11px;
-    margin-right: 18px;
+    margin-right: 16px;
+    max-width: 148px;
     font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500;
     color: var(--muted);
     transition: color 0.15s ease;
@@ -293,10 +296,20 @@ font-family: var(--font-body);
     font-family: var(--font-mono); font-size: var(--fs-xxs);
     padding: 1px 6px; border-radius: 999px;
     background: var(--fg-soft); color: var(--muted);
+    flex: none;
   }
   .tab.active .count { background: var(--accent-soft); color: var(--accent); }
+  .tab .tab-label { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tab .tab-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+  .tabs-more-btn {
+    flex: none; width: 26px; height: 26px; margin-bottom: 7px;
+    border-radius: 7px; display: grid; place-items: center; color: var(--muted);
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  .tabs-more-btn:hover { background: var(--fg-soft); color: var(--fg); }
+  .tabs-more-btn svg { width: 15px; height: 15px; }
 
-  .panel-body { flex: 1; overflow-y: auto; padding: 14px 14px 10px; overscroll-behavior: contain; }
+  .panel-body { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 14px 10px; overscroll-behavior: contain; }
   .panel-body::-webkit-scrollbar { width: 10px; }
   .panel-body::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg) 14%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: content-box; }
 
@@ -440,11 +453,13 @@ font-family: var(--font-body);
   .btn-block { width: 100%; }
   .btn svg { width: 15px; height: 15px; }
 
-  .panel-foot {
-    display: flex; align-items: center; justify-content: space-between;
+.panel-foot {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    min-height: 46px;
     padding: 10px 16px;
     border-top: 1px solid var(--border);
     font-size: var(--fs-xs); color: var(--muted);
+    min-width: 0;
   }
 
   /* ─── push card ─────────────────────────────────────────────── */
@@ -635,9 +650,239 @@ font-family: var(--font-body);
   .picker-sel b { color: var(--fg); font-weight: 600; }
   .picker-foot .btn { flex: none; }
 
+  /* ─── device workspace · 设备工作区（文件 / 消息 双视图） ────── */
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+  .panel-body.ws-mode { padding: 0; min-height: 0; overflow: hidden; display: flex; }
+
+  .ws { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr); }
+
+  .ws-head { display: flex; align-items: center; gap: var(--gap-sm); padding: 12px 14px 10px; }
+  .ws-head .d-avatar { width: 38px; height: 38px; border-radius: 11px; font-size: var(--fs-md); color: var(--fg); background: var(--accent-soft); border-color: color-mix(in oklch, var(--accent) 28%, transparent); }
+  .ws-name .state-chip { flex: none; }
+  .ws-cap { flex: 1; min-width: 0; display: grid; gap: 2px; }
+  .ws-name { display: flex; align-items: center; gap: 8px; min-width: 0; font-family: var(--font-display); font-size: var(--fs-md); font-weight: 600; letter-spacing: -0.005em; }
+  .ws-nm { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ws-ip { display: block; font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ws-acts { flex: none; display: flex; align-items: center; gap: 2px; }
+  .ws-avs { display: flex; flex: none; }
+  .ws-avs .d-avatar { width: 30px; height: 30px; border-radius: 9px; font-size: var(--fs-xs); color: var(--fg); background: var(--accent-soft); border: 2px solid var(--surface); margin-left: -9px; }
+  .ws-avs .d-avatar:first-child { margin-left: 0; }
+
+  /* ─── 收件人栏 · 一对一 / 群发 ──────────────────────────────── */
+  .recip { flex: none; display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .recip-label { flex: none; font-family: var(--font-mono); font-size: var(--fs-xxs); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  .recip-chips { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+  .recip-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 168px; height: 24px; padding: 0 4px 0 5px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); font-size: var(--fs-xs); color: var(--fg); }
+  .recip-chip .rc-av { flex: none; width: 15px; height: 15px; border-radius: 5px; display: grid; place-items: center; font-family: var(--font-display); font-weight: 650; font-size: 9px; color: var(--accent); background: var(--accent-soft); }
+  .recip-chip .rc-name { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .recip-chip .rc-st { flex: none; width: 6px; height: 6px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 26%, transparent); }
+  .recip-chip .rc-st.ok { background: var(--ok); }
+  .recip-chip .rc-x { flex: none; width: 16px; height: 16px; border-radius: 50%; display: grid; place-items: center; color: var(--muted); }
+  .recip-chip .rc-x:hover { background: var(--fg-soft); color: var(--fg); }
+  .recip-chip .rc-x svg { width: 10px; height: 10px; }
+  .recip-add { flex: none; display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 10px; border-radius: 999px; border: 1px dashed color-mix(in oklch, var(--fg) 24%, transparent); color: var(--muted); font-size: var(--fs-xs); }
+  .recip-add:hover { color: var(--fg); border-color: color-mix(in oklch, var(--fg) 42%, transparent); }
+  .recip-add svg { width: 12px; height: 12px; }
+
+  /* ─── 收件人选择对话框 ─────────────────────────────────────── */
+  .recip-tools { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 8px; }
+  .recip-tools .num { font-size: var(--fs-xs); color: var(--muted); }
+  .recip-list { display: flex; flex-direction: column; gap: 4px; max-height: 236px; overflow-y: auto; margin-bottom: 4px; }
+  .recip-list::-webkit-scrollbar { width: 8px; }
+  .recip-list::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg) 14%, transparent); border-radius: 999px; border: 2px solid transparent; background-clip: content-box; }
+  .recip-row { display: flex; align-items: center; gap: 9px; padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius); cursor: pointer; transition: background 0.15s ease, border-color 0.15s ease; }
+  .recip-row:hover { background: var(--fg-soft); }
+  .recip-row:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+  .recip-row input { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; flex: none; }
+  .recip-row .d-avatar { width: 28px; height: 28px; border-radius: 9px; font-size: var(--fs-sm); flex: none; }
+  .recip-row .rr-main { flex: 1; min-width: 0; display: grid; gap: 1px; }
+  .recip-row .rr-name { font-family: var(--font-display); font-size: var(--fs-md); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .recip-row .rr-ip { font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .recip-row .state-chip { flex: none; }
+
+  /* ─── 会话页：列表 + 详情 ─────────────────────────────────── */
+  .ws-simple { grid-template-rows: auto minmax(0, 1fr); }
+  .convos { flex: 1; min-width: 0; min-height: 0; display: flex; }
+  .convos-list-view { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+  .convos-head { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 14px 10px; }
+  .convos-title { font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
+  .convo-list { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 2px 10px 14px; display: flex; flex-direction: column; gap: 2px; }
+  .convo-list::-webkit-scrollbar { width: 10px; }
+  .convo-list::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg) 14%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: content-box; }
+  .convo-item { display: flex; align-items: center; gap: 10px; padding: 10px; border-radius: var(--radius); text-align: left; transition: background 0.15s ease; }
+  .convo-item:hover { background: var(--fg-soft); }
+  .convo-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .convo-avs { display: flex; flex: none; }
+  .convo-avs .d-avatar { width: 34px; height: 34px; border-radius: 10px; font-size: var(--fs-sm); color: var(--fg); background: var(--accent-soft); border: 2px solid var(--surface); margin-left: -10px; }
+  .convo-avs .d-avatar:first-child { margin-left: 0; }
+  .convo-main { flex: 1; min-width: 0; display: grid; gap: 2px; }
+  .convo-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .convo-name { flex: 0 1 auto; min-width: 0; font-family: var(--font-display); font-size: var(--fs-md); font-weight: 500; letter-spacing: -0.005em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .convo-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 26%, transparent); }
+  .convo-dot.ok { background: var(--ok); }
+  .convo-dot.warn { background: var(--warn); }
+  .convo-time { margin-left: auto; flex: none; font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); }
+  .convo-prev { font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .convo-unread { flex: none; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; background: var(--accent); color: var(--surface); font-family: var(--font-mono); font-size: 10px; font-weight: 700; line-height: 1; display: grid; place-items: center; }
+  .convo-detail { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; }
+  .conv-back { flex: none; width: 28px; height: 28px; border-radius: 7px; display: grid; place-items: center; color: var(--muted); transition: background 0.15s ease, color 0.15s ease; }
+  .conv-back:hover { background: var(--fg-soft); color: var(--fg); }
+  .conv-back svg { width: 16px; height: 16px; }
+  .convos-head-acts { display: flex; align-items: center; gap: 6px; }
+
+  /* 会话详情：单行紧凑标题栏 */
+  .conv-top { flex: none; display: flex; align-items: center; gap: 6px; padding: 7px 8px 7px 10px; border-bottom: 1px solid var(--border); }
+  .conv-title { flex: 0 1 auto; min-width: 0; font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 600; letter-spacing: -0.005em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .conv-status { flex: none; width: 7px; height: 7px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 26%, transparent); }
+  .conv-status.ok { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+  .conv-status.warn { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in oklch, var(--warn) 16%, transparent); }
+  .conv-count { flex: none; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+  .conv-acts { margin-left: auto; flex: none; display: flex; align-items: center; gap: 2px; }
+
+  /* ─── 底栏会话入口（常驻，不遮挡内容） ─────────────────────── */
+  .foot-left { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
+  .foot-ip { font-family: var(--font-mono); font-size: var(--fs-xxs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .foot-right { display: flex; align-items: center; gap: 8px; flex: none; }
+  .foot-ver { font-size: var(--fs-xxs); color: var(--muted); }
+  .foot-bell { flex: none; width: 24px; height: 24px; border-radius: 6px; display: grid; place-items: center; color: var(--muted); transition: background 0.15s ease, color 0.15s ease; }
+  .foot-bell:hover { background: var(--fg-soft); color: var(--fg); }
+  .foot-bell svg { width: 15px; height: 15px; }
+  .foot-msg {
+    position: relative; flex: none;
+    display: inline-flex; align-items: center; gap: 6px;
+    height: 26px; padding: 0 10px 0 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--muted);
+    font-family: var(--font-display); font-size: var(--fs-xs); font-weight: 500;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  }
+  .foot-msg svg { width: 17px; height: 17px; flex: none; }
+  .foot-msg:hover, .foot-msg.open { background: var(--accent-soft); border-color: color-mix(in oklch, var(--accent) 34%, transparent); color: var(--accent); }
+  .msg-fab-badge {
+    position: absolute; top: -4px; right: -4px; min-width: 18px; height: 18px; padding: 0 5px;
+    border-radius: 999px; background: var(--accent); color: var(--surface);
+    font-family: var(--font-mono); font-size: 10px; font-weight: 700; line-height: 1;
+    display: grid; place-items: center; border: 2px solid var(--surface);
+  }
+
+  /* ─── 会话浮层：左下角展开，不占全屏 ─────────────────────── */
+  .convo-pop {
+    position: absolute; left: 16px; bottom: 52px; z-index: 8;
+    width: min(320px, calc(100% - 32px));
+    height: min(420px, calc(100% - 72px));
+    display: flex; flex-direction: column;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 26px 64px -26px oklch(18% 0.012 250 / 0.30), 0 2px 8px -2px oklch(18% 0.012 250 / 0.12);
+    overflow: hidden;
+    transform-origin: 32px calc(100% - 29px);
+    transform: scale(0.2);
+    opacity: 0; pointer-events: none;
+    transition: transform 0.3s cubic-bezier(0.2, 0.9, 0.25, 1.08), opacity 0.18s ease;
+  }
+  .convo-pop.open { transform: none; opacity: 1; pointer-events: auto; }
+
+  /* ─── 文件消息：传输状态 + 会话内接收卡 ───────────────────── */
+  .cf-status { display: block; font-family: var(--font-mono); font-size: 10px; opacity: 0.85; }
+  .cf-bar { display: block; height: 3px; margin-top: 5px; border-radius: 999px; background: color-mix(in oklch, currentColor 22%, transparent); overflow: hidden; }
+  .cf-bar i { display: block; height: 100%; width: 0; border-radius: 999px; background: currentColor; transition: width 0.1s linear; }
+  .chat-msg.me .cf-bar { color: var(--surface); }
+  .invite-card { display: flex; flex-direction: column; gap: 9px; max-width: 100%; padding: 11px 12px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); box-shadow: 0 2px 8px -4px oklch(18% 0.012 250 / 0.14); }
+  .ic-row { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .ic-row .f-icon { width: 18px; height: 18px; flex: none; color: var(--warn); }
+  .ic-row .f-icon svg { width: 18px; height: 18px; }
+  .ic-main { flex: 1; min-width: 0; display: grid; gap: 1px; }
+  .ic-name { font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ic-size { font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+  .ic-sub { font-size: var(--fs-xs); color: var(--muted); }
+  .ic-acts { display: flex; gap: 8px; }
+  .ic-acts .btn { flex: 1; height: 30px; }
+  .ic-done { display: flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--muted); }
+
+  .ws-switch { display: flex; gap: 2px; padding: 0 14px; border-bottom: 1px solid var(--border); }
+  .ws-seg {
+    position: relative; display: inline-flex; align-items: center; gap: 6px;
+    padding: 8px 4px 10px; margin-right: 16px;
+    font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500;
+    color: var(--muted); transition: color 0.15s ease;
+  }
+  .ws-seg::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
+    border-radius: 2px 2px 0 0; background: var(--accent);
+    transform: scaleX(0); transition: transform 0.2s ease;
+  }
+  .ws-seg:hover { color: var(--fg); }
+  .ws-seg.active { color: var(--fg); }
+  .ws-seg.active::after { transform: scaleX(1); }
+  .ws-seg .count { font-family: var(--font-mono); font-size: var(--fs-xxs); padding: 1px 6px; border-radius: 999px; background: var(--fg-soft); color: var(--muted); flex: none; }
+  .ws-seg.active .count { background: var(--accent-soft); color: var(--accent); }
+  .ws-seg .tab-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
+
+  .ws-body { min-width: 0; min-height: 0; display: flex; }
+  .ws-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+  .ws-pane[hidden] { display: none; }
+  .ws-files { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 12px 14px 14px; }
+  .ws-files::-webkit-scrollbar { width: 10px; }
+  .ws-files::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg) 14%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: content-box; }
+
+  .remote-tag {
+    display: inline-flex; align-items: center; gap: 4px; flex: none;
+    font-size: var(--fs-xs); font-weight: 500;
+    padding: 1px 7px; border-radius: 999px;
+    background: var(--fg-soft); color: var(--muted);
+  }
+  .share-item.remote > .share-row .f-icon { color: var(--accent); }
+  .share-item.remote > .share-row .s-acts .icon-btn { width: 24px; height: 24px; }
+
+  .chat-log { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 14px 14px 10px; display: flex; flex-direction: column; gap: 8px; }
+  .chat-log::-webkit-scrollbar { width: 8px; }
+  .chat-log::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg) 14%, transparent); border-radius: 999px; border: 2px solid transparent; background-clip: content-box; }
+
+  .chat-empty { margin: auto; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 18px 12px; text-align: center; color: var(--muted); }
+  .chat-empty svg { width: 22px; height: 22px; opacity: 0.5; }
+  .chat-empty p { margin: 0; font-size: var(--fs-xs); }
+  .chat-empty .ce-sub { font-size: 10px; line-height: 1.5; max-width: 170px; }
+
+  .chat-msg { display: flex; flex-direction: column; max-width: 86%; user-select: text; -webkit-user-select: text; animation: chat-in 0.2s cubic-bezier(0.2, 0.8, 0.2, 1); }
+  @keyframes chat-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .chat-msg.me { align-self: flex-end; align-items: flex-end; }
+  .chat-msg.peer { align-self: flex-start; align-items: flex-start; }
+  .chat-bubble { max-width: 100%; padding: 7px 10px; border-radius: 12px; font-size: var(--fs-sm); line-height: 1.55; overflow-wrap: anywhere; }
+  .chat-msg.peer .chat-bubble { background: color-mix(in oklch, var(--fg) 6%, transparent); color: var(--fg); border-bottom-left-radius: 4px; }
+  .chat-msg.me .chat-bubble { background: var(--accent-deep); color: var(--surface); border-bottom-right-radius: 4px; }
+  .chat-msg.picked .chat-bubble { box-shadow: 0 0 0 2px color-mix(in oklch, var(--accent) 45%, transparent); }
+  .chat-text { display: block; white-space: pre-wrap; }
+  .chat-meta { margin-top: 3px; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+  .chat-bubble-file { display: flex; align-items: center; gap: 8px; }
+  .cf-ico { flex: none; display: grid; place-items: center; }
+  .cf-ico svg { width: 16px; height: 16px; }
+  .cf-main { min-width: 0; max-width: 148px; display: grid; gap: 1px; }
+  .cf-name { display: block; font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500; }
+  .cf-size { display: block; font-family: var(--font-mono); font-size: 10px; opacity: 0.8; }
+
+  .chat-compose { flex: none; display: flex; align-items: center; gap: 6px; padding: 9px 12px; border-top: 1px solid var(--border); }
+  .chat-plus, .chat-send { flex: none; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; transition: background 0.15s ease, color 0.15s ease, transform 0.06s ease, opacity 0.15s ease; }
+  .chat-plus { background: var(--fg-soft); color: var(--muted); }
+  .chat-plus:hover { background: color-mix(in oklch, var(--accent) 14%, transparent); color: var(--accent); }
+  .chat-send { background: var(--accent-deep); color: var(--surface); }
+  .chat-send:hover { background: var(--accent-deeper); }
+  .chat-send:disabled { opacity: 0.38; cursor: default; }
+  .chat-plus:active, .chat-send:not(:disabled):active { transform: scale(0.94); }
+  .chat-plus svg { width: 16px; height: 16px; }
+  .chat-send svg { width: 15px; height: 15px; }
+  .chat-input { flex: 1; min-width: 0; height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--fg); font-size: var(--fs-sm); user-select: text; -webkit-user-select: text; }
+  .chat-input::placeholder { color: var(--muted); }
+  .chat-input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+
+  
+
   @media (prefers-reduced-motion: reduce) {
-    .orb-stage, .panel, .orb, .toast, .ctx, .push-card, #consentCard, .sheet, .dialog, .tree, .chev, .p-bar i, .pulse, .overlay,
-    .picker-layer, .picker, .pk-spin { transition: none !important; animation: none !important; }
+    .orb-stage, .panel, .orb, .toast, .ctx, .push-card, .sheet, .dialog, .tree, .chev, .p-bar i, .pulse, .overlay,
+    .picker-layer, .picker, .pk-spin, .chat-msg, .ws-seg::after, .tab::after, .foot-msg, .convo-pop { transition: none !important; animation: none !important; }
   }
 </style>
 </head>
@@ -701,9 +946,14 @@ font-family: var(--font-body);
         </div>
       </header>
 
-      <nav class="tabs" data-od-id="tabs" role="tablist">
-        <button class="tab active" role="tab" aria-selected="true" data-tab="local">本机 <span class="count">4</span></button>
-        <button class="tab" role="tab" aria-selected="false" data-tab="devices">设备 <span class="count">3</span></button>
+      <nav class="tabs" data-od-id="tabs">
+        <div class="tabs-scroll" id="tabsScroll" role="tablist" aria-label="本机与设备">
+          <button class="tab active" role="tab" aria-selected="true" data-tab="local" aria-controls="tab-local"><span class="tab-label">本机</span> <span class="count">4</span></button>
+          <button class="tab" role="tab" aria-selected="false" data-tab="devices" aria-controls="tab-devices"><span class="tab-label">设备</span> <span class="count" id="devTabCount">3</span></button>
+        </div>
+        <button class="tabs-more-btn" id="tabsMoreBtn" type="button" aria-label="更多设备" aria-haspopup="true" aria-expanded="false" hidden>
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>
+        </button>
       </nav>
 
       <div class="panel-body">
@@ -797,6 +1047,10 @@ font-family: var(--font-body);
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
             添加设备 · 配对码
           </button>
+          <button class="btn btn-secondary btn-block" id="newConvoBtn" style="height:34px; margin-top:6px">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M16 19v-1a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v1"/><circle cx="9" cy="7" r="3"/><path d="M22 19v-1a4 4 0 0 0-3-3.87"/><path d="M16 4.13a4 4 0 0 1 0 7.75"/></svg>
+            新建会话 · 选择多台设备
+          </button>
 
           <div class="list-label"><span>局域网设备</span><span class="num" id="devCount">3 台 · 1 长连接</span></div>
           <ul class="device-list" id="deviceList">
@@ -808,7 +1062,7 @@ font-family: var(--font-body);
               </div>
               <div class="d-acts">
                 <button class="btn btn-ghost btn-sm" data-disconnect>断开</button>
-                <button class="btn btn-ghost btn-sm" data-push>推送</button>
+                <button class="btn btn-ghost btn-sm" data-msg>消息</button>
               </div>
             </li>
             <li class="device-row online" data-id="d2" data-state="paired" data-ip="192.168.1.4:3891">
@@ -819,7 +1073,7 @@ font-family: var(--font-body);
               </div>
               <div class="d-acts">
                 <button class="btn btn-primary btn-sm" data-connect>建立长连接</button>
-                <button class="btn btn-ghost btn-sm" data-push>推送</button>
+                <button class="btn btn-ghost btn-sm" data-msg>消息</button>
               </div>
             </li>
             <li class="device-row online" data-id="d3" data-state="unbound" data-ip="192.168.1.9:3890">
@@ -830,7 +1084,7 @@ font-family: var(--font-body);
               </div>
               <div class="d-acts">
                 <button class="btn btn-primary btn-sm" data-pair>配对</button>
-                <button class="btn btn-ghost btn-sm" data-push>推送</button>
+                <button class="btn btn-ghost btn-sm" data-msg>消息</button>
               </div>
             </li>
           </ul>
@@ -840,33 +1094,105 @@ font-family: var(--font-body);
             <p class="e-sub">点击上方「添加设备 · 配对码」，在对方设备的 OrbDrop 中输入本机配对码即可完成配对。</p>
           </div>
           <p style="margin:14px 2px 0; font-size:var(--fs-xs); color:var(--muted); line-height:1.6;">
-            <span class="hl">未绑定</span>设备可点击「推送」直接发送（接收方需同意）；<span class="hl">已配对</span>设备可点击「建立长连接」；
+            <span class="hl">消息</span>可在「会话」页与设备一对一或群聊，发文件即推送（对端接收后落收件目录）；<span class="hl">已配对</span>设备可点击「建立长连接」；
             处于<span class="hl">长连接</span>的设备会自动收到你拖入悬浮球文件的广播，无需逐条操作。          </p>
+        </section>
+
+        <section id="tab-device" class="ws ws-simple" data-od-id="tab-device" role="tabpanel" hidden aria-label="设备文件工作区">
+          <header class="ws-head">
+            <span class="d-avatar" id="wsAvatar">B</span>
+            <div class="ws-cap">
+              <div class="ws-name"><span class="ws-nm" id="wsName">PC-B</span><span class="state-chip connected" id="wsState"><span class="dot ok"></span>长连接</span></div>
+              <span class="ws-ip num" id="wsIp">192.168.1.6:3890</span>
+            </div>
+            <div class="ws-acts">
+              <button class="btn btn-ghost btn-sm" id="wsMsgBtn">发消息</button>
+              <button class="btn btn-ghost btn-sm" id="wsDisconnect">断开</button>
+              <button class="icon-btn" id="wsMore" type="button" aria-label="更多操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
+            </div>
+          </header>
+
+          <div class="ws-body">
+            <div class="ws-pane ws-files" id="wsFiles" role="tabpanel" aria-label="对方共享项"></div>
+          </div>
         </section>
       </div>
 
       <footer class="panel-foot">
-        <span class="num">端口 3890</span>
-        <span>原型 · 示例数据</span>
+        <span class="foot-left">
+          <button class="foot-msg" id="msgFab" data-od-id="msg-entry" type="button" aria-label="会话" aria-expanded="false" aria-controls="convoSheet">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.75" y="5.25" width="16.5" height="13.5" rx="4.25"/><circle cx="8.6" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="15.4" cy="12" r="1.15" fill="currentColor" stroke="none"/></svg>
+            <span class="foot-msg-label">会话</span>
+            <span class="msg-fab-badge num" id="msgFabBadge" hidden>0</span>
+          </button>
+          <span class="foot-ip" id="footIp" title="本机地址">192.168.1.10:3890</span>
+        </span>
+        <span class="foot-right">
+          <span class="foot-ver num">v0.5.0</span>
+          <button class="foot-bell" id="notifyBtn" type="button" aria-label="通知">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
+          </button>
+        </span>
       </footer>
+
+      <section class="convo-pop" id="convoSheet" data-od-id="convo-sheet" aria-label="会话" aria-hidden="true" inert>
+        <div class="convos-list-view" id="convosListView">
+          <header class="convos-head">
+            <span class="convos-title">会话</span>
+            <div class="convos-head-acts">
+              <button class="btn btn-secondary btn-sm" id="convNewBtn" type="button">＋ 新建会话</button>
+              <button class="icon-btn" id="convoCloseBtn" type="button" aria-label="关闭会话">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+              </button>
+            </div>
+          </header>
+          <div class="convo-list" id="convoList" aria-label="会话列表"></div>
+        </div>
+
+        <div class="convo-detail" id="convoDetail" hidden>
+          <header class="conv-top">
+            <button class="conv-back" id="convBackBtn" type="button" aria-label="返回会话列表">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 6-6 6 6 6"/></svg>
+            </button>
+            <span class="conv-title" id="convTitle">PC-B</span>
+            <span class="conv-status" id="convDot"></span>
+            <span class="conv-count num" id="convCount" hidden></span>
+            <div class="conv-acts">
+              <button class="icon-btn" id="convMore" type="button" data-ctx data-convoctx aria-label="会话操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
+              <button class="icon-btn" id="convoCloseBtn2" type="button" aria-label="关闭会话">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+              </button>
+            </div>
+          </header>
+
+          <div class="recip" id="recipBar">
+            <span class="recip-label">发送给</span>
+            <div class="recip-chips" id="recipChips"></div>
+            <button class="recip-add" id="recipAdd" type="button" aria-label="添加收件人">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+              添加
+            </button>
+          </div>
+
+          <div class="chat-log" id="chatLog" role="log" aria-label="会话记录"></div>
+
+          <form class="chat-compose" id="chatCompose">
+            <label class="sr-only" for="chatInput">发送消息</label>
+            <input class="chat-input" id="chatInput" type="text" placeholder="输入消息…" autocomplete="off" />
+            <button class="chat-plus" id="chatPlusBtn" type="button" aria-label="发送文件（即推送）">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+            <button class="chat-send" id="chatSendBtn" type="submit" aria-label="发送消息" disabled>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V6"/><path d="M6 12l6-6 6 6"/></svg>
+            </button>
+          </form>
+        </div>
+      </section>
 
       <div class="push-card" id="pushCard" data-od-id="push-card">
         <div class="p-top"><span id="pushTitle">正在发送 · 项目设计稿</span><span class="p-per num" id="pushPer">0%</span></div>
         <div class="p-bar"><i id="pushBar"></i></div>
         <div class="p-meta"><span id="pushTarget">→ PC-B · 局域网</span><span class="num" id="pushBytes">0 / 12.6 MB</span></div>
-      </div>
-
-      <div class="push-card" id="consentCard" data-od-id="consent-card">
-        <div class="p-top"><span>接收推送邀请</span><span class="mono" id="consentFrom">来自设备</span></div>
-        <div class="consent-info">
-          <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l5 5v13H6V3Z"/></svg></span>
-          <span class="c-name" id="consentName">项目设计稿</span>
-          <span class="c-size num" id="consentSize">12.6 MB</span>
-        </div>
-        <div class="consent-acts">
-          <button class="btn btn-secondary" id="declineBtn">拒绝</button>
-          <button class="btn btn-primary" id="acceptBtn">同意</button>
-        </div>
       </div>
 
       <section class="sheet" id="settingsSheet" data-od-id="settings" aria-label="设置">
@@ -933,6 +1259,22 @@ font-family: var(--font-body);
         </div>
       </div>
 
+      <div class="overlay" id="recipDialog" data-od-id="recipient-dialog" role="dialog" aria-modal="true" aria-labelledby="recipTitle">
+        <div class="dialog">
+          <h3 id="recipTitle">选择收件人</h3>
+          <p class="d-desc">勾选一台设备是一对一会话，勾选两台以上会创建一个群会话。</p>
+          <div class="recip-tools">
+            <button class="btn btn-ghost btn-sm" id="recipAllBtn" type="button">全选 / 取消全选</button>
+            <span class="num" id="recipCount">已选 0 台</span>
+          </div>
+          <div class="recip-list" id="recipList" role="group" aria-label="局域网设备"></div>
+          <div class="d-acts">
+            <button class="btn btn-secondary" id="recipCancelBtn">取消</button>
+            <button class="btn btn-primary" id="recipConfirmBtn" disabled>确定</button>
+          </div>
+        </div>
+      </div>
+
       <div class="picker-layer" id="pickerLayer" aria-hidden="true">
         <section class="picker" role="dialog" aria-modal="true" aria-labelledby="pickerTitle">
           <header class="picker-head">
@@ -972,6 +1314,8 @@ font-family: var(--font-body);
 
   <div class="ctx" id="ctxMenu" data-od-id="context-menu"></div>
   <div class="ctx" id="pickerCtx" data-od-id="picker-context-menu"></div>
+  <div class="ctx" id="chatCtx" data-od-id="chat-context-menu"></div>
+  <div class="ctx" id="tabsMenu" data-od-id="tabs-menu" role="menu" aria-label="更多设备"></div>
 
   <div class="toast-layer" id="toastLayer"></div>
 
@@ -988,22 +1332,91 @@ font-family: var(--font-body);
   function setOpen(v) {
     stage.classList.toggle('open', v);
     orbBtn.setAttribute('aria-expanded', String(v));
-    if (!v) { closeSheet(); closePair(); hideCtx(); closePicker(); }
+    if (!v) { closeSheet(); closePair(); hideCtx(); closePicker(); hideTabsMenu(); hideChatCtx(); closeRecipientDialog(); closeConvoSheet(true); }
   }
 
   orbBtn.addEventListener('click', function () { setOpen(true); });
   $('#collapseBtn').addEventListener('click', function () { setOpen(false); });
 
-  /* tabs */
-  $$('.tab').forEach(function (t) {
-    t.addEventListener('click', function () {
-      $$('.tab').forEach(function (x) {
-        x.classList.toggle('active', x === t);
-        x.setAttribute('aria-selected', x === t ? 'true' : 'false');
-      });
-      $('#tab-local').hidden = t.dataset.tab !== 'local';
-      $('#tab-devices').hidden = t.dataset.tab !== 'devices';
+  /* tabs · 本机 / 设备 / 每台长连接设备一个页签 */
+  var tabsScroll = $('#tabsScroll');
+  var tabsMoreBtn = $('#tabsMoreBtn');
+  var tabsMenu = $('#tabsMenu');
+  var panelBody = $('.panel-body');
+  var panelFoot = $('.panel-foot');
+
+  function selectTab(tab) {
+    if (!tab) return false;
+    $$('.tab', tabsScroll).forEach(function (x) {
+      var on = x === tab;
+      x.classList.toggle('active', on);
+      x.setAttribute('aria-selected', on ? 'true' : 'false');
     });
+    var kind = tab.dataset.tab;
+    $('#tab-local').hidden = kind !== 'local';
+    $('#tab-devices').hidden = kind !== 'devices';
+    $('#tab-device').hidden = kind !== 'device';
+    panelBody.classList.toggle('ws-mode', kind === 'device');
+    if (kind === 'device') openWorkspace(tab.dataset.device);
+    else closeWorkspace();
+    hideTabsMenu();
+    return true;
+  }
+  function tabForDevice(devId) {
+    return $('.tab[data-tab="device"][data-device="' + devId + '"]', tabsScroll);
+  }
+  function selectDevice(devId) {
+    var t = tabForDevice(devId);
+    if (t) return selectTab(t);
+    selectTab($('.tab[data-tab="devices"]', tabsScroll));
+    return false;
+  }
+  tabsScroll.addEventListener('click', function (e) {
+    var t = e.target.closest('.tab');
+    if (t) selectTab(t);
+  });
+  tabsScroll.addEventListener('keydown', function (e) {
+    if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+    var tabs = $$('.tab', tabsScroll);
+    var i = tabs.indexOf(document.activeElement);
+    if (i < 0) return;
+    e.preventDefault();
+    var next = tabs[e.key === 'ArrowRight' ? Math.min(tabs.length - 1, i + 1) : Math.max(0, i - 1)];
+    if (next) { next.focus(); selectTab(next); }
+  });
+  tabsMoreBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    if (tabsMenu.classList.contains('show')) { hideTabsMenu(); return; }
+    showTabsMenu();
+  });
+  function hideTabsMenu() {
+    tabsMenu.classList.remove('show');
+    tabsMoreBtn.setAttribute('aria-expanded', 'false');
+  }
+  function showTabsMenu() {
+    var live = connectedDevices();
+    if (!live.length) { toast('暂无长连接设备'); return; }
+    tabsMenu.innerHTML = live.map(function (r) {
+      var t = tabForDevice(r.dataset.id);
+      var on = t && t.classList.contains('active');
+      return '<button class="ctx-item" role="menuitem" data-dev="' + r.dataset.id + '">' + ICO_MONITOR +
+        '<span class="od-truncate' + (on ? ' hl' : '') + '">' + devName(r) + '</span></button>';
+    }).join('');
+    var rect = tabsMoreBtn.getBoundingClientRect();
+    tabsMenu.classList.remove('show');
+    tabsMenu.style.left = Math.max(8, Math.min(rect.right - 200, innerWidth - 208)) + 'px';
+    tabsMenu.style.top = (rect.bottom + 6) + 'px';
+    tabsMoreBtn.setAttribute('aria-expanded', 'true');
+    requestAnimationFrame(function () { tabsMenu.classList.add('show'); });
+  }
+  tabsMenu.addEventListener('click', function (e) {
+    var b = e.target.closest('[data-dev]');
+    if (!b) return;
+    hideTabsMenu();
+    selectDevice(b.dataset.dev);
+  });
+  document.addEventListener('click', function (e) {
+    if (!tabsMenu.contains(e.target) && e.target !== tabsMoreBtn) hideTabsMenu();
   });
 
   /* share tree expand */
@@ -1036,13 +1449,29 @@ font-family: var(--font-body);
   var ICON_LINK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/></svg>';
   var ICON_LINKOFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/><path d="M3 3l18 18"/></svg>';
   var ICON_PUSH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>';
+  var ICON_CMP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><rect x="3" y="6" width="6" height="12" rx="1"/><rect x="15" y="6" width="6" height="12" rx="1"/></svg>';
+  var ICON_MONITOR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="12" rx="2"/><path d="M9 20h6M12 16v4"/></svg>';
+  var ICO_GROUP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M16 19v-1a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v1"/><circle cx="9" cy="7" r="3"/><path d="M22 19v-1a4 4 0 0 0-3-3.87"/><path d="M16 4.13a4 4 0 0 1 0 7.75"/></svg>';
+  var ICON_CHAT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 0 1-8 8H6.5L3 22V12a8 8 0 0 1 8-8h1a8 8 0 0 1 8 8Z"/><path d="M8.5 11h7M8.5 14.5h4"/></svg>';
   function ctxHTMLFor(target) {
+    var cctx = target && target.closest && target.closest('[data-convoctx]');
+    if (cctx) {
+      var isGroup = convoParticipants(chat.openKey).length > 1;
+      return (isGroup ? '' : '<button class="ctx-item" data-act="convofiles">' + ICON_OPEN + '查看该设备文件</button>') +
+        '<button class="ctx-item danger" data-act="convoexit">' + ICON_TRASH + (isGroup ? '退出会话（本地删除并广播离开）' : '清空聊天记录') + '</button>';
+    }
     var share = target && target.closest('.share-item');
     var device = target && target.closest('.device-row');
     if (share) {
+      if (share.classList.contains('remote')) {
+        return '<button class="ctx-item" data-act="download">' + ICON_DOWN + '下载到本地</button>' +
+          '<button class="ctx-item" data-act="bc">' + ICON_CMP + '用 BeyondCompare 比较</button>' +
+          '<button class="ctx-item" data-act="copy">' + ICON_COPY + '复制远程路径</button>';
+      }
       return '<button class="ctx-item" data-act="download">' + ICON_DOWN + '下载到本地</button>' +
         '<button class="ctx-item" data-act="open">' + ICON_OPEN + '打开所在文件夹</button>' +
         '<button class="ctx-item" data-act="copy">' + ICON_COPY + '复制共享路径</button>' +
+        '<button class="ctx-item" data-act="sendshare">' + ICON_PUSH + '发送给…</button>' +
         '<div class="ctx-sep"></div>' +
         '<button class="ctx-item danger" data-act="remove">' + ICON_TRASH + '移除共享项</button>';
     }
@@ -1051,7 +1480,8 @@ font-family: var(--font-body);
       return (st === 'connected'
           ? '<button class="ctx-item" data-act="disconnect">' + ICON_LINKOFF + '断开长连接</button>'
           : '<button class="ctx-item" data-act="connect">' + ICON_LINK + '建立长连接</button>') +
-        '<button class="ctx-item" data-act="push">' + ICON_PUSH + '推送文件</button>' +
+        '<button class="ctx-item" data-act="msg">' + ICON_CHAT + '发消息</button>' +
+        '<button class="ctx-item" data-act="sendfile">' + ICON_PUSH + '发送文件…</button>' +
         '<div class="ctx-sep"></div>' +
         '<button class="ctx-item danger" data-act="unpair">' + ICON_TRASH + '解除配对</button>';
     }
@@ -1103,7 +1533,8 @@ font-family: var(--font-body);
     switch (act.dataset.act) {
       case 'download': toast('已开始下载「' + name + '」到 桌面/OrbDrop'); break;
       case 'open': toast('已在访达中打开「' + name + '」所在文件夹'); break;
-      case 'copy': toast('已复制「' + name + '」的共享路径'); break;
+      case 'copy': toast(li && li.classList.contains('remote') ? '已复制「' + name + '」的远程路径' : '已复制「' + name + '」的共享路径'); break;
+      case 'bc': toast('已通过 WebDAV 用 BeyondCompare 打开「' + name + '」比较'); break;
       case 'remove':
         if (li) {
           li.style.transition = 'opacity .25s ease, transform .25s ease';
@@ -1113,16 +1544,33 @@ font-family: var(--font-body);
         }
         toast('已移除共享项「' + name + '」');
         break;
+      case 'sendshare':
+        if (li) {
+          var sn = $('.s-name', li);
+          var sm = $('.s-meta .num', li);
+          var shareName = sn ? sn.textContent : '共享项';
+          var shareSize = sm ? String(sm.textContent).split('·')[0].trim() : '12.6 MB';
+          openRecipientDialog([], function (ids) { sendFilePayload(ids, [{ name: shareName, size: shareSize }]); });
+        }
+        break;
       case 'connect': connectDevice(drow); break;
       case 'disconnect': disconnectDevice(drow); break;
-      case 'push': requestPush(drow); break;
+      case 'msg': if (drow) openDeviceChat(drow.dataset.id); break;
+      case 'sendfile': if (drow) pickAndSendFiles([drow.dataset.id]); break;
+      case 'convofiles': { var ck = chat.openKey; if (ck && ck.indexOf('dev:') === 0) selectDevice(ck.slice(4)); break; }
+      case 'convoexit': exitConvo(); break;
       case 'unpair':
         if (drow) {
+          var wasCurrentDev = wsDeviceId === drow.dataset.id;
           drow.dataset.state = 'removed';
           drow.style.transition = 'opacity .25s ease, transform .25s ease';
           drow.style.opacity = '0';
           drow.style.transform = 'scale(.98)';
           setTimeout(function () { if (drow.parentNode) drow.parentNode.removeChild(drow); }, 240);
+          purgeDeviceFromGroups(drow.dataset.id);
+          renderDeviceTabs();
+          if (wasCurrentDev) selectTab($('.tab[data-tab="devices"]', tabsScroll));
+          if (chat.openKey && !convoValid(chat.openKey)) { chat.openKey = null; showConvoList(); }
         }
         toast('已解除配对并移除设备「' + name + '」');
         updateBroadcastUI();
@@ -1264,7 +1712,7 @@ font-family: var(--font-body);
   var pushTarget = $('#pushTarget');
   var pushInterval = null;
 
-  function startPush(name, target, total) {
+  function startPush(name, target, total, onProgress, onDone) {
     pushTitle.textContent = '正在发送 · ' + name;
     pushTarget.textContent = '→ ' + target + ' · 局域网';
     pushBytes.textContent = '0 / ' + total;
@@ -1280,13 +1728,15 @@ font-family: var(--font-body);
       pushPer.textContent = pct + '%';
       var rMB = Math.round(received / 1024 / 1024 * 10) / 10;
       pushBytes.textContent = rMB + ' / ' + total;
+      if (onProgress) onProgress(pct);
       if (pct >= 100) {
         clearInterval(pushInterval);
         pushInterval = null;
         pushCard.classList.add('done');
         pushTitle.textContent = '已发送完成 · ' + name;
-        toast('「' + name + '」已成功发送至 ' + target);
-        setTimeout(function () { pushCard.classList.remove('show'); pushCard.classList.remove('done'); }, 3000);
+        if (onProgress) onProgress(100);
+        if (onDone) onDone();
+        setTimeout(function () { pushCard.classList.remove('show'); pushCard.classList.remove('done'); }, 2200);
       }
     }, 600);
   }
@@ -1314,13 +1764,13 @@ font-family: var(--font-body);
     var st = devState(row);
     if (st === 'connected') {
       acts.innerHTML = '<button class="btn btn-ghost btn-sm" data-disconnect>断开</button>' +
-        '<button class="btn btn-ghost btn-sm" data-push>推送</button>';
+        '<button class="btn btn-ghost btn-sm" data-msg>消息</button>';
     } else if (st === 'paired') {
       acts.innerHTML = '<button class="btn btn-primary btn-sm" data-connect>建立长连接</button>' +
-        '<button class="btn btn-ghost btn-sm" data-push>推送</button>';
+        '<button class="btn btn-ghost btn-sm" data-msg>消息</button>';
     } else {
       acts.innerHTML = '<button class="btn btn-primary btn-sm" data-pair>配对</button>' +
-        '<button class="btn btn-ghost btn-sm" data-push>推送</button>';
+        '<button class="btn btn-ghost btn-sm" data-msg>消息</button>';
     }
   }
   function updateBroadcastUI() {
@@ -1348,18 +1798,23 @@ font-family: var(--font-body);
     row.dataset.state = 'connected';
     renderStateChip(row); renderDeviceActions(row);
     updateBroadcastUI();
+    renderDeviceTabs();
     toast('已与「' + devName(row) + '」建立长连接，拖入文件将自动广播');
   }
   function disconnectDevice(row) {
+    var wasCurrent = wsDeviceId === row.dataset.id;
     row.dataset.state = 'paired';
     renderStateChip(row); renderDeviceActions(row);
     updateBroadcastUI();
+    renderDeviceTabs();
+    if (wasCurrent) selectDevice(row.dataset.id);
     toast('已断开与「' + devName(row) + '」的长连接');
   }
   function pairDevice(row) {
     row.dataset.state = 'paired';
     renderStateChip(row); renderDeviceActions(row);
     updateBroadcastUI();
+    renderDeviceTabs();
     toast('配对成功 ·「' + devName(row) + '」已加入设备列表');
   }
   var pendingPairRow = null;
@@ -1378,33 +1833,21 @@ font-family: var(--font-body);
     pairDlg.classList.add('open');
   }
 
-  /* 推送：未绑定/已配对需同意，长连接直接推送 */
-  var consentCard = $('#consentCard');
-  function requestPush(row) {
-    var st = devState(row);
-    var dName = devName(row);
-    if (st === 'connected') {
-      startPush('项目设计稿', dName, '12.6 MB');
-      return;
-    }
-    toast('已向「' + dName + '」发起推送，等待对方同意');
-    $('#consentName').textContent = '项目设计稿';
-    $('#consentSize').textContent = '12.6 MB';
-    $('#consentFrom').textContent = '来自 ' + dName;
-    consentCard.dataset.pending = dName;
-    consentCard.classList.add('show');
+  /* 文件传输队列：文件消息即推送，按（消息 × 在线设备）依次传输 */
+  var transferQueue = [];
+  var transferring = false;
+  function enqueueTransfer(job) { transferQueue.push(job); processTransfers(); }
+  function processTransfers() {
+    if (transferring) return;
+    var job = transferQueue.shift();
+    if (!job) return;
+    transferring = true;
+    startPush(job.name, job.devName, job.size, job.onProgress, function () {
+      transferring = false;
+      if (job.onDone) job.onDone();
+      setTimeout(processTransfers, 240);
+    });
   }
-  $('#acceptBtn').addEventListener('click', function () {
-    var dName = consentCard.dataset.pending;
-    consentCard.classList.remove('show');
-    toast('「' + dName + '」已同意接收，开始传输');
-    startPush('项目设计稿', dName, '12.6 MB');
-  });
-  $('#declineBtn').addEventListener('click', function () {
-    var dName = consentCard.dataset.pending;
-    consentCard.classList.remove('show');
-    toast('「' + dName + '」拒绝了接收');
-  });
 
   /* device row action delegation */
   $('#deviceList').addEventListener('click', function (e) {
@@ -1415,7 +1858,7 @@ font-family: var(--font-body);
     if (btn.hasAttribute('data-connect')) connectDevice(row);
     else if (btn.hasAttribute('data-disconnect')) disconnectDevice(row);
     else if (btn.hasAttribute('data-pair')) openPair(row);
-    else if (btn.hasAttribute('data-push')) requestPush(row);
+    else if (btn.hasAttribute('data-msg')) openDeviceChat(row.dataset.id);
     else if (btn.hasAttribute('data-ctx')) openCtxFor(e, btn);
   });
 
@@ -1994,6 +2437,864 @@ font-family: var(--font-body);
       remove: function (path) { pkRemoveFav(path); }
     }
   };
+
+  /* ── 会话 · 设备文件工作区 + 会话列表 / 详情 ─────────────── */
+  var chatLog = $('#chatLog');
+  var chatInput = $('#chatInput');
+  var chatSendBtn = $('#chatSendBtn');
+  var chatCtx = $('#chatCtx');
+  var wsFiles = $('#wsFiles');
+  var wsAvatar = $('#wsAvatar');
+  var wsName = $('#wsName');
+  var wsState = $('#wsState');
+  var wsIp = $('#wsIp');
+  var wsDisconnect = $('#wsDisconnect');
+  var wsMsgBtn = $('#wsMsgBtn');
+  var wsMore = $('#wsMore');
+  var convoSheet = $('#convoSheet');
+  var convosListView = $('#convosListView');
+  var convoDetail = $('#convoDetail');
+  var convoList = $('#convoList');
+  var msgFab = $('#msgFab');
+  var msgFabBadge = $('#msgFabBadge');
+  var convTitle = $('#convTitle');
+  var convDot = $('#convDot');
+  var convCount = $('#convCount');
+  var convBackBtn = $('#convBackBtn');
+  var convMore = $('#convMore');
+  var recipChips = $('#recipChips');
+  var recipAdd = $('#recipAdd');
+  var recipDialog = $('#recipDialog');
+  var recipList = $('#recipList');
+  var wsDeviceId = null;
+  var convoReturnFocus = null;
+  var groupIdSeq = 1;
+  var chat = {
+    store: {}, unread: { 'dev:d1': 2 }, draft: {},
+    groups: { g1: { id: 'g1', participants: ['d1', 'd2'] } },
+    groupOrder: ['g1'],
+    order: ['dev:d1', 'dev:d3', 'g1', 'dev:d2'],
+    openKey: null
+  };
+  var CHAT_ICO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 0 1-8 8H6.5L3 22V12a8 8 0 0 1 8-8h1a8 8 0 0 1 8 8Z"/><path d="M8.5 11h7M8.5 14.5h4"/></svg>';
+  var CHAT_FILE_ICO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M6 3h8l5 5v13H6V3Z"/></svg>';
+  var CHAT_SEED = {
+    'dev:d1': [
+      { from: 'peer', kind: 'text', text: '设计稿收到了，先在 assets 里对一遍色板。', t: '10:18' },
+      { from: 'me', kind: 'text', text: '好，重点看主色和中性色的对比，不合适的直接标出来。', t: '10:20' },
+      { from: 'peer', kind: 'file', name: '色板-修订.png', size: '128 KB', t: '10:22' },
+      { from: 'peer', kind: 'text', text: '标了三处，最大的一处落在按钮悬停态上。', t: '10:22' }
+    ],
+    'dev:d2': [
+      { from: 'me', kind: 'file', name: 'PRD-v0.5.md', size: '48 KB', t: '09:41' },
+      { from: 'peer', kind: 'text', text: '收到，我下午回一版评审意见。', t: '09:44' }
+    ],
+    'dev:d3': [
+      { from: 'peer', kind: 'text', text: '在吗？帮我传一下「Q3 排期表」。', t: '10:11' },
+      { from: 'peer', fromName: 'PC-C', kind: 'file', name: '接口清单.xlsx', size: '1.1 MB', t: '10:12', invite: true, inviteState: 'pending' }
+    ],
+    g1: [
+      { from: 'me', kind: 'text', text: '两位，发布包我一起推到你们两台机器上。', t: '10:05' },
+      { from: 'peer', fromName: 'MacBook Pro', kind: 'text', text: '收到，我先在素材仓库对一版。', t: '10:07' },
+      { from: 'peer', fromName: 'PC-B', kind: 'text', text: '好，文件到了我就跑冒烟。', t: '10:08' }
+    ]
+  };
+  /* 设备页「文件」视图：对方共享给我的共享项（引用模式，只读浏览 / 下载 / 比较） */
+  var REMOTE_SHARES = {
+    d1: [
+      { name: '素材仓库', folder: true, meta: '2.4 GB · 18 个文件', children: [
+        { name: '主视觉', folder: true, meta: '6 项' },
+        { name: '字体', folder: true, meta: '空' },
+        { name: '交付清单.md', folder: false, meta: '32 KB' }
+      ] },
+      { name: '发布包-v0.5.zip', folder: false, meta: '86 MB' }
+    ],
+    d2: [
+      { name: 'Mac 设计稿', folder: true, meta: '1.2 GB · 9 个文件', children: [
+        { name: 'home-v3.fig', folder: false, meta: '4.2 MB' },
+        { name: 'tokens.json', folder: false, meta: '12 KB' }
+      ] }
+    ],
+    d3: []
+  };
+
+  function devById(id) {
+    for (var i = 0; i < deviceRows.length; i++) if (deviceRows[i].dataset.id === id) return deviceRows[i];
+    return null;
+  }
+  function connectedDevices() {
+    return deviceRows.filter(function (r) { return r.parentNode && r.dataset.state === 'connected'; });
+  }
+  function devAvatarOf(row) {
+    var a = row && $('.d-avatar', row);
+    return (a && a.textContent.trim()) || devName(row).charAt(0);
+  }
+  function devNameById(id) { var r = devById(id); return r ? devName(r) : id; }
+  function groupKeyOf(ids) { return ids.slice().sort().join('|'); }
+  function convoParticipants(key) {
+    if (!key) return [];
+    if (key.indexOf('dev:') === 0) return [key.slice(4)];
+    var g = chat.groups[key];
+    return g ? g.participants.slice() : [];
+  }
+  function convoTitleText(key) { return convoParticipants(key).map(devNameById).join('、'); }
+  function convoValid(key) {
+    if (!key) return false;
+    if (key.indexOf('dev:') === 0) return !!devById(key.slice(4));
+    return !!chat.groups[key] && chat.groups[key].participants.length >= 2;
+  }
+  function convoLast(key) { var a = chat.store[key]; return a && a.length ? a[a.length - 1] : null; }
+  function convoDotState(key) {
+    var ids = convoParticipants(key);
+    for (var i = 0; i < ids.length; i++) {
+      var r = devById(ids[i]);
+      if (r && r.dataset.state === 'connected') return 'ok';
+    }
+    var first = devById(ids[0]);
+    return first && first.dataset.state === 'unbound' ? 'warn' : 'off';
+  }
+  function renderConvoStatus(key) {
+    var ids = convoParticipants(key);
+    var st = convoDotState(key);
+    convDot.className = 'conv-status' + (st === 'ok' ? ' ok' : st === 'warn' ? ' warn' : '');
+    if (ids.length > 1) { convCount.hidden = false; convCount.textContent = ids.length + ' 台'; }
+    else convCount.hidden = true;
+  }
+  function convoSummarize(key) {
+    var m = convoLast(key);
+    if (!m) return '还没有消息';
+    var pre = m.from === 'me' ? '你：' : '';
+    return pre + (m.kind === 'file' ? '[文件] ' + m.name : m.text);
+  }
+  function touchConvo(key) {
+    var i = chat.order.indexOf(key);
+    if (i > -1) chat.order.splice(i, 1);
+    chat.order.unshift(key);
+  }
+  function allConvoKeys() {
+    var keys = chat.order.filter(convoValid);
+    deviceRows.forEach(function (r) {
+      if (!r.parentNode) return;
+      var k = 'dev:' + r.dataset.id;
+      if (convoValid(k) && keys.indexOf(k) < 0) keys.push(k);
+    });
+    chat.groupOrder.forEach(function (gid) {
+      if (convoValid(gid) && keys.indexOf(gid) < 0) keys.push(gid);
+    });
+    return keys;
+  }
+  function ensureConvo(ids) {
+    if (ids.length === 1) return 'dev:' + ids[0];
+    var sig = groupKeyOf(ids);
+    for (var i = 0; i < chat.groupOrder.length; i++) {
+      var g = chat.groups[chat.groupOrder[i]];
+      if (g && groupKeyOf(g.participants) === sig) return chat.groupOrder[i];
+    }
+    var gid = 'g' + (++groupIdSeq);
+    chat.groups[gid] = { id: gid, participants: ids.slice() };
+    chat.groupOrder.push(gid);
+    return gid;
+  }
+  function purgeDeviceFromGroups(id) {
+    chat.groupOrder.slice().forEach(function (gid) {
+      var g = chat.groups[gid];
+      if (!g) return;
+      var k = g.participants.indexOf(id);
+      if (k > -1) g.participants.splice(k, 1);
+      if (g.participants.length < 2) {
+        var oi = chat.groupOrder.indexOf(gid);
+        if (oi > -1) chat.groupOrder.splice(oi, 1);
+        delete chat.groups[gid];
+      }
+    });
+  }
+  function chatStoreFor(key) {
+    if (!chat.store[key]) chat.store[key] = (CHAT_SEED[key] || []).slice();
+    return chat.store[key];
+  }
+  function chatNow() {
+    var d = new Date();
+    return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  }
+  function chatUnread(key) { return chat.unread[key] || 0; }
+
+  function fileStatusText(m) {
+    if (m.transfer) {
+      if (m.transfer.state === 'sending') return '传输中 ' + (m.transfer.pct || 0) + '%';
+      if (m.transfer.state === 'failed') return '对方离线 · 未送达';
+      return '已发送至 ' + m.transfer.total + ' 台' + (m.transfer.offline ? ' · ' + m.transfer.offline + ' 台离线' : '');
+    }
+    if (m.inviteState === 'received') return '已接收 · 已保存到收件目录';
+    if (m.inviteState === 'rejected') return '已拒绝接收';
+    return '';
+  }
+  function updateFileBubble(el, m) {
+    if (!el) return;
+    var st = el.querySelector('.cf-status');
+    if (st) st.textContent = fileStatusText(m);
+    var i = el.querySelector('.cf-bar i');
+    if (i && m.transfer) i.style.width = Math.min(100, m.transfer.pct || 0) + '%';
+  }
+  function resolveInvite(m, card, accepted) {
+    m.inviteState = accepted ? 'received' : 'rejected';
+    card.innerHTML = '<div class="ic-row"><span class="f-icon">' + CHAT_FILE_ICO + '</span>' +
+      '<span class="ic-main"><span class="ic-name"></span><span class="ic-size"></span></span></div>' +
+      '<div class="ic-done">' + (accepted ? '已接收 · 已保存到收件目录' : '已拒绝接收') + '</div>';
+    card.querySelector('.ic-name').textContent = m.name;
+    card.querySelector('.ic-size').textContent = m.size || '文件';
+    renderConvoList();
+    toast(accepted ? '已接收「' + m.name + '」，保存到收件目录' : '已拒绝接收「' + m.name + '」');
+  }
+  function inviteCardEl(m) {
+    var card = document.createElement('div');
+    card.className = 'invite-card';
+    card.innerHTML =
+      '<div class="ic-row"><span class="f-icon">' + CHAT_FILE_ICO + '</span>' +
+      '<span class="ic-main"><span class="ic-name"></span><span class="ic-size"></span></span></div>' +
+      '<div class="ic-sub">来自 ' + (m.fromName || 'PC-C') + ' · 接收后保存到收件目录</div>' +
+      '<div class="ic-acts"><button class="btn btn-secondary btn-sm" type="button" data-inv="no">拒绝</button>' +
+      '<button class="btn btn-primary btn-sm" type="button" data-inv="yes">接收</button></div>';
+    card.querySelector('.ic-name').textContent = m.name;
+    card.querySelector('.ic-size').textContent = m.size || '文件';
+    card.querySelector('[data-inv="yes"]').addEventListener('click', function () { resolveInvite(m, card, true); });
+    card.querySelector('[data-inv="no"]').addEventListener('click', function () { resolveInvite(m, card, false); });
+    return card;
+  }
+  function chatMsgEl(m) {
+    var wrap = document.createElement('div');
+    wrap.className = 'chat-msg ' + (m.from === 'me' ? 'me' : 'peer');
+    wrap.setAttribute('data-copy', m.kind === 'file' ? (m.name + '（' + m.size + '）') : m.text);
+    if (m.invite && m.inviteState === 'pending') {
+      wrap.appendChild(inviteCardEl(m));
+      var tm0 = document.createElement('div');
+      tm0.className = 'chat-meta';
+      tm0.textContent = (m.fromName || 'PC-C') + ' · ' + m.t;
+      wrap.appendChild(tm0);
+      return wrap;
+    }
+    var bubble = document.createElement('div');
+    bubble.className = 'chat-bubble';
+    if (m.kind === 'file') {
+      bubble.classList.add('chat-bubble-file');
+      bubble.innerHTML = '<span class="cf-ico">' + CHAT_FILE_ICO + '</span><span class="cf-main">' +
+        '<span class="cf-name od-truncate"></span><span class="cf-size"></span><span class="cf-status"></span></span>';
+      bubble.querySelector('.cf-name').textContent = m.name;
+      bubble.querySelector('.cf-size').textContent = m.size || '文件';
+      var stEl = bubble.querySelector('.cf-status');
+      stEl.textContent = fileStatusText(m);
+      if (m.transfer && m.transfer.state === 'sending') {
+        var bar = document.createElement('span');
+        bar.className = 'cf-bar';
+        bar.innerHTML = '<i style="width:' + Math.min(100, m.transfer.pct || 0) + '%"></i>';
+        bubble.querySelector('.cf-main').appendChild(bar);
+      }
+      if (!fileStatusText(m)) stEl.remove();
+    } else {
+      bubble.innerHTML = '<span class="chat-text"></span>';
+      bubble.querySelector('.chat-text').textContent = m.text;
+    }
+    var meta = document.createElement('div');
+    meta.className = 'chat-meta';
+    meta.textContent = m.from === 'me'
+      ? (m.t + ' · ' + (m.status || '已送达'))
+      : ((m.fromName ? m.fromName + ' · ' : '') + m.t);
+    wrap.appendChild(bubble);
+    wrap.appendChild(meta);
+    return wrap;
+  }
+
+  function renderChatLog() {
+    chatLog.innerHTML = '';
+    var key = chat.openKey;
+    if (!key) {
+      chatLog.innerHTML = '<div class="chat-empty"><p>暂无会话</p><p class="ce-sub">先到「设备」里配对或建立长连接。</p></div>';
+      return;
+    }
+    var msgs = chatStoreFor(key);
+    if (!msgs.length) {
+      chatLog.innerHTML = '<div class="chat-empty">' + CHAT_ICO + '<p>还没有消息</p><p class="ce-sub">发一条消息或传一个文件，开始和设备对话。</p></div>';
+      return;
+    }
+    msgs.forEach(function (m) { chatLog.appendChild(chatMsgEl(m)); });
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+
+  /* ── 会话列表：1:1 与群混排，按最近消息排序 ──────────────── */
+  function renderConvoList() {
+    convoList.innerHTML = '';
+    var keys = allConvoKeys();
+    if (!keys.length) {
+      convoList.innerHTML = '<div class="empty">' + CHAT_ICO + '<p>还没有会话</p><p class="e-sub">点击右上「新建会话」选择设备，或从设备页发消息。</p></div>';
+      return;
+    }
+    keys.forEach(function (key) {
+      var ids = convoParticipants(key);
+      var isGroup = ids.length > 1;
+      var last = convoLast(key);
+      var unread = chatUnread(key);
+      var item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'convo-item';
+      item.dataset.key = key;
+      var avs = '<span class="convo-avs">';
+      ids.slice(0, 2).forEach(function (id) {
+        var r = devById(id);
+        avs += '<span class="d-avatar">' + (r ? devAvatarOf(r) : '?') + '</span>';
+      });
+      avs += '</span>';
+      item.innerHTML = avs +
+        '<span class="convo-main"><span class="convo-top"><span class="convo-name"></span><span class="convo-dot"></span><span class="convo-time num"></span></span>' +
+        '<span class="convo-prev"></span></span>' +
+        (unread ? '<span class="convo-unread">' + unread + '</span>' : '');
+      item.querySelector('.convo-name').textContent = convoTitleText(key) + (isGroup ? ' · 群' : '');
+      item.querySelector('.convo-dot').className = 'convo-dot ' + convoDotState(key);
+      item.querySelector('.convo-time').textContent = last ? last.t : '';
+      item.querySelector('.convo-prev').textContent = convoSummarize(key);
+      item.addEventListener('click', function () { openConversation(key); });
+      convoList.appendChild(item);
+    });
+  }
+
+  /* ── 顶部页签：本机 / 设备 / 各长连接设备 + 溢出菜单 ───────── */
+  function renderDeviceTabs() {
+    $$('.tab[data-tab="device"]', tabsScroll).forEach(function (n) { n.remove(); });
+    var onDevice = !$('#tab-device').hidden;
+    connectedDevices().forEach(function (r) {
+      var key = 'dev:' + r.dataset.id;
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'tab' + (onDevice && wsDeviceId === r.dataset.id ? ' active' : '');
+      b.setAttribute('role', 'tab');
+      b.setAttribute('aria-selected', b.classList.contains('active') ? 'true' : 'false');
+      b.setAttribute('aria-controls', 'tab-device');
+      b.dataset.tab = 'device';
+      b.dataset.device = r.dataset.id;
+      b.title = devName(r) + ' · ' + (r.dataset.ip || '');
+      b.innerHTML = '<span class="tab-label"></span>' + (chatUnread(key) ? '<span class="tab-dot"></span>' : '');
+      b.querySelector('.tab-label').textContent = devName(r);
+      tabsScroll.appendChild(b);
+    });
+    var devTabCount = $('#devTabCount');
+    if (devTabCount) devTabCount.textContent = deviceRows.filter(function (r) { return r.parentNode; }).length;
+    var total = allConvoKeys().reduce(function (n, k) { return n + chatUnread(k); }, 0);
+    if (msgFabBadge) {
+      msgFabBadge.textContent = total > 99 ? '99+' : String(total);
+      msgFabBadge.hidden = total === 0;
+    }
+    if (msgFab) {
+      msgFab.title = total ? '会话 · ' + total + ' 条未读' : '会话';
+      msgFab.setAttribute('aria-label', total ? '会话，' + total + ' 条未读' : '会话');
+    }
+    if (convoSheet.classList.contains('open')) {
+      renderConvoList();
+      if (chat.openKey && convoValid(chat.openKey)) renderConvoStatus(chat.openKey);
+    }
+    requestAnimationFrame(syncTabsOverflow);
+  }
+  function syncTabsOverflow() {
+    tabsMoreBtn.hidden = true;
+    tabsMoreBtn.hidden = !(tabsScroll.scrollWidth > tabsScroll.clientWidth + 1);
+  }
+
+  /* ── 设备工作区 ─────────────────────────────────────────── */
+  function renderWsState(row) {
+    var st = row ? row.dataset.state : 'paired';
+    var cls = 'state-chip', label, dot;
+    if (st === 'connected') { cls += ' connected'; label = '长连接'; dot = 'ok'; }
+    else if (st === 'unbound') { cls += ' unbound'; label = '未绑定'; dot = 'warn'; }
+    else { label = '已配对'; dot = 'off'; }
+    wsState.className = cls;
+    wsState.innerHTML = '<span class="dot ' + dot + '"></span>' + label;
+  }
+  function renderWorkspaceFiles(devId) {
+    var shares = REMOTE_SHARES[devId] || [];
+    if (!shares.length) {
+      wsFiles.innerHTML = '<div class="empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg><p>该设备尚未向你共享目录</p><p class="e-sub">请对方在 OrbDrop 中开启广播开关，共享项会实时出现在这里；也可以切到会话给对方发消息或发送文件。</p></div>';
+      return;
+    }
+    var rows = shares.map(function (s, i) {
+      var treeHtml = '';
+      if (s.folder) {
+        var kids = s.children || [];
+        var inner = kids.map(function (c) {
+          return '<div class="node"><span class="f-icon">' + (c.folder ? ICO_FOLDER : ICO_FILE) + '</span><span class="n-name"></span><span class="n-meta num"></span></div>';
+        }).join('');
+        if (!inner) inner = '<div class="node"><span class="n-name" style="padding-left:0;color:var(--muted)">空文件夹</span></div>';
+        treeHtml = '<div class="tree"><div class="tree-inner">' + inner + '</div></div>';
+      }
+      return '<li class="share-item remote' + (s.folder ? ' folder' : '') + '" data-rid="' + i + '">' +
+        '<div class="share-row">' +
+        '<button class="chev"' + (s.folder ? '' : ' style="visibility:hidden"') + ' aria-label="展开"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>' +
+        '<span class="f-icon">' + (s.folder ? ICO_FOLDER : ICO_FILE) + '</span>' +
+        '<div class="s-main"><div class="s-name"></div><div class="s-meta"><span class="num rm-meta"></span><span class="remote-tag">远程</span></div></div>' +
+        '<div class="s-acts"><button class="icon-btn" data-ctx aria-label="更多操作">' + ICO_DOTS + '</button></div>' +
+        '</div>' + treeHtml + '</li>';
+    }).join('');
+    wsFiles.innerHTML = '<div class="list-label"><span>对方共享</span><span class="num">' + shares.length + ' 项</span></div>' +
+      '<ul class="share-list">' + rows + '</ul>';
+    $$('.share-item.remote', wsFiles).forEach(function (li) {
+      var s = shares[+li.dataset.rid];
+      $('.s-name', li).textContent = s.name;
+      $('.rm-meta', li).textContent = s.meta || '';
+      var nodes = $$('.node', li);
+      (s.children || []).forEach(function (c, j) {
+        var n = nodes[j];
+        if (!n) return;
+        $('.n-name', n).textContent = c.name;
+        $('.n-meta', n).textContent = c.meta || '';
+      });
+      var chev = $('.chev', li);
+      if (chev) chev.addEventListener('click', function (e) { e.stopPropagation(); li.classList.toggle('open'); });
+      var row = $('.share-row', li);
+      row.addEventListener('contextmenu', function (e) { e.preventDefault(); e.stopPropagation(); openCtxFor(e, row); });
+      var btn = $('[data-ctx]', li);
+      if (btn) btn.addEventListener('click', function (ev) { ev.stopPropagation(); openCtxFor(ev, btn); });
+    });
+  }
+  function renderRecipients() {
+    recipChips.innerHTML = '';
+    var key = chat.openKey;
+    if (!key) return;
+    var ids = convoParticipants(key);
+    var isGroup = ids.length > 1;
+    ids.forEach(function (id) {
+      var row = devById(id);
+      var chip = document.createElement('span');
+      chip.className = 'recip-chip';
+      chip.innerHTML = '<span class="rc-av"></span><span class="rc-name"></span><span class="rc-st"></span>' +
+        (isGroup ? '<button class="rc-x" type="button" aria-label="从我的收件人移除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>' : '');
+      chip.querySelector('.rc-av').textContent = row ? devAvatarOf(row) : '?';
+      chip.querySelector('.rc-name').textContent = row ? devName(row) : id;
+      chip.querySelector('.rc-st').className = 'rc-st' + (row && row.dataset.state === 'connected' ? ' ok' : '');
+      if (isGroup) chip.querySelector('.rc-x').addEventListener('click', function (e) { e.stopPropagation(); removeRecipient(id); });
+      recipChips.appendChild(chip);
+    });
+  }
+
+  /* ── 设备文件工作区（页签） ─────────────────────────────── */
+  function openWorkspace(devId) {
+    var row = devById(devId);
+    if (!row || !row.parentNode) { wsDeviceId = null; selectTab($('.tab[data-tab="devices"]', tabsScroll)); return; }
+    wsDeviceId = devId;
+    wsAvatar.textContent = devAvatarOf(row);
+    wsName.textContent = devName(row);
+    renderWsState(row);
+    wsIp.textContent = row.dataset.ip || '';
+    renderWorkspaceFiles(devId);
+  }
+  function closeWorkspace() { wsDeviceId = null; }
+
+  /* ── 会话抽屉：列表 ↔ 详情（不占页签） ─────────────────── */
+  function openConvoSheet() {
+    convoSheet.classList.add('open');
+    convoSheet.setAttribute('aria-hidden', 'false');
+    convoSheet.removeAttribute('inert');
+    msgFab.classList.add('open');
+    msgFab.setAttribute('aria-expanded', 'true');
+    if (chat.openKey && convoValid(chat.openKey)) {
+      convoDetail.hidden = false;
+      convosListView.hidden = true;
+      renderRecipients();
+      renderChatLog();
+      renderConvoList();
+      renderDeviceTabs();
+      chatInput.focus();
+    } else {
+      chat.openKey = null;
+      showConvoList();
+    }
+  }
+  function closeConvoSheet(noFocus) {
+    convoSheet.classList.remove('open');
+    convoSheet.setAttribute('aria-hidden', 'true');
+    convoSheet.setAttribute('inert', '');
+    msgFab.classList.remove('open');
+    msgFab.setAttribute('aria-expanded', 'false');
+    hideChatCtx();
+    if (!noFocus) msgFab.focus();
+  }
+  function showConvoList() {
+    renderConvoList();
+    convoDetail.hidden = true;
+    convosListView.hidden = false;
+    renderDeviceTabs();
+  }
+  function openConversation(key, keepTab) {
+    if (!convoValid(key)) { toast('该会话已不存在'); chat.openKey = null; showConvoList(); return; }
+    if (chat.openKey && chat.openKey !== key) chat.draft[chat.openKey] = chatInput.value;
+    chat.openKey = key;
+    chat.unread[key] = 0;
+    var ids = convoParticipants(key);
+    convTitle.textContent = convoTitleText(key);
+    renderConvoStatus(key);
+    renderRecipients();
+    chatInput.value = chat.draft[key] || '';
+    chatSyncSend();
+    convoDetail.hidden = false;
+    convosListView.hidden = true;
+    renderChatLog();
+    renderConvoList();
+    renderDeviceTabs();
+    if (!keepTab) openConvoSheet();
+    chatInput.focus();
+  }
+  function closeConversation() {
+    if (chat.openKey) chat.draft[chat.openKey] = chatInput.value;
+    chat.openKey = null;
+    showConvoList();
+    renderDeviceTabs();
+  }
+  function openDeviceChat(devId) {
+    var row = devById(devId);
+    if (!row || !row.parentNode) { toast('该设备已被移除'); return; }
+    openConversation('dev:' + devId);
+  }
+  function exitConvo() {
+    var key = chat.openKey;
+    if (!key) return;
+    var isGroup = convoParticipants(key).length > 1;
+    var title = convoTitleText(key);
+    if (!isGroup) {
+      chat.store[key] = [];
+      chat.draft[key] = '';
+      chat.unread[key] = 0;
+      chat.openKey = null;
+      showConvoList();
+      renderDeviceTabs();
+      toast('已清空与「' + title + '」的聊天记录');
+      return;
+    }
+    var oi = chat.order.indexOf(key);
+    if (oi > -1) chat.order.splice(oi, 1);
+    delete chat.store[key];
+    delete chat.draft[key];
+    delete chat.unread[key];
+    var gi = chat.groupOrder.indexOf(key);
+    if (gi > -1) chat.groupOrder.splice(gi, 1);
+    delete chat.groups[key];
+    chat.openKey = null;
+    showConvoList();
+    renderDeviceTabs();
+    toast('已退出「' + title + '」并向其余参与者广播离开');
+  }
+  function removeRecipient(id) {
+    var key = chat.openKey;
+    if (!key || key.indexOf('dev:') === 0) return;
+    var g = chat.groups[key];
+    if (!g) return;
+    var i = g.participants.indexOf(id);
+    if (i > -1) g.participants.splice(i, 1);
+    var name = devNameById(id);
+    if (g.participants.length >= 2) {
+      convTitle.textContent = convoTitleText(key);
+      renderConvoStatus(key);
+      renderRecipients();
+      renderConvoList();
+      toast('已从我的收件人移除「' + name + '」（不是踢人，对方不会收到通知）');
+      return;
+    }
+    var last = g.participants[0];
+    var oldStore = chat.store[key] || [];
+    delete chat.store[key];
+    var gi = chat.groupOrder.indexOf(key);
+    if (gi > -1) chat.groupOrder.splice(gi, 1);
+    delete chat.groups[key];
+    var oi = chat.order.indexOf(key);
+    if (oi > -1) chat.order.splice(oi, 1);
+    if (last) chat.store['dev:' + last] = (chat.store['dev:' + last] || []).concat(oldStore);
+    chat.openKey = null;
+    renderDeviceTabs();
+    if (last) openConversation('dev:' + last);
+    else showConvoList();
+    toast('参与者只剩一台，已退回一对一会话');
+  }
+  wsDisconnect.addEventListener('click', function () {
+    var row = devById(wsDeviceId);
+    if (row) disconnectDevice(row);
+  });
+  wsMsgBtn.addEventListener('click', function () { if (wsDeviceId) openDeviceChat(wsDeviceId); });
+  wsMore.addEventListener('click', function (e) {
+    e.stopPropagation();
+    var row = devById(wsDeviceId);
+    if (row) openCtxFor(e, row);
+  });
+  convBackBtn.addEventListener('click', closeConversation);
+  recipAdd.addEventListener('click', function () { openRecipientDialog(convoParticipants(chat.openKey), null); });
+  msgFab.addEventListener('click', function () {
+    if (convoSheet.classList.contains('open')) closeConvoSheet();
+    else openConvoSheet();
+  });
+  var notifyBtn = $('#notifyBtn');
+  if (notifyBtn) notifyBtn.addEventListener('click', function () { toast('暂无新通知'); });
+  $('#convoCloseBtn').addEventListener('click', function () { closeConvoSheet(); });
+  $('#convoCloseBtn2').addEventListener('click', function () { closeConvoSheet(); });
+
+  /* ── 收件人选择（一对一 / 群） ───────────────────────────── */
+  var recipSel = [];
+  var recipCallback = null;
+  function openRecipientDialog(initial, cb) {
+    recipSel = (initial || []).filter(function (id) { return !!devById(id); });
+    recipCallback = cb || null;
+    renderRecipList();
+    recipDialog.classList.add('open');
+    requestAnimationFrame(function () {
+      var first = $('input', recipList);
+      if (first) first.focus();
+    });
+  }
+  function closeRecipientDialog() { recipDialog.classList.remove('open'); recipCallback = null; }
+  function renderRecipList() {
+    recipList.innerHTML = '';
+    deviceRows.filter(function (r) { return r.parentNode; }).forEach(function (r) {
+      var id = r.dataset.id;
+      var label = document.createElement('label');
+      label.className = 'recip-row';
+      label.innerHTML = '<input type="checkbox"' + (recipSel.indexOf(id) > -1 ? ' checked' : '') + ' />' +
+        '<span class="d-avatar"></span>' +
+        '<span class="rr-main"><span class="rr-name"></span><span class="rr-ip num"></span></span>' +
+        '<span class="state-chip"></span>';
+      label.querySelector('.d-avatar').textContent = devAvatarOf(r);
+      label.querySelector('.rr-name').textContent = devName(r);
+      label.querySelector('.rr-ip').textContent = r.dataset.ip || '';
+      var chip = label.querySelector('.state-chip');
+      var st = r.dataset.state;
+      if (st === 'connected') { chip.className = 'state-chip connected'; chip.innerHTML = '<span class="dot ok"></span>长连接'; }
+      else if (st === 'unbound') { chip.className = 'state-chip unbound'; chip.innerHTML = '<span class="dot warn"></span>未绑定'; }
+      else { chip.className = 'state-chip'; chip.innerHTML = '<span class="dot off"></span>已配对'; }
+      label.querySelector('input').addEventListener('change', function (e) {
+        if (e.target.checked) { if (recipSel.indexOf(id) < 0) recipSel.push(id); }
+        else { var k = recipSel.indexOf(id); if (k > -1) recipSel.splice(k, 1); }
+        updateRecipCount();
+      });
+      recipList.appendChild(label);
+    });
+    updateRecipCount();
+  }
+  function updateRecipCount() {
+    var c = $('#recipCount');
+    if (c) c.textContent = '已选 ' + recipSel.length + ' 台';
+    var btn = $('#recipConfirmBtn');
+    if (btn) btn.disabled = recipSel.length === 0;
+  }
+  $('#recipAllBtn').addEventListener('click', function () {
+    var all = deviceRows.filter(function (r) { return r.parentNode; }).map(function (r) { return r.dataset.id; });
+    recipSel = (recipSel.length === all.length) ? [] : all;
+    renderRecipList();
+  });
+  $('#recipCancelBtn').addEventListener('click', closeRecipientDialog);
+  $('#recipConfirmBtn').addEventListener('click', function () {
+    var ids = recipSel.slice();
+    if (!ids.length) return;
+    var cb = recipCallback;
+    closeRecipientDialog();
+    if (cb) cb(ids); else applyRecipients(ids);
+  });
+  recipDialog.addEventListener('click', function (e) { if (e.target === recipDialog) closeRecipientDialog(); });
+  $('#newConvoBtn').addEventListener('click', function () { openRecipientDialog([], null); });
+  $('#convNewBtn').addEventListener('click', function () { openRecipientDialog([], null); });
+
+  function applyRecipients(ids) {
+    ids = ids.filter(function (id) { return !!devById(id); });
+    if (!ids.length) return;
+    var fromKey = chat.openKey;
+    var key = ensureConvo(ids);
+    if (ids.length > 1 && fromKey && fromKey.indexOf('dev:') === 0 && ids.indexOf(fromKey.slice(4)) > -1 && !chat.store[key]) {
+      chat.store[key] = (chat.store[fromKey] || []).slice();
+    }
+    openConversation(key);
+    toast(ids.length > 1 ? '已进入群会话 · ' + ids.length + ' 台设备' : '已进入与「' + devNameById(ids[0]) + '」的会话');
+  }
+
+  function chatPush(m) {
+    var key = chat.openKey;
+    if (!key) { toast('暂无会话，先选择收件人'); return null; }
+    if (chatLog.querySelector('.chat-empty')) chatLog.innerHTML = '';
+    var el = chatMsgEl(m);
+    chatLog.appendChild(el);
+    chatStoreFor(key).push(m);
+    chatLog.scrollTop = chatLog.scrollHeight;
+    touchConvo(key);
+    if (m.from === 'peer') chat.unread[key] = chatUnread(key) + 1;
+    renderDeviceTabs();
+    if (m.from === 'me' && !m.transfer) {
+      setTimeout(function () {
+        m.status = '已读';
+        var meta = el.querySelector('.chat-meta');
+        if (meta) meta.textContent = m.t + ' · 已读';
+      }, 1200);
+    }
+    return el;
+  }
+
+  function chatSyncSend() { chatSendBtn.disabled = chatInput.value.trim() === ''; }
+  function chatSendText() {
+    var text = chatInput.value.trim();
+    if (!text) return;
+    if (!chat.openKey) { toast('暂无会话，先选择收件人'); return; }
+    chatPush({ from: 'me', kind: 'text', text: text, t: chatNow(), status: '已送达' });
+    chatInput.value = '';
+    chatSyncSend();
+    renderConvoList();
+    chatInput.focus();
+  }
+  chatInput.addEventListener('input', chatSyncSend);
+  chatInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); chatSendText(); }
+  });
+  $('#chatCompose').addEventListener('submit', function (e) { e.preventDefault(); chatSendText(); });
+  chatSyncSend();
+
+  /* 文件即推送：文件消息携带传输状态，按（消息 × 在线设备）依次传输 */
+  function sendFilePayload(ids, items) {
+    if (!ids || !ids.length || !items || !items.length) return;
+    var key = ensureConvo(ids);
+    openConversation(key);
+    var parts = convoParticipants(key);
+    var connected = parts.map(devById).filter(function (r) { return r && r.dataset.state === 'connected'; });
+    items.forEach(function (it) {
+      var size = it.folder ? '12.6 MB' : (it.size || '0.8 MB');
+      var m = {
+        from: 'me', kind: 'file', name: it.name,
+        size: it.folder ? '文件夹' : (it.size || '文件'),
+        t: chatNow(), status: '已送达',
+        transfer: {
+          total: connected.length,
+          offline: parts.length - connected.length,
+          done: 0, pct: 0,
+          state: connected.length ? 'sending' : 'failed'
+        }
+      };
+      var el = chatPush(m);
+      if (!connected.length) { updateFileBubble(el, m); return; }
+      connected.forEach(function (r) {
+        enqueueTransfer({
+          name: it.name, size: size, devName: devName(r),
+          onProgress: function (pct) { m.transfer.pct = pct; updateFileBubble(el, m); },
+          onDone: function () {
+            m.transfer.done += 1;
+            m.transfer.pct = 100;
+            if (m.transfer.done >= m.transfer.total) {
+              m.transfer.state = 'done';
+              var talk = m.transfer.offline ? ' · ' + m.transfer.offline + ' 台离线' : '';
+              toast('「' + it.name + '」已发送至 ' + m.transfer.total + ' 台设备' + talk);
+            }
+            updateFileBubble(el, m);
+          }
+        });
+      });
+    });
+    renderConvoList();
+    renderDeviceTabs();
+  }
+  function pickAndSendFiles(ids) {
+    if (!window.OrbDropPicker) return;
+    window.OrbDropPicker.open({
+      mode: 'both', multi: true,
+      title: '发送文件', sub: '文件与文件夹都可发送；双击文件夹进入',
+      confirmLabel: '发送',
+      onConfirm: function (items) {
+        if (!items || !items.length) return;
+        sendFilePayload(ids, items.map(function (it) {
+          return { name: it.name, folder: it.type === 'folder', size: it.size };
+        }));
+      }
+    });
+  }
+
+  $('#chatPlusBtn').addEventListener('click', function () {
+    if (!chat.openKey) { toast('暂无会话，先选择收件人'); return; }
+    pickAndSendFiles(convoParticipants(chat.openKey));
+  });
+
+  function hideChatCtx() {
+    chatCtx.classList.remove('show');
+    $$('.chat-msg.picked', chatLog).forEach(function (m) { m.classList.remove('picked'); });
+  }
+  function chatCopyFallback(text) {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;top:-1000px;left:0;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      var done = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return done;
+    } catch (err) { return false; }
+  }
+  function chatCopy(text) {
+    var ok = function () { toast('已复制整条消息'); };
+    var bad = function () { toast('复制失败，请手动选中文字后复制'); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(ok, function () { if (chatCopyFallback(text)) ok(); else bad(); });
+      return;
+    }
+    if (chatCopyFallback(text)) ok(); else bad();
+  }
+  function showChatCtx(x, y, msgEl, selText) {
+    var html = '';
+    if (selText) html += '<button class="ctx-item" data-chat="sel">' + ICON_COPY + '复制所选文字</button>';
+    html += '<button class="ctx-item" data-chat="all">' + ICON_COPY + '复制整条消息</button>';
+    chatCtx.innerHTML = html;
+    chatCtx.dataset.full = msgEl.getAttribute('data-copy') || '';
+    chatCtx.dataset.sel = selText || '';
+    chatCtx.classList.remove('show');
+    chatCtx.style.left = x + 'px';
+    chatCtx.style.top = y + 'px';
+    $$('.chat-msg.picked', chatLog).forEach(function (m) { m.classList.remove('picked'); });
+    msgEl.classList.add('picked');
+    requestAnimationFrame(function () {
+      var r = chatCtx.getBoundingClientRect();
+      if (r.right > innerWidth - 8) chatCtx.style.left = Math.max(8, innerWidth - r.width - 8) + 'px';
+      if (r.bottom > innerHeight - 8) chatCtx.style.top = Math.max(8, innerHeight - r.height - 8) + 'px';
+      chatCtx.classList.add('show');
+    });
+  }
+  chatLog.addEventListener('contextmenu', function (e) {
+    var msg = e.target.closest && e.target.closest('.chat-msg');
+    if (!msg) { hideChatCtx(); return; }
+    e.preventDefault();
+    e.stopPropagation();
+    var sel = '';
+    var s = window.getSelection();
+    if (s && s.rangeCount && !s.isCollapsed) {
+      var picked = s.toString().trim();
+      if (picked && msg.contains(s.getRangeAt(0).commonAncestorContainer)) sel = picked;
+    }
+    showChatCtx(e.clientX, e.clientY, msg, sel);
+  });
+  chatCtx.addEventListener('click', function (e) {
+    var b = e.target.closest('[data-chat]');
+    if (!b) return;
+    var full = chatCtx.dataset.full || '';
+    var sel = chatCtx.dataset.sel || '';
+    var isSel = b.dataset.chat === 'sel';
+    hideChatCtx();
+    chatCopy(isSel ? sel : full);
+  });
+  document.addEventListener('click', function (e) { if (!chatCtx.contains(e.target)) hideChatCtx(); });
+  document.addEventListener('contextmenu', function (e) {
+    var el = e.target.closest && e.target.closest('.chat-msg');
+    if (chatCtx.contains(e.target) || el) return;
+    hideChatCtx();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' || e.defaultPrevented) return;
+    if (recipDialog.classList.contains('open')) { closeRecipientDialog(); return; }
+    if (tabsMenu.classList.contains('show')) { hideTabsMenu(); return; }
+    if (chatCtx.classList.contains('show')) { hideChatCtx(); return; }
+    if (convoSheet.classList.contains('open') && !(window.OrbDropPicker && window.OrbDropPicker.isOpen())) { closeConvoSheet(); return; }
+  });
+  window.addEventListener('resize', function () { hideChatCtx(); syncTabsOverflow(); });
+  chatLog.addEventListener('scroll', hideChatCtx);
+
+  $('#deviceList').addEventListener('click', function () {
+    setTimeout(function () { renderDeviceTabs(); }, 0);
+  });
+
+  renderDeviceTabs();
+  renderConvoList();
 
 })();
 </script>

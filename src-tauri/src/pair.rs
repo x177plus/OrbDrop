@@ -219,6 +219,12 @@ pub fn commit_pairing(
         "inviteId": invite_id,
     }));
     ws::emit_ui(state, ui::DEVICES_CHANGED, &serde_json::json!({}));
+    // 设备刚进地址簿：Trust 那张"地址 → 指纹"的表要跟着建起来，否则下一次拨号
+    // 会因为"这个地址没见过"而退回 TOFU（而不是按已配对的身份校验）。
+    // 这次连线真见过它的证书就顺手钉住（配对码那条路是本机拨出去的，见过；邀请那条路
+    // 是对端拨进来的，见不到，留到下一次探活/长连接补上）。
+    crate::state::remember_peer_fingerprint(state, &peer.id, &peer.ip);
+    crate::state::refresh_trust(state);
     Ok(())
 }
 
@@ -365,8 +371,11 @@ pub async fn withdraw_invite_remote(state: Arc<AppState>, invite_id: &str) -> Re
     let Some(peer) = state.get_peer(&peer_id) else {
         return Ok(());
     };
-    let url = format!("http://{}:{}/pair/invite/withdraw", peer.ip, peer.port);
-    let resp = reqwest::Client::new()
+    let url = format!(
+        "{}/pair/invite/withdraw",
+        crate::net::peer_base(&peer.ip, peer.port)
+    );
+    let resp = crate::net::client()
         .post(&url)
         .timeout(WITHDRAW_TIMEOUT)
         .json(&serde_json::json!({ "inviteId": invite_id }))
@@ -391,8 +400,8 @@ async fn deliver_invite_http(
     own_id: &str,
     own_name: &str,
 ) -> Result<PairGrant, String> {
-    let url = format!("http://{}:{}/pair/invite", peer.ip, peer.port);
-    let mut req = reqwest::Client::new()
+    let url = format!("{}/pair/invite", crate::net::peer_base(&peer.ip, peer.port));
+    let mut req = crate::net::client()
         .post(&url)
         .timeout(HTTP_INVITE_TIMEOUT)
         .json(&serde_json::json!({

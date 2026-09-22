@@ -15,6 +15,7 @@ use crate::state::{AppState, LinkIntent};
 use crate::ws;
 
 mod auth;
+pub mod proxy;
 mod routes_dav;
 mod routes_discover;
 mod routes_file;
@@ -97,6 +98,22 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/push/download",
             axum::routing::get(routes_push::push_download_handler),
+        )
+        // Beyond Compare 的 WebDAV 入口：让 BC 连**本机**（回环），由这里加密转发到对端。
+        // 挂在公开路由上是因为它自己校验凭据（它要的挑战/凭据形状必须与对端 DAV 面一致，
+        // 而 `auth_middleware` 对回环是直接免认证的 —— 那是给本机 UI 自验用的，不能用在这里）。
+        // handler 内部另有一道"只认回环"的闸门。
+        .route(
+            "/proxy/{peer_id}",
+            axum::routing::any(proxy::dav_proxy_root),
+        )
+        .route(
+            "/proxy/{peer_id}/",
+            axum::routing::any(proxy::dav_proxy_root),
+        )
+        .route(
+            "/proxy/{peer_id}/{*rest}",
+            axum::routing::any(proxy::dav_proxy),
         );
 
     // Authenticated routes (auth middleware).
@@ -228,6 +245,9 @@ async fn events_ws_handler(
 
 pub async fn start_server(state: Arc<AppState>, base_port: u16) -> Result<u16, String> {
     let app = build_router(state.clone());
+    // 监听方向要一份 TLS 配置：没有身份就没有加密，宁可就起不来。
+    let identity = crate::net::load_or_create_identity()?;
+    let tls = crate::net::server_config(&identity);
 
     for port in base_port..=base_port + 10 {
         let addr: SocketAddr = ([0, 0, 0, 0], port).into();
@@ -237,17 +257,13 @@ pub async fn start_server(state: Arc<AppState>, base_port: u16) -> Result<u16, S
                 *state.server_shutdown.lock() = Some(tx);
 
                 let task_handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
-                    // Use into_make_service_with_connect_info so ConnectInfo
-                    // extractors work in middleware and handlers.
-                    if let Err(e) = axum::serve(
-                        listener,
-                        app.into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .with_graceful_shutdown(async { rx.await.ok(); })
-                    .await
-                    {
-                        error!("axum serve error: {e}");
-                    }
+                    // 自己跑 accept 循环（`net::serve`）：这个端口上要同时接两种连接 ——
+                    // 对端走 TLS，明文只留给回环（本机 UI 自验、BC 的 WebDAV 入口）。
+                    // `axum::serve` 只能整条监听都是同一种，所以这里换成手写的那个。
+                    crate::net::serve(listener, app, tls, async {
+                        rx.await.ok();
+                    })
+                    .await;
                 });
                 *state.server_task.lock() = Some(task_handle);
 

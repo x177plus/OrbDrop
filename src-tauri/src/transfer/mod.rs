@@ -502,8 +502,11 @@ async fn deliver_invite_http(
     let mut body = serde_json::to_value(event).map_err(|e| format!("邀请序列化失败: {e}"))?;
     body["port"] = serde_json::json!(server_port);
 
-    let url = format!("http://{}:{}/push/invite", peer.ip, peer.port);
-    let mut req = reqwest::Client::new()
+    let url = format!(
+        "{}/push/invite",
+        crate::net::peer_base(&peer.ip, peer.port)
+    );
+    let mut req = crate::net::client()
         .post(&url)
         .timeout(HTTP_INVITE_TIMEOUT)
         .json(&body);

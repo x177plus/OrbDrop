@@ -176,16 +176,43 @@ impl Default for AppSettings {
 // Persistent config (TOML)
 // ---------------------------------------------------------------------------
 
-/// 悬浮球上一次的落位：折叠态窗口左上角（物理像素，虚拟屏坐标）。
+/// 悬浮球上一次的落位：悬浮体**本体中心**（球心 / 卡片白底中心；物理像素，虚拟屏坐标）。
 ///
-/// 只记窗口左上角，**不记贴边方向与球偏移**：吸附是幂等的 —— 把已贴边的矩形再判一次
+/// 只记这一个点，**不记贴边方向与球偏移**：吸附是幂等的 —— 把已贴边的矩形再判一次
 /// 得到同样的窗口与球偏移，所以复原时（`orbLayout.planDock`）能把贴边形态一起算回来；
-/// 尺寸也不记，跟着当前 DPI 走。
+/// 尺寸与本体在窗口里的内缩也不记，跟随当前形态与 DPI（窗口左上角 = 中心 − 内缩）。
+/// 内缩见 `lib.rs` 的 `collapsed_center_inset`（与前端 `orbShape.ts` 的 `body` 逐值一致）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrbPos {
     pub x: i32,
     pub y: i32,
+}
+
+/// 悬浮体**本体中心**在折叠态窗口内的偏移（**逻辑像素**）：窗口左上角 = 中心 − 这个值。
+///
+/// 与前端 `src/lib/orbShape.ts` 的 `CollapsedLayout.body` **逐值一致**（改一处要改两处）：
+///   圆球：本体 = 62 的球，居中于 90×90 窗口 → (90−62)/2 + 31 = 45、45
+///   圆角矩形：本体 = 卡片那张白底 176×134，落在窗口的 (14, 10) → 14 + 88 = 102、10 + 67 = 77
+///             （**不含**右侧「间距 10 + 点列 20」那一条）
+pub fn collapsed_center_inset(shape: OrbShape) -> (f64, f64) {
+    match shape {
+        OrbShape::Rect => (102.0, 77.0),
+        OrbShape::Circle => (45.0, 45.0),
+    }
+}
+
+/// 老配置的 `orbPos`（折叠态窗口左上角）→ 本体中心（`orbCenter`）。
+///
+/// 换算只用到**当前形态**的本体内缩乘当前 DPI —— 老值是拿"那种形态的窗口左上角"记的，
+/// 而形态本来就在同一份配置里，所以这一步是确定的、不丢位置。调用点只有启动落位那一处
+/// （那里才拿得到 DPI，见 `lib.rs` 的 `place_orb_on_startup`）。
+pub fn orb_center_from_legacy(pos: OrbPos, shape: OrbShape, scale_factor: f64) -> OrbPos {
+    let (ix, iy) = collapsed_center_inset(shape);
+    OrbPos {
+        x: pos.x + (ix * scale_factor).round() as i32,
+        y: pos.y + (iy * scale_factor).round() as i32,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,8 +253,12 @@ pub struct Config {
     /// Known devices: manual adds + paired peers (address book, persisted).
     #[serde(default)]
     pub peers: Vec<PeerDevice>,
-    /// 悬浮球落位（F-74「窗口位置」）：`None` = 还没记过（首启 / 旧配置），启动时按居中显示。
+    /// 悬浮体本体中心（F-74「窗口位置」）：`None` = 还没记过（首启 / 旧配置），启动时按默认落位。
     #[serde(default)]
+    pub orb_center: Option<OrbPos>,
+    /// **已废弃**，只为读老配置：早先存的是"折叠态窗口左上角"。读取时由 `orb_center_from_legacy`
+    /// 换算成本体中心并落盘；不再写出（`skip_serializing`）。
+    #[serde(default, skip_serializing)]
     pub orb_pos: Option<OrbPos>,
     /// 折叠态悬浮形态（设置里的「悬浮形态」）：圆球 / 圆角矩形悬浮框。见 `OrbShape`。
     #[serde(default)]
@@ -335,6 +366,7 @@ impl Default for Config {
             bc_right: None,
             device_id: new_device_id(),
             peers: Vec::new(),
+            orb_center: None,
             orb_pos: None,
             orb_shape: OrbShape::default(),
             picker_favorites: Vec::new(),
@@ -777,7 +809,8 @@ mod tests {
                 label: None,
             }),
             bc_right: None,
-            orb_pos: Some(OrbPos { x: -1280, y: 40 }),
+            orb_center: Some(OrbPos { x: -1280, y: 40 }),
+            orb_pos: None,
             orb_shape: OrbShape::Rect,
             online: false,
             auto_broadcast_new: true,
@@ -836,9 +869,13 @@ mod tests {
         assert_eq!(loaded.bc_right, None);
         assert_eq!(loaded.online, false, "「离线」要跨重启保留（用户选了就一直离线）");
         assert_eq!(
-            loaded.orb_pos,
+            loaded.orb_center,
             Some(OrbPos { x: -1280, y: 40 }),
             "悬浮球位置要跨重启保留（F-74）：负坐标是左边那块显示器"
+        );
+        assert!(
+            !std::fs::read_to_string(&tmp_file).unwrap().contains("orbPos"),
+            "老字段（窗口左上角）不再写出：位置只有 `orbCenter` 这一个真相"
         );
         assert_eq!(
             loaded.orb_shape,
@@ -891,16 +928,46 @@ mod tests {
         assert_eq!(config.device_id, "device-1");
     }
 
-    /// 旧配置文件里没有 `orbPos`：照样解析成 `None`，不能判成损坏。
+    /// 旧配置文件里没有 `orbCenter`：照样解析成 `None`，不能判成损坏（旧字段 `orbPos` 最多是 `None`）。
     ///
     /// （`load_config` 遇到损坏文件会把它改名成 `.toml.bad` 再写回默认值 —— 加一个字段
     /// 就让用户的共享项/配对表消失，代价太大。）
     #[test]
-    fn config_without_orb_pos_keeps_loading() {
+    fn config_without_orb_center_keeps_loading() {
         let config: Config = toml::from_str("port = 3895\ndeviceId = \"device-1\"\n").unwrap();
+        assert_eq!(config.orb_center, None);
         assert_eq!(config.orb_pos, None);
         assert_eq!(config.port, 3895);
         assert_eq!(config.device_id, "device-1");
+    }
+
+    /// 老配置里的 `orbPos`（窗口左上角）要能读出来，并换算出**同一个位置**的本体中心。
+    ///
+    /// 换算公式 = 旧值 + 本体内缩 × DPI：圆球 45/45、卡片 102/77（见 `collapsed_center_inset`）。
+    /// 不这么换的话，升级后悬浮球会跳（球 45px、卡片 102/77px）—— 用户的"窗口位置记忆"就白存了。
+    #[test]
+    fn legacy_orb_pos_migrates_to_body_center() {
+        let legacy: Config =
+            toml::from_str("deviceId = \"device-1\"\norbShape = \"rect\"\n[orbPos]\nx = -1280\ny = 40\n")
+                .unwrap();
+        assert_eq!(legacy.orb_center, None);
+        assert_eq!(legacy.orb_pos, Some(OrbPos { x: -1280, y: 40 }));
+        assert_eq!(
+            orb_center_from_legacy(legacy.orb_pos.unwrap(), OrbShape::Rect, 1.0),
+            OrbPos { x: -1178, y: 117 },
+            "卡片本体中心 = 窗口左上角 + (102, 77)"
+        );
+        assert_eq!(
+            orb_center_from_legacy(OrbPos { x: 100, y: 200 }, OrbShape::Circle, 1.25),
+            OrbPos { x: 100 + 56, y: 200 + 56 },
+            "圆球本体中心 = 窗口左上角 + 45×DPI（125% 下是 56）"
+        );
+
+        // 老字段不再写出：迁移之后配置里只剩 `orbCenter`。
+        let migrated = Config { orb_center: Some(OrbPos { x: -1178, y: 117 }), orb_pos: None, ..legacy };
+        let text = toml::to_string_pretty(&migrated).unwrap();
+        assert!(text.contains("orbCenter"), "{text}");
+        assert!(!text.contains("orbPos"), "{text}");
     }
 
     /// 选择框「常用」默认是空的：老配置（没有这一节）解析出来就是空表，界面不会凭空冒出

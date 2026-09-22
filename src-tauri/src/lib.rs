@@ -6,6 +6,7 @@ pub mod discover;
 pub mod drag;
 pub mod fs_browse;
 pub mod log;
+pub mod net;
 pub mod orb_window;
 pub mod pair;
 pub mod server;
@@ -620,8 +621,12 @@ fn disconnect_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(
 /// Add a device manually by IP:port. Probes /pair/info to get identity.
 #[tauri::command]
 async fn add_peer(ip: String, port: u16, state: State<'_, Arc<AppState>>) -> Result<PeerDevice, String> {
-    let url = format!("http://{ip}:{port}/pair/info");
-    let resp = reqwest::get(&url).await.map_err(|e| format!("无法连接 {ip}:{port}: {e}"))?;
+    let url = format!("{}/pair/info", net::peer_base(&ip, port));
+    let resp = net::client()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("无法连接 {ip}:{port}: {e}"))?;
     let info: serde_json::Value = resp.json().await.map_err(|e| format!("响应异常: {e}"))?;
     let id = info["id"].as_str().unwrap_or("").to_string();
     let name = info["name"].as_str().unwrap_or(&ip).to_string();
@@ -644,8 +649,8 @@ pub async fn unpair_peer(state: &Arc<AppState>, peer_id: &str) -> Result<(), Str
     // 通知对端用的是本机手里"对它"的 token —— 必须在本机删除之前用掉。
     if !peer.ip.is_empty() && peer.port != 0 {
         if let Ok(Some(token)) = credential::get_peer_token(peer_id) {
-            let url = format!("http://{}:{}/unpair", peer.ip, peer.port);
-            let client = reqwest::Client::builder()
+            let url = format!("{}/unpair", net::peer_base(&peer.ip, peer.port));
+            let client = net::client_builder()
                 .timeout(std::time::Duration::from_secs(3))
                 .build()
                 .map_err(|e| e.to_string())?;
@@ -674,6 +679,12 @@ pub async fn unpair_peer(state: &Arc<AppState>, peer_id: &str) -> Result<(), Str
     // 关系没了，BC 里那条指向它的 WebDAV profile 也就没用了（token 已作废）：按当前
     // 在册设备刷新一遍 —— prune 只删我们自己写下且已失效的条目（见 `bc::prune_webdav_profiles`）。
     bc::provision_profiles(state);
+    // 指纹也一起忘掉：这一段关系结束了，地址再被别人拿到时不该还拿着旧指纹去比对
+    // （那条地址现在是"没见过的对端"，走 TOFU 重新认）。
+    if let Ok(ip) = peer.ip.parse() {
+        net::trust().unpin(ip);
+    }
+    state::refresh_trust(state);
     Ok(())
 }
 
@@ -685,8 +696,8 @@ async fn remove_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result
 /// 一键清空本机**全部**配对凭据（F-15）：用户不必（也不该）去翻文件或系统凭据管理器。
 ///
 /// 三处一起清，少一处就等于没清干净：
-/// 1. 凭据文件（`%LOCALAPPDATA%\OrbDrop\credentials.dat`）—— 全部设备的 token 都在里面，
-///    删它就全清（`credential::wipe`，顺带清掉老版本留在系统凭据库里的那一条）；
+/// 1. 凭据文件（`%LOCALAPPDATA%\OrbDrop\credentials.dat`）—— 全部设备的 token 与对端
+///    证书指纹都在里面，删它就全清（`credential::wipe`）；
 /// 2. 地址簿里的配对标记与地址行 —— 设备行留着（还在网上看得见就继续以"未绑定"列出，
 ///    见 F-14），只是关系回到未配对；
 /// 3. 本机写进 Beyond Compare 的 WebDAV profile —— 那是 token 的**第二份拷贝**，
@@ -706,6 +717,9 @@ pub fn wipe_all_credentials(state: &Arc<AppState>) -> Result<usize, String> {
         state.unpair(id);
     }
     bc::provision_profiles(state);
+    // 凭据全清了，钉住的指纹也就没有归属了：Trust 表跟着清空，地址上的对端从此按
+    // "没见过的身份"重新认（那正是"清空后重新配对"该有的样子）。
+    state::refresh_trust(state);
     info!(peers = ids.len(), "wiped all pairing credentials");
     Ok(ids.len())
 }
@@ -741,11 +755,11 @@ async fn pair_confirm(peer_id: String, code: String, state: State<'_, Arc<AppSta
     let own_id = state.config.lock().device_id.clone();
     let own_name = state.config.lock().device_name.clone();
 
-    let url = format!("http://{}:{}/pair", peer.ip, peer.port);
+    let url = format!("{}/pair", net::peer_base(&peer.ip, peer.port));
     // Our own HTTP port: the peer we post to may be the side that dials the WS
     // link (smaller device id) and it has no other way to learn our address.
     let own_port = bound_port(&state);
-    let client = reqwest::Client::new();
+    let client = net::client();
     let resp = client
         .post(&url)
         .json(&serde_json::json!({
@@ -880,6 +894,94 @@ async fn cancel_receive(invite_id: String, state: State<'_, Arc<AppState>>) -> R
 }
 
 // ---------------------------------------------------------------------------
+// 对端浏览（前端不再直连对端）
+// ---------------------------------------------------------------------------
+
+/// 调对端某个端点要用的地址、token、以及它的 IP（IP 是给"把这次见到的指纹钉住"用的）。
+///
+/// 一处拼地址 = 一处改协议：到对端的那一跳是 TLS + 自签证书，而 WebView 既不会认我们的
+/// 证书、也不该让它认。所以对端浏览整体挪进后端（认证、指纹校验、token 只有一份实现）。
+fn peer_endpoint(state: &AppState, peer_id: &str, path: &str) -> Result<(String, String, String), String> {
+    let peer = state.get_peer(peer_id).ok_or_else(|| "设备不在列表中".to_string())?;
+    if peer.ip.is_empty() || peer.port == 0 {
+        return Err(format!("「{}」的地址未知（还没被发现或还没上线）", peer.name));
+    }
+    let token = credential::get_peer_token(peer_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "未配对，无法读取对方的共享项".to_string())?;
+    Ok((
+        format!("{}{path}", net::peer_base(&peer.ip, peer.port)),
+        token,
+        peer.ip,
+    ))
+}
+
+/// 调对端失败时给界面看的话。**指纹不一致要单独说**：它不是"它没开机"，重试也没用
+/// （用户得去重新配对），跟「离线」混在一起会让人一直等一台永远连不上的设备。
+fn peer_call_error(err: &reqwest::Error) -> String {
+    if net::is_identity_rejected(err) {
+        "对端证书与本机记住的不一致（它换过机器？）：需要重新配对".to_string()
+    } else {
+        format!("联系不上对端：{err}")
+    }
+}
+
+/// 读对端"广播给本机"的共享项清单（对端标签页的数据源）。
+#[tauri::command]
+async fn peer_shares(
+    peer_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let (url, token, ip) = peer_endpoint(state.inner(), &peer_id, "/shares")?;
+    let response = net::client()
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| peer_call_error(&e))?;
+    if !response.status().is_success() {
+        return Err(format!("读取失败: HTTP {}", response.status().as_u16()));
+    }
+    let body = response
+        .json()
+        .await
+        .map_err(|e| format!("响应异常: {e}"))?;
+    state::remember_peer_fingerprint(state.inner(), &peer_id, &ip);
+    Ok(body)
+}
+
+/// 读对端某个共享项里的一层目录（对端标签页展开树用）。
+#[tauri::command]
+async fn peer_tree(
+    peer_id: String,
+    share_id: String,
+    path: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let query = format!(
+        "/tree?share={}&path={}",
+        urlencode(&share_id),
+        urlencode(&path)
+    );
+    let (url, token, ip) = peer_endpoint(state.inner(), &peer_id, &query)?;
+    let response = net::client()
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| peer_call_error(&e))?;
+    if !response.status().is_success() {
+        return Err(format!("读取失败: HTTP {}", response.status().as_u16()));
+    }
+    let body = response
+        .json()
+        .await
+        .map_err(|e| format!("响应异常: {e}"))?;
+    state::remember_peer_fingerprint(state.inner(), &peer_id, &ip);
+    Ok(body)
+}
+
+// ---------------------------------------------------------------------------
 // Download commands (F-40 / F-44)
 // ---------------------------------------------------------------------------
 
@@ -916,9 +1018,14 @@ async fn download_from_peer(
         }
         DownloadMode::Direct => config::unique_path(&download_dir, &file_name),
     };
-    let url = format!("http://{}:{}/file?share={}&path={}", peer.ip, peer.port, share_id, urlencode(&path_in_share));
+    let url = format!(
+        "{}/file?share={}&path={}",
+        net::peer_base(&peer.ip, peer.port),
+        share_id,
+        urlencode(&path_in_share)
+    );
 
-    let resp = reqwest::Client::new()
+    let resp = net::client()
         .get(&url)
         .bearer_auth(&token)
         .send()
@@ -1095,17 +1202,17 @@ fn orb_mouse_down() -> bool {
     orb_window::mouse_down()
 }
 
-/// 记录悬浮球落位（折叠态窗口左上角，物理像素）：下次启动复原到同一位置（F-74）。
+/// 记录悬浮体**本体中心**（球心 / 卡片白底中心；物理像素）：下次启动复原到同一位置（F-74）。
 ///
 /// 由界面在**几何落定之后**调用（拖动松手 → 吸附判定跑完 → 窗口不再动），见 App.svelte
-/// `rememberOrbPos`；松手那一刻记下的是自由落点，贴边还会再挪一次窗口。位置没变就不落盘。
+/// `rememberOrbCenter`；松手那一刻记下的是自由落点，贴边还会再挪一次窗口。位置没变就不落盘。
 #[tauri::command]
-fn orb_save_pos(x: i32, y: i32, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+fn orb_save_center(x: i32, y: i32, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let mut config = state.config.lock();
-    if config.orb_pos == Some(OrbPos { x, y }) {
+    if config.orb_center == Some(OrbPos { x, y }) {
         return Ok(());
     }
-    config.orb_pos = Some(OrbPos { x, y });
+    config.orb_center = Some(OrbPos { x, y });
     config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())
 }
 
@@ -1114,6 +1221,9 @@ fn orb_save_pos(x: i32, y: i32, state: State<'_, Arc<AppState>>) -> Result<(), S
 /// 两种都在 `setup` 里做完、赶在首帧之前：窗口是按 tauri.conf 的 `center: true` 建的，
 /// 等界面起来再挪会看到球从屏幕中央跳过去。落位之后界面还会对同一个矩形重跑一次吸附
 /// 判定，复原贴边形态（吸附幂等，默认落位则因为余量大于阈值而不吸附）。
+///
+/// 记的是**本体中心**，窗口左上角 = 中心 − `collapsed_center_inset`（跟随形态与 DPI）。
+/// 老配置存的是窗口左上角（`orbPos`）：这里顺手换算成本体中心并落盘，迁移只做一次。
 fn place_orb_on_startup(app: &AppHandle) {
     let Some(win) = app.get_webview_window("main") else {
         warn!("未找到 main 窗口，跳过悬浮球落位");
@@ -1121,8 +1231,26 @@ fn place_orb_on_startup(app: &AppHandle) {
     };
     let (shape, saved) = {
         let state = app.state::<Arc<AppState>>();
-        let config = state.config.lock();
-        (config.orb_shape, config.orb_pos)
+        let mut config = state.config.lock();
+        let center = match config.orb_center {
+            Some(c) => Some(c),
+            // 老配置（`orbPos` = 窗口左上角）：换算成本体中心，并当场落盘完成迁移
+            None => match config.orb_pos.take() {
+                Some(legacy) => {
+                    let sf = win.scale_factor().unwrap_or(1.0);
+                    let c = config::orb_center_from_legacy(legacy, config.orb_shape, sf);
+                    config.orb_center = Some(c);
+                    if let Err(e) = config::save_config_at(&state.config_path, &config) {
+                        warn!("迁移悬浮球落位（orbPos → orbCenter）落盘失败: {e}");
+                    } else {
+                        info!(x = c.x, y = c.y, "已把悬浮球落位从窗口左上角迁到本体中心");
+                    }
+                    Some(c)
+                }
+                None => None,
+            },
+        };
+        (config.orb_shape, center)
     };
     // 折叠态尺寸先按形态定下来：tauri.conf 里只写了圆球那一档（90×90），圆角矩形悬浮框是
     // 236×162。等界面起来再改尺寸，悬浮框会先以 90×90 露出半张卡再跳大。
@@ -1137,7 +1265,11 @@ fn place_orb_on_startup(app: &AppHandle) {
             warn!(x = pos.x, y = pos.y, "上次的悬浮球位置已不在任何显示器上，保持居中");
             return;
         }
-        Some(pos) => (pos.x, pos.y),
+        Some(center) => {
+            let sf = win.scale_factor().unwrap_or(1.0);
+            let (ix, iy) = config::collapsed_center_inset(shape);
+            (center.x - (ix * sf).round() as i32, center.y - (iy * sf).round() as i32)
+        }
         None => match orb_window::default_pos(&win, width) {
             Ok(p) => p,
             Err(e) => {
@@ -1190,6 +1322,9 @@ fn setup_server_task(app: &AppHandle) {
                     if arc_state.is_online() {
                         register_mdns(&arc_state, port);
                     }
+                    // 服务已经起来了：把凭据库里钉住的指纹灌进 TLS 校验器读的那份表。
+                    // 必须赶在 mDNS 发现/探活/长连接恢复之前 —— 那几条路一拨号就要校验。
+                    state::refresh_trust(&arc_state);
                     let _ = handle.emit(ws::events::ui::SERVER_STARTED, port);
 
                     // Spawn mDNS scanner.
@@ -1201,13 +1336,6 @@ fn setup_server_task(app: &AppHandle) {
                     let s2 = arc_state.clone();
                     tokio::spawn(async move {
                         use discover::PeerEvent;
-                        // 身份核对要按对端自己的 token 问一次 `/pair/info`（见
-                        // `state::reconcile_stale_identity`）：超时给短一点，别让
-                        // 一次慢回话卡住后面的事件。
-                        let client = reqwest::Client::builder()
-                            .timeout(std::time::Duration::from_secs(2))
-                            .build()
-                            .unwrap_or_default();
                         while let Some(event) = mdns_rx.recv().await {
                             // 离线 = 隐身：本机不参与局域网。发现结果一概不登记（也不按
                             // "对端回来了"接回长连接）—— 离线期间设备列表就该是"谁都不在线"
@@ -1257,12 +1385,7 @@ fn setup_server_task(app: &AppHandle) {
                                     // 还指着这个地址 —— 收拾掉它，别让同一台设备在列表里
                                     // 留两行（旧行"已绑定"、新行"未绑定"）。
                                     for stale_id in s2.stale_ids_at(&ip.to_string(), port, &id) {
-                                        state::reconcile_stale_identity(
-                                            &s2,
-                                            &client,
-                                            &stale_id,
-                                        )
-                                        .await;
+                                        state::reconcile_stale_identity(&s2, &stale_id).await;
                                     }
                                 }
                                 PeerEvent::Offline(id) => {
@@ -1292,10 +1415,6 @@ fn setup_server_task(app: &AppHandle) {
                     // 与它真正的新身份并排显示成两行（见 `state::probe_step`）。
                     let probe_state = arc_state.clone();
                     tokio::spawn(async move {
-                        let client = reqwest::Client::builder()
-                            .timeout(std::time::Duration::from_millis(1500))
-                            .build()
-                            .unwrap_or_default();
                         loop {
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                             // 离线（隐身）期间不发探活：本机对入站一律 503，探活只会把
@@ -1303,7 +1422,7 @@ fn setup_server_task(app: &AppHandle) {
                             if !probe_state.is_online() {
                                 continue;
                             }
-                            state::probe_peers_once(&probe_state, &client).await;
+                            state::probe_peers_once(&probe_state).await;
                         }
                     });
 
@@ -1344,21 +1463,18 @@ pub fn run() {
         "OrbDrop 启动"
     );
 
-    // 老版本把整份配对凭据放在系统凭据库里；现在它住在数据目录的凭据文件里。
-    // 迁移**只在这里**发生（启动时显式一次）：读路径绝不改用户的东西。
-    // 先写文件、后删老条目，中途失败只是两处都在，下次启动重来。
-    match credential::migrate_legacy_entry() {
-        Ok(Some(peers)) => info!(peers = peers.len(), "已把系统凭据库里的配对迁移到凭据文件"),
-        Ok(None) => {}
-        // 迁不动不是致命错误：读路径会只读地回落到老条目，功能照旧。
-        Err(e) => warn!("配对凭据迁移失败（继续用系统凭据库里的老条目）: {e}"),
+    // 本机身份（自签证书 + 私钥）要在服务起来之前就位：没有它就没有 TLS，而对端之间的
+    // 一切流量都走 TLS。失败是致命的第一步 —— 宁可在这里报清楚，也不要等到某次拨号
+    // 才冒出一句"连接失败"。
+    if let Err(e) = net::init() {
+        error!("本机身份不可用（TLS 无法启用）: {e}");
     }
 
-    // P1 写出的凭据文件是"头部 + base64 正文 + 署名"的明文遮挡；现在是整块混淆。
-    // 老文件照样读得回来，但只在启动时改写一次（读路径绝不改用户的东西）。
-    // 改不动不是致命错误：老格式的读兼容一直在，下次启动重来。
+    // P1 写出的凭据文件是"头部 + base64 正文 + 署名"的明文遮挡，P2 是裸的 id→token 映射；
+    // 现在每条记录还要带对端证书指纹。老文件照样读得回来，但只在启动时改写一次
+    // （读路径绝不改用户的东西）。改不动不是致命错误：老格式的读兼容一直在，下次启动重来。
     match credential::upgrade_vault_format() {
-        Ok(Some(peers)) => info!(peers, "已把凭据文件改写成整块混淆格式"),
+        Ok(Some(peers)) => info!(peers, "已把凭据文件改写成当前格式"),
         Ok(None) => {}
         Err(e) => warn!("凭据文件格式改写失败（继续按老格式读）: {e}"),
     }
@@ -1406,6 +1522,8 @@ pub fn run() {
             accept_pair_invite,
             reject_pair_invite,
             get_peer_token,
+            peer_shares,
+            peer_tree,
             connect_peer,
             disconnect_peer,
             wipe_credentials,
@@ -1432,7 +1550,7 @@ pub fn run() {
             orb_set_rect,
             orb_drag_start,
             orb_mouse_down,
-            orb_save_pos,
+            orb_save_center,
         ])
         .setup(|app| {
             // Store the AppHandle so WS events can be emitted.

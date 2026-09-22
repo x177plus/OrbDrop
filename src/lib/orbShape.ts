@@ -24,7 +24,9 @@ import type { ScreenRect } from '$lib/orbLayout';
  * 右侧与底部见 `RECT_SLACK`。
  *
  * 与后端的一致性：`src-tauri/src/lib.rs` 的 `collapsed_logical` 用同一组数字算首启落位与
- * 首帧尺寸（圆角矩形那一档写死 236×162，就是这里的定尺）。
+ * 首帧尺寸（圆角矩形那一档写死 236×162，就是这里的定尺）；`config.rs` 的
+ * `collapsed_center_inset` 用 `body` 算"本体中心 → 窗口左上角"的内缩
+ * （圆球 45/45、卡片 102/77），落盘位置（`orbCenter`）与 `body` 的中心也靠它对齐。
  */
 
 /** 圆球直径（CSS px）。 */
@@ -69,27 +71,38 @@ export type CollapsedLayout = {
   /** 折叠态窗口尺寸 */
   size: { w: number; h: number };
   /**
-   * 悬浮球 / 悬浮框（含右侧分页点）在窗口内的矩形：`--orb-x/y` 与悬停热区都由它来。
+   * **真正画出来的那件东西**在窗口内的矩形：球的圆盘 / 卡片那张白底（不含右侧分页点列）。
    *
-   * 它同时是**位置的参考点**：折叠态位置记的是这个矩形的左上角，窗口左上角 = 它 − 这个偏移
-   * （`App.svelte` 的 `bodyFromWindow` / `windowFromBody`）。两种形态的内缩不同（球 14/14、
-   * 卡片 14/10），所以切形态只挪窗口，悬浮体一动不动。
+   * 位置的参考点是它的**中心**（`App.svelte` 的 `orbAnchor`、`orbLayout.planExpansion`）：面板的
+   * 可视盒角就落在这个中心上。两种形态用它各自的中心 —— 球是圆心、卡片是白底中心，所以它
+   * 和 `widget` 在圆角矩形那一档不同（后者含右侧「间距 10 + 点列 20」，中心会右偏 15px）。
+   */
+  body: ScreenRect;
+  /**
+   * 悬浮球 / 悬浮框（含右侧分页点）在窗口内的矩形：`--orb-x/y`、悬停热区、贴边判定都由它来。
+   *
+   * 折叠态位置记的是这个矩形的左上角（`windowFromCenter` 反推出来的窗口 + 内缩）：两种形态的
+   * 内缩不同（球 14/14、卡片 14/10），所以切形态只挪窗口，悬浮体一动不动。
    */
   widget: ScreenRect;
 };
 
-/** 圆球：窗口 90×90，球 62 居中。 */
+/** 圆球：窗口 90×90，球 62 居中（本体就是整颗球，与 `widget` 相同）。 */
 export function circleLayout(): CollapsedLayout {
   const inset = (CIRCLE_COLLAPSED - ORB_SIZE) / 2;
+  const ball: ScreenRect = { x: inset, y: inset, w: ORB_SIZE, h: ORB_SIZE };
   return {
     size: { w: CIRCLE_COLLAPSED, h: CIRCLE_COLLAPSED },
-    widget: { x: inset, y: inset, w: ORB_SIZE, h: ORB_SIZE },
+    body: ball,
+    widget: ball,
   };
 }
 
 /**
  * 圆角矩形悬浮框：窗口 = 卡片 + 点列那 30px + 四周余量 = **236×162**。
  * 定尺，没有参数：点列画不画、卡片里 IP 多长都不改窗口尺寸（见文件头）。
+ *
+ * 本体只算**卡片那张白底**（`body` = 176×134）：中心压在面板角上的是它，不是含点列那一版。
  */
 export function rectLayout(): CollapsedLayout {
   const trail = RECT_DOTS_GAP + RECT_DOTS_W;
@@ -97,6 +110,12 @@ export function rectLayout(): CollapsedLayout {
     size: {
       w: RECT_SLACK.left + RECT_CARD_W + trail + RECT_SLACK.right,
       h: RECT_SLACK.top + RECT_CARD_H + RECT_SLACK.bottom,
+    },
+    body: {
+      x: RECT_SLACK.left,
+      y: RECT_SLACK.top,
+      w: RECT_CARD_W,
+      h: RECT_CARD_H,
     },
     widget: {
       x: RECT_SLACK.left,

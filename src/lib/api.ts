@@ -260,28 +260,23 @@ export function orbMouseDown(): Promise<boolean> {
   return invoke('orb_mouse_down');
 }
 
-/** 记录悬浮球落位（折叠态窗口左上角，物理像素）：下次启动复原到同一位置 */
-export function orbSavePos(x: number, y: number): Promise<void> {
-  return invoke('orb_save_pos', { x, y });
+/** 记录悬浮体本体中心（球心 / 卡片白底中心；物理像素）：下次启动复原到同一位置 */
+export function orbSaveCenter(x: number, y: number): Promise<void> {
+  return invoke('orb_save_center', { x, y });
 }
 
-// HTTP-based remote browsing (P1: against a peer's server with Bearer token)
-export async function fetchPeerShares(baseUrl: string, token: string): Promise<PeerShareItem[]> {
-  const resp = await fetch(`${baseUrl}/shares`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const data = await resp.json();
+// 对端浏览：**走后端命令**，不在 WebView 里直接 fetch 对端。
+//
+// 到对端那一跳是 TLS + 自签证书，WebView 不会认我们的证书（也不该让它认 —— 那要靠把证书
+// 装进系统信任库，是明确不要的方案）。放后端还有两个顺带的好处：token 不再出现在前端，
+// 证书指纹的校验与"连上了就把指纹钉住"也和其它调用共用同一份实现。
+export async function peerShares(peerId: string): Promise<PeerShareItem[]> {
+  const data = await invoke<{ shares: PeerShareItem[] }>('peer_shares', { peerId });
   return data.shares;
 }
 
-export async function fetchPeerTree(baseUrl: string, token: string, shareId: string, path: string): Promise<TreeEntry[]> {
-  const url = `${baseUrl}/tree?share=${encodeURIComponent(shareId)}&path=${encodeURIComponent(path)}`;
-  const resp = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
-  const data = await resp.json();
+export async function peerTree(peerId: string, shareId: string, path: string): Promise<TreeEntry[]> {
+  const data = await invoke<{ entries: TreeEntry[] }>('peer_tree', { peerId, shareId, path });
   return data.entries;
 }
 

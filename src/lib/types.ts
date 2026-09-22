@@ -30,7 +30,7 @@ export type LinkState =
   | { kind: 'retrying' }
   /** 对端此刻不在网上：等它出现（不再空发 TCP）。 */
   | { kind: 'waiting' }
-  | { kind: 'stopped'; reason: 'peerDisconnected' | 'tokenRejected' | 'localDisconnected' };
+  | { kind: 'stopped'; reason: 'peerDisconnected' | 'tokenRejected' | 'identityChanged' | 'localDisconnected' };
 
 export interface PeerDevice {
   id: string;
