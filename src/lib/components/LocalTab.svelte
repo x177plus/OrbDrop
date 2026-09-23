@@ -90,7 +90,7 @@
      `ShareItem::new`），所以"添加即自动广播"是不成立的 —— 要让人看到得自己打开那一项的开关。 -->
 {#if connectedDevices.length > 0}
   <p class="bcast-hint">
-    <span class="dot ok"></span>
+    <span class="dot live"></span>
     <span>{connectedDevices.map(d => `「${d.name}」`).join('、')} 已连接：在共享项上打开广播开关，对端才能看到</span>
   </p>
 {/if}
@@ -133,7 +133,7 @@
               <span class="num">{share.path}</span>
               {#if connectedDevices.length > 0 && share.broadcastEnabled}
                 <span class="bcast-chip" title="自动广播至 {connectedDevices.map(d => `「${d.name}」`).join('、')}">
-                  <span class="dot ok"></span>{connectedDevices.length}台设备
+                  <span class="dot live"></span>{connectedDevices.length}台设备
                 </span>
               {/if}
             </div>

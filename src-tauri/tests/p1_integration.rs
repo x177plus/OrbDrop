@@ -2395,6 +2395,79 @@ async fn probe_learns_the_peers_segment_and_sweeps_it_when_the_voucher_goes_quie
 }
 
 // ---------------------------------------------------------------------------
+// 证书指纹（TLS 信任）：重新配对必须能换掉一条过时的钉
+// ---------------------------------------------------------------------------
+
+/// 用户点「配对 / 重新配对」= 明确重建关系：这个地址上钉着的旧指纹先让位
+/// （内存表 + 凭据库都让），否则拨号会在 TLS 那一跳被"指纹不一致"直接拒掉 ——
+/// 表现就是"点了重新配对还是连不上，重新配好也连不上"。
+#[test]
+fn forget_stale_pin_clears_both_the_memory_and_the_vault_copy() {
+    credential::remove_peer("device-pin-a").ok();
+    credential::remove_peer("device-pin-b").ok();
+    let dir = std::env::temp_dir().join(format!("orbdrop_pin_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = make_state(3997, "device-pin-a", "PC-PIN-A", dir.clone());
+    state.add_peer_book(orbdrop_lib::config::PeerDevice {
+        id: "device-pin-b".into(), name: "PC-PIN-B".into(), ip: "10.9.9.9".into(), port: 3890,
+        online: true, paired: true, auto_connect: false, paused: false,
+    });
+
+    // 上一次配对留下的指纹（对端重装过 = 这枚已经过时）。
+    credential::set_peer_credential("device-pin-b", "stale-token", &"ab".repeat(32)).unwrap();
+    orbdrop_lib::state::refresh_trust(&state);
+    let ip: std::net::IpAddr = "10.9.9.9".parse().unwrap();
+    assert!(orbdrop_lib::net::trust().get(ip).is_some(), "前提：这个地址上钉着旧指纹");
+
+    orbdrop_lib::pair::forget_stale_pin(&state, "device-pin-b");
+
+    assert!(orbdrop_lib::net::trust().get(ip).is_none(), "内存那份让位了");
+    assert_eq!(
+        credential::get_peer_fingerprint("device-pin-b").unwrap(),
+        None,
+        "凭据库那份也清了（否则下一次 refresh_trust 又把它灌回来）"
+    );
+    credential::remove_peer("device-pin-b").ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 配对落定（`commit_pairing`）时**不再保留**那条过时指纹：这一跳真见过对端证书就钉这枚，
+/// 没见过（邀请那条路本机是收方）就留空 —— 留着旧的正是"刚重新配好却依旧连不上"的成因。
+#[test]
+fn commit_pairing_replaces_a_stale_fingerprint_instead_of_keeping_it() {
+    credential::remove_peer("device-cp-a").ok();
+    credential::remove_peer("device-cp-b").ok();
+    let dir = std::env::temp_dir().join(format!("orbdrop_cp_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = make_state(3998, "device-cp-a", "PC-CP-A", dir.clone());
+
+    credential::set_peer_credential("device-cp-b", "stale-token", &"cd".repeat(32)).unwrap();
+    orbdrop_lib::pair::commit_pairing(
+        &state,
+        orbdrop_lib::pair::PairedPeer {
+            id: "device-cp-b".into(),
+            name: "PC-CP-B".into(),
+            ip: "10.9.9.10".into(),
+            port: 3890,
+        },
+        "fresh-token",
+        None,
+    )
+    .expect("配对落定");
+
+    // 这一跳没走过 TLS（测试里没有真连），所以写下的应当是"空"（= 这个地址暂时没有钉住的
+    // 指纹，交给下一次成功连线 TOFU 重新认），**绝不是**那条过时的。
+    assert_eq!(
+        credential::get_peer_fingerprint("device-cp-b").unwrap(),
+        None,
+        "过时的指纹必须让位"
+    );
+    assert_eq!(credential::get_peer_token("device-cp-b").unwrap().as_deref(), Some("fresh-token"));
+    credential::remove_peer("device-cp-b").ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
 // 会话（聊天）：文本消息与已读回执走的就是那条长连接
 // ---------------------------------------------------------------------------
 
@@ -2456,8 +2529,10 @@ async fn chat_messages_and_read_receipts_travel_over_the_long_connection() {
 
     // ---- A 发一条文本 ----
     let text = "在吗？帮我传一下「Q3 排期表」。";
-    let (snap, sent_id) = chat::send_text(&state_a, &["device-chat-b".to_string()], text);
-    assert!(!sent_id.is_empty(), "发出去的消息带回它的 id（界面据此逐台读状态）");
+    let res = chat::send_text(&state_a, &["device-chat-b".to_string()], text, None);
+    assert!(!res.id.is_empty(), "发出去的消息带回它的 id（界面据此逐台读状态）");
+    assert_eq!(res.batch_id, None, "一对一发的：不挂群发名单");
+    let snap = res.snapshot;
     let convo = snap.convos.iter().find(|c| c.peer_id == "device-chat-b").expect("A 侧有一条会话");
     assert_eq!(convo.messages.len(), 1);
     let sent = &convo.messages[0];
@@ -2493,39 +2568,112 @@ async fn chat_messages_and_read_receipts_travel_over_the_long_connection() {
     })
     .await;
 
-    // ---- 对端断开：消息**不排队**，就地落一条未送达（下次连上也照旧） ----
+    // ---- 长连接断了：**消息照样到**（HTTP 兜底那一跳；消息不该以"点过连接"为前提） ----
     state_b.ws.pause("device-chat-a");
     wait_until("B 侧链路断开", || !state_a.ws.has_connection("device-chat-b")).await;
-    let (snap, _) = chat::send_text(&state_a, &["device-chat-b".to_string()], "这条送不出去");
+    let before = state_b.chat.inbound_watermark("device-chat-a");
+    let snap = chat::send_text(&state_a, &["device-chat-b".to_string()], "没有长连接也要到", None).snapshot;
     let convo = snap.convos.iter().find(|c| c.peer_id == "device-chat-b").unwrap();
-    assert_eq!(convo.messages.last().unwrap().delivery, Delivery::Failed);
+    assert_eq!(
+        convo.messages.last().unwrap().delivery,
+        Delivery::Sending,
+        "落账那一刻是「在途」：HTTP 那一跳还没回来"
+    );
+    wait_until("HTTP 兜底把这条送到（状态落定）", || {
+        state_a
+            .chat
+            .snapshot()
+            .convos
+            .iter()
+            .find(|c| c.peer_id == "device-chat-b")
+            .and_then(|c| c.messages.last())
+            .is_some_and(|m| m.delivery == Delivery::Sent)
+    })
+    .await;
+    wait_until("B 真的收到了这条（HTTP 直达，没长连接）", || {
+        state_b.chat.inbound_watermark("device-chat-a") > before
+    })
+    .await;
+
+    // B 打开会话 → 已读回执也走 HTTP 兜底回来（没有长连接，"已读"照样得能传到）。
+    let before_read = state_b.chat.read_watermark("device-chat-a");
+    chat::mark_read(&state_b, &["device-chat-a".to_string()]);
+    assert!(
+        state_b.chat.read_watermark("device-chat-a") > before_read,
+        "B 自己的水位先推进"
+    );
+    wait_until("A 收到 HTTP 回来的已读回执", || {
+        state_a
+            .chat
+            .snapshot()
+            .convos
+            .iter()
+            .find(|c| c.peer_id == "device-chat-b")
+            .and_then(|c| c.messages.last())
+            .is_some_and(|m| m.delivery == Delivery::Read)
+    })
+    .await;
 
     // ---- 群发：每台各一份（同一个 id），**没有群实体** —— 世界里只多出"与每台的两条会话" ----
     // 一台有链路、一台（没配对过的 id）根本没有会话：逐台成败各算各的。
-    let (snap, fan_id) = chat::send_text(
+    let fan = chat::send_text(
         &state_a,
         &["device-chat-b".to_string(), "device-chat-ghost".to_string()],
         "群发一句",
+        None,
     );
+    let fan_id = fan.id.clone();
+    let batch_id = fan.batch_id.clone().expect("多台发送要挂上一份群发名单");
+    let snap = fan.snapshot;
+    assert_eq!(snap.batches.len(), 1, "这次群发产生了一份名单");
+    assert_eq!(snap.batches[0].id, batch_id);
+    assert_eq!(snap.batches[0].members.len(), 2);
+    assert_eq!(snap.batches[0].name, "", "名字留空，等用户在列表里右键改名");
     let fan_b = snap.convos.iter().find(|c| c.peer_id == "device-chat-b").unwrap();
     let fan_ghost = snap.convos.iter().find(|c| c.peer_id == "device-chat-ghost").expect("另一台也有自己那条");
     assert_eq!(fan_b.messages.last().unwrap().id, fan_id);
     assert_eq!(fan_ghost.messages.last().unwrap().id, fan_id, "同一个 id：逐台状态靠它拼");
-    assert_eq!(
-        fan_b.messages.last().unwrap().delivery,
-        Delivery::Failed,
-        "链路断着，这条也没送出去"
-    );
-    assert_eq!(fan_ghost.messages.last().unwrap().delivery, Delivery::Failed);
     assert_eq!(snap.convos.len(), 2, "群发不产生第三条「群会话」，就是两台各一条");
+    // 逐台各算各的：B 走 HTTP 兜底能到；那个 id **地址簿里没有**（没有 ip/端口可打）→ 够不着，
+    // 落「排队」等它上线（它哪天被发现、有了地址就会被补发出去，见 F-95）。
+    wait_until("没有地址的那台排队等它上线", || {
+        state_a
+            .chat
+            .snapshot()
+            .convos
+            .iter()
+            .find(|c| c.peer_id == "device-chat-ghost")
+            .and_then(|c| c.messages.last())
+            .is_some_and(|m| m.delivery == Delivery::Queued)
+    })
+    .await;
+    wait_until("有地址的那台（HTTP 兜底）落「已送达」", || {
+        state_a
+            .chat
+            .snapshot()
+            .convos
+            .iter()
+            .find(|c| c.peer_id == "device-chat-b")
+            .and_then(|c| c.messages.last())
+            .is_some_and(|m| m.delivery == Delivery::Sent)
+    })
+    .await;
 
     // ---- 两侧都落了盘：重开一份 store 还能读到（会话记录是用户数据） ----
     let reopened_a = chat::ChatStore::with_path(dir_a.join("chat.json"));
-    assert_eq!(reopened_a.snapshot().convos[0].messages.len(), 3);
+    assert_eq!(
+        reopened_a.snapshot().convos[0].messages.len(),
+        3,
+        "第一句、HTTP 兜底那句、群发那句 —— 各一份"
+    );
     let reopened_b = chat::ChatStore::with_path(dir_b.join("chat.json"));
     let kept = &reopened_b.snapshot().convos[0].messages[0];
     assert_eq!(kept.text, text);
-    assert_eq!(reopened_b.read_watermark("device-chat-a"), kept.at, "已读水位也落盘");
+    assert_eq!(
+        reopened_b.read_watermark("device-chat-a"),
+        state_b.chat.read_watermark("device-chat-a"),
+        "已读水位也落盘"
+    );
 
     orbdrop_lib::server::stop_server(&state_a).await;
     orbdrop_lib::server::stop_server(&state_b).await;
@@ -2533,4 +2681,472 @@ async fn chat_messages_and_read_receipts_travel_over_the_long_connection() {
     credential::remove_peer("device-chat-b").ok();
     let _ = std::fs::remove_dir_all(&root);
     let _ = (server_a, server_b);   // 端口号不是句柄：服务器由 `stop_server` 收
+}
+
+/// 对端离线时发出去的消息**不丢**：落「等待发送」排着队，对端一上线就按原顺序自动发出去
+/// （F-95）。顺带钉住三件事：
+///
+/// - **顺序**：欠着消息的时候新消息跟着排（不许后发先至）；
+/// - **时刻**：对端显示的是**发送时刻**（发送方的钟），不是它收到的时刻 —— 顺序与已读水位
+///   都按它比（这一条决定了两端看到的时刻一致、会话位置也一致）；
+/// - **幂等**：同一个 id 再投一次不会在对端写成两条（补发是"至少一次"）。
+///
+/// "离线"是用**没人监听的地址**造的（见测试里的说明）：与"对端不在网上"在代码里是同一条路
+/// —— 连不上 → 够不着 → 排队；而 `stop_server` 造不出这一段（keep-alive 连接还在被服务）。
+#[tokio::test]
+async fn messages_sent_while_the_peer_is_offline_arrive_when_it_comes_back() {
+    use orbdrop_lib::chat::{self, Delivery};
+    use orbdrop_lib::ws::events::WsEvent;
+
+    let root = std::env::temp_dir().join(format!("orbdrop_it_chat_off_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let (port_a, port_b) = two_free_ports();
+    let (state_a, _dir_a) = chat_state(port_a, "device-off-a", "PC-OFF-A", &root);
+    let (state_b, _dir_b) = chat_state(port_b, "device-off-b", "PC-OFF-B", &root);
+
+    let server_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
+    let server_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+
+    credential::remove_peer("device-off-a").ok();
+    credential::remove_peer("device-off-b").ok();
+    let token = format!("t-off-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    credential::set_peer("device-off-a", &token).unwrap();
+    credential::set_peer("device-off-b", &token).unwrap();
+    let addr = |id: &str, name: &str, ip: &str, port: u16| PeerDevice {
+        id: id.into(), name: name.into(), ip: ip.into(), port,
+        online: true, paired: true, auto_connect: false, paused: false,
+    };
+    state_a.mark_paired(&addr("device-off-b", "PC-OFF-B", "127.0.0.1", port_b));
+    state_b.mark_paired(&addr("device-off-a", "PC-OFF-A", "127.0.0.1", port_a));
+
+    // 先正常说一句：这一步把对端证书按 TOFU 认下来（之后 B 换了进程也还是同一份身份文件）。
+    chat::send_text(&state_a, &["device-off-b".to_string()], "在线时说的", None);
+    wait_until("在线时那句到了", || state_b.chat.inbound_watermark("device-off-a") > 0).await;
+    let convo = |state: &Arc<AppState>, peer: &str| {
+        state.chat.snapshot().convos.into_iter().find(|c| c.peer_id == peer)
+    };
+    assert_eq!(convo(&state_a, "device-off-b").unwrap().messages[0].delivery, Delivery::Sent);
+
+    // ---- B 离线：把地址指到一个**没人监听**的端口（连接被拒 = 够不着） ----
+    //
+    // 这里不用 `stop_server` 模拟"对端关机"：监听停了，但已经建立的 keep-alive 连接
+    // 仍由它那条连接任务服务着，下一跳照样会"成功"（测出来的是"消息直接送达"，不是排队）。
+    // 地址指到死端口与"对端不在网上"在代码里是同一条路：连不上 → 够不着。
+    const DEAD: u16 = 1; // 需要管理员权限才绑得上，测试进程不可能占用它
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", DEAD)).is_err(),
+        "死地址上不该有人监听"
+    );
+    state_a.mark_paired(&addr("device-off-b", "PC-OFF-B", "127.0.0.1", DEAD));
+    state_a.set_peer_online("device-off-b", false);
+
+    // ---- 这个窗口里 A 说了三句 ----
+    let first = chat::send_text(&state_a, &["device-off-b".to_string()], "你不在的时候说的", None);
+    let first_at = convo(&state_a, "device-off-b").unwrap().messages.last().unwrap().at;
+    chat::send_text(&state_a, &["device-off-b".to_string()], "还有这一句", None);
+    wait_until("前两句都排上队（HTTP 那一跳没打通）", || {
+        // 会话里第一条是"在线时说的"（已送达），后面两条才是这一个窗口里的。
+        convo(&state_a, "device-off-b").is_some_and(|c| {
+            c.messages.len() == 3 && c.messages[1..].iter().all(|m| m.delivery == Delivery::Queued)
+        })
+    })
+    .await;
+    // 欠着消息的时候新消息**跟着排**（不许后发先至：对端那边顺序乱了，已读水位就跟着错）。
+    let third = chat::send_text(&state_a, &["device-off-b".to_string()], "第三句", None);
+    let third_copy = third
+        .snapshot
+        .convos
+        .iter()
+        .find(|c| c.peer_id == "device-off-b")
+        .and_then(|c| c.messages.last())
+        .expect("第三句也有一份副本");
+    assert_eq!(third_copy.delivery, Delivery::Queued, "欠着消息时新消息跟着排队");
+    assert!(third_copy.at > first_at, "时刻仍是发送那一刻（递增）");
+
+    // ---- B 上线：地址指回去 + 一次"重新出现在网上"的证据 ----
+    let before_back = chat::now_ms();
+    state_a.mark_paired(&addr("device-off-b", "PC-OFF-B", "127.0.0.1", port_b));
+    // 真实部署里这个证据来自探活/mDNS（`set_peer_online` 是它们的汇合点），补发的触发点
+    // 就挂在它上面。
+    state_a.set_peer_online("device-off-b", true);
+
+    wait_until("B 收到补发的三句", || {
+        convo(&state_b, "device-off-a").is_some_and(|c| c.messages.len() == 4)
+    })
+    .await;
+    wait_until("A 侧三句都落「已送达」", || {
+        convo(&state_a, "device-off-b").is_some_and(|c| c.messages.iter().all(|m| m.delivery == Delivery::Sent))
+    })
+    .await;
+
+    let on_b = convo(&state_b, "device-off-a").unwrap();
+    let texts: Vec<&str> = on_b.messages.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        vec!["在线时说的", "你不在的时候说的", "还有这一句", "第三句"],
+        "补发的按原顺序接在后面"
+    );
+    let resent = &on_b.messages[1];
+    assert_eq!(resent.id, first.id, "补发的就是当初那一条（id 不变）");
+    // **发送时刻**，不是收到的时刻：B 是三句都发完之后才开机的（`before_back` 之后）。
+    assert_eq!(resent.at, first_at, "对端看到的时刻 = A 发出去那一刻");
+    assert!(
+        on_b.messages.windows(2).all(|w| w[0].at < w[1].at),
+        "四条的时刻跟着会话顺序递增"
+    );
+    assert!(
+        on_b.messages[1].at < before_back,
+        "补发进来的时刻早于对端开机那一刻（不是它收到的时刻）"
+    );
+    assert_eq!(on_b.unread, 4, "四条都没打开过 —— 补发进来的照样是未读（收到 ≠ 读过）");
+
+    // ---- 重复投递由接收方按 id 幂等吸收（补发是"至少一次"：HTTP 到了、回话丢了） ----
+    let dup = WsEvent::ChatText { id: first.id.clone(), text: "你不在的时候说的".into(), at: first_at };
+    assert_eq!(chat::deliver(&state_a, "device-off-b", &dup).await, chat::Outcome::Delivered, "这一跳是通的");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        convo(&state_b, "device-off-a").unwrap().messages.len(),
+        4,
+        "同一个 id 再投一次不会写成两条"
+    );
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    credential::remove_peer("device-off-a").ok();
+    credential::remove_peer("device-off-b").ok();
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = (server_a, server_b);
+}
+
+// ---------------------------------------------------------------------------
+// 群聊（共享群）：名册 + 群消息，成员**不需要配对**（D6=b）
+// ---------------------------------------------------------------------------
+
+/// 三台设备互不认识（各占一个数据目录），但在地址簿里互相有地址 —— 这就是"局域网里看得见"
+/// 的最小形态。**刻意不配对**：群成员不需要配对（D6=b），这一条必须被真实覆盖。
+fn address_book(state: &Arc<AppState>, id: &str, name: &str, port: u16) {
+    state.upsert_peer(&PeerDevice {
+        id: id.into(),
+        name: name.into(),
+        ip: "127.0.0.1".into(),
+        port,
+        online: true,
+        paired: false,
+        auto_connect: false,
+        paused: false,
+    });
+}
+
+/// 群聊的主线：A 建群 → B/C 收到的是**邀请卡**（要人确认）→ 加入 → A 发一句三端都能看到 →
+/// B 回一句 A/C 也能看到（成员互见，这是"群"与"群发"的分水岭）。
+#[tokio::test]
+async fn group_roster_confirmation_and_messages_reach_every_member() {
+    use orbdrop_lib::group;
+
+    let root = std::env::temp_dir().join(format!("orbdrop_it_group_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+
+    let (port_a, port_b) = two_free_ports();
+    let port_c = free_port();
+    let (state_a, _) = chat_state(port_a, "device-grp-a", "PC-GA", &root);
+    let (state_b, _) = chat_state(port_b, "device-grp-b", "PC-GB", &root);
+    let (state_c, _) = chat_state(port_c, "device-grp-c", "PC-GC", &root);
+    let server_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
+    let server_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    let server_c = orbdrop_lib::server::start_server(state_c.clone(), port_c).await.expect("C server");
+
+    address_book(&state_a, "device-grp-b", "PC-GB", port_b);
+    address_book(&state_a, "device-grp-c", "PC-GC", port_c);
+    address_book(&state_b, "device-grp-a", "PC-GA", port_a);
+    address_book(&state_b, "device-grp-c", "PC-GC", port_c);
+    address_book(&state_c, "device-grp-a", "PC-GA", port_a);
+    address_book(&state_c, "device-grp-b", "PC-GB", port_b);
+
+    // ---- A 建群：名册当场广播出去 ----
+    let gid = group::create(&state_a, &["device-grp-b".into(), "device-grp-c".into()], "排期组")
+        .expect("至少要有一台设备");
+    assert!(state_a.groups.is_member(&gid, "device-grp-a"), "本机在建的群里");
+    assert_eq!(state_a.groups.members(&gid).len(), 3);
+
+    // ---- B、C 收到的是**邀请卡**：没点「加入」之前不算群 ----
+    wait_until("B 收到邀请卡", || !state_b.groups.pending_views("device-grp-b").is_empty()).await;
+    wait_until("C 收到邀请卡", || !state_c.groups.pending_views("device-grp-c").is_empty()).await;
+    let invite = &state_b.groups.pending_views("device-grp-b")[0];
+    assert_eq!(invite.group_id, gid);
+    assert_eq!(invite.name, "排期组");
+    assert_eq!(invite.from, "device-grp-a");
+    assert_eq!(
+        invite.members.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        vec!["device-grp-a".to_string(), "device-grp-c".to_string()],
+        "邀请卡里列出的是别人（不含本机）"
+    );
+    assert!(state_b.groups.view(&gid, "device-grp-b").is_none(), "没确认之前不进会话列表");
+
+    // 摆出界面那份快照：邀请在 `pendingGroups` 里，还没进 `groups`。
+    let snap_b = group::snapshot(&state_b);
+    assert_eq!(snap_b.pending_groups.len(), 1);
+    assert!(snap_b.groups.is_empty());
+
+    // ---- 点「加入」 ----
+    assert!(group::accept(&state_b, &gid));
+    assert!(group::accept(&state_c, &gid));
+    assert_eq!(state_b.groups.view(&gid, "device-grp-b").unwrap().members.len(), 2, "视图里不含本机");
+    assert!(group::snapshot(&state_b).pending_groups.is_empty(), "卡收走了");
+
+    // ---- A 发一句：B、C 都要收到（未配对 → 只能走 HTTP 兜底那一跳） ----
+    let text = "周三十点开个短会";
+    let msg_id = group::send_text(&state_a, &gid, text).expect("本机在群里，发得出去");
+    wait_until("B 收到群消息", || {
+        state_b.groups.view(&gid, "device-grp-b").is_some_and(|v| v.messages.len() == 1)
+    })
+    .await;
+    wait_until("C 收到群消息", || {
+        state_c.groups.view(&gid, "device-grp-c").is_some_and(|v| v.messages.len() == 1)
+    })
+    .await;
+    let seen = &state_b.groups.view(&gid, "device-grp-b").unwrap().messages[0];
+    assert_eq!(seen.id, msg_id);
+    assert_eq!(seen.text, text);
+    assert_eq!(seen.from, "device-grp-a");
+    assert_eq!(seen.from_name, "PC-GA", "发言人名字按**收方的设备表**填");
+    assert!(!seen.from_me);
+    assert_eq!(state_b.groups.unread_total("device-grp-b"), 1);
+    assert!(state_a.groups.view(&gid, "device-grp-a").unwrap().messages[0].from_me, "自己的那条");
+
+    // ---- B 回一句：**A 与 C 都该看到**（成员互见 —— 群发做不到这件事） ----
+    group::send_text(&state_b, &gid, "收到，我把参会人拉齐").expect("B 发得出去");
+    wait_until("A 看到 B 的那句", || {
+        state_a.groups.view(&gid, "device-grp-a").is_some_and(|v| v.messages.len() == 2)
+    })
+    .await;
+    wait_until("C 也看到 B 的那句", || {
+        state_c.groups.view(&gid, "device-grp-c").is_some_and(|v| v.messages.len() == 2)
+    })
+    .await;
+    let c_view = state_c.groups.view(&gid, "device-grp-c").unwrap();
+    let speakers: Vec<&str> = c_view.messages.iter().map(|m| m.from.as_str()).collect();
+    assert_eq!(speakers, vec!["device-grp-a", "device-grp-b"], "两句、两个发言人，按时间排");
+
+    // ---- B 打开会话 → 已读回执逐发送者回去 → A 那条算「已读 1/2」 ----
+    group::mark_read(&state_b, &gid);
+    wait_until("A 看到 B 读了", || {
+        state_a
+            .groups
+            .view(&gid, "device-grp-a")
+            .is_some_and(|v| v.messages[0].read_count == 1)
+    })
+    .await;
+    let a_view = state_a.groups.view(&gid, "device-grp-a").unwrap();
+    assert_eq!(a_view.messages[0].read_count, 1, "B 读了、C 还没读");
+    assert_eq!(a_view.messages[0].delivery.get("device-grp-b"), Some(&orbdrop_lib::chat::Delivery::Sent));
+
+    // ---- 改群名：名册 +1 广播，另两端跟着改 ----
+    assert!(group::edit(&state_a, &gid, &["device-grp-b".into(), "device-grp-c".into()], "排期组（周三）"));
+    wait_until("B 那边群名也变了", || {
+        state_b.groups.view(&gid, "device-grp-b").is_some_and(|v| v.name == "排期组（周三）")
+    })
+    .await;
+
+    // ---- 退群：本地没了，另两端的名册里也少一个人 ----
+    assert!(group::leave(&state_c, &gid));
+    assert!(state_c.groups.view(&gid, "device-grp-c").is_none(), "C 这边删干净了");
+    wait_until("A、B 的名册里 C 走了", || {
+        state_a
+            .groups
+            .view(&gid, "device-grp-a")
+            .is_some_and(|v| v.members.iter().all(|m| m.id != "device-grp-c"))
+    })
+    .await;
+
+    // 群数据落在自己的文件里（与 `chat.json` 分开）。
+    let reopened = orbdrop_lib::group::GroupStore::with_path(root.join("device-grp-a").join("groups.json"));
+    assert_eq!(reopened.views("device-grp-a").len(), 1, "重启后群还在");
+    assert_eq!(reopened.views("device-grp-a")[0].messages.len(), 2, "消息也还在");
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    orbdrop_lib::server::stop_server(&state_c).await;
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = (server_a, server_b, server_c);
+}
+
+/// 群消息的离线补发：对端**没开机**时那一份落「排队」，等它上线由补发那一跳按原顺序送出去。
+///
+/// 顺带覆盖"名册先于消息"：名册当初广播时 C 不在网上，所以补发那一步必须先补名册、
+/// 再发消息（否则 C 不认识这个群，消息无处可放）。
+#[tokio::test]
+async fn group_messages_wait_for_an_offline_member_and_the_roster_goes_first() {
+    use orbdrop_lib::chat::{self, Delivery};
+    use orbdrop_lib::group;
+
+    let root = std::env::temp_dir().join(format!("orbdrop_it_groupq_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+
+    let (port_a, port_b) = two_free_ports();
+    let (state_a, _) = chat_state(port_a, "device-gq-a", "PC-QA", &root);
+    let (state_b, _) = chat_state(port_b, "device-gq-b", "PC-QB", &root);
+    let server_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
+
+    address_book(&state_a, "device-gq-b", "PC-QB", port_b);
+
+    let gid = group::create(&state_a, &["device-gq-b".into()], "临时群").expect("建群");
+    // B 还没开机：名册投不出去（`told` 停在"没说过"）。
+    assert!(state_a.groups.needs_roster(&gid, "device-gq-b"));
+    let msg_id = group::send_text(&state_a, &gid, "你上线再看这句").expect("发得出去");
+    let view = state_a.groups.view(&gid, "device-gq-a").unwrap();
+    assert_eq!(
+        view.messages[0].delivery.get("device-gq-b"),
+        Some(&Delivery::Queued),
+        "够不着 = 排队等它上线（不是「未送达」）"
+    );
+    assert_eq!(view.messages[0].id, msg_id);
+    assert!(state_a.groups.has_backlog_for("device-gq-b"));
+
+    // ---- B 上线（起服务器 + 判在线）→ 补发那一跳：先名册、再消息 ----
+    let server_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    chat::flush_queued(&state_a, "device-gq-b");
+    // 名册先到：B 那边先挂一张邀请卡（它还没点「加入」）。
+    wait_until("B 收到邀请卡", || state_b.groups.has_pending(&gid)).await;
+    assert!(state_b.groups.view(&gid, "device-gq-b").is_none(), "没确认前不算群");
+    // 紧跟其后的那条消息**不能丢**：它还挂在卡上，先攒着。
+    wait_until("那条消息被攒下来了", || state_b.groups.buffered_count(&gid) == 1).await;
+
+    // 点「加入」→ 攒着的那条并进会话。
+    assert!(group::accept(&state_b, &gid));
+    let view_b = state_b.groups.view(&gid, "device-gq-b").expect("加入后有群了");
+    assert_eq!(view_b.messages.len(), 1);
+    assert_eq!(view_b.messages[0].text, "你上线再看这句");
+    assert_eq!(view_b.unread, 1, "攒进来的照样是未读（收到 ≠ 读过）");
+    assert!(!state_a.groups.needs_roster(&gid, "device-gq-b"), "名册补过了");
+    wait_until("A 那一份落成已送达", || {
+        state_a
+            .groups
+            .view(&gid, "device-gq-a")
+            .is_some_and(|v| v.messages[0].delivery.get("device-gq-b") == Some(&Delivery::Sent))
+    })
+    .await;
+
+    // ---- 再发一条：B 现在可达，直接就送到（不用再排队） ----
+    group::send_text(&state_a, &gid, "这句是它上线之后发的").expect("发得出去");
+    wait_until("B 收到第二条", || {
+        state_b.groups.view(&gid, "device-gq-b").is_some_and(|v| v.messages.len() == 2)
+    })
+    .await;
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = (server_a, server_b);
+}
+
+/// 跨网段（链式：A—B—C，A 与 C 互相够不着）时，群消息靠**两条路**到得了对面：
+/// ① 接收方主动**补拉**（向自己够得着的邻居要）；② 链路上的成员**中转**（`groupRelay` 开关）。
+///
+/// 拓扑用地址簿造出来：A 只认识 B、C 只认识 B —— 就是"两台机器各在一个网段、中间那台双网卡"
+/// 的最小替身（`learned` 那一层的跨段发现在 `routes_discover` 里就写明"拿到表之后本机直连"，
+/// 所以这里的"够不着"正是真实情形）。
+#[tokio::test]
+async fn a_chain_group_catches_up_by_pull_and_by_relay() {
+    use orbdrop_lib::chat::Delivery;
+    use orbdrop_lib::group;
+
+    let root = std::env::temp_dir().join(format!("orbdrop_it_chain_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+
+    let (port_a, port_b) = two_free_ports();
+    let port_c = free_port();
+    let (state_a, _) = chat_state(port_a, "device-ch-a", "PC-CHA", &root);
+    let (state_b, _) = chat_state(port_b, "device-ch-b", "PC-CHB", &root);
+    let (state_c, _) = chat_state(port_c, "device-ch-c", "PC-CHC", &root);
+    let server_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
+    let server_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    let server_c = orbdrop_lib::server::start_server(state_c.clone(), port_c).await.expect("C server");
+
+    // A ↔ B、B ↔ C 有地址；A ↔ C **没有**（两个网段之间没有路径）。
+    address_book(&state_a, "device-ch-b", "PC-CHB", port_b);
+    address_book(&state_b, "device-ch-a", "PC-CHA", port_a);
+    address_book(&state_b, "device-ch-c", "PC-CHC", port_c);
+    address_book(&state_c, "device-ch-b", "PC-CHB", port_b);
+
+    // 群由**中间那台**建：能同时看见两端的人建群，两端才都收得到名册（真事也是这样 ——
+    // A 那边连 C 都列不出来，选不中它）。
+    let gid = group::create(&state_b, &["device-ch-a".into(), "device-ch-c".into()], "跨段组").expect("建群");
+    wait_until("A、C 都收到邀请卡", || {
+        state_a.groups.has_pending(&gid) && state_c.groups.has_pending(&gid)
+    })
+    .await;
+    assert!(group::accept(&state_a, &gid));
+    assert!(group::accept(&state_c, &gid));
+
+    // ---- ① 补拉：A 发一句（只能到 B），C 向 B 要来 ----
+    group::send_text(&state_a, &gid, "排期表我放共享里了").expect("A 发得出去");
+    wait_until("B 收到", || {
+        state_b.groups.view(&gid, "device-ch-b").is_some_and(|v| v.messages.len() == 1)
+    })
+    .await;
+    assert!(
+        state_c.groups.view(&gid, "device-ch-c").is_some_and(|v| v.messages.is_empty()),
+        "C 收不到：A 到不了 C（那一份在 A 那边排着队）"
+    );
+    assert_eq!(
+        state_a.groups.view(&gid, "device-ch-a").unwrap().messages[0].delivery.get("device-ch-c"),
+        Some(&Delivery::Queued),
+        "A 对 C 的那一份：够不着 = 排队"
+    );
+
+    // C 打开群（或定时扫）→ 向够得着的 B 要一遍。
+    group::sync_with(&state_c, &gid, "device-ch-b");
+    wait_until("C 补到了 A 的那句", || {
+        state_c
+            .groups
+            .view(&gid, "device-ch-c")
+            .is_some_and(|v| v.messages.iter().any(|m| m.text == "排期表我放共享里了"))
+    })
+    .await;
+    let seen = &state_c.groups.view(&gid, "device-ch-c").unwrap().messages[0];
+    assert_eq!(seen.from, "device-ch-a", "作者是 A，不是搬运工 B");
+    assert_eq!(seen.from_name, "PC-CHA");
+
+    // ---- ② 中转：B 打开开关后，A 新发的那句由 B 转给 C（不必等补拉） ----
+    state_b.config.lock().group_relay = true;
+    group::send_text(&state_a, &gid, "十点开会").expect("A 发得出去");
+    wait_until("C 从中转那条路收到", || {
+        state_c
+            .groups
+            .view(&gid, "device-ch-c")
+            .is_some_and(|v| v.messages.iter().any(|m| m.text == "十点开会"))
+    })
+    .await;
+    let c_view = state_c.groups.view(&gid, "device-ch-c").unwrap();
+    let c_msgs: Vec<(String, String, u64)> = c_view
+        .messages
+        .iter()
+        .map(|m| (m.from.clone(), m.text.clone(), m.seq))
+        .collect();
+    let b_msgs: Vec<(String, String, u64)> = state_b
+        .groups
+        .view(&gid, "device-ch-b")
+        .unwrap()
+        .messages
+        .iter()
+        .map(|m| (m.from.clone(), m.text.clone(), m.seq))
+        .collect();
+    assert_eq!(c_view.messages.len(), 2, "两句都在，没有重复：C={c_msgs:?} B={b_msgs:?}");
+    assert!(
+        c_view.messages.iter().all(|m| m.from == "device-ch-a"),
+        "两句都是 A 说的：C={c_msgs:?} B={b_msgs:?}"
+    );
+    // A 那边也不会因为中转多出副本（作者始终是 A；中转不产生新消息）。
+    let a_view = state_a.groups.view(&gid, "device-ch-a").unwrap();
+    assert_eq!(a_view.messages.len(), 2, "A 只看到自己发的那两条");
+    assert!(
+        a_view.messages.iter().all(|m| m.from_me),
+        "中转不会把消息转回给作者"
+    );
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    orbdrop_lib::server::stop_server(&state_c).await;
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = (server_a, server_b, server_c);
 }

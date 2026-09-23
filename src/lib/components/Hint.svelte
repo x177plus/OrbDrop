@@ -2,7 +2,12 @@
   import type { Snippet } from 'svelte';
   import { hideHint, showHint } from '$lib/stores/hint.svelte';
 
-  /** 说明正文：直接写成子内容，能带 `<strong>` / `<span class="hl">` 这类强调。 */
+  /**
+   * 说明正文：直接写成子内容，能带 `<strong>` / `<span class="hl">` 这类强调。
+   *
+   * 点「?」**不往上传**：它常挨着某个控件（设置里的字段标题、会话创建框里的模式卡片都在
+   * `<label>` 里）—— 不拦一下，点说明会顺带把那个单选/开关给切了。
+   */
   let { children }: { children: Snippet } = $props();
 
   let trigger = $state<HTMLElement | null>(null);
@@ -17,6 +22,7 @@
   $effect(() => () => hideHint());
 </script>
 
+<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <span
   class="hint"
   bind:this={trigger}
@@ -28,4 +34,5 @@
   onmouseleave={hideHint}
   onfocus={show}
   onblur={hideHint}
+  onclick={(e) => e.stopPropagation()}
 >?</span>

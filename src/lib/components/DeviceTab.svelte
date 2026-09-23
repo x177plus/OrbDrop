@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { PeerDevice } from '$lib/types';
-  import { getDevices, loadDevices } from '$lib/stores/devices.svelte';
+  import { getDevices, loadDevices, deviceState, needsRepair } from '$lib/stores/devices.svelte';
   import { connectPeer, disconnectPeer } from '$lib/api';
   import * as chat from '$lib/stores/chat.svelte';
   import Hint from '$lib/components/Hint.svelte';
@@ -57,97 +57,20 @@
   }
 
   /**
-   * 这台设备是不是"我们的 token 已经不作数了"（对端清过数据 / 它把我们解除配对了）。
-   *
-   * 这一档**不能给「连接」**：拨号必然 401，`stop_reason_for` 会立刻让循环停手
-   * （`LinkState::Stopped{TokenRejected}`），点多少次都一样。唯一出路是重新配对 ——
-   * 走一遍配对流程，对端会发一枚新 token，本机存的那枚（和 BC 里那份）跟着更新。
-   *
-   * 它也是唯一用红的档：本机断开、对端断开都是**有人主动做的正常动作**（界面回到
-   * 「已配对」），链路被网络打断是自愈的「重连中」—— 只有"关系已经不成立"才算异常。
+   * 「新建会话」：选设备、选模式（一对一 / 单向群发 / 共享群聊）、起名字 ——
+   * 与会话浮层右上那颗「＋ 新建会话」是同一条路（`stores/chat` 里的收件人选择框）。
    */
-  function needsRepair(d: PeerDevice): boolean {
-    const s = d.linkState;
-    // 两种都归这里：token 它不认（清过数据/解除了配对）、证书指纹对不上（它换了机器）。
-    // 对用户是同一个动作 —— 重新配对。
-    return !!s && s.kind === 'stopped' && (s.reason === 'tokenRejected' || s.reason === 'identityChanged');
-  }
-
-  /** 「群发」：选完收件人开那块群发框（它只是载体，发完即消失；记录落在各台会话里）。 */
-  function openBatch() {
-    chat.askRecipients([], (ids) => chat.openBatch(ids));
+  function openNewConvo() {
+    chat.askNewConvo();
   }
 
   /**
-   * 离线优先判定：已配对但对方此刻不在网上（mDNS/探活都看不到）。它留在列表里是为了
-   * 「解除配对」——那是纯本机动作；长连接状态（重连中/等对端上线）对一个不在网上的
-   * 设备没有意义，所以这一档不看 linkState。
-   */
-  function stateChipClass(d: PeerDevice): string {
-    if (!d.online) return 'state-chip offline';
-    if (d.connected) return 'state-chip connected';
-    if (d.paired) {
-      if (needsRepair(d)) return 'state-chip danger';
-      // 已配对：关系正常、随时可用 —— 蓝色（项目主色）。
-      return linkChipExtra(d) ? 'state-chip pending' : 'state-chip paired';
-    }
-    return 'state-chip unbound';
-  }
-
-  function stateLabel(d: PeerDevice): string {
-    if (!d.online) return '离线';
-    if (d.connected) return '长连接';
-    if (d.paired) return linkLabel(d) ?? '已配对';
-    return '未绑定';
-  }
-
-  function stateDotClass(d: PeerDevice): string {
-    if (!d.online) return 'dot off';
-    if (d.connected) return 'dot ok';
-    if (d.paired) {
-      if (needsRepair(d)) return 'dot danger';
-      return linkChipExtra(d) ? 'dot warn' : 'dot off';
-    }
-    // 未绑定 = 局域网设备的常态（不配对也能推送），不是告警：灰点，别和"要处理"的黄点抢注意力。
-    return 'dot off';
-  }
-
-  /**
-   * 已配对但没连着的时候，后端会说明"为什么"（重连中 / 已停止）。把它显示出来，用户
-   * 才知道该等、该点「连接」、还是该重新配对 —— 静默的失败是最糟的一种。
+   * 悬停说明：这一行现在到底在做什么（排障时唯一能自证的东西）。
    *
-   * 文案一律 3 个字：完整原因放在悬停说明里（`linkHint`），pill 只负责"一眼分类"。
-   *
-   * `waiting`（对端不在网上、拨号转入待命）**不单独成档**：它蕴含"对端离线"，pill 归
-   * 「离线」（见 stateLabel 的离线优先判定），"本机还在等它上线"这层意思挪进悬停说明。
+   * 胶囊上那几个字（长连接 / 已配对 / 未绑定 / 离线 / 重连中 / 需配对）由 `stores/devices`
+   * 的 `deviceState` 给；这里补的是**为什么**与**该做什么**（`waiting` 那类"本机还在等它"
+   * 的意思也只有这里说得下）。
    */
-  function linkLabel(d: PeerDevice): string | null {
-    const s = d.linkState;
-    // 没有拨号意图、或会话本来就在 → 不用多说，界面上"长连接/已配对"就够了。
-    if (!s || s.kind === 'connected') return null;
-    switch (s.kind) {
-      case 'retrying': return '重连中';
-      case 'stopped':
-        switch (s.reason) {
-          // 本机点过「断开」：**这是用户自己做的事，不是故障** —— 行回到「已配对」（蓝），
-          // 原因只留在悬停说明里。否则每次主动断开都像出了事，pill 也就失去信号价值。
-          case 'localDisconnected': return null;
-          // 对端点过「断开」：**对端主动做的事，同样属于正常断开**（重拨会被它拒绝，
-          // 但它随时会拨回来或本机再点「连接」）—— 也回到「已配对」，不是"意外断开"。
-          case 'peerDisconnected': return null;
-          case 'tokenRejected':
-          case 'identityChanged': return '需配对';
-        }
-    }
-    // waiting 与任何未知 kind 都落到这里：不额外占一档。
-    return null;
-  }
-
-  function linkChipExtra(d: PeerDevice): boolean {
-    return !d.connected && !!linkLabel(d);
-  }
-
-  /** 悬停说明：这一行现在到底在做什么（排障时唯一能自证的东西）。 */
   function linkHint(d: PeerDevice): string {
     if (!d.online) {
       // 「等上线」并进这一档：拨号待命 / 正在退避都只是"本机在等它"，pill 仍是「离线」。
@@ -245,29 +168,35 @@
   </svg>
   添加设备 · 配对码
 </button>
-<!-- 群发入口：选几台设备，在同一段话里发出去（记录分别落到各自会话，见 ConvoPanel）。
+<!-- 新建会话入口：选几台设备、选模式（一对一 / 单向群发 / 共享群聊）、起名字。
      与「设备」页其它按钮同宽同高的一组。 -->
-<button class="btn btn-secondary btn-block" style="height:var(--control-h); margin-top:6px" onclick={openBatch}>
+<button class="btn btn-secondary btn-block" style="height:var(--control-h); margin-top:6px" onclick={openNewConvo}>
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
     <path d="M16 19v-1a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v1"/><circle cx="9" cy="7" r="3"/>
     <path d="M22 19v-1a4 4 0 0 0-3-3.87"/><path d="M16 4.13a4 4 0 0 1 0 7.75"/>
   </svg>
-  群发 · 选择多台设备
+  新建会话 · 选择多台设备
 </button>
 
 <div class="list-label dev-label">
   <span class="ll-name"><span class="ll-text">局域网设备</span><Hint>
     <p>
-      <span class="hl">发消息</span>按钮打开与这台设备的会话 —— 消息走长连接，没有长连接的设备
-      发出去会落「未送达」（点「连接」建链后再发）；
+      <span class="hl">状态点</span>：实心绿=长连接、绿环=在线（能收到）、灰环=离线、琥珀=本机在等、红=需重新配对；
+      胶囊上那几个字说的是关系与链路，与点不重复。
+      <span class="hl">发消息</span>按钮打开与这台设备的会话 —— 消息**长连接优先、HTTP 兜底**：
+      已配对的不点「连接」也能收发，未绑定设备也能收能发（对端名字是它自报的）；
+      对端不在网上时那条消息**排着队**，它一上线就自动发出去（界面那一刻写「等待发送」）；
       <span class="hl">已配对</span>设备点「连接」建立长连接（配对本身不建链）；
       处于<span class="hl">长连接</span>的设备会自动收到你拖入悬浮球文件的广播，无需逐条操作；
       关机时连着长连接的设备，下次启动 OrbDrop 时会自动接回来（点过「断开」的不会）。
       <span class="hl">已配对但离线</span>的设备排在列表下方（在线的在上），可以「解除配对」
       —— 解除是本机动作，不需要对方在线。
       <span class="hl">推送</span>在会话里（输入框左边那颗「＋」）：选文件发过去就是推送 ——
-      1:1 会话发给这一台；上面的<span class="hl">群发</span>框里同样有那颗「＋」，
-      一次发给选中的所有设备（各自邀请、各自进度）。
+      一对一发给这一台；「群发」那条会话里同样有那颗「＋」，一次发给名单上的所有设备
+      （各自邀请、各自进度）。上面的<span class="hl">新建会话</span>一次选几台、选模式：
+      <span class="hl">单向群发</span>是每台各自收到一条单独消息，<span class="hl">共享群聊</span>
+      是所有人的<b>同一条</b>消息流（收到邀请的人点「加入」才算入群）；群那条会话里也有那颗
+      「＋」，按名册逐台推过去。
       <span class="hl">搜索框</span>只在这里筛显示（设备名或 IP），不影响长连接与消息。
     </p>
   </Hint></span>
@@ -310,6 +239,8 @@
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <ul class="device-list" id="deviceList" onclick={handleDeviceAction}>
     {#each filtered as d (d.id)}
+      <!-- 状态点与状态章同一处判据（`stores/devices` 的 `deviceState`）：颜色=能不能送到、形状=有没有长连接。 -->
+      {@const st = deviceState(d)}
       <li
         class="device-row"
         class:online={d.online}
@@ -322,8 +253,8 @@
         <div class="d-main">
           <div class="d-name">
             {d.name}
-            <span class={stateChipClass(d)} title={linkHint(d)}>
-              <span class={stateDotClass(d)}></span>{stateLabel(d)}
+            <span class="state-chip {st.chip}" title={linkHint(d)}>
+              <span class="dot {st.dot}"></span>{st.label}
             </span>
             <span class="auto-tag">自动广播</span>
           </div>
@@ -333,7 +264,8 @@
           {#if !d.online}
             <!-- 离线设备唯一能做的本机动作：解除配对（后端不依赖长连接，见 unpair_peer）。
                  「连接」在这里不提供：对端不在网上，只会开一个空转的拨号循环；
-                 「发消息」也不行——消息走长连接，没有链路发出去就是「未送达」。 -->
+                 「发消息」也不给（同 F-14 的离线行规则）——设备页这一行不是消息的入口，
+                 会话列表里与它的那条会话一直在（那里的输入框照样能用，消息会排队等它上线）。 -->
             <button class="btn btn-ghost btn-sm" data-unpair>解除配对</button>
           {:else if d.connected}
             <button class="btn btn-ghost btn-sm" data-disconnect>断开</button>

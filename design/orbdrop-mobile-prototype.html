@@ -1,0 +1,2036 @@
+<!doctype html>
+<!--
+  OrbDrop · 移动端原型 (Open Design)
+  Handheld shell derived from the Open Design mobile-app template (Apache-2.0).
+  Product: conversations + receiving files, full-screen expanded state, no floating orb.
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OrbDrop · 移动端原型</title>
+<style>
+/* OD-LAYOUT-PRIMITIVES v1 — structure only: display, flex/grid, overflow, wrapping, ratio.
+   Put this @layer first; product CSS outside the layer always wins. */
+@layer od-layout {
+  :where(.od-stack,.od-row,.od-row-top,.od-cluster,.od-grid,.od-field,.od-stat,.od-cell,.od-tile) > :where(*) { min-width: 0; }
+
+  .od-stack   { display: flex; flex-direction: column; gap: var(--od-gap, 8px); }
+  .od-row     { display: flex; align-items: center; gap: var(--od-gap, 8px); }
+  .od-row-top { display: flex; align-items: flex-start; gap: var(--od-gap, 8px); }
+  .od-cluster { display: flex; flex-wrap: wrap; align-items: center; gap: var(--od-gap, 8px); }
+  .od-fill    { flex: 1 1 0; min-width: 0; }
+  .od-fixed   { flex: none; }
+  .od-grid    { display: grid; gap: var(--od-gap, 12px); grid-template-columns: repeat(var(--od-cols, 3), minmax(0, 1fr)); }
+
+  .od-stat, .od-field, .od-cell { display: grid; gap: var(--od-gap, 2px); }
+  :where(.od-stat,.od-field,.od-cell) > :where(*) { display: block; }
+  .od-tile { display: grid; grid-template-rows: auto 1fr; }
+  :where(.od-tile) > :where(*) { display: block; }
+
+  .od-media { display: block; width: 100%; height: auto; aspect-ratio: var(--od-ratio, auto); }
+  .od-media-cover { object-fit: cover; }
+
+  .od-truncate { display: block; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .od-clamp-2, .od-clamp-3 { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+  .od-clamp-2 { -webkit-line-clamp: 2; }
+  .od-clamp-3 { -webkit-line-clamp: 3; }
+  .od-lines-2 { min-height: calc(2 * 1.4em); }
+  .od-nowrap  { white-space: nowrap; }
+  .od-keep    { word-break: keep-all; overflow-wrap: anywhere; }
+
+  .od-screen { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; height: 100%; }
+  .od-scroll { overflow-y: auto; overscroll-behavior: contain; min-height: 0; }
+
+  .od-rail { display: flex; gap: var(--od-gap, 8px); overflow-x: auto; scroll-snap-type: x proximity; scrollbar-width: none;
+             padding-inline: var(--od-rail-pad, 16px); scroll-padding-inline: var(--od-rail-pad, 16px); }
+  .od-rail::-webkit-scrollbar { display: none; }
+  :where(.od-rail) > :where(*) { flex: none; scroll-snap-align: start; }
+  :where(.od-rail) > :where(:last-child) { margin-inline-end: var(--od-rail-pad, 16px); }
+
+  .od-spacer { flex: none; visibility: hidden; pointer-events: none; }
+  .od-touch  { min-width: 44px; min-height: 44px; }
+}
+/* /OD-LAYOUT-PRIMITIVES v1 */
+
+/* ─────────────────────────── design tokens ───────────────────────────
+   与桌面原型 orbdrop-app-prototype.html 共用同一套 modern-minimal 令牌。 */
+:root {
+  --bg:        oklch(99% 0.002 240);
+  --surface:   oklch(100% 0 0);
+  --surface-2: oklch(97.4% 0.004 245);
+  --fg:        oklch(18% 0.012 250);
+  --muted:     oklch(50% 0.012 250);
+  --border:    oklch(92% 0.005 250);
+
+  --accent:  oklch(58% 0.18 255);
+  --ok:      oklch(52% 0.15 158);
+  --warn:    oklch(58% 0.14 60);
+  --danger:  oklch(56% 0.20 25);
+
+  --accent-soft:  color-mix(in oklch, var(--accent) 12%, transparent);
+  --accent-deep:  color-mix(in oklch, var(--accent) 78%, black);
+  --accent-deeper: color-mix(in oklch, var(--accent) 70%, black);
+  --ok-soft:      color-mix(in oklch, var(--ok) 13%, transparent);
+  --fg-soft:      color-mix(in oklch, var(--fg) 6%, transparent);
+  --hairline:     color-mix(in oklch, var(--fg) 20%, var(--border));
+  --danger-soft:  color-mix(in oklch, var(--danger) 12%, transparent);
+  --danger-deep:  color-mix(in oklch, var(--danger) 78%, black);
+
+  --bc:      oklch(58% 0.15 38);
+  --bc-soft: color-mix(in oklch, var(--bc) 13%, transparent);
+  --bc-deep: color-mix(in oklch, var(--bc) 74%, black);
+  --sp-1:    oklch(58% 0.18 255);
+  --sp-2:    oklch(56% 0.14 158);
+  --sp-3:    oklch(56% 0.16 320);
+  --sp-1-deep: color-mix(in oklch, var(--sp-1) 74%, black);
+  --sp-2-deep: color-mix(in oklch, var(--sp-2) 74%, black);
+  --sp-3-deep: color-mix(in oklch, var(--sp-3) 74%, black);
+
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+  --font-body:    -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono:    ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 15px;
+  --fs-lg: 16px;
+  --fs-xl: 22px;
+
+  --radius: 10px;
+  --radius-lg: 16px;
+  --shadow: 0 24px 64px -28px oklch(18% 0.012 250 / 0.22), 0 2px 8px -2px oklch(18% 0.012 250 / 0.08);
+}
+/* ─────────────────────────── base ─────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; min-height: 100%; }
+img, svg { display: block; }
+button { font: inherit; cursor: pointer; color: inherit; background: none; border: 0; padding: 0; }
+input { font: inherit; }
+a { color: inherit; text-decoration: none; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+/* ── handheld shell (platform-neutral) ─────────────────────────────── */
+:root {
+  --phone-screen-width: 390px;
+  --phone-screen-height: 844px;
+  --phone-bezel: 10px;
+  --phone-outer-radius: 52px;
+  --phone-screen-radius: 42px;
+  --phone-safe-top: 50px;
+  --phone-safe-bottom: 29px;
+  --phone-system-fg: #17181a;
+  --phone-screen-bg: #f8f8f9;
+  --phone-stage-bg: #eaebee;
+}
+html, body { height: 100%; }
+body {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background:
+    radial-gradient(circle at 50% 15%, rgba(255,255,255,.94), transparent 35%),
+    var(--phone-stage-bg);
+  color: #191a1d;
+  font-family: var(--font-body);
+}
+.phone-frame {
+  position: relative;
+  width: calc(var(--phone-screen-width) + var(--phone-bezel) * 2);
+  height: calc(var(--phone-screen-height) + var(--phone-bezel) * 2);
+  padding: var(--phone-bezel);
+  border-radius: var(--phone-outer-radius);
+  background:
+    linear-gradient(145deg, rgba(255,255,255,.2), transparent 17%),
+    linear-gradient(160deg, #3f4146 0%, #202227 48%, #0b0c0f 100%);
+  box-shadow:
+    inset 0 0 0 1px rgba(255,255,255,.13),
+    inset 0 0 0 2px rgba(0,0,0,.85),
+    0 32px 68px -20px rgba(10,12,16,.52),
+    0 10px 24px -10px rgba(10,12,16,.32);
+  isolation: isolate;
+}
+.phone-frame::before,
+.phone-frame::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  top: 96px;
+  bottom: 96px;
+  width: 2px;
+  background: linear-gradient(to bottom, transparent, rgba(255,255,255,.13) 16%, transparent 30%, transparent 72%, rgba(255,255,255,.07) 88%, transparent);
+}
+.phone-frame::before { left: 0; }
+.phone-frame::after { right: 0; }
+.hardware-button {
+  position: absolute;
+  width: 4px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #08090b, #2a2d33 60%, #08090b);
+  box-shadow: inset 0 1px rgba(255,255,255,.08);
+}
+.hardware-button.volume { left: -3px; top: 222px; height: 86px; }
+.hardware-button.power { right: -3px; top: 270px; height: 82px; }
+.phone-screen {
+  position: relative;
+  width: var(--phone-screen-width);
+  height: var(--phone-screen-height);
+  overflow: hidden;
+  border-radius: var(--phone-screen-radius);
+  background: var(--phone-screen-bg);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.05);
+}
+.phone-content {
+  position: absolute;
+  inset: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  padding-top: var(--phone-safe-top);
+  padding-bottom: var(--phone-safe-bottom);
+  background: var(--phone-screen-bg);
+}
+.phone-content::-webkit-scrollbar { display: none; }
+.camera-dot {
+  position: absolute;
+  z-index: 20;
+  top: 13px;
+  left: 50%;
+  width: 10px;
+  height: 10px;
+  transform: translateX(-50%);
+  border-radius: 50%;
+  background: radial-gradient(circle at 38% 35%, #344154 0 12%, #0a0c10 34%, #000 76%);
+  box-shadow: 0 0 0 1px rgba(255,255,255,.06);
+  pointer-events: none;
+}
+.status-bar {
+  position: absolute;
+  z-index: 15;
+  inset: 0 0 auto;
+  height: var(--phone-safe-top);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 56px minmax(0, 1fr);
+  align-items: start;
+  padding: 14px 20px 0;
+  color: var(--phone-system-fg);
+  opacity: .8;
+  pointer-events: none;
+}
+.status-time { justify-self: start; display: flex; align-items: center; height: 15px; font-size: 14px; font-weight: 560; line-height: 1; }
+.status-cutout-zone { width: 56px; }
+.status-icons { justify-self: end; display: inline-flex; align-items: center; height: 15px; gap: 6px; }
+.status-icons svg { display: block; flex: none; fill: none; stroke: currentColor; stroke-width: 1.35; stroke-linecap: round; stroke-linejoin: round; }
+.status-icons .connectivity { width: 15px; height: 12px; }
+.status-icons .wifi { width: 15px; height: 12px; }
+.status-icons .battery { width: 19px; height: 11px; }
+.gesture-indicator {
+  position: absolute;
+  z-index: 20;
+  left: 50%;
+  bottom: 8px;
+  width: 96px;
+  height: 4px;
+  transform: translateX(-50%);
+  border-radius: 99px;
+  background: var(--phone-system-fg);
+  opacity: .86;
+  pointer-events: none;
+}
+@media (max-height: 927px) { .phone-frame { zoom: 0.9; } }
+@media (max-height: 840px) { .phone-frame { zoom: 0.82; } }
+@media (max-height: 771px) { .phone-frame { zoom: 0.74; } }
+@media (max-height: 702px) { .phone-frame { zoom: 0.66; } }
+@media (max-width: 480px) {
+  body { padding: 0; display: block; }
+  .phone-frame { width: 100%; height: 100dvh; padding: 0; border-radius: 0; background: none; box-shadow: none; zoom: 1; }
+  .phone-frame::before, .phone-frame::after, .hardware-button { display: none; }
+  .phone-screen { width: 100%; height: 100%; border-radius: 0; }
+}
+/* ─────────────────────────── icons ─────────────────────────── */
+.ic { width: 20px; height: 20px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.ic-fill { fill: currentColor; stroke: none; }
+
+/* ─────────────────────────── app frame ─────────────────────────── */
+.app {
+  position: relative;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-body);
+  font-size: var(--fs-lg);
+  line-height: 1.55;
+  overflow: hidden;
+}
+.appbar {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 18px 12px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+.ab-main { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.ab-title { margin: 0; font-family: var(--font-display); font-size: var(--fs-xl); font-weight: 650; letter-spacing: -0.02em; line-height: 1.15; }
+.ab-sub { margin: 0; font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ab-acts { flex: none; display: flex; gap: 4px; margin-top: 3px; }
+
+.icon-btn {
+  width: 40px; height: 40px; flex: none; border-radius: 11px;
+  display: grid; place-items: center; color: var(--muted);
+  transition: background .15s ease, color .15s ease;
+}
+.icon-btn .ic { width: 21px; height: 21px; }
+.icon-btn:hover { background: var(--fg-soft); color: var(--fg); }
+.icon-btn:active { transform: scale(.95); }
+
+.appmain { overflow-y: auto; overscroll-behavior: contain; min-height: 0; scrollbar-width: none; }
+.appmain::-webkit-scrollbar { display: none; }
+
+/* ─────────────────────────── bottom navigation ─────────────────────────── */
+.tabbar {
+  flex: none;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 2px;
+  padding: 6px 6px 4px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+.tab-item {
+  position: relative;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+  min-height: 54px; border-radius: 12px;
+  color: var(--muted); font-size: 11px; font-weight: 560;
+  transition: color .15s ease, background .15s ease;
+}
+.tab-item:hover { background: var(--fg-soft); color: var(--fg); }
+.tab-item.active { color: var(--accent-deep); background: var(--accent-soft); }
+.tab-item.active:hover { background: color-mix(in oklch, var(--accent) 18%, transparent); color: var(--accent-deep); }
+.ti-ic { position: relative; display: grid; place-items: center; }
+.ti-ic .ic { width: 23px; height: 23px; }
+.ti-badge {
+  position: absolute; top: -4px; right: -10px;
+  min-width: 17px; height: 17px; padding: 0 4px;
+  border-radius: 99px; background: var(--accent); color: #fff;
+  font-family: var(--font-mono); font-size: 10px; font-weight: 700; line-height: 17px; text-align: center;
+}
+.ti-badge.hot { background: var(--bc); }
+
+/* ─────────────────────────── generic pieces ─────────────────────────── */
+.body { padding: 14px 18px 26px; }
+.sec + .sec { margin-top: 20px; }
+.sec-label {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 0 2px 8px; font-size: var(--fs-xs); font-weight: 620; color: var(--muted); letter-spacing: .01em;
+}
+.sec-label .num { font-family: var(--font-mono); font-weight: 400; }
+.stack { display: grid; gap: 2px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); }
+.card.list { overflow: hidden; }
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  height: 42px; padding: 0 16px; border-radius: 11px; border: 1px solid transparent;
+  font-size: var(--fs-md); font-weight: 600; white-space: nowrap;
+  transition: background .15s ease, border-color .15s ease, color .15s ease;
+}
+.btn .ic { width: 16px; height: 16px; }
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { background: var(--accent-deep); }
+.btn-secondary { background: var(--surface); border-color: var(--border); color: var(--fg); }
+.btn-secondary:hover { background: var(--fg-soft); border-color: var(--hairline); }
+.btn-danger { background: var(--danger-soft); color: var(--danger-deep); }
+.btn-danger:hover { background: color-mix(in oklch, var(--danger) 20%, transparent); }
+.btn-block { width: 100%; }
+.btn-sm { height: 34px; padding: 0 12px; font-size: var(--fs-sm); border-radius: 9px; }
+
+.dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.dot.ok { background: var(--ok); }
+.dot.warn { background: var(--warn); }
+.dot.off { background: color-mix(in oklch, var(--fg) 26%, transparent); }
+.dot.bc { background: var(--bc); }
+
+.empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 44px 24px; text-align: center; color: var(--muted); }
+.empty .ic { width: 30px; height: 30px; opacity: .45; }
+.empty p { margin: 0; font-size: var(--fs-md); }
+.empty .es { font-size: var(--fs-xs); max-width: 250px; line-height: 1.6; }
+
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 12px;
+  border-radius: 99px; border: 1px solid var(--border); background: var(--surface);
+  font-size: var(--fs-sm); color: var(--fg); flex: none;
+}
+.chip .ic { width: 15px; height: 15px; }
+.chip.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-deep); font-weight: 600; }
+/* ─────────────────────────── conversation list ─────────────────────────── */
+.convo {
+  width: 100%; display: flex; align-items: center; gap: 12px;
+  padding: 11px 10px; border-radius: 14px; text-align: left;
+  transition: background .15s ease;
+}
+.convo:hover { background: var(--fg-soft); }
+.av {
+  flex: none; width: 46px; height: 46px; border-radius: 14px;
+  display: grid; place-items: center;
+  font-family: var(--font-display); font-size: 18px; font-weight: 650;
+}
+.av .ic { width: 22px; height: 22px; }
+.av.dir { background: var(--accent-soft); color: var(--accent-deep); }
+.av.grp { background: var(--accent-deep); color: var(--surface); }
+.av.bc  { background: var(--bc-soft); color: var(--bc-deep); }
+.cv-main { flex: 1; min-width: 0; display: grid; gap: 3px; }
+.cv-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.cv-name {
+  flex: 0 1 auto; min-width: 0;
+  font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 600; letter-spacing: -0.01em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cv-mode { flex: none; display: inline-flex; align-items: center; gap: 3px; height: 18px; padding: 0 7px; border-radius: 99px; font-size: 10px; font-weight: 620; }
+.cv-mode .ic { width: 11px; height: 11px; }
+.cv-mode.bc { background: var(--bc-soft); color: var(--bc-deep); }
+.cv-mode.grp { background: var(--accent-soft); color: var(--accent-deep); }
+.cv-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 24%, transparent); }
+.cv-dot.ok { background: var(--ok); }
+.cv-dot.warn { background: var(--warn); }
+.cv-time { margin-left: auto; flex: none; font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
+.cv-prev { font-size: var(--fs-sm); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cv-unread {
+  flex: none; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 99px;
+  background: var(--accent); color: #fff; font-family: var(--font-mono); font-size: 11px; font-weight: 700;
+  display: grid; place-items: center;
+}
+.convo.bc .cv-unread { background: var(--bc); }
+
+/* ─────────────────────────── chat subscreen ─────────────────────────── */
+.sub {
+  position: absolute; inset: 0; z-index: 6;
+  display: flex; flex-direction: column;
+  background: var(--bg);
+  transform: translateX(12%); opacity: 0; visibility: hidden; pointer-events: none;
+  transition: transform .28s cubic-bezier(.2,.8,.2,1), opacity .2s ease, visibility .28s;
+}
+.sub.open { transform: none; opacity: 1; visibility: visible; pointer-events: auto; }
+.chatbar { flex: none; display: flex; align-items: center; gap: 8px; padding: 11px 12px; background: var(--bg); border-bottom: 1px solid var(--border); }
+.cb-main { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.cb-title { font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 620; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cb-sub { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
+.chat-banner { flex: none; display: flex; align-items: flex-start; gap: 8px; padding: 9px 14px; font-size: var(--fs-xs); line-height: 1.5; }
+.chat-banner .ic { width: 15px; height: 15px; flex: none; margin-top: 1px; }
+.chat-banner.bc { background: var(--bc-soft); color: var(--bc-deep); }
+.chat-banner.grp { background: var(--accent-soft); color: var(--accent-deep); }
+
+.chatlog {
+  flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+  padding: 14px 14px 12px; display: flex; flex-direction: column; gap: 10px;
+  scrollbar-width: none;
+}
+.chatlog::-webkit-scrollbar { display: none; }
+.chatlog > .empty { margin: auto; }
+.msg { display: flex; flex-direction: column; max-width: 84%; }
+.msg.me { align-self: flex-end; align-items: flex-end; }
+.msg.peer { align-self: flex-start; align-items: flex-start; }
+.bubble {
+  max-width: 100%; padding: 9px 12px; border-radius: 16px;
+  font-size: var(--fs-md); line-height: 1.55; overflow-wrap: anywhere;
+  user-select: text; -webkit-user-select: text;
+}
+.msg.peer .bubble { background: var(--surface-2); color: var(--fg); border-bottom-left-radius: 6px; }
+.msg.me .bubble { background: var(--accent-deep); color: #fff; border-bottom-right-radius: 6px; }
+.msg.bc .bubble { background: var(--bc-deep); }
+.ctext { display: block; white-space: pre-wrap; }
+.meta { margin-top: 4px; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+.who { display: flex; align-items: center; gap: 5px; margin: 0 2px 4px; }
+.who .who-av {
+  flex: none; width: 18px; height: 18px; border-radius: 6px;
+  display: grid; place-items: center; color: #fff;
+  font-family: var(--font-display); font-size: 10px; font-weight: 700;
+}
+.who .who-nm { font-family: var(--font-display); font-size: 11px; font-weight: 620; }
+.who.sp-1 .who-av { background: var(--sp-1-deep); }
+.who.sp-1 .who-nm { color: var(--sp-1-deep); }
+.who.sp-2 .who-av { background: var(--sp-2-deep); }
+.who.sp-2 .who-nm { color: var(--sp-2-deep); }
+.who.sp-3 .who-av { background: var(--sp-3-deep); }
+.who.sp-3 .who-nm { color: var(--sp-3-deep); }
+
+.fbub { display: flex; align-items: center; gap: 10px; min-width: 168px; }
+.fbub .fio { flex: none; width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; background: color-mix(in oklch, currentColor 15%, transparent); }
+.fbub .fio .ic { width: 18px; height: 18px; }
+.fbub .fmain { min-width: 0; display: grid; gap: 2px; }
+.fname { font-size: var(--fs-md); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fsize { font-family: var(--font-mono); font-size: 10px; opacity: .82; }
+.fstat { font-size: 10px; opacity: .88; }
+.fbar { display: block; height: 4px; margin-top: 5px; border-radius: 99px; background: color-mix(in oklch, currentColor 24%, transparent); overflow: hidden; }
+.fbar i { display: block; height: 100%; border-radius: 99px; background: currentColor; }
+
+.invite {
+  align-self: flex-start; max-width: 88%;
+  padding: 12px; display: grid; gap: 10px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 16px; border-bottom-left-radius: 6px;
+  box-shadow: 0 12px 30px -22px oklch(18% 0.012 250 / 0.5);
+}
+.inv-head { display: flex; align-items: center; gap: 10px; }
+.inv-head > .ic { flex: none; width: 26px; height: 26px; color: var(--accent-deep); }
+.inv-head .cv-main { gap: 1px; }
+.inv-sub { font-size: 11px; color: var(--muted); }
+.inv-acts { display: flex; gap: 8px; }
+.inv-acts .btn { flex: 1; }
+
+.receipt {
+  align-self: flex-end; width: 100%; max-width: 320px;
+  display: grid; gap: 7px; padding: 10px 11px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+}
+.rc-head { font-size: 11px; color: var(--muted); }
+.rc-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.rc-dev { display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 8px 0 4px; border-radius: 99px; background: var(--fg-soft); font-size: 11px; }
+.rc-dev .rc-av { flex: none; width: 16px; height: 16px; border-radius: 5px; display: grid; place-items: center; font-size: 9px; font-weight: 700; background: var(--accent-soft); color: var(--accent-deep); }
+.rc-dev .ic { width: 12px; height: 12px; }
+.rc-dev.ok .rc-ic { color: var(--ok); }
+.rc-dev.off { opacity: .62; }
+.rc-dev.off .rc-ic { color: var(--muted); }
+.rc-peek { justify-self: start; padding: 3px 0; font-size: 11px; font-weight: 620; color: var(--accent-deep); }
+
+.compose { flex: none; display: flex; align-items: center; gap: 8px; padding: 10px 12px; background: var(--bg); border-top: 1px solid var(--border); }
+.cbtn { flex: none; width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; transition: background .15s ease, transform .08s ease; }
+.cbtn .ic { width: 19px; height: 19px; }
+.cplus { background: var(--fg-soft); color: var(--muted); }
+.cplus:hover { background: var(--accent-soft); color: var(--accent-deep); }
+.csend { background: var(--accent-deep); color: #fff; }
+.csend:hover { background: var(--accent-deeper); }
+.csend:disabled { opacity: .38; }
+.cbtn:active { transform: scale(.94); }
+.cinput {
+  flex: 1; min-width: 0; height: 40px; padding: 0 14px;
+  border: 1px solid var(--border); border-radius: 20px;
+  background: var(--surface); color: var(--fg); font-size: var(--fs-lg);
+}
+.cinput::placeholder { color: var(--muted); }
+.cinput:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+/* ─────────────────────────── segmented control ─────────────────────────── */
+.seg { display: flex; gap: 4px; padding: 2px 18px 0; background: var(--bg); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 3; }
+.seg-item { position: relative; padding: 11px 4px 12px; margin-right: 18px; color: var(--muted); font-size: var(--fs-md); font-weight: 560; display: inline-flex; align-items: center; gap: 6px; }
+.seg-item .segn { font-family: var(--font-mono); font-size: 10px; padding: 1px 6px; border-radius: 99px; background: var(--fg-soft); color: var(--muted); }
+.seg-item.active { color: var(--fg); }
+.seg-item.active::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; border-radius: 99px; background: var(--accent); }
+.seg-item.active .segn { background: var(--accent-soft); color: var(--accent-deep); }
+
+/* ─────────────────────────── files · receiving ─────────────────────────── */
+.pend {
+  display: grid; gap: 11px; padding: 14px;
+  background: color-mix(in oklch, var(--accent-soft) 55%, var(--surface));
+  border: 1px solid color-mix(in oklch, var(--accent) 26%, var(--border));
+  border-radius: var(--radius-lg);
+}
+.pend-top { display: flex; align-items: center; gap: 8px; }
+.pend-chip { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 8px; border-radius: 99px; background: var(--accent); color: #fff; font-size: 10px; font-weight: 700; letter-spacing: .02em; }
+.pend-chip .ic { width: 11px; height: 11px; }
+.pend-who { font-size: 11px; color: var(--muted); }
+.pend-body { display: flex; align-items: center; gap: 11px; }
+.pend-acts { display: flex; gap: 8px; }
+.pend-acts .btn { flex: 1; }
+
+.ftile { flex: none; width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center; background: var(--fg-soft); color: var(--muted); }
+.ftile .ic { width: 21px; height: 21px; }
+.ftile.image { background: var(--accent-soft); color: var(--accent-deep); }
+.ftile.zip { background: var(--bc-soft); color: var(--bc-deep); }
+.ftile.doc { background: var(--ok-soft); color: color-mix(in oklch, var(--ok) 72%, black); }
+.ftile.folder { background: color-mix(in oklch, var(--warn) 14%, transparent); color: color-mix(in oklch, var(--warn) 68%, black); }
+.fmain { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.frow { width: 100%; display: flex; align-items: center; gap: 12px; padding: 11px 12px; text-align: left; }
+.frow + .frow { border-top: 1px solid var(--border); }
+.frow:hover { background: var(--fg-soft); }
+.fname2 { font-size: var(--fs-md); font-weight: 560; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fmeta { font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fgo { flex: none; width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center; color: var(--muted); }
+.fgo:hover { background: var(--fg-soft); color: var(--fg); }
+.fgo .ic { width: 18px; height: 18px; }
+
+/* ─────────────────────────── files · transfers ─────────────────────────── */
+.trow { display: grid; gap: 8px; padding: 13px 14px; }
+.trow + .trow { border-top: 1px solid var(--border); }
+.t-top { display: flex; align-items: center; gap: 10px; }
+.t-name { flex: 1; min-width: 0; font-size: var(--fs-md); font-weight: 560; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.t-pct { flex: none; font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); }
+.t-bar { height: 6px; border-radius: 99px; background: var(--fg-soft); overflow: hidden; }
+.t-bar i { display: block; height: 100%; border-radius: 99px; background: var(--accent); transition: width .3s linear; }
+.t-bar.done i { background: var(--ok); }
+.t-bar.fail i { background: var(--warn); }
+.t-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: var(--fs-xs); color: var(--muted); }
+.t-meta .num { font-family: var(--font-mono); }
+.t-cancel { flex: none; font-size: var(--fs-xs); font-weight: 600; color: var(--accent-deep); padding: 3px 0; }
+
+/* ─────────────────────────── files · browse ─────────────────────────── */
+.chips { display: flex; gap: 8px; overflow-x: auto; padding: 2px 0 6px; scrollbar-width: none; }
+.chips::-webkit-scrollbar { display: none; }
+.node { width: 100%; display: flex; align-items: center; gap: 11px; padding: 11px 12px; text-align: left; }
+.node + .node { border-top: 1px solid var(--border); }
+.node:hover { background: var(--fg-soft); }
+.node .ntile { flex: none; width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center; background: var(--fg-soft); color: var(--muted); }
+.node .ntile.folder { background: color-mix(in oklch, var(--warn) 14%, transparent); color: color-mix(in oklch, var(--warn) 68%, black); }
+.node .ntile .ic { width: 19px; height: 19px; }
+.node .chev { flex: none; color: var(--muted); }
+.node .chev .ic { width: 16px; height: 16px; transform: rotate(0deg); transition: transform .18s ease; }
+.node.open .chev .ic { transform: rotate(90deg); }
+
+/* ─────────────────────────── devices ─────────────────────────── */
+.dcard { display: flex; align-items: center; gap: 12px; padding: 14px; }
+.dcard .dav {
+  flex: none; width: 48px; height: 48px; border-radius: 15px;
+  display: grid; place-items: center;
+  background: var(--accent); color: #fff;
+}
+.dcard .dav .ic { width: 24px; height: 24px; }
+.dmain { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.dname { font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 620; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dip { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.drow { width: 100%; display: flex; align-items: center; gap: 12px; padding: 11px 12px; text-align: left; }
+.drow + .drow { border-top: 1px solid var(--border); }
+.drow:hover { background: var(--fg-soft); }
+.drow .dav2 {
+  flex: none; width: 42px; height: 42px; border-radius: 13px;
+  display: grid; place-items: center;
+  background: var(--fg-soft); color: var(--fg); font-family: var(--font-display); font-size: 16px; font-weight: 650;
+}
+.drow.connected .dav2 { background: var(--accent-soft); color: var(--accent-deep); }
+.state-chip { display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 8px; border-radius: 99px; background: var(--fg-soft); color: var(--muted); font-size: 10px; font-weight: 600; }
+.state-chip.connected { background: var(--ok-soft); color: color-mix(in oklch, var(--ok) 74%, black); }
+.state-chip.paired { background: var(--accent-soft); color: var(--accent-deep); }
+.state-chip.unbound { background: color-mix(in oklch, var(--warn) 15%, transparent); color: color-mix(in oklch, var(--warn) 68%, black); }
+.dacts { flex: none; display: flex; align-items: center; gap: 4px; }
+
+/* ─────────────────────────── settings ─────────────────────────── */
+.gcard { overflow: hidden; }
+.srow { display: grid; gap: 5px; padding: 13px 14px; }
+.srow + .srow { border-top: 1px solid var(--border); }
+.srow-top { display: flex; align-items: center; gap: 12px; }
+.slabel { flex: 1; min-width: 0; font-size: var(--fs-md); }
+.shelp { margin: 0; font-size: var(--fs-xs); color: var(--muted); line-height: 1.55; }
+.input {
+  width: 100%; height: 42px; padding: 0 12px;
+  border: 1px solid var(--border); border-radius: 11px;
+  background: var(--surface); color: var(--fg); font-size: var(--fs-md);
+}
+.input::placeholder { color: var(--muted); }
+.input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.input[readonly] { background: var(--surface-2); color: var(--muted); }
+.radio { display: flex; align-items: center; gap: 11px; padding: 11px 12px; border: 1px solid var(--border); border-radius: 12px; }
+.radio:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.radio input { flex: none; width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
+.radio .rmain { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.radio .rname { font-size: var(--fs-md); font-weight: 560; }
+.radio .rdesc { font-size: var(--fs-xs); color: var(--muted); }
+.switch { position: relative; flex: none; width: 46px; height: 28px; }
+.switch input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; }
+.switch .track { position: absolute; inset: 0; border-radius: 99px; background: color-mix(in oklch, var(--fg) 18%, transparent); transition: background .18s ease; pointer-events: none; }
+.switch .track::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.22); transition: transform .18s ease; }
+.switch input:checked + .track { background: var(--accent); }
+.switch input:checked + .track::after { transform: translateX(18px); }
+.switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+.about { display: grid; gap: 2px; padding: 14px; }
+.about .an { font-family: var(--font-display); font-size: var(--fs-md); font-weight: 620; }
+.about .av2 { font-size: var(--fs-xs); color: var(--muted); }
+/* ─────────────────────────── overlays ─────────────────────────── */
+.scrim {
+  position: absolute; inset: 0; z-index: 12;
+  background: color-mix(in oklch, var(--fg) 32%, transparent);
+  opacity: 0; pointer-events: none; transition: opacity .22s ease;
+}
+.scrim.open { opacity: 1; pointer-events: auto; }
+.sheet-layer {
+  position: absolute; inset: 0; z-index: 14;
+  display: flex; align-items: flex-end;
+  pointer-events: none;
+}
+.sheet-layer.open { pointer-events: auto; }
+.sheet {
+  width: 100%; max-height: 84%;
+  display: flex; flex-direction: column;
+  background: var(--surface);
+  border-radius: 22px 22px 0 0;
+  box-shadow: 0 -20px 54px -22px rgba(0,0,0,.4);
+  transform: translateY(100%);
+  transition: transform .3s cubic-bezier(.2,.8,.2,1);
+}
+.sheet-layer.open .sheet { transform: none; }
+.sheet-grip { flex: none; width: 38px; height: 4px; border-radius: 99px; background: color-mix(in oklch, var(--fg) 18%, transparent); margin: 10px auto 4px; }
+.sheet-head { flex: none; padding: 6px 20px 4px; display: flex; align-items: flex-start; gap: 12px; }
+.sheet-head .sht { flex: 1; min-width: 0; display: grid; gap: 3px; }
+.sheet-title { margin: 0; font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.015em; }
+.sheet-desc { margin: 0; font-size: var(--fs-xs); color: var(--muted); line-height: 1.55; }
+.sheet-body { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 20px 22px; display: grid; gap: 12px; align-content: start; scrollbar-width: none; }
+.sheet-body::-webkit-scrollbar { display: none; }
+.sheet-foot { display: flex; gap: 10px; }
+.sheet-foot .btn { flex: 1; }
+
+.opt { display: flex; gap: 11px; padding: 12px; border: 1px solid var(--border); border-radius: 13px; text-align: left; }
+.opt:hover { background: var(--fg-soft); }
+.opt .oi { flex: none; width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; }
+.opt .oi .ic { width: 19px; height: 19px; }
+.opt .om { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.opt .on { font-size: var(--fs-md); font-weight: 620; }
+.opt .od { font-size: var(--fs-xs); color: var(--muted); line-height: 1.5; }
+.opt.danger { border-color: color-mix(in oklch, var(--danger) 28%, var(--border)); }
+.opt.danger .oi { background: var(--danger-soft); color: var(--danger-deep); }
+.opt.danger .on { color: var(--danger-deep); }
+
+.mode { display: flex; gap: 11px; padding: 12px; border: 1px solid var(--border); border-radius: 13px; }
+.mode:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.mode[data-mode="broadcast"]:has(input:checked) { border-color: var(--bc); background: var(--bc-soft); }
+.mode input { flex: none; width: 18px; height: 18px; margin: 3px 0 0; accent-color: var(--accent); }
+.mode[data-mode="broadcast"] input { accent-color: var(--bc); }
+.mode .mi { flex: none; width: 32px; height: 32px; border-radius: 10px; display: grid; place-items: center; }
+.mode .mi .ic { width: 18px; height: 18px; }
+.mode[data-mode="broadcast"] .mi { background: var(--bc-soft); color: var(--bc-deep); }
+.mode[data-mode="group"] .mi { background: var(--accent-soft); color: var(--accent-deep); }
+.mode .mm { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.mode .mn { font-size: var(--fs-md); font-weight: 620; }
+.mode .md { font-size: var(--fs-xs); color: var(--muted); line-height: 1.5; }
+
+.pick { display: flex; align-items: center; gap: 11px; padding: 11px 12px; border: 1px solid var(--border); border-radius: 13px; }
+.pick:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.pick input { flex: none; width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
+.pick .pav { flex: none; width: 34px; height: 34px; border-radius: 11px; display: grid; place-items: center; background: var(--fg-soft); color: var(--fg); font-family: var(--font-display); font-size: 14px; font-weight: 650; }
+
+.field { display: grid; gap: 5px; }
+.field > label { font-size: var(--fs-xs); color: var(--muted); }
+.field-hint { margin: 0; font-size: var(--fs-xs); color: var(--muted); }
+.field-hint b { color: var(--fg); font-weight: 620; }
+
+.code-box { display: grid; gap: 8px; justify-items: center; padding: 16px; border-radius: 15px; background: var(--accent-soft); }
+.code { font-family: var(--font-mono); font-size: 40px; font-weight: 700; letter-spacing: .14em; color: var(--accent-deep); }
+.code-hint { font-size: var(--fs-xs); color: var(--accent-deep); opacity: .85; }
+
+.peek-thread { display: grid; gap: 8px; justify-items: start; padding: 14px; border-radius: 15px; background: var(--surface-2); }
+.peek-bubble {
+  max-width: 100%; padding: 9px 12px; border-radius: 16px; border-bottom-left-radius: 6px;
+  background: var(--surface); border: 1px solid var(--border);
+  font-size: var(--fs-md); line-height: 1.55; overflow-wrap: anywhere; user-select: text;
+}
+.peek-off { font-size: var(--fs-xs); font-weight: 560; color: color-mix(in oklch, var(--ok) 74%, black); }
+.peek-off.bad { color: var(--muted); }
+.peek-note { margin: 0; font-size: var(--fs-xs); color: var(--muted); line-height: 1.6; }
+
+/* ─────────────────────────── toasts ─────────────────────────── */
+.toasts { position: absolute; left: 0; right: 0; bottom: 92px; z-index: 30; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 0 24px; pointer-events: none; }
+.toast {
+  max-width: 100%; padding: 10px 16px; border-radius: 999px;
+  background: color-mix(in oklch, var(--fg) 93%, transparent); color: #fff;
+  font-size: var(--fs-sm); text-align: center;
+  box-shadow: 0 12px 30px -12px rgba(0,0,0,.45);
+  display: flex; align-items: center; gap: 8px;
+  animation: toast-in .22s cubic-bezier(.2,.8,.2,1);
+}
+.toast .ic { width: 14px; height: 14px; opacity: .82; }
+.toast.leaving { opacity: 0; transform: translateY(6px); transition: opacity .24s ease, transform .24s ease; }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
+
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; scroll-behavior: auto !important; }
+  .sub { transform: none; }
+  .sheet { transform: none; }
+}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" aria-hidden="true" style="position:absolute">
+  <symbol id="i-chat" viewBox="0 0 24 24"><rect x="3.75" y="5.25" width="16.5" height="13.5" rx="4.25"/><circle cx="8.6" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="15.4" cy="12" r="1.15" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-files" viewBox="0 0 24 24"><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/><path d="M12 4v10"/><path d="m8 10 4 4 4-4"/></symbol>
+  <symbol id="i-devices" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="12" rx="2.2"/><path d="M9 20h6M12 16.5V20"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h9M18 7h2M4 17h3M11 17h9"/><circle cx="15.5" cy="7" r="2.1"/><circle cx="8.5" cy="17" r="2.1"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="m15 5-7 7 7 7"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19V6"/><path d="m6 12 6-6 6 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2.2"/><path d="M5.5 15V6.5a2 2 0 0 1 2-2H15"/></symbol>
+  <symbol id="i-share" viewBox="0 0 24 24"><circle cx="6" cy="12" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="18" cy="18" r="2.4"/><path d="M8.2 10.9 15.8 7.1M8.2 13.1l7.6 3.8"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7.5A2 2 0 0 1 5 5.5h4l2 2.4h6a2 2 0 0 1 2 2v8.6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l5 5v13H6V3Z"/><path d="M14 3v5h5"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2.2"/><circle cx="9" cy="10" r="1.6"/><path d="m5 17 4.5-4.5L13 16l3-2.5L20.5 18"/></symbol>
+  <symbol id="i-zip" viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="6" rx="1.6"/><path d="M6.5 10v8a2 2 0 0 0 2 2h7a2 2 0 0 0 2-2v-8"/><path d="M12 3v7"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v10"/><path d="m8 10 4 4 4-4"/><path d="M5 19h14"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M9.5 14.5 14.5 9.5"/><path d="M8 11 5.5 13.5a3.5 3.5 0 0 0 5 5L13 16"/><path d="m16 13 2.5-2.5a3.5 3.5 0 0 0-5-5L11 8"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 13.7-5.7L20 8"/><path d="M20 4v4h-4"/><path d="M20 12a8 8 0 0 1-13.7 5.7L4 16"/><path d="M4 20v-4h4"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 15V10a6 6 0 1 0-12 0v5l-1.5 3h15z"/><path d="M10 21h4"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.6"/><path d="M11 18.5h2"/></symbol>
+  <symbol id="i-bc" viewBox="0 0 24 24"><path d="M18.5 5.5 6.5 9.5H5a1.5 1.5 0 0 0-1.5 1.5v2A1.5 1.5 0 0 0 5 14.5h1.5l12 4V5.5Z"/><path d="M8 14.8V18a1.6 1.6 0 0 0 1.6 1.6h1.2"/></symbol>
+  <symbol id="i-group" viewBox="0 0 24 24"><path d="M16 19v-1a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v1"/><circle cx="9" cy="7" r="3"/><path d="M22 19v-1a4 4 0 0 0-3-3.87"/><path d="M16 4.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M3 13h5l1.5 3h5L16 13h5"/><path d="M5.5 5h13l2.5 8v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2.2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></symbol>
+</svg>
+
+<div class="phone-frame" data-phone-shell data-platform="neutral">
+  <span class="hardware-button volume" aria-hidden="true"></span>
+  <span class="hardware-button power" aria-hidden="true"></span>
+
+  <section class="phone-screen" data-phone-screen>
+    <main class="phone-content" data-phone-content>
+      <!-- APP CONTENT START -->
+      <div class="app" id="app">
+        <header class="appbar" id="appbar"></header>
+        <div class="appmain" id="appmain"></div>
+        <nav class="tabbar" id="tabbar" role="tablist" aria-label="主导航"></nav>
+        <section class="sub" id="chatScreen" aria-label="会话详情" aria-hidden="true"></section>
+      </div>
+      <!-- APP CONTENT END -->
+    </main>
+
+    <div class="status-bar" aria-hidden="true">
+      <span class="status-time" id="statusTime">9:41</span>
+      <span class="status-cutout-zone"></span>
+      <span class="status-icons">
+        <svg class="connectivity" viewBox="0 0 15 12"><path d="M1.5 10.5v-2m4 2v-4.5m4 4.5v-7m4 7v-9"/></svg>
+        <svg class="wifi" viewBox="0 0 16 12"><path d="M1.5 4.7a9.2 9.2 0 0 1 13 0M4.2 7.3a5.4 5.4 0 0 1 7.6 0M6.9 10a1.55 1.55 0 0 1 2.2 0"/></svg>
+        <svg class="battery" viewBox="0 0 20 11"><rect x=".75" y="1.25" width="16.5" height="8.5" rx="2"/><path d="M18.5 4v3M3.2 3.4h10.4v4.2H3.2z" fill="currentColor" stroke="none"/></svg>
+      </span>
+    </div>
+    <div class="camera-dot" aria-hidden="true"></div>
+    <div class="gesture-indicator" aria-hidden="true"></div>
+
+    <div class="scrim" id="scrim"></div>
+    <div class="sheet-layer" id="sheetLayer"></div>
+    <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+  </section>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var appbar = document.getElementById('appbar');
+  var appmain = document.getElementById('appmain');
+  var tabbar = document.getElementById('tabbar');
+  var chatScreen = document.getElementById('chatScreen');
+  var scrim = document.getElementById('scrim');
+  var sheetLayer = document.getElementById('sheetLayer');
+  var toasts = document.getElementById('toasts');
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function ic(id, cls) {
+    return '<svg class="ic' + (cls ? ' ' + cls : '') + '" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-' + id + '"/></svg>';
+  }
+  function nowHM() {
+    var d = new Date();
+    return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  }
+  function kindOf(name) {
+    var e = String(name).split('.').pop().toLowerCase();
+    if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'heic'].indexOf(e) > -1) return 'image';
+    if (['zip', 'rar', '7z', 'tar', 'gz'].indexOf(e) > -1) return 'zip';
+    return 'doc';
+  }
+  function iconOf(name) {
+    var k = kindOf(name);
+    return k === 'image' ? 'image' : k === 'zip' ? 'zip' : 'file';
+  }
+
+  /* ── state ───────────────────────────────────────────────────── */
+  var state = {
+    tab: 'convos',
+    filesSeg: 'inbox',
+    openChat: null,
+    draft: {},
+    seq: 0,
+    devices: [
+      { id: 'd1', name: 'PC-B', ip: '192.168.1.6:3890', state: 'connected', av: 'B' },
+      { id: 'd2', name: 'PC-C', ip: '192.168.1.4:3891', state: 'paired', av: 'C' },
+      { id: 'd3', name: 'MacBook Pro', ip: '192.168.1.9:3890', state: 'unbound', av: 'M' }
+    ],
+    threads: {
+      g1: { id: 'g1', mode: 'group', name: '发布联调', participants: ['d1', 'd2', 'd3'] },
+      b1: { id: 'b1', mode: 'broadcast', name: '发布包 v0.5', participants: ['d1', 'd2', 'd3'] }
+    },
+    order: ['dev:d1', 'dev:d3', 'g1', 'b1'],
+    unread: { 'dev:d1': 2, 'dev:d3': 1 },
+    store: {
+      'dev:d1': [
+        { from: 'peer', kind: 'text', text: '设计稿收到了，先在 assets 里对一遍色板。', t: '10:18' },
+        { from: 'me', kind: 'text', text: '好，重点看主色和中性色的对比，不合适的直接标出来。', t: '10:20', status: '已读' },
+        { from: 'peer', kind: 'file', name: '色板-修订.png', size: '128 KB', t: '10:22' },
+        { from: 'peer', kind: 'text', text: '标了三处，最大的一处落在按钮悬停态上。', t: '10:22' }
+      ],
+      'dev:d3': [
+        { from: 'peer', kind: 'text', text: '在吗？帮我传一下「Q3 排期表」。', t: '10:11' },
+        { from: 'peer', kind: 'invite', name: '接口清单.xlsx', size: '1.1 MB', t: '10:12', inviteState: 'pending', fromName: 'MacBook Pro' }
+      ],
+      g1: [
+        { from: 'me', kind: 'text', text: '发布包我一起推给你们三台，先在群里同步一下。', t: '10:05', status: '已送达' },
+        { from: 'peer', fromName: 'MacBook Pro', kind: 'text', text: '收到，我先在素材仓库对一版。', t: '10:07' },
+        { from: 'peer', fromName: 'PC-B', kind: 'text', text: '好，文件到了我就跑冒烟。', t: '10:08' },
+        { from: 'peer', fromName: 'PC-C', kind: 'text', text: '我这边网络刚恢复，也一起看。', t: '10:09' }
+      ],
+      b1: [
+        { from: 'me', kind: 'text', text: 'v0.5 发布包已放到共享项「项目设计稿」，请各位各拉一份。', t: '09:30' },
+        { from: 'me', kind: 'file', name: '发布包-v0.5.zip', size: '86 MB', t: '09:31', transfer: { state: 'done', total: 2, offline: 1, pct: 100 } },
+        { from: 'me', kind: 'text', text: '验收请走「引用模式」直连比较，不用先下载到本地。', t: '09:33' }
+      ]
+    },
+    inbox: [
+      { id: 'f1', name: '色板-修订.png', size: '128 KB', from: 'PC-B', time: '今天 10:22', kind: 'image' },
+      { id: 'f2', name: '发布包-v0.5.zip', size: '86 MB', from: 'PC-B', time: '今天 09:31', kind: 'zip' },
+      { id: 'f3', name: '交付清单.md', size: '32 KB', from: 'PC-C', time: '昨天', kind: 'doc' },
+      { id: 'f4', name: 'home-v3.fig', size: '4.2 MB', from: 'PC-C', time: '昨天', kind: 'doc' }
+    ],
+    transfers: [
+      { id: 't1', name: '发布包-v0.5.zip', size: '86 MB', peer: 'PC-B', dir: 'out', pct: 62, state: 'active' },
+      { id: 't2', name: '接口清单.xlsx', size: '1.1 MB', peer: 'MacBook Pro', dir: 'in', pct: 100, state: 'done' }
+    ],
+    browseDev: 'd1',
+    browseOpen: {},
+    settings: {
+      name: '我的手机', ip: '192.168.1.10:3890', port: '3890',
+      inboxDir: '~/OrbDrop/收件', downloadDir: '~/Downloads/OrbDrop',
+      downloadMode: 'direct', keepAlive: true, autostart: false
+    }
+  };
+
+  var REMOTE = {
+    d1: [
+      { name: '素材仓库', folder: true, meta: '2.4 GB · 18 个文件', children: [
+        { name: '主视觉', folder: true, meta: '6 项', children: [
+          { name: 'home-v3.fig', folder: false, meta: '4.2 MB' },
+          { name: 'kv-og.png', folder: false, meta: '820 KB' }
+        ] },
+        { name: '交付清单.md', folder: false, meta: '32 KB' }
+      ] },
+      { name: '发布包-v0.5.zip', folder: false, meta: '86 MB' }
+    ],
+    d2: [
+      { name: 'Mac 设计稿', folder: true, meta: '1.2 GB · 9 个文件', children: [
+        { name: 'tokens.json', folder: false, meta: '12 KB' },
+        { name: 'home-v3.fig', folder: false, meta: '4.2 MB' }
+      ] }
+    ],
+    d3: []
+  };
+
+  /* ── helpers ─────────────────────────────────────────────────── */
+  function dev(id) { return state.devices.filter(function (d) { return d.id === id; })[0] || null; }
+  function devName(id) { var d = dev(id); return d ? d.name : id; }
+  function onlineDeviceList() { return state.devices.filter(function (d) { return d.state === 'connected'; }); }
+  function onlineCountAll() { return onlineDeviceList().length; }
+  function totalUnread() {
+    return convoKeys().reduce(function (n, k) { return n + (state.unread[k] || 0); }, 0);
+  }
+  function partOf(key) {
+    if (key.indexOf('dev:') === 0) return [key.slice(4)];
+    var t = state.threads[key];
+    return t ? t.participants.slice() : [];
+  }
+  function modeOf(key) {
+    if (key.indexOf('dev:') === 0) return 'direct';
+    var t = state.threads[key];
+    return t ? t.mode : 'direct';
+  }
+  function nameOfThread(key) { var t = state.threads[key]; return (t && t.name) || ''; }
+  function titleOf(key) {
+    var m = modeOf(key);
+    if (m === 'broadcast') return '群发 · ' + (nameOfThread(key) || '未命名群发');
+    if (m === 'group' && nameOfThread(key)) return '群聊 · ' + nameOfThread(key);
+    return partOf(key).map(devName).join('、');
+  }
+  function validConvo(key) {
+    if (!key) return false;
+    if (key.indexOf('dev:') === 0) return !!dev(key.slice(4));
+    var t = state.threads[key];
+    return !!t && t.participants.length >= 2;
+  }
+  function msgs(key) { if (!state.store[key]) state.store[key] = []; return state.store[key]; }
+  function lastVisible(key) {
+    var a = msgs(key);
+    if (modeOf(key) === 'broadcast') {
+      for (var i = a.length - 1; i >= 0; i--) if (a[i].from === 'me') return a[i];
+      return null;
+    }
+    return a.length ? a[a.length - 1] : null;
+  }
+  function onlineCount(key) {
+    return partOf(key).filter(function (id) { var d = dev(id); return d && d.state === 'connected'; }).length;
+  }
+  function dotState(key) {
+    if (onlineCount(key) > 0) return 'ok';
+    var f = dev(partOf(key)[0]);
+    return f && f.state === 'unbound' ? 'warn' : 'off';
+  }
+  function receiptOf(key) {
+    var ids = partOf(key), states = {}, delivered = 0;
+    ids.forEach(function (id) {
+      var d = dev(id), ok = !!(d && d.state === 'connected');
+      states[id] = ok ? 'ok' : 'off';
+      if (ok) delivered++;
+    });
+    return { total: ids.length, delivered: delivered, offline: ids.length - delivered, states: states };
+  }
+  function convoKeys() {
+    var keys = state.order.filter(validConvo);
+    state.devices.forEach(function (d) { var k = 'dev:' + d.id; if (validConvo(k) && keys.indexOf(k) < 0) keys.push(k); });
+    Object.keys(state.threads).forEach(function (t) { if (validConvo(t) && keys.indexOf(t) < 0) keys.push(t); });
+    return keys;
+  }
+  function convoLastTime(key) { var m = lastVisible(key); return m ? m.t : ''; }
+  function summary(key) {
+    var m = lastVisible(key);
+    if (!m) return '还没有消息';
+    if (modeOf(key) === 'broadcast') {
+      var r = receiptOf(key);
+      return '已送达 ' + r.delivered + '/' + r.total + ' 台 · ' + (m.kind === 'file' ? '[文件] ' + m.name : m.text);
+    }
+    var lead = m.from === 'me' ? '你：' : (m.fromName ? m.fromName + '：' : '');
+    return lead + (m.kind === 'file' || m.invite ? '[文件] ' + m.name : m.text);
+  }
+  function pendingInvites() {
+    var out = [];
+    Object.keys(state.store).forEach(function (key) {
+      msgs(key).forEach(function (m, i) {
+        if (m.invite && m.inviteState === 'pending') out.push({ key: key, idx: i, m: m });
+      });
+    });
+    return out;
+  }
+  function activeTransfers() { return state.transfers.filter(function (t) { return t.state === 'active'; }); }
+  function speakerIdx(name) {
+    var h = 0, s = String(name || '?');
+    for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 997;
+    return (h % 3) + 1;
+  }
+  function speakerInitial(name) { return String(name || '?').trim().charAt(0); }
+
+  /* ── conversation item ───────────────────────────────────────── */
+  function convoItemHTML(key) {
+    var mode = modeOf(key), parts = partOf(key);
+    var av = mode === 'broadcast' ? '<span class="av bc">' + ic('bc') + '</span>'
+      : mode === 'group' ? '<span class="av grp">' + ic('group') + '</span>'
+      : '<span class="av dir">' + esc(dev(parts[0]) ? dev(parts[0]).av : '?') + '</span>';
+    var chip = mode === 'broadcast' ? '<span class="cv-mode bc">' + ic('bc') + '群发</span>'
+      : mode === 'group' ? '<span class="cv-mode grp">' + ic('group') + '群聊</span>' : '';
+    var unread = state.unread[key] || 0;
+    return '<button class="convo' + (mode === 'broadcast' ? ' bc' : '') + '" type="button" data-act="open" data-key="' + esc(key) + '">' +
+      av +
+      '<span class="cv-main"><span class="cv-top"><span class="cv-name">' + esc(titleOf(key)) + '</span>' + chip +
+      '<span class="cv-dot ' + dotState(key) + '"></span><span class="cv-time num">' + esc(convoLastTime(key)) + '</span></span>' +
+      '<span class="cv-prev">' + esc(summary(key)) + '</span></span>' +
+      (unread ? '<span class="cv-unread num">' + unread + '</span>' : '') +
+      '</button>';
+  }
+
+  /* ── appbar / tabbar ─────────────────────────────────────────── */
+  function renderAppbar() {
+    var cfg = {
+      convos: { title: '会话', sub: onlineCountAll() + ' 台在线 · ' + state.devices.length + ' 台设备', acts: [['newConvo', 'plus', '新建会话']] },
+      files: { title: '文件', sub: pendingInvites().length + ' 个待接收 · ' + state.inbox.length + ' 个已接收', acts: [['refresh', 'refresh', '刷新']] },
+      devices: { title: '设备', sub: '本机 · ' + state.settings.ip, acts: [['addDevice', 'plus', '手动添加设备']] },
+      settings: { title: '设置', sub: 'OrbDrop 移动端 · 需求 v0.5', acts: [] }
+    }[state.tab];
+    appbar.innerHTML =
+      '<div class="ab-main"><h1 class="ab-title">' + cfg.title + '</h1><p class="ab-sub">' + esc(cfg.sub) + '</p></div>' +
+      (cfg.acts.length ? '<div class="ab-acts">' + cfg.acts.map(function (a) {
+        return '<button class="icon-btn" type="button" data-act="' + a[0] + '" aria-label="' + a[2] + '">' + ic(a[1]) + '</button>';
+      }).join('') + '</div>' : '');
+  }
+  function renderTabbar() {
+    var tabs = [
+      { id: 'convos', label: '会话', icon: 'chat', badge: totalUnread() },
+      { id: 'files', label: '文件', icon: 'files', badge: pendingInvites().length, hot: true },
+      { id: 'devices', label: '设备', icon: 'devices' },
+      { id: 'settings', label: '设置', icon: 'settings' }
+    ];
+    tabbar.innerHTML = tabs.map(function (t) {
+      var on = state.tab === t.id;
+      return '<button class="tab-item' + (on ? ' active' : '') + '" type="button" role="tab" aria-selected="' + on + '" data-act="tab" data-tab="' + t.id + '">' +
+        '<span class="ti-ic">' + ic(t.icon) + (t.badge ? '<span class="ti-badge' + (t.hot ? ' hot' : '') + '">' + t.badge + '</span>' : '') + '</span>' +
+        '<span class="ti-lb">' + t.label + '</span>' +
+        '</button>';
+    }).join('');
+  }
+
+  /* ── views ───────────────────────────────────────────────────── */
+  function renderConvos() {
+    var keys = convoKeys();
+    if (!keys.length) {
+      return '<div class="body"><div class="empty">' + ic('chat') + '<p>还没有会话</p><p class="es">先在设备页配对或连接一台设备，再发起会话。</p></div></div>';
+    }
+    return '<div class="body"><div class="stack">' + keys.map(convoItemHTML).join('') + '</div></div>';
+  }
+  function segBtn(id, label, n) {
+    var on = state.filesSeg === id;
+    return '<button class="seg-item' + (on ? ' active' : '') + '" type="button" role="tab" aria-selected="' + on + '" data-act="seg" data-seg="' + id + '">' +
+      label + (n ? '<span class="segn num">' + n + '</span>' : '') + '</button>';
+  }
+  function renderFiles() {
+    var seg = '<div class="seg" role="tablist" aria-label="文件视图">' +
+      segBtn('inbox', '收件', state.inbox.length + pendingInvites().length) +
+      segBtn('transfer', '传输', activeTransfers().length) +
+      segBtn('browse', '浏览', 0) +
+      '</div>';
+    var body = state.filesSeg === 'inbox' ? filesInboxHTML() : (state.filesSeg === 'transfer' ? filesTransferHTML() : filesBrowseHTML());
+    return seg + body;
+  }
+  function pendingCardHTML(p) {
+    var m = p.m;
+    var from = m.fromName || devName(partOf(p.key)[0]);
+    return '<div class="pend">' +
+      '<div class="pend-top"><span class="pend-chip">' + ic('download') + '待接收</span><span class="pend-who">来自 ' + esc(from) + '</span></div>' +
+      '<div class="pend-body"><span class="ftile ' + kindOf(m.name) + '">' + ic(iconOf(m.name)) + '</span>' +
+      '<span class="fmain"><span class="fname2">' + esc(m.name) + '</span><span class="fmeta">' + esc(m.size || '文件') + ' · 保存到收件目录</span></span></div>' +
+      '<div class="pend-acts"><button class="btn btn-secondary" type="button" data-act="invite" data-key="' + esc(p.key) + '" data-i="' + p.idx + '" data-yes="0">拒绝</button>' +
+      '<button class="btn btn-primary" type="button" data-act="invite" data-key="' + esc(p.key) + '" data-i="' + p.idx + '" data-yes="1">接收</button></div>' +
+      '</div>';
+  }
+  function inboxRowHTML(f) {
+    return '<button class="frow" type="button" data-act="fileMore" data-id="' + f.id + '">' +
+      '<span class="ftile ' + kindOf(f.name) + '">' + ic(iconOf(f.name)) + '</span>' +
+      '<span class="fmain"><span class="fname2">' + esc(f.name) + '</span><span class="fmeta">' + esc(f.from) + ' · ' + esc(f.size) + ' · ' + esc(f.time) + '</span></span>' +
+      '<span class="fgo" aria-hidden="true">' + ic('more', 'ic-fill') + '</span>' +
+      '</button>';
+  }
+  function filesInboxHTML() {
+    var pend = pendingInvites(), h = '<div class="body">';
+    if (pend.length) {
+      h += '<div class="sec"><div class="sec-label"><span>待接收</span><span class="num">' + pend.length + ' 个</span></div>' +
+        '<div class="stack">' + pend.map(pendingCardHTML).join('') + '</div></div>';
+    }
+    h += '<div class="sec"><div class="sec-label"><span>已接收文件</span><span class="num">' + state.inbox.length + ' 个</span></div>';
+    h += state.inbox.length
+      ? '<div class="card list">' + state.inbox.map(inboxRowHTML).join('') + '</div>'
+      : '<div class="card list"><div class="empty">' + ic('inbox') + '<p>还没有收到的文件</p><p class="es">收到推送并同意后，文件会落到收件目录并出现在这里。</p></div></div>';
+    h += '</div></div>';
+    return h;
+  }
+  function transferRowHTML(t) {
+    var pct = Math.round(t.pct || 0);
+    var barCls = t.state === 'done' ? ' done' : (t.state === 'canceled' ? ' fail' : '');
+    return '<div class="trow" data-tid="' + t.id + '">' +
+      '<div class="t-top"><span class="ftile ' + kindOf(t.name) + '">' + ic(iconOf(t.name)) + '</span>' +
+      '<span class="t-name">' + esc(t.name) + '</span>' +
+      (t.state === 'active' ? '<span class="t-pct num">' + pct + '%</span>' : '<span class="t-pct num">' + esc(t.size) + '</span>') + '</div>' +
+      '<div class="t-bar' + barCls + '"><i style="width:' + pct + '%"></i></div>' +
+      '<div class="t-meta"><span>' + (t.dir === 'in' ? '接收自 ' : '发送至 ') + esc(t.peer) + '</span>' +
+      (t.state === 'active'
+        ? '<button class="t-cancel" type="button" data-act="cancelTransfer" data-id="' + t.id + '">取消</button>'
+        : '<span class="num">' + (t.state === 'done' ? '已完成' : '已取消') + '</span>') + '</div>' +
+      '</div>';
+  }
+  function filesTransferHTML() {
+    var act = state.transfers.filter(function (t) { return t.state === 'active'; });
+    var rest = state.transfers.filter(function (t) { return t.state !== 'active'; });
+    var h = '<div class="body">';
+    h += '<div class="sec"><div class="sec-label"><span>进行中</span><span class="num">' + act.length + ' 个</span></div>';
+    h += act.length
+      ? '<div class="card list">' + act.map(transferRowHTML).join('') + '</div>'
+      : '<div class="card list"><div class="empty">' + ic('files') + '<p>当前没有进行中的传输</p><p class="es">推送或下载文件时会在这里显示进度。</p></div></div>';
+    h += '</div>';
+    if (rest.length) {
+      h += '<div class="sec"><div class="sec-label"><span>最近完成</span><span class="num">' + rest.length + ' 个</span></div>' +
+        '<div class="card list">' + rest.map(transferRowHTML).join('') + '</div></div>';
+    }
+    h += '</div>';
+    return h;
+  }
+  function flattenNodes(nodes, depth, devId) {
+    var out = '';
+    nodes.forEach(function (n, i) {
+      var path = devId + '/' + depth + '/' + i;
+      var kids = n.folder && (n.children || []).length;
+      var open = !!state.browseOpen[path];
+      var act = kids ? 'browseToggle' : (n.folder ? 'browseNoop' : 'downloadNode');
+      out += '<div class="node' + (open ? ' open' : '') + '" role="button" tabindex="0" data-act="' + act + '" data-path="' + path + '" data-name="' + esc(n.name) + '"' +
+        (kids ? ' aria-expanded="' + open + '"' : '') + ' style="padding-left:' + (12 + depth * 20) + 'px">' +
+        '<span class="ntile' + (n.folder ? ' folder' : '') + '">' + ic(n.folder ? 'folder' : iconOf(n.name)) + '</span>' +
+        '<span class="fmain"><span class="fname2">' + esc(n.name) + '</span><span class="fmeta">' + esc(n.meta || '') + '</span></span>' +
+        (n.folder ? '<span class="chev" aria-hidden="true">' + ic('chev') + '</span>' : '<span class="fgo" aria-hidden="true">' + ic('download') + '</span>') +
+        '</div>';
+      if (open && kids) out += flattenNodes(n.children, depth + 1, devId);
+    });
+    return out;
+  }
+  function filesBrowseHTML() {
+    var devs = state.devices.filter(function (d) { return d.state !== 'unbound'; });
+    if (!devs.length) {
+      return '<div class="body"><div class="empty">' + ic('devices') + '<p>没有可浏览的设备</p><p class="es">先配对一台 PC，就能浏览对方共享的目录。</p></div></div>';
+    }
+    var h = '<div class="body"><div class="chips">' + devs.map(function (d) {
+      return '<button class="chip' + (state.browseDev === d.id ? ' active' : '') + '" type="button" data-act="browseDev" data-id="' + d.id + '">' + ic('devices') + esc(d.name) + '</button>';
+    }).join('') + '</div>';
+    var list = REMOTE[state.browseDev] || [];
+    if (!list.length) {
+      h += '<div class="card list" style="margin-top:8px"><div class="empty">' + ic('folder') + '<p>对方还没有共享项</p><p class="es">对方把目录拖入 OrbDrop 并开启广播后，就会出现在这里。</p></div></div>';
+    } else {
+      h += '<div class="card list" style="margin-top:8px">' + flattenNodes(list, 0, state.browseDev) + '</div>';
+    }
+    h += '</div>';
+    return h;
+  }
+
+  /* ── devices ─────────────────────────────────────────────────── */
+  function deviceRowHTML(d) {
+    var chip = d.state === 'connected' ? '<span class="state-chip connected"><i class="dot ok"></i>长连接</span>'
+      : d.state === 'unbound' ? '<span class="state-chip unbound"><i class="dot warn"></i>未配对</span>'
+      : '<span class="state-chip paired"><i class="dot"></i>已配对</span>';
+    var action = d.state === 'connected' ? 'disconnect' : 'connect';
+    var label = d.state === 'connected' ? '断开' : (d.state === 'unbound' ? '配对' : '连接');
+    return '<div class="drow' + (d.state === 'connected' ? ' connected' : '') + '" data-id="' + d.id + '">' +
+      '<span class="dav2">' + esc(d.av || d.name.charAt(0)) + '</span>' +
+      '<span class="dmain"><span class="dname">' + esc(d.name) + '</span><span class="dip num">' + esc(d.ip) + '</span>' + chip + '</span>' +
+      '<span class="dacts">' +
+      '<button class="btn ' + (d.state === 'connected' ? 'btn-secondary' : 'btn-primary') + ' btn-sm" type="button" data-act="' + action + '" data-id="' + d.id + '">' + label + '</button>' +
+      '<button class="icon-btn" type="button" data-act="deviceMore" data-id="' + d.id + '" aria-label="设备操作">' + ic('more', 'ic-fill') + '</button>' +
+      '</span></div>';
+  }
+  function renderDevices() {
+    var h = '<div class="body">';
+    h += '<div class="sec"><div class="card list"><div class="dcard">' +
+      '<span class="dav">' + ic('phone') + '</span>' +
+      '<span class="dmain"><span class="dname">' + esc(state.settings.name) + '</span><span class="dip num">' + esc(state.settings.ip) + '</span></span>' +
+      '<span class="state-chip connected"><i class="dot ok"></i>本机</span>' +
+      '</div></div></div>';
+    h += '<div class="sec"><button class="btn btn-primary btn-block" type="button" data-act="pairOpen">' + ic('link') + '配对设备</button></div>';
+    h += '<div class="sec"><div class="sec-label"><span>已发现设备</span><span class="num">' + state.devices.length + ' 台</span></div>';
+    h += state.devices.length
+      ? '<div class="card list">' + state.devices.map(deviceRowHTML).join('') + '</div>'
+      : '<div class="card list"><div class="empty">' + ic('devices') + '<p>还没有发现设备</p><p class="es">确保两台设备在同一局域网，或手动添加 IP:端口。</p></div></div>';
+    h += '</div>';
+    h += '<div class="sec"><button class="btn btn-secondary btn-block" type="button" data-act="addDevice">' + ic('plus') + '手动添加设备</button></div>';
+    h += '</div>';
+    return h;
+  }
+
+  /* ── settings ────────────────────────────────────────────────── */
+  function radioHTML(v, n, d) {
+    return '<label class="radio"><input type="radio" name="dlMode" value="' + v + '"' + (state.settings.downloadMode === v ? ' checked' : '') + ' />' +
+      '<span class="rmain"><span class="rname">' + n + '</span><span class="rdesc">' + d + '</span></span></label>';
+  }
+  function switchRow(key, label, help) {
+    return '<div class="srow"><div class="srow-top"><span class="slabel">' + label + '</span>' +
+      '<label class="switch"><input type="checkbox" data-switch="' + key + '"' + (state.settings[key] ? ' checked' : '') + ' aria-label="' + label + '" /><span class="track"></span></label>' +
+      '</div><p class="shelp">' + help + '</p></div>';
+  }
+  function renderSettings() {
+    var s = state.settings;
+    var h = '<div class="body">';
+    h += '<div class="sec"><div class="sec-label"><span>本机</span></div><div class="card gcard">' +
+      '<div class="srow"><span class="slabel">本机名称</span><input class="input" id="setName" value="' + esc(s.name) + '" maxlength="20" aria-label="本机名称" /></div>' +
+      '<div class="srow"><span class="slabel">监听端口</span><input class="input num" id="setPort" value="' + esc(s.port) + '" inputmode="numeric" aria-label="监听端口" /><p class="shelp">默认 3890；被占用时自动探测 3891–3899。</p></div>' +
+      '</div></div>';
+    h += '<div class="sec"><div class="sec-label"><span>文件</span></div><div class="card gcard">' +
+      '<div class="srow"><span class="slabel">收件目录</span><input class="input" value="' + esc(s.inboxDir) + '" readonly aria-label="收件目录" /></div>' +
+      '<div class="srow"><span class="slabel">下载目录</span><input class="input" value="' + esc(s.downloadDir) + '" readonly aria-label="下载目录" /></div>' +
+      '<div class="srow"><span class="slabel">下载模式</span>' +
+      radioHTML('direct', '直接存下载目录', '引用下载时不再询问位置。') +
+      radioHTML('ask', '每次弹窗选位置', '每次下载前选择保存位置。') +
+      '</div></div></div>';
+    h += '<div class="sec"><div class="sec-label"><span>运行</span></div><div class="card gcard">' +
+      switchRow('keepAlive', '后台保活', '保持长连接，后台也能收到推送。') +
+      switchRow('autostart', '开机自启', '开机后自动启动 OrbDrop。') +
+      '</div></div>';
+    h += '<div class="sec"><div class="card gcard"><div class="about"><span class="an">OrbDrop 移动端</span><span class="av2">需求 v0.5 · 局域网文件中转工具 · 仅局域网内使用</span></div></div></div>';
+    h += '<div class="sec"><button class="btn btn-primary btn-block" type="button" data-act="saveSettings">保存设置</button></div>';
+    h += '</div>';
+    return h;
+  }
+/* ── view dispatch ───────────────────────────────────────────── */
+  function renderView(preserve) {
+    var st = appmain.scrollTop;
+    if (state.tab === 'convos') appmain.innerHTML = renderConvos();
+    else if (state.tab === 'files') appmain.innerHTML = renderFiles();
+    else if (state.tab === 'devices') appmain.innerHTML = renderDevices();
+    else appmain.innerHTML = renderSettings();
+    appmain.scrollTop = preserve ? st : 0;
+  }
+  function renderApp() { renderAppbar(); renderView(); renderTabbar(); }
+
+  /* ── chat ────────────────────────────────────────────────────── */
+  function visibleMsgs(key) {
+    var all = msgs(key);
+    return modeOf(key) === 'broadcast' ? all.filter(function (m) { return m.from === 'me'; }) : all;
+  }
+  function fileStatus(m) {
+    if (m.transfer) {
+      if (m.transfer.state === 'sending') return '传输中 ' + Math.round(m.transfer.pct || 0) + '%';
+      if (m.transfer.state === 'failed') return '对方离线 · 未送达';
+      if (m.transfer.state === 'done') return '已发送至 ' + m.transfer.total + ' 台' + (m.transfer.offline ? ' · ' + m.transfer.offline + ' 台离线' : '');
+    }
+    if (m.inviteState === 'received') return '已接收 · 已保存到收件目录';
+    if (m.inviteState === 'rejected') return '已拒绝接收';
+    return '';
+  }
+  function subText(key) {
+    if (modeOf(key) === 'direct') return onlineCount(key) > 0 ? '长连接 · 在线' : '离线 · 消息不会送达';
+    return onlineCount(key) + '/' + partOf(key).length + ' 台在线';
+  }
+  function chatEmptyHTML() {
+    return '<div class="empty">' + ic('chat') + '<p>还没有消息</p><p class="es">发一条消息或传一个文件，开始和设备对话。</p></div>';
+  }
+  function receiptHTML(key) {
+    var r = receiptOf(key);
+    var chips = partOf(key).map(function (id) {
+      var d = dev(id), st = r.states[id] || 'off';
+      return '<span class="rc-dev ' + st + '"><span class="rc-av">' + esc(d ? d.av : '?') + '</span>' +
+        '<span class="rc-nm">' + esc(devName(id)) + '</span>' +
+        '<span class="rc-ic">' + ic(st === 'ok' ? 'check' : 'x') + '</span></span>';
+    }).join('');
+    return '<div class="receipt"><span class="rc-head">已送达 ' + r.delivered + '/' + r.total + ' 台' + (r.offline ? ' · ' + r.offline + ' 台离线' : '') + '</span>' +
+      '<span class="rc-list">' + chips + '</span>' +
+      '<button class="rc-peek" type="button" data-act="peek" data-key="' + esc(key) + '">查看收件效果</button></div>';
+  }
+  function msgHTML(m, key) {
+    var mode = modeOf(key);
+    if (m.invite && m.inviteState === 'pending') {
+      var idx = msgs(key).indexOf(m);
+      return '<div class="invite">' +
+        '<div class="inv-head">' + ic('file') +
+        '<span class="cv-main"><span class="fname">' + esc(m.name) + '</span><span class="fmeta">' + esc(m.size || '文件') + '</span></span></div>' +
+        '<div class="inv-sub">来自 ' + esc(m.fromName || '设备') + ' · 接收后保存到收件目录</div>' +
+        '<div class="inv-acts"><button class="btn btn-secondary" type="button" data-act="invite" data-key="' + esc(key) + '" data-i="' + idx + '" data-yes="0">拒绝</button>' +
+        '<button class="btn btn-primary" type="button" data-act="invite" data-key="' + esc(key) + '" data-i="' + idx + '" data-yes="1">接收</button></div>' +
+        '</div>';
+    }
+    var isBc = mode === 'broadcast';
+    var who = '';
+    if (mode === 'group' && m.from === 'peer') {
+      who = '<div class="who sp-' + speakerIdx(m.fromName) + '"><span class="who-av">' + esc(speakerInitial(m.fromName)) + '</span>' +
+        '<span class="who-nm">' + esc(m.fromName || '设备') + '</span></div>';
+    }
+    var mid = ' data-mid="' + esc(m.mid || '') + '"';
+    var bubble;
+    if (m.kind === 'file') {
+      var status = m.transfer && m.transfer.state === 'sending'
+        ? '<span class="fstat">传输中 ' + Math.round(m.transfer.pct || 0) + '%</span><span class="fbar"><i style="width:' + Math.round(m.transfer.pct || 0) + '%"></i></span>'
+        : (fileStatus(m) ? '<span class="fstat">' + esc(fileStatus(m)) + '</span>' : '');
+      bubble = '<div class="bubble"' + mid + '><span class="fbub"><span class="fio">' + ic('file') + '</span>' +
+        '<span class="fmain"><span class="fname">' + esc(m.name) + '</span><span class="fsize num">' + esc(m.size || '文件') + '</span>' + status + '</span></span></div>';
+    } else {
+      bubble = '<div class="bubble"' + mid + '><span class="ctext">' + esc(m.text) + '</span></div>';
+    }
+    var meta = m.from === 'me'
+      ? (m.t + (isBc ? '' : ' · ' + (m.status || '已送达')))
+      : ((mode !== 'group' && m.fromName ? m.fromName + ' · ' : '') + m.t);
+    var out = '<div class="msg ' + (m.from === 'me' ? 'me' : 'peer') + (isBc ? ' bc' : '') + '">' + who + bubble +
+      '<span class="meta num">' + esc(meta) + '</span></div>';
+    if (isBc && m.from === 'me') out += receiptHTML(key);
+    return out;
+  }
+  function renderChat() {
+    var key = state.openChat;
+    if (!key) return;
+    var mode = modeOf(key), parts = partOf(key);
+    var banner = mode === 'broadcast'
+      ? '<div class="chat-banner bc">' + ic('bc') + '<span>群发（单向）：每条内容都会作为一条独立的一对一消息分别发给 ' + parts.length + ' 台设备，这里只显示你发出的部分。</span></div>'
+      : mode === 'group' ? '<div class="chat-banner grp">' + ic('group') + '<span>群聊：' + parts.length + ' 台设备共享此会话，任何设备发送的消息所有人都能看到。</span></div>'
+      : '';
+    var vis = visibleMsgs(key);
+    var log = vis.length ? vis.map(function (m) { return msgHTML(m, key); }).join('') : chatEmptyHTML();
+    chatScreen.innerHTML =
+      '<header class="chatbar">' +
+        '<button class="icon-btn" type="button" data-act="chatBack" aria-label="返回会话列表">' + ic('back') + '</button>' +
+        '<div class="cb-main"><span class="cb-title">' + esc(titleOf(key)) + '</span>' +
+        '<span class="cb-sub"><i class="cv-dot ' + dotState(key) + '"></i>' + esc(subText(key)) + '</span></div>' +
+        '<button class="icon-btn" type="button" data-act="chatMore" data-key="' + esc(key) + '" aria-label="会话操作">' + ic('more', 'ic-fill') + '</button>' +
+      '</header>' + banner +
+      '<div class="chatlog" id="chatlog" role="log" aria-label="会话记录">' + log + '</div>' +
+      '<form class="compose" id="compose">' +
+        '<button class="cbtn cplus" type="button" data-act="sendFile" aria-label="发送文件">' + ic('plus') + '</button>' +
+        '<input class="cinput" id="chatInput" type="text" placeholder="发送消息…" autocomplete="off" aria-label="消息内容" />' +
+        '<button class="cbtn csend" type="submit" id="chatSend" aria-label="发送消息" disabled>' + ic('send') + '</button>' +
+      '</form>';
+    var inp = document.getElementById('chatInput');
+    inp.value = state.draft[key] || '';
+    inp.addEventListener('input', function () { state.draft[key] = inp.value; syncSend(); });
+    inp.addEventListener('keydown', function (e) { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); sendChatText(); } });
+    document.getElementById('compose').addEventListener('submit', function (e) { e.preventDefault(); sendChatText(); });
+    syncSend();
+  }
+  function inputVal() { var i = document.getElementById('chatInput'); return i ? i.value : ''; }
+  function syncSend() {
+    var b = document.getElementById('chatSend'), i = document.getElementById('chatInput');
+    if (b && i) b.disabled = i.value.trim() === '';
+  }
+  function touchOrder(key) {
+    var i = state.order.indexOf(key);
+    if (i > -1) state.order.splice(i, 1);
+    state.order.unshift(key);
+  }
+  function openSub(key) {
+    if (state.openChat && state.openChat !== key) state.draft[state.openChat] = inputVal();
+    state.openChat = key;
+    state.unread[key] = 0;
+    renderApp();
+    renderChat();
+    chatScreen.classList.add('open');
+    chatScreen.setAttribute('aria-hidden', 'false');
+    setTimeout(function () { var cl = document.getElementById('chatlog'); if (cl) cl.scrollTop = cl.scrollHeight; }, 0);
+  }
+  function closeSub() {
+    if (state.openChat) state.draft[state.openChat] = inputVal();
+    state.openChat = null;
+    chatScreen.classList.remove('open');
+    chatScreen.setAttribute('aria-hidden', 'true');
+  }
+  function openConversation(key) {
+    var h = '#/chat/' + encodeURIComponent(key);
+    if (location.hash === h) route(); else location.hash = h;
+  }
+  function closeConversation() {
+    var h = '#/' + state.tab;
+    if (location.hash === h) route(); else location.hash = h;
+  }
+  function setTab(tab) {
+    var h = '#/' + tab;
+    if (location.hash === h) route(); else location.hash = h;
+  }
+  function updateBubble(m) {
+    var el = chatScreen.querySelector('[data-mid="' + m.mid + '"]');
+    if (!el) return;
+    var bar = el.querySelector('.fbar i');
+    if (bar) bar.style.width = Math.round(m.transfer.pct) + '%';
+    var st = el.querySelector('.fstat');
+    if (st) st.textContent = fileStatus(m);
+    if (m.transfer.state === 'done') { var w = el.querySelector('.fbar'); if (w) w.remove(); }
+  }
+  function simulateOutgoing(m) {
+    var timer = setInterval(function () {
+      m.transfer.pct = Math.min(100, (m.transfer.pct || 0) + 7 + Math.random() * 10);
+      if (m.transfer.pct >= 100) {
+        m.transfer.pct = 100;
+        m.transfer.state = 'done';
+        m.transfer.done = m.transfer.total;
+        clearInterval(timer);
+      }
+      updateBubble(m);
+    }, 430);
+  }
+  function sendChatText() {
+    var key = state.openChat;
+    if (!key) return;
+    var inp = document.getElementById('chatInput');
+    if (!inp) return;
+    var text = inp.value.trim();
+    if (!text) return;
+    var m = { from: 'me', kind: 'text', text: text, t: nowHM(), status: '已送达', mid: 'm' + (++state.seq) };
+    msgs(key).push(m);
+    inp.value = '';
+    state.draft[key] = '';
+    touchOrder(key);
+    renderChat();
+    renderAppbar();
+    renderTabbar();
+    var inp2 = document.getElementById('chatInput');
+    if (inp2) inp2.focus();
+    var cl = document.getElementById('chatlog');
+    if (cl) cl.scrollTop = cl.scrollHeight;
+    if (modeOf(key) !== 'broadcast') {
+      setTimeout(function () {
+        m.status = '已读';
+        var el = chatScreen.querySelector('[data-mid="' + m.mid + '"]');
+        var meta = el && el.parentNode ? el.parentNode.querySelector('.meta') : null;
+        if (meta) meta.textContent = m.t + ' · 已读';
+      }, 1400);
+    }
+  }
+  function sendChatFiles(key, items) {
+    var parts = partOf(key);
+    var connected = parts.map(dev).filter(function (d) { return d && d.state === 'connected'; });
+    touchOrder(key);
+    items.forEach(function (it) {
+      var m = {
+        from: 'me', kind: 'file', name: it.name,
+        size: it.size === '文件夹' ? '文件夹' : it.size,
+        t: nowHM(), status: '已送达', mid: 'm' + (++state.seq),
+        transfer: { total: connected.length, offline: parts.length - connected.length, done: 0, pct: 0, state: connected.length ? 'sending' : 'failed' }
+      };
+      msgs(key).push(m);
+      if (connected.length) simulateOutgoing(m);
+    });
+    if (modeOf(key) === 'broadcast') toast('已群发至 ' + parts.length + ' 台设备');
+    renderChat();
+    renderAppbar();
+    setTimeout(function () { var cl = document.getElementById('chatlog'); if (cl) cl.scrollTop = cl.scrollHeight; }, 0);
+  }
+  function resolveInvite(key, idx, accepted) {
+    var m = msgs(key)[idx];
+    if (!m) return;
+    m.inviteState = accepted ? 'received' : 'rejected';
+    if (accepted) {
+      if (!state.inbox.some(function (f) { return f.name === m.name; })) {
+        state.inbox.unshift({ id: 'f' + (++state.seq), name: m.name, size: m.size || '文件', from: m.fromName || devName(partOf(key)[0]), time: '刚刚', kind: kindOf(m.name) });
+      }
+      toast('已接收「' + m.name + '」，保存到收件目录');
+    } else {
+      toast('已拒绝接收「' + m.name + '」');
+    }
+    touchOrder(key);
+    renderApp();
+    if (state.openChat === key) renderChat();
+  }
+
+  /* ── sheets ──────────────────────────────────────────────────── */
+  var sheetTimers = [];
+  function showSheetLayer() { sheetLayer.classList.add('open'); scrim.classList.add('open'); }
+  function closeSheet() {
+    sheetTimers.forEach(function (t) { clearInterval(t); });
+    sheetTimers = [];
+    sheetLayer.classList.remove('open');
+    sheetLayer.innerHTML = '';
+    scrim.classList.remove('open');
+  }
+  function focusFirst(root) {
+    var el = root.querySelector('button, input, [tabindex="0"]');
+    if (el) el.focus();
+  }
+  function chipFor(d) {
+    return d.state === 'connected' ? '<span class="state-chip connected"><i class="dot ok"></i>长连接</span>'
+      : d.state === 'unbound' ? '<span class="state-chip unbound"><i class="dot warn"></i>未配对</span>'
+      : '<span class="state-chip paired"><i class="dot"></i>已配对</span>';
+  }
+  function modeOptHTML(v, n, d) {
+    return '<label class="mode" data-mode="' + v + '"><input type="radio" name="convoMode" value="' + v + '" />' +
+      '<span class="mi">' + ic(v === 'broadcast' ? 'bc' : 'group') + '</span>' +
+      '<span class="mm"><span class="mn">' + n + '</span><span class="md">' + d + '</span></span></label>';
+  }
+  function ensureConvo(ids, mode, name) {
+    if (ids.length === 1) return 'dev:' + ids[0];
+    var want = mode === 'broadcast' ? 'broadcast' : 'group';
+    var sig = ids.slice().sort().join('|') + '#' + want;
+    var found = null;
+    Object.keys(state.threads).forEach(function (t) {
+      var th = state.threads[t];
+      if (th.participants.slice().sort().join('|') + '#' + th.mode === sig) found = t;
+    });
+    if (found) { if (typeof name === 'string' && name) state.threads[found].name = name; return found; }
+    var tid = (want === 'broadcast' ? 'b' : 'g') + (++state.seq);
+    state.threads[tid] = { id: tid, mode: want, participants: ids.slice(), name: name || (want === 'broadcast' ? '发布通知' : '') };
+    return tid;
+  }
+  function openNewConvoSheet() {
+    var sel = {};
+    sheetLayer.innerHTML = '<div class="sheet" role="dialog" aria-modal="true" aria-label="新建会话"><div class="sheet-grip"></div>' +
+      '<div class="sheet-head"><div class="sht"><h3 class="sheet-title">新建会话</h3><p class="sheet-desc">选一台设备建立一对一；选两台以上可用群发或群聊。</p></div>' +
+      '<button class="icon-btn" type="button" data-act="closeSheet" aria-label="关闭">' + ic('x') + '</button></div>' +
+      '<div class="sheet-body">' +
+        '<div class="stack" id="modeWrap">' + modeOptHTML('broadcast', '群发', '单向：每条消息分别作为单独的一对一消息发给每台设备。') + modeOptHTML('group', '群聊', '共享：所有参与设备都能看到彼此的消息。') + '</div>' +
+        '<div class="field" id="nameField" hidden><label for="convoName">会话名称</label>' +
+        '<input class="input" id="convoName" maxlength="16" placeholder="例如：发布通知" /><p class="field-hint">显示为 <b id="namePreview">群聊 · 设备名称</b></p></div>' +
+        '<div class="sec-label" style="padding-bottom:0"><span>选择设备</span><span class="num" id="selCount">已选 0 台</span></div>' +
+        '<div class="stack" id="devWrap">' + state.devices.map(function (d) {
+          return '<label class="pick"><input type="checkbox" data-dev="' + d.id + '" /><span class="pav">' + esc(d.av) + '</span>' +
+            '<span class="fmain"><span class="fname2">' + esc(d.name) + '</span><span class="fmeta num">' + esc(d.ip) + '</span></span>' + chipFor(d) + '</label>';
+        }).join('') + '</div>' +
+        '<div class="sheet-foot"><button class="btn btn-secondary" type="button" data-act="closeSheet">取消</button>' +
+        '<button class="btn btn-primary" type="button" id="convoCreate" disabled>进入会话</button></div>' +
+      '</div></div>';
+    showSheetLayer();
+    var nameField = document.getElementById('nameField');
+    var nameInput = document.getElementById('convoName');
+    var preview = document.getElementById('namePreview');
+    var count = document.getElementById('selCount');
+    var createBtn = document.getElementById('convoCreate');
+    function pickedMode() { var r = sheetLayer.querySelector('input[name="convoMode"]:checked'); return r ? r.value : 'group'; }
+    function sync() {
+      var ids = Object.keys(sel).filter(function (k) { return sel[k]; });
+      var multi = ids.length > 1;
+      nameField.hidden = !multi;
+      count.textContent = '已选 ' + ids.length + ' 台';
+      createBtn.disabled = ids.length === 0;
+      var m = pickedMode();
+      createBtn.textContent = multi ? (m === 'broadcast' ? '进入群发' : '进入群聊') : '进入会话';
+      var v = (nameInput.value || '').trim();
+      var fallback = m === 'broadcast' ? '未命名群发' : (ids.map(devName).join('、') || '设备名称');
+      preview.textContent = (m === 'broadcast' ? '群发 · ' : '群聊 · ') + (v || fallback);
+    }
+    [document.getElementById('modeWrap'), document.getElementById('devWrap')].forEach(function (w) {
+      w.addEventListener('change', function (e) {
+        var d = e.target.getAttribute('data-dev');
+        if (d) { sel[d] = e.target.checked; sync(); }
+        else if (e.target.name === 'convoMode') { sync(); }
+      });
+    });
+    nameInput.addEventListener('input', sync);
+    createBtn.addEventListener('click', function () {
+      var ids = Object.keys(sel).filter(function (k) { return sel[k]; });
+      if (!ids.length) return;
+      var m = ids.length > 1 ? pickedMode() : 'direct';
+      var name = (nameInput.value || '').trim();
+      closeSheet();
+      var key = ensureConvo(ids, m, name);
+      touchOrder(key);
+      renderAppbar(); renderTabbar();
+      openConversation(key);
+      toast(ids.length > 1
+        ? (m === 'broadcast' ? '已进入群发 · ' + ids.length + ' 台设备' : '已进入群聊 · ' + ids.length + ' 台设备')
+        : '已进入与「' + devName(ids[0]) + '」的会话');
+    });
+    sync();
+    focusFirst(sheetLayer);
+  }
+  function openFilePicker() {
+    var key = state.openChat;
+    if (!key) return;
+    var files = [
+      { name: '项目设计稿-v0.5.zip', size: '86 MB' },
+      { name: '色板-修订.png', size: '128 KB' },
+      { name: '接口清单.xlsx', size: '1.1 MB' },
+      { name: '交付清单.md', size: '32 KB' },
+      { name: '素材仓库', size: '文件夹' }
+    ];
+    var sel = {};
+    sheetLayer.innerHTML = '<div class="sheet" role="dialog" aria-modal="true" aria-label="发送文件"><div class="sheet-grip"></div>' +
+      '<div class="sheet-head"><div class="sht"><h3 class="sheet-title">发送文件</h3><p class="sheet-desc">选择要发送到「' + esc(titleOf(key)) + '」的文件或文件夹。</p></div>' +
+      '<button class="icon-btn" type="button" data-act="closeSheet" aria-label="关闭">' + ic('x') + '</button></div>' +
+      '<div class="sheet-body"><div class="stack" id="pickBody">' + files.map(function (f, i) {
+        return '<label class="pick"><input type="checkbox" data-pick="' + i + '" /><span class="pav">' + ic(f.size === '文件夹' ? 'folder' : iconOf(f.name)) + '</span>' +
+          '<span class="fmain"><span class="fname2">' + esc(f.name) + '</span><span class="fmeta">' + esc(f.size) + '</span></span></label>';
+      }).join('') + '</div>' +
+      '<div class="sheet-foot"><button class="btn btn-secondary" type="button" data-act="closeSheet">取消</button>' +
+      '<button class="btn btn-primary" type="button" id="pickSend" disabled>发送</button></div></div></div>';
+    showSheetLayer();
+    var body = document.getElementById('pickBody');
+    var sendBtn = document.getElementById('pickSend');
+    function sync() {
+      var n = Object.keys(sel).filter(function (k) { return sel[k]; }).length;
+      sendBtn.disabled = !n;
+      sendBtn.textContent = n ? '发送 ' + n + ' 个' : '发送';
+    }
+    body.addEventListener('change', function (e) {
+      var i = e.target.getAttribute('data-pick');
+      if (i == null) return;
+      sel[i] = e.target.checked;
+      sync();
+    });
+    sendBtn.addEventListener('click', function () {
+      var items = Object.keys(sel).filter(function (k) { return sel[k]; }).map(function (k) { return files[k]; });
+      closeSheet();
+      sendChatFiles(key, items);
+    });
+    focusFirst(sheetLayer);
+  }
+  function openPairSheet() {
+    var code = String(Math.floor(100000 + Math.random() * 900000));
+    var left = 120;
+    sheetLayer.innerHTML = '<div class="sheet" role="dialog" aria-modal="true" aria-label="配对设备"><div class="sheet-grip"></div>' +
+      '<div class="sheet-head"><div class="sht"><h3 class="sheet-title">配对设备</h3><p class="sheet-desc">两台设备交换 6 位码即完成配对，token 保存在系统凭据库。</p></div>' +
+      '<button class="icon-btn" type="button" data-act="closeSheet" aria-label="关闭">' + ic('x') + '</button></div>' +
+      '<div class="sheet-body">' +
+        '<div class="code-box"><span class="code" id="pairCode">' + code + '</span><span class="code-hint" id="pairHint">在对方设备上输入此码 · 剩余 2:00</span></div>' +
+        '<div class="field"><label for="pairInput">或输入对方配对码</label><input class="input num" id="pairInput" inputmode="numeric" maxlength="6" placeholder="6 位数字" />' +
+        '<p class="field-hint">对方在「设备 → 配对设备」中显示。</p></div>' +
+        '<div class="sheet-foot"><button class="btn btn-secondary" type="button" data-act="closeSheet">关闭</button>' +
+        '<button class="btn btn-primary" type="button" id="pairConfirm">确认配对</button></div>' +
+      '</div></div>';
+    showSheetLayer();
+    var hint = document.getElementById('pairHint');
+    var timer = setInterval(function () {
+      left -= 1;
+      if (left <= 0) { clearInterval(timer); hint.textContent = '配对码已过期，请重新打开'; return; }
+      hint.textContent = '在对方设备上输入此码 · 剩余 ' + Math.floor(left / 60) + ':' + String(left % 60).padStart(2, '0');
+    }, 1000);
+    sheetTimers.push(timer);
+    document.getElementById('pairConfirm').addEventListener('click', function () {
+      var v = (document.getElementById('pairInput').value || '').replace(/\D/g, '');
+      if (v.length !== 6) { toast('请输入 6 位数字配对码'); return; }
+      var target = state.devices.filter(function (d) { return d.state === 'unbound'; })[0] || state.devices[0];
+      if (target) target.state = 'paired';
+      closeSheet();
+      toast(target ? '已与「' + target.name + '」完成配对' : '配对完成');
+      renderApp();
+    });
+    focusFirst(sheetLayer);
+  }
+  function openAddDeviceSheet() {
+    sheetLayer.innerHTML = '<div class="sheet" role="dialog" aria-modal="true" aria-label="手动添加设备"><div class="sheet-grip"></div>' +
+      '<div class="sheet-head"><div class="sht"><h3 class="sheet-title">手动添加设备</h3><p class="sheet-desc">mDNS 不能跨网段，跨网段时输入对方 IP:端口。</p></div>' +
+      '<button class="icon-btn" type="button" data-act="closeSheet" aria-label="关闭">' + ic('x') + '</button></div>' +
+      '<div class="sheet-body"><div class="field"><label for="ipInput">设备地址</label>' +
+      '<input class="input num" id="ipInput" placeholder="192.168.1.20:3890" /></div>' +
+      '<div class="sheet-foot"><button class="btn btn-secondary" type="button" data-act="closeSheet">取消</button>' +
+      '<button class="btn btn-primary" type="button" id="addConfirm">添加</button></div></div></div>';
+    showSheetLayer();
+    document.getElementById('addConfirm').addEventListener('click', function () {
+      var v = (document.getElementById('ipInput').value || '').trim();
+      if (!/^[\w.\-]+:\d+$/.test(v)) { toast('请输入 IP:端口，例如 192.168.1.20:3890'); return; }
+      var host = v.slice(0, v.lastIndexOf(':'));
+      state.devices.push({ id: 'd' + (++state.seq), name: '设备 ' + host.split('.').pop(), ip: v, state: 'unbound', av: host.slice(-1).toUpperCase() });
+      closeSheet();
+      toast('已添加 ' + v + '，等待配对');
+      renderApp();
+    });
+    focusFirst(sheetLayer);
+  }
+function openDeviceActions(id) {
+    var d = dev(id);
+    if (!d) return;
+    var isConn = d.state === 'connected';
+    sheetLayer.innerHTML = '<div class="sheet" role="dialog" aria-modal="true" aria-label="设备操作"><div class="sheet-grip"></div>' +
+      '<div class="sheet-head"><div class="sht"><h3 class="sheet-title">' + esc(d.name) + '</h3><p class="sheet-desc num">' + esc(d.ip) + '</p></div>' +
+      '<button class="icon-btn" type="button" data-act="closeSheet" aria-label="关闭">' + ic('x') + '</button></div>' +
+      '<div class="sheet-body">' +
+        '<button class="opt" type="button" id="devRename"><span class="oi">' + ic('settings') + '</span>' +
+        '<span class="om"><span class="on">重命名</span><span class="od">修改设备在本机显示的名称。</span></span></button>' +
+        '<button class="opt" type="button" id="devToggle"><span class="oi">' + ic('link') + '</span>' +
+        '<span class="om"><span class="on">' + (isConn ? '断开连接' : '建立长连接') + '</span><span class="od">' +
+        (isConn ? '断开后仍保持配对，可随时重连。' : '连接后即可发消息与收文件。') + '</span></span></button>' +
+        '<button class="opt danger" type="button" id="devRemove"><span class="oi">' + ic('trash') + '</span>' +
+        '<span class="om"><span class="on">解除配对</span><span class="od">移除设备并清理对应系统凭据。</span></span></button>' +
+      '</div></div>';
+    showSheetLayer();
+    document.getElementById('devRename').addEventListener('click', function () { openRenameSheet(id); });
+    document.getElementById('devToggle').addEventListener('click', function () {
+      closeSheet();
+      if (isConn) disconnectDevice(id); else connectDevice(id);
+    });
+    document.getElementById('devRemove').addEventListener('click', function () { closeSheet(); removeDevice(id); });
+    focusFirst(sheetLayer);
+  }
+  function openRenameSheet(id) {
+    var d = dev(id);
+    if (!d) return;
+    sheetLayer.innerHTML = '<div class="sheet" role="dialog" aria-modal="true" aria-label="重命名设备"><div class="sheet-grip"></div>' +
+      '<div class="sheet-head"><div class="sht"><h3 class="sheet-title">重命名设备</h3><p class="sheet-desc">仅修改本机显示的名称。</p></div>' +
+      '<button class="icon-btn" type="button" data-act="closeSheet" aria-label="关闭">' + ic('x') + '</button></div>' +
+      '<div class="sheet-body"><div class="field"><label for="renameInput">设备名称</label>' +
+      '<input class="input" id="renameInput" maxlength="20" value="' + esc(d.name) + '" /></div>' +
+      '<div class="sheet-foot"><button class="btn btn-secondary" type="button" data-act="closeSheet">取消</button>' +
+      '<button class="btn btn-primary" type="button" id="renameSave">保存</button></div></div></div>';
+    showSheetLayer();
+    document.getElementById('renameSave').addEventListener('click', function () {
+      var v = (document.getElementById('renameInput').value || '').trim();
+      if (!v) { toast('名称不能为空'); return; }
+      d.name = v;
+      d.av = v.charAt(0);
+      closeSheet();
+      toast('已重命名为「' + v + '」');
+      renderApp();
+      if (state.openChat) renderChat();
+    });
+    focusFirst(sheetLayer);
+  }
+  function removeDevice(id) {
+    var d = dev(id);
+    if (!d) return;
+    state.devices = state.devices.filter(function (x) { return x.id !== id; });
+    var k = 'dev:' + id;
+    delete state.store[k]; delete state.draft[k]; delete state.unread[k];
+    var oi = state.order.indexOf(k);
+    if (oi > -1) state.order.splice(oi, 1);
+    Object.keys(state.threads).forEach(function (t) {
+      var th = state.threads[t];
+      var i = th.participants.indexOf(id);
+      if (i > -1) th.participants.splice(i, 1);
+      if (th.participants.length < 2) {
+        delete state.threads[t];
+        var ti = state.order.indexOf(t);
+        if (ti > -1) state.order.splice(ti, 1);
+      }
+    });
+    if (state.openChat === k) { closeSheet(); location.hash = '#/' + state.tab; }
+    toast('已解除与「' + d.name + '」的配对');
+    renderApp();
+  }
+  function connectDevice(id) {
+    var d = dev(id);
+    if (!d) return;
+    if (d.state === 'unbound') { openPairSheet(); return; }
+    d.state = 'connected';
+    toast('已与「' + d.name + '」建立长连接');
+    renderApp();
+    if (state.openChat) renderChat();
+  }
+  function disconnectDevice(id) {
+    var d = dev(id);
+    if (!d) return;
+    d.state = 'paired';
+    toast('已断开与「' + d.name + '」的连接');
+    renderApp();
+    if (state.openChat) renderChat();
+  }
+  function openFileActions(id) {
+    var f = state.inbox.filter(function (x) { return x.id === id; })[0];
+    if (!f) return;
+    sheetLayer.innerHTML = '<div class="sheet" role="dialog" aria-modal="true" aria-label="文件操作"><div class="sheet-grip"></div>' +
+      '<div class="sheet-head"><div class="sht"><h3 class="sheet-title">' + esc(f.name) + '</h3>' +
+      '<p class="sheet-desc">' + esc(f.from) + ' · ' + esc(f.size) + ' · ' + esc(f.time) + '</p></div>' +
+      '<button class="icon-btn" type="button" data-act="closeSheet" aria-label="关闭">' + ic('x') + '</button></div>' +
+      '<div class="sheet-body">' +
+        '<button class="opt" type="button" id="fOpen"><span class="oi">' + ic('file') + '</span>' +
+        '<span class="om"><span class="on">打开</span><span class="od">用系统应用打开这份文件。</span></span></button>' +
+        '<button class="opt" type="button" id="fShare"><span class="oi">' + ic('share') + '</span>' +
+        '<span class="om"><span class="on">分享</span><span class="od">通过系统分享菜单发送出去。</span></span></button>' +
+        '<button class="opt" type="button" id="fCopy"><span class="oi">' + ic('copy') + '</span>' +
+        '<span class="om"><span class="on">复制路径</span><span class="od">复制收件目录中的完整路径。</span></span></button>' +
+        '<button class="opt danger" type="button" id="fDel"><span class="oi">' + ic('trash') + '</span>' +
+        '<span class="om"><span class="on">删除本地副本</span><span class="od">仅删除本机收件目录中的这一份。</span></span></button>' +
+      '</div></div>';
+    showSheetLayer();
+    document.getElementById('fOpen').addEventListener('click', function () { closeSheet(); toast('已用系统应用打开「' + f.name + '」'); });
+    document.getElementById('fShare').addEventListener('click', function () { closeSheet(); toast('已调起系统分享菜单'); });
+    document.getElementById('fCopy').addEventListener('click', function () { closeSheet(); toast('已复制路径：' + state.settings.inboxDir + '/' + f.name); });
+    document.getElementById('fDel').addEventListener('click', function () {
+      state.inbox = state.inbox.filter(function (x) { return x.id !== id; });
+      closeSheet();
+      toast('已删除本地副本「' + f.name + '」');
+      renderApp();
+    });
+    focusFirst(sheetLayer);
+  }
+  function openPeek(key) {
+    var ids = partOf(key);
+    if (!ids.length) return;
+    var idx = 0;
+    function build() {
+      var id = ids[idx], d = dev(id);
+      var m = lastVisible(key) || msgs(key)[0];
+      var r = receiptOf(key);
+      var st = r.states[id] || 'off';
+      var bubble = m && m.kind === 'file'
+        ? '<span class="fbub"><span class="fio">' + ic('file') + '</span><span class="fmain"><span class="fname">' + esc(m.name) + '</span><span class="fsize num">' + esc(m.size || '文件') + '</span></span></span>'
+        : esc(m ? m.text : '');
+      sheetLayer.innerHTML = '<div class="sheet" role="dialog" aria-modal="true" aria-label="收件方视角"><div class="sheet-grip"></div>' +
+        '<div class="sheet-head"><div class="sht"><h3 class="sheet-title">' + esc(d ? d.name : id) + '</h3>' +
+        '<p class="sheet-desc">收件方视角 · 每台设备只看到单独的一对一消息</p></div>' +
+        '<button class="icon-btn" type="button" data-act="closeSheet" aria-label="关闭">' + ic('x') + '</button></div>' +
+        '<div class="sheet-body">' +
+          '<div class="peek-thread"><div class="peek-bubble">' + bubble + '</div>' +
+          '<span class="peek-off' + (st === 'ok' ? '' : ' bad') + '">' + (st === 'ok' ? '该设备当时在线，已收到这条消息' : '该设备当时离线，这条消息未送达') + '</span></div>' +
+          '<p class="peek-note">对方只看到这一条单独的一对一消息；群发中的其他收件人以及你发出的其他内容都不会出现在这里。</p>' +
+          '<div class="sheet-foot"><button class="btn btn-secondary" type="button" id="peekNext"' + (ids.length < 2 ? ' disabled' : '') + '>' +
+          (ids.length > 1 ? '下一台（' + (idx + 1) + '/' + ids.length + '）' : '只有这一台') + '</button>' +
+          '<button class="btn btn-primary" type="button" data-act="closeSheet">知道了</button></div>' +
+        '</div></div>';
+      showSheetLayer();
+      var nx = document.getElementById('peekNext');
+      if (nx) nx.addEventListener('click', function () { idx = (idx + 1) % ids.length; build(); });
+      focusFirst(sheetLayer);
+    }
+    build();
+  }
+  function openChatActions(key) {
+    var isThread = modeOf(key) !== 'direct';
+    sheetLayer.innerHTML = '<div class="sheet" role="dialog" aria-modal="true" aria-label="会话操作"><div class="sheet-grip"></div>' +
+      '<div class="sheet-head"><div class="sht"><h3 class="sheet-title">' + esc(titleOf(key)) + '</h3>' +
+      '<p class="sheet-desc">' + partOf(key).length + ' 台设备</p></div>' +
+      '<button class="icon-btn" type="button" data-act="closeSheet" aria-label="关闭">' + ic('x') + '</button></div>' +
+      '<div class="sheet-body">' +
+        '<button class="opt" type="button" id="chatMark"><span class="oi">' + ic('check') + '</span>' +
+        '<span class="om"><span class="on">标记为已读</span><span class="od">清空此会话的未读计数。</span></span></button>' +
+        (isThread ? '<button class="opt" type="button" id="chatEdit"><span class="oi">' + ic('group') + '</span>' +
+          '<span class="om"><span class="on">编辑收件人</span><span class="od">调整群发或群聊的参与设备。</span></span></button>' : '') +
+        '<button class="opt danger" type="button" id="chatClear"><span class="oi">' + ic('trash') + '</span>' +
+        '<span class="om"><span class="on">清空聊天记录</span><span class="od">只清理本机记录，不影响对方。</span></span></button>' +
+      '</div></div>';
+    showSheetLayer();
+    document.getElementById('chatMark').addEventListener('click', function () { state.unread[key] = 0; closeSheet(); renderApp(); toast('已标记为已读'); });
+    var edit = document.getElementById('chatEdit');
+    if (edit) edit.addEventListener('click', function () { closeSheet(); openEditRecipients(key); });
+    document.getElementById('chatClear').addEventListener('click', function () {
+      msgs(key).length = 0;
+      state.unread[key] = 0;
+      closeSheet();
+      renderChat();
+      renderAppbar();
+      renderTabbar();
+      toast('已清空聊天记录');
+    });
+    focusFirst(sheetLayer);
+  }
+  function openEditRecipients(key) {
+    var th = state.threads[key];
+    if (!th) return;
+    var sel = {};
+    th.participants.forEach(function (id) { sel[id] = true; });
+    sheetLayer.innerHTML = '<div class="sheet" role="dialog" aria-modal="true" aria-label="编辑收件人"><div class="sheet-grip"></div>' +
+      '<div class="sheet-head"><div class="sht"><h3 class="sheet-title">' + (th.mode === 'broadcast' ? '编辑群发' : '编辑群聊') + '</h3>' +
+      '<p class="sheet-desc">至少保留两台设备。</p></div>' +
+      '<button class="icon-btn" type="button" data-act="closeSheet" aria-label="关闭">' + ic('x') + '</button></div>' +
+      '<div class="sheet-body">' +
+        '<div class="sec-label" style="padding-bottom:0"><span>参与设备</span><span class="num" id="editCount">已选 ' + th.participants.length + ' 台</span></div>' +
+        '<div class="stack" id="editWrap">' + state.devices.map(function (d) {
+          return '<label class="pick"><input type="checkbox" data-edev="' + d.id + '"' + (sel[d.id] ? ' checked' : '') + ' />' +
+            '<span class="pav">' + esc(d.av) + '</span>' +
+            '<span class="fmain"><span class="fname2">' + esc(d.name) + '</span><span class="fmeta num">' + esc(d.ip) + '</span></span>' + chipFor(d) + '</label>';
+        }).join('') + '</div>' +
+        '<div class="sheet-foot"><button class="btn btn-secondary" type="button" data-act="closeSheet">取消</button>' +
+        '<button class="btn btn-primary" type="button" id="editSave">保存</button></div>' +
+      '</div></div>';
+    showSheetLayer();
+    var wrap = document.getElementById('editWrap');
+    wrap.addEventListener('change', function (e) {
+      var d = e.target.getAttribute('data-edev');
+      if (!d) return;
+      sel[d] = e.target.checked;
+      var n = Object.keys(sel).filter(function (k) { return sel[k]; }).length;
+      document.getElementById('editCount').textContent = '已选 ' + n + ' 台';
+    });
+    document.getElementById('editSave').addEventListener('click', function () {
+      var ids = Object.keys(sel).filter(function (k) { return sel[k]; });
+      if (ids.length < 2) { toast('至少保留两台设备'); return; }
+      th.participants = ids;
+      closeSheet();
+      renderChat();
+      renderApp();
+      toast('已更新参与设备');
+    });
+    focusFirst(sheetLayer);
+  }
+  function startDownload(name) {
+    var d = dev(state.browseDev);
+    state.transfers.unshift({ id: 't' + (++state.seq), name: name, size: '4.2 MB', peer: d ? d.name : '设备', dir: 'in', pct: 3, state: 'active' });
+    toast('开始下载「' + name + '」到收件目录');
+    state.filesSeg = 'transfer';
+    renderView();
+    renderTabbar();
+  }
+  function cancelTransfer(id) {
+    var t = state.transfers.filter(function (x) { return x.id === id; })[0];
+    if (!t) return;
+    t.state = 'canceled';
+    toast('已取消「' + t.name + '」的传输');
+    if (state.tab === 'files' && state.filesSeg === 'transfer') renderView(true);
+    renderTabbar();
+  }
+
+  /* ── actions ─────────────────────────────────────────────────── */
+  function handleAct(act, el) {
+    var id = el.getAttribute('data-id');
+    var key = el.getAttribute('data-key');
+    switch (act) {
+      case 'tab': setTab(el.getAttribute('data-tab')); break;
+      case 'seg': state.filesSeg = el.getAttribute('data-seg'); renderView(); break;
+      case 'open': openConversation(key); break;
+      case 'newConvo': openNewConvoSheet(); break;
+      case 'refresh': toast('已刷新设备与共享项'); renderApp(); break;
+      case 'chatBack': closeConversation(); break;
+      case 'chatMore': openChatActions(key); break;
+      case 'sendFile': openFilePicker(); break;
+      case 'invite': resolveInvite(key, parseInt(el.getAttribute('data-i'), 10), el.getAttribute('data-yes') === '1'); break;
+      case 'fileMore': openFileActions(id); break;
+      case 'cancelTransfer': cancelTransfer(id); break;
+      case 'browseDev': state.browseDev = id; state.browseOpen = {}; renderView(); break;
+      case 'browseToggle': {
+        var p = el.getAttribute('data-path');
+        state.browseOpen[p] = !state.browseOpen[p];
+        renderView(true);
+        break;
+      }
+      case 'browseNoop': toast('这是一个空目录'); break;
+      case 'downloadNode': startDownload(el.getAttribute('data-name')); break;
+      case 'connect': connectDevice(id); break;
+      case 'disconnect': disconnectDevice(id); break;
+      case 'deviceMore': openDeviceActions(id); break;
+      case 'pairOpen': openPairSheet(); break;
+      case 'addDevice': openAddDeviceSheet(); break;
+      case 'saveSettings': {
+        var nm = document.getElementById('setName');
+        if (nm) state.settings.name = nm.value.trim() || '我的手机';
+        var pt = document.getElementById('setPort');
+        if (pt) state.settings.port = pt.value.replace(/\D/g, '') || '3890';
+        toast('设置已保存');
+        renderApp();
+        break;
+      }
+      case 'closeSheet': closeSheet(); break;
+      case 'peek': openPeek(key); break;
+      default: break;
+    }
+  }
+
+  /* ── transfers tick ──────────────────────────────────────────── */
+  function tick() {
+    var act = state.transfers.filter(function (t) { return t.state === 'active'; });
+    if (!act.length) return;
+    act.forEach(function (t) {
+      t.pct = Math.min(100, (t.pct || 0) + 4 + Math.random() * 6);
+      var row = document.querySelector('.trow[data-tid="' + t.id + '"]');
+      if (row) {
+        var bar = row.querySelector('.t-bar i');
+        if (bar) bar.style.width = Math.round(t.pct) + '%';
+        var pctEl = row.querySelector('.t-pct');
+        if (pctEl) pctEl.textContent = Math.round(t.pct) + '%';
+      }
+      if (t.pct >= 100) {
+        t.pct = 100;
+        t.state = 'done';
+        if (t.dir === 'in') {
+          if (!state.inbox.some(function (f) { return f.name === t.name; })) {
+            state.inbox.unshift({ id: 'f' + (++state.seq), name: t.name, size: t.size, from: t.peer, time: '刚刚', kind: kindOf(t.name) });
+          }
+          toast('「' + t.name + '」接收完成，已保存到收件目录');
+        } else {
+          toast('「' + t.name + '」已发送至 ' + t.peer);
+        }
+        if (state.tab === 'files' && state.filesSeg === 'transfer' && !state.openChat) renderView(true);
+        renderTabbar();
+      }
+    });
+  }
+
+  /* ── routing / init ──────────────────────────────────────────── */
+  function route() {
+    var h = location.hash || '#/convos';
+    if (h.indexOf('#/chat/') === 0) {
+      var key = h.slice(7);
+      try { key = decodeURIComponent(key); } catch (e) { /* keep raw */ }
+      if (validConvo(key)) { openSub(key); return; }
+      location.hash = '#/' + state.tab;
+      return;
+    }
+    var t = h.replace(/^#\//, '');
+    if (['convos', 'files', 'devices', 'settings'].indexOf(t) < 0) t = 'convos';
+    state.tab = t;
+    closeSub();
+    renderApp();
+  }
+  function init() {
+    document.addEventListener('click', function (e) {
+      var el = e.target.closest && e.target.closest('[data-act]');
+      if (!el) return;
+      handleAct(el.getAttribute('data-act'), el);
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && sheetLayer.classList.contains('open')) { closeSheet(); return; }
+      if (e.key === 'Enter' || e.key === ' ') {
+        var el = e.target.closest && e.target.closest('[role="button"][data-act]');
+        if (el) { e.preventDefault(); handleAct(el.getAttribute('data-act'), el); }
+      }
+    });
+    scrim.addEventListener('click', closeSheet);
+    appmain.addEventListener('input', function (e) {
+      if (e.target.id === 'setName') state.settings.name = e.target.value;
+      else if (e.target.id === 'setPort') state.settings.port = e.target.value;
+    });
+    appmain.addEventListener('change', function (e) {
+      if (e.target.name === 'dlMode') state.settings.downloadMode = e.target.value;
+      var sw = e.target.getAttribute && e.target.getAttribute('data-switch');
+      if (sw) state.settings[sw] = e.target.checked;
+    });
+    window.addEventListener('hashchange', route);
+    setInterval(tick, 1000);
+    var st = document.getElementById('statusTime');
+    if (st) st.textContent = nowHM();
+    if (!location.hash) location.hash = '#/convos';
+    route();
+  }
+  init();
+})();
+</script>
+
+</body>
+</html>

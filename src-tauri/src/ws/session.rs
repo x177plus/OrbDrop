@@ -35,6 +35,8 @@ pub async fn run_inbound_session(state: Arc<AppState>, peer_id: String, ws: WebS
     state.emit_devices_changed();
     // 链路上来了：把上一次没送出去的「已读」补一次（回执丢了，对端那条消息就永远只是「已送达」）。
     crate::chat::flush_read_receipt(&state, &peer_id);
+    // 也是"对端现在收得到"这个证据：排队等它的消息该发出去了（够不着时发的那些）。
+    crate::chat::flush_queued(&state, &peer_id);
 
     loop {
         tokio::select! {
@@ -267,15 +269,56 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| peer_id.to_string());
             debug!(%id, %peer_id, "inbound chat text");
-            let snap = state.chat.record_inbound(peer_id, &name, &id, &text, at);
-            emit_ui(state, ui::CHAT_CHANGED, &crate::chat::snapshot_value(&snap));
+            state.chat.record_inbound(peer_id, &name, &id, &text, at);
+            crate::group::emit(state);
             // 界面是不是**正开着**这个会话，只有界面知道（它自己会来 `chat_mark_read`）；
             // 这里不回已读回执 —— 收到 ≠ 读过。
         }
         WsEvent::ChatRead { up_to } => {
             debug!(%peer_id, up_to, "inbound chat read receipt");
-            let snap = state.chat.mark_read_by_peer(peer_id, up_to);
-            emit_ui(state, ui::CHAT_CHANGED, &crate::chat::snapshot_value(&snap));
+            state.chat.mark_read_by_peer(peer_id, up_to);
+            crate::group::emit(state);
+        }
+        // 群聊三条：落账那一段在 `group.rs`（WS 与 HTTP 兜底两条路共用同一个 dispatcher，
+        // 所以这里只有转发）。
+        WsEvent::GroupText { group_id, id, text, at, seq, rev, author, hops, reached } => {
+            debug!(%group_id, %id, %peer_id, hops, "inbound group text");
+            crate::group::on_group_text(
+                state,
+                peer_id,
+                crate::group::GroupTextIn {
+                    group_id,
+                    id,
+                    text,
+                    at,
+                    seq,
+                    rev,
+                    sender_id: author.id,
+                    sender_name: author.name,
+                    hops,
+                    reached,
+                },
+            );
+        }
+        WsEvent::GroupRead { group_id, up_to } => {
+            debug!(%group_id, %peer_id, up_to, "inbound group read receipt");
+            crate::group::on_group_read(state, peer_id, &group_id, up_to);
+        }
+        WsEvent::GroupRoster { roster, sender } => {
+            debug!(group = %roster.id, rev = roster.rev, %peer_id, "inbound group roster");
+            crate::group::on_roster(state, peer_id, roster, &sender.name);
+        }
+        WsEvent::GroupSyncAsk { group_id, ask_id, since_at, holes } => {
+            debug!(%group_id, %ask_id, %peer_id, since_at, "inbound group sync ask");
+            crate::group::on_sync_ask(state, peer_id, &group_id, &ask_id, since_at, holes);
+        }
+        WsEvent::GroupSyncPost { group_id, ask_id, roster, has_more, messages } => {
+            debug!(%group_id, %ask_id, %peer_id, count = messages.len(), has_more, "inbound group sync post");
+            crate::group::on_sync_post(state, peer_id, &group_id, roster, has_more, messages);
+        }
+        WsEvent::GroupAck { group_id, up_to } => {
+            debug!(%group_id, %peer_id, up_to, "inbound group ack");
+            crate::group::on_ack(state, peer_id, &group_id, up_to);
         }
     }
 }

@@ -154,6 +154,8 @@ pub struct AppSettings {
     pub orb_shape: OrbShape,
     /// 新添加的目录/文件是否默认开播（设置里的「添加后自动共享」，默认关）。见 `Config::auto_broadcast_new`。
     pub auto_broadcast_new: bool,
+    /// 是否允许本机为群聊**中转**消息（跨网段那一档，默认关）。见 `Config::group_relay`。
+    pub group_relay: bool,
 }
 
 impl Default for AppSettings {
@@ -168,6 +170,7 @@ impl Default for AppSettings {
             online: true,
             orb_shape: OrbShape::default(),
             auto_broadcast_new: false,
+            group_relay: false,
         }
     }
 }
@@ -289,6 +292,14 @@ pub struct Config {
     /// 和「在线 / 离线」「开机自启」同一个道理。
     #[serde(default)]
     pub auto_broadcast_new: bool,
+    /// 是否允许本机**为群聊中转消息**（设置里的「允许为群聊中转消息」，默认关）。
+    ///
+    /// 只在**群消息**上生效，而且是"本机也在那个群里"时才转（见 `group::relay_to`）：
+    /// 跨网段时两端之间没有路径，缺的那一段只能由链路上的成员帮着搬。代价是本机替别人
+    /// 占用上行带宽，且这条与本项目"只走单播、不做多跳"的取舍相冲 —— 所以它必须由用户
+    /// 显式打开，默认关（需求文档里那两条非目标也随之改写）。
+    #[serde(default)]
+    pub group_relay: bool,
 }
 
 fn default_port() -> u16 {
@@ -323,6 +334,7 @@ impl Config {
             online: self.online,
             orb_shape: self.orb_shape,
             auto_broadcast_new: self.auto_broadcast_new,
+            group_relay: self.group_relay,
         }
     }
 
@@ -372,6 +384,7 @@ impl Default for Config {
             picker_favorites: Vec::new(),
             online: true,
             auto_broadcast_new: false,
+            group_relay: false,
         }
     }
 }
@@ -814,6 +827,7 @@ mod tests {
             orb_shape: OrbShape::Rect,
             online: false,
             auto_broadcast_new: true,
+            group_relay: true,
             picker_favorites: vec![
                 PickerFavorite { name: "桌面".into(), path: "C:/Users/t/Desktop".into() },
                 PickerFavorite { name: "项目".into(), path: "D:/项目".into() },

@@ -71,10 +71,29 @@ export interface AppSettings {
    * `broadcastEnabled` 的初值，已经在列表里的开关一个都不动。
    */
   autoBroadcastNew: boolean;
+  /**
+   * 本机是否替群聊**中转**消息（设置里的「允许为群聊中转消息」，默认 `false`）。
+   *
+   * 群里两个成员互相够不着时（跨网段 / 只有本机跟它们都连得上），本机把消息替它们转一份，
+   * 最多 3 跳（后端 `hops <= 3` + `reached` 抑制重复）。**默认关**：代价落在本机 ——
+   * 每转一份就占一份上行带宽，而"转不转"是用户自己的取舍，不该由程序替他决定。
+   */
+  groupRelay: boolean;
 }
 
 /** 折叠态悬浮形态：圆球 / 圆角矩形悬浮框（后端 `config::OrbShape` 的同一套小写字面量）。 */
 export type OrbShape = 'circle' | 'rect';
+
+/**
+ * 会话模式（原型的三张身份）：一对一 / 单向群发 / 共享群聊。
+ *
+ * - `direct`：与一台设备的那条（后端 `ChatPeerConvo`）；
+ * - `broadcast`：一次发给几台，各台单独收到 —— 后端由「一批收件人」的名单 + 副本上的
+ *   `batchId` 支撑（`ChatBatch`）；
+ * - `group`：共享群聊 —— 一条**所有人的同一个**消息流（`ChatGroup`）；收到邀请还没点「加入」
+ *   的群不算群，只在 `ChatSnapshot.pendingGroups` 里。
+ */
+export type ConvoMode = 'direct' | 'broadcast' | 'group';
 
 /**
  * BeyondCompare 比较的一端：本机共享项 / 长连接设备的共享项。
@@ -238,11 +257,17 @@ export interface PushBatch {
 /**
  * 会话（聊天）里一条消息在一台设备上的状态（后端 `chat::Delivery`）。
  *
- * `sent` = 已写进那条长连接；`read` = 对端回执说它读过了；`failed` = 发出去的时候对端没有
- * 长连接（**不排队重发**：会话里的话过期补发没有意义）；`received` = 收到的消息 ——
+ * `sending` = 在途（没有长连接，正走 HTTP 兜底那一跳）；`sent` = 已交给对端（写进长连接，
+ * 或 HTTP 拿到了 200）；`read` = 对端回执说它读过了；`queued` = 对端这会儿不在网上，
+ * **排队等它上线**（它一上线就按原顺序自动发出，消息没丢）；`failed` = 对端明确拒绝
+ * （4xx：认不出凭据或请求体 —— 重试不会变好，不发第二次）；`received` = 收到的消息 ——
  * 本机视角没有"送达"可言。
+ *
+ * `synced` = **只有群消息有**：这一份不是本机直接投到对方的，是对方后来从**别的成员**那里
+ * 补到的（补拉 / 跨段转发；后端 `Delivery::Synced`，由 `GroupAck` 回过头告诉原发送方）。
+ * 内容与直投的那份是同一份，只是路径不同 —— 所以它算"到位"，不算没送到。
  */
-export type ChatDelivery = 'sent' | 'read' | 'failed' | 'received';
+export type ChatDelivery = 'sending' | 'sent' | 'read' | 'synced' | 'queued' | 'failed' | 'received';
 
 /**
  * 会话里的一条文本消息。
@@ -261,6 +286,22 @@ export interface ChatMessage {
   at: number;
   delivery: ChatDelivery;
   targets: string[];
+  /** 这条是走哪个群发发出去的（`null`/缺省 = 一对一发的）。 */
+  batchId?: string | null;
+}
+
+/**
+ * 一批收件人（会话列表里的「群发 · 名字」）。
+ *
+ * 它只是一份**名单**，不拥有消息：群发的记录 = 副本上带着这个 `id` 的那些消息
+ * （`ChatMessage.batchId`）。所以删掉名单不会丢消息，成员变了也不动历史。
+ */
+export interface ChatBatch {
+  id: string;
+  /** 显示名（`群发 · <名字>`）。空 = 界面退回「群发 · N 台」。 */
+  name: string;
+  /** 成员设备 id（用户选择的顺序，已去重）。 */
+  members: string[];
 }
 
 /** 一台设备的会话：会话就是**与这台设备**的那一条（没有群实体，群发只是每台各存一份）。 */
@@ -272,10 +313,90 @@ export interface ChatPeerConvo {
   unread: number;
 }
 
+/** 群成员（名册里的一行）。 */
+export interface ChatGroupMember {
+  id: string;
+  name: string;
+}
+
+/**
+ * 一个共享群聊。
+ *
+ * 与群发**相反**：群聊只有**一条**消息流（`messages` 就是它），群消息**不镜像进各台的
+ * 1:1 会话里** —— 界面上只出现在 `grp:<群 id>` 那一条视图里。名册的真相在后端（含本机），
+ * 这里这份 `members` 是**视图**：后端已经把自己滤掉了，前端不需要知道本机设备 id。
+ */
+export interface ChatGroup {
+  id: string;
+  /** 群名；空 = 标题回落到成员名（与 `titleOf('group', …)` 一致）。 */
+  name: string;
+  /** 名册版本（LWW 用，前端只读）。 */
+  rev: number;
+  /** 创建者设备 id。 */
+  createdBy: string;
+  /** 名册（**不含本机**，后端已滤掉；顺序按名册）。 */
+  members: ChatGroupMember[];
+  /** 群消息，落盘顺序（追加序）。 */
+  messages: ChatGroupMsg[];
+  /** 本机读到哪条了（那条消息 id；`null` = 一条都没读过）。 */
+  readPos: string | null;
+  /** 本群的未读：本机之外的成员发的、排在 `readPos` 之后的条数（后端算好，前端别重算）。 */
+  unread: number;
+  /**
+   * 本机**已知缺**在群里的条数（后端算好，前端别重算）：掉线期间别人说的话，补拉又够不着的
+   * 那一部分（`seq` 的洞 + `since_at` 之后的缺口，见 `GroupSyncAsk`）。
+   *
+   * `> 0` 时消息流头顶如实说一句「有 N 条消息未能同步」—— 缺口是有的就说，不假装完整，
+   * 也不为它摆一个"正在同步"的假状态（补拉是尽力而为，一次没拉到不代表下次拉不到）。
+   */
+  missing: number;
+}
+
+/** 群里的一条消息。 */
+export interface ChatGroupMsg {
+  id: string;
+  /** 发送方设备 id（本机发的 = 本机自己的 id）。 */
+  from: string;
+  /** 发送方显示名（本机发出的为空串）—— 颜色**不要**跟着它走，改一次名就会跳。 */
+  fromName: string;
+  text: string;
+  at: number;
+  /** 该发送方在这个群里的第几条（1 起）：只用于同一个人说话的先后。 */
+  seq: number;
+  fromMe: boolean;
+  /**
+   * **仅 `fromMe` 有意义**：成员 id → 状态（`queued`/`sending`/`sent`/`read`/`synced`/`failed`）；
+   * 收来的那条是空对象（别人发到没到不是本机的事）。
+   */
+  delivery: Record<string, ChatDelivery>;
+  /** **仅 `fromMe` 有意义**：读过这条的成员数（配 `delivery` 的台数就是「已读 n/m」）。 */
+  readCount: number;
+}
+
+/** 收到但还没确认的群邀请：用户没点「加入」之前它都不算群（只进会话列表那张邀请卡）。 */
+export interface PendingGroup {
+  /** = 群 id。 */
+  id: string;
+  name: string;
+  /** 邀请人设备 id。 */
+  from: string;
+  fromName: string;
+  /** 名册（不含本机）。 */
+  members: ChatGroupMember[];
+  /** 邀请到达时刻。 */
+  at: number;
+}
+
 /** 整份会话状态：`chat_snapshot` 命令的返回，也是 `chat://changed` 事件的载荷。 */
 export interface ChatSnapshot {
   convos: ChatPeerConvo[];
-  /** 全部未读（底栏那颗角标 / 悬浮球左上角那颗）。 */
+  /** 群发名单（会话列表里「群发 · 名字」那些行就是它）。 */
+  batches: ChatBatch[];
+  /** 本地已知的群（已加入的那些；含本地拒绝邀请之后的状态）。 */
+  groups: ChatGroup[];
+  /** 收到但还没确认的群邀请（点了「加入」才进 `groups`）。 */
+  pendingGroups: PendingGroup[];
+  /** 全部未读（底栏那颗角标 / 悬浮球左上角那颗）：含群聊未读。 */
   unread: number;
 }
 

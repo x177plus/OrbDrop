@@ -26,6 +26,13 @@
   --accent-deep:  color-mix(in oklch, var(--accent) 82%, black);
   --accent-deeper: color-mix(in oklch, var(--accent) 74%, black);
 
+  /* 会话模式语义色：群发是信号暖色（喇叭），与主色（群聊）分开 —— 列表里三种身份一眼可辨。
+     群聊直接用主色那一套（`--accent*`），不另起一枚色相。 */
+  --bc:        oklch(58% 0.15 38);
+  --bc-soft:   color-mix(in oklch, var(--bc) 13%, transparent);
+  --bc-deep:   color-mix(in oklch, var(--bc) 74%, black);
+  --bc-deeper: color-mix(in oklch, var(--bc) 66%, black);
+
   --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
   --font-body:    -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
   --font-mono:    ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
@@ -1051,20 +1058,22 @@ input { font: inherit; }
   font-size: var(--fs-xs); font-weight: 500;
   border: 1px solid var(--border); color: var(--muted);
 }
-.state-chip .dot { width: 5px; height: 5px; box-shadow: none; }
-.state-chip.connected { color: color-mix(in oklch, var(--ok) 70%, black); border-color: color-mix(in oklch, var(--ok) 38%, transparent); background: var(--ok-soft); }
-/* 已配对 = 蓝色（项目主色）：这是"关系正常、随时可用"的一档，和"没配对"（灰）分开。 */
-.state-chip.paired { color: color-mix(in oklch, var(--accent) 70%, black); border-color: color-mix(in oklch, var(--accent) 34%, transparent); background: var(--accent-soft); }
+.state-chip .dot { width: 6px; height: 6px; }
+/* 胶囊的档位跟着**状态点**走（`stores/devices` 的 `deviceState`）：能送到 = 绿（`live` 长连接 /
+   `online` 已配对在线，两者的点一实心一空心，字也不同），等 = 琥珀，要重新配对 = 红，
+   送不到 = 灰虚框。以前「已配对」是蓝的 —— 蓝留给"关系"这层意思的时代过去了：
+   聊天上线后用户问的是"它现在收得到吗"，胶囊答复那个问题，关系由文案（未绑定 / 已配对）说。 */
+.state-chip.live, .state-chip.online { color: color-mix(in oklch, var(--ok) 70%, black); border-color: color-mix(in oklch, var(--ok) 38%, transparent); background: var(--ok-soft); }
 /* 未绑定、离线 = 常态：中性描边 + 灰字，不参与"告警"配色。
    未绑定是局域网设备的**默认**状态（不配对也能推送，接收方同意即可），
    把它画成告警色会让"没配对"看起来像出了问题 —— 只有"正在变化 / 需要你处理"才用暖色。 */
 .state-chip.unbound { color: var(--muted); border-color: var(--border); }
-/* 已配对但链路没接上（重连中 / 等对端上线）：和"稳稳的已配对"区分开 ——
+/* 本机在等（重连中 / 等对端上线）：和"稳稳的已配对"区分开 ——
    用户要能一眼看出这台设备此刻正在被处理，而不是静态的"已配对"。 */
-.state-chip.pending { color: color-mix(in oklch, var(--warn) 62%, black); border-color: color-mix(in oklch, var(--warn) 30%, transparent); background: color-mix(in oklch, var(--warn) 8%, transparent); }
+.state-chip.retrying { color: color-mix(in oklch, var(--warn) 62%, black); border-color: color-mix(in oklch, var(--warn) 30%, transparent); background: color-mix(in oklch, var(--warn) 8%, transparent); }
 /* 关系出问题（对端点过「断开」/ token 失效）：红。这两档要么等对端、要么重新配对，
    是唯一真正"出事了"的状态，不该和"正在重试"共用琥珀色。 */
-.state-chip.danger { color: color-mix(in oklch, var(--danger) 72%, black); border-color: color-mix(in oklch, var(--danger) 32%, transparent); background: color-mix(in oklch, var(--danger) 8%, transparent); }
+.state-chip.repair { color: color-mix(in oklch, var(--danger) 72%, black); border-color: color-mix(in oklch, var(--danger) 32%, transparent); background: color-mix(in oklch, var(--danger) 8%, transparent); }
 /* 已配对但对方不在网上：这一行仍留在列表里（离线时唯一能做的是「解除配对」），
    但一眼就该看出它此刻不可用 —— 虚线边框 + 灰掉的设备名。 */
 .state-chip.offline { border-style: dashed; }
@@ -1078,8 +1087,8 @@ input { font: inherit; }
     0%, 100% { opacity: 1; transform: scale(1); }
     50% { opacity: 0.4; transform: scale(0.72); }
   }
-  .state-chip.connected .dot,
-  .state-chip.pending .dot { animation: chip-breathe 1.9s ease-in-out infinite; }
+  .state-chip.live .dot,
+  .state-chip.retrying .dot { animation: chip-breathe 1.9s ease-in-out infinite; }
 .bcast-hint { display: flex; align-items: center; gap: 6px; margin: 8px 2px 0; font-size: var(--fs-xs); color: var(--muted); }
 .bcast-hint .dot { width: 5px; height: 5px; }
 .hl { color: var(--fg); font-weight: 500; }
@@ -1276,7 +1285,10 @@ input { font: inherit; }
    文件选择框（`.picker-layer`）与对话框同一层：两者不会同时开（选择框是推送给它的下一步），
    谁多一层都没有意义。
    右键菜单 `.ctx` 挂在 `.orb-stage` **之外**，跨层叠上下文永远在最上，不受这里影响。 */
-.overlay { position: absolute; inset: 0; z-index: 90; background: color-mix(in oklch, var(--fg) 22%, transparent); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); display: grid; place-items: center; opacity: 0; pointer-events: none; transition: opacity 0.2s ease; }
+/* 浮层里的对话框：面板固定 620px 高，而会话的创建/编辑框（模式两张卡 + 名字 + 设备列表）
+   比它还高 —— `safe center` 让"装得下就居中、装不下就从顶上开始"（否则上下两头都会被
+   裁掉，最要紧的取消 / 确定两颗按钮正好在下头）。 */
+.overlay { position: absolute; inset: 0; z-index: 90; background: color-mix(in oklch, var(--fg) 22%, transparent); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); display: grid; place-items: center; align-content: safe center; overflow-y: auto; opacity: 0; pointer-events: none; transition: opacity 0.2s ease; }
 .overlay.open { opacity: 1; pointer-events: auto; }
 .dialog { width: min(340px, calc(100% - 32px)); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); padding: 22px; transform: translateY(10px) scale(0.98); transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1); }
 .overlay.open .dialog { transform: none; }
@@ -1515,23 +1527,22 @@ input { font: inherit; }
 .convo-main { flex: 1; min-width: 0; display: grid; gap: 2px; }
 .convo-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .convo-name { flex: 0 1 auto; min-width: 0; font-family: var(--font-display); font-size: var(--fs-md); font-weight: 500; letter-spacing: -0.005em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.convo-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 26%, transparent); }
-.convo-dot.ok { background: var(--ok); }
-.convo-dot.warn { background: var(--warn); }
+.convo-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; }
 .convo-time { margin-left: auto; flex: none; font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); }
 .convo-prev { font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .convo-unread { flex: none; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; background: var(--accent); color: var(--surface); font-family: var(--font-mono); font-size: 10px; font-weight: 700; line-height: 1; display: grid; place-items: center; }
 
 /* ── 会话详情 ── */
-.convo-detail { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; }
+/* 单列必须显式 `minmax(0, 1fr)`：隐式列按 max-content 算宽度，群聊那条较长的模式文案
+   （`.cm-txt`）会把整列顶到 320 之外 —— 浮层 `overflow: hidden` 一裁，末尾那颗「编辑群聊」
+   就少了一截。 */
+.convo-detail { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(0, 1fr) auto; }
 .conv-top { flex: none; display: flex; align-items: center; gap: 6px; padding: 7px 8px 7px 10px; border-bottom: 1px solid var(--border); }
 .conv-back { flex: none; width: 28px; height: 28px; border-radius: 7px; display: grid; place-items: center; color: var(--muted); transition: background 0.15s ease, color 0.15s ease; }
 .conv-back:hover { background: var(--fg-soft); color: var(--fg); }
 .conv-back svg { width: 16px; height: 16px; }
 .conv-title { flex: 0 1 auto; min-width: 0; font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 600; letter-spacing: -0.005em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.conv-status { flex: none; width: 7px; height: 7px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 26%, transparent); }
-.conv-status.ok { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
-.conv-status.warn { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in oklch, var(--warn) 16%, transparent); }
+.conv-status { flex: none; width: 7px; height: 7px; border-radius: 50%; }
 .conv-count { flex: none; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
 .conv-acts { margin-left: auto; flex: none; display: flex; align-items: center; gap: 2px; }
 
@@ -1542,8 +1553,26 @@ input { font: inherit; }
 .recip-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 168px; height: 24px; padding: 0 4px 0 5px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); font-size: var(--fs-xs); color: var(--fg); }
 .recip-chip .rc-av { flex: none; width: 15px; height: 15px; border-radius: 5px; display: grid; place-items: center; font-family: var(--font-display); font-weight: 650; font-size: 9px; color: var(--accent); background: var(--accent-soft); }
 .recip-chip .rc-name { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.recip-chip .rc-st { flex: none; width: 6px; height: 6px; border-radius: 50%; background: color-mix(in oklch, var(--fg) 26%, transparent); }
-.recip-chip .rc-st.ok { background: var(--ok); }
+.recip-chip .rc-st { flex: none; width: 6px; height: 6px; border-radius: 50%; }
+
+/* ─── 设备状态点：一处判据，四处共用（颜色 = 可达性，形状 = 链路）────────────────
+   档位与 `stores/devices.svelte.ts` 的 `deviceDotState` 一一对应：
+   `live` 长连接（**只有它填实心**，并带一圈浅绿光环）/ `online` 在线但没连长连接（绿环，
+   消息照样收得到）/ `offline` 不在网上（灰环）/ `retrying` 本机在等（琥珀环）/
+   `repair` 关系失效（红环）。会话列表行、会话标题旁、收件人栏、设备行胶囊里的那颗点，
+   画的都是这一套 —— 各画一套的话，"灰"迟早又变成两种意思。 */
+/* 环的粗细在 6px 的点上是实测取舍：1.5px 会被浏览器取整成 1px（环太细，和实心那档几乎分不出），
+   2px 留下的 2px 内孔刚好看得见"这是个环"。 */
+.dot, .convo-dot, .conv-status, .rc-st { border: 2px solid transparent; background: transparent; }
+.dot.live, .convo-dot.live, .conv-status.live, .rc-st.live { background: var(--ok); border-color: var(--ok); }
+.dot.online, .convo-dot.online, .conv-status.online, .rc-st.online { border-color: var(--ok); }
+.dot.offline, .convo-dot.offline, .conv-status.offline, .rc-st.offline { border-color: color-mix(in oklch, var(--fg) 32%, transparent); }
+.dot.retrying, .convo-dot.retrying, .conv-status.retrying, .rc-st.retrying { border-color: var(--warn); }
+.dot.repair, .convo-dot.repair, .conv-status.repair, .rc-st.repair { border-color: var(--danger); }
+/* 光圈只给"长连接"那一档（= 实时）：会话列表与标题旁那两处是"一眼扫过去"的地方，
+   有它才分得出"实心绿 + 光圈"和"绿环"；胶囊里的点不用（胶囊本来就在边框里）。 */
+.dot.live, .convo-dot.live, .conv-status.live { box-shadow: 0 0 0 3px var(--ok-soft); }
+.state-chip .dot, .state-chip .dot.live { box-shadow: none; }
 .recip-chip .rc-x { flex: none; width: 16px; height: 16px; border-radius: 50%; display: grid; place-items: center; color: var(--muted); }
 .recip-chip .rc-x:hover { background: var(--fg-soft); color: var(--fg); }
 .recip-chip .rc-x svg { width: 10px; height: 10px; }
@@ -1585,7 +1614,12 @@ input { font: inherit; }
 /* 右键菜单指着的那一条：给个同色系的圈，别用"选中态"那种实心变化（消息是只读的） */
 .chat-msg.picked .chat-bubble { box-shadow: 0 0 0 2px color-mix(in oklch, var(--accent) 45%, transparent); }
 .chat-text { display: block; white-space: pre-wrap; }
-.chat-meta { margin-top: 3px; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+.chat-meta { margin-top: 3px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+/* 群发那条视图里，一条记录下面要写清"哪台已读、哪台还没送到"：逐台一段小字，颜色跟着状态走
+   （绿 = 已读、灰 = 已送达、琥珀 = 未送达 —— 与设备状态那套配色同一个含义）。 */
+.chat-per { display: inline-flex; flex-wrap: wrap; gap: 2px 8px; }
+.chat-per .per.read { color: color-mix(in oklch, var(--ok) 78%, black); }
+.chat-per .per.failed { color: color-mix(in oklch, var(--warn) 78%, black); }
 .chat-bubble-file { display: flex; align-items: center; gap: 8px; }
 .cf-ico { flex: none; display: grid; place-items: center; }
 .cf-ico svg { width: 16px; height: 16px; }
@@ -1626,6 +1660,162 @@ input { font: inherit; }
 .chat-input::placeholder { color: var(--muted); }
 .chat-input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
 
+/* ── 消息模式：单向群发 / 共享群聊（原型同名的两块）────────────────────────
+   一对一没有模式条（`.conv-headgroup` 里那一行整个不画）；群发与群聊各说自己的规则，
+   并各带一颗「编辑」进收件人选择框。 */
+/* 同样要显式 `minmax(0, 1fr)`：隐式列按 max-content 定宽，而标题是 `nowrap` ——
+   群聊那条回落到"参与者名字"的长标题会把这一列顶到浮层宽度之外（`.cm-act` 被裁掉一截）。 */
+.conv-headgroup { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; }
+.convo-mode {
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 12px;
+  font-size: var(--fs-xs); line-height: 1.5;
+  border-bottom: 1px solid var(--border);
+}
+.convo-mode[data-mode="broadcast"] { background: var(--bc-soft); color: var(--bc-deep); }
+.convo-mode[data-mode="group"] { background: var(--accent-soft); color: var(--accent-deep); }
+.convo-mode .cm-ic { flex: none; display: grid; place-items: center; }
+.convo-mode .cm-ic svg { width: 14px; height: 14px; }
+.convo-mode .cm-txt { flex: 1; min-width: 0; }
+.convo-mode .cm-txt b { font-weight: 650; }
+/* 「未接通」那一格已经删掉：群聊接上了，那颗虚线章（`.cm-off`）连同它的样式一起走。 */
+.convo-mode .cm-act {
+  flex: none; height: 22px; padding: 0 9px; border-radius: 999px;
+  border: 1px solid color-mix(in oklch, currentColor 38%, transparent);
+  color: inherit; font-size: var(--fs-xxs); font-weight: 600;
+  transition: background 0.15s ease;
+}
+.convo-mode .cm-act:hover { background: color-mix(in oklch, currentColor 14%, transparent); }
+
+/* 会话列表：三种身份各一套头像 —— 私聊=设备首字母（浅底），群聊=实心主色多人图标，
+   群发=暖色底喇叭图标。 */
+.convo-avs .d-avatar.bc-mark {
+  background: var(--bc-soft); color: var(--bc-deep);
+  border-color: color-mix(in oklch, var(--bc) 30%, transparent);
+}
+.convo-avs .d-avatar.bc-mark svg,
+.convo-avs .d-avatar.grp-mark svg { width: 18px; height: 18px; }
+.convo-avs .d-avatar.grp-mark {
+  background: var(--accent-deep); color: var(--surface);
+  border-color: var(--accent-deep);
+}
+.convo-mode-chip {
+  flex: none; display: inline-flex; align-items: center; gap: 3px;
+  height: 16px; padding: 0 6px; border-radius: 999px;
+  font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.04em;
+}
+.convo-mode-chip svg { width: 10px; height: 10px; }
+.convo-mode-chip.bc { background: var(--bc-soft); color: var(--bc-deep); }
+.convo-mode-chip.group { background: var(--accent-soft); color: var(--accent-deep); }
+
+/* 群发：单向台账（"这条条都是我发出去的"）+ 逐设备送达回执 + 接收方视角入口 */
+.chat-ledger { display: flex; align-items: center; gap: 8px; padding: 4px 2px 2px; }
+.chat-ledger .cl-line { flex: 1; height: 1px; background: var(--border); }
+.chat-ledger .cl-txt {
+  flex: none; font-family: var(--font-mono); font-size: 10px;
+  letter-spacing: 0.06em; color: var(--bc-deep);
+}
+.chat-msg.bc .chat-bubble { background: var(--bc-deep); }
+.chat-receipt {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px 6px;
+  margin-top: 5px; padding: 6px 8px; max-width: 100%;
+  border: 1px solid color-mix(in oklch, var(--bc) 26%, var(--border));
+  border-radius: 10px; background: var(--surface);
+}
+.cr-head { flex: none; font-family: var(--font-mono); font-size: 10px; color: var(--bc-deep); }
+.cr-list { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.cr-dev {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 132px;
+  height: 18px; padding: 0 6px 0 3px; border-radius: 999px;
+  border: 1px solid var(--border); font-size: var(--fs-xxs); color: var(--fg);
+}
+.cr-dev .cr-av {
+  flex: none; width: 13px; height: 13px; border-radius: 4px;
+  display: grid; place-items: center;
+  font-family: var(--font-display); font-size: 8px; font-weight: 700;
+  color: var(--surface); background: var(--muted);
+}
+.cr-dev .cr-nm { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cr-dev .cr-ic { flex: none; display: grid; place-items: center; color: var(--ok); }
+.cr-dev .cr-ic svg { width: 9px; height: 9px; }
+.cr-dev.off { color: var(--warn); border-color: color-mix(in oklch, var(--warn) 40%, var(--border)); }
+.cr-dev.off .cr-av { background: var(--warn); }
+.cr-dev.off .cr-ic { color: var(--warn); }
+/* 还在路上的那几台（HTTP 兜底那一跳没回来）：中性灰，别跟"没送到"抢注意力。 */
+.cr-dev.pending .cr-ic { color: var(--muted); }
+.cr-peek {
+  flex: none; margin-left: auto; display: inline-flex; align-items: center;
+  height: 20px; padding: 0 8px; border-radius: 999px;
+  border: 1px dashed color-mix(in oklch, var(--bc) 48%, transparent);
+  color: var(--bc-deep); font-size: var(--fs-xxs); font-weight: 600;
+  transition: background 0.15s ease, border-style 0.15s ease;
+}
+.cr-peek:hover { background: var(--bc-soft); border-style: solid; }
+
+/* 群发：输入区与发送按钮也换成模式形态（喇叭 + 信号色） */
+.chat-compose.bc .chat-input { border-color: color-mix(in oklch, var(--bc) 34%, var(--border)); }
+.chat-compose.bc .chat-input:focus { outline-color: var(--bc-soft); border-color: var(--bc); }
+.chat-plus.bc:hover { background: var(--bc-soft); color: var(--bc-deep); }
+.chat-send.bc { background: var(--bc-deep); }
+.chat-send.bc:hover { background: var(--bc-deeper); }
+
+/* ── 新建 / 编辑会话：先选模式，再选设备 ── */
+.mode-pick { display: grid; gap: 5px; margin: 0 0 10px; }
+/* 编辑已有会话时模式只读（模式变了历史就成了两半）：整组失效，但仍看得出选的是哪个。 */
+.mode-pick[data-off="1"] { pointer-events: none; }
+.mode-opt {
+  display: flex; align-items: center; gap: 9px;
+  padding: 9px 10px; border: 1px solid var(--border); border-radius: var(--radius);
+  cursor: pointer; transition: background 0.15s ease, border-color 0.15s ease;
+}
+.mode-opt:hover { background: var(--fg-soft); }
+.mode-opt:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.mode-opt[data-mode="broadcast"]:has(input:checked) { border-color: var(--bc); background: var(--bc-soft); }
+.mode-pick[data-off="1"] .mode-opt { opacity: 0.6; }
+.mode-opt input { flex: none; width: 15px; height: 15px; margin: 0; accent-color: var(--accent); }
+.mode-opt[data-mode="broadcast"] input { accent-color: var(--bc); }
+.mode-opt .mo-ic { flex: none; width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; }
+.mode-opt .mo-ic svg { width: 15px; height: 15px; }
+.mode-opt[data-mode="broadcast"] .mo-ic { background: var(--bc-soft); color: var(--bc-deep); }
+.mode-opt[data-mode="group"] .mo-ic { background: var(--accent-soft); color: var(--accent-deep); }
+/* 卡片只放名字：规则在名字旁边那颗「?」（`.hint`）里 —— 铺在卡里会把整个框撑满。 */
+.mode-opt .mo-name { flex: 1; min-width: 0; display: flex; align-items: center; font-family: var(--font-display); font-size: var(--fs-md); font-weight: 620; }
+.mode-note { margin: 0 0 10px; font-size: var(--fs-xxs); color: var(--muted); line-height: 1.6; }
+.field-hint { margin: 0; font-size: var(--fs-xxs); color: var(--muted); }
+.field-hint b { color: var(--fg); font-weight: 600; }
+
+/* ── 接收方视角预览：证明群发对每台设备都只是一条单独消息 ── */
+.peek-frame {
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  background: color-mix(in oklch, var(--fg) 3%, var(--surface));
+  padding: 10px; display: grid; gap: 8px;
+}
+.peek-head { display: flex; align-items: center; gap: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+.peek-head .d-avatar { width: 28px; height: 28px; border-radius: 9px; font-size: var(--fs-sm); }
+.peek-who { flex: 1; min-width: 0; display: grid; gap: 1px; }
+.peek-who .pk-nm { font-family: var(--font-display); font-size: var(--fs-md); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.peek-who .pk-sub { font-size: var(--fs-xxs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.peek-badge {
+  flex: none; font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.06em;
+  padding: 2px 6px; border-radius: 999px; background: var(--fg-soft); color: var(--muted);
+}
+.peek-thread { display: grid; gap: 6px; }
+.peek-msg { display: flex; flex-direction: column; align-items: flex-start; max-width: 100%; }
+.peek-bubble {
+  max-width: 88%; padding: 7px 10px; border-radius: 12px 12px 12px 4px;
+  background: color-mix(in oklch, var(--fg) 6%, transparent);
+  color: var(--fg); font-size: var(--fs-sm); line-height: 1.55; overflow-wrap: anywhere;
+}
+.peek-bubble .pb-file { display: flex; align-items: center; gap: 8px; }
+.peek-bubble .pb-file svg { width: 16px; height: 16px; flex: none; color: var(--warn); }
+.peek-bubble .pb-main { min-width: 0; display: grid; gap: 1px; }
+.peek-bubble .pb-name { display: block; font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500; }
+.peek-bubble .pb-size { display: block; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+.peek-meta { margin-top: 3px; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+.peek-off { font-size: var(--fs-xxs); color: color-mix(in oklch, var(--ok) 70%, black); }
+.peek-off.bad { color: color-mix(in oklch, var(--warn) 72%, black); }
+.peek-note { margin: 12px 0 0; font-size: var(--fs-xs); color: var(--muted); line-height: 1.6; }
+
 @media (prefers-reduced-motion: reduce) {
-  .orb-stage, .panel, .orb, .orb-arm, .orb-badge, .rq, .rq-card, .rq-dock, .rq-dots, .rq-dotlist, .rq-dot, .rq-shellbadge, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin, .chat-msg, .convo-pop, .foot-msg, .cf-bar i { transition: none !important; animation: none !important; }
+  .orb-stage, .panel, .orb, .orb-arm, .orb-badge, .rq, .rq-card, .rq-dock, .rq-dots, .rq-dotlist, .rq-dot, .rq-shellbadge, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin, .chat-msg, .convo-pop, .foot-msg, .cf-bar i, .chat-receipt, .cr-peek, .mode-opt, .cm-act { transition: none !important; animation: none !important; }
 }

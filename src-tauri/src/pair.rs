@@ -177,6 +177,26 @@ impl PendingInvite {
     }
 }
 
+/// 用户点了「配对 / 重新配对」：**这个地址上钉着的旧指纹先让位**（连同凭据库里那枚）。
+///
+/// 这是明确的关系重建动作 —— 对端重装过、地址换过主人、上次配对留下残影，都会让这个地址
+/// 上钉着一枚过时的指纹；不让位的话，拨号在 TLS 那一跳就被"指纹与钉住的不一致"拒掉，
+/// 用户看到的是"点了重新配对还是连不上"，而且没有任何可操作的出路。
+///
+/// 认下来之后由 `commit_pairing` 把**真正的那枚**写回去（邀请那条路这一跳见不到对端证书，
+/// 就先留空，交给下一次成功连线按 TOFU 认）。
+pub fn forget_stale_pin(state: &Arc<AppState>, peer_id: &str) {
+    let Some(peer) = state.get_peer(peer_id) else { return };
+    let Ok(ip) = peer.ip.parse() else { return };
+    if crate::net::trust().get(ip).is_some() {
+        info!(%peer_id, %ip, "重新配对：这个地址上钉着的旧指纹让位");
+    }
+    crate::net::trust().unpin(ip);
+    // 凭据库那枚也要清：`refresh_trust` 是从它重建内存表的，只清内存会被下一次重建盖回来。
+    let _ = credential::set_peer_fingerprint(peer_id, "");
+    crate::state::refresh_trust(state);
+}
+
 /// 本机这一半的回执：自己的 id/名字 + 新铸的 token。
 pub fn mint_grant(state: &AppState) -> PairGrant {
     let config = state.config.lock();
@@ -196,7 +216,19 @@ pub fn commit_pairing(
     token: &str,
     invite_id: Option<&str>,
 ) -> Result<(), String> {
-    credential::set_peer(&peer.id, token).map_err(|e| format!("凭据存储失败: {e}"))?;
+    // 凭据一次写全：**token 与对端指纹是同一份关系**（`set_peer_credential` 存在的理由）。
+    //
+    // 这里也是**唯一会覆盖旧指纹**的地方：用户刚刚（重新）建立了这段关系，那个地址上钉着的
+    // 旧指纹（对端重装过、地址换了主人、上次配对留下的）必须让位 —— 不让位就会变成
+    // "刚重新配对好，却依旧连不上（指纹与钉住的不一致）"，而且这一跳如果是**收方**
+    // （邀请那条路），本机根本见不到对端证书，没法当场把新指纹写下来。
+    //
+    // - 本机这一跳真见过它的证书（配对码那条路是本机拨出去的）→ 直接钉住这枚；
+    // - 见不到（邀请那条路）→ 把指纹写**空**（= 这个地址暂时没有钉住的指纹），
+    //   交给下一次成功连线按 TOFU 重新认。写空而不是留着旧的，是本条注释前半段那件事。
+    let seen = crate::net::trust().observed_at(&peer.ip);
+    credential::set_peer_credential(&peer.id, token, seen.as_deref().unwrap_or(""))
+        .map_err(|e| format!("凭据存储失败: {e}"))?;
     state.mark_paired(&PeerDevice {
         id: peer.id.clone(),
         name: peer.name.clone(),
@@ -219,11 +251,7 @@ pub fn commit_pairing(
         "inviteId": invite_id,
     }));
     ws::emit_ui(state, ui::DEVICES_CHANGED, &serde_json::json!({}));
-    // 设备刚进地址簿：Trust 那张"地址 → 指纹"的表要跟着建起来，否则下一次拨号
-    // 会因为"这个地址没见过"而退回 TOFU（而不是按已配对的身份校验）。
-    // 这次连线真见过它的证书就顺手钉住（配对码那条路是本机拨出去的，见过；邀请那条路
-    // 是对端拨进来的，见不到，留到下一次探活/长连接补上）。
-    crate::state::remember_peer_fingerprint(state, &peer.id, &peer.ip);
+    // 设备刚进地址簿：Trust 那张"地址 → 指纹"的表要跟着重灌一次（上面刚写过凭据）。
     crate::state::refresh_trust(state);
     Ok(())
 }
@@ -308,6 +336,8 @@ pub async fn invite_peer(state: Arc<AppState>, peer_id: &str) -> Result<String, 
     if !peer.online || peer.ip.is_empty() || peer.port == 0 {
         return Err(format!("「{}」不在网上，邀请未发出", peer.name));
     }
+    // 同 `pair_confirm`：用户点「配对」时，这个地址上的旧指纹先让位。
+    forget_stale_pin(&state, peer_id);
     let invite_id = uuid::Uuid::new_v4().to_string();
     // 服务端口：对端要凭它回连/调用本机（这个 HTTP 请求的源端口是一次性的）。
     let own_port = match state.server_port.load(Ordering::SeqCst) {

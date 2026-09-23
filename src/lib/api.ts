@@ -30,7 +30,7 @@ export function getSettings(): Promise<AppSettings> {
   return invoke('get_settings');
 }
 
-export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; downloadMode: string; deviceName: string; autoStart: boolean; bcExePath: string; autoBroadcastNew: boolean }): Promise<AppSettings> {
+export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; downloadMode: string; deviceName: string; autoStart: boolean; bcExePath: string; autoBroadcastNew: boolean; groupRelay: boolean }): Promise<AppSettings> {
   return invoke('update_settings', { req: s });
 }
 
@@ -193,8 +193,33 @@ export function chatSnapshot(): Promise<ChatSnapshot> {
  * 除了整份快照还带回这条消息的 `id`：界面据此**逐台读状态**（谁送到了、谁没送到），
  * 不用去猜"哪条是刚发出去的"。
  */
-export function chatSend(peerIds: string[], text: string): Promise<{ id: string; snapshot: ChatSnapshot }> {
-  return invoke('chat_send', { peerIds, text });
+export function chatSend(
+  peerIds: string[],
+  text: string,
+  batchId?: string | null,
+): Promise<{ id: string; batchId: string | null; snapshot: ChatSnapshot }> {
+  return invoke('chat_send', { peerIds, text, batchId: batchId ?? null });
+}
+
+/**
+ * 「这批设备」用哪份群发名单：点名了 `id` 就用它（并把成员更新成这次选的这几台），
+ * 没点名就按成员集合复用一份、都没有再新建（名字留空，随后由 `chatBatchRename` 命名）。
+ *
+ * 两条路都走它：新建群发（不点名 → 复用/新建）与「编辑收件人」（点名 → 成员当场落定，
+ * 不用等到下次发送）。
+ */
+export function chatBatchEnsure(members: string[], id?: string | null): Promise<{ id: string; snapshot: ChatSnapshot }> {
+  return invoke('chat_batch_ensure', { members, id: id ?? null });
+}
+
+/** 改群发的名字（列表里右键「修改名字」）；名字留空 = 界面退回「群发 · N 台」。 */
+export function chatBatchRename(id: string, name: string): Promise<ChatSnapshot> {
+  return invoke('chat_batch_rename', { id, name });
+}
+
+/** 删掉一份群发名单（消息一条不动，它们本来就在各台设备的会话里）。 */
+export function chatBatchDelete(id: string): Promise<ChatSnapshot> {
+  return invoke('chat_batch_delete', { id });
 }
 
 /** 界面读过这些设备的会话：推进本地已读水位，并给对端回一条已读回执。 */
@@ -205,6 +230,57 @@ export function chatMarkRead(peerIds: string[]): Promise<ChatSnapshot> {
 /** 清空与一台设备的聊天记录（会话菜单里的「清空聊天记录」）。 */
 export function chatClear(peerId: string): Promise<ChatSnapshot> {
   return invoke('chat_clear', { peerId });
+}
+
+// 共享群聊：一份"所有人的同一个"消息流（与群发相反 —— 群消息不镜像进各台的 1:1）。
+// 与上面几条同一个路数：命令一律返回**整份会话状态**，界面拿来就换。
+/**
+ * 建一个群。`members` 是**除本机以外**的成员（名册里本机那一条由后端补）。
+ * 返回新群 id 与整份状态（界面据此直接打开这条群聊）。
+ */
+export function groupCreate(members: string[], name: string): Promise<{ id: string; snapshot: ChatSnapshot }> {
+  return invoke('group_create', { members, name });
+}
+
+/** 改群的名册与群名（名册走 LWW，`rev` 递增）。 */
+export function groupEdit(id: string, members: string[], name: string): Promise<ChatSnapshot> {
+  return invoke('group_edit', { id, members, name });
+}
+
+/** 往群里发一条文本；返回的 `id` 是**这条消息**的 id（不是群的）。 */
+export function groupSend(id: string, text: string): Promise<{ id: string; snapshot: ChatSnapshot }> {
+  return invoke('group_send', { id, text });
+}
+
+/** 本机读到哪儿了：推进群里的已读水位（未读清零）。 */
+export function groupMarkRead(id: string): Promise<ChatSnapshot> {
+  return invoke('group_mark_read', { id });
+}
+
+/**
+ * 补拉一个群：把本机**已知缺**的那几条（`seq` 的洞 + `since_at` 之后的缺口）向成员要回来，
+ * 一次最多 200 条、多轮（后端 `GroupSyncAsk` / `GroupSyncPost`）。返回的还是整份快照。
+ *
+ * 尽力而为：够不着的成员就是够不着（它不在线），要点回来的也可能只到一部分 —— 所以调用方
+ * **失败静默**，缺口本身由 `ChatGroup.missing` 如实报给用户。
+ */
+export function groupSync(id: string): Promise<ChatSnapshot> {
+  return invoke('group_sync', { id });
+}
+
+/** 接受一条群邀请 —— 从这一刻起它才算群（进会话列表，不再只是那张邀请卡）。 */
+export function groupJoin(id: string): Promise<ChatSnapshot> {
+  return invoke('group_join', { id });
+}
+
+/** 拒绝一条群邀请（本地记下"拒绝过"，同一份邀请不会再弹）。 */
+export function groupDismiss(id: string): Promise<ChatSnapshot> {
+  return invoke('group_dismiss', { id });
+}
+
+/** 退出一个群（本机从名册里去掉；已经收到的消息留在本机这份记录里）。 */
+export function groupLeave(id: string): Promise<ChatSnapshot> {
+  return invoke('group_leave', { id });
 }
 
 // BeyondCompare 比较（本机 / 长连接设备的共享项）。四个命令都返回最新 BcStatus，
@@ -269,6 +345,18 @@ export function orbScreenMetrics(): Promise<ScreenMetrics> {
 
 export function orbSetRect(rect: ScreenRect): Promise<void> {
   return invoke('orb_set_rect', { x: rect.x, y: rect.y, w: rect.w, h: rect.h });
+}
+
+/**
+ * 窗口里「吃点击」的那几块（CSS px，窗口左上角为原点）。
+ *
+ * 窗口比看得见的那件东西大一圈：四周留的是 `--shadow` 的余量（`orbShape.RECT_SLACK` /
+ * `App.PANEL_SLACK`）。那圈余量是**墨迹**不是实体，可透明像素在 Windows 上照样算命中 ——
+ * 点它就是在点我们的窗口，压在下面的窗口一直收不到（点击、悬停、右键、焦点都被吃掉）。
+ * 后端按这份区域 + 指针位置开关整窗穿透（见 `src-tauri/src/hit_region.rs`）。
+ */
+export function orbSetHitRegion(rects: ScreenRect[]): Promise<void> {
+  return invoke('orb_set_hit_region', { rects });
 }
 
 /**

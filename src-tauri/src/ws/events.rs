@@ -102,6 +102,91 @@ pub enum WsEvent {
     ChatRead {
         up_to: u64,
     },
+    /// 群聊：Sender → Receiver 的一条**群消息**。
+    ///
+    /// 与 `ChatText` 分开而不是给它加可选字段：群消息属于"这个群"，一对一属于"与这台设备的
+    /// 往来"，两者落盘、取未读、算回执的方式都不一样（见 `crate::group`）。
+    ///
+    /// - `id` 由发送方生成：去重键是 `(作者, id)`（补发/重连重投都是同一个 id）。
+    /// - `seq` = 这个作者在该群里的第几条（1 起）：同一个人的先后不看墙钟。
+    /// - `rev` = 作者手上的名册版本：收方据此知道自己落后（补拉会给回来）。
+    /// - **`author` 是"谁说的"，不是本帧的对端**：中转过来的消息里，本帧的对端是搬运工
+    ///   （`POST /chat/group` 体上的 `sender` / WS 会话的持有者），作者另有其人。
+    ///   所以这个字段**不能**叫 `sender` —— HTTP 兜底那一跳的信封上已经有一个 `sender`
+    ///   （发送方自报的身份，用来认人），同名会被信封覆盖掉，作者就变成了搬运工。
+    /// - 收方对这个自称只在**它确实是名册成员**时才采信（否则谁都能借一台成员设备冒名）。
+    GroupText {
+        group_id: String,
+        id: String,
+        text: String,
+        at: u64,
+        seq: u64,
+        rev: u64,
+        author: PeerInfo,
+        /// 这条被**中转**了几跳（发送方自己发 = 0）。跨网段时两端之间没有路径，缺的那一段
+        /// 只能由链路上也在群里的成员帮着搬（本机开关 `groupRelay`，默认关）；跳数封顶
+        /// （`group::MAX_HOPS`）保证转发一定停下来。
+        #[serde(default)]
+        hops: u8,
+        /// 这一路上**已经经手过**的成员 id。收到的人据此跳过"已经有人送过"的成员，
+        /// 不必再把同一条投给全群（去重另有 `(from, id)` 兜底）。
+        ///
+        /// 注意它是**声明**、没有签名：谎报只会让别人少转发，不会伪造出消息本身。
+        #[serde(default)]
+        reached: Vec<String>,
+    },
+    /// 群聊：Receiver → Sender 的已读回执。`up_to` = 读到的、**你在这个群里发的**最大 `at`。
+    ///
+    /// 与 `ChatRead` 同一个语义，只是多一个群维度：群里有多个人，水位必须逐发送者算
+    /// （对方的时钟只有它自己那一条可比）。
+    GroupRead {
+        group_id: String,
+        up_to: u64,
+    },
+    /// 群聊：名册（建群邀请 / 成员变更 / 补发时补的那一份）。
+    ///
+    /// 收到不认识的名册**不等于**加入：它先落成一张邀请卡，用户点了「加入」才算群
+    /// （见 `crate::group::PendingInvite`）。
+    GroupRoster {
+        roster: crate::group::RosterPayload,
+        sender: PeerInfo,
+    },
+    /// 群聊：**补拉** —— 向一个成员要"我手上没有的那些"。
+    ///
+    /// 为什么要它：群消息是逐成员直投的（无组播），跨网段/离线期间漏掉的那些，发送方投不
+    /// 进来也没法重投；由**接收方**向"它连得上的成员"要，缺的那一段才补得回来
+    /// （每个成员各向自己的邻居要，信息像涟漪一样沿链路传下去）。
+    ///
+    /// - `since_at` = 我手上最新一条的 `at`（**0 = 我一条都没有**：这时要的是"从头发一份给
+    ///   我"，新加入的成员就是这样追上群里的；这种情况下对方只回一批、不再追后续）。
+    /// - `holes` = 我**明确知道**缺的那几条（按发送方 + `seq`）：`since_at` 只能表达"之后的
+    ///   全要"，中间那几个洞只能一条条点名。
+    GroupSyncAsk {
+        group_id: String,
+        /// 这一问的凭据（回执原样带回来，日志里对得上）。
+        ask_id: String,
+        since_at: u64,
+        holes: Vec<crate::group::SyncHole>,
+    },
+    /// 群聊：补拉的回答（有货就回，没货回空）。
+    GroupSyncPost {
+        group_id: String,
+        ask_id: String,
+        /// 顺带把名册给它：补拉常常正是"对方的群名册已经落后"的场景，一次往返解决。
+        roster: Option<crate::group::RosterPayload>,
+        /// 我手上还有更多（对方按这个继续要下一批）。
+        has_more: bool,
+        messages: Vec<crate::group::GroupMsgWire>,
+    },
+    /// 群聊：**"我手上有你发的这些"** —— 补拉拿到的消息回执给原发送方。
+    ///
+    /// 与 `GroupRead` 分开：那是"读过"，这是"**拿到了**"（补拉回来的消息往往还没被人看过）。
+    /// 原发送方据此把那条副本从「排队/未送达」改成「已同步」。
+    GroupAck {
+        group_id: String,
+        /// 我手上你发的消息里最大的一条 `at`。
+        up_to: u64,
+    },
 }
 
 impl WsEvent {
@@ -118,6 +203,12 @@ impl WsEvent {
             WsEvent::Unpair { .. } => "unpair",
             WsEvent::ChatText { .. } => "chat_text",
             WsEvent::ChatRead { .. } => "chat_read",
+            WsEvent::GroupText { .. } => "group_text",
+            WsEvent::GroupRead { .. } => "group_read",
+            WsEvent::GroupRoster { .. } => "group_roster",
+            WsEvent::GroupSyncAsk { .. } => "group_sync_ask",
+            WsEvent::GroupSyncPost { .. } => "group_sync_post",
+            WsEvent::GroupAck { .. } => "group_ack",
         }
     }
 }

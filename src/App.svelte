@@ -5,13 +5,13 @@
   import { fly } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
   import { listen } from '@tauri-apps/api/event';
-  import { getDevices, loadDevices } from '$lib/stores/devices.svelte';
+  import { getDevices, loadDevices, isLocalOnline, noteLocalOnline } from '$lib/stores/devices.svelte';
   import { getServerPort, setServerPort, loadShares, addShare, removeShare, getShares } from '$lib/stores/shares.svelte';
   import { loadSettings, getSettings } from '$lib/stores/settings.svelte';
   import { getPeerSharesState, loadPeerShares } from '$lib/stores/peers.svelte';
   import { getBcStatus, loadBcStatus, setBcSide, clearSide, compare } from '$lib/stores/bc.svelte';
   import * as chat from '$lib/stores/chat.svelte';
-  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, localAddresses, orbScreenMetrics, orbSetRect, orbDragStart, orbMouseDown, orbSaveCenter, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, openPath, fetchTree, peerTree } from '$lib/api';
+  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, openPath, fetchTree, peerTree } from '$lib/api';
   import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape } from '$lib/types';
   import { shareMeta } from '$lib/types';
   import { planExpansion, planCollapse, planDock, planRectDock, spinForDock, type BadgeSpin, type DockAxis, type DockPlan, type ScreenRect } from '$lib/orbLayout';
@@ -26,6 +26,7 @@
   import ContextMenu from '$lib/components/ContextMenu.svelte';
   import ConvoPanel from '$lib/components/ConvoPanel.svelte';
   import RecipientDialog from '$lib/components/RecipientDialog.svelte';
+  import PeekDialog from '$lib/components/PeekDialog.svelte';
   import Hint from '$lib/components/Hint.svelte';
   import HintLayer from '$lib/components/HintLayer.svelte';
 
@@ -139,6 +140,12 @@
     dest?: string;
     /** 配对邀请的发起方 id（kind = 'pair'）。 */
     peerId?: string;
+    /**
+     * 配对邀请（kind = 'pair'）来自"本机记录里已配对、但没带上本机发给它的凭据"的设备
+     * （后端 `pair://invite` 的 `unproven`）。只在本机已知需重新配对时才会放行到这一档，
+     * 正文要提醒用户"它自称是老搭档，但凭据对不上"。
+     */
+    unproven?: boolean;
   };
   let notices = $state<PushNotice[]>([]);
   // 铃铛：展开/收起右下角那组"等你确认"的气泡。收起 ≠ 已读 —— 角标照旧挂着。
@@ -148,7 +155,8 @@
   // 中间那一下"点了没反应"最像卡死）。
   let statusOpen = $state(false);
   let statusEl = $state<HTMLElement | null>(null);
-  let localOnline = $state(true);
+  // 本机「在线 / 离线」的当前值住在 `stores/devices` 里（设备/会话的状态点要看它：隐身时后端
+  // 拒发，那些点一律按"送不到"画）—— 这里只读它、只把它报回去，不再自己存一份。
 
   /**
    * 点状态框里的一行。
@@ -158,7 +166,7 @@
    * 点另一行就是切过去，顺带收起列表。
    */
   function pickOnline(on: boolean) {
-    if (on === localOnline) statusOpen = !statusOpen;
+    if (on === isLocalOnline()) statusOpen = !statusOpen;
     else void setLocalOnline(on);
   }
 
@@ -169,14 +177,14 @@
    */
   async function setLocalOnline(on: boolean) {
     statusOpen = false;
-    if (on === localOnline) return;
-    const prev = localOnline;
-    localOnline = on;
+    if (on === isLocalOnline()) return;
+    const prev = isLocalOnline();
+    noteLocalOnline(on);
     try {
       await setOnline(on);
       toast(on ? '已切回「在线」，重新对局域网可见' : '已切到「离线」，本机对局域网隐身');
     } catch (e) {
-      localOnline = prev;
+      noteLocalOnline(prev);
       toast(typeof e === 'string' ? e : '切换在线状态失败');
     }
   }
@@ -207,7 +215,7 @@
   let toasts = $state<{ id: number; msg: string; leaving: boolean }[]>([]);
   let toastId = $state(0);
   // Context menu
-  type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer' | 'chat' | 'convo'; el?: HTMLElement; shareId?: string; path?: string; isDir?: boolean; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; peerName?: string; name?: string; chatId?: string; chatFull?: string; chatSel?: string; convoBrowse?: boolean };
+  type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer' | 'chat' | 'convo'; el?: HTMLElement; shareId?: string; path?: string; isDir?: boolean; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; name?: string; chatId?: string; chatFull?: string; chatSel?: string; convoKey?: string; convoPeerId?: string; convoThread?: boolean; convoBc?: boolean; convoBrowse?: boolean };
   let ctxState = $state<CtxState | null>(null);
 
   let connectedCount = $derived(getDevices().filter(d => d.connected).length);
@@ -508,6 +516,62 @@
         console.error('按形态改折叠态窗口尺寸失败:', e);
       }
     })();
+  });
+
+  /**
+   * 右键菜单自己的盒子（窗口坐标，CSS px）。菜单是 `position: fixed`，而夹取按**窗口**算
+   * （`ctxPlacement` 的 `bounds` = 视口，见 ContextMenu.svelte）—— 所以它可能压在那圈阴影余量上，
+   * 报可点区域时得把它并进来，否则探进余量的那一截点不着（点下去穿到桌面去了）。
+   *
+   * 量 `offset*` 而不是 `getBoundingClientRect()`：菜单出现时带 0.12s 的 `scale(0.96)`
+   * （转心在左上角），实时盒子会是缩小后的那一格；`offset*` 就是 `ctxPlacement` 写下的定位值与
+   * 菜单的固有尺寸 —— 稳定之后的那一格。
+   */
+  function ctxMenuRects(): ScreenRect[] {
+    if (!ctxState) return [];
+    const el = document.querySelector<HTMLElement>('[data-od-id="ctx-menu"]');
+    return el ? [{ x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight }] : [];
+  }
+
+  /**
+   * 折叠期该吃指针的那一块（CSS px，窗口内）。
+   *
+   * **未贴边**时就是"画出来的那件东西"：圆球 = 球本身；圆角矩形 = 卡片，**有点列时**才并上右侧
+   * 那 30px（间距 10 + 点列 20）。只有一页时点列不画（`RectOrb` 的 `{#if pages.length > 1}`，
+   * 它拿的就是同一个 `rectPages`），那一列就一并交给桌面穿透 —— 不画也不吃指针的一列还占着，
+   * 用户看到的就是"点空处没反应"。反过来，点列一画出来就必须留在区域内（指针得能挪上去点它），
+   * 所以这个"收窄"只在**没有点列**时发生：`layout.body` 正是 `layout.widget` 减去那 30px
+   * （圆球那一档两者相同，`rectPages` 也是空的，同一条式子照样对）。
+   *
+   * **贴边收起**时用整块热区（`--zone-*` =「露出的那段 ∪ 完整悬浮体」）：悬浮体在它里面滑出去/
+   * 滑回来，区域**必须固定不动** —— 跟着悬浮体走的话，指针会被滑走的它甩到区域外，窗口当场穿透、
+   * hover 丢掉，悬浮体又滑回来，一进一出抖个不停。
+   */
+  function collapsedHitRects(): ScreenRect[] {
+    if (dockAxis.x !== 0 || dockAxis.y !== 0) return [{ ...orbZone }];
+    const w = rectPages.length > 1 ? layout.widget.w : layout.body.w;
+    return [{ x: orbOffset.x, y: orbOffset.y, w, h: layout.body.h }];
+  }
+
+  /**
+   * 报给后端的「可点区域」：窗口里该吃点击的那几个盒子（`hit_region.rs` 据此按指针位置开关
+   * 整窗穿透）。窗口比看得见的那件东西大一圈，而**透明像素照样算命中** —— 不报的话，那圈余量
+   * 会把点击全吃掉（压在下面的窗口收不到，焦点还会被抢走）。
+   *
+   * 取「当前会吃指针的东西」：
+   * - 面板期（含切窗口那一小段 `holdOrb`：面板还画着、窗口还没缩回去）：面板的可视盒，外加开着的
+   *   右键菜单（见 `ctxMenuRects`）。面板里的对话框/设置/选择框都挂在面板里，被它的
+   *   `overflow: hidden` 裁在面板内，不用另算。
+   * - 折叠期：见 `collapsedHitRects`。
+   *
+   * 这个 `$effect` 会在它读到的每一个状态变化时重跑（形态/偏移/贴边方向/页数/展开/右键菜单…），
+   * 所以区域是**动态**的：点列随设备增减出现或消失，那一列的可点性当场跟着变。
+   */
+  $effect(() => {
+    const rects: ScreenRect[] = expanded || holdOrb
+      ? [{ x: PANEL_SLACK, y: PANEL_SLACK, w: PANEL.w, h: PANEL.h }, ...ctxMenuRects()]
+      : collapsedHitRects();
+    void orbSetHitRegion(rects).catch((e) => console.error('设置可点区域失败:', e));
   });
 
   /**
@@ -951,7 +1015,7 @@
     picker = null;        // 选择框和右键菜单一样属于面板：收起即作废
     chat.setChatOpen(false);
     chat.closeRecipients();
-    chat.closeBatch();
+    chat.closePeek();
     toasts = [];          // 提示是面板上的浮层：收起即作废，别等下次展开又冒出来
     holdOrb = true;
     if (foldTimer) clearTimeout(foldTimer);
@@ -1131,7 +1195,7 @@
    * `pick_file(s) / pick_folder(s)`，没有混合模式。选择框自绘之后这一层就不需要了，
    * 用户可以先把一个文件勾上、再进另一层目录把整个文件夹勾上，一次推过去。
    */
-  function requestPushMany(devices: PeerDevice[]) {
+  function requestPushMany(devices: PeerDevice[], chatBatchId = '', groupId = '') {
     const live = devices.filter((d) => d.online);
     if (live.length === 0) {
       toast(devices.length === 1 ? `「${devices[0].name}」不在网上，推送未发送` : '所选设备都不在网上，推送未发送');
@@ -1141,7 +1205,7 @@
       title: `推送到${pushTargetsLabel(live)}`,
       sub: '文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。同一份内容会分别发给每台设备：已配对的直接收，未绑定的各自点同意，进度与成败都记在右下角那张卡片上。',
       confirmLabel: live.length > 1 ? `推送到 ${live.length} 台设备` : '推送',
-      onConfirm: (items) => void pushPicked(items, live),
+      onConfirm: (items) => void pushPicked(items, live, chatBatchId, groupId),
     };
   }
 
@@ -1158,15 +1222,16 @@
   }
 
   /** 推送确认：关框 → 把这批路径交给后端去送（取消时这里根本不会调到）。 */
-  async function pushPicked(items: LocalPick[], devices: PeerDevice[]) {
+  async function pushPicked(items: LocalPick[], devices: PeerDevice[], chatBatchId: string, groupId = '') {
     closePicker();
     if (items.length === 0) return;
     try {
       // 同一份清单发给每台：多选合并成**每台一条**推送（对端一张卡、一次同意、一条进度）。
       const batch = await pushPaths(items.map((i) => i.path), devices.map((d) => d.id));
       // 会话里也留一条（文件消息就是这次推送的状态行）—— 推了哪些项、走到哪一步，
-      // 落点只有一个：会话。
-      chat.noteOutgoingFiles(devices.map((d) => d.id), items, batch.batchId);
+      // 落点只有一个：会话。`chatBatchId` 非空时它归到那条「群发」的记录里，`groupId`
+      // 非空时归到群那条视图里（两者互斥）。
+      chat.noteOutgoingFiles(devices.map((d) => d.id), items, batch, chatBatchId, groupId);
     } catch (e) {
       toast(String(e));    // 全都不可达等：就地失败，不排队（F-53）
     }
@@ -1249,7 +1314,7 @@
       void chat.refresh();
     } else {
       chat.closeRecipients();
-      chat.closeBatch();
+      chat.closePeek();
     }
   }
 
@@ -1262,12 +1327,26 @@
       toast('该设备已被移除');
       return;
     }
-    chat.openConversation(peerId);
+    chat.openDeviceChat(peerId);
   }
 
-  /** 会话里「＋」：选文件就是推送（`requestPushMany` 那条路，一次选、分头发）。 */
-  function chatSendFiles(peerIds: string[]) {
-    requestPushMany(getDevices().filter((d) => peerIds.includes(d.id)));
+  /**
+   * 会话里「＋」：选文件就是推送（`requestPushMany` 那条路，一次选、分头发）。
+   *
+   * 目标是**当前开着的那条会话**的参与者 —— 一对一发给这一台；群发那条会话发给名单上的
+   * 每台，并把这批文件记到那份群发的记录里（`chatBatchId`）；群聊也是同一招：**拿群成员当
+   * 收件人跑一次多目标推送**（群里发文件没有单独的后端命令），本机这条记录挂上 `groupId`
+   * 就落在群那条视图里。名册成员要还在本机设备表里才推得动（推送是按设备寻址的），
+   * 不在的那些会在下面的过滤里掉出去。
+   */
+  function chatSendFiles() {
+    const t = chat.activeThread();
+    if (!t) return;
+    requestPushMany(
+      getDevices().filter((d) => t.participants.includes(d.id)),
+      t.mode === 'broadcast' ? t.id : '',
+      t.mode === 'group' ? t.id : '',
+    );
   }
 
   /** 会话菜单的「查看该设备文件」：切到那台设备的浏览标签（标签只给长连接设备开）。 */
@@ -1279,13 +1358,26 @@
     ctxState = { x, y, kind: 'chat', chatId: id, chatFull: full, chatSel: sel };
   }
 
-  function openConvoCtx(x: number, y: number) {
-    const peerId = chat.getOpenPeer();
-    if (!peerId) return;
+  /**
+   * 会话菜单（详情右上那颗「⋮」）：锚点 + **是哪个会话**交出去，菜单由 `ContextMenu`
+   * 按模式分（一对一：查看该设备文件 / 清空聊天记录；群发与群聊：编辑那份名单 / 删掉它）。
+   */
+  function openConvoCtx(x: number, y: number, key: string) {
+    const t = chat.activeThread();
+    if (!t || t.key !== key) return;
     // 「查看该设备文件」要有对方的**浏览标签**才成立（那个标签只给长连接设备开）：
     // 没长连接时挂上去只是个点了没反应的项。
-    const browse = getDevices().find((d) => d.id === peerId)?.connected === true;
-    ctxState = { x, y, kind: 'convo', peerId, convoBrowse: browse };
+    const browse = getDevices().find((d) => d.id === t.participants[0])?.connected === true;
+    ctxState = {
+      x,
+      y,
+      kind: 'convo',
+      convoKey: t.key,
+      convoPeerId: t.mode === 'direct' ? t.participants[0] : undefined,
+      convoThread: t.mode !== 'direct',
+      convoBc: t.mode === 'broadcast',
+      convoBrowse: t.mode === 'direct' && browse,
+    };
   }
 
   /** 消息菜单：复制整条 / 只复制选中的那段（与别处复制同一套：剪贴板 API + 失败提示）。 */
@@ -1309,25 +1401,70 @@
 
   /** 会话菜单的「查看该设备文件」：切到那台设备的浏览标签。 */
   function ctxConvoFiles() {
-    const id = ctxState?.peerId;
+    const id = ctxState?.convoPeerId;
     hideCtx();
     if (id) chatOpenDeviceFiles(id);
   }
 
-  /** 会话菜单的「清空聊天记录」：只清这一台那条记录，别的设备那份不受影响。 */
-  async function ctxConvoExit() {
-    const peerId = ctxState?.peerId;
-    const title = peerId ? chat.deviceNameOf(peerId) : '';
+  /** 会话菜单的「编辑收件人与群发名称 / 编辑参与者与群聊名称」：打开收件人选择框（模式锁定）。 */
+  function ctxConvoEdit() {
+    const key = ctxState?.convoKey;
     hideCtx();
-    if (!peerId) return;
+    if (key) chat.askParticipants(key);
+  }
+
+  /**
+   * 群发菜单的「升级为群聊」：拿这份名单的成员建一个**共享群**（之后任何成员发的消息，
+   * 所有成员都看得到 —— 群发做不到这件事）。
+   *
+   * **历史不迁**：群发那些消息在各端都只存在于 1:1 会话里，对端也从没见过"它们属于一个群"，
+   * 搬过来只会造出一份只有本机认的历史。新群从空开始（菜单项自己的 `title` 里写了这句）。
+   */
+  async function ctxConvoUpgrade() {
+    const key = ctxState?.convoKey;
+    hideCtx();
+    if (!key) return;
     try {
-      await chat.clearPeer(peerId);
+      const id = await chat.upgradeBatch(key);
+      if (id) toast('已升级为群聊：邀请已发出去，对方点「加入」后才算进群');
     } catch (e) {
       toast(String(e));
+    }
+  }
+
+  /**
+   * 会话菜单最后那一项：
+   * - 一对一 = 「清空聊天记录」：只清这一台那条记录，别的设备那份不受影响；
+   * - 群发 = 「删除群发」：删的是这份名单，**消息一条不动**（它们本来就在各台会话里）；
+   * - 群聊 = 「退出群聊」：本机从名册里退掉（后端收掉本机与这个群的关系），其余成员不受影响。
+   */
+  async function ctxConvoExit() {
+    const c = ctxState;
+    hideCtx();
+    if (!c?.convoKey) return;
+    if (!c.convoThread) {
+      const peerId = c.convoPeerId;
+      if (!peerId) return;
+      const title = chat.deviceNameOf(peerId);
+      try {
+        await chat.clearPeer(peerId);
+      } catch (e) {
+        toast(String(e));
+        return;
+      }
+      chat.backToList();
+      toast(`已清空与「${title}」的聊天记录`);
       return;
     }
-    chat.backToList();
-    toast(`已清空与「${title}」的聊天记录`);
+    try {
+      const gone = await chat.exitThread(c.convoKey);
+      if (!gone) return;
+      toast(gone.mode === 'broadcast'
+        ? `已删除「${gone.title}」（消息仍留在各台设备的会话里）`
+        : `已退出「${gone.title}」`);
+    } catch (e) {
+      toast(String(e));
+    }
   }
 
   /**
@@ -1411,7 +1548,12 @@
   function noticeBody(n: PushNotice): string {
     // 配对邀请：说清"点下去会发生什么" —— 接受即交换凭据、互为「已配对」。
     if (n.kind === 'pair') {
-      return '接受后两台设备互为「已配对」（互相交换凭据），之后就能建立长连接、互相推送；60 秒内未处理自动作废。';
+      // 没带凭据的那种（后端 `unproven`）要当场说清：用户是在"它可能真是那台老设备、
+      // 也可能不是"的前提下按「接收」的。
+      const warn = n.unproven
+        ? '注意：它自称是本机已配对的设备，却没带上本机发给它的凭据（它重新装过 / 解除过配对？）。接收即按它现在这个地址重新配对。'
+        : '';
+      return `${warn}接受后两台设备互为「已配对」（互相交换凭据），之后就能建立长连接、互相推送；60 秒内未处理自动作废。`;
     }
     if (n.kind === 'pairWait') {
       return `已把邀请推到「${n.from}」：它在自己的通知里点「接收」即配对成功。60 秒内没人处理自动作废。`;
@@ -1826,7 +1968,7 @@
       try {
         await Promise.all([settingsReady, loadDevices(), loadBcStatus()]);
         // 状态框的初始值跟着落盘的设置走（上次退出时是「离线」就还是「离线」）。
-        localOnline = getSettings()?.online ?? true;
+        noteLocalOnline(getSettings()?.online ?? true);
         const port = await getActualPort();
         if (port === 0) {
           const p = await startHttpServer();
@@ -1988,7 +2130,7 @@
     // 本机「在线 / 离线」变了：状态框是这份状态的镜像，事件到哪儿它跟到哪儿
     // （`setOnline` 的返回路径与这里都会走同一份值，重复设置是幂等的）。
     const unLocalOnline = listen<{ online: boolean }>('local://online', (ev) => {
-      localOnline = ev.payload.online;
+      noteLocalOnline(ev.payload.online);
     });
 
     // 状态框展开后，点别处 / 按 Esc 收起。用 **捕获阶段的 pointerdown**：标签栏、
@@ -2004,13 +2146,13 @@
     document.addEventListener('pointerdown', closeStatus, true);
     document.addEventListener('keydown', escStatus);
 
-    // Esc 的层级：收件人选择框 → 会话菜单 → 会话浮层（原型同款顺序）。
+    // Esc 的层级：接收方视角预览 → 收件人选择框 → 会话菜单 → 会话浮层（原型同款顺序）。
     // 会话菜单那一下必须由这里先处理：菜单自己的 Esc 监听是**后挂**的（组件随菜单挂载），
     // 它只会把菜单关掉；先一步把菜单关掉并 return，就不会连带把浮层也关了。
     const escChat = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || e.defaultPrevented) return;
+      if (chat.getPeek()) { chat.closePeek(); return; }
       if (chat.getRecipientReq()) { chat.closeRecipients(); return; }
-      if (chat.getBatch()) { chat.closeBatch(); return; }
       if (ctxState?.kind === 'chat' || ctxState?.kind === 'convo') { hideCtx(); return; }
       if (chat.isChatOpen()) chat.setChatOpen(false);
     };
@@ -2041,7 +2183,7 @@
 
     // 收到一条配对邀请 → 挂一条通知（带「接收/拒绝」），悬浮球左上角的数字 +1。
     // **不主动弹面板**：与推送邀请同一套约定（F-51），人来点那颗球。
-    const unPairInvite = listen<{ inviteId: string; peerId: string; peerName: string }>('pair://invite', (ev) => {
+    const unPairInvite = listen<{ inviteId: string; peerId: string; peerName: string; unproven?: boolean }>('pair://invite', (ev) => {
       const p = ev.payload;
       notices = [...notices, {
         inviteId: p.inviteId,
@@ -2053,6 +2195,7 @@
         isDir: false,
         count: 1,
         received: 0,
+        unproven: p.unproven === true,
       }];
     });
 
@@ -2129,7 +2272,7 @@
   class="orb-stage"
   class:open={expanded}
   class:live={connectedCount > 0}
-  class:offline={!localOnline}
+  class:offline={!isLocalOnline()}
   class:drag={dragging}
   class:hold={holdOrb}
   class:docked={rectDock !== 0}
@@ -2195,18 +2338,18 @@
              左右半圆；展开时是高两倍的矩形、同一个 14px 圆角。展开时框盖在标签栏上，
              面板头自己不跟着变高（框绝对定位贴着头部的上沿长）。 -->
         <div class="ch-wrap" bind:this={statusEl}>
-          <div class="ch-inst" class:open={statusOpen} class:off={!localOnline}>
+          <div class="ch-inst" class:open={statusOpen} class:off={!isLocalOnline()}>
             <div class="ch-list">
-              <button class="ch-row online" class:active={localOnline} aria-expanded={localOnline ? statusOpen : undefined} onclick={() => pickOnline(true)}>
+              <button class="ch-row online" class:active={isLocalOnline()} aria-expanded={isLocalOnline() ? statusOpen : undefined} onclick={() => pickOnline(true)}>
                 <span class="dot ok"></span>
                 <span>在线</span>
                 <!-- 与改前那颗胶囊同款文案：`在线 · 长连接 N`。本机离线时那台设备一条长连接
                      都没有，写出来只是噪音 —— 所以整段**藏起来**（`visibility`）而不是删掉：
                      元素仍占着同样的宽度，切到离线时框不会缩一截。 -->
-                <span class="ch-meta" class:gone={!localOnline}>· 长连接 {connectedCount}</span>
+                <span class="ch-meta" class:gone={!isLocalOnline()}>· 长连接 {connectedCount}</span>
                 <svg class="ch-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
               </button>
-              <button class="ch-row offline" class:active={!localOnline} aria-expanded={!localOnline ? statusOpen : undefined} onclick={() => pickOnline(false)}>
+              <button class="ch-row offline" class:active={!isLocalOnline()} aria-expanded={!isLocalOnline() ? statusOpen : undefined} onclick={() => pickOnline(false)}>
                 <span class="dot off"></span>
                 <span>离线</span>
                 <svg class="ch-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
@@ -2521,6 +2664,9 @@
     {#if chat.getRecipientReq()}
       <RecipientDialog />
     {/if}
+    {#if chat.getPeek()}
+      <PeekDialog />
+    {/if}
 
     <!-- 文件选择框：文件与文件夹在同一个框里混选、选中项跨目录累积。推送与「添加共享项」
          都用它 —— 开成什么样由 `picker` 这个请求对象决定（`closePicker` 关掉它）。 -->
@@ -2562,6 +2708,8 @@
     bcThisStaged={bcMenu.thisStaged}
     chatSel={!!ctxState.chatSel}
     convoBrowse={ctxState.convoBrowse === true}
+    convoThread={ctxState.convoThread === true}
+    convoBc={ctxState.convoBc === true}
     onClose={hideCtx}
     onToast={toast}
     onDownload={ctxDownload}
@@ -2575,6 +2723,8 @@
     onMessage={ctxMessage}
     onChatCopy={ctxChatCopy}
     onConvoFiles={ctxConvoFiles}
+    onConvoEdit={ctxConvoEdit}
+    onConvoUpgrade={() => void ctxConvoUpgrade()}
     onConvoExit={() => void ctxConvoExit()}
     onPeerDownload={ctxPeerDownload}
     onBcCompare={ctxBcCompare}
