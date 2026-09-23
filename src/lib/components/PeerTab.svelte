@@ -102,7 +102,7 @@
     <div class="d-name">{device.name}</div>
     <div class="d-ip num">{device.ip}:{device.port}</div>
   </div>
-  <span class="state-chip connected"><span class="dot ok"></span>长连接</span>
+  <span class="state-chip live"><span class="dot live"></span>长连接</span>
   <button class="icon-btn" onclick={refresh} aria-label="刷新共享项" title="刷新共享项">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5"/></svg>
   </button>

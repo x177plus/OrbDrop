@@ -6,6 +6,8 @@ pub mod credential;
 pub mod discover;
 pub mod drag;
 pub mod fs_browse;
+pub mod group;
+pub mod hit_region;
 pub mod log;
 pub mod mirror;
 pub mod net;
@@ -135,6 +137,9 @@ pub struct UpdateSettingsRequest {
     /// 字段缺失 = 沿用 `Config` 的缺省（关），不是替用户打开。
     #[serde(default)]
     pub auto_broadcast_new: bool,
+    /// 是否允许本机为群聊中转消息（设置里的「允许为群聊中转消息」，默认关）。
+    #[serde(default)]
+    pub group_relay: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +327,7 @@ async fn update_settings(
             .filter(|p| !p.as_os_str().is_empty());
         config.orb_shape = req.orb_shape;
         config.auto_broadcast_new = req.auto_broadcast_new;
+        config.group_relay = req.group_relay;
         config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
     }
 
@@ -334,21 +340,34 @@ async fn update_settings(
         }
     }
 
-    // Device name changed → re-register mDNS (drop existing daemon, re-register).
+    let name_changed = req.device_name != old_name;
+    let port_changed = req.port != old_port;
+
+    // Device name changed（端口没动）→ 重注册 mDNS（丢掉旧 daemon、按新参数再注册一个）。
+    // 播的是**实际**绑定端口，不是配置端口：配置端口被占时服务器会顺延到 +1..+10，
+    // 播配置值等于给对端一个没人听的地址。
     // 离线时**不**重新注册：现在的状态就是"没有广播"（`set_online` 已经把 daemon 丢掉了），
     // 重注册等于替用户改回在线。
-    if req.device_name != old_name && state.is_online() {
-        register_mdns(state.inner(), req.port);
+    if name_changed && !port_changed && state.is_online() {
+        register_mdns(state.inner(), bound_port(state.inner()));
     }
 
-    // Port changed → restart HTTP server
-    if req.port != old_port {
+    // Port changed → 重启 HTTP 服务器，**再按重启后实际绑定的端口重播 mDNS**。
+    // 两件事必须成对：只重启不重播的话，广播里留着旧端口，而对端是拿广播里的端口当
+    // 拨号目标的（5s 探活不刷新端口），它会一直拨一个没人听的地址 —— 直到本机重启，
+    // 或用户切一次「离线→在线」（那条路会用 `bound_port` 重注册）。
+    if port_changed {
         let arc_state = state.inner().clone();
         let _ = tokio::spawn(async move {
             server::stop_server(&arc_state).await;
-            match server::ensure_server(arc_state).await {
+            match server::ensure_server(arc_state.clone()).await {
                 Ok(port) => {
                     info!(port, "HTTP server restarted");
+                    // 广播跟着重启后的端口走（配置端口还被占的话会再顺延一次）；
+                    // 离线时照旧不播。
+                    if arc_state.is_online() {
+                        register_mdns(&arc_state, port);
+                    }
                     let _ = app.emit(ws::events::ui::SERVER_STARTED, port);
                 }
                 Err(e) => {
@@ -556,6 +575,9 @@ pub(crate) fn apply_online(
     if online {
         register_mdns(arc, bound_port(arc));
         ws::restore_links_on_startup(arc);
+        // 离线期间对端收不到任何东西（本机整个路由回 503），够不着的那些消息在排队：
+        // 切回在线就把它们发出去（"在途"的那些不退 —— 它们是真的在飞）。
+        chat::flush_all_queued(arc);
     } else {
         unregister_mdns(arc);
         arc.ws.drop_all();
@@ -768,6 +790,9 @@ async fn pair_confirm(peer_id: String, code: String, state: State<'_, Arc<AppSta
     let own_id = state.config.lock().device_id.clone();
     let own_name = state.config.lock().device_name.clone();
 
+    // 用户点了「配对」= 明确要（重新）建立关系：这个地址上钉着的旧指纹先让位，
+    // 否则这次拨号会在 TLS 那一跳被"指纹不一致"直接拒掉（见 `pair::forget_stale_pin`）。
+    pair::forget_stale_pin(&state, &peer_id);
     let url = format!("{}/pair", net::peer_base(&peer.ip, peer.port));
     // Our own HTTP port: the peer we post to may be the side that dials the WS
     // link (smaller device id) and it has no other way to learn our address.
@@ -910,25 +935,39 @@ async fn cancel_receive(invite_id: String, state: State<'_, Arc<AppState>>) -> R
 // 会话（聊天）
 // ---------------------------------------------------------------------------
 
-/// 会话的整份状态。面板打开时拉一次，之后由 `chat://changed` 推进（载荷是同一个形状）。
+/// 会话的整份状态（**一对一 + 群**）。面板打开时拉一次，之后由 `chat://changed` 推进
+/// （载荷是同一个形状）。
 #[tauri::command]
-fn chat_snapshot(state: State<'_, Arc<AppState>>) -> chat::Snapshot {
-    state.chat.snapshot()
+fn chat_snapshot(state: State<'_, Arc<AppState>>) -> group::Snapshot {
+    group::snapshot(&state)
 }
 
-/// 发一条文本消息给一台或多台设备（多台 = 界面上那个「群发」框）；返回整份会话快照。
+/// `chat_send` 的返回：这条消息的 id + 它挂在哪份群发名单上 + 整份状态。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatSendView {
+    pub id: String,
+    /// `None` = 一对一发的；否则是那份群发名单的 id。
+    pub batch_id: Option<String>,
+    pub snapshot: group::Snapshot,
+}
+
+/// 发一条文本消息给一台或多台设备；返回整份会话快照 + 这条消息的 id。
 ///
-/// 一台设备存一份副本（**同一个消息 id**，各带各的送达状态）：群发给 B、C 之后，会话列表里
-/// 就是「与 B」「与 C」两条，各自带着这条消息；"送到了几台"由同一个 id 的几份副本拼出来。
-/// **没有群这个实体** —— 对端收到的是一条普通消息，回复各自回到与发送方的 1:1。
+/// 一台设备存一份副本（**同一个消息 id**，各带各的送达状态）：群发给 B、C 之后，「与 B」
+/// 「与 C」两条会话各自带着这条消息（1:1 是"与这台设备的完整往来"），"群发 · 名字"那条则是
+/// "我发给这几台的记录"（按副本上的 `batchId` 筛）。
+/// **对端永远只收到一条普通消息**（它不知道也不需要在某个"群"里），回复各自回到与发送方的 1:1。
 ///
+/// `batch_id` = 从哪个群发里发的（空 = 一次新的群发：按成员集合复用已有名单，没有就新建）。
 /// 落账与逐台投递都在 `chat::send_text`（集成测试与这里共用同一条路）。
 #[tauri::command]
 fn chat_send(
     peer_ids: Vec<String>,
     text: String,
+    batch_id: Option<String>,
     state: State<'_, Arc<AppState>>,
-) -> Result<chat::SendResult, String> {
+) -> Result<ChatSendView, String> {
     ensure_online(&state)?;
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -945,26 +984,158 @@ fn chat_send(
     if targets.is_empty() {
         return Err("收件人不存在".to_string());
     }
-    let (snapshot, id) = chat::send_text(&state, &targets, &text);
-    ws::emit_ui(&state, ws::events::ui::CHAT_CHANGED, &chat::snapshot_value(&snapshot));
-    Ok(chat::SendResult { id, snapshot })
+    let result = chat::send_text(&state, &targets, &text, batch_id.as_deref());
+    group::emit(&state);
+    Ok(ChatSendView {
+        id: result.id,
+        batch_id: result.batch_id,
+        snapshot: group::snapshot(&state),
+    })
 }
 
 /// 界面读过这些设备的会话：推进本地已读水位，并给对端回一条已读回执。
 #[tauri::command]
-fn chat_mark_read(peer_ids: Vec<String>, state: State<'_, Arc<AppState>>) -> chat::Snapshot {
+fn chat_mark_read(peer_ids: Vec<String>, state: State<'_, Arc<AppState>>) -> group::Snapshot {
     chat::mark_read(&state, &peer_ids);
-    let snap = state.chat.snapshot();
-    ws::emit_ui(&state, ws::events::ui::CHAT_CHANGED, &chat::snapshot_value(&snap));
-    snap
+    group::emit(&state);
+    group::snapshot(&state)
+}
+
+/// 会话（聊天）命令的返回里那一小截：这份群发名单的 id + 整份快照。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRef {
+    pub id: String,
+    pub snapshot: group::Snapshot,
+}
+
+/// 「这批设备」用哪份群发名单：点名了 `id` 就用它（并把成员更新成这次选的这几台），
+/// 没点名就按成员集合复用一份、都没有再新建（名字留空，随后由 `chat_batch_rename` 命名）。
+///
+/// 两条路都走它：**新建群发**（不点名 → 复用/新建）与会话里的**「编辑收件人」**（点名 →
+/// 成员当场落定，不必等到下次发送）。`id` 已经不在名单里（另一边删掉了）时按"没点名"走。
+#[tauri::command]
+fn chat_batch_ensure(members: Vec<String>, id: Option<String>, state: State<'_, Arc<AppState>>) -> BatchRef {
+    let id = state.chat.resolve_batch(id.as_deref(), &members);
+    group::emit(&state);
+    BatchRef { id, snapshot: group::snapshot(&state) }
+}
+
+/// 改群发的名字（新建时命名 / 会话里的「编辑收件人与群发名称」）。名字留空 = 「群发 · 未命名群发」。
+#[tauri::command]
+fn chat_batch_rename(id: String, name: String, state: State<'_, Arc<AppState>>) -> group::Snapshot {
+    state.chat.rename_batch(&id, &name);
+    group::emit(&state);
+    group::snapshot(&state)
+}
+
+/// 删掉一份群发名单（会话菜单里的「删除群发」）。**消息一条不动**：它们本来就在各台会话里。
+#[tauri::command]
+fn chat_batch_delete(id: String, state: State<'_, Arc<AppState>>) -> group::Snapshot {
+    state.chat.delete_batch(&id);
+    group::emit(&state);
+    group::snapshot(&state)
 }
 
 /// 清空与一台设备的聊天记录（会话菜单里的「清空聊天记录」）。
 #[tauri::command]
-fn chat_clear(peer_id: String, state: State<'_, Arc<AppState>>) -> chat::Snapshot {
-    let snap = state.chat.clear_peer(&peer_id);
-    ws::emit_ui(&state, ws::events::ui::CHAT_CHANGED, &chat::snapshot_value(&snap));
-    snap
+fn chat_clear(peer_id: String, state: State<'_, Arc<AppState>>) -> group::Snapshot {
+    state.chat.clear_peer(&peer_id);
+    group::emit(&state);
+    group::snapshot(&state)
+}
+
+// ---------------------------------------------------------------------------
+// 群聊（共享群）
+// ---------------------------------------------------------------------------
+//
+// 与「群发」的区别：群发是**一批收件人**（对端只看到一条普通私聊，成员之间互不可见）；
+// 群聊是**一个共享的群**（名册 + 群消息，群里任何一台发的消息所有成员都能看到）。
+// 群成员**不需要配对**（D6=b）：名册里只有 id 与名字，投递走长连接优先、HTTP 兜底。
+
+/// 群聊命令的返回里那一小截：这个群（或这条消息）的 id + 整份状态。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupRef {
+    pub id: String,
+    pub snapshot: group::Snapshot,
+}
+
+/// 新建一个共享群聊：名册当场定下来并广播给每个成员。
+///
+/// 对方收到名册 = 界面上一张**邀请卡**，点了「加入」才算进群（未知群的第一份名册要人确认）。
+#[tauri::command]
+fn group_create(members: Vec<String>, name: String, state: State<'_, Arc<AppState>>) -> Result<GroupRef, String> {
+    let id = group::create(&state, &members, &name).ok_or_else(|| "至少要选一台设备".to_string())?;
+    group::emit(&state);
+    Ok(GroupRef { id, snapshot: group::snapshot(&state) })
+}
+
+/// 改群名 / 加减成员：名册版本 +1 后广播（对等的 LWW：任何成员都能改，冲突留一个胜者）。
+#[tauri::command]
+fn group_edit(id: String, members: Vec<String>, name: String, state: State<'_, Arc<AppState>>) -> Result<group::Snapshot, String> {
+    if !group::edit(&state, &id, &members, &name) {
+        return Err("群聊不存在".to_string());
+    }
+    group::emit(&state);
+    Ok(group::snapshot(&state))
+}
+
+/// 在群里发一条文本（每台各一份；够不着的排队等它上线）。
+#[tauri::command]
+fn group_send(id: String, text: String, state: State<'_, Arc<AppState>>) -> Result<GroupRef, String> {
+    ensure_online(&state)?;
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("消息为空".to_string());
+    }
+    let msg_id = group::send_text(&state, &id, &text).ok_or_else(|| "本机不在这个群里".to_string())?;
+    Ok(GroupRef { id: msg_id, snapshot: group::snapshot(&state) })
+}
+
+/// 界面读过这个群：推进本地读位，并给每个成员回一条**逐发送者水位**的已读回执。
+#[tauri::command]
+fn group_mark_read(id: String, state: State<'_, Arc<AppState>>) -> group::Snapshot {
+    group::mark_read(&state, &id);
+    group::snapshot(&state)
+}
+
+/// 打开群会话时拉一次："我缺的那些，向能连上的成员要一遍"（补拉）。
+///
+/// 拿回来的东西**不是这一条命令的返回**：它由那一跳异步落账，落完照常推 `chat://changed`。
+/// 所以这里只负责"叫一次"（自带闸门与冷却，重复调是安全的），返回当前这份状态。
+#[tauri::command]
+fn group_sync(id: String, state: State<'_, Arc<AppState>>) -> group::Snapshot {
+    group::sync_group(&state, &id);
+    group::snapshot(&state)
+}
+
+/// 用户点了邀请卡上的「加入」。
+#[tauri::command]
+fn group_join(id: String, state: State<'_, Arc<AppState>>) -> Result<group::Snapshot, String> {
+    if !group::accept(&state, &id) {
+        return Err("邀请已经不在列表里了".to_string());
+    }
+    group::emit(&state);
+    Ok(group::snapshot(&state))
+}
+
+/// 用户点了「不加入」：记住这个决定，之后这个群的事件直接忽略。
+#[tauri::command]
+fn group_dismiss(id: String, state: State<'_, Arc<AppState>>) -> group::Snapshot {
+    group::dismiss(&state, &id);
+    group::emit(&state);
+    group::snapshot(&state)
+}
+
+/// 退出群聊：本地删掉，并把"没有本机了"的名册广播给其他成员。
+#[tauri::command]
+fn group_leave(id: String, state: State<'_, Arc<AppState>>) -> Result<group::Snapshot, String> {
+    if !group::leave(&state, &id) {
+        return Err("群聊不存在".to_string());
+    }
+    group::emit(&state);
+    Ok(group::snapshot(&state))
 }
 
 // ---------------------------------------------------------------------------
@@ -1276,6 +1447,16 @@ fn orb_mouse_down() -> bool {
     orb_window::mouse_down()
 }
 
+/// 窗口里「吃点击」的那几块（CSS px，窗口左上角为原点）。
+///
+/// 窗口比看得见的那件东西大一圈（四周是 `--shadow` 的余量），而透明像素在 Windows 上照样算
+/// 命中 —— 余量里那一下点击会被我们的窗口吃掉，压在下面的东西收不到。所以由界面报「当前该吃
+/// 指针的是哪几个盒子」，后端按指针位置开关整窗的 `WS_EX_TRANSPARENT`（见 `hit_region`）。
+#[tauri::command]
+fn orb_set_hit_region(window: WebviewWindow, rects: Vec<hit_region::RegionRect>) -> Result<(), String> {
+    hit_region::set_region(&window, rects)
+}
+
 /// 记录悬浮体**本体中心**（球心 / 卡片白底中心；物理像素）：下次启动复原到同一位置（F-74）。
 ///
 /// 由界面在**几何落定之后**调用（拖动松手 → 吸附判定跑完 → 窗口不再动），见 App.svelte
@@ -1453,6 +1634,9 @@ fn setup_server_task(app: &AppHandle) {
                                     if !was_online {
                                         ws::redial_if_remembered(&s2, &id);
                                     }
+                                    // 刚才这一行还可能只是"把地址补上了"（之前地址簿里没有它，
+                                    // 所以够不着只能排队）—— 现在有地址了，把排队的消息发出去。
+                                    crate::chat::flush_queued(&s2, &id);
 
                                     // 一个地址上只能有一个身份：对端被重置过（数据目录
                                     // 清了 → 换了 device id）时，本机为旧 id 存的那一行
@@ -1475,6 +1659,11 @@ fn setup_server_task(app: &AppHandle) {
                     // 恢复上次关机时的长连接（F-16）：地址簿里记着"还连着"的设备自动
                     // 拨回来——用户不用重新点一遍「连接」。
                     ws::restore_links_on_startup(&arc_state);
+
+                    // 上次关机/强杀时还走在 HTTP 那一跳上的消息：那次尝试已经随进程没了 —— 退回落定的档，
+                    // 再给每一台欠着的设备叫一次补发（对端一回应就会收到）。
+                    chat::requeue_inflight(&arc_state);
+                    chat::flush_all_queued(&arc_state);
 
                     // Liveness backstop: mDNS only reports a departure when the peer
                     // sends goodbye or its records expire (up to ~2 min), and a
@@ -1504,6 +1693,24 @@ fn setup_server_task(app: &AppHandle) {
                     if arc_state.config.lock().auto_start {
                         let _ = autostart::enable_autostart();
                     }
+
+                    // 群聊补拉的**兜底节拍**：链路上线、对端被判在线、消息跳号都会立刻触发
+                    // 一次，但"跨网段时对手握消息的那个中间节点"未必会有这些事件（它可能
+                    // 一直在网、只是本机与它之间没有新消息）。每 60s 扫一遍，让每个成员各向
+                    // 自己的邻居要一次 —— 缺的那一段就是靠这一拍顺着链路传过来的。
+                    //
+                    // 每（群，设备）自带 3s 冷却与轮数上限（`group::sync_gate_open`），
+                    // 所以重复触发不会变成刷接口。
+                    let sync_state = arc_state.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                            if !sync_state.is_online() {
+                                continue;
+                            }
+                            group::sync_all(&sync_state);
+                        }
+                    });
                 }
                 Err(e) => {
                     error!("Failed to start HTTP server: {e}");
@@ -1555,19 +1762,35 @@ pub fn run() {
 
     let state = Arc::new(AppState::new(config, config_path));
 
-    tauri::Builder::default()
-        // 单实例：第二份进程由插件负责收敛，**不能**让它自己静默退出 ——
-        // 那在用户侧就是"启动一下就闪退"，而且什么提示都没有。这里把它变成
-        // "把已在运行的实例叫到台面上来"（悬浮球面板直接展开）。
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            info!("另一实例被启动：把本实例调到前台并展开面板");
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.show();
-                let _ = win.unminimize();
-                let _ = win.set_focus();
-                let _ = win.emit(ws::events::ui::ORB_SHOW, ());
-            }
-        }))
+    let builder = tauri::Builder::default();
+
+    // 单实例：第二份进程由插件负责收敛，**不能**让它自己静默退出 ——
+    // 那在用户侧就是"启动一下就闪退"，而且什么提示都没有。这里把它变成
+    // "把已在运行的实例叫到台面上来"（悬浮球面板直接展开）。
+    //
+    // 例外：`ORBDROP_ALLOW_MULTI=1` 时不挂这个插件 —— 一台机器上多开几份当"几台设备"
+    // 是联调最省事的路子（真机验证"群发"至少要三个实例：A 发给 B、C）。多开时**每份
+    // 必须有自己的 `ORBDROP_DATA_DIR` 和端口**：单实例锁按应用标识符取（插件在 Windows
+    // 上开的是 `{identifier}-sim` 命名互斥体），同一个 exe 天然共享它，所以只能靠这个开关。
+    let single_instance = std::env::var_os("ORBDROP_ALLOW_MULTI").is_none();
+    let builder = {
+        if single_instance {
+            builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+                info!("另一实例被启动：把本实例调到前台并展开面板");
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.unminimize();
+                    let _ = win.set_focus();
+                    let _ = win.emit(ws::events::ui::ORB_SHOW, ());
+                }
+            }))
+        } else {
+            warn!("ORBDROP_ALLOW_MULTI 已设置：跳过单实例约束（本机多开，各自的数据目录/端口必须分开）");
+            builder
+        }
+    };
+
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1614,7 +1837,18 @@ pub fn run() {
             chat_snapshot,
             chat_send,
             chat_mark_read,
+            chat_batch_ensure,
+            chat_batch_rename,
+            chat_batch_delete,
             chat_clear,
+            group_create,
+            group_edit,
+            group_send,
+            group_mark_read,
+            group_sync,
+            group_join,
+            group_dismiss,
+            group_leave,
             download_from_peer,
             download_file,
             download_and_open,
@@ -1628,6 +1862,7 @@ pub fn run() {
             orb_set_rect,
             orb_drag_start,
             orb_mouse_down,
+            orb_set_hit_region,
             orb_save_center,
         ])
         .setup(|app| {

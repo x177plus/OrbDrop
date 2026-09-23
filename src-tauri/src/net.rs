@@ -236,12 +236,36 @@ impl Trust {
     /// 用「地址 → 指纹」重建这份表（启动时、配对成功/解除配对后各调一次）。
     ///
     /// 整份替换而不是增量合并：地址簿与凭据库才是真相，这里只是一份供握手线程只读的快照。
+    ///
+    /// **同一个地址上出现两枚不同指纹 = 不钉**（并留一行 warn）。这种事只可能来自"本机台账
+    /// 里有两台已配对设备共用一个地址"（对端重装换了 id、地址被另一台机器接手、上次配对
+    /// 留下的残影）。随便挑一个钉住，另一台就永远被"指纹不一致"挡在门外，而且那条错误
+    /// 只在日志里 —— 表现就是"这台设备怎么都连不上，重新配对也没用"。不钉 = 退到 TOFU，
+    /// 下一次成功连线会把真正的那枚认下来（同时 `remember_peer_fingerprint` 落库）。
     pub fn seed(&self, entries: impl IntoIterator<Item = (String, String)>) {
-        let mut map = HashMap::new();
+        let mut map: HashMap<StdIpAddr, String> = HashMap::new();
+        let mut conflicted: Vec<StdIpAddr> = Vec::new();
         for (ip, fp) in entries {
-            if let Ok(ip) = ip.parse::<StdIpAddr>() {
-                map.insert(ip, fp);
+            let Ok(ip) = ip.parse::<StdIpAddr>() else { continue };
+            match map.get(&ip) {
+                Some(existing) if *existing != fp => {
+                    if !conflicted.contains(&ip) {
+                        warn!(
+                            %ip,
+                            pinned = %short_fingerprint(existing),
+                            seen = %short_fingerprint(&fp),
+                            "同一地址上钉着两枚不同指纹：这一轮不钉它（退到 TOFU，下次连上重新认）"
+                        );
+                        conflicted.push(ip);
+                    }
+                }
+                _ => {
+                    map.insert(ip, fp);
+                }
             }
+        }
+        for ip in conflicted {
+            map.remove(&ip);
         }
         *self.pinned.lock() = map;
     }
@@ -661,6 +685,27 @@ mod tests {
             short_fingerprint("0123456789abcdef0123"),
             "0123-4567-89AB-CDEF"
         );
+    }
+
+    /// 同一地址两枚不同指纹：**一枚都不钉**（挑一枚就会把另一台永远挡在门外）；
+    /// 只有一枚时照旧钉住。
+    #[test]
+    fn seed_refuses_an_ambiguous_address() {
+        let trust = Trust::new();
+        trust.seed([
+            ("10.0.0.9".to_string(), "aa".to_string()),
+            ("10.0.0.9".to_string(), "bb".to_string()),
+            ("10.0.0.8".to_string(), "cc".to_string()),
+        ]);
+        assert_eq!(trust.get("10.0.0.9".parse().unwrap()), None, "有歧义的地址不钉");
+        assert_eq!(
+            trust.get("10.0.0.8".parse().unwrap()).as_deref(),
+            Some("cc"),
+            "没歧义的照旧钉"
+        );
+        // 歧义消失（比如那台旧的被解除配对了）→ 下一轮 seed 就正常钉上。
+        trust.seed([("10.0.0.9".to_string(), "bb".to_string())]);
+        assert_eq!(trust.get("10.0.0.9".parse().unwrap()).as_deref(), Some("bb"));
     }
 
     #[test]

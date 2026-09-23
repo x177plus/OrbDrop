@@ -72,8 +72,19 @@
     --accent-soft:  color-mix(in oklch, var(--accent) 13%, transparent);
     --fg-soft:      color-mix(in oklch, var(--fg) 6%, transparent);
     --ok-soft:      color-mix(in oklch, var(--ok) 13%, transparent);
-    --accent-deep:  color-mix(in oklch, var(--accent) 82%, black);
+--accent-deep:  color-mix(in oklch, var(--accent) 82%, black);
     --accent-deeper: color-mix(in oklch, var(--accent) 74%, black);
+
+    /* 消息模式语义色：群发为信号暖色，群聊发言人取自同一饱和度的三枚色相 */
+    --bc:            oklch(58% 0.15 38);
+    --bc-soft:       color-mix(in oklch, var(--bc) 13%, transparent);
+    --bc-deep:       color-mix(in oklch, var(--bc) 74%, black);
+    --sp-1:          oklch(58% 0.18 255);
+    --sp-2:          oklch(56% 0.14 158);
+    --sp-3:          oklch(56% 0.16 320);
+    --sp-1-deep:     color-mix(in oklch, var(--sp-1) 74%, black);
+    --sp-2-deep:     color-mix(in oklch, var(--sp-2) 74%, black);
+    --sp-3-deep:     color-mix(in oklch, var(--sp-3) 74%, black);
 
 --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
     --font-body:    -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
@@ -878,11 +889,186 @@ font-family: var(--font-body);
   .chat-input::placeholder { color: var(--muted); }
   .chat-input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
 
-  
+  /* ─── 消息模式：单向群发 / 共享群聊 ─────────────────────── */
+  .conv-headgroup { display: grid; min-width: 0; }
+
+  .convo-mode {
+    display: flex; align-items: center; gap: 7px;
+    padding: 6px 12px;
+    font-size: var(--fs-xs); line-height: 1.5;
+    border-bottom: 1px solid var(--border);
+  }
+  .convo-mode[hidden] { display: none !important; }
+  .convo-mode[data-mode="broadcast"] { background: var(--bc-soft); color: var(--bc-deep); }
+  .convo-mode[data-mode="group"] { background: var(--accent-soft); color: var(--accent-deep); }
+  .convo-mode .cm-ic { flex: none; display: grid; place-items: center; }
+  .convo-mode .cm-ic svg { width: 14px; height: 14px; }
+  .convo-mode .cm-txt { flex: 1; min-width: 0; }
+  .convo-mode .cm-txt b { font-weight: 650; }
+  .convo-mode .cm-live {
+    flex: none; display: inline-flex; align-items: center; gap: 5px;
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.05em; opacity: 0.9;
+  }
+  .convo-mode .cm-live i {
+    width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+    animation: cm-live 2.2s ease-out infinite;
+  }
+  @keyframes cm-live { 0% { transform: scale(0.75); opacity: 0.5; } 70%, 100% { transform: scale(1.7); opacity: 0; } }
+  .convo-mode .cm-act {
+    flex: none; height: 22px; padding: 0 9px; border-radius: 999px;
+    border: 1px solid color-mix(in oklch, currentColor 38%, transparent);
+    color: inherit; font-size: var(--fs-xxs); font-weight: 600;
+    transition: background 0.15s ease;
+  }
+  .convo-mode .cm-act:hover { background: color-mix(in oklch, currentColor 14%, transparent); }
+
+  /* 会话列表：三种身份各一套头像 —— 私聊=设备首字母（浅底），群聊=实心主色多人图标，群发=暖色底喇叭图标 */
+  .convo-avs .d-avatar.bc-mark {
+    background: var(--bc-soft); color: var(--bc-deep);
+    border-color: color-mix(in oklch, var(--bc) 30%, transparent);
+  }
+  .convo-avs .d-avatar.bc-mark svg { width: 18px; height: 18px; }
+  .convo-avs .d-avatar.grp-mark {
+    background: var(--accent-deep); color: var(--surface);
+    border-color: var(--accent-deep);
+  }
+  .convo-avs .d-avatar.grp-mark svg { width: 18px; height: 18px; }
+  .convo-mode-chip {
+    flex: none; display: inline-flex; align-items: center; gap: 3px;
+    height: 16px; padding: 0 6px; border-radius: 999px;
+    font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.04em;
+  }
+  .convo-mode-chip svg { width: 10px; height: 10px; }
+  .convo-mode-chip.bc { background: var(--bc-soft); color: var(--bc-deep); }
+  .convo-mode-chip.group { background: var(--accent-soft); color: var(--accent-deep); }
+
+  /* 群聊：发言人身份（名称 + 头像 + 语义色），按人分组只出现一次 */
+  .chat-who { display: flex; align-items: center; gap: 5px; margin: 3px 2px 4px; }
+  .chat-who .cw-av {
+    width: 18px; height: 18px; flex: none; border-radius: 6px;
+    display: grid; place-items: center;
+    font-family: var(--font-display); font-size: 9px; font-weight: 650;
+    color: var(--surface);
+  }
+  .chat-who .cw-nm { font-family: var(--font-display); font-size: var(--fs-xxs); font-weight: 620; }
+  .chat-who.sp-1 .cw-av { background: var(--sp-1-deep); }
+  .chat-who.sp-1 .cw-nm { color: var(--sp-1-deep); }
+  .chat-who.sp-2 .cw-av { background: var(--sp-2-deep); }
+  .chat-who.sp-2 .cw-nm { color: var(--sp-2-deep); }
+  .chat-who.sp-3 .cw-av { background: var(--sp-3-deep); }
+  .chat-who.sp-3 .cw-nm { color: var(--sp-3-deep); }
+
+  /* 群发：单向台账 + 逐设备送达回执 + 接收方视角入口 */
+  .chat-ledger { display: flex; align-items: center; gap: 8px; padding: 4px 2px 2px; }
+  .chat-ledger .cl-line { flex: 1; height: 1px; background: var(--border); }
+  .chat-ledger .cl-txt {
+    flex: none; font-family: var(--font-mono); font-size: 10px;
+    letter-spacing: 0.06em; color: var(--bc-deep);
+  }
+  .chat-msg.bc .chat-bubble { background: var(--bc-deep); }
+  .chat-receipt {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 4px 6px;
+    margin-top: 5px; padding: 6px 8px; max-width: 100%;
+    border: 1px solid color-mix(in oklch, var(--bc) 26%, var(--border));
+    border-radius: 10px; background: var(--surface);
+  }
+  .cr-head { flex: none; font-family: var(--font-mono); font-size: 10px; color: var(--bc-deep); }
+  .cr-list { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+  .cr-dev {
+    display: inline-flex; align-items: center; gap: 4px; max-width: 132px;
+    height: 18px; padding: 0 6px 0 3px; border-radius: 999px;
+    border: 1px solid var(--border); font-size: var(--fs-xxs); color: var(--fg);
+  }
+  .cr-dev .cr-av {
+    flex: none; width: 13px; height: 13px; border-radius: 4px;
+    display: grid; place-items: center;
+    font-family: var(--font-display); font-size: 8px; font-weight: 700;
+    color: var(--surface); background: var(--muted);
+  }
+  .cr-dev .cr-nm { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cr-dev .cr-ic { flex: none; display: grid; place-items: center; color: var(--ok); }
+  .cr-dev .cr-ic svg { width: 9px; height: 9px; }
+  .cr-dev.off { color: var(--warn); border-color: color-mix(in oklch, var(--warn) 40%, var(--border)); }
+  .cr-dev.off .cr-av { background: var(--warn); }
+  .cr-dev.off .cr-ic { color: var(--warn); }
+  .cr-peek {
+    flex: none; margin-left: auto; display: inline-flex; align-items: center;
+    height: 20px; padding: 0 8px; border-radius: 999px;
+    border: 1px dashed color-mix(in oklch, var(--bc) 48%, transparent);
+    color: var(--bc-deep); font-size: var(--fs-xxs); font-weight: 600;
+    transition: background 0.15s ease, border-style 0.15s ease;
+  }
+  .cr-peek:hover { background: var(--bc-soft); border-style: solid; }
+
+  /* 群发：输入区与发送按钮也换成模式形态 */
+  .chat-compose.bc .chat-input { border-color: color-mix(in oklch, var(--bc) 34%, var(--border)); }
+  .chat-compose.bc .chat-input:focus { outline-color: var(--bc-soft); border-color: var(--bc); }
+  .chat-plus.bc:hover { background: var(--bc-soft); color: var(--bc-deep); }
+  .chat-send.bc { background: var(--bc-deep); }
+  .chat-send.bc:hover { background: color-mix(in oklch, var(--bc) 66%, black); }
+
+  /* 新建会话：先选模式，再选设备 */
+  .mode-pick { display: grid; gap: 5px; margin: 0 0 10px; }
+  .mode-pick[data-off="1"] { pointer-events: none; }
+  .mode-opt {
+    display: flex; align-items: flex-start; gap: 9px;
+    padding: 9px 10px; border: 1px solid var(--border); border-radius: var(--radius);
+    cursor: pointer; transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  .mode-opt:hover { background: var(--fg-soft); }
+  .mode-opt:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+  .mode-opt[data-mode="broadcast"]:has(input:checked) { border-color: var(--bc); background: var(--bc-soft); }
+  .mode-pick[data-off="1"] .mode-opt { opacity: 0.6; }
+  .mode-opt input { flex: none; width: 15px; height: 15px; margin: 3px 0 0; accent-color: var(--accent); }
+  .mode-opt[data-mode="broadcast"] input { accent-color: var(--bc); }
+  .mode-opt .mo-ic { flex: none; width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; }
+  .mode-opt .mo-ic svg { width: 15px; height: 15px; }
+  .mode-opt[data-mode="broadcast"] .mo-ic { background: var(--bc-soft); color: var(--bc-deep); }
+  .mode-opt[data-mode="group"] .mo-ic { background: var(--accent-soft); color: var(--accent-deep); }
+  .mode-opt .mo-main { flex: 1; min-width: 0; display: grid; gap: 2px; }
+  .mode-opt .mo-name { font-family: var(--font-display); font-size: var(--fs-md); font-weight: 620; }
+  .mode-opt .mo-desc { font-size: var(--fs-xs); color: var(--muted); line-height: 1.5; }
+  .mode-note { margin: 0 0 10px; font-size: var(--fs-xxs); color: var(--muted); line-height: 1.6; }
+  .field-hint { margin: 0; font-size: var(--fs-xxs); color: var(--muted); }
+  .field-hint b { color: var(--fg); font-weight: 600; }
+
+  /* 接收方视角预览：证明群发对每台设备都只是一条单独消息 */
+  .peek-frame {
+    border: 1px solid var(--border); border-radius: var(--radius-lg);
+    background: color-mix(in oklch, var(--fg) 3%, var(--surface));
+    padding: 10px; display: grid; gap: 8px;
+  }
+  .peek-head { display: flex; align-items: center; gap: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+  .peek-head .d-avatar { width: 28px; height: 28px; border-radius: 9px; font-size: var(--fs-sm); }
+  .peek-who { flex: 1; min-width: 0; display: grid; gap: 1px; }
+  .peek-who .pk-nm { font-family: var(--font-display); font-size: var(--fs-md); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .peek-who .pk-sub { font-size: var(--fs-xxs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .peek-badge {
+    flex: none; font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.06em;
+    padding: 2px 6px; border-radius: 999px; background: var(--fg-soft); color: var(--muted);
+  }
+  .peek-thread { display: grid; gap: 6px; }
+  .peek-msg { display: flex; flex-direction: column; align-items: flex-start; max-width: 100%; }
+  .peek-bubble {
+    max-width: 88%; padding: 7px 10px; border-radius: 12px 12px 12px 4px;
+    background: color-mix(in oklch, var(--fg) 6%, transparent);
+    color: var(--fg); font-size: var(--fs-sm); line-height: 1.55; overflow-wrap: anywhere;
+  }
+  .peek-bubble .pb-file { display: flex; align-items: center; gap: 8px; }
+  .peek-bubble .pb-file svg { width: 16px; height: 16px; flex: none; color: var(--warn); }
+  .peek-bubble .pb-main { min-width: 0; display: grid; gap: 1px; }
+  .peek-bubble .pb-name { display: block; font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500; }
+  .peek-bubble .pb-size { display: block; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+  .peek-meta { margin-top: 3px; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+  .peek-off { font-size: var(--fs-xxs); color: color-mix(in oklch, var(--ok) 70%, black); }
+  .peek-off.bad { color: color-mix(in oklch, var(--warn) 72%, black); }
+  .peek-note { margin: 12px 0 0; font-size: var(--fs-xs); color: var(--muted); line-height: 1.6; }
 
   @media (prefers-reduced-motion: reduce) {
     .orb-stage, .panel, .orb, .toast, .ctx, .push-card, .sheet, .dialog, .tree, .chev, .p-bar i, .pulse, .overlay,
-    .picker-layer, .picker, .pk-spin, .chat-msg, .ws-seg::after, .tab::after, .foot-msg, .convo-pop { transition: none !important; animation: none !important; }
+    .picker-layer, .picker, .pk-spin, .chat-msg, .ws-seg::after, .tab::after, .foot-msg, .convo-pop,
+    .mode-opt, .chat-receipt, .cr-peek, .cm-act, .peek-frame, .peek-msg { transition: none !important; animation: none !important; }
+    .convo-mode .cm-live i { animation: none !important; opacity: 0.85; }
   }
 </style>
 </head>
@@ -1150,20 +1336,29 @@ font-family: var(--font-body);
         </div>
 
         <div class="convo-detail" id="convoDetail" hidden>
-          <header class="conv-top">
-            <button class="conv-back" id="convBackBtn" type="button" aria-label="返回会话列表">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 6-6 6 6 6"/></svg>
-            </button>
-            <span class="conv-title" id="convTitle">PC-B</span>
-            <span class="conv-status" id="convDot"></span>
-            <span class="conv-count num" id="convCount" hidden></span>
-            <div class="conv-acts">
-              <button class="icon-btn" id="convMore" type="button" data-ctx data-convoctx aria-label="会话操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
-              <button class="icon-btn" id="convoCloseBtn2" type="button" aria-label="关闭会话">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+          <div class="conv-headgroup">
+            <header class="conv-top">
+              <button class="conv-back" id="convBackBtn" type="button" aria-label="返回会话列表">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 6-6 6 6 6"/></svg>
               </button>
+              <span class="conv-title" id="convTitle">PC-B</span>
+              <span class="conv-status" id="convDot"></span>
+              <span class="conv-count num" id="convCount" hidden></span>
+              <div class="conv-acts">
+                <button class="icon-btn" id="convMore" type="button" data-ctx data-convoctx aria-label="会话操作"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
+                <button class="icon-btn" id="convoCloseBtn2" type="button" aria-label="关闭会话">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+                </button>
+              </div>
+            </header>
+
+            <div class="convo-mode" id="convMode" data-mode="direct" hidden>
+              <span class="cm-ic" id="convModeIc" aria-hidden="true"></span>
+              <span class="cm-txt" id="convModeTxt"></span>
+              <span class="cm-live" id="convModeLive" hidden><i></i>实时</span>
+              <button class="cm-act" id="convModeAct" type="button" hidden>编辑群发</button>
             </div>
-          </header>
+          </div>
 
           <div class="recip" id="recipBar">
             <span class="recip-label">发送给</span>
@@ -1261,8 +1456,35 @@ font-family: var(--font-body);
 
       <div class="overlay" id="recipDialog" data-od-id="recipient-dialog" role="dialog" aria-modal="true" aria-labelledby="recipTitle">
         <div class="dialog">
-          <h3 id="recipTitle">选择收件人</h3>
-          <p class="d-desc">勾选一台设备是一对一会话，勾选两台以上会创建一个群会话。</p>
+          <h3 id="recipTitle">新建会话</h3>
+          <p class="d-desc" id="recipDesc">先选消息模式，再勾选设备；勾选两台以上才启用模式。</p>
+
+          <div class="mode-pick" id="modePick" data-off="0" role="radiogroup" aria-label="消息模式">
+            <label class="mode-opt" data-mode="broadcast">
+              <input type="radio" name="convoMode" value="broadcast" checked />
+              <span class="mo-ic" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M18.5 5.5 6.5 9.5H5a1.5 1.5 0 0 0-1.5 1.5v2A1.5 1.5 0 0 0 5 14.5h1.5l12 4V5.5Z"/><path d="M8 14.8V18a1.6 1.6 0 0 0 1.6 1.6h1.2"/></svg></span>
+              <span class="mo-main">
+                <span class="mo-name">单向群发</span>
+                <span class="mo-desc">只显示你发出的消息；每台设备各自收到一条单独消息，互相看不到，也不会回到这里。</span>
+              </span>
+            </label>
+            <label class="mode-opt" data-mode="group">
+              <input type="radio" name="convoMode" value="group" />
+              <span class="mo-ic" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M16 19v-1a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v1"/><circle cx="9" cy="7" r="3"/><path d="M22 19v-1a4 4 0 0 0-3-3.87"/><path d="M16 4.13a4 4 0 0 1 0 7.75"/></svg></span>
+              <span class="mo-main">
+                <span class="mo-name">共享群聊</span>
+                <span class="mo-desc">群里任意一台设备发送的消息，所有参与者实时可见，消息互通。</span>
+              </span>
+            </label>
+          </div>
+          <p class="mode-note" id="modeNote" hidden>已有会话的模式不可更改；移除到只剩一台时会退回单独会话。</p>
+
+          <div class="field" id="convoNameField">
+            <label for="convoNameInput" id="convoNameLabel">群发名称</label>
+            <input class="input" id="convoNameInput" value="" maxlength="16" placeholder="例如：发布通知" />
+            <p class="field-hint">会话标题显示为「<b id="convoNamePreview">群发 · 发布通知</b>」</p>
+          </div>
+
           <div class="recip-tools">
             <button class="btn btn-ghost btn-sm" id="recipAllBtn" type="button">全选 / 取消全选</button>
             <span class="num" id="recipCount">已选 0 台</span>
@@ -1270,7 +1492,27 @@ font-family: var(--font-body);
           <div class="recip-list" id="recipList" role="group" aria-label="局域网设备"></div>
           <div class="d-acts">
             <button class="btn btn-secondary" id="recipCancelBtn">取消</button>
-            <button class="btn btn-primary" id="recipConfirmBtn" disabled>确定</button>
+            <button class="btn btn-primary" id="recipConfirmBtn" disabled>进入会话</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="overlay" id="peekDialog" data-od-id="recipient-view" role="dialog" aria-modal="true" aria-labelledby="peekTitle">
+        <div class="dialog">
+          <h3 id="peekTitle">接收方看到的样子</h3>
+          <p class="d-desc">群发是单向的：每台设备只收到一条单独的一对一消息。</p>
+          <div class="peek-frame">
+            <header class="peek-head">
+              <span class="d-avatar" id="peekAvatar">B</span>
+              <span class="peek-who"><span class="pk-nm" id="peekName">PC-B</span><span class="pk-sub" id="peekSub"></span></span>
+              <span class="peek-badge">预览</span>
+            </header>
+            <div class="peek-thread" id="peekThread"></div>
+          </div>
+          <p class="peek-note" id="peekNote"></p>
+          <div class="d-acts">
+            <button class="btn btn-secondary" id="peekNextBtn" type="button">下一台</button>
+            <button class="btn btn-primary" id="peekCloseBtn" type="button">知道了</button>
           </div>
         </div>
       </div>
@@ -1456,9 +1698,12 @@ font-family: var(--font-body);
   function ctxHTMLFor(target) {
     var cctx = target && target.closest && target.closest('[data-convoctx]');
     if (cctx) {
-      var isGroup = convoParticipants(chat.openKey).length > 1;
-      return (isGroup ? '' : '<button class="ctx-item" data-act="convofiles">' + ICON_OPEN + '查看该设备文件</button>') +
-        '<button class="ctx-item danger" data-act="convoexit">' + ICON_TRASH + (isGroup ? '退出会话（本地删除并广播离开）' : '清空聊天记录') + '</button>';
+      var ckey = chat.openKey;
+      var isThread = convoParticipants(ckey).length > 1;
+      var isBc = threadIsBroadcast(ckey);
+      return (isThread ? '' : '<button class="ctx-item" data-act="convofiles">' + ICON_OPEN + '查看该设备文件</button>') +
+        (isThread ? '<button class="ctx-item" data-act="convoedit">' + ICO_GROUP + (isBc ? '编辑收件人与群发名称' : '编辑参与者与群聊名称') + '</button>' : '') +
+        '<button class="ctx-item danger" data-act="convoexit">' + ICON_TRASH + (isThread ? '退出会话（本地删除并广播离开）' : '清空聊天记录') + '</button>';
     }
     var share = target && target.closest('.share-item');
     var device = target && target.closest('.device-row');
@@ -1550,14 +1795,15 @@ font-family: var(--font-body);
           var sm = $('.s-meta .num', li);
           var shareName = sn ? sn.textContent : '共享项';
           var shareSize = sm ? String(sm.textContent).split('·')[0].trim() : '12.6 MB';
-          openRecipientDialog([], function (ids) { sendFilePayload(ids, [{ name: shareName, size: shareSize }]); });
+          openRecipientDialog([], function (ids, m) { sendFilePayload(ids, [{ name: shareName, size: shareSize }], m); }, {});
         }
         break;
       case 'connect': connectDevice(drow); break;
       case 'disconnect': disconnectDevice(drow); break;
       case 'msg': if (drow) openDeviceChat(drow.dataset.id); break;
-      case 'sendfile': if (drow) pickAndSendFiles([drow.dataset.id]); break;
+      case 'sendfile': if (drow) pickAndSendFiles([drow.dataset.id], 'group'); break;
       case 'convofiles': { var ck = chat.openKey; if (ck && ck.indexOf('dev:') === 0) selectDevice(ck.slice(4)); break; }
+      case 'convoedit': editParticipants(); break;
       case 'convoexit': exitConvo(); break;
       case 'unpair':
         if (drow) {
@@ -1567,7 +1813,7 @@ font-family: var(--font-body);
           drow.style.opacity = '0';
           drow.style.transform = 'scale(.98)';
           setTimeout(function () { if (drow.parentNode) drow.parentNode.removeChild(drow); }, 240);
-          purgeDeviceFromGroups(drow.dataset.id);
+          purgeDeviceFromThreads(drow.dataset.id);
           renderDeviceTabs();
           if (wasCurrentDev) selectTab($('.tab[data-tab="devices"]', tabsScroll));
           if (chat.openKey && !convoValid(chat.openKey)) { chat.openKey = null; showConvoList(); }
@@ -2468,16 +2714,25 @@ font-family: var(--font-body);
   var recipList = $('#recipList');
   var wsDeviceId = null;
   var convoReturnFocus = null;
-  var groupIdSeq = 1;
+  var threadIdSeq = 1;
   var chat = {
     store: {}, unread: { 'dev:d1': 2 }, draft: {},
-    groups: { g1: { id: 'g1', participants: ['d1', 'd2'] } },
-    groupOrder: ['g1'],
-    order: ['dev:d1', 'dev:d3', 'g1', 'dev:d2'],
-    openKey: null
+    threads: {
+      g1: { id: 'g1', mode: 'group', name: '发布联调', participants: ['d1', 'd2', 'd3'] },
+      b1: { id: 'b1', mode: 'broadcast', name: '发布包 v0.5', participants: ['d1', 'd2', 'd3'] }
+    },
+    threadOrder: ['g1', 'b1'],
+    order: ['dev:d1', 'b1', 'dev:d3', 'g1', 'dev:d2'],
+    openKey: null,
+    liveFired: {}
   };
   var CHAT_ICO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 0 1-8 8H6.5L3 22V12a8 8 0 0 1 8-8h1a8 8 0 0 1 8 8Z"/><path d="M8.5 11h7M8.5 14.5h4"/></svg>';
   var CHAT_FILE_ICO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M6 3h8l5 5v13H6V3Z"/></svg>';
+  var ICO_BC = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18.5 5.5 6.5 9.5H5a1.5 1.5 0 0 0-1.5 1.5v2A1.5 1.5 0 0 0 5 14.5h1.5l12 4V5.5Z"/><path d="M8 14.8V18a1.6 1.6 0 0 0 1.6 1.6h1.2"/></svg>';
+  var ICO_GRP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 19v-1a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v1"/><circle cx="9" cy="7" r="3"/><path d="M22 19v-1a4 4 0 0 0-3-3.87"/><path d="M16 4.13a4 4 0 0 1 0 7.75"/></svg>';
+  var ICO_CHECK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7"/></svg>';
+  var ICO_MINUS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M7 12h10"/></svg>';
+  var CHAT_SEND_ICO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V6"/><path d="M6 12l6-6 6 6"/></svg>';
   var CHAT_SEED = {
     'dev:d1': [
       { from: 'peer', kind: 'text', text: '设计稿收到了，先在 assets 里对一遍色板。', t: '10:18' },
@@ -2494,9 +2749,19 @@ font-family: var(--font-body);
       { from: 'peer', fromName: 'PC-C', kind: 'file', name: '接口清单.xlsx', size: '1.1 MB', t: '10:12', invite: true, inviteState: 'pending' }
     ],
     g1: [
-      { from: 'me', kind: 'text', text: '两位，发布包我一起推到你们两台机器上。', t: '10:05' },
+      { from: 'me', kind: 'text', text: '发布包我一起推给你们三台，先在群里同步一下。', t: '10:05' },
       { from: 'peer', fromName: 'MacBook Pro', kind: 'text', text: '收到，我先在素材仓库对一版。', t: '10:07' },
-      { from: 'peer', fromName: 'PC-B', kind: 'text', text: '好，文件到了我就跑冒烟。', t: '10:08' }
+      { from: 'peer', fromName: 'PC-B', kind: 'text', text: '好，文件到了我就跑冒烟。', t: '10:08' },
+      { from: 'peer', fromName: 'PC-C', kind: 'text', text: '我这边网络刚恢复，也一起看。', t: '10:09' }
+    ],
+    b1: [
+      { from: 'me', kind: 'text', text: 'v0.5 发布包已放到共享项「项目设计稿」，请各位各拉一份。', t: '09:30', status: '已送达',
+        receipt: { total: 3, delivered: 3, offline: 0, states: { d1: 'ok', d2: 'ok', d3: 'ok' } } },
+      { from: 'me', kind: 'file', name: '发布包-v0.5.zip', size: '86 MB', t: '09:31', status: '已送达',
+        transfer: { total: 2, offline: 1, done: 2, pct: 100, state: 'done' },
+        receipt: { total: 3, delivered: 2, offline: 1, states: { d1: 'ok', d2: 'off', d3: 'ok' } } },
+      { from: 'me', kind: 'text', text: '验收请走「引用模式」直连比较，不用先下载到本地。', t: '09:33', status: '已送达',
+        receipt: { total: 3, delivered: 1, offline: 2, states: { d1: 'ok', d2: 'off', d3: 'off' } } }
     ]
   };
   /* 设备页「文件」视图：对方共享给我的共享项（引用模式，只读浏览 / 下载 / 比较） */
@@ -2531,19 +2796,44 @@ font-family: var(--font-body);
   }
   function devNameById(id) { var r = devById(id); return r ? devName(r) : id; }
   function groupKeyOf(ids) { return ids.slice().sort().join('|'); }
+  /* 会话模式：direct（一对一） / broadcast（单向群发） / group（共享群聊） */
+  function threadOf(key) { return (key && key.indexOf('dev:') !== 0) ? (chat.threads[key] || null) : null; }
+  function threadMode(key) {
+    if (!key || key.indexOf('dev:') === 0) return 'direct';
+    var t = chat.threads[key];
+    return t ? t.mode : 'direct';
+  }
+  function threadIsBroadcast(key) { return threadMode(key) === 'broadcast'; }
+  /* 会话名称：群发与群聊都可命名；未命名时群聊回落到参与者名称 */
+  function threadName(key) { var t = threadOf(key); return (t && t.name) || ''; }
   function convoParticipants(key) {
     if (!key) return [];
     if (key.indexOf('dev:') === 0) return [key.slice(4)];
-    var g = chat.groups[key];
-    return g ? g.participants.slice() : [];
+    var t = chat.threads[key];
+    return t ? t.participants.slice() : [];
   }
-  function convoTitleText(key) { return convoParticipants(key).map(devNameById).join('、'); }
+  function convoTitleText(key) {
+    var mode = threadMode(key);
+    var nm = threadName(key);
+    if (mode === 'broadcast') return '群发 · ' + (nm || '未命名群发');
+    if (mode === 'group' && nm) return '群聊 · ' + nm;
+    return convoParticipants(key).map(devNameById).join('、');
+  }
   function convoValid(key) {
     if (!key) return false;
     if (key.indexOf('dev:') === 0) return !!devById(key.slice(4));
-    return !!chat.groups[key] && chat.groups[key].participants.length >= 2;
+    var t = chat.threads[key];
+    return !!t && t.participants.length >= 2;
   }
   function convoLast(key) { var a = chat.store[key]; return a && a.length ? a[a.length - 1] : null; }
+  function convoLastVisible(key) {
+    var a = chat.store[key] || [];
+    if (threadIsBroadcast(key)) {
+      for (var i = a.length - 1; i >= 0; i--) if (a[i].from === 'me') return a[i];
+      return null;
+    }
+    return a.length ? a[a.length - 1] : null;
+  }
   function convoDotState(key) {
     var ids = convoParticipants(key);
     for (var i = 0; i < ids.length; i++) {
@@ -2553,18 +2843,28 @@ font-family: var(--font-body);
     var first = devById(ids[0]);
     return first && first.dataset.state === 'unbound' ? 'warn' : 'off';
   }
+  function convoOnlineCount(key) {
+    return convoParticipants(key).filter(function (id) {
+      var r = devById(id);
+      return r && r.dataset.state === 'connected';
+    }).length;
+  }
+  function convoSummarize(key) {
+    var m = convoLastVisible(key);
+    if (!m) return '还没有消息';
+    if (threadIsBroadcast(key)) {
+      var pre = m.receipt ? '已送达 ' + m.receipt.delivered + '/' + m.receipt.total + ' 台 · ' : '';
+      return pre + (m.kind === 'file' ? '[文件] ' + m.name : m.text);
+    }
+    var lead = m.from === 'me' ? '你：' : (m.fromName ? m.fromName + '：' : '');
+    return lead + (m.kind === 'file' ? '[文件] ' + m.name : m.text);
+  }
   function renderConvoStatus(key) {
     var ids = convoParticipants(key);
     var st = convoDotState(key);
     convDot.className = 'conv-status' + (st === 'ok' ? ' ok' : st === 'warn' ? ' warn' : '');
     if (ids.length > 1) { convCount.hidden = false; convCount.textContent = ids.length + ' 台'; }
     else convCount.hidden = true;
-  }
-  function convoSummarize(key) {
-    var m = convoLast(key);
-    if (!m) return '还没有消息';
-    var pre = m.from === 'me' ? '你：' : '';
-    return pre + (m.kind === 'file' ? '[文件] ' + m.name : m.text);
   }
   function touchConvo(key) {
     var i = chat.order.indexOf(key);
@@ -2578,33 +2878,39 @@ font-family: var(--font-body);
       var k = 'dev:' + r.dataset.id;
       if (convoValid(k) && keys.indexOf(k) < 0) keys.push(k);
     });
-    chat.groupOrder.forEach(function (gid) {
-      if (convoValid(gid) && keys.indexOf(gid) < 0) keys.push(gid);
+    chat.threadOrder.forEach(function (tid) {
+      if (convoValid(tid) && keys.indexOf(tid) < 0) keys.push(tid);
     });
     return keys;
   }
-  function ensureConvo(ids) {
+  function ensureConvo(ids, mode, name) {
     if (ids.length === 1) return 'dev:' + ids[0];
-    var sig = groupKeyOf(ids);
-    for (var i = 0; i < chat.groupOrder.length; i++) {
-      var g = chat.groups[chat.groupOrder[i]];
-      if (g && groupKeyOf(g.participants) === sig) return chat.groupOrder[i];
+    var want = mode === 'broadcast' ? 'broadcast' : 'group';
+    var sig = groupKeyOf(ids) + '#' + want;
+    for (var i = 0; i < chat.threadOrder.length; i++) {
+      var t = chat.threads[chat.threadOrder[i]];
+      if (t && (groupKeyOf(t.participants) + '#' + t.mode) === sig) {
+        if (typeof name === 'string') t.name = name || (t.mode === 'broadcast' ? '发布通知' : '');
+        return chat.threadOrder[i];
+      }
     }
-    var gid = 'g' + (++groupIdSeq);
-    chat.groups[gid] = { id: gid, participants: ids.slice() };
-    chat.groupOrder.push(gid);
-    return gid;
+    var tid = (want === 'broadcast' ? 'b' : 'g') + (++threadIdSeq);
+    chat.threads[tid] = { id: tid, mode: want, participants: ids.slice() };
+    if (name) chat.threads[tid].name = name;
+    else if (want === 'broadcast') chat.threads[tid].name = '发布通知';
+    chat.threadOrder.push(tid);
+    return tid;
   }
-  function purgeDeviceFromGroups(id) {
-    chat.groupOrder.slice().forEach(function (gid) {
-      var g = chat.groups[gid];
-      if (!g) return;
-      var k = g.participants.indexOf(id);
-      if (k > -1) g.participants.splice(k, 1);
-      if (g.participants.length < 2) {
-        var oi = chat.groupOrder.indexOf(gid);
-        if (oi > -1) chat.groupOrder.splice(oi, 1);
-        delete chat.groups[gid];
+  function purgeDeviceFromThreads(id) {
+    chat.threadOrder.slice().forEach(function (tid) {
+      var t = chat.threads[tid];
+      if (!t) return;
+      var k = t.participants.indexOf(id);
+      if (k > -1) t.participants.splice(k, 1);
+      if (t.participants.length < 2) {
+        var oi = chat.threadOrder.indexOf(tid);
+        if (oi > -1) chat.threadOrder.splice(oi, 1);
+        delete chat.threads[tid];
       }
     });
   }
@@ -2660,10 +2966,69 @@ font-family: var(--font-body);
     card.querySelector('[data-inv="no"]').addEventListener('click', function () { resolveInvite(m, card, false); });
     return card;
   }
-  function chatMsgEl(m) {
+  /* 群聊发言人：名称决定稳定的语义色，按人分组只出现一次 */
+  function speakerIndex(name) {
+    var h = 0;
+    for (var i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 997;
+    return (h % 3) + 1;
+  }
+  function speakerClass(name) { return 'sp-' + speakerIndex(name || '?'); }
+  function speakerInitial(name) { return String(name || '?').trim().charAt(0); }
+  function buildReceipt(key) {
+    var ids = convoParticipants(key);
+    var states = {}, delivered = 0;
+    ids.forEach(function (id) {
+      var r = devById(id);
+      var ok = !!(r && r.dataset.state === 'connected');
+      states[id] = ok ? 'ok' : 'off';
+      if (ok) delivered++;
+    });
+    return { total: ids.length, delivered: delivered, offline: ids.length - delivered, states: states };
+  }
+  /* 群发回执：逐设备状态，并可打开接收方视角预览 */
+  function receiptEl(key, m) {
+    var box = document.createElement('div');
+    box.className = 'chat-receipt';
+    var head = document.createElement('span');
+    head.className = 'cr-head';
+    head.textContent = '已送达 ' + m.receipt.delivered + '/' + m.receipt.total + ' 台';
+    box.appendChild(head);
+    var list = document.createElement('span');
+    list.className = 'cr-list';
+    convoParticipants(key).forEach(function (id) {
+      var r = devById(id);
+      var st = (m.receipt.states && m.receipt.states[id]) || 'off';
+      var chip = document.createElement('span');
+      chip.className = 'cr-dev ' + st;
+      chip.title = (r ? devName(r) : id) + ' · ' + (st === 'ok' ? '已送达' : '离线 · 未送达');
+      chip.innerHTML = '<span class="cr-av"></span><span class="cr-nm"></span><span class="cr-ic">' + (st === 'ok' ? ICO_CHECK : ICO_MINUS) + '</span>';
+      chip.querySelector('.cr-av').textContent = r ? devAvatarOf(r) : '?';
+      chip.querySelector('.cr-nm').textContent = r ? devName(r) : id;
+      list.appendChild(chip);
+    });
+    box.appendChild(list);
+    var peek = document.createElement('button');
+    peek.type = 'button';
+    peek.className = 'cr-peek';
+    peek.textContent = '查看收件效果';
+    peek.addEventListener('click', function () { openPeek(key, m, 0); });
+    box.appendChild(peek);
+    return box;
+  }
+  function chatMsgEl(m, opts) {
+    opts = opts || {};
+    var isBc = threadIsBroadcast(chat.openKey);
     var wrap = document.createElement('div');
-    wrap.className = 'chat-msg ' + (m.from === 'me' ? 'me' : 'peer');
+    wrap.className = 'chat-msg ' + (m.from === 'me' ? 'me' : 'peer') + (isBc ? ' bc' : '');
     wrap.setAttribute('data-copy', m.kind === 'file' ? (m.name + '（' + m.size + '）') : m.text);
+    if (opts.showWho) {
+      var who = document.createElement('div');
+      who.className = 'chat-who ' + speakerClass(m.fromName);
+      who.innerHTML = '<span class="cw-av"></span><span class="cw-nm"></span>';
+      who.querySelector('.cw-av').textContent = speakerInitial(m.fromName);
+      who.querySelector('.cw-nm').textContent = m.fromName || '设备';
+      wrap.appendChild(who);
+    }
     if (m.invite && m.inviteState === 'pending') {
       wrap.appendChild(inviteCardEl(m));
       var tm0 = document.createElement('div');
@@ -2695,11 +3060,11 @@ font-family: var(--font-body);
     }
     var meta = document.createElement('div');
     meta.className = 'chat-meta';
-    meta.textContent = m.from === 'me'
-      ? (m.t + ' · ' + (m.status || '已送达'))
-      : ((m.fromName ? m.fromName + ' · ' : '') + m.t);
+    if (m.from === 'me') meta.textContent = isBc ? m.t : (m.t + ' · ' + (m.status || '已送达'));
+    else meta.textContent = (opts.showWho ? '' : (m.fromName ? m.fromName + ' · ' : '')) + m.t;
     wrap.appendChild(bubble);
     wrap.appendChild(meta);
+    if (isBc && m.receipt) wrap.appendChild(receiptEl(chat.openKey, m));
     return wrap;
   }
 
@@ -2710,12 +3075,28 @@ font-family: var(--font-body);
       chatLog.innerHTML = '<div class="chat-empty"><p>暂无会话</p><p class="ce-sub">先到「设备」里配对或建立长连接。</p></div>';
       return;
     }
-    var msgs = chatStoreFor(key);
+    var isBc = threadIsBroadcast(key);
+    var all = chatStoreFor(key);
+    var msgs = isBc ? all.filter(function (m) { return m.from === 'me'; }) : all;
     if (!msgs.length) {
-      chatLog.innerHTML = '<div class="chat-empty">' + CHAT_ICO + '<p>还没有消息</p><p class="ce-sub">发一条消息或传一个文件，开始和设备对话。</p></div>';
+      var n = convoParticipants(key).length;
+      chatLog.innerHTML = isBc
+        ? '<div class="chat-empty">' + ICO_BC + '<p>还没有群发消息</p><p class="ce-sub">你发出的每条消息都会作为单独的一对一消息，分别送达 ' + n + ' 台设备；这里只显示你发出的内容。</p></div>'
+        : '<div class="chat-empty">' + CHAT_ICO + '<p>还没有消息</p><p class="ce-sub">发一条消息或传一个文件，开始和设备对话。</p></div>';
       return;
     }
-    msgs.forEach(function (m) { chatLog.appendChild(chatMsgEl(m)); });
+    if (isBc) {
+      var led = document.createElement('div');
+      led.className = 'chat-ledger';
+      led.innerHTML = '<span class="cl-line"></span><span class="cl-txt">已发送 · ' + msgs.length + ' 条 · 单向</span><span class="cl-line"></span>';
+      chatLog.appendChild(led);
+    }
+    var prevWho = null;
+    msgs.forEach(function (m) {
+      var showWho = !isBc && m.from === 'peer' && (m.fromName || '') !== prevWho;
+      chatLog.appendChild(chatMsgEl(m, { showWho: showWho }));
+      prevWho = m.from === 'peer' ? (m.fromName || '') : null;
+    });
     chatLog.scrollTop = chatLog.scrollHeight;
   }
 
@@ -2729,24 +3110,32 @@ font-family: var(--font-body);
     }
     keys.forEach(function (key) {
       var ids = convoParticipants(key);
-      var isGroup = ids.length > 1;
-      var last = convoLast(key);
+      var mode = threadMode(key);
+      var isGroup = mode === 'group';
+      var isBc = mode === 'broadcast';
+      var last = convoLastVisible(key);
       var unread = chatUnread(key);
       var item = document.createElement('button');
       item.type = 'button';
-      item.className = 'convo-item';
+      item.className = 'convo-item' + (isBc ? ' bc' : isGroup ? ' grp' : '');
       item.dataset.key = key;
-      var avs = '<span class="convo-avs">';
-      ids.slice(0, 2).forEach(function (id) {
-        var r = devById(id);
-        avs += '<span class="d-avatar">' + (r ? devAvatarOf(r) : '?') + '</span>';
-      });
-      avs += '</span>';
+      var avs;
+      if (isBc) {
+        avs = '<span class="convo-avs"><span class="d-avatar bc-mark">' + ICO_BC + '</span></span>';
+      } else if (isGroup) {
+        avs = '<span class="convo-avs"><span class="d-avatar grp-mark">' + ICO_GRP + '</span></span>';
+      } else {
+        var solo = devById(ids[0]);
+        avs = '<span class="convo-avs"><span class="d-avatar">' + (solo ? devAvatarOf(solo) : '?') + '</span></span>';
+      }
+      var chip = isBc
+        ? '<span class="convo-mode-chip bc">' + ICO_BC + '群发</span>'
+        : isGroup ? '<span class="convo-mode-chip group">' + ICO_GRP + '群聊</span>' : '';
       item.innerHTML = avs +
-        '<span class="convo-main"><span class="convo-top"><span class="convo-name"></span><span class="convo-dot"></span><span class="convo-time num"></span></span>' +
+        '<span class="convo-main"><span class="convo-top"><span class="convo-name"></span>' + chip + '<span class="convo-dot"></span><span class="convo-time num"></span></span>' +
         '<span class="convo-prev"></span></span>' +
         (unread ? '<span class="convo-unread">' + unread + '</span>' : '');
-      item.querySelector('.convo-name').textContent = convoTitleText(key) + (isGroup ? ' · 群' : '');
+      item.querySelector('.convo-name').textContent = convoTitleText(key);
       item.querySelector('.convo-dot').className = 'convo-dot ' + convoDotState(key);
       item.querySelector('.convo-time').textContent = last ? last.t : '';
       item.querySelector('.convo-prev').textContent = convoSummarize(key);
@@ -2856,19 +3245,102 @@ font-family: var(--font-body);
     var key = chat.openKey;
     if (!key) return;
     var ids = convoParticipants(key);
+    var isBc = threadIsBroadcast(key);
     var isGroup = ids.length > 1;
+    var bar = $('#recipBar');
+    if (bar) {
+      bar.dataset.mode = isBc ? 'broadcast' : isGroup ? 'group' : 'direct';
+      var lab = $('.recip-label', bar);
+      if (lab) lab.textContent = isBc ? '群发至' : '发送给';
+    }
     ids.forEach(function (id) {
       var row = devById(id);
       var chip = document.createElement('span');
       chip.className = 'recip-chip';
       chip.innerHTML = '<span class="rc-av"></span><span class="rc-name"></span><span class="rc-st"></span>' +
-        (isGroup ? '<button class="rc-x" type="button" aria-label="从我的收件人移除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>' : '');
+        (isGroup ? '<button class="rc-x" type="button" aria-label="从收件人移除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>' : '');
       chip.querySelector('.rc-av').textContent = row ? devAvatarOf(row) : '?';
       chip.querySelector('.rc-name').textContent = row ? devName(row) : id;
       chip.querySelector('.rc-st').className = 'rc-st' + (row && row.dataset.state === 'connected' ? ' ok' : '');
       if (isGroup) chip.querySelector('.rc-x').addEventListener('click', function (e) { e.stopPropagation(); removeRecipient(id); });
       recipChips.appendChild(chip);
     });
+  }
+
+  /* 详情头部的模式条：一对一隐藏，群发与群聊各说自己的规则 */
+  function renderModeBar(key) {
+    var bar = $('#convMode');
+    if (!bar) return;
+    var mode = threadMode(key);
+    if (mode === 'direct') { bar.hidden = true; return; }
+    bar.hidden = false;
+    bar.dataset.mode = mode;
+    var isBc = mode === 'broadcast';
+    $('#convModeIc').innerHTML = isBc ? ICO_BC : ICO_GRP;
+    var txt = $('#convModeTxt');
+    txt.innerHTML = '';
+    var b = document.createElement('b');
+    b.textContent = isBc ? '群发模式' : '群聊模式';
+    txt.appendChild(b);
+    txt.appendChild(document.createTextNode(isBc ? ' · 单向发送，对方各自单独收到' : ' · 任意设备发送，所有参与者实时可见'));
+    $('#convModeLive').hidden = isBc;
+    var act = $('#convModeAct');
+    act.hidden = false;
+    act.textContent = isBc ? '编辑群发' : '编辑群聊';
+  }
+
+  /* 输入区跟随模式：群发是喇叭 + 信号色，群聊说明多台可见 */
+  function applyComposeMode(key) {
+    var isBc = threadIsBroadcast(key);
+    var isGroup = threadMode(key) === 'group';
+    var form = $('#chatCompose');
+    var n = convoParticipants(key).length;
+    form.classList.toggle('bc', isBc);
+    chatSendBtn.classList.toggle('bc', isBc);
+    chatPlusBtn.classList.toggle('bc', isBc);
+    if (isBc) {
+      chatInput.placeholder = '群发给 ' + n + ' 台设备…';
+      chatSendBtn.innerHTML = ICO_BC;
+      chatSendBtn.setAttribute('aria-label', '群发消息');
+      chatPlusBtn.setAttribute('aria-label', '群发文件（即推送）');
+    } else if (isGroup) {
+      chatInput.placeholder = '发到群聊，' + n + ' 台设备都能看到…';
+      chatSendBtn.innerHTML = CHAT_SEND_ICO;
+      chatSendBtn.setAttribute('aria-label', '发送到群聊');
+      chatPlusBtn.setAttribute('aria-label', '发送文件（即推送）');
+    } else {
+      chatInput.placeholder = '输入消息…';
+      chatSendBtn.innerHTML = CHAT_SEND_ICO;
+      chatSendBtn.setAttribute('aria-label', '发送消息');
+      chatPlusBtn.setAttribute('aria-label', '发送文件（即推送）');
+    }
+  }
+
+  /* 群聊的实时共享：其他参与设备的新消息会即时出现在同一条线程里 */
+  var LIVE_REPLIES = [
+    '收到，我这边同步到了。',
+    '看到了，我一会儿跑一遍验证。',
+    '好的，我按这个版本走。',
+    '明白，有结果我在群里回。'
+  ];
+  function scheduleLiveReply(key) {
+    if (threadMode(key) !== 'group' || chat.liveFired[key]) return;
+    chat.liveFired[key] = true;
+    var ids = convoParticipants(key);
+    var online = ids.filter(function (id) {
+      var r = devById(id);
+      return r && r.dataset.state === 'connected';
+    });
+    var fromId = online[0] || ids[0];
+    var fromName = devNameById(fromId);
+    if (!fromName) return;
+    setTimeout(function () {
+      if (chat.openKey !== key) return;
+      var seen = (chat.store[key] || []).length;
+      chatPush({ from: 'peer', fromName: fromName, kind: 'text', text: LIVE_REPLIES[seen % LIVE_REPLIES.length], t: chatNow() });
+      toast(fromName + ' 在群聊中发来新消息');
+      renderConvoList();
+    }, 2600);
   }
 
   /* ── 设备文件工作区（页签） ─────────────────────────────── */
@@ -2894,7 +3366,9 @@ font-family: var(--font-body);
     if (chat.openKey && convoValid(chat.openKey)) {
       convoDetail.hidden = false;
       convosListView.hidden = true;
+      renderModeBar(chat.openKey);
       renderRecipients();
+      applyComposeMode(chat.openKey);
       renderChatLog();
       renderConvoList();
       renderDeviceTabs();
@@ -2924,10 +3398,11 @@ font-family: var(--font-body);
     if (chat.openKey && chat.openKey !== key) chat.draft[chat.openKey] = chatInput.value;
     chat.openKey = key;
     chat.unread[key] = 0;
-    var ids = convoParticipants(key);
     convTitle.textContent = convoTitleText(key);
     renderConvoStatus(key);
+    renderModeBar(key);
     renderRecipients();
+    applyComposeMode(key);
     chatInput.value = chat.draft[key] || '';
     chatSyncSend();
     convoDetail.hidden = false;
@@ -2937,6 +3412,7 @@ font-family: var(--font-body);
     renderDeviceTabs();
     if (!keepTab) openConvoSheet();
     chatInput.focus();
+    scheduleLiveReply(key);
   }
   function closeConversation() {
     if (chat.openKey) chat.draft[chat.openKey] = chatInput.value;
@@ -2969,9 +3445,10 @@ font-family: var(--font-body);
     delete chat.store[key];
     delete chat.draft[key];
     delete chat.unread[key];
-    var gi = chat.groupOrder.indexOf(key);
-    if (gi > -1) chat.groupOrder.splice(gi, 1);
-    delete chat.groups[key];
+    delete chat.liveFired[key];
+    var gi = chat.threadOrder.indexOf(key);
+    if (gi > -1) chat.threadOrder.splice(gi, 1);
+    delete chat.threads[key];
     chat.openKey = null;
     showConvoList();
     renderDeviceTabs();
@@ -2980,25 +3457,27 @@ font-family: var(--font-body);
   function removeRecipient(id) {
     var key = chat.openKey;
     if (!key || key.indexOf('dev:') === 0) return;
-    var g = chat.groups[key];
-    if (!g) return;
-    var i = g.participants.indexOf(id);
-    if (i > -1) g.participants.splice(i, 1);
+    var t = chat.threads[key];
+    if (!t) return;
+    var i = t.participants.indexOf(id);
+    if (i > -1) t.participants.splice(i, 1);
     var name = devNameById(id);
-    if (g.participants.length >= 2) {
+    if (t.participants.length >= 2) {
       convTitle.textContent = convoTitleText(key);
       renderConvoStatus(key);
+      renderModeBar(key);
       renderRecipients();
+      renderChatLog();
       renderConvoList();
-      toast('已从我的收件人移除「' + name + '」（不是踢人，对方不会收到通知）');
+      toast('已从收件人移除「' + name + '」（不是踢人，对方不会收到通知）');
       return;
     }
-    var last = g.participants[0];
+    var last = t.participants[0];
     var oldStore = chat.store[key] || [];
     delete chat.store[key];
-    var gi = chat.groupOrder.indexOf(key);
-    if (gi > -1) chat.groupOrder.splice(gi, 1);
-    delete chat.groups[key];
+    var gi = chat.threadOrder.indexOf(key);
+    if (gi > -1) chat.threadOrder.splice(gi, 1);
+    delete chat.threads[key];
     var oi = chat.order.indexOf(key);
     if (oi > -1) chat.order.splice(oi, 1);
     if (last) chat.store['dev:' + last] = (chat.store['dev:' + last] || []).concat(oldStore);
@@ -3019,7 +3498,21 @@ font-family: var(--font-body);
     if (row) openCtxFor(e, row);
   });
   convBackBtn.addEventListener('click', closeConversation);
-  recipAdd.addEventListener('click', function () { openRecipientDialog(convoParticipants(chat.openKey), null); });
+  function editParticipants() {
+    var key = chat.openKey;
+    if (!key) return;
+    var mode = threadMode(key);
+    var isThread = mode !== 'direct';
+    openRecipientDialog(convoParticipants(key), function (ids, m, name) {
+      if (isThread && ids.length < 2) {
+        toast('至少保留两台设备；减少到一台请用收件人上的移除');
+        return;
+      }
+      applyRecipients(ids, isThread ? mode : m, name);
+    }, { mode: isThread ? mode : 'broadcast', name: isThread ? threadName(key) : undefined, lock: isThread });
+  }
+  recipAdd.addEventListener('click', editParticipants);
+  $('#convModeAct').addEventListener('click', editParticipants);
   msgFab.addEventListener('click', function () {
     if (convoSheet.classList.contains('open')) closeConvoSheet();
     else openConvoSheet();
@@ -3029,20 +3522,40 @@ font-family: var(--font-body);
   $('#convoCloseBtn').addEventListener('click', function () { closeConvoSheet(); });
   $('#convoCloseBtn2').addEventListener('click', function () { closeConvoSheet(); });
 
-  /* ── 收件人选择（一对一 / 群） ───────────────────────────── */
+  /* ── 会话创建 / 编辑：先选模式（群发 / 群聊），再选设备 ───── */
   var recipSel = [];
   var recipCallback = null;
-  function openRecipientDialog(initial, cb) {
+  var recipLock = null;
+  function pickedMode() {
+    var r = $('input[name="convoMode"]:checked');
+    return r ? r.value : 'broadcast';
+  }
+  function setPickedMode(mode) {
+    $$('input[name="convoMode"]').forEach(function (r) { r.checked = r.value === mode; });
+  }
+  function openRecipientDialog(initial, cb, opts) {
+    opts = opts || {};
     recipSel = (initial || []).filter(function (id) { return !!devById(id); });
     recipCallback = cb || null;
+    recipLock = opts.lock ? (opts.mode || 'group') : null;
+    setPickedMode(opts.mode === 'group' ? 'group' : 'broadcast');
+    var nameInp = $('#convoNameInput');
+    if (typeof opts.name === 'string') nameInp.value = opts.name;
+    else nameInp.value = (recipLock || pickedMode()) === 'broadcast' ? '发布通知' : '';
+    syncNameField();
     renderRecipList();
     recipDialog.classList.add('open');
     requestAnimationFrame(function () {
-      var first = $('input', recipList);
+      var first = $('input[type="checkbox"]', recipList);
       if (first) first.focus();
+      else $('#recipConfirmBtn').focus();
     });
   }
-  function closeRecipientDialog() { recipDialog.classList.remove('open'); recipCallback = null; }
+  function closeRecipientDialog() {
+    recipDialog.classList.remove('open');
+    recipCallback = null;
+    recipLock = null;
+  }
   function renderRecipList() {
     recipList.innerHTML = '';
     deviceRows.filter(function (r) { return r.parentNode; }).forEach(function (r) {
@@ -3064,18 +3577,51 @@ font-family: var(--font-body);
       label.querySelector('input').addEventListener('change', function (e) {
         if (e.target.checked) { if (recipSel.indexOf(id) < 0) recipSel.push(id); }
         else { var k = recipSel.indexOf(id); if (k > -1) recipSel.splice(k, 1); }
-        updateRecipCount();
+        syncRecipDialog();
       });
       recipList.appendChild(label);
     });
-    updateRecipCount();
+    syncRecipDialog();
   }
-  function updateRecipCount() {
-    var c = $('#recipCount');
-    if (c) c.textContent = '已选 ' + recipSel.length + ' 台';
-    var btn = $('#recipConfirmBtn');
-    if (btn) btn.disabled = recipSel.length === 0;
+  /* 名称字段：群发与群聊都可命名，标题随之变成「群发 · X」/「群聊 · X」 */
+  function syncNameField() {
+    var mode = recipLock || pickedMode();
+    var isBc = mode === 'broadcast';
+    var show = (recipSel.length > 1 || !!recipLock);
+    $('#convoNameField').hidden = !show;
+    $('#convoNameLabel').textContent = isBc ? '群发名称' : '群聊名称';
+    $('#convoNameInput').placeholder = isBc ? '例如：发布通知' : '留空则显示设备名称';
+    var v = ($('#convoNameInput').value || '').trim();
+    var fallback = isBc
+      ? '未命名群发'
+      : (recipSel.map(devNameById).join('、') || '设备名称');
+    $('#convoNamePreview').textContent = (isBc ? '群发 · ' : '群聊 · ') + (v || fallback);
   }
+  /* 模式与设备数共同决定对话框的标题、说明与按钮文案 */
+  function syncRecipDialog() {
+    var locked = !!recipLock;
+    var mode = locked ? recipLock : pickedMode();
+    var isBc = mode === 'broadcast';
+    var multi = recipSel.length > 1;
+    var pick = $('#modePick');
+    pick.dataset.off = locked ? '1' : '0';
+    pick.setAttribute('aria-disabled', locked ? 'true' : 'false');
+    $('#modeNote').hidden = !locked;
+    syncNameField();
+    $('#recipCount').textContent = '已选 ' + recipSel.length + ' 台';
+    $('#recipTitle').textContent = locked
+      ? (isBc ? '编辑群发' : '编辑群聊')
+      : (multi ? (isBc ? '新建群发' : '新建群聊') : '新建会话');
+    $('#recipDesc').textContent = multi
+      ? (isBc
+        ? '勾选多台设备，一次群发给它们；每台设备各自收到一条单独消息。'
+        : '勾选多台设备，建立一个共享群聊；任何设备发送的消息所有参与者都能看到。')
+      : '勾选一台设备时为单独会话；勾选两台以上才启用模式。';
+    $('#recipConfirmBtn').textContent = multi ? (isBc ? '进入群发' : '进入群聊') : '进入会话';
+    $('#recipConfirmBtn').disabled = recipSel.length === 0;
+  }
+  $$('input[name="convoMode"]').forEach(function (r) { r.addEventListener('change', syncRecipDialog); });
+  $('#convoNameInput').addEventListener('input', syncNameField);
   $('#recipAllBtn').addEventListener('click', function () {
     var all = deviceRows.filter(function (r) { return r.parentNode; }).map(function (r) { return r.dataset.id; });
     recipSel = (recipSel.length === all.length) ? [] : all;
@@ -3086,37 +3632,107 @@ font-family: var(--font-body);
     var ids = recipSel.slice();
     if (!ids.length) return;
     var cb = recipCallback;
+    var mode = recipLock || (ids.length > 1 ? pickedMode() : 'direct');
+    var name = ($('#convoNameInput').value || '').trim();
     closeRecipientDialog();
-    if (cb) cb(ids); else applyRecipients(ids);
+    if (cb) cb(ids, mode, name); else applyRecipients(ids, mode, name);
   });
   recipDialog.addEventListener('click', function (e) { if (e.target === recipDialog) closeRecipientDialog(); });
-  $('#newConvoBtn').addEventListener('click', function () { openRecipientDialog([], null); });
-  $('#convNewBtn').addEventListener('click', function () { openRecipientDialog([], null); });
+  $('#newConvoBtn').addEventListener('click', function () { openRecipientDialog([], null, {}); });
+  $('#convNewBtn').addEventListener('click', function () { openRecipientDialog([], null, {}); });
 
-  function applyRecipients(ids) {
+  function applyRecipients(ids, mode, name) {
     ids = ids.filter(function (id) { return !!devById(id); });
     if (!ids.length) return;
     var fromKey = chat.openKey;
-    var key = ensureConvo(ids);
+    var key = ensureConvo(ids, mode, name);
     if (ids.length > 1 && fromKey && fromKey.indexOf('dev:') === 0 && ids.indexOf(fromKey.slice(4)) > -1 && !chat.store[key]) {
       chat.store[key] = (chat.store[fromKey] || []).slice();
     }
     openConversation(key);
-    toast(ids.length > 1 ? '已进入群会话 · ' + ids.length + ' 台设备' : '已进入与「' + devNameById(ids[0]) + '」的会话');
+    var m = threadMode(key);
+    toast(ids.length > 1
+      ? (m === 'broadcast' ? '已进入群发 · ' + ids.length + ' 台设备' : '已进入群聊 · ' + ids.length + ' 台设备')
+      : '已进入与「' + devNameById(ids[0]) + '」的会话');
   }
+
+  /* ── 接收方视角预览：每台设备只看到一条单独的一对一消息 ───── */
+  var peekDialog = $('#peekDialog');
+  var peekKey = null, peekMsg = null, peekIndex = 0;
+  function openPeek(key, m, index) {
+    peekKey = key;
+    peekMsg = m;
+    peekIndex = index || 0;
+    renderPeek();
+    peekDialog.classList.add('open');
+    $('#peekCloseBtn').focus();
+  }
+  function closePeek() { peekDialog.classList.remove('open'); peekKey = null; peekMsg = null; }
+  function myDeviceName() {
+    var el = $('#deviceName');
+    return (el && el.value.trim()) || '本机';
+  }
+  function renderPeek() {
+    var ids = convoParticipants(peekKey);
+    if (!ids.length || !peekMsg) return;
+    if (peekIndex >= ids.length) peekIndex = 0;
+    var id = ids[peekIndex];
+    var row = devById(id);
+    $('#peekAvatar').textContent = row ? devAvatarOf(row) : '?';
+    $('#peekName').textContent = row ? devName(row) : id;
+    $('#peekSub').textContent = '单独会话 · 来自 ' + myDeviceName();
+    var st = (peekMsg.receipt && peekMsg.receipt.states && peekMsg.receipt.states[id]) || 'off';
+    var thread = $('#peekThread');
+    thread.innerHTML = '';
+    var msg = document.createElement('div');
+    msg.className = 'peek-msg';
+    var bubble = document.createElement('div');
+    bubble.className = 'peek-bubble';
+    if (peekMsg.kind === 'file') {
+      bubble.innerHTML = '<span class="pb-file">' + CHAT_FILE_ICO + '</span><span class="pb-main"><span class="pb-name"></span><span class="pb-size"></span></span>';
+      bubble.querySelector('.pb-name').textContent = peekMsg.name;
+      bubble.querySelector('.pb-size').textContent = peekMsg.size || '文件';
+    } else {
+      bubble.textContent = peekMsg.text;
+    }
+    msg.appendChild(bubble);
+    var meta = document.createElement('div');
+    meta.className = 'peek-meta';
+    meta.textContent = peekMsg.t;
+    msg.appendChild(meta);
+    thread.appendChild(msg);
+    var off = document.createElement('div');
+    off.className = 'peek-off' + (st === 'ok' ? '' : ' bad');
+    off.textContent = st === 'ok' ? '该设备当时在线，已收到这条消息' : '该设备当时离线，这条消息未送达';
+    thread.appendChild(off);
+    $('#peekNote').textContent = '对方只看到这一条单独的一对一消息；群发中的其他收件人，以及你发出的其他内容，都不会出现在这里。';
+    var next = $('#peekNextBtn');
+    next.disabled = ids.length <= 1;
+    next.textContent = ids.length > 1 ? '下一台（' + (peekIndex + 1) + '/' + ids.length + '）' : '只有这一台';
+  }
+  $('#peekCloseBtn').addEventListener('click', closePeek);
+  $('#peekNextBtn').addEventListener('click', function () {
+    var n = convoParticipants(peekKey).length;
+    if (n < 2) return;
+    peekIndex = (peekIndex + 1) % n;
+    renderPeek();
+  });
+  peekDialog.addEventListener('click', function (e) { if (e.target === peekDialog) closePeek(); });
 
   function chatPush(m) {
     var key = chat.openKey;
     if (!key) { toast('暂无会话，先选择收件人'); return null; }
     if (chatLog.querySelector('.chat-empty')) chatLog.innerHTML = '';
-    var el = chatMsgEl(m);
+    var el = chatMsgEl(m, {});
     chatLog.appendChild(el);
     chatStoreFor(key).push(m);
     chatLog.scrollTop = chatLog.scrollHeight;
     touchConvo(key);
-    if (m.from === 'peer') chat.unread[key] = chatUnread(key) + 1;
+    if (m.from === 'peer' && !(convoSheet.classList.contains('open') && chat.openKey === key)) {
+      chat.unread[key] = chatUnread(key) + 1;
+    }
     renderDeviceTabs();
-    if (m.from === 'me' && !m.transfer) {
+    if (m.from === 'me' && !m.transfer && !threadIsBroadcast(key)) {
       setTimeout(function () {
         m.status = '已读';
         var meta = el.querySelector('.chat-meta');
@@ -3130,8 +3746,16 @@ font-family: var(--font-body);
   function chatSendText() {
     var text = chatInput.value.trim();
     if (!text) return;
-    if (!chat.openKey) { toast('暂无会话，先选择收件人'); return; }
-    chatPush({ from: 'me', kind: 'text', text: text, t: chatNow(), status: '已送达' });
+    var key = chat.openKey;
+    if (!key) { toast('暂无会话，先选择收件人'); return; }
+    var m = { from: 'me', kind: 'text', text: text, t: chatNow(), status: '已送达' };
+    if (threadIsBroadcast(key)) {
+      m.receipt = buildReceipt(key);
+      toast(m.receipt.offline
+        ? '已群发 · ' + m.receipt.delivered + '/' + m.receipt.total + ' 台送达，' + m.receipt.offline + ' 台离线'
+        : '已群发至 ' + m.receipt.total + ' 台设备');
+    }
+    chatPush(m);
     chatInput.value = '';
     chatSyncSend();
     renderConvoList();
@@ -3145,10 +3769,11 @@ font-family: var(--font-body);
   chatSyncSend();
 
   /* 文件即推送：文件消息携带传输状态，按（消息 × 在线设备）依次传输 */
-  function sendFilePayload(ids, items) {
+  function sendFilePayload(ids, items, mode) {
     if (!ids || !ids.length || !items || !items.length) return;
-    var key = ensureConvo(ids);
+    var key = ensureConvo(ids, mode);
     openConversation(key);
+    var isBc = threadIsBroadcast(key);
     var parts = convoParticipants(key);
     var connected = parts.map(devById).filter(function (r) { return r && r.dataset.state === 'connected'; });
     items.forEach(function (it) {
@@ -3164,6 +3789,7 @@ font-family: var(--font-body);
           state: connected.length ? 'sending' : 'failed'
         }
       };
+      if (isBc) m.receipt = buildReceipt(key);
       var el = chatPush(m);
       if (!connected.length) { updateFileBubble(el, m); return; }
       connected.forEach(function (r) {
@@ -3186,7 +3812,7 @@ font-family: var(--font-body);
     renderConvoList();
     renderDeviceTabs();
   }
-  function pickAndSendFiles(ids) {
+  function pickAndSendFiles(ids, mode) {
     if (!window.OrbDropPicker) return;
     window.OrbDropPicker.open({
       mode: 'both', multi: true,
@@ -3196,14 +3822,14 @@ font-family: var(--font-body);
         if (!items || !items.length) return;
         sendFilePayload(ids, items.map(function (it) {
           return { name: it.name, folder: it.type === 'folder', size: it.size };
-        }));
+        }), mode);
       }
     });
   }
 
   $('#chatPlusBtn').addEventListener('click', function () {
     if (!chat.openKey) { toast('暂无会话，先选择收件人'); return; }
-    pickAndSendFiles(convoParticipants(chat.openKey));
+    pickAndSendFiles(convoParticipants(chat.openKey), threadIsBroadcast(chat.openKey) ? 'broadcast' : 'group');
   });
 
   function hideChatCtx() {
@@ -3281,6 +3907,7 @@ font-family: var(--font-body);
   });
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape' || e.defaultPrevented) return;
+    if (peekDialog.classList.contains('open')) { closePeek(); return; }
     if (recipDialog.classList.contains('open')) { closeRecipientDialog(); return; }
     if (tabsMenu.classList.contains('show')) { hideTabsMenu(); return; }
     if (chatCtx.classList.contains('show')) { hideChatCtx(); return; }

@@ -1,17 +1,19 @@
 <script lang="ts">
   import * as chat from '$lib/stores/chat.svelte';
   import type { ChatItem } from '$lib/stores/chat.svelte';
-  import { getDevices } from '$lib/stores/devices.svelte';
+  import { getDevices, deviceDotState, deviceState, threadDotState } from '$lib/stores/devices.svelte';
+  import type { PendingGroup } from '$lib/types';
 
   /**
-   * 会话浮层（原型 `.convo-pop`）：三块视图共用一层 —— **会话列表 / 与某台设备的会话 / 群发框**。
+   * 会话浮层（原型 `.convo-pop`）：两块视图共用一层 —— **会话列表 / 某个会话**。
    *
-   * 这里**只管画**：会话记录在后端（`stores/chat` 拿着那份快照），"谁在跟你说话"看设备表。
-   * 需要 App 出面的事（开文件选择框、右下角那条邀请、右键菜单、切到设备标签）都走回调 ——
-   * 会话是面板里的一个视图，不是第二个 App。
+   * 这里**只管画**：三种会话的记录都在后端（`stores/chat` 拿着那份快照），"谁在跟你说话"在
+   * 群聊里看消息自己的 `fromName`（颜色按**设备 id** 哈希，见 `chat.speakerIndex`），其余看
+   * 设备表。需要 App 出面的事（开文件选择框、右键菜单）都走回调 —— 会话是面板里的一个视图，
+   * 不是第二个 App。
    *
-   * **群发框是临时载体**：它自己不是会话、不留历史（记录落在各台设备的会话里），所以它是
-   * 一块独立的视图，而不是"某个会话"。
+   * 三种身份（一对一 / 单向群发 / 共享群聊）在两块视图里各有一套画法：列表那头像与模式章、
+   * 详情头部的模式条、收件人栏、输入区都跟着 `thread.mode` 走（原型的三张身份）。
    */
   let {
     pickedId,
@@ -25,45 +27,81 @@
     /** 右键菜单正指着的那条消息（高亮它，菜单收掉就清空）。 */
     pickedId: string | null;
     onToast: (msg: string) => void;
-    /** 「＋」：给这几台选文件发过去（App 开文件选择框，走推送那条路；1:1 会话就是单台）。 */
-    onSendFiles: (peerIds: string[]) => void;
+    /** 「＋」：给这条会话的每台选文件发过去（App 开文件选择框，走推送那条路）。 */
+    onSendFiles: () => void;
     onAcceptInvite: (inviteId: string) => void;
     onRejectInvite: (inviteId: string) => void;
-    /** 「与这台设备的会话」右上角「⋮」：把会话菜单的锚点交出去（菜单由 App 画）。 */
-    onConvoCtx: (x: number, y: number) => void;
+    /** 「⋮」：把会话菜单的锚点与**是哪个会话**交出去（菜单由 App 画，项按模式分）。 */
+    onConvoCtx: (x: number, y: number, key: string) => void;
     /** 消息右键：坐标 + 这一条要复制的内容（整条 / 选中的那段）。 */
     onMessageCtx: (x: number, y: number, id: string, full: string, sel: string) => void;
   } = $props();
 
   const open = $derived(chat.isChatOpen());
-  const batch = $derived(chat.getBatch());
-  const openPeer = $derived(chat.getOpenPeer());
-  const peers = $derived(chat.convoPeers());
+  const thread = $derived(chat.activeThread());
+  const rows = $derived(chat.convoRows());
   const devices = $derived(getDevices());
-  const items = $derived<ChatItem[]>(openPeer ? chat.itemsOf(openPeer) : []);
-  const openDev = $derived(devices.find((d) => d.id === openPeer));
+  const items = $derived<ChatItem[]>(thread ? chat.itemsOf(thread.key) : []);
+  const draft = $derived(thread ? chat.draftOf(thread.key) : '');
+  /** 最后一条的 id：新消息进来就跳到底（按 id 而不是长度，编辑/替换也算变化）。 */
   const tail = $derived(items.length ? items[items.length - 1].id : '');
+  const openDev = $derived(thread?.mode === 'direct' ? devices.find((d) => d.id === thread.participants[0]) : undefined);
+  /**
+   * 一对一那条会话对着哪台设备（群发/群聊是空串）。
+   *
+   * 一对一那一屏里，"这条到没到"只说**这一台**：群发过去的副本同样躺在这条会话里
+   * （群发是每台各存一份），但"几台送到了"是群发那条视图的事（`deliveryText` / `fileStatusText`）。
+   */
+  const directPeer = $derived(thread?.mode === 'direct' ? thread.participants[0] : '');
+
+  /**
+   * 这条群聊**已知缺**几条（后端算好，见 `ChatGroup.missing`）：> 0 就在消息流头顶如实说一句。
+   * 只认本地已知的那个群（`groupOf`）：这条键指向的群要是已经不在了，就没得可缺。
+   */
+  const missing = $derived(thread?.mode === 'group' ? (chat.groupOf(thread.id)?.missing ?? 0) : 0);
 
   let logEl = $state<HTMLDivElement | null>(null);
   let inputEl = $state<HTMLInputElement | null>(null);
-  let batchInputEl = $state<HTMLInputElement | null>(null);
 
   /** 新消息进来、换会话、浮层重新展开 —— 都落到最底下（原型 `renderChatLog` 结尾那次滚动）。 */
   $effect(() => {
-    const el = logEl;
-    if (!el) return;
     void tail;
-    void openPeer;
+    void thread;
     void open;
-    if (open && openPeer) el.scrollTop = el.scrollHeight;
+    if (!open || !logEl) return;
+    logEl.scrollTop = logEl.scrollHeight;
   });
 
-  /** 打开某个会话 / 群发框就把光标放进输入框（点「发消息」「群发」进来的人下一步一定是打字）。 */
+  /** 打开某个会话就把光标放进输入框（点「发消息」进来的人下一步一定是打字）。 */
   $effect(() => {
-    if (!open) return;
-    if (batch) batchInputEl?.focus();
-    else if (openPeer) inputEl?.focus();
+    void thread?.key;
+    if (!open || !thread) return;
+    inputEl?.focus();
   });
+
+  /**
+   * 这一条要不要在上头插一行发言人（群聊里他人发的、且与上一条不是同一个人说的）。
+   *
+   * 同一个人连着说几句只在头一条上面标一次（原型也是这么分组的，一屏里就不会满眼都是名字）。
+   * 比的是**设备 id**：名字会变，拿名字比会把改过名的同一个人当成两个人。
+   */
+  function speakerOf(i: number): { cls: string; initial: string; name: string } | null {
+    if (thread?.mode !== 'group') return null;
+    const item = items[i];
+    if (!item || item.fromMe || item.kind !== 'text' || !('from' in item)) return null;
+    const prev = items[i - 1];
+    if (prev && !prev.fromMe && prev.kind === 'text' && 'from' in prev && prev.from === item.from) return null;
+    const name = item.fromName.trim() || chat.deviceNameOf(item.from);
+    return { cls: `sp-${chat.speakerIndex(item.from)}`, initial: (name.charAt(0) || '?').toUpperCase(), name };
+  }
+
+  /**
+   * 群邀请卡的「加入 / 不加入」：加入之后直接把这条群聊打开（点它的人就是要进去说话）；
+   * 拒绝只是别再弹这张卡（本地记下"拒绝过"）。
+   */
+  function answerInvite(pg: PendingGroup, join: boolean) {
+    void (join ? chat.joinGroup(pg.id) : chat.dismissGroup(pg.id)).catch((e) => onToast(String(e)));
+  }
 
   const ICON_CHAT = 'M20 12a8 8 0 0 1-8 8H6.5L3 22V12a8 8 0 0 1 8-8h1a8 8 0 0 1 8 8Z M8.5 11h7 M8.5 14.5h4';
   const ICON_FILE = 'M6 3h8l5 5v13H6V3Z';
@@ -77,14 +115,22 @@
   /**
    * 一条消息那一刻（`HH:MM`）加上该说的话。
    *
-   * 自己发的带送达状态；对方发的**只写时刻** —— 会话的标题已经写着是谁了，不必每行再报一遍
-   * 名字（原型的 `chat-meta` 也是这个逻辑：只有群里的参与者消息才带名字，而这里没有群）。
+   * 一对一：自己发的带**这台设备自己的**送达状态（群发过去的副本在这屏也只写这一台，
+   * 见 `chat.deliveryText`），对方发的只写时刻 —— 标题已经写着是谁了。
+   * 群发：只写时刻 —— 逐台战果由下面那块回执（`.chat-receipt`）逐台写清楚。
+   * 群聊：自己发的写群里的账（「已读 3/4」，见 `chat.groupReceiptText`），别人发的只写时刻
+   * —— 是谁说的，上一行那枚发言人标已经写了。
    */
   function metaOf(item: ChatItem): string {
     const when = chat.clock(item.at);
     if (!item.fromMe) return when;
-    const state = chat.deliveryText(item);
-    return state ? `${when} · ${state}` : when;
+    if (directPeer) {
+      const state = chat.deliveryText(directPeer, item);
+      return state ? `${when} · ${state}` : when;
+    }
+    if (thread?.mode !== 'group') return when;
+    const receipt = chat.groupReceiptText(item);
+    return receipt ? `${when} · ${receipt}` : when;
   }
 
   /** 消息右键要复制的那串（文件消息 = `名字（大小）`，与原型 `data-copy` 同一套）。 */
@@ -107,48 +153,85 @@
     onMessageCtx(e.clientX, e.clientY, msgEl.dataset.id ?? '', item ? copyTextOf(item) : '', sel);
   }
 
-  function send(peerId: string, text: string) {
-    if (!text.trim()) return;
-    void chat
-      .sendText(peerId, text)
-      .then((ok) => {
-        if (ok) chat.setDraftOf(peerId, '');
-        else onToast('这台设备已经被移除了');
-      })
-      .catch((e) => onToast(String(e)));
-  }
-
   /**
-   * 群发框里的那条发出去：框自己会关掉（`sendBatch` 里 `batch = null`），这里只给一句话 ——
-   * 逐台成败由刚发那条的 `id` 读出来（不猜），列表里那几台的最近记录随即变成这条。
+   * 发出去这条。三种身份都走 `chat.sendText`（群发 = "每台各存一份副本"，群聊 = 群里那一条
+   * 共用的消息流）。
+   *
+   * 群发的提示当场给出逐台战果（刚发那条读出来的，不猜）：全到位只说台数；没到位的把
+   * "几台送达 / 几台在等对端上线 / 几台没送到 / 几台发送中"一次说清 —— 随后
+   * `chat://changed` 还会更新回执（对端上线后，等待发送的那几台会自己变成已送达）。
    */
-  function sendBatch() {
+  function send() {
+    const t = thread;
+    const text = draft.trim();
+    if (!t || !text) return;
     void chat
-      .sendBatch()
+      .sendText(t.key, text)
       .then((res) => {
         if (!res) return;
-        if (!res.failed.length) onToast(`已群发给${chat.namesLabel(res.sent)}`);
-        else if (!res.sent.length) onToast(`群发未送达：${chat.namesLabel(res.failed)}没有长连接`);
-        else onToast(`已群发给${chat.namesLabel(res.sent)} · ${res.failed.length} 台未送达`);
+        chat.setDraftOf(t.key, '');
+        if (t.mode !== 'broadcast') return;
+        const item = chat.itemById(t.key, res.id);
+        const receipt = item ? chat.receiptOf(item) : null;
+        if (!item || !receipt) return;
+        if (receipt.delivered === receipt.total) {
+          onToast(`已群发至 ${receipt.total} 台设备`);
+          return;
+        }
+        const tail = [`${receipt.delivered}/${receipt.total} 台送达`];
+        if (receipt.waiting) tail.push(`${receipt.waiting} 台等对端上线`);
+        if (receipt.offline) tail.push(`${receipt.offline} 台未送达`);
+        const pending = chat.perDeviceOf(item).filter((p) => p.state === 'pending').length;
+        if (pending) tail.push(`${pending} 台发送中`);
+        onToast(`已群发 · ${tail.join('，')}`);
       })
       .catch((e) => onToast(String(e)));
   }
 
-  /**
-   * 与某台设备的会话里点「添加」：这里没有"群会话"可加 —— 加人就是**改成群发**
-   * （把当前这台带去群发框，选完设备一起发，记录各落各的会话）。
-   */
-  function addToBatch(seed: string[]) {
-    chat.askRecipients(seed, (ids) => chat.openBatch(ids));
+  /** 收件人上那颗 ✕（原型 `removeRecipient`）：去掉一台；只剩一台就退回一对一会话。 */
+  function dropRecipient(peerId: string) {
+    const t = thread;
+    if (!t) return;
+    void chat
+      .removeParticipant(t.key, peerId)
+      .then((res) => {
+        if (!res) return;
+        if (!res.dissolved) {
+          onToast(`已从收件人移除「${res.name}」（不是踢人，对方不会收到任何通知）`);
+          return;
+        }
+        onToast(res.remaining ? '参与者只剩一台，已退回一对一会话' : '这台设备已经不在设备表里了，会话已关闭');
+      })
+      .catch((e) => onToast(String(e)));
   }
 
-  /** 「与这台设备的会话」右上角「⋮」：坐标交给 App，菜单内容也由它决定。 */
+  /** 「⋮」：坐标与是哪个会话都交给 App，菜单内容也由它按模式决定。 */
   function convoMenu(e: MouseEvent) {
     e.stopPropagation();
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    onConvoCtx(rect.right, rect.bottom + 4);
+    if (thread) onConvoCtx(rect.right, rect.bottom + 4, thread.key);
   }
 </script>
+
+{#snippet icBc()}
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18.5 5.5 6.5 9.5H5a1.5 1.5 0 0 0-1.5 1.5v2A1.5 1.5 0 0 0 5 14.5h1.5l12 4V5.5Z" /><path d="M8 14.8V18a1.6 1.6 0 0 0 1.6 1.6h1.2" /></svg>
+{/snippet}
+
+{#snippet icGrp()}
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 19v-1a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v1" /><circle cx="9" cy="7" r="3" /><path d="M22 19v-1a4 4 0 0 0-3-3.87" /><path d="M16 4.13a4 4 0 0 1 0 7.75" /></svg>
+{/snippet}
+
+{#snippet icChat()}
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d={ICON_CHAT} /></svg>
+{/snippet}
+
+{#snippet icCheck()}
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.5 4.5 4.5L19 7" /></svg>
+{/snippet}
+
+{#snippet icMinus()}
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M7 12h10" /></svg>
+{/snippet}
 
 <!-- 浮层常驻 DOM（`inert` 关掉交互）：收起 / 展开那一下得靠 `class:open` 触发过渡，
      要是按需挂载，挂上时就已经是终态，缩放那一动画就没了。 -->
@@ -160,72 +243,150 @@
   inert={!open}
   data-od-id="convo-sheet"
 >
-  <div class="convos-list-view" hidden={!!openPeer || !!batch}>
+  <div class="convos-list-view" hidden={!!thread}>
     <header class="convos-head">
       <span class="convos-title">会话</span>
       <div class="convos-head-acts">
-        <button class="btn btn-secondary btn-sm" type="button" onclick={() => chat.askRecipients([], (ids) => chat.openBatch(ids))}>＋ 群发</button>
+        <button class="btn btn-secondary btn-sm" type="button" onclick={() => chat.askNewConvo()}>＋ 新建会话</button>
         <button class="icon-btn" type="button" aria-label="关闭会话" onclick={() => chat.setChatOpen(false)}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
         </button>
       </div>
     </header>
 
+    <!-- 群邀请：**收到但还没确认**的群就到这儿为止（用户没点「加入」就不算群，不占会话列表
+         一行）。卡长在列表头顶、不跟着列表滚：邀请是"等你处理"的东西，滚走就等于没看见。 -->
+    {#if chat.pendingGroups().length > 0}
+      <div class="invite-strip" aria-label="群聊邀请">
+        {#each chat.pendingGroups() as pg (pg.id)}
+          <div class="invite-card">
+            <div class="ic-row">
+              <span class="f-icon">{@render icGrp()}</span>
+              <span class="ic-main">
+                <span class="ic-name">「{pg.fromName}」邀请你加入群聊「{pg.name.trim() || '未命名群聊'}」</span>
+                <span class="ic-size">其他 {pg.members.length} 台设备</span>
+              </span>
+            </div>
+            <div class="ic-acts">
+              <button class="btn btn-secondary btn-sm" type="button" onclick={() => answerInvite(pg, false)}>不加入</button>
+              <button class="btn btn-primary btn-sm" type="button" onclick={() => answerInvite(pg, true)}>加入</button>
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+
     <div class="convo-list" aria-label="会话列表">
-      {#if peers.length === 0}
+      {#if rows.length === 0}
         <div class="empty">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d={ICON_CHAT} /></svg>
+          {@render icChat()}
           <p>还没有会话</p>
-          <p class="e-sub">到「设备」页配对或建立长连接后，每台设备就是一条会话；要同时发几台就用「＋ 群发」。</p>
+          <p class="e-sub">到「设备」页配对或建立长连接后，每台设备就是一条会话；要同时发几台就用「＋ 新建会话」。</p>
         </div>
       {:else}
-        {#each peers as peerId (peerId)}
-          {@const unread = chat.unreadForPeer(peerId)}
-          <button class="convo-item" type="button" onclick={() => chat.openConversation(peerId)}>
-            <span class="convo-avs"><span class="d-avatar">{chat.peerInitial(peerId)}</span></span>
+        {#each rows as row (row.key)}
+          <!-- 三种身份混排、行长得一样（头像 / 名字 / 模式章 / 预览 / 时间 / 未读）：头像与模式章区分身份。 -->
+          <button class="convo-item" type="button" onclick={() => chat.openConversation(row.key)}>
+            <span class="convo-avs">
+              {#if row.mode === 'direct'}
+                <span class="d-avatar">{row.initial}</span>
+              {:else if row.mode === 'broadcast'}
+                <span class="d-avatar bc-mark">{@render icBc()}</span>
+              {:else}
+                <span class="d-avatar grp-mark">{@render icGrp()}</span>
+              {/if}
+            </span>
             <span class="convo-main">
               <span class="convo-top">
-                <span class="convo-name">{chat.deviceNameOf(peerId)}</span>
-                <span class="convo-dot {chat.peerDotState(peerId)}"></span>
-                <span class="convo-time num">{chat.timeOf(peerId)}</span>
+                <span class="convo-name">{row.label}</span>
+                {#if row.mode === 'broadcast'}
+                  <span class="convo-mode-chip bc">{@render icBc()}群发</span>
+                {:else if row.mode === 'group'}
+                  <span class="convo-mode-chip group">{@render icGrp()}群聊</span>
+                {/if}
+                <span class="convo-dot {row.dot}"></span>
+                <span class="convo-time num">{row.time}</span>
               </span>
-              <span class="convo-prev">{chat.summaryOf(peerId)}</span>
+              <span class="convo-prev">{row.sub}</span>
             </span>
-            {#if unread > 0}<span class="convo-unread">{unread}</span>{/if}
+            {#if row.unread > 0}<span class="convo-unread">{row.unread}</span>{/if}
           </button>
         {/each}
       {/if}
     </div>
   </div>
 
-  {#if openPeer}
+  {#if thread}
     <div class="convo-detail">
-      <header class="conv-top">
-        <button class="conv-back" type="button" aria-label="返回会话列表" onclick={() => chat.backToList()}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 6-6 6 6 6" /></svg>
-        </button>
-        <span class="conv-title">{chat.deviceNameOf(openPeer)}</span>
-        <span class="conv-status {chat.peerDotState(openPeer)}"></span>
-        <div class="conv-acts">
-          <button class="icon-btn" type="button" aria-label="会话操作" onclick={convoMenu}>
-            <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="19" cy="12" r="1.6" /></svg>
+      <div class="conv-headgroup">
+        <header class="conv-top">
+          <button class="conv-back" type="button" aria-label="返回会话列表" onclick={() => chat.backToList()}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 6-6 6 6 6" /></svg>
           </button>
-          <button class="icon-btn" type="button" aria-label="关闭会话" onclick={() => chat.setChatOpen(false)}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
-          </button>
-        </div>
-      </header>
+          <span class="conv-title">{thread.title}</span>
+          <span class="conv-status {directPeer ? deviceDotState(openDev) : threadDotState(thread.participants)}"></span>
+          {#if thread.participants.length > 1}
+            <span class="conv-count num">{thread.participants.length} 台</span>
+          {/if}
+          <!-- 未绑定的设备照样能收发（消息走"长连接优先 + HTTP 直达"），但"这台是谁"只有它
+               自己报的名字 + 一个真实 IP：把这件事摆在标题旁边，一眼能看出来。 -->
+          {#if openDev && !openDev.paired}
+            {@const st = deviceState(openDev)}
+            <span class="state-chip {st.chip}"><span class="dot {st.dot}"></span>{st.label}</span>
+          {/if}
+          <div class="conv-acts">
+            <button class="icon-btn" type="button" aria-label="会话操作" onclick={convoMenu}>
+              <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="19" cy="12" r="1.6" /></svg>
+            </button>
+            <button class="icon-btn" type="button" aria-label="关闭会话" onclick={() => chat.setChatOpen(false)}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
+            </button>
+          </div>
+        </header>
+
+        <!-- 模式条：一对一不画（它就是默认）；群发与群聊各说自己的规则，并各带一颗「编辑」。 -->
+        {#if thread.mode !== 'direct'}
+          <div class="convo-mode" data-mode={thread.mode}>
+            <span class="cm-ic" aria-hidden="true">{#if thread.mode === 'broadcast'}{@render icBc()}{:else}{@render icGrp()}{/if}</span>
+            <span class="cm-txt">
+              <b>{thread.mode === 'broadcast' ? '群发模式' : '群聊模式'}</b>
+              {thread.mode === 'broadcast' ? ' · 单向发送，对方各自单独收到' : ' · 任意参与者共享同一条消息流'}
+            </span>
+            <button class="cm-act" type="button" onclick={() => chat.askParticipants(thread.key)}>
+              {thread.mode === 'broadcast' ? '编辑群发' : '编辑群聊'}
+            </button>
+          </div>
+        {/if}
+      </div>
 
       <div class="recip">
-        <span class="recip-label">发送给</span>
+        <span class="recip-label">{thread.mode === 'broadcast' ? '群发至' : '发送给'}</span>
         <div class="recip-chips">
-          <span class="recip-chip">
-            <span class="rc-av">{chat.peerInitial(openPeer)}</span>
-            <span class="rc-name">{openDev?.name ?? openPeer}</span>
-            <span class="rc-st" class:ok={openDev?.connected}></span>
-          </span>
+          {#each thread.participants as peerId (peerId)}
+            {@const dev = devices.find((d) => d.id === peerId)}
+            <!-- 群成员不一定还在本机设备表里（被解除了配对、或只是没再加回来）：那时用名册上
+                 随群带来的名字，别把一串设备 id 摆给用户看。 -->
+            {@const rosterName = thread.mode === 'group' ? chat.groupOf(thread.id)?.members.find((m) => m.id === peerId)?.name.trim() : ''}
+            {@const label = dev?.name ?? rosterName ?? peerId}
+            <span class="recip-chip">
+              <span class="rc-av">{(label.trim().charAt(0) || '?').toUpperCase()}</span>
+              <span class="rc-name">{label}</span>
+              <span class="rc-st {deviceDotState(dev)}"></span>
+              {#if thread.mode !== 'direct'}
+                <button class="rc-x" type="button" aria-label="从收件人里移除" onclick={() => dropRecipient(peerId)}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
+                </button>
+              {/if}
+            </span>
+          {/each}
         </div>
-        <button class="recip-add" type="button" aria-label="再加几台一起发（群发）" onclick={() => addToBatch([openPeer])}>
+        <button
+          class="recip-add"
+          type="button"
+          aria-label={thread.mode === 'direct' ? '再加几台一起发' : '编辑收件人'}
+          title={thread.mode === 'direct' ? '再加几台：选到两台以上就成为一个多台会话（群发或群聊）' : ''}
+          onclick={() => chat.askParticipants(thread.key)}
+        >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
           添加
         </button>
@@ -233,21 +394,60 @@
 
       <!-- 消息流：右键复制走 `onLogContext`（菜单由 App 画在 `.orb-stage` 之外，跨层叠上下文永远在最上）。 -->
       <div class="chat-log" bind:this={logEl} role="log" aria-label="会话记录" oncontextmenu={onLogContext}>
-        {#if items.length === 0}
+        <!-- 补拉够不着的那几条：群里明明已知缺着东西，就别只摆一条看着很完整的记录。
+             一行小字，与群发那条单向台账同一副骨头（`.chat-ledger` 那一档），只在真缺时才在。 -->
+        {#if missing > 0}
+          <div class="chat-sync">
+            <span class="cs-line"></span>
+            <span class="cs-txt">有 {missing} 条消息未能同步（来源设备不在线）</span>
+            <span class="cs-line"></span>
+          </div>
+        {/if}
+        {#if items.length === 0 && missing === 0}
           <div class="chat-empty">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d={ICON_CHAT} /></svg>
-            <p>还没有消息</p>
-            <p class="ce-sub">发一条消息或传一个文件，开始和设备对话。</p>
+            {#if thread.mode === 'broadcast'}
+              {@render icBc()}
+              <p>还没有群发消息</p>
+              <p class="ce-sub">
+                你发出的每条消息都会作为单独的一对一消息，分别送达 {thread.participants.length} 台设备；这里只显示你发出的内容。
+              </p>
+            {:else if thread.mode === 'group'}
+              {@render icGrp()}
+              <p>还没有消息</p>
+              <p class="ce-sub">在这里说一句，名册上的成员都会看到（同一条消息流）；传文件则按成员逐台推送。</p>
+            {:else}
+              {@render icChat()}
+              <p>还没有消息</p>
+              <p class="ce-sub">发一条消息或传一个文件，开始和设备对话。</p>
+            {/if}
           </div>
         {:else}
-          {#each items as item (item.id)}
+          {#if thread.mode === 'broadcast'}
+            <!-- 单向台账：这一条条都是我发出去的（对方的回复各自回到它们的 1:1，不在这儿）。 -->
+            <div class="chat-ledger">
+              <span class="cl-line"></span>
+              <span class="cl-txt">已发送 · {items.length} 条 · 单向</span>
+              <span class="cl-line"></span>
+            </div>
+          {/if}
+          {#each items as item, i (item.id)}
+            {@const who = speakerOf(i)}
             <div
               class="chat-msg"
               class:me={item.fromMe}
               class:peer={!item.fromMe}
+              class:bc={thread.mode === 'broadcast'}
               class:picked={pickedId === item.id}
               data-id={item.id}
             >
+              <!-- 群聊：换个人说话就在这条上面插一行发言人（头像字 + 名字，颜色按设备 id 哈希）——
+                   同一个人连着说的几句共享头一行，一屏里不会满眼都是名字。 -->
+              {#if who}
+                <div class="chat-who {who.cls}">
+                  <span class="cw-av">{who.initial}</span>
+                  <span class="cw-nm">{who.name}</span>
+                </div>
+              {/if}
               {#if item.kind === 'text'}
                 <div class="chat-bubble"><span class="chat-text">{item.text}</span></div>
               {:else if !item.fromMe && item.inviteState === 'pending'}
@@ -284,18 +484,47 @@
                   {/if}
                 </div>
               {:else}
-                <!-- 自己发出去的文件：传输状态行（进度来自右下角那张推送卡） -->
+                <!-- 自己发出去的文件：传输状态行（一对一 = 这台自己的状态；群发 = 整批的进度，
+                     逐台状态另有一排回执。进度来自右下角那张推送卡）。 -->
+                {@const fState = chat.fileStatusText(item, directPeer)}
                 <div class="chat-bubble chat-bubble-file">
                   <span class="cf-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d={icPath(item)} /></svg></span>
                   <span class="cf-main">
                     <span class="cf-name">{item.name}</span>
                     <span class="cf-size">{item.size}</span>
-                    {#if chat.fileStatusText(item)}<span class="cf-status">{chat.fileStatusText(item)}</span>{/if}
+                    {#if fState}<span class="cf-status">{fState}</span>{/if}
                     {#if item.sending}<span class="cf-bar"><i style="width:{item.pct}%"></i></span>{/if}
                   </span>
                 </div>
               {/if}
               <div class="chat-meta">{metaOf(item)}</div>
+
+              <!-- 群发：这条当时发给了谁、每台走到哪一步（逐台读副本的送达状态，不按当前名单猜），
+                   外加一颗「查看收件效果」—— 看对方那边到底收到了什么。 -->
+              {#if thread.mode === 'broadcast' && item.fromMe}
+                {@const per = chat.perDeviceOf(item)}
+                {@const receipt = chat.receiptOf(item)}
+                {#if receipt}
+                  <div class="chat-receipt">
+                    <span class="cr-head">已送达 {receipt.delivered}/{receipt.total} 台</span>
+                    <span class="cr-list">
+                      {#each per as p (p.peerId)}
+                        <span
+                          class="cr-dev"
+                          class:off={p.state === 'off'}
+                          class:pending={p.state === 'pending' || p.state === 'waiting'}
+                          title="{chat.deviceNameOf(p.peerId)} · {p.label}"
+                        >
+                          <span class="cr-av">{chat.peerInitial(p.peerId)}</span>
+                          <span class="cr-nm">{chat.deviceNameOf(p.peerId)}</span>
+                          <span class="cr-ic">{#if p.state === 'ok'}{@render icCheck()}{:else}{@render icMinus()}{/if}</span>
+                        </span>
+                      {/each}
+                    </span>
+                    <button class="cr-peek" type="button" onclick={() => chat.openPeek(thread.key, item.id)}>查看收件效果</button>
+                  </div>
+                {/if}
+              {/if}
             </div>
           {/each}
         {/if}
@@ -303,123 +532,92 @@
 
       <form
         class="chat-compose"
+        class:bc={thread.mode === 'broadcast'}
         onsubmit={(e) => {
           e.preventDefault();
-          if (openPeer) send(openPeer, chat.draftOf(openPeer));
+          send();
         }}
       >
         <input
           class="chat-input"
           bind:this={inputEl}
           type="text"
-          placeholder="输入消息…"
+          placeholder={thread.mode === 'broadcast'
+            ? `群发给 ${thread.participants.length} 台设备…`
+            : thread.mode === 'group'
+              ? '在群里说一句…'
+              : '输入消息…'}
           autocomplete="off"
-          aria-label="发送消息"
-          value={chat.draftOf(openPeer)}
-          oninput={(e) => chat.setDraftOf(openPeer, e.currentTarget.value)}
+          aria-label={thread.mode === 'broadcast' ? '输入要群发的消息' : thread.mode === 'group' ? '输入群消息' : '发送消息'}
+          title={thread.mode === 'group' ? '群里说的话，名册上的成员都会看到' : ''}
+          value={draft}
+          oninput={(e) => chat.setDraftOf(thread.key, e.currentTarget.value)}
           onkeydown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
               e.preventDefault();
-              send(openPeer, chat.draftOf(openPeer));
+              send();
             }
           }}
         />
-        <button class="chat-plus" type="button" aria-label="发送文件（即推送）" onclick={() => onSendFiles([openPeer])}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
-        </button>
-        <button class="chat-send" type="submit" aria-label="发送消息" disabled={!chat.draftOf(openPeer).trim()}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V6" /><path d="M6 12l6-6 6 6" /></svg>
-        </button>
-      </form>
-    </div>
-  {/if}
-
-  {#if batch}
-    <!-- 群发框：**一次投递的载体**（标题就叫「群发」）。收件人在这里选、可以再加，但这里
-         不存历史 —— 发出去之后记录落在各台设备的会话里，这个框随即消失。 -->
-    <div class="convo-detail">
-      <header class="conv-top">
-        <span class="conv-title">群发</span>
-        <span class="conv-count num">{batch.recipients.length} 台</span>
-        <div class="conv-acts">
-          <button class="icon-btn" type="button" aria-label="关闭群发" onclick={() => chat.closeBatch()}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
-          </button>
-        </div>
-      </header>
-
-      <div class="recip">
-        <span class="recip-label">发送给</span>
-        <div class="recip-chips">
-          {#each batch.recipients as peerId (peerId)}
-            {@const dev = devices.find((d) => d.id === peerId)}
-            <span class="recip-chip">
-              <span class="rc-av">{chat.peerInitial(peerId)}</span>
-              <span class="rc-name">{dev?.name ?? peerId}</span>
-              <span class="rc-st" class:ok={dev?.connected}></span>
-              <button
-                class="rc-x"
-                type="button"
-                aria-label="从收件人里移除"
-                onclick={() => chat.setBatchRecipients(batch.recipients.filter((id) => id !== peerId))}
-              >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
-              </button>
-            </span>
-          {/each}
-        </div>
-        <button class="recip-add" type="button" aria-label="添加收件人" onclick={() => chat.askRecipients(batch.recipients, (ids) => chat.setBatchRecipients(ids))}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
-          添加
-        </button>
-      </div>
-
-      <div class="chat-log">
-        <div class="chat-empty">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d={ICON_CHAT} /></svg>
-          <p>群发不留历史</p>
-          <p class="ce-sub">这条会分别落到每台设备的会话里 —— 之后在各自的会话里继续聊。</p>
-        </div>
-      </div>
-
-      <form
-        class="chat-compose"
-        onsubmit={(e) => {
-          e.preventDefault();
-          sendBatch();
-        }}
-      >
-        <input
-          class="chat-input"
-          bind:this={batchInputEl}
-          type="text"
-          placeholder="输入要群发的消息…"
-          autocomplete="off"
-          aria-label="输入要群发的消息"
-          value={batch.draft}
-          oninput={(e) => chat.setBatchDraft(e.currentTarget.value)}
-          onkeydown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
-              e.preventDefault();
-              sendBatch();
-            }
-          }}
-        />
-        <!-- 「＋」＝选文件推送给这几台（各自一条邀请、各自一条进度；记录一样各落各的会话）。
-             推完**框不关**：文件有它自己那张进度卡在管，而这个框是"我正在选的收件人"，
-             关它该由用户决定（✕ / Esc / 发完那句话）。 -->
-        <button class="chat-plus" type="button" aria-label="发送文件（即推送）" onclick={() => onSendFiles(batch.recipients)}>
+        <button
+          class="chat-plus"
+          class:bc={thread.mode === 'broadcast'}
+          type="button"
+          aria-label={thread.mode === 'broadcast' ? '群发文件（即推送）' : thread.mode === 'group' ? '发送文件到群里' : '发送文件（即推送）'}
+          title={thread.mode === 'group' ? '选文件发到群里：按成员逐台推送（未配对的成员各自点一次同意）' : '选文件发过去就是推送'}
+          onclick={onSendFiles}
+        >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
         </button>
         <button
           class="chat-send"
+          class:bc={thread.mode === 'broadcast'}
           type="submit"
-          aria-label="群发"
-          disabled={batch.recipients.length === 0 || !batch.draft.trim()}
+          aria-label={thread.mode === 'broadcast' ? '群发消息' : '发送消息'}
+          title={thread.mode === 'group' ? '发送到群里' : ''}
+          disabled={draft.trim() === ''}
         >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V6" /><path d="M6 12l6-6 6 6" /></svg>
+          {#if thread.mode === 'broadcast'}
+            {@render icBc()}
+          {:else}
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V6" /><path d="M6 12l6-6 6 6" /></svg>
+          {/if}
         </button>
       </form>
     </div>
   {/if}
 </section>
+
+<style>
+  /* 群聊的补拉缺口：与群发那条单向台账（全局 `.chat-ledger`）同一副骨头 —— 两侧细线夹一行
+     等宽小字 —— 但不借它的颜色：那套橙色是"群发"的语义色，这里只是"少了几条"的如实交代，
+     用中性灰，读作提示而不是模式标记。 */
+  .chat-sync { display: flex; align-items: center; gap: 8px; padding: 4px 2px 2px; }
+  .chat-sync .cs-line { flex: 1; height: 1px; background: var(--border); }
+  .chat-sync .cs-txt {
+    flex: none; font-family: var(--font-mono); font-size: 10px;
+    letter-spacing: 0.06em; color: var(--muted);
+  }
+
+  /* 群邀请卡长在列表头顶：`.invite-card`（全局）自带边框与底色，这里只补它需要的落位与
+     内边距 —— 贴着浮层左右边缘会长得像个横幅。 */
+  .invite-strip { flex: none; display: grid; gap: 8px; padding: 10px 12px 0; }
+
+  /* 群聊的发言人行：只在换人说话时插一行（头像字 + 名字）。三种语义色按设备 id 哈希取，
+     用的是本机主色 / 成功色 / 群发暖色（`--accent` / `--ok` / `--bc`）—— 与"这是谁"无关，
+     只负责把几个发言人一眼分开，且改名字不会换色。 */
+  .chat-who { display: flex; align-items: center; gap: 5px; margin: 1px 2px 4px; }
+  .chat-who .cw-av {
+    flex: none; width: 18px; height: 18px; border-radius: 6px;
+    display: grid; place-items: center;
+    font-family: var(--font-display); font-size: 9px; font-weight: 650;
+    color: var(--surface);
+  }
+  .chat-who .cw-nm { font-family: var(--font-display); font-size: var(--fs-xxs); font-weight: 620; }
+  .chat-who.sp-0 .cw-av { background: var(--accent-deep); }
+  .chat-who.sp-0 .cw-nm { color: var(--accent-deep); }
+  .chat-who.sp-1 .cw-av { background: var(--ok); }
+  .chat-who.sp-1 .cw-nm { color: color-mix(in oklch, var(--ok) 78%, black); }
+  .chat-who.sp-2 .cw-av { background: var(--bc-deep); }
+  .chat-who.sp-2 .cw-nm { color: var(--bc-deep); }
+</style>

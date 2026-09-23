@@ -58,6 +58,11 @@
    * 只影响之后新登记的共享项，已在列表里的开关不受影响。
    */
   let autoBroadcastNew = $state(false);
+  /**
+   * 替群聊中转消息（后端 `AppSettings.groupRelay`，默认关）。开着才在本机替够不着的同群成员
+   * 转一份（最多 3 跳），代价是本机的上行带宽 —— 所以默认关，由用户自己选。
+   */
+  let groupRelay = $state(false);
   let bcExePath = $state('');
   /** 折叠态悬浮形态：圆球（现有的 62px 球）/ 圆角矩形悬浮框（设备分页卡片）。 */
   let orbShape = $state<OrbShape>('circle');
@@ -111,6 +116,7 @@
         deviceName = s.deviceName;
         autoStart = s.autoStart;
         autoBroadcastNew = s.autoBroadcastNew;
+        groupRelay = s.groupRelay;
         bcExePath = s.bcExePath ?? '';
         orbShape = s.orbShape;
       }
@@ -127,6 +133,7 @@
         deviceName,
         autoStart,
         autoBroadcastNew,
+        groupRelay,
         bcExePath,
         orbShape,
       });
@@ -150,6 +157,7 @@
       deviceName = s.deviceName;
       autoStart = s.autoStart;
       autoBroadcastNew = s.autoBroadcastNew;
+      groupRelay = s.groupRelay;
       bcExePath = s.bcExePath ?? '';
       orbShape = s.orbShape;
     }
@@ -276,6 +284,22 @@
         <span style="font-size:var(--fs-sm); color:var(--muted);">新添加的目录/文件自动开启共享</span>
         <label class="switch">
           <input type="checkbox" bind:checked={autoBroadcastNew} data-autobroadcast />
+          <span class="track"></span>
+        </label>
+      </div>
+    </div>
+    <!-- svelte-ignore a11y_label_has_associated_control -->
+    <div class="field">
+      <label>允许为群聊中转消息<Hint>
+        群里两个成员互相够不着时（跨网段、只有本机跟它们都连得上），本机替它们把消息转一份，
+        最多 3 跳；同一份消息转过一次就不再转（不来回绕圈）。<br />
+        <strong>默认关闭</strong>：转一份就占一份本机的上行带宽，而这笔开销该不该出，由你来定 ——
+        对端之间直连得了时，这个开关开不开都一样。
+      </Hint></label>
+      <div style="display:flex; align-items:center; justify-content:space-between;">
+        <span style="font-size:var(--fs-sm); color:var(--muted);">开启后本机会把同群消息转给其他成员（最多 3 跳），用于跨网段；会占用本机上行带宽</span>
+        <label class="switch">
+          <input type="checkbox" bind:checked={groupRelay} data-grouprelay />
           <span class="track"></span>
         </label>
       </div>

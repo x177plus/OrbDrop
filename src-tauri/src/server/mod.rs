@@ -16,6 +16,7 @@ use crate::ws;
 
 mod auth;
 pub mod proxy;
+mod routes_chat;
 mod routes_dav;
 mod routes_discover;
 mod routes_file;
@@ -98,6 +99,42 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/push/download",
             axum::routing::get(routes_push::push_download_handler),
+        )
+        // 会话（聊天）没有长连接时的那一跳：同样挂在公开路由上、自己认人
+        // （未绑定设备没有 token 可带），判断规则与 `/push/invite` 一模一样。
+        .route(
+            "/chat/message",
+            axum::routing::post(routes_chat::chat_message_handler),
+        )
+        .route(
+            "/chat/read",
+            axum::routing::post(routes_chat::chat_read_handler),
+        )
+        // 群聊三条同样走公开路由 + 自己认人：群成员**不需要配对**（D6=b），所以不能挪到
+        // `auth_routes` 里（那条路要求 token 反解出身份）。
+        .route(
+            "/chat/group",
+            axum::routing::post(routes_chat::group_text_handler),
+        )
+        .route(
+            "/chat/group-read",
+            axum::routing::post(routes_chat::group_read_handler),
+        )
+        .route(
+            "/chat/group-roster",
+            axum::routing::post(routes_chat::group_roster_handler),
+        )
+        .route(
+            "/chat/group-sync",
+            axum::routing::post(routes_chat::group_sync_ask_handler),
+        )
+        .route(
+            "/chat/group-sync-post",
+            axum::routing::post(routes_chat::group_sync_post_handler),
+        )
+        .route(
+            "/chat/group-ack",
+            axum::routing::post(routes_chat::group_ack_handler),
         )
         // Beyond Compare 的 WebDAV 入口：让 BC 连**本机**（回环），由这里加密转发到对端。
         // 挂在公开路由上是因为它自己校验凭据（它要的挑战/凭据形状必须与对端 DAV 面一致，

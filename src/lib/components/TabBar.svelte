@@ -85,7 +85,7 @@
       bind:this={peerEls[device.id]}
       onclick={() => onSelect(tab)}
     >
-      <span class="dot ok"></span>
+      <span class="dot live"></span>
       {device.name}
       {#if unreadForPeer(device.id) > 0}
         <span class="tab-dot" title={`${unreadForPeer(device.id)} 条未读消息`}></span>

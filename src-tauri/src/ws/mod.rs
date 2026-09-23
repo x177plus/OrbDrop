@@ -116,6 +116,21 @@ impl WsManager {
         self.links.lock().get(peer_id).copied()
     }
 
+    /// 本机是否**已经知道**这段配对关系不成立了（界面正显示「需配对」）。
+    ///
+    /// 两个来源：拨号被对端 401（它不认本机这枚 token）、或证书指纹对不上 —— 判据与前端
+    /// `DeviceTab::needsRepair` 同一套。给 `server::routes_pair` 用：这种状态下那枚老凭据
+    /// 早已被对端删掉，再拿它当门槛只会把一次正常的重新配对挡成静默 401（对端点「配对」、
+    /// 本机连提示都没有）。
+    pub fn needs_repair(&self, peer_id: &str) -> bool {
+        matches!(
+            self.link_state(peer_id),
+            Some(LinkState::Stopped {
+                reason: StopReason::TokenRejected | StopReason::IdentityChanged
+            })
+        )
+    }
+
     /// 这台设备是否已经有一个拨号循环在跑（含正在退避/待命的）。
     ///
     /// "对端上线"这类证据触发要用它去重：已经在跑的循环自己会动手，不该再叠一个
@@ -386,6 +401,9 @@ fn dial_now(state: &Arc<AppState>, peer_id: &str, manual: bool, auto: bool) {
     state.ws.abort_dial(peer_id);
     // 上一次的"停手理由"到此失效：用户点「连接」、对端上线、重启恢复都算重新开始。
     state.ws.set_link_state(peer_id, LinkState::Retrying);
+    // 理由变了要当场告诉界面（`set_link_state` 自己不广播），否则上一次那枚「需配对」/
+    // 「已停止」会一直赖在设备行上，看起来像"点了连接没反应"。
+    state.emit_devices_changed();
     spawn_outbound_link(Arc::clone(state), peer_id.to_string(), manual, auto);
 }
 
@@ -509,6 +527,7 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
                         &peer_id,
                         LinkState::Stopped { reason: StopReason::TokenRejected },
                     );
+                    state.emit_devices_changed();
                     return;
                 }
                 Err(e) => {
@@ -540,6 +559,7 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
                             reason: StopReason::IdentityChanged,
                         },
                     );
+                    state.emit_devices_changed();
                     return;
                 }
                 other => other,
@@ -566,6 +586,8 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
                     state.emit_devices_changed();
                     // 同 `run_inbound_session`：链路上来了补一次已读回执。
                     crate::chat::flush_read_receipt(&state, &peer_id);
+                    // 也是"对端现在收得到"这个证据：排队等它的消息该发出去了。
+                    crate::chat::flush_queued(&state, &peer_id);
 
                     let mut ping_interval = interval(Duration::from_secs(30));
                     let mut missed = 0u32;
@@ -639,6 +661,9 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
                     if let Some(reason) = stop {
                         info!(%peer_id, error = %e, "link refused, giving up until the situation changes");
                         state.ws.set_link_state(&peer_id, LinkState::Stopped { reason });
+                        // 停手理由要当场送到界面：不然这一行会一直停在「杂项」上，用户根本
+                        // 看不出"为什么要重新配对"（`set_link_state` 自己不广播）。
+                        state.emit_devices_changed();
                         return;
                     }
                     fails += 1;
@@ -751,5 +776,30 @@ mod tests {
             value(LinkState::Stopped { reason: StopReason::LocalDisconnected }),
             serde_json::json!({ "kind": "stopped", "reason": "localDisconnected" })
         );
+    }
+
+    /// 「需配对」= **关系已经不成立**，只有两个理由算数；有人主动断开（本机/对端点「断开」）
+    /// 不是。这道判定同时决定界面那颗红点、和"对端发来的配对邀请要不要放行"（见 `routes_pair`），
+    /// 放宽一档就等于把主动断开也变成静默接受邀请。
+    #[test]
+    fn needs_repair_only_for_dead_relationships() {
+        let ws = WsManager::new();
+        assert!(!ws.needs_repair("peer-a"), "没有拨号状态 = 没有拨号意图，不算需配对");
+        ws.set_link_state("peer-a", LinkState::Retrying);
+        assert!(!ws.needs_repair("peer-a"));
+        ws.set_link_state("peer-a", LinkState::Connected);
+        assert!(!ws.needs_repair("peer-a"));
+
+        for reason in [StopReason::LocalDisconnected, StopReason::PeerDisconnected] {
+            ws.set_link_state("peer-a", LinkState::Stopped { reason });
+            assert!(!ws.needs_repair("peer-a"), "{reason:?} 是主动断开，不是关系失效");
+        }
+        for reason in [StopReason::TokenRejected, StopReason::IdentityChanged] {
+            ws.set_link_state("peer-a", LinkState::Stopped { reason });
+            assert!(ws.needs_repair("peer-a"), "{reason:?} 才是需重新配对");
+        }
+
+        ws.clear_link_state("peer-a");
+        assert!(!ws.needs_repair("peer-a"));
     }
 }

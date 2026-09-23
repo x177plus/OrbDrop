@@ -63,6 +63,11 @@ pub struct AppState {
     pub pair: PairStore,
     /// 会话（聊天）记录：文本消息的落盘 + 界面快照（`chat.json`）。
     pub chat: crate::chat::ChatStore,
+    /// 群聊（共享群）：名册 + 群消息（`groups.json`）。
+    ///
+    /// 与 `chat.json` **分开一个文件**：老版本进程读 `chat.json`（serde 静默忽略不认识的
+    /// 顶层键）再原样写回，会把新增的顶层键抹掉 —— 名册与群消息丢了不可恢复。
+    pub groups: crate::group::GroupStore,
     /// Tauri handle for emitting UI events.
     pub app_handle: Mutex<Option<AppHandle>>,
     /// File watchers keyed by share id.
@@ -129,6 +134,11 @@ impl AppState {
             Some(dir) => dir.join("chat.json"),
             None => crate::config::data_dir().join("chat.json"),
         };
+        // 群聊（`groups.json`）与它同一个家、同一个理由：都是一个实例自己的用户数据。
+        let group_path = match config_path.parent() {
+            Some(dir) => dir.join("groups.json"),
+            None => crate::config::data_dir().join("groups.json"),
+        };
 
         Self {
             config_path,
@@ -143,6 +153,7 @@ impl AppState {
             drag: crate::drag::DragStore::new(),
             pair: PairStore::new(),
             chat: crate::chat::ChatStore::with_path(chat_path),
+            groups: crate::group::GroupStore::with_path(group_path),
             app_handle: Mutex::new(None),
             watchers: Mutex::new(std::collections::HashMap::new()),
             learned: Mutex::new(HashMap::new()),
@@ -334,7 +345,12 @@ impl AppState {
     }
 
     /// Set online state. Emits only on a real change.
-    pub fn set_peer_online(&self, peer_id: &str, online: bool) {
+    ///
+    /// 对端**刚上线**这件事还带两层副作用：①它离线期间排队等它的会话消息（`Delivery::Queued`）
+    /// 该发出去了；②本机在共同群里缺的那些（跨网段漏掉的、离线期间别人发的）该去补拉了。
+    /// 探活 / mDNS / 链路三条路都汇到这里，所以这两个触发点都放在这一个地方
+    /// （`chat::flush_queued` 与 `group::sync_with_peer` 都自带闸门，重复叫是安全的）。
+    pub fn set_peer_online(self: &Arc<Self>, peer_id: &str, online: bool) {
         let changed;
         {
             let mut peers = self.peers.lock();
@@ -354,6 +370,11 @@ impl AppState {
                 let _ = app.emit(event, serde_json::json!({ "peerId": peer_id }));
             }
             self.emit_devices_changed();
+            if online {
+                crate::chat::flush_queued(self, peer_id);
+                // 共同群里缺的那些：这台设备是"本机连得上的人"，问它一遍。
+                crate::group::sync_with_peer(self, peer_id);
+            }
         }
     }
 
@@ -849,6 +870,35 @@ pub enum ProbeStep {
     OtherIdentity(PeerIdentity),
 }
 
+/// 探活顺带问出的"配对关系还活着没有"：它亲口给的答案。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenLiveness {
+    /// 对端认本机带过去的这枚 token（`pairedAs` 有值）。
+    Alive,
+    /// 对端答话了、id 也对得上，但它**不认**这枚 token —— 它把本机解除配对 / 清过数据。
+    Dead,
+    /// 问不出结论：本机没 token、地址上换了设备（那是另一条路）、或压根没问到。
+    Unknown,
+}
+
+/// 从 `/pair/info`（或 `/discover`）的回话里读"这枚 token 它还认不认"。
+///
+/// 只有 `id` 对得上才算数：id 变了是"地址上换了设备"，由
+/// [`apply_identity_reconcile`] 处理，不是这里的结论。`paired_as` 的语义见
+/// [`PeerIdentity`]（对端凭据库里反解出的是谁）—— 有值 = 它认，没值 = 它不认。
+pub fn token_liveness(seen: Option<&PeerIdentity>, expected_id: &str) -> TokenLiveness {
+    match seen {
+        Some(identity) if identity.id == expected_id => {
+            if identity.paired_as.is_some() {
+                TokenLiveness::Alive
+            } else {
+                TokenLiveness::Dead
+            }
+        }
+        _ => TokenLiveness::Unknown,
+    }
+}
+
 /// 由"地址上的回话"判定这台设备的死活。
 ///
 /// 中间那条是全部要害：**"地址上有人答话"不等于"这台设备在"**。探活只按 ip:port
@@ -906,6 +956,9 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
     for p in candidates {
         if state.ws.has_connection(&p.id) {
             state.set_peer_online(&p.id, true);
+            // 有一台链路活着但还欠着消息（那一跳当时没写进去）：每一拍都值得再试一次。
+            // 有闸门，重复叫不会叠出一条并发的补发。
+            crate::chat::flush_queued(state, &p.id);
             continue;
         }
         // 手里那条 token 一起捎上：对端顺带回答"它把本机认作谁"，那是配对关系
@@ -957,9 +1010,48 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
             }
             _ => None,
         };
-        match probe_step(&p.id, seen) {
+        match probe_step(&p.id, seen.clone()) {
             ProbeStep::Online => {
                 state.set_peer_online(&p.id, true);
+                // 排队等它的消息：够不着常常只是暂时的（它刚起来、或上一次那一跳正好撞上它的
+                // 重启），所以**每一拍**都再叫一次 —— 不只是"离线→在线"那一次翻转。闸门在，
+                // 已经在跑的那条不会被叠第二条。
+                crate::chat::flush_queued(state, &p.id);
+                // 顺带确认"配对还活不活着"：本机带着 token 问过去、它答话却说"不认这枚"
+                // （`pairedAs` 为空），而本机这一行还写着已配对 —— 那就是对端把本机解除配对
+                // / 清过数据的**它亲口的证据**。标成「需配对」（与拨号 401 落到同一个状态）：
+                // 界面才会提示该重新配对，对端发来的配对邀请也才会放行到通知里（见
+                // `server::routes_pair`）。token 与配对标记**都不动** —— 万一它只是瞬时读不到，
+                // 下一轮探活就会把这一档撤掉。
+                if p.paired && token.as_deref().is_some_and(|t| !t.is_empty()) {
+                    match token_liveness(seen.as_ref(), &p.id) {
+                        TokenLiveness::Dead => {
+                            // 已经是「需配对」就别每 5s 重写一遍（状态没变，只是徒增广播）。
+                            if !state.ws.needs_repair(&p.id) {
+                                info!(
+                                    peer_id = %p.id,
+                                    "对端不认本机的凭据（它解除过配对 / 清过数据）：需重新配对"
+                                );
+                                state.ws.set_link_state(
+                                    &p.id,
+                                    crate::ws::LinkState::Stopped {
+                                        reason: crate::ws::StopReason::TokenRejected,
+                                    },
+                                );
+                                state.emit_devices_changed();
+                            }
+                        }
+                        // 它又认了（上一次是瞬时读不到，或对端恢复过备份）：把这一档撤掉，
+                        // 否则「需配对」会一直赖在界面上。
+                        TokenLiveness::Alive => {
+                            if state.ws.needs_repair(&p.id) {
+                                state.ws.clear_link_state(&p.id);
+                                state.emit_devices_changed();
+                            }
+                        }
+                        TokenLiveness::Unknown => {}
+                    }
+                }
                 // 离线→在线：这就是"对端回到网上了"这个证据。正在待命的拨号循环光靠
                 // 自己的 15s 轮询要慢一拍，这里直接把它叫起来（已经在跑的循环不会被动）。
                 if !p.online {
@@ -1123,5 +1215,27 @@ mod tests {
             ProbeStep::OtherIdentity(seen) => assert_eq!(seen.id, "new"),
             other => panic!("应判为「地址上是另一台设备」，得到 {other:?}"),
         }
+    }
+
+    /// "这枚 token 它还认不认"只读一条：id 对得上 + `pairedAs` 有没有值。
+    ///
+    /// 这条判定的后果很实：`Dead` 会把设备行标成「需配对」，并让对端发来的配对邀请
+    /// 放行到通知里。所以"没问到""地址上是别人"都必须是 `Unknown`，不能误判成 `Dead`
+    /// —— 那会让一台好设备凭空变成"关系已失效"。
+    #[test]
+    fn token_liveness_needs_a_matching_id_and_a_verdict() {
+        // 它认这枚 token：配对还活着
+        assert_eq!(token_liveness(Some(&identity("me", Some("me"))), "me"), TokenLiveness::Alive);
+        // 它答话了、id 也对，但不认这枚 token
+        assert_eq!(token_liveness(Some(&identity("me", None)), "me"), TokenLiveness::Dead);
+        // 没问到（超时 / 没答话）
+        assert_eq!(token_liveness(None, "me"), TokenLiveness::Unknown);
+        // 地址上换了设备：那条路由 `apply_identity_reconcile` 走，不是"关系失效"
+        assert_eq!(
+            token_liveness(Some(&identity("new", None)), "me"),
+            TokenLiveness::Unknown
+        );
+        // id 问不出来（老版本 / 中间有代理）同样不下结论
+        assert_eq!(token_liveness(Some(&identity("", None)), "me"), TokenLiveness::Unknown);
     }
 }
