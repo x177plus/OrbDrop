@@ -3,6 +3,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { peerTree } from '$lib/api';
   import { getPeerSharesState, loadPeerShares } from '$lib/stores/peers.svelte';
+  import { deviceDisplayName } from '$lib/stores/devices.svelte';
   import type { PeerDevice, PeerShareItem, TreeEntry } from '$lib/types';
   import { dragOut } from '$lib/dragOut';
   import TreeNode from './TreeNode.svelte';
@@ -22,6 +23,9 @@
 
   /** 每次收到对端目录变更就自增，驱动 TreeNode 重拉自己已加载的那一层（F-33）。 */
   let refreshSignal = $state(0);
+
+  /** 显示名（F-101）：设了备注就是「备注(设备名)」—— 标签页里到处都用它。 */
+  const deviceName = $derived(deviceDisplayName(device));
 
   const shares = $derived(getPeerSharesState(device.id));
 
@@ -76,7 +80,7 @@
       if (st.loaded) void loadShareRoot(shareId, true);
     }
     await loadPeerShares(device.id);
-    onToast(`已刷新「${device.name}」的共享项`);
+    onToast(`已刷新「${deviceName}」的共享项`);
   }
 
   function openCtx(e: MouseEvent, share: PeerShareItem) {
@@ -97,9 +101,9 @@
 </script>
 
 <div class="peer-head">
-  <span class="d-avatar">{device.name.charAt(0).toUpperCase()}</span>
+  <span class="d-avatar">{deviceName.charAt(0).toUpperCase()}</span>
   <div class="d-main">
-    <div class="d-name">{device.name}</div>
+    <div class="d-name">{deviceName}</div>
     <div class="d-ip num">{device.ip}:{device.port}</div>
   </div>
   <span class="state-chip live"><span class="dot live"></span>长连接</span>
@@ -122,7 +126,7 @@
     <p class="e-sub">对方只把开了广播的共享项发给长连接设备；确认双方仍在长连接状态后重试。</p>
   </div>
 {:else if shares.loading && !shares.loaded}
-  <div class="empty"><p>正在读取「{device.name}」的共享项…</p></div>
+  <div class="empty"><p>正在读取「{deviceName}」的共享项…</p></div>
 {:else if shares.items.length === 0}
   <div class="empty">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -150,7 +154,7 @@
           <span class="f-icon">{@html share.isDir ? ICON_FOLDER : ICON_FILE}</span>
           <div class="s-main">
             <div class="s-name">{share.name}</div>
-            <div class="s-meta"><span class="num">来自「{device.name}」</span></div>
+            <div class="s-meta"><span class="num">来自「{deviceName}」</span></div>
           </div>
         </div>
 

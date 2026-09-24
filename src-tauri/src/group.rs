@@ -205,6 +205,14 @@ struct SyncGate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingInvite {
+    /// 线上与落盘的键是 **`id`**（就是名册里那个群 id）：界面读的是 `PendingGroup.id`，
+    /// 并原样把它交给 `group_join` / `group_dismiss`。
+    ///
+    /// 这里曾经直接让字段名 camelCase 出去 → 键叫 `groupId`，而前端按 `id` 读 → 读到
+    /// `undefined` → `invoke('group_join', { id: undefined })` 序列化时那个键**消失**，
+    /// 后端报 `missing required key id`：「加入」和「拒绝」两颗按钮双双点不动。
+    /// `alias` 兜住已经落盘的老文件（里面写的是 `groupId`）。
+    #[serde(rename = "id", alias = "groupId")]
     pub group_id: String,
     #[serde(default)]
     pub name: String,
@@ -224,6 +232,30 @@ pub struct PendingInvite {
     updated_by: String,
     #[serde(default)]
     updated_at: u64,
+}
+
+/// 邀请卡**给界面**的那份形状。
+///
+/// 与落盘那份（`PendingInvite`）唯一的不同是多一个 `buffered`，而它只能活在这里：攒着几条
+/// 是"此刻"从 `orphans` 里数出来的事实，存进 `groups.json` 只会是一个过期的数（新消息进来
+/// 时没人去改它）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingInviteView {
+    /// 线上的键是 **`id`**（就是名册里那个群 id）：界面读的是 `PendingGroup.id`，并原样把它
+    /// 交给 `group_join` / `group_dismiss`。这里曾经 camelCase 出去叫 `groupId`，而前端按
+    /// `id` 读 → 读到 `undefined` → `invoke` 里那个键**直接消失** → 两颗按钮双双点不动。
+    #[serde(rename = "id")]
+    pub group_id: String,
+    pub name: String,
+    /// 邀请人（名册是从它那儿来的）。
+    pub from: String,
+    pub from_name: String,
+    /// 名册里的成员（不含本机）。
+    pub members: Vec<Member>,
+    pub at: u64,
+    /// 邀请挂着期间已经到门口的消息条数（`MAX_ORPHANS`）：点「加入」那一刻它们并进会话。
+    pub buffered: usize,
 }
 
 /// 名册（线上事件 `group_roster` 的载荷，也是落盘那份邀请的原始形状）。
@@ -345,16 +377,24 @@ impl GroupStore {
             .collect()
     }
 
-    /// 邀请卡（成员里不含本机）。
-    pub fn pending_views(&self, own_id: &str) -> Vec<PendingInvite> {
-        self.inner
-            .lock()
+    /// 邀请卡（成员里不含本机）；`buffered` 是此刻还攒着的条数。
+    pub fn pending_views(&self, own_id: &str) -> Vec<PendingInviteView> {
+        let guard = self.inner.lock();
+        guard
             .pending
             .iter()
             .map(|p| {
-                let mut p = p.clone();
-                p.members.retain(|m| m.id != own_id);
-                p
+                let mut members = p.members.clone();
+                members.retain(|m| m.id != own_id);
+                PendingInviteView {
+                    group_id: p.group_id.clone(),
+                    name: p.name.clone(),
+                    from: p.from.clone(),
+                    from_name: p.from_name.clone(),
+                    members,
+                    at: p.at,
+                    buffered: guard.orphans.get(&p.group_id).map_or(0, |v| v.len()),
+                }
             })
             .collect()
     }
@@ -501,11 +541,40 @@ impl GroupStore {
 
     // ── 写：名册 ──────────────────────────────────────────────────────────
 
-    /// 本机建群：名册含本机，`rev = 1`。返回群 id。
+    /// 找一份**成员完全一样**的名册（比 id 集合，顺序无关）。
+    ///
+    /// **不含已经退出的群**：用户退过之后再"建"同样的名单，那该是个新群 —— 他不在了，
+    /// 旧群后续的名册/消息事件也不该再回到他这里（`left` 那一档的处理见 `leave`）。
+    fn find_by_members(&self, members: &[Member]) -> Option<String> {
+        let mut want: Vec<&str> = members.iter().map(|m| m.id.as_str()).collect();
+        want.sort_unstable();
+        self.inner
+            .lock()
+            .groups
+            .iter()
+            .find(|g| {
+                if g.left {
+                    return false;
+                }
+                let mut have: Vec<&str> = g.members.iter().map(|m| m.id.as_str()).collect();
+                have.sort_unstable();
+                have == want
+            })
+            .map(|g| g.id.clone())
+    }
+
+    /// 本机建群：名册含本机，`rev = 1`。返回群 id；**名单一样的群已经存在就复用那个 id**
+    ///（见 `find_by_members` 的注释）。
     pub fn create(&self, own: Member, others: Vec<Member>, name: &str) -> String {
-        let id = uuid::Uuid::new_v4().to_string();
         let mut members = vec![own.clone()];
         normalize_members(&mut members, others);
+        // **同一批人只该有一个群**：名单一样就复用现有的那个（不新建、也不改名 —— 改名是
+        // 名册编辑那件事）。不然"再建一次同样的三个人"会生出一个成员完全相同的第二个群，
+        // 消息从此分叉在两条会话里，谁也看不全。
+        if let Some(existing) = self.find_by_members(&members) {
+            return existing;
+        }
+        let id = uuid::Uuid::new_v4().to_string();
         let now = now_ms();
         let mut guard = self.inner.lock();
         guard.groups.push(Group {
@@ -1290,8 +1359,10 @@ pub struct Snapshot {
     pub convos: Vec<crate::chat::PeerConvoView>,
     pub batches: Vec<crate::chat::ChatBatch>,
     pub groups: Vec<GroupView>,
-    pub pending_groups: Vec<PendingInvite>,
-    /// 全部未读（一对一 + 群）。
+    /// 还没被确认的群邀请（来的那份是**视图**，比落盘那份多一个 `buffered`）。
+    pub pending_groups: Vec<PendingInviteView>,
+    /// 全部未读（一对一 + 群）—— **不含**邀请卡：它不是消息，界面上也不进"未读"那个数，
+    /// 而是与未读一起构成"会话侧待处理"（底栏「会话」与悬浮球左上角那颗，见前端 `convoBadgeTotal`）。
     pub unread: u32,
 }
 
@@ -1477,6 +1548,31 @@ fn spawn_roster_to(state: &Arc<AppState>, peer_id: &str, group: &Group) {
     });
 }
 
+/// 名册这一跳的结果怎么用。
+///
+/// **为什么要把「够不着」和「被拒」分开**：够不着（连不上/5xx）会一直排队等对端上线，
+/// 重试是对的；而"认不出这个请求体"（4xx）重试一万次也还是认不出 —— 比如对端是**老版本**、
+/// 根本没有群聊那几条路由（`/chat/group-roster` 回 404）。以前两者都落成 `Queued`，于是同一个
+/// 404 每 5 秒重放一次（`flush_queued` 每个探活拍都会再试）、群里那条消息永远停在「等待发送」，
+/// 而它其实永远也送不出去。按 `group.rs` 开头那条纪律，这种要落「未送达」、不发第二次。
+#[derive(PartialEq, Eq, Debug)]
+enum RosterStep {
+    /// 名册已经送到了：接着投本体。
+    Proceed,
+    /// 够不着：整条留在「排队」里，等下一次触发（对端上线就补）。
+    Queue,
+    /// 对端明确拒绝：落「未送达」，别再重放。
+    Reject,
+}
+
+fn roster_step(outcome: Outcome) -> RosterStep {
+    match outcome {
+        Outcome::Delivered => RosterStep::Proceed,
+        Outcome::Unreachable => RosterStep::Queue,
+        Outcome::Rejected => RosterStep::Reject,
+    }
+}
+
 /// 投一条群事件（消息 / 回执）：**名册落后就先补名册**，再投本体。
 ///
 /// 为什么必须先补：对方不认识的群，群里那条消息无处可放（会被丢掉）—— 名册是它的入场券。
@@ -1492,14 +1588,21 @@ fn spawn_group_event(state: &Arc<AppState>, peer_id: &str, event: WsEvent, settl
             if state.groups.needs_roster(&gid, &peer) {
                 if let Some(g) = state.groups.group(&gid) {
                     let roster = WsEvent::GroupRoster { roster: g.payload(), sender: own_info(&state) };
-                    if crate::chat::deliver(&state, &peer, &roster).await != Outcome::Delivered {
-                        // 名册没送到就别发本体了：对方只会把它丢掉。这一份留在「排队」里。
-                        if let Some((gid, msg_id)) = settle.as_ref() {
-                            settle_group(&state, gid, msg_id, &peer, Outcome::Unreachable);
+                    match roster_step(crate::chat::deliver(&state, &peer, &roster).await) {
+                        RosterStep::Proceed => state.groups.mark_told(&gid, &peer),
+                        // 名册没送到就别发本体了：对方只会把它丢掉。
+                        // 够不着 = 留在「排队」里等它上线；被拒 = 落「未送达」（别再重放）。
+                        step => {
+                            if let Some((gid, msg_id)) = settle.as_ref() {
+                                let outcome = match step {
+                                    RosterStep::Queue => Outcome::Unreachable,
+                                    _ => Outcome::Rejected,
+                                };
+                                settle_group(&state, gid, msg_id, &peer, outcome);
+                            }
+                            return;
                         }
-                        return;
                     }
-                    state.groups.mark_told(&gid, &peer);
                 }
             }
         }
@@ -1531,10 +1634,16 @@ pub enum FlushStep {
 pub async fn flush_one(state: &Arc<AppState>, peer_id: &str, group_id: &str, msg: &GroupMsg, group: &Group) -> FlushStep {
     if state.groups.needs_roster(group_id, peer_id) {
         let roster = WsEvent::GroupRoster { roster: group.payload(), sender: own_info(state) };
-        if crate::chat::deliver(state, peer_id, &roster).await != Outcome::Delivered {
-            return FlushStep::Blocked;
+        match roster_step(crate::chat::deliver(state, peer_id, &roster).await) {
+            RosterStep::Proceed => state.groups.mark_told(group_id, peer_id),
+            RosterStep::Queue => return FlushStep::Blocked,
+            RosterStep::Reject => {
+                // 对端认不出这条名册（老版本没有群聊路由之类）：这一份落「未送达」，
+                // 别再排队重放 —— 否则同一个 404 会每 5 秒来一次，消息永远"等待"。
+                settle_group(state, group_id, &msg.id, peer_id, Outcome::Rejected);
+                return FlushStep::Advanced;
+            }
         }
-        state.groups.mark_told(group_id, peer_id);
     }
     let own = own_info(state);
     let event = group_text_event(group, &own.id, &own.name, &msg.id, &msg.text, msg.at, msg.seq, vec![msg.from.clone()]);
@@ -2402,6 +2511,9 @@ mod tests {
         assert!(s.has_pending("g1"));
         assert!(s.view("g1", "me").is_none(), "还没加入：没有会话");
         assert_eq!(s.buffered_count("g1"), 1);
+        // 卡上那句「已有 N 条消息在等你」的数就来自这里：攒着几条要**看得见**，否则用户
+        // 不点「加入」就不知道里面有东西。
+        assert_eq!(s.pending_views("me")[0].buffered, 1);
 
         assert!(s.accept_pending("g1", "me"));
         let view = s.view("g1", "me").unwrap();
@@ -2450,5 +2562,71 @@ mod tests {
         assert!(text.contains("\"version\""), "落盘要带版本位：{text}");
         assert_eq!(FORMAT_VERSION, 1);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// 名册那一跳的三档：送到 → 继续；够不着 → 排队等下次；**被拒（4xx，例如老版本没有
+    /// 群聊路由）→ 落「未送达」，不许再排队重放**。最后一档分错的话，同一个 404 会每 5 秒
+    /// 重放一次、群里那条消息永远停在「等待」（实测过）。
+    #[test]
+    fn roster_step_separates_rejection_from_unreachable() {
+        assert_eq!(roster_step(Outcome::Delivered), RosterStep::Proceed);
+        assert_eq!(roster_step(Outcome::Unreachable), RosterStep::Queue);
+        assert_eq!(roster_step(Outcome::Rejected), RosterStep::Reject);
+        // 被拒落的是「未送达」（`Delivery::Failed`），不是「排队」—— 与 `Outcome::delivery` 一致。
+        assert_eq!(Outcome::Rejected.delivery(), Delivery::Failed);
+        assert_eq!(Outcome::Unreachable.delivery(), Delivery::Queued);
+    }
+
+    /// 邀请卡的**线上键是 `id`**：界面按 `PendingGroup.id` 读，并原样交给
+    /// `group_join` / `group_dismiss`。曾经是 `groupId` → 前端读到 `undefined` →
+    /// `invoke('group_join', { id: undefined })` 里那个键直接消失，后端报
+    /// `missing required key id`：「加入」与「拒绝」双双点不动。
+    #[test]
+    fn pending_invite_exposes_id_not_group_id() {
+        // 给界面的那份是**视图**（`pending_views` 造的那个），线上形状拿它来验。
+        let view = PendingInviteView {
+            group_id: "g-1".into(),
+            name: "群".into(),
+            from: "p1".into(),
+            from_name: "P1".into(),
+            members: vec![member("p1")],
+            at: 1,
+            buffered: 2,
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["id"], "g-1", "界面读的键就是它");
+        assert!(json.get("groupId").is_none(), "别再吐 groupId");
+        assert_eq!(json["buffered"], 2, "攒着几条也要给界面（卡上那句「已有 N 条消息在等你」）");
+
+        // 老文件（那个键叫 `groupId`）要照样读得进来，不能因为改键丢掉别人挂着的邀请。
+        let old = serde_json::json!({
+            "groupId": "g-2", "name": "旧", "from": "p1", "fromName": "P1",
+            "members": [{ "id": "p1", "name": "P1" }], "at": 1,
+            "rev": 1, "updatedBy": "p1", "updatedAt": 1
+        });
+        let back: PendingInvite = serde_json::from_value(old).expect("老键要读得进");
+        assert_eq!(back.group_id, "g-2");
+    }
+
+    /// **同一批人只该有一个群**：再"建"一次同样的名单 → 复用同一个 id（不新建）。
+    /// 顺序无关；名单不同才是新群；退过的群不复用。
+    #[test]
+    fn creating_the_same_member_set_reuses_the_group() {
+        let s = store("dedupe");
+        let me = member("me");
+
+        let first = s.create(me.clone(), vec![member("b"), member("c")], "项目组");
+        let again = s.create(me.clone(), vec![member("c"), member("b")], "另一个名字");
+        assert_eq!(first, again, "名单一样（顺序不同）就是同一个群");
+        assert_eq!(s.group(&first).unwrap().name, "项目组", "复用不改名：改名走名册编辑那条路");
+        assert_eq!(s.views(&me.id).len(), 1, "只该有一个群");
+
+        let other = s.create(me.clone(), vec![member("b"), member("d")], "换个人");
+        assert_ne!(other, first, "名单不同 = 新群");
+
+        // 退过之后同样名单再建 → 新的（旧群他不在了，不该把旧群的事件接回来）
+        assert!(s.leave(&first, &me.id).is_some());
+        let rebuilt = s.create(me.clone(), vec![member("b"), member("c")], "重建");
+        assert_ne!(rebuilt, first, "退过的群不复用");
     }
 }

@@ -2,7 +2,7 @@ import { listen } from '@tauri-apps/api/event';
 import { formatFileSize } from '$lib/types';
 import type { ChatDelivery, ChatGroup, ChatGroupMsg, ChatSnapshot, ChatMessage, ChatPeerConvo, ConvoMode, LocalPick, PendingGroup, PushBatch, PushInvite, PushTargetState } from '$lib/types';
 import * as api from '$lib/api';
-import { getDevices, deviceDotState, threadDotState, type DeviceDotState } from './devices.svelte';
+import { getDevices, deviceDotState, threadDotState, peerDisplayName, type DeviceDotState } from './devices.svelte';
 
 /**
  * 会话（聊天）：后端那份记录在前端的影子 + 会话界面自己的状态。
@@ -43,8 +43,6 @@ let openKey = $state<string | null>(null);
 let draft = $state<Record<string, string>>({});
 /** 收件人选择框（「新建会话」「编辑参与者」共用一份）。 */
 let recipientReq = $state<RecipientReq | null>(null);
-/** 接收方视角预览（群发那条记录上的「查看收件效果」）。 */
-let peek = $state<{ key: string; itemId: string; index: number } | null>(null);
 /** 文件消息：设备 id → 那几条（见文件头说明）。 */
 let files = $state<Record<string, ChatFileMsg[]>>({});
 /**
@@ -224,9 +222,21 @@ export function unreadTotal(): number {
   return peers + groups;
 }
 
-/** 一台设备的显示名（消息里存的是收到那一刻的名字，改过名的设备以设备表为准）。 */
+/**
+ * 会话侧"等你处理"的总数 = 未读 **+ 还没确认的群邀请**（底栏「会话」那颗角标、悬浮球左上角
+ * 那颗、移动端「会话」页签都读它）。
+ *
+ * 为什么邀请要并进来：邀请卡只画在会话列表（桌面端）/「会话」页（移动端）里，而这两处都是
+ * 用户主动打开的 —— 不计数的话，**面板收着（或停在别的页）时一条群邀请一个像素都不显示**
+ * （后端那份 `unread` 只算一对一 + 已加入的群，邀请卡不在其中，这是刻意的：邀请不是消息）。
+ */
+export function convoBadgeTotal(): number {
+  return unreadTotal() + snapshot.pendingGroups.length;
+}
+
+/** 一台设备的显示名（F-101：设了备注就是「备注(设备名)」）：消息里存的是收到那一刻的名字，改过名/起过备注的设备以本机设备表为准。 */
 export function deviceNameOf(peerId: string): string {
-  return getDevices().find((d) => d.id === peerId)?.name ?? peerId;
+  return peerDisplayName(peerId);
 }
 
 /** 头像上的那个字（设备名的首字符；与设备页 `.d-avatar` 同一套算法）。 */
@@ -661,62 +671,6 @@ export function askParticipants(key: string) {
   askRecipients({ seed: t.participants, lock: t.mode, name: t.name }, (ids, _mode, name) => void editThread(key, ids, name));
 }
 
-// ── 接收方视角预览（群发那条记录上的「查看收件效果」）──────────────────────
-
-export function getPeek(): { key: string; itemId: string; index: number } | null {
-  return peek;
-}
-
-export function openPeek(key: string, itemId: string) {
-  peek = { key, itemId, index: 0 };
-}
-
-export function closePeek() {
-  peek = null;
-}
-
-/** 预览框里那一屏的数据：这一条对某台设备来说长什么样（对方那边的样子）。 */
-export interface PeekView {
-  index: number;
-  total: number;
-  deviceName: string;
-  initial: string;
-  body: { kind: 'text'; text: string } | { kind: 'file'; name: string; size: string };
-  time: string;
-  state: PerDeviceState;
-  stateLabel: string;
-}
-
-export function peekView(): PeekView | null {
-  const cur = peek;
-  if (!cur) return null;
-  const item = itemById(cur.key, cur.itemId);
-  if (!item || !item.fromMe) return null;
-  const per = perDeviceOf(item);
-  if (!per.length) return null;
-  const index = cur.index % per.length;
-  const target = per[index];
-  return {
-    index,
-    total: per.length,
-    deviceName: deviceNameOf(target.peerId),
-    initial: peerInitial(target.peerId),
-    body: item.kind === 'text'
-      ? { kind: 'text', text: item.text }
-      : { kind: 'file', name: item.name, size: item.size },
-    time: clock(item.at),
-    state: target.state,
-    stateLabel: target.label,
-  };
-}
-
-/** 换下一台（一台时什么都不做 —— 界面上那颗按钮也会是禁用的）。 */
-export function peekNext() {
-  const view = peekView();
-  if (!peek || !view || view.total < 2) return;
-  peek = { ...peek, index: (peek.index + 1) % view.total };
-}
-
 // ── 动作 ──────────────────────────────────────────────────────────────────
 
 function replace(next: ChatSnapshot) {
@@ -767,7 +721,6 @@ function syncGroup(id: string) {
 export function openConversation(key: string) {
   if (!threadOf(key)) return;
   openKey = key;
-  peek = null;
   open = true;
   // 打开群会话时补拉一次：开它的人就是马上要看的人，缺的那几条此刻去要最值（`group_sync`）。
   const ref = refOf(key);
@@ -783,7 +736,6 @@ export function openDeviceChat(peerId: string) {
 /** 回到会话列表（草稿留着）。 */
 export function backToList() {
   openKey = null;
-  peek = null;
 }
 
 /**

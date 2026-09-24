@@ -43,6 +43,14 @@ export interface PeerDevice {
   connected: boolean;
   /** 自动重连的现状；缺省 = 没有拨号意图（已配对但没人点过「连接」）。 */
   linkState?: LinkState | null;
+  /**
+   * 本机给这台设备起的备注（F-101）：`null`/缺省 = 没备注。
+   *
+   * **只存在本机**（`config.toml` 的 `deviceRemarks`，键是设备 id）：不随设备名广播出去，
+   * 对端看到的始终是它自己的名字。界面上设备名一律显示成「备注(设备名)」——
+   * 拼装只有一处（`stores/devices` 的 `deviceDisplayName`），别在组件里各拼一套。
+   */
+  remark?: string | null;
 }
 
 export interface AppSettings {
@@ -115,6 +123,22 @@ export interface BcStatus {
   exePath: string | null;
   left: BcSide | null;
   right: BcSide | null;
+}
+
+/**
+ * 收件目录里的一项（后端 `mobile::InboxEntryDto`，只在移动端构建里注册）。
+ *
+ * `from` 是落盘时那一层发送方目录名；本机自己下载下来的为空串（它们直接落在下载目录下）。
+ */
+export interface InboxEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  /** 目录恒为 0：不为它递归求和，界面按 `isDir` 显示「文件夹」。 */
+  size: number;
+  /** epoch 毫秒。 */
+  modified: number;
+  from: string;
 }
 
 export interface TreeEntry {
@@ -385,6 +409,11 @@ export interface PendingGroup {
   members: ChatGroupMember[];
   /** 邀请到达时刻。 */
   at: number;
+  /**
+   * 邀请挂着期间已经到门口的消息条数（后端 `orphans` 里现数的，后端算、界面不算）。
+   * 点「加入」那一刻它们并进会话 —— 卡上那句「已有 N 条消息在等你」就是它。
+   */
+  buffered: number;
 }
 
 /** 整份会话状态：`chat_snapshot` 命令的返回，也是 `chat://changed` 事件的载荷。 */

@@ -37,6 +37,9 @@ pub async fn run_inbound_session(state: Arc<AppState>, peer_id: String, ws: WebS
     crate::chat::flush_read_receipt(&state, &peer_id);
     // 也是"对端现在收得到"这个证据：排队等它的消息该发出去了（够不着时发的那些）。
     crate::chat::flush_queued(&state, &peer_id);
+    // 同理，推送那边也补一次账：回执（完成/拒绝）可能丢在断链的那一刻，而对端其实早就
+    // 收完了 —— 链路刚建立就是问它的最好时机（见 `transfer::reconcile`）。
+    crate::transfer::reconcile(&state, &peer_id);
 
     loop {
         tokio::select! {
@@ -85,8 +88,16 @@ pub async fn run_inbound_session(state: Arc<AppState>, peer_id: String, ws: WebS
     if !state.ws.is_paused(&peer_id) {
         state.ws.clear_link_state(&peer_id);
     }
-    // 在线状态不在这里翻：本机"断开"不代表对端不可达（推送仍走 HTTP），
+    // 在线状态一般不在链路断开时翻：本机"断开"不代表对端不可达（推送仍走 HTTP），
     // 可达性交给 mDNS 与探活，避免设备行在断开瞬间消失再冒出来。
+    //
+    // **例外是没有可拨地址的对端**：探活要有地址才能问、mDNS 也看不到它（模拟器/NAT
+    // 后面的那类），这条链路是它可达的**唯一**证据。断了就该如实回到"送不到"
+    // （消息排队，等它下次拨进来时 `flush_queued` 送出去）—— 不翻的话设备行会一直挂着
+    // 绿点，而本机其实一条消息都送不出去。
+    if state.get_peer(&peer_id).is_some_and(|p| p.ip.is_empty() || p.port == 0) {
+        state.set_peer_online(&peer_id, false);
+    }
     state.emit_devices_changed();
     info!(%peer_id, "inbound WS session ended");
 }
@@ -319,6 +330,18 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
         WsEvent::GroupAck { group_id, up_to } => {
             debug!(%group_id, %peer_id, up_to, "inbound group ack");
             crate::group::on_ack(state, peer_id, &group_id, up_to);
+        }
+        // 推送对账（回执丢了怎么办）：对端在问它发出去的那几条邀请现在什么状态 ——
+        // 按本机记录如实答（还拿着的 `waiting`、处理过的报结局、没见过的 `unknown`）。
+        WsEvent::PushAsk { ask_id, invite_ids } => {
+            let answer = crate::transfer::answer_ask(state, peer_id, &ask_id, &invite_ids);
+            if !state.ws.send(peer_id, answer) {
+                warn!(%peer_id, %ask_id, "对账答案发不回去（会话刚断）");
+            }
+        }
+        // 本机发出去的邀请的对账答案：这才是权威 —— 本机之前那条"超时失败"可能只是回执丢了。
+        WsEvent::PushState { ask_id, states } => {
+            crate::transfer::apply_push_states(state, peer_id, &ask_id, &states);
         }
     }
 }

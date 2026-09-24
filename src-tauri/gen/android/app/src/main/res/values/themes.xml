@@ -1,0 +1,8 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Theme.orbdrop" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <!-- 窗口底色：显式钉成应用自己的浅色（见 colors.xml 里 orbdrop_bg 的说明）。
+             不给的话它会跟着系统深浅走，深色系统下任何露出窗口底色的缝都是近黑的。 -->
+        <item name="android:windowBackground">@color/orbdrop_bg</item>
+    </style>
+</resources>

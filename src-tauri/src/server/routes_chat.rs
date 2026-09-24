@@ -20,6 +20,7 @@ use serde::Deserialize;
 use tracing::info;
 
 use crate::config::PeerDevice;
+use crate::net;
 use crate::state::AppState;
 use crate::ws::events::{PeerInfo, WsEvent};
 use crate::ws::session::peer_id_from_token;
@@ -248,12 +249,21 @@ async fn accept(
 
     // 未绑定/没见过的发送方也要能在会话列表里露出来：登记进设备表（ip 取自 TCP 来源，
     // 不可伪造；端口用它自报的服务端口）。已经配对的那些原样保留（`upsert_peer` 只增不减）。
+    //
+    // 来源地址是本机自己的监听端点时（模拟器/NAT 后面的对端回连进来，见
+    // `net::observed_dial_target`）**一处都不记**：那种行没有可拨的地址，它的可达性只能
+    // 由长连接证明（`ws::session` 在链路断开时把这种行标回离线）——这里也不替它声明
+    // "在线"，否则设备行会在"离线"与"已配对"之间来回跳。
+    let (ip, port, online) = match net::observed_dial_target(addr.ip(), port, state.listening_port()) {
+        Some((ip, port)) => (ip, port, true),
+        None => (String::new(), 0, false),
+    };
     state.upsert_peer(&PeerDevice {
         id: sender.id.clone(),
         name: sender.name.clone(),
-        ip: addr.ip().to_string(),
+        ip,
         port,
-        online: true,
+        online,
         paired,
         auto_connect: false,
         paused: false,

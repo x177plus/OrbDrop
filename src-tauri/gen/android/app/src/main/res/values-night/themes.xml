@@ -1,0 +1,8 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Theme.orbdrop" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <!-- 与 values/themes.xml 同一份（夜间限定符下这个 style 会**整份替换**基版，
+             所以这一条必须两处都写：只写基版等于没写）。见 colors.xml 里 orbdrop_bg 的说明。 -->
+        <item name="android:windowBackground">@color/orbdrop_bg</item>
+    </style>
+</resources>

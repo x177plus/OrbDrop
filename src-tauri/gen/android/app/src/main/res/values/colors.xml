@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="purple_200">#FFBB86FC</color>
+    <color name="purple_500">#FF6200EE</color>
+    <color name="purple_700">#FF3700B3</color>
+    <color name="teal_200">#FF03DAC5</color>
+    <color name="teal_700">#FF018786</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+    <!-- 应用自己的底色 = 移动端 mobile.css 里 `bg` 变量的那份 sRGB 值。
+         窗口底色**必须**显式给这个：留给 Material DayNight 的主题默认值的话，深色系统下窗口是
+         #121212，而我们的 UI 只有浅色一套 —— 任何一像素没被页面覆盖（启动的第一帧、WebView
+         尺寸变化的瞬间、平台层不整比缩放的缝）露出来的就是贴在屏幕两侧的近黑条。 -->
+    <color name="orbdrop_bg">#FFFBFCFD</color>
+</resources>

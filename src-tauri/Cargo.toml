@@ -17,7 +17,6 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
-tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -71,6 +70,12 @@ pathdiff = "0.2"
 # 明文桩连不上）。直接用应用自己那份身份（`net::server_config`），免得测试里再编一套证书。
 # 版本与 features 必须和 `[dependencies]` 里那份一致：两个 rustls 会被当成不同的 crate。
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+
+# 单实例锁是桌面概念（插件官方平台表里 android/ios 均无支持），移动端不编进来。
+# 这里的 cfg 是**目标**平台：与 `tauri-build` 给代码设的 `desktop`/`mobile` 同义
+# （mobile = ios | android）。
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

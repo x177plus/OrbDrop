@@ -42,7 +42,7 @@
     /** 第一页永远是本机；空 = 数据还没到位（渲染一张本机空态卡）。 */
     pages?: RectPage[];
     deviceCount?: number;
-    /** 左上角那颗待处理数（面板里那组通知与在途推送，**加上会话未读**）。 */
+    /** 左上角那颗待处理数（面板里那组通知与在途推送，**加上会话未读与还没确认的群邀请**）。 */
     notifCount?: number;
     expanded?: boolean;
     /** 贴边收起态（`App` 的 `rectDock !== 0`）：卡片已滑出窗口、露在屏幕边上的换成那条竖条。
@@ -414,10 +414,10 @@
     <!-- 两枚角标骑在卡片的两个上角（原型 `.rq-shellbadge`：28px 高的宽体圆角矩形、2px 卡底
          描边、等宽数字）。**含义、角位、配色都与悬浮球逐项一致**：收起态从球换成这张卡时，
          同一个数还在同一个角、还是同一个颜色，只是外壳从圆球变成卡片。
-         左 = 待处理数（橙，同球左上那颗：通知 + 在途推送 + 会话未读）；右 = 长连接设备数（绿，同球右上那颗）。
+         左 = 待处理数（橙，同球左上那颗：通知 + 在途推送 + 会话未读 + 群邀请）；右 = 长连接设备数（绿，同球右上那颗）。
          翻页时轻微呼吸一下，和翻页动作产生关联。 -->
     <span class="rq-shellbadge is-alert num" bind:this={alertBadgeEl} role="img" hidden={notifCount === 0}
-      aria-label="待处理 {notifCount} 条：通知与未读消息">{notifCount}</span>
+      aria-label="待处理 {notifCount} 条：通知、未读消息与群邀请">{notifCount}</span>
     <span class="rq-shellbadge is-devices num" bind:this={devBadgeEl} role="img" hidden={deviceCount === 0}
       aria-label="长连接设备 {deviceCount} 台">{deviceCount}</span>
 

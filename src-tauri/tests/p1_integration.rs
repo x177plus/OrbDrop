@@ -35,7 +35,29 @@ fn hermetic_bc_exe() -> std::path::PathBuf {
     dir.join("BCompare.exe")
 }
 
+/// 数据目录（连带凭据库）指到临时目录：**别碰用户真实那份**。
+///
+/// 文件头一直写着"不污染真实配对"，但这一步以前**没实现**（那句话是靠"就算写进去也不影响
+/// 读路径"兜的，而它会影响读路径）：`credential::set_peer` 写的是 `data_dir()` 下的
+/// `credentials.dat` —— **真实那份**。于是同一台机器上**跑过一遍之后**，`AppState::new`
+/// 会先按凭据合成一行（在 `add_peer_book` 之前），例如 C 眼里 A 变成"已配对"、不再走未绑定
+/// 那条免认证的路 → 推送当场 `HTTP 401`。表现就是那条多设备用例"干净机器上第一遍绿、
+/// 之后必红"（而它自己收尾的 `credential::remove_peer` 在 panic 时根本走不到）。
+///
+/// `LazyLock`：环境变量是进程级的，同一个测试二进制里只设一次（多线程反复 `set_var` 是
+/// 未定义行为，这里让第一个到达的用例设、其余复用）。
+fn isolate_data_dir() {
+    static INIT: std::sync::LazyLock<()> = std::sync::LazyLock::new(|| {
+        let dir = std::env::temp_dir().join(format!("orbdrop_it_data_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时数据目录");
+        std::env::set_var("ORBDROP_DATA_DIR", &dir);
+    });
+    std::sync::LazyLock::force(&INIT);
+}
+
 fn make_state(port: u16, device_id: &str, device_name: &str, save_dir: std::path::PathBuf) -> Arc<AppState> {
+    // 必须在任何凭据访问之前（每个用例都是先 `make_state` 再动 `credential`）。
+    isolate_data_dir();
     let mut config = Config::default();
     config.port = port;
     config.device_id = device_id.to_string();
@@ -591,17 +613,43 @@ async fn multi_device_push_isolates_targets_and_shares_one_manifest() {
     // ── C 点头（未绑定设备的同意制在批次里照旧）→ 也传完 ──
     transfer::accept_invite(state_c.clone(), &invite_c).expect("C 同意");
     let expected_c = save_c.join("PC-MDA").join(&name).join("hello.txt");
+    // 等**整份目录**都落齐再断言：下载是逐文件的顺序循环，`hello.txt` 写完不代表
+    // `sub/nested.txt` 也写完了 —— 只等其中一个、再断言另一个，是一条会偶发的竞态
+    //（串行也照样会撞上，与谁先谁后无关，只看两台的调度）。
+    let expected_nested = save_c.join("PC-MDA").join(&name).join("sub").join("nested.txt");
     wait_until("C 也收下整份目录", || {
         std::fs::read(&expected_c).map(|c| c == b"hello world from A").unwrap_or(false)
+            && std::fs::read(&expected_nested)
+                .map(|c| c == b"nested content")
+                .unwrap_or(false)
     })
     .await;
     assert!(
-        std::fs::read(save_c.join("PC-MDA").join(&name).join("sub").join("nested.txt")).is_ok(),
+        std::fs::metadata(&expected_nested).is_ok(),
         "目录结构照旧完整保留"
     );
 
-    // ── 整批的最后一步：没有一台还在路上，批次就丢掉（界面手里那份快照已经是全量） ──
-    wait_until("整批结束后批次被丢掉", || state_a.push.batch_snapshot(&batch_id).is_none()).await;
+    // ── 整批的最后一步：没有一台还在路上。**批次不再立刻丢** —— 留 `SETTLED_GRACE`
+    //    宽限期（对端的回执可能还在路上，链路回来之后的对账也要先找得到这批），
+    //    这样"对面其实收完了、本机写着失败"才纠正得回来（`transfer::apply_push_states`）。
+    //    可观察的契约于是是"全部落终态 + 批次到点才被清扫掉"。 ──
+    wait_until("整批都落终态", || {
+        state_a
+            .push
+            .batch_snapshot(&batch_id)
+            .map(|shot| shot.waiting == 0 && shot.done == 2)
+            .unwrap_or(false)
+    })
+    .await;
+    state_a.push.sweep_settled_batches();
+    assert!(
+        state_a.push.batch_snapshot(&batch_id).is_some(),
+        "宽限期内不清：纠正（对账）还得找得到这批"
+    );
+    assert!(
+        state_a.push.target_of_invite(&invite_b).is_some(),
+        "按邀请号也找得到 —— 对账答案要落到这一行上"
+    );
 
     // ── 一台都派不出去 = 单台那条"就地失败"（F-53）：整体报错，界面弹提示、不建卡片 ──
     let err = transfer::push_paths(
@@ -1018,6 +1066,100 @@ async fn unpair_clears_both_sides_and_keeps_the_device_listed() {
     credential::remove_peer("device-ua").ok();
     credential::remove_peer("device-ub").ok();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// NAT 后面的对端（安卓模拟器）：**来源地址不能当对端地址记**，可达性只能由长连接说话。
+///
+/// 用户报的现象是"PC 上那台模拟器一直显示「离线」，可配对、长连接、消息都正常"。根因在
+/// 模拟器把宿主回环别名（`10.0.2.2`）拍成宿主的 `127.0.0.1`：**本机**这一侧看到的来源
+/// 地址就是本机自己，配上对端自报的端口（默认同样是 3890）正好是本机的监听端点。记进
+/// 地址簿之后一路错下去：探活问回自己、把**本机的**证书指纹钉到对端名下，最后这一行被
+/// 当成"这个地址上换了设备"作废 —— 而它此后再没有地址可问，设备行就永远停在「离线」。
+///
+/// 这里把那一刻原样摆出来（邀请从回环来、`port` 报的正是**被访问实例自己**的监听端口），
+/// 盯三件事：① 那一对地址一处都不记、本机的指纹也不许落到对端名下；② 链路建起来之前
+/// 不许自称"在线"；③ 链路活着 = 在线、链路断了 = 回到离线（这种对端没有地址，探活、
+/// mDNS 都够不着它，链路是唯一的证据）。
+#[tokio::test]
+async fn nat_peer_keeps_no_address_and_its_liveness_follows_the_link() {
+    // 凭据库是机器级的：先抹掉上一轮（尤其是跑挂的那轮）留下的 token。
+    credential::remove_peer("device-nat").ok();
+    let save_dir = temp_share_dir("nat_save");
+    let port = free_port();
+    let state = make_state(port, "device-pc", "PC-NAT", save_dir.clone());
+    let serving = orbdrop_lib::server::start_server(state.clone(), port)
+        .await
+        .expect("server");
+
+    // ---- 模拟器发来配对邀请：来源 127.0.0.1，自报端口正是本机的监听端口 ----
+    let invite_id = "invite-nat".to_string();
+    let posted = {
+        let url = format!("http://127.0.0.1:{serving}/pair/invite");
+        let body = serde_json::json!({
+            "inviteId": invite_id,
+            "peerId": "device-nat",
+            "peerName": "PJJ110",
+            "port": serving,
+        });
+        tokio::spawn(async move {
+            orbdrop_lib::net::client().post(url).json(&body).send().await
+        })
+    };
+    wait_until("本机界面上出现这条邀请", || state.pair.has_invite(&invite_id)).await;
+    assert!(
+        !state.get_peer("device-nat").is_some_and(|p| p.paired),
+        "还没人点「接收」，不许变成已配对"
+    );
+    orbdrop_lib::pair::accept_invite(&state, &invite_id).expect("accept invite");
+    let resp = posted.await.expect("invite task").expect("invite request completes");
+    assert_eq!(resp.status(), 200, "被接受后发起方拿到回执");
+    let grant: serde_json::Value = resp.json().await.unwrap();
+    let token = grant["token"].as_str().expect("token").to_string();
+
+    // ---- ① 那一对地址一处都不记：本机拨不到它（来源地址指的就是本机自己） ----
+    let row = state.get_peer("device-nat").expect("配对完设备行应该在");
+    assert!(row.paired, "配对关系已经建立");
+    assert_eq!(
+        (row.ip.as_str(), row.port),
+        ("", 0),
+        "来源是本机自己的监听端点：不能当对端地址记下来（记下来会让探活问回自己）"
+    );
+    assert!(
+        !row.online,
+        "还没有链路：这种对端此刻送不到，不许先替它挂一颗绿点"
+    );
+    let our_fingerprint = orbdrop_lib::net::load_or_create_identity().unwrap().fingerprint;
+    assert_ne!(
+        credential::get_peer_fingerprint("device-nat").unwrap().as_deref(),
+        Some(our_fingerprint.as_str()),
+        "**本机的**证书指纹不许钉到对端名下"
+    );
+
+    // ---- ② 对端拨进来（长连接）：这是它可达的唯一证据 ----
+    let url = orbdrop_lib::net::peer_ws_url("127.0.0.1", serving, &token, false);
+    let ws = orbdrop_lib::net::connect_ws(&url, "127.0.0.1", serving)
+        .await
+        .expect("inbound ws from the nat'd peer");
+    wait_until("本机把它认成在线的长连接设备", || {
+        state.get_peer("device-nat").is_some_and(|p| p.online)
+            && state.ws.has_connection("device-nat")
+    })
+    .await;
+
+    // ---- ③ 链路一断就回到离线 ----
+    drop(ws);
+    wait_until("链路断开后回到离线", || {
+        !state.get_peer("device-nat").is_some_and(|p| p.online)
+    })
+    .await;
+    assert!(
+        !state.ws.has_connection("device-nat"),
+        "链路已经断了，不许还写着长连接"
+    );
+
+    orbdrop_lib::server::stop_server(&state).await;
+    credential::remove_peer("device-nat").ok();
+    let _ = std::fs::remove_dir_all(&save_dir);
 }
 
 /// 本机的局域网地址：用来模拟"来自另一台设备"的请求（回环会被当成本机 UI 免鉴权）。

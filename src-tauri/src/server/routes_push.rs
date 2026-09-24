@@ -13,6 +13,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
+use crate::net;
 use crate::state::AppState;
 use crate::transfer::push_job::{DownloadTarget, InboundInvite};
 use crate::transfer::{accept_invite, reject_invite_with, schedule_invite_timeout, INVITE_TTL};
@@ -99,8 +100,12 @@ pub async fn push_invite_handler(
         is_dir: body.is_dir,
         count: body.count,
         files: body.files,
-        // ip 取自 TCP 来源（不可伪造），端口用发送方自报的服务端口。
-        callback: Some((addr.ip().to_string(), body.port)),
+        // ip 取自 TCP 来源（不可伪造），端口用发送方自报的服务端口 —— 但**本机自己的监听
+        // 端点不能记**：NAT 后面的对端（安卓模拟器）回连进来时，来源地址在**本机**这一侧
+        // 就是本机自己（见 `net::observed_dial_target`）。留一个指向自己的回执地址，等于
+        // 把"接收/进度/完成"回报 POST 给本机自己（对端永远收不到，日志里还看不出是谁的错）。
+        // 判定为"自己"时给 `None`：回执改走长连接，没有长连接就如实报"无处可送"。
+        callback: net::observed_dial_target(addr.ip(), body.port, state.listening_port()),
         responder: None,
     };
 

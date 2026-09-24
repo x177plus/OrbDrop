@@ -71,6 +71,27 @@ pub enum WsEvent {
         status: String, // "completed" | "failed"
         reason: Option<String>,
     },
+    /// Sender → Receiver: **对账**（推送回执的补漏）。
+    ///
+    /// 回执（进度/完成/拒绝）是"一次、尽力而为"的：长连接在"检查有没有会话"和"真的发出去"
+    /// 之间断掉、或那一跳 HTTP 补发失败，回执就没了 —— 发送方那一台会一直停在「等待」，
+    /// 5 分钟后被判成「对方未响应」，而对面其实早就收完了。链路回来（或探活发现链路在）时，
+    /// 发送方把自己**还没落终态**的邀请号问一遍，由接收方按它的记录回答（`PushState`）。
+    /// 一次一批，只走长连接（对账的前提就是"链路在"）。
+    PushAsk {
+        /// 这一次问的凭据（回执原样带回来，日志里对得上）。
+        ask_id: String,
+        /// 发送方还没落终态的邀请号。
+        invite_ids: Vec<String>,
+    },
+    /// Receiver → Sender: 对账的答案（`PushAsk` 的回执）。
+    ///
+    /// **只答"本机确实收到过、或此刻还拿着"的邀请**：没有记录的答 `unknown` ——
+    /// 那说明这条邀请根本没送到，发送方据此当场收手，不必再等满 5 分钟。
+    PushState {
+        ask_id: String,
+        states: Vec<crate::transfer::push_job::PushInviteStateWire>,
+    },
     /// Sharer → Viewer: a broadcast share changed (F-33).
     ShareChanged {
         share_id: String,
@@ -198,6 +219,8 @@ impl WsEvent {
             WsEvent::PushResponse { .. } => "push_response",
             WsEvent::PushProgress { .. } => "push_progress",
             WsEvent::PushDone { .. } => "push_done",
+            WsEvent::PushAsk { .. } => "push_ask",
+            WsEvent::PushState { .. } => "push_state",
             WsEvent::ShareChanged { .. } => "share_changed",
             WsEvent::SharesChanged => "shares_changed",
             WsEvent::Unpair { .. } => "unpair",

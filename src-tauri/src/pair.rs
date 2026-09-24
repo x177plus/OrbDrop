@@ -229,14 +229,19 @@ pub fn commit_pairing(
     let seen = crate::net::trust().observed_at(&peer.ip);
     credential::set_peer_credential(&peer.id, token, seen.as_deref().unwrap_or(""))
         .map_err(|e| format!("凭据存储失败: {e}"))?;
+    // 刚配对：还没长连接，没有要恢复的东西。`online` 要看**有没有可拨的地址**：有地址
+    // （mDNS 看到的、手动填的、配对请求里学到的）就是"在线、送得到"；没有地址的是本机
+    // 拨不到的那种对端（模拟器/NAT 后面 —— 它把自己看到的本机地址回连进来，那一对地址
+    // 记不得，见 `net::observed_dial_target`），它的可达性只能等长连接来证明，先如实按
+    // "离线"记，别在设备行上先挂一颗绿点。
+    let dialable = !peer.ip.is_empty() && peer.port != 0;
     state.mark_paired(&PeerDevice {
         id: peer.id.clone(),
         name: peer.name.clone(),
         ip: peer.ip.clone(),
         port: peer.port,
-        online: true,
+        online: dialable,
         paired: true,
-        // 刚配对：还没长连接，没有要恢复的东西。
         auto_connect: false, paused: false,
     });
     // 刚拿到 token：把 BC 的 WebDAV profile 预写好（BC 只在启动时登记 profile 文件，

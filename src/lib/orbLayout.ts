@@ -131,9 +131,14 @@ export type DockPlan = {
   /** 收起（未悬停）时悬浮球在窗口内的偏移：贴边侧 = `overhang` 探出屏幕外（物理像素） */
   orb: { x: number; y: number };
   /**
-   * 悬停热区（窗口内偏移 + 尺寸，物理像素）：「收起露出的半颗」与「悬停后的完整球」
-   * 的并集。热区固定不动，只有球在里面滑 —— 球若跟着动，指针会滑出它，随即又滑回来，
-   * 一进一出抖个不停。
+   * **收起态（未悬停）的悬停热区**（窗口内偏移 + 尺寸，物理像素）= 屏上**看得见的那一条**：
+   * 圆球是露出那截弧的方框、悬浮框是那条竖条。呼出阈值就是它 —— 悬浮体滑出去之后**才会**占的
+   * 那一块不吃指针（否则收起态在屏幕边上圈着一大块，指针从旁边路过就把它呼出来，压在下面的
+   * 窗口也点不着）。
+   *
+   * 呼出**之后**的热区是它 ∪ 完整悬浮体，由 `App.collapsedHitRects` 现拼：那时悬浮体确实已经
+   * 滑到完整位上，指针就落在它上面；区域不含那一块的话，指针一离开那一条，窗口就当场穿透、
+   * hover 丢掉，悬浮体又收回去 —— 一进一出抖个不停。
    */
   zone: ScreenRect;
 };
@@ -153,6 +158,12 @@ export type DockPlan = {
  * 左右让出屏幕（露出来的是球的一侧，那段弧约 142°，两颗角标都放得下），而不是往角上缩成
  * 只露一个角（那样只剩约 52°，连一颗 22px 的角标都得精打细算）。于是 `dock` 只可能是
  * `(0,0)` / `(±1,0)` / `(0,±1)`，`spinForDock` 也只需要管这几种。
+ *
+ * **呼出阈值 = 露在屏内那一小条**（`zone`）：球收进去之后要占的那块**不算**热区 ——
+ * 它占了，收起态就等于在屏幕边上圈了一整颗球的方框，指针从旁边路过就把球呼出来，压在下面的
+ * 窗口也点不着（见 `DockPlan.zone`）。球滑回完整位之后指针落在球上，那时才把球并进热区
+ * （`App.collapsedHitRects`）—— 热区本身**固定不动**：跟着球走的话，指针会被滑走的球甩下、
+ * 球随即滑回又被指针压到，一进一出抖个不停。
  */
 export function planDock(input: {
   /** 自由落位的折叠态窗口矩形（物理像素） */
@@ -169,6 +180,8 @@ export function planDock(input: {
   threshold: number;
 }): DockPlan {
   const { ball, work, orbSize, orbInset, overhang, threshold } = input;
+  /** 贴边收起后**仍露在屏幕内**的球宽度（= `orbSize - overhang`）：呼出阈值就只算这一截。 */
+  const expose = orbSize - overhang;
 
   /** 单轴吸附：贴边方向 d、窗口该轴坐标 win、球在该轴的偏移 orb、悬停热区该轴的起点与长度。
    *  `allow = false`：这一轴不判吸附、保持自由落位（横向已经贴边时的纵向，见上面的说明）。 */
@@ -182,9 +195,10 @@ export function planDock(input: {
       win: d === -1 ? limit : d === 1 ? limit + total - size : start,
       // 负向（左/上）：球左缘探出 overhang；正向（右/下）：球右缘探出 overhang
       orb: d === -1 ? -overhang : d === 1 ? size - orbSize + overhang : orbInset,
-      // 热区 = 「露出的部分」∪「完整球」：贴边侧从窗口边缘起算，另一侧到完整球的外缘
-      zone: d === -1 ? 0 : orbInset,
-      zoneSize: d === 0 ? orbSize : orbSize + orbInset,
+      // 热区 = 屏上**看得见的那一条**：贴边侧从窗口边缘起算，长度就是露在屏内的那截 `expose`；
+      // 未贴边（d === 0）时整颗球都在屏内，热区就是球本身
+      zone: d === 0 ? orbInset : d === -1 ? 0 : size - expose,
+      zoneSize: d === 0 ? orbSize : expose,
     };
   };
 
@@ -195,7 +209,7 @@ export function planDock(input: {
     window: { x: ax.win, y: ay.win, w: ball.w, h: ball.h },
     dock: { x: ax.d, y: ay.d },
     orb: { x: ax.orb, y: ay.orb },
-    zone: { x: ax.zone, y: ay.zone, w: ax.zoneSize, h: ax.zoneSize },
+    zone: { x: ax.zone, y: ay.zone, w: ax.zoneSize, h: ay.zoneSize },
   };
 }
 
@@ -209,6 +223,11 @@ export function planDock(input: {
  *
  * 竖条钉在悬浮框**贴边那一端**（贴右钉在左端、贴左钉在右端，位置由 `RECT_DOCK_INSET` 定），
  * 于是露出的那 `peek` 宽正是卡片贴边侧的那一竖条 —— 竖条与它占同一块屏幕区域。
+ *
+ * **呼出阈值 = 那条竖条**（`zone`）：卡片滑回来之后要占的那一大片**不算**热区 —— 算进来的话，
+ * 收起态就是在屏幕边上圈了一张卡片那么大的方框（222×134），指针从旁边路过就把卡片呼出来，
+ * 压在下面的窗口也点不着（见 `DockPlan.zone`）。卡片滑回完整位之后指针落在卡片上，那时才把
+ * 卡片并进热区（`App.collapsedHitRects`）。
  *
  * 竖向不贴（与圆球不同）：卡片是横幅，贴上边露的是列表尾部、贴左边露的是分页点列 ——
  * 收起态读不出东西的贴边位不如不要；上下两条边按 `margin` 夹进工作区就算了。
@@ -229,7 +248,7 @@ export function planRectDock(input: {
   peek: number;
   /** 悬浮框（卡片 + 点列）在窗口内的矩形（物理像素） */
   widget: ScreenRect;
-  /** 卡片本身（不含右侧点列）的宽度（物理像素）：竖条的落位与热区按它算 */
+  /** 卡片本身（不含右侧点列）的宽度（物理像素）：卡片贴边收起滑到哪个位置按它算 */
   cardW: number;
   /** 吸附阈值：悬浮框边缘距工作区边缘 ≤ 该值即贴边（物理像素） */
   threshold: number;
@@ -262,11 +281,12 @@ export function planRectDock(input: {
       x: dock === -1 ? -(cardW - peek) : dock === 1 ? win.w - peek : widget.x,
       y: widget.y,
     },
-    // 热区 = 「露出的竖条」∪「悬停后的完整卡片」，两者都在贴边那一侧；未贴边就是悬浮框本身
+    // 热区 = 屏上看得见的那条**竖条**（卡片滑出窗口后只剩它）：竖条钉在卡片贴边的那一端，
+    // 所以贴左在窗口最左 `peek`、贴右在窗口最右 `peek`；未贴边就是悬浮框本身
     zone: {
-      x: dock === -1 ? 0 : widget.x,
+      x: dock === -1 ? 0 : dock === 1 ? win.w - peek : widget.x,
       y: widget.y,
-      w: dock === -1 ? widget.x + cardW : dock === 1 ? win.w - widget.x : widget.w,
+      w: dock === 0 ? widget.w : peek,
       h: widget.h,
     },
   };

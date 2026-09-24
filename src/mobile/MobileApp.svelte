@@ -1,0 +1,188 @@
+<script lang="ts">
+  import "./mobile.css";
+  // 后端事件的移动端登记处（推送/配对这几族在桌面端写在 `App.svelte` 里，移动端原先一条没接，
+  // 见 `events.ts` 的说明）。模块级副作用，引一次就够。
+  import "./events";
+  import { onMount } from "svelte";
+  import Icon from "./Icon.svelte";
+  import Toasts from "./components/Toasts.svelte";
+  import SheetHost from "./SheetHost.svelte";
+  import ConvosTab from "./tabs/ConvosTab.svelte";
+  import FilesTab from "./tabs/FilesTab.svelte";
+  import DevicesTab from "./tabs/DevicesTab.svelte";
+  import SettingsTab from "./tabs/SettingsTab.svelte";
+  import ChatScreen from "./ChatScreen.svelte";
+  import * as store from "./store.svelte";
+  import * as chat from "$lib/stores/chat.svelte";
+  import * as devices from "$lib/stores/devices.svelte";
+  import type { IconName } from "./icons";
+
+  const tab = $derived(store.currentTab());
+  const chatKey = $derived(store.openChatKey());
+  const sheet = $derived(store.currentSheet());
+
+  // 「会话」页签那颗角标 = 未读 + 还没确认的群邀请（见 `convoBadgeTotal`）：邀请卡只画在
+  // 「会话」页里，不计数的话停在别的页时它就完全没有提示。
+  const convoBadge = $derived(chat.convoBadgeTotal());
+  const pending = $derived(store.pendingInvites().length);
+  const inboxCount = $derived(store.getInbox().length);
+  const onlineCount = $derived(devices.getDevices().filter((d) => d.connected).length);
+  const deviceCount = $derived(devices.getDevices().length);
+  const addr = $derived(store.getLocalAddr());
+
+  /** 顶部那一行：标题、副标题、右侧动作 —— 四个 tab 各一份，与原型一致。 */
+  const bar = $derived.by((): { title: string; sub: string; act?: { icon: IconName; label: string; run: () => void } } => {
+    if (tab === "convos") {
+      return {
+        title: "会话",
+        sub: `${onlineCount} 台在线 · ${deviceCount} 台设备`,
+        act: { icon: "plus", label: "新建会话", run: () => store.openSheet({ kind: "convo" }) },
+      };
+    }
+    if (tab === "files") {
+      return {
+        title: "文件",
+        sub: `${pending} 个待接收 · ${inboxCount} 个已接收`,
+        act: { icon: "refresh", label: "刷新", run: () => void refreshAll() },
+      };
+    }
+    if (tab === "devices") {
+      return {
+        title: "设备",
+        sub: addr ? `本机 · ${addr.ip || "离线"}:${addr.port}` : "本机",
+        act: { icon: "plus", label: "手动添加设备", run: () => store.openSheet({ kind: "addDevice" }) },
+      };
+    }
+    return { title: "设置", sub: "OrbDrop 移动端 · 局域网文件共享" };
+  });
+
+  const tabs = [
+    { id: "convos", label: "会话", icon: "chat" },
+    { id: "files", label: "文件", icon: "files" },
+    { id: "devices", label: "设备", icon: "devices" },
+    { id: "settings", label: "设置", icon: "settings" },
+  ] as const;
+
+  /** 一次把三处数据拉齐（下拉刷新没有：桌面端也没有，靠这颗按钮与后端事件）。 */
+  async function refreshAll(): Promise<void> {
+    await Promise.all([devices.loadDevices(), chat.refresh(), store.loadInbox()]);
+    store.toast("已刷新设备与共享项", "refresh");
+  }
+
+  onMount(() => {
+    // 路由真相就是 hash：安卓的返回键走 webview 历史栈时，这一条链不用另写一套。
+    // 安卓返回键：MainActivity 注册的回调会调 `window.__orbdropBack`（见那个 Kotlin 文件）。
+    // 顺序就是"从最上面一层开始收"：底板 → 会话子屏 → 非首层 tab；都没有才返回 false，
+    // 让原生那边按平台惯例退出应用。桌面端永远不会调用它（没有那段 Kotlin）。
+    (window as unknown as Record<string, unknown>).__orbdropBack = () => {
+      if (store.currentSheet()) {
+        store.closeSheet();
+        return true;
+      }
+      if (store.openChatKey()) {
+        store.navigateBackToList();
+        return true;
+      }
+      if (store.currentTab() !== "convos") {
+        store.navigateTab("convos");
+        return true;
+      }
+      return false;
+    };
+
+    const sync = () => {
+      const h = location.hash || "#/convos";
+      const chatPrefix = "#/chat/";
+      if (h.startsWith(chatPrefix)) {
+        let key = h.slice(chatPrefix.length);
+        try {
+          key = decodeURIComponent(key);
+        } catch {
+          // 键里的 % 不是转义就走原样：非法键会由 `chat.activeThread` 判空，退回列表。
+        }
+        chat.openConversation(key);
+        return;
+      }
+      store.setTab(h.replace(/^#\//, ""));
+      chat.backToList();
+    };
+    window.addEventListener("hashchange", sync);
+    if (!location.hash) location.hash = "#/convos";
+    sync();
+
+    void devices.loadDevices();
+    void chat.refresh();
+    void store.loadInbox();
+    void store.loadLocalAddr();
+    return () => {
+      window.removeEventListener("hashchange", sync);
+      delete (window as unknown as Record<string, unknown>).__orbdropBack;
+    };
+  });
+</script>
+
+<div class="app">
+  <header class="appbar">
+    <div class="ab-main">
+      <h1 class="ab-title">{bar.title}</h1>
+      <p class="ab-sub">{bar.sub}</p>
+    </div>
+    {#if bar.act}
+      <div class="ab-acts">
+        <button class="icon-btn" type="button" aria-label={bar.act.label} onclick={bar.act.run}>
+          <Icon name={bar.act.icon} />
+        </button>
+      </div>
+    {/if}
+  </header>
+
+  <div class="appmain">
+    {#if tab === "convos"}
+      <ConvosTab />
+    {:else if tab === "files"}
+      <FilesTab />
+    {:else if tab === "devices"}
+      <DevicesTab />
+    {:else}
+      <SettingsTab />
+    {/if}
+  </div>
+
+  <!-- 用 div 而不是 nav：`role="tablist"` 会顶掉 `<nav>` 自己的 landmark 语义，屏幕阅读器
+       里就少了一个导航地标（a11y 检查也会报）。原型把它写在 `<nav>` 上，这里改掉。 -->
+  <div class="tabbar" role="tablist" aria-label="主导航">
+    {#each tabs as t (t.id)}
+      <button
+        class="tab-item"
+        class:active={tab === t.id}
+        type="button"
+        role="tab"
+        aria-selected={tab === t.id}
+        onclick={() => store.navigateTab(t.id)}
+      >
+        <span class="ti-ic">
+          <Icon name={t.icon} />
+          {#if t.id === "convos" && convoBadge > 0}
+            <span class="ti-badge">{convoBadge}</span>
+          {:else if t.id === "files" && pending > 0}
+            <span class="ti-badge hot">{pending}</span>
+          {/if}
+        </span>
+        <span class="ti-lb">{t.label}</span>
+      </button>
+    {/each}
+  </div>
+
+  <!-- 会话子屏：盖在 tab 之上（原型 `.sub`），开着时底下的列表不再可点。 -->
+  <section class="sub" class:open={!!chatKey} aria-hidden={!chatKey} aria-label="会话详情">
+    {#if chatKey}
+      <ChatScreen convoKey={chatKey} />
+    {/if}
+  </section>
+
+  {#if sheet}
+    <SheetHost {sheet} onClose={() => store.closeSheet()} />
+  {/if}
+
+  <Toasts />
+</div>

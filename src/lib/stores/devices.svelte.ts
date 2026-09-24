@@ -16,14 +16,20 @@ export function isDevicesLoading() { return loading; }
  * 离线且未绑定的不列：它没有任何可做的动作，只会堆积曾经扫到的设备。
  *
  * 排序（用户要求）：**在线在前、离线在后**；在线组内 长连接 → 已配对 → 未绑定
- * （离线组内同理，只是没有长连接可言）。同级按名字排，免得每次刷新行序乱跳。
+ * （离线组内同理，只是没有长连接可言）。同级按名字排 —— 按**显示名**（设了备注就是
+ * 「备注(设备名)」）：用户看到的是显示名，排序就该跟眼睛一致，否则备注会把行序弄乱。
  */
 export function visibleDevices(all: PeerDevice[]): PeerDevice[] {
   const group = (d: PeerDevice) => (d.online ? 0 : 1);
   const rank = (d: PeerDevice) => (d.connected ? 0 : d.paired ? 1 : 2);
   return all
     .filter((d) => d.online || d.paired)
-    .sort((a, b) => group(a) - group(b) || rank(a) - rank(b) || a.name.localeCompare(b.name));
+    .sort(
+      (a, b) =>
+        group(a) - group(b) ||
+        rank(a) - rank(b) ||
+        deviceDisplayName(a).localeCompare(deviceDisplayName(b)),
+    );
 }
 
 export async function loadDevices() {
@@ -35,6 +41,44 @@ export async function loadDevices() {
   } finally {
     loading = false;
   }
+}
+
+/**
+ * 一台设备的**显示名**（F-101）：设了备注就是「备注(设备名)」，否则就是设备名本身。
+ *
+ * 备注只存在本机（`config.toml` 的 `deviceRemarks`），对端看到的仍是它自己的名字 ——
+ * 所以拼装只在这一处：设备行、标签栏、会话标题、收件人选择框、推送卡与 toast 全走它，
+ * 谁也别自己拼一遍（那才是"设备名又分叉了"的老毛病）。
+ *
+ * 空字符串的备注按"没备注"处理：后端不会存空串（见 `Config::set_device_remark`），
+ * 但手改过的 `config.toml` 里可能有。
+ */
+export function deviceDisplayName(d: PeerDevice): string {
+  const remark = d.remark?.trim();
+  return remark ? `${remark}(${d.name})` : d.name;
+}
+
+/**
+ * 按设备 id 取显示名（拿不到这台设备时用 `fallback`，没给就退回 id 本身）。
+ *
+ * `fallback` 是给"名字来自别处"的场合用的：会话消息、推送卡与通知里的名字是**收到那一刻**
+ * 存下来的字符串，设备表里可能已经没有这一台（移除过、或还没学到它），那时至少要有名字可显示。
+ */
+export function peerDisplayName(peerId: string, fallback?: string): string {
+  const d = devices.find((x) => x.id === peerId);
+  return d ? deviceDisplayName(d) : fallback ?? peerId;
+}
+
+/**
+ * 写一台设备的备注（F-101）：`''` = 清除。返回后端真正存下去的值（`null` = 已清除）。
+ *
+ * 本地**当场**改一份（右键点完立刻能看到新显示名），后端随后广播的 `devices://changed`
+ * 会再拉一次完整列表（两边同值，谁先到都不影响）。
+ */
+export async function saveDeviceRemark(peerId: string, remark: string): Promise<string | null> {
+  const stored = (await api.setDeviceRemark(peerId, remark)) ?? null;
+  devices = devices.map((d) => (d.id === peerId ? { ...d, remark: stored } : d));
+  return stored;
 }
 
 // ── 设备状态：一处判据，处处共用 ────────────────────────────────────────────
@@ -124,10 +168,11 @@ export type DeviceState = { dot: DeviceDotState; chip: DeviceDotState | 'unbound
 /**
  * 设备行 / 收件人行那一整套状态（设备页、收件人选择框、会话标题旁的「未绑定」章共用）。
  *
- * 胶囊的配色跟**点**走（能送到=绿、在等=琥珀、要重新配对=红、送不到=灰虚框），文案说关系与
- * 链路 —— 一行里"点"和"胶囊"于是不会互相打架。**例外是「未绑定」**：那台设备确实能收到东西
- * （点给绿环），但关系还没建立，胶囊保持中性灰，别让它跟"要你处理"的琥珀抢注意力
- * （见 `visibleDevices` 那条注释：未绑定是局域网设备的常态）。
+ * 胶囊的配色跟**点**走（绿=长连接、蓝=已配对在线、在等=琥珀、要重新配对=红、送不到=灰虚框），
+ * 文案说关系与链路 —— 一行里"点"和"胶囊"于是不会互相打架。**绿只给长连接**：自动广播的对象
+ * 就是它，而"实心绿 vs 绿环"在 6px 的点上第一眼分不出来（要能扫一眼看出哪几台收得到广播）。
+ * **例外是「未绑定」**：那台设备确实能收到东西（点照常给环），但关系还没建立，胶囊保持中性灰，
+ * 别让它跟"要你处理"的琥珀抢注意力（见 `visibleDevices` 那条注释：未绑定是局域网设备的常态）。
  */
 export function deviceState(d: PeerDevice | undefined): DeviceState {
   const dot = deviceDotState(d);

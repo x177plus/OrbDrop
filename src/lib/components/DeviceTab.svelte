@@ -1,10 +1,10 @@
 <script lang="ts">
   import type { PeerDevice } from '$lib/types';
-  import { getDevices, loadDevices, deviceState, needsRepair } from '$lib/stores/devices.svelte';
+  import { getDevices, loadDevices, deviceState, needsRepair, deviceDisplayName } from '$lib/stores/devices.svelte';
   import { connectPeer, disconnectPeer } from '$lib/api';
   import * as chat from '$lib/stores/chat.svelte';
   import Hint from '$lib/components/Hint.svelte';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
 
   let {
     onToast,
@@ -27,7 +27,8 @@
 
   /**
    * 前端筛选（纯本地，不发请求）：局域网里设备一多，靠滚动找一台太慢。
-   * 只匹配**设备名**与 **IP**（大小写不敏感）。空串 / 纯空白 = 不过滤。
+   * 匹配**显示名**（F-101：设了备注就是「备注(设备名)」，所以备注也搜得到）与 **IP**
+   * （大小写不敏感）。空串 / 纯空白 = 不过滤。
    *
    * 只过滤显示，不动数据：右键菜单与动作处理都按 `devices` 查表，筛只是少画几行。
    */
@@ -35,7 +36,7 @@
   let filtered = $derived.by(() => {
     const q = query.trim().toLowerCase();
     if (!q) return devices;
-    return devices.filter((d) => d.name.toLowerCase().includes(q) || d.ip.includes(q));
+    return devices.filter((d) => deviceDisplayName(d).toLowerCase().includes(q) || d.ip.includes(q));
   });
 
   let connectedCount = $derived(devices.filter(d => d.connected).length);
@@ -50,6 +51,22 @@
   function deviceInitial(name: string): string {
     return name.charAt(0).toUpperCase();
   }
+
+  let listEl = $state<HTMLUListElement | undefined>();
+
+  /* 名字超出就加一档右端渐隐（与标签栏、悬浮框列表同一套）。**只淡名字，不碰状态章**：
+     名字与胶囊在同一个 flex 行里，容器上写 `text-overflow` 那种做法会把胶囊一起裁掉 ——
+     长连接/已配对那几个字必须完整（那是这一行的结论）。触发点：行集合变（进出/筛选）、
+     某个显示名变（改了备注）；首次渲染也要量一遍。 */
+  function markClipped() {
+    for (const el of listEl?.querySelectorAll<HTMLElement>('.d-name-txt') ?? []) {
+      el.classList.toggle('is-clipped', el.scrollWidth > el.clientWidth + 0.5);
+    }
+  }
+  $effect(() => {
+    void filtered.map((d) => deviceDisplayName(d)).join('\u0000');
+    void tick().then(markClipped);
+  });
 
   /** 地址未知的设备（只有凭据、还没学到过地址）：别显示成 `:0`。 */
   function addressLabel(d: PeerDevice): string {
@@ -101,10 +118,10 @@
     try {
       if (connect) {
         await connectPeer(d.id);
-        onToast(`正在与「${d.name}」建立长连接`);
+        onToast(`正在与「${deviceDisplayName(d)}」建立长连接`);
       } else {
         await disconnectPeer(d.id);
-        onToast(`已与「${d.name}」断开长连接（临时暂停，不是解除配对）：本机不再自动接回，对方点「连接」可立刻恢复`);
+        onToast(`已与「${deviceDisplayName(d)}」断开长连接（临时暂停，不是解除配对）：本机不再自动接回，对方点「连接」可立刻恢复`);
       }
     } catch (e) {
       onToast(`${connect ? '建立长连接' : '断开'}失败：${e}`);
@@ -146,7 +163,7 @@
         deviceState: d.connected ? 'connected' : d.paired ? 'paired' : 'unbound',
         online: d.online,
         needsPair: needsRepair(d),
-        name: d.name,
+        name: deviceDisplayName(d),
         deviceId: d.id,
       }
     }));
@@ -181,8 +198,10 @@
 <div class="list-label dev-label">
   <span class="ll-name"><span class="ll-text">局域网设备</span><Hint>
     <p>
-      <span class="hl">状态点</span>：实心绿=长连接、绿环=在线（能收到）、灰环=离线、琥珀=本机在等、红=需重新配对；
-      胶囊上那几个字说的是关系与链路，与点不重复。
+      <span class="hl">状态点</span>：实心绿=长连接（会收到你拖入悬浮球的广播的就是这几台）、
+      蓝环=已配对在线（能收到，但不会收到自动广播）、灰环=离线、琥珀=本机在等、红=需重新配对；
+      胶囊上那几个字说的是关系与链路，与点不重复 —— 行上不再另挂一枚「自动广播」标签，
+      要一眼看出哪几台收得到广播，看状态点的颜色就够（绿只给长连接）。
       <span class="hl">发消息</span>按钮打开与这台设备的会话 —— 消息**长连接优先、HTTP 兜底**：
       已配对的不点「连接」也能收发，未绑定设备也能收能发（对端名字是它自报的）；
       对端不在网上时那条消息**排着队**，它一上线就自动发出去（界面那一刻写「等待发送」）；
@@ -197,7 +216,9 @@
       <span class="hl">单向群发</span>是每台各自收到一条单独消息，<span class="hl">共享群聊</span>
       是所有人的<b>同一条</b>消息流（收到邀请的人点「加入」才算入群）；群那条会话里也有那颗
       「＋」，按名册逐台推过去。
-      <span class="hl">搜索框</span>只在这里筛显示（设备名或 IP），不影响长连接与消息。
+      <span class="hl">搜索框</span>只在这里筛显示（显示名或 IP），不影响长连接与消息。
+      <span class="hl">右键设备行</span>可以「修改备注」：备注只存在本机（对端看不到），
+      设好之后这台设备在本机到处都显示成「备注(设备名)」。
     </p>
   </Hint></span>
   {#if devices.length > 0}
@@ -237,7 +258,7 @@
 {:else}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <ul class="device-list" id="deviceList" onclick={handleDeviceAction}>
+  <ul class="device-list" id="deviceList" bind:this={listEl} onclick={handleDeviceAction}>
     {#each filtered as d (d.id)}
       <!-- 状态点与状态章同一处判据（`stores/devices` 的 `deviceState`）：颜色=能不能送到、形状=有没有长连接。 -->
       {@const st = deviceState(d)}
@@ -249,14 +270,13 @@
         data-ip={`${d.ip}:${d.port}`}
         oncontextmenu={(e) => openCtx(e, d)}
       >
-        <span class="d-avatar">{deviceInitial(d.name)}</span>
+        <span class="d-avatar">{deviceInitial(deviceDisplayName(d))}</span>
         <div class="d-main">
           <div class="d-name">
-            {d.name}
+            <span class="d-name-txt">{deviceDisplayName(d)}</span>
             <span class="state-chip {st.chip}" title={linkHint(d)}>
               <span class="dot {st.dot}"></span>{st.label}
             </span>
-            <span class="auto-tag">自动广播</span>
           </div>
           <div class="d-ip">{addressLabel(d)}</div>
         </div>

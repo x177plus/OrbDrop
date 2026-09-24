@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
+#[cfg(desktop)]
+use tauri::Manager;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -195,6 +197,9 @@ pub async fn start(app: AppHandle, state: Arc<AppState>, ticket: String) -> Resu
             }
             // 起拖前把窗口带到前台（见 `orb_window::ensure_foreground`）：`DoDragDrop` 同样只在
             // 窗口是前台窗口时才真正吃住指针，而"点击激活"是异步的。
+            // 起拖前把窗口带到前台是 Windows OLE 拖放的前提（见 `orb_window::ensure_foreground`）：
+            // 桌面专属，移动端连悬浮球窗口都没有。
+            #[cfg(desktop)]
             if let Some(win) = app.get_webview_window("main") {
                 let _ = crate::orb_window::ensure_foreground(&win);
             }
@@ -293,6 +298,7 @@ fn plain_path(path: &Path) -> PathBuf {
 ///
 /// 手写字节而不是拼 `DROPFILES` 结构，是为了这份布局能在任何平台上被测试盯着
 /// （`imp` 里有一条 `size_of::<DROPFILES>() == 20` 的静态断言给两边对表）。
+#[cfg(any(windows, test))]
 fn hdrop_bytes(paths: &[PathBuf]) -> Vec<u8> {
     const HEADER_LEN: u32 = 20;
     let mut wide: Vec<u16> = Vec::new();

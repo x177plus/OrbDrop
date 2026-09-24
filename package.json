@@ -6,6 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "dev:mobile": "vite --mode mobile",
+    "build:mobile": "vite build --mode mobile",
+    "tokens:gen": "node scripts/gen-color-tokens.mjs",
+    "tokens:check": "node scripts/gen-color-tokens.mjs --check",
+    "check:compat": "node scripts/check-compat.mjs",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-check --tsconfig ./tsconfig.json --watch",

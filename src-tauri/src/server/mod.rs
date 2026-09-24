@@ -32,6 +32,17 @@ pub use routes_shares::shares_handler;
 pub use routes_stat::stat_handler;
 pub use routes_tree::tree_handler;
 
+/// 本机网卡上的全部地址（含回环、含 IPv6）。
+///
+/// 与 `local_ipv4_addresses` 分开是因为用途不同：那个是"要给用户看/要给对端播"的
+/// 内网地址（回环不算），这个是判"一个来源地址是不是我自己"用的 —— 回环必须在内
+/// （见 `net::observed_dial_target`）。
+pub fn interface_addresses() -> Vec<std::net::IpAddr> {
+    if_addrs::get_if_addrs()
+        .map(|list| list.into_iter().map(|i| i.addr.ip()).collect())
+        .unwrap_or_default()
+}
+
 /// 本机在局域网上的 IPv4 地址（非回环），**按"该先报哪个"排好序**。
 ///
 /// 一块网卡一个地址：有线 + 无线 + VPN 同时开着就会有 2~3 个。界面（左下角

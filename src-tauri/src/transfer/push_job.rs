@@ -19,6 +19,20 @@ use crate::ws::events::{FileEntry, PeerInfo, WsEvent};
 /// 20 个请求/秒，而界面看 5 次/秒已经足够平滑。
 const REPORT_INTERVAL: Duration = Duration::from_millis(200);
 
+/// 接收方给发送方的一条对账答案（`WsEvent::PushState` 里的一项）。
+///
+/// `state` 的取值：`done` / `failed` / `cancelled` / `rejected` / `waiting`（本机还拿着这条
+/// 邀请：等用户处理或正在拉）/ `unknown`（本机没见过它 —— 那条邀请根本没送到）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushInviteStateWire {
+    pub invite_id: String,
+    pub state: String,
+    /// 已收字节。只有 `waiting` 有参考价值（进度回执本身也可能丢）。
+    pub received: u64,
+    pub reason: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Data models
 // ---------------------------------------------------------------------------
@@ -135,7 +149,7 @@ pub enum DownloadTarget {
 ///
 /// `Cancelled` 不并进 `Failed`：取消是**用户自己做的事**，行文案必须是「已取消」而不是
 /// 「失败」；两者只在"这一批算不算全成"这件事上同类（卡片的收起规则见前端）。
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TargetState {
     /// 邀请已发出、还没有任何回执（已配对的目标会很快转 `Sending`）。
     Invited,
@@ -296,7 +310,41 @@ pub struct PushStore {
     /// invite_id → batch_id：回执（WS / `POST /push/report`）只知道邀请 id，
     /// 得 O(1) 找到它属于哪一批。
     batch_of_invite: Mutex<HashMap<String, String>>,
+    /// 最近处理过的**别人推给本机**的邀请结局（有界）。
+    ///
+    /// 为什么要留一份：传完/失败之后 `inbound` 与 `jobs` 里那条都已经清了，而"回执丢了"
+    /// 的对账（`WsEvent::PushAsk`）得答得出"这条我当时收没收到、结果如何" —— 没有这份记录，
+    /// 发送方就只能等它那 5 分钟超时，然后把一条已经成功的传输记成失败。
+    recent: Mutex<HashMap<String, RecentOutcome>>,
+    /// 对账的节流：peer_id → 上次问的时刻（一台设备别每 5 秒问一遍）。
+    asked_at: Mutex<HashMap<String, Instant>>,
+    /// 已经走完、但还在宽限期的批次：batch_id → 走完的时刻（见 `SETTLED_GRACE`）。
+    settled: Mutex<HashMap<String, Instant>>,
 }
+
+/// 一条**入站**邀请的处理结局（对账用；`state` 是 `PushInviteStateWire::state` 的取值）。
+struct RecentOutcome {
+    /// 发送方 id：只有它自己能问出这一条（别人的会话问同一个 id 一律 `unknown`）。
+    sender_id: String,
+    state: &'static str,
+    received: u64,
+    reason: Option<String>,
+    at: Instant,
+}
+
+/// 记多少条结局：一笔推送一条，64 条足以覆盖"还没落终态"的那几分钟。
+const RECENT_OUTCOMES: usize = 64;
+
+/// 对账的间隔：链路在的时候每 5 秒探活一拍，但同一台设备最快 20 秒问一次
+/// （回执丢了就靠下一拍补上，没必要 5 秒一问）。
+const ASK_INTERVAL: Duration = Duration::from_secs(20);
+
+/// 一批走完之后还留多久。
+///
+/// 走完就丢的代价是："本机推测的失败"再也没有机会被纠正 —— 对端的回执可能还在路上，
+/// 而链路回来之后的对账（`PushAsk`）也得先找得到这批。留一段宽限期，到点由
+/// `sweep_settled_batches` 收掉（跑得比这快的应用里也就几 KB）。
+const SETTLED_GRACE: Duration = Duration::from_secs(600);
 
 impl PushStore {
     pub fn new() -> Self {
@@ -306,6 +354,9 @@ impl PushStore {
             resume: super::resume::ResumeStore::new(),
             batches: Mutex::new(HashMap::new()),
             batch_of_invite: Mutex::new(HashMap::new()),
+            recent: Mutex::new(HashMap::new()),
+            asked_at: Mutex::new(HashMap::new()),
+            settled: Mutex::new(HashMap::new()),
         }
     }
 
@@ -424,6 +475,134 @@ impl PushStore {
     pub fn take_invite(&self, id: &str) -> Option<InboundInvite> {
         self.inbound.lock().remove(id)
     }
+
+    // 对账（回执丢了怎么办，见 `WsEvent::PushAsk` / `PushState`）
+    /// 记下一条入站邀请的结局。**每条只记一次**（终局），条数按 `RECENT_OUTCOMES` 淘汰最旧的。
+    pub fn record_outcome(
+        &self,
+        invite_id: &str,
+        sender_id: &str,
+        state: &'static str,
+        received: u64,
+        reason: Option<String>,
+    ) {
+        let mut recent = self.recent.lock();
+        recent.insert(
+            invite_id.to_string(),
+            RecentOutcome {
+                sender_id: sender_id.to_string(),
+                state,
+                received,
+                reason,
+                at: Instant::now(),
+            },
+        );
+        while recent.len() > RECENT_OUTCOMES {
+            let Some(oldest) = recent
+                .iter()
+                .min_by_key(|(_, o)| o.at)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            recent.remove(&oldest);
+        }
+    }
+
+    /// 对账：这条邀请（如果是**这台**设备推来的）此刻什么状态。
+    ///
+    /// 先看还拿在手里的（`inbound` 里有 = 等用户处理，或下载循环还在跑）→ `waiting`；
+    /// 再看结局记录；都没有 → `unknown`。
+    pub fn answer_invite_state(&self, invite_id: &str, sender_id: &str) -> PushInviteStateWire {
+        let held = self
+            .inbound
+            .lock()
+            .get(invite_id)
+            .is_some_and(|inv| inv.sender.id == sender_id);
+        if held {
+            return PushInviteStateWire {
+                invite_id: invite_id.to_string(),
+                state: "waiting".into(),
+                received: 0,
+                reason: None,
+            };
+        }
+        if let Some(o) = self.recent.lock().get(invite_id) {
+            if o.sender_id == sender_id {
+                return PushInviteStateWire {
+                    invite_id: invite_id.to_string(),
+                    state: o.state.into(),
+                    received: o.received,
+                    reason: o.reason.clone(),
+                };
+            }
+        }
+        PushInviteStateWire {
+            invite_id: invite_id.to_string(),
+            state: "unknown".into(),
+            received: 0,
+            reason: None,
+        }
+    }
+
+    /// 对账的闸门：这台设备现在可以问了吗（可以 = 顺带把"上次问的时刻"推到现在）。
+    /// 回执丢了就靠下一拍再问，所以这里是**节流**而不是"只问一次"。
+    pub fn ask_due(&self, peer_id: &str) -> bool {
+        let mut asked = self.asked_at.lock();
+        let due = asked
+            .get(peer_id)
+            .is_none_or(|t| t.elapsed() >= ASK_INTERVAL);
+        if due {
+            asked.insert(peer_id.to_string(), Instant::now());
+        }
+        due
+    }
+
+    /// 一批走完了：记下时刻，等宽限期到了再丢（见 `SETTLED_GRACE`）。
+    pub fn settle_batch(&self, batch_id: &str) {
+        let mut settled = self.settled.lock();
+        if settled.contains_key(batch_id) {
+            return; // 纠正之后可能又走一遍"全终态"，别把宽限期往后推
+        }
+        settled.insert(batch_id.to_string(), Instant::now());
+    }
+
+    /// 把过了宽限期的批次真丢掉（由后台那个一分钟一拍的小任务叫）。
+    pub fn sweep_settled_batches(&self) {
+        let due: Vec<String> = {
+            let settled = self.settled.lock();
+            settled
+                .iter()
+                .filter(|(_, at)| at.elapsed() >= SETTLED_GRACE)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in due {
+            self.settled.lock().remove(&id);
+            self.drop_batch(&id);
+        }
+    }
+
+    /// 这批里推给 `peer_id`、还**没落终态**的邀请号（发送方对账要问的就是它们）。
+    pub fn waiting_invites_of(&self, peer_id: &str) -> Vec<String> {
+        self.batches
+            .lock()
+            .values()
+            .flat_map(|b| b.targets.iter())
+            .filter(|t| t.peer_id == peer_id && t.state.is_waiting())
+            .map(|t| t.invite_id.clone())
+            .collect()
+    }
+
+    /// 这条邀请是哪一台的（对账答案落账前要先确认"确实是这台设备的"）。
+    pub fn target_of_invite(&self, invite_id: &str) -> Option<BatchTarget> {
+        self.batches
+            .lock()
+            .values()
+            .flat_map(|b| b.targets.iter())
+            .find(|t| t.invite_id == invite_id)
+            .cloned()
+    }
 }
 
 impl Default for PushStore {
@@ -433,6 +612,16 @@ impl Default for PushStore {
 // ---------------------------------------------------------------------------
 // Batch snapshots to the UI
 // ---------------------------------------------------------------------------
+
+/// 「终态只落一次」的**唯一例外**：本机猜的失败可以被对端更权威的终态改写。
+///
+/// 失败有两种来源：当事人明确表达的（用户取消 / 对端拒绝）与本机的**推测**（超时未响应、
+/// 邀请送不出去、对账答 `unknown` —— 三种都可能只是因为"回执丢了"或"恰好撞上对账窗口"）。
+/// 后一种一旦拿到对端的权威结局（`Done` = 收完了，`Rejected` = 它明确拒绝了）就是假账，必须改；
+/// 前一种是明确意图，改了才是错的。
+fn late_success(from: TargetState, to: TargetState) -> bool {
+    from == TargetState::Failed && matches!(to, TargetState::Done | TargetState::Rejected)
+}
 
 /// 把一批里的某台目标推进到新状态，并把**整批快照**发给界面（`push://batch`）。
 ///
@@ -464,8 +653,13 @@ pub fn batch_set(
         let Some(target) = batch.targets.iter_mut().find(|t| t.invite_id == invite_id) else {
             return;
         };
-        if target.state.is_terminal() {
+        if target.state.is_terminal() && !late_success(target.state, target_state) {
             return;
+        }
+        if late_success(target.state, target_state) {
+            // 本机判的"失败"（超时 / 送不出去）被更权威的成功回执改写了 —— 对面确实收完了，
+            // 本机之前那条是假账（回执丢了）。日志留一句，免得以后看到"失败变成功"以为是 bug。
+            info!(%invite_id, "push marked failed before, but the peer reports it completed; correcting");
         }
         target.state = target_state;
         if target_state == TargetState::Done {
@@ -484,7 +678,10 @@ pub fn batch_set(
         ws::emit_ui(state, ws::events::ui::PUSH_BATCH, &value);
     }
     if shot.waiting == 0 {
-        state.push.drop_batch(&batch_id);
+        // 整批走完：**不立刻丢**。对端的回执可能还在路上（链路回来才对得上账），而
+        // "本机推测的失败"要被纠正，就得先找得到这批 —— 留一段宽限期（`SETTLED_GRACE`），
+        // 到点由 `sweep_settled_batches` 收掉。
+        state.push.settle_batch(&batch_id);
     }
 }
 
@@ -494,16 +691,18 @@ pub fn batch_set(
 
 /// 把一条推送状态回报给发送方（进度 / 完成 / 失败）。
 ///
-/// 长连接在就直接走 WS；不在（已配对未连、未绑定）就 POST 回邀请上的 callback 地址，
-/// 请求体仍是同一个 `WsEvent` —— 两条通道说同一套协议，发送方只有一份处理代码。
+/// 长连接在就**先试它**；"塞进队列"不等于"送出去了"（`ws::send` 只写进当前会话的 mpsc，
+/// socket 写失败它并不知道），所以塞失败要**退回 HTTP**，而不是把这条回执丢掉 ——
+/// 丢了这一条，发送方那台就会在 5 分钟后把一条已经成功的传输记成失败（假账）。
+/// HTTP 那一跳是最后一道兜底：**退避重试几次**，够覆盖对端重启/瞬时抖动。
+/// 两条通道说的是同一个 `WsEvent`，发送方只有一份处理代码。
 pub fn report_to_sender(
     state: &AppState,
     peer_id: &str,
     callback: &Option<(String, u16)>,
     event: WsEvent,
 ) {
-    if state.ws.has_connection(peer_id) {
-        ws::send_to_peer(state, peer_id, event);
+    if state.ws.send(peer_id, event.clone()) {
         return;
     }
     let Some((ip, port)) = callback.clone() else {
@@ -512,9 +711,25 @@ pub fn report_to_sender(
     };
     let url = format!("{}/push/report", crate::net::peer_base(&ip, port));
     crate::task::spawn("push report", async move {
-        if let Err(e) = crate::net::client().post(&url).json(&event).send().await {
-            warn!(%url, %e, "推送回执发送失败");
+        for (attempt, delay) in [
+            Duration::ZERO,
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if !delay.is_zero() {
+                sleep(delay).await;
+            }
+            match crate::net::client().post(&url).json(&event).send().await {
+                Ok(_) => return,
+                Err(e) => warn!(%url, attempt, %e, "推送回执发送失败"),
+            }
         }
+        // 三次都没成：这条回执就真没了。发送方那边有对账（`PushAsk`）兜底 ——
+        // 链路回来时它会问一遍，接收方的结局记录会给出真实答案。
+        error!(%url, "推送回执三次都发不出去，等发送方对账");
     });
 }
 
@@ -705,6 +920,11 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
         }
 
         state.push.resume.clear(&invite_id);
+        // 结局**先**落地、再摘邀请：对账可能正好撞在这一瞬（邀请已摘、记录还没写），
+        // 那种窗口里答出去的是 `unknown`（"没送到"）——事实是"收到了"。
+        state
+            .push
+            .record_outcome(&invite_id, &peer_id, "done", total_bytes, None);
         state.push.remove_invite(&invite_id);
         report_to_sender(&state, &peer_id, &callback, WsEvent::PushDone {
             invite_id: invite_id.clone(),
@@ -731,6 +951,10 @@ fn fail_download(
     reason: String,
 ) {
     error!(%invite_id, %reason, "push download failed");
+    // 同"完成"那条：先落结局再摘邀请（对账撞在中间那一瞬不该答 `unknown`）。
+    state
+        .push
+        .record_outcome(invite_id, peer_id, "failed", 0, Some(reason.clone()));
     state.push.remove_invite(invite_id);
     report_to_sender(state, peer_id, callback, WsEvent::PushDone {
         invite_id: invite_id.to_string(),
@@ -835,5 +1059,152 @@ mod tests {
             (Some(0), Some(2), Some(1), Some(0), Some(20 * 1024 * 1024)),
             "取消的那台不算在路上：等待 2 台，进度分母也只有它俩"
         );
+    }
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+
+    fn wire(invite: &str, state: &str) -> PushInviteStateWire {
+        PushInviteStateWire {
+            invite_id: invite.into(),
+            state: state.into(),
+            received: 0,
+            reason: None,
+        }
+    }
+
+    fn invite_of(id: &str, sender: &str) -> InboundInvite {
+        InboundInvite {
+            invite_id: id.into(),
+            sender: PeerInfo { id: sender.into(), name: sender.into() },
+            name: "a.txt".into(),
+            size: 10,
+            is_dir: false,
+            count: 1,
+            files: vec![],
+            callback: None,
+            responder: None,
+        }
+    }
+
+    /// 还拿在手里的 = `waiting`（等用户处理或下载循环还在跑），处理过的报结局，
+    /// 没见过的报 `unknown` —— 发送方据此区分"还在路上"和"根本没送到"。
+    #[test]
+    fn answer_reports_held_recorded_and_unknown() {
+        let store = PushStore::new();
+        store.insert_invite(invite_of("held", "pc"));
+        store.record_outcome("done-1", "pc", "done", 1234, None);
+        store.record_outcome("failed-1", "pc", "failed", 0, Some("磁盘满了".into()));
+
+        assert_eq!(store.answer_invite_state("held", "pc").state, "waiting");
+        let done = store.answer_invite_state("done-1", "pc");
+        assert_eq!(done.state, "done");
+        assert_eq!(done.received, 1234);
+        let failed = store.answer_invite_state("failed-1", "pc");
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.reason.as_deref(), Some("磁盘满了"));
+        assert_eq!(store.answer_invite_state("nobody", "pc").state, "unknown");
+    }
+
+    /// 对端不能借别人的邀请 id 问出第三方的传输情况：发送方对不上就一律 `unknown`。
+    #[test]
+    fn answer_refuses_ids_from_another_sender() {
+        let store = PushStore::new();
+        store.insert_invite(invite_of("held", "pc"));
+        store.record_outcome("done-1", "pc", "done", 10, None);
+
+        assert_eq!(store.answer_invite_state("held", "别人").state, "unknown");
+        assert_eq!(store.answer_invite_state("done-1", "别人").state, "unknown");
+    }
+
+    /// 结局记录有界：塞满之后淘汰最旧的那条（只留"最近几分钟"就够对账用）。
+    #[test]
+    fn outcomes_are_bounded() {
+        let store = PushStore::new();
+        for i in 0..RECENT_OUTCOMES + 5 {
+            store.record_outcome(&format!("i{i}"), "pc", "done", 0, None);
+        }
+        let answered = (0..RECENT_OUTCOMES + 5)
+            .filter(|i| store.answer_invite_state(&format!("i{i}"), "pc").state == "done")
+            .count();
+        assert_eq!(answered, RECENT_OUTCOMES, "只留最后 N 条");
+    }
+
+    /// 闸门：第一次放行、紧接着第二次不放行（链路每 5 秒一拍，对账按 20 秒节流）。
+    #[test]
+    fn ask_gate_throttles() {
+        let store = PushStore::new();
+        assert!(store.ask_due("pc"));
+        assert!(!store.ask_due("pc"));
+        assert!(store.ask_due("别的设备"), "闸门是按设备算的");
+    }
+
+    /// 「终态只落一次」的唯一例外：本机**猜的**失败可以被对端的权威终态改写，
+    /// 明确意图不行。
+    #[test]
+    fn only_speculative_failures_can_be_overwritten() {
+        assert!(late_success(TargetState::Failed, TargetState::Done));
+        assert!(
+            late_success(TargetState::Failed, TargetState::Rejected),
+            "对账答 `unknown` 判的失败，随后收到对方明确的拒绝 —— 该改口"
+        );
+        for from in [
+            TargetState::Rejected,
+            TargetState::Cancelled,
+            TargetState::Done,
+            TargetState::Invited,
+            TargetState::Sending,
+        ] {
+            assert!(!late_success(from, TargetState::Done), "{from:?} 不该被改成成功");
+        }
+        assert!(!late_success(TargetState::Done, TargetState::Rejected), "成功不该变成被拒");
+        assert!(!late_success(TargetState::Failed, TargetState::Cancelled), "失败不该变成已取消");
+    }
+
+    /// 待对账的邀请：只列这台设备、还没落终态的那些。
+    #[test]
+    fn waiting_invites_filter_by_peer_and_state() {
+        let store = PushStore::new();
+        let t = |peer: &str, invite: &str, state: TargetState| BatchTarget {
+            peer_id: peer.into(),
+            peer_name: peer.into(),
+            invite_id: invite.into(),
+            paired: true,
+            state,
+            received: 0,
+            error: None,
+        };
+        store.insert_batch(PushBatch {
+            id: "b".into(),
+            name: "a.txt".into(),
+            count: 1,
+            skipped: 0,
+            per_target_total: 10,
+            targets: vec![
+                t("pc", "w1", TargetState::Invited),
+                t("pc", "w2", TargetState::Sending),
+                t("pc", "d1", TargetState::Done),
+                t("别的", "w3", TargetState::Invited),
+            ],
+            last_emit: Instant::now(),
+        });
+
+        let mut ids = store.waiting_invites_of("pc");
+        ids.sort();
+        assert_eq!(ids, vec!["w1".to_string(), "w2".to_string()]);
+        assert_eq!(store.waiting_invites_of("别的"), vec!["w3".to_string()]);
+        assert_eq!(store.target_of_invite("w3").unwrap().peer_id, "别的");
+        assert!(store.target_of_invite("没有这条").is_none());
+    }
+
+    /// `Wire` 形状是对端能读的：camelCase 字段名（`PushState` 一上线就得两端一致）。
+    #[test]
+    fn wire_shape_is_camel_case() {
+        let json = serde_json::to_value(wire("i1", "waiting")).unwrap();
+        assert_eq!(json["inviteId"], "i1");
+        assert_eq!(json["state"], "waiting");
+        assert!(json.get("reason").is_some(), "字段在（值为 null 也要在）");
     }
 }
