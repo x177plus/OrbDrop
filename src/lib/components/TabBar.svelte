@@ -1,8 +1,10 @@
 <script lang="ts">
   import type { PeerDevice, TabKey } from '$lib/types';
+  import { tick } from 'svelte';
   import { tabKeyEquals } from '$lib/types';
   import { scrollRail } from '$lib/scrollRail';
   import { unreadForPeer } from '$lib/stores/chat.svelte';
+  import { deviceDisplayName } from '$lib/stores/devices.svelte';
 
   let {
     localCount = 0,
@@ -30,8 +32,21 @@
    长连接设备一多，标签栏（`.tabs`）就横向溢出。拖动横滚 + 滚轮横滚由 `scrollRail`
    统一提供（选择框的「常用」栏用的是同一份实现，见 `$lib/scrollRail.ts`）。 */
 
-  let tabsEl: HTMLDivElement | undefined;
+  let tabsEl = $state<HTMLDivElement | undefined>();
   let peerEls: Record<string, HTMLButtonElement | undefined> = {};
+
+  /* 名字超出标签宽度就加一档右端渐隐（与悬浮框列表的 `.rq-iname` 同一套：不加省略号，
+     还看得到后面的字 —— 备注（F-101）把显示名变成「备注(设备名)」之后，一行装不下是常态）。
+     触发点两条：标签集合变（长连接进出）、某个显示名变（改了备注）；首次渲染也要量一遍。 */
+  function markClipped() {
+    for (const el of tabsEl?.querySelectorAll<HTMLElement>('.tab-name') ?? []) {
+      el.classList.toggle('is-clipped', el.scrollWidth > el.clientWidth + 0.5);
+    }
+  }
+  $effect(() => {
+    void browsers.map((d) => deviceDisplayName(d)).join('\u0000');
+    void tick().then(markClipped);
+  });
 
   /* 新设备接入：把它滚进视野。否则标签静默加在末尾、留在可视区外，
      用户根本不知道多了一台（activeTab 只在点击和对端消失时才写）。
@@ -81,12 +96,14 @@
       class:active={isActive(tab)}
       role="tab"
       aria-selected={isActive(tab)}
-      title="{device.name} · {device.ip}:{device.port} · 长连接"
+      title="{deviceDisplayName(device)} · {device.ip}:{device.port} · 长连接"
       bind:this={peerEls[device.id]}
       onclick={() => onSelect(tab)}
     >
-      <span class="dot live"></span>
-      {device.name}
+      <!-- 没有状态点：这一栏只给**长连接**设备开（`App.svelte` 的 `browsers`），
+           每一条都是绿的，一枚常量点等于没说 —— 标签在不在本身就是那一档状态。
+           全名与地址在 `title` 里，页头那颗胶囊（`PeerTab`）也写着「长连接」。 -->
+      <span class="tab-name">{deviceDisplayName(device)}</span>
       {#if unreadForPeer(device.id) > 0}
         <span class="tab-dot" title={`${unreadForPeer(device.id)} 条未读消息`}></span>
       {/if}

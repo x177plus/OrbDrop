@@ -17,8 +17,11 @@ fn main() {
     //
     // 注意：别用不带后缀的 rustc-link-arg —— 它连 app/bin 一起改，
     // /MANIFEST:EMBED 会与 tauri-build 的 .res 清单冲突（LNK1123）。
-    #[cfg(windows)]
-    {
+    // 注意：**不能用 `#[cfg(windows)]`** —— build script 是按**宿主**编译的，从 Windows 交叉
+    // 编到 Android 时它照样为真，`/DELAYLOAD:...` 与 `delayimp.lib` 会被喂给 NDK 的 clang，
+    // 报 `no such file or directory: '/DELAYLOAD:comctl32.dll'`。判目标平台只能看
+    // `CARGO_CFG_TARGET_OS`。
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         // comctl32 延迟加载：任何二进制在**加载期**都不再需要解析
         // `comctl32!TaskDialogIndirect`，测试目标因此不必额外补清单。
         // delayimp.lib 是延迟加载的辅助库（随 Windows SDK 提供）。

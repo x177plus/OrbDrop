@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, PickerFavorite, ChatSnapshot } from './types';
+import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, PickerFavorite, ChatSnapshot, InboxEntry } from './types';
 import type { ScreenMetrics, ScreenRect } from './orbLayout';
 
 // Share management
@@ -73,6 +73,20 @@ export function addPeer(ip: string, port: number): Promise<PeerDevice> {
 
 export function removePeer(peerId: string): Promise<void> {
   return invoke('remove_peer', { peerId });
+}
+
+/**
+ * 设备备注（F-101）：**只写本机配置**（`config.toml` 的 `deviceRemarks`），不发给对端、
+ * 也不改对方的设备名。空串 = 清除。返回真正存下去的值（`null` = 已清除）——超长会被
+ * 后端截断，所以界面以后端为准。
+ */
+export function setDeviceRemark(peerId: string, remark: string): Promise<string | null> {
+  return invoke('set_device_remark', { peerId, remark });
+}
+
+/** 改设备在本机显示的名字（后端只在移动端构建里注册 `rename_peer`）。 */
+export function renamePeer(peerId: string, name: string): Promise<void> {
+  return invoke('rename_peer', { peerId, name });
 }
 
 export function getPeerToken(peerId: string): Promise<string | null> {
@@ -278,7 +292,8 @@ export function groupDismiss(id: string): Promise<ChatSnapshot> {
   return invoke('group_dismiss', { id });
 }
 
-/** 退出一个群（本机从名册里去掉；已经收到的消息留在本机这份记录里）。 */
+/** 退出一个群：名册里去掉本机并把"没有本机了"的名册广播给其他成员；**本机这份记录一并删掉**
+ *  （后端 `GroupStore::leave` 会把本地的群、会话、读位都清干净；被对方移出才是"留在盘上"）。 */
 export function groupLeave(id: string): Promise<ChatSnapshot> {
   return invoke('group_leave', { id });
 }
@@ -318,6 +333,17 @@ export function downloadAndOpen(shareId: string, pathInShare: string): Promise<s
  *  路径不在了会 reject —— 调用方据此把通知留住。 */
 export function openPath(path: string): Promise<void> {
   return invoke('open_path', { path });
+}
+
+// 收件目录（移动端专属：手机上没有一个文件夹可翻，后端只在那边的构建里注册这两条）
+/** 列收件目录：本机下载的直接项 + 每个「发送方目录」里的直接项（只两层，不递归）。 */
+export function listInbox(): Promise<InboxEntry[]> {
+  return invoke('list_inbox');
+}
+
+/** 删掉收件目录里的一项**文件**（后端会挡住下载目录之外的路径与目录本身）。 */
+export function deleteInboxFile(path: string): Promise<void> {
+  return invoke('delete_inbox_file', { path });
 }
 
 // 拖拽下载（F-46）：把树里的任意文件/目录拖到资源管理器里，落在拖到的那个目录。

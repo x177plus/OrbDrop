@@ -1,16 +1,25 @@
+#[cfg(desktop)]
 pub mod autostart;
+// bc 不能门控：pair.rs / server::proxy / routes_pair.rs 这些共享协议路径也用它的
+// DAV_USER 常量与 profile 预写（后者在非 Win/mac 上因 locate_exe 返回 None 而自然空转）。
 pub mod bc;
 pub mod chat;
 pub mod config;
 pub mod credential;
 pub mod discover;
 pub mod drag;
+#[cfg(desktop)]
 pub mod fs_browse;
 pub mod group;
+#[cfg(desktop)]
 pub mod hit_region;
 pub mod log;
 pub mod mirror;
+// 移动端专属命令（收件目录列举/删除、设备重命名）：只在 Android 构建里登记。
+#[cfg(mobile)]
+pub mod mobile;
 pub mod net;
+#[cfg(desktop)]
 pub mod orb_window;
 pub mod pair;
 pub mod peer_fs;
@@ -18,6 +27,7 @@ pub mod server;
 pub mod share;
 pub mod state;
 pub mod task;
+#[cfg(desktop)]
 pub mod tray;
 pub mod transfer;
 pub mod unsendable;
@@ -27,12 +37,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State};
+#[cfg(desktop)]
+use tauri::WebviewWindow;
 use tauri_plugin_opener::OpenerExt;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use config::{AppSettings, BcTarget, DownloadMode, OrbPos, OrbShape, PeerDevice, PickerFavorite, ShareItem};
+use config::{AppSettings, DownloadMode, OrbShape, PeerDevice, ShareItem};
+#[cfg(desktop)]
+use config::{BcTarget, OrbPos, PickerFavorite};
 use state::{AppState, LinkIntent};
 
 // ---------------------------------------------------------------------------
@@ -215,6 +229,7 @@ async fn share_dto(item: &ShareItem) -> Result<ShareItemDto, String> {
 }
 
 /// 选择框「常用」列表（F-50）：用户右键目录攒出来的快捷入口，随配置持久化。
+#[cfg(desktop)]
 #[tauri::command]
 fn list_picker_favorites(state: State<'_, Arc<AppState>>) -> Vec<PickerFavorite> {
     state.config.lock().picker_favorites.clone()
@@ -222,6 +237,7 @@ fn list_picker_favorites(state: State<'_, Arc<AppState>>) -> Vec<PickerFavorite>
 
 /// 整份写回「常用」（界面给的就是它此刻显示的那份）；返回后端规整过的那份（去重后），
 /// 界面以后端为准。**写完立刻落盘**：这几条是用户手动的选择，不能在退出时才写。
+#[cfg(desktop)]
 #[tauri::command]
 fn set_picker_favorites(
     items: Vec<PickerFavorite>,
@@ -312,12 +328,17 @@ async fn update_settings(
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
 ) -> Result<AppSettings, String> {
-    let (old_port, old_name, old_autostart);
+    let (old_port, old_name);
+    #[cfg(desktop)]
+    let old_autostart;
     {
         let mut config = state.config.lock();
         old_port = config.port;
         old_name = config.device_name.clone();
-        old_autostart = config.auto_start;
+        #[cfg(desktop)]
+        {
+            old_autostart = config.auto_start;
+        }
         config.port = req.port;
         config.download_dir = PathBuf::from(&req.download_dir);
         config.download_mode = req.download_mode;
@@ -332,6 +353,7 @@ async fn update_settings(
     }
 
     // Autostart change
+    #[cfg(desktop)]
     if req.auto_start != old_autostart {
         if req.auto_start {
             let _ = autostart::enable_autostart();
@@ -385,11 +407,13 @@ async fn update_settings(
 // BeyondCompare 集成（F-41 ~ F-43）
 // ---------------------------------------------------------------------------
 
+#[cfg(desktop)]
 #[tauri::command]
 fn bc_status(state: State<'_, Arc<AppState>>) -> bc::BcStatusDto {
     bc::status(state.inner())
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 fn bc_set_side(
     side: String,
@@ -408,6 +432,7 @@ fn bc_set_side(
     Ok(bc::status(state.inner()))
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 fn bc_clear_side(
     side: String,
@@ -427,6 +452,7 @@ fn bc_clear_side(
 
 /// 用 BeyondCompare 打开两侧比较：目标是本机共享项就直接给本地路径，
 /// 是对端共享项就给 `profile:<ip:port>?<shareId>/<路径>`（顺手写好 WebDAV profile）。
+#[cfg(desktop)]
 #[tauri::command]
 fn bc_compare(
     a: BcTarget,
@@ -473,7 +499,10 @@ fn local_addresses() -> LocalAddresses {
 
 #[tauri::command]
 fn list_devices(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
-    let peers = state.peers.lock();
+    // 两份快照各自锁一次、不嵌套：设备表与配置表是两把独立的锁，嵌套着取是白送一个
+    // 死锁面（两处顺序不同就够）。设备表本身很小（一屏设备数），拷一份不值一提。
+    let peers = state.peers.lock().clone();
+    let remarks = state.config.lock().device_remarks.clone();
     peers.iter().map(|p| serde_json::json!({
         "id": p.id,
         "name": p.name,
@@ -487,7 +516,33 @@ fn list_devices(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
         // 没连着的时候"为什么"：重连中 / 等对端上线 / 已停止（对端断开过、token 失效…）。
         // 界面把它显示成人话，用户才知道该等、该点「连接」、还是该重新配对。
         "linkState": state.ws.link_state(&p.id),
+        // 本机给这台设备起的备注（F-101）：只存在本机，**不参与任何对外报文** ——
+        // 界面把它拼成显示名「备注(设备名)」（前端 `deviceDisplayName`）。
+        "remark": remarks.get(&p.id),
     })).collect()
+}
+
+/// 写一台设备的备注（F-101）。空串 / 纯空白 = 清除；返回真正存下去的值（`null` = 已清除），
+/// 界面以后端为准（超长会被截断，见 `config::REMARK_MAX_CHARS`）。
+///
+/// **纯本机动作**：不广播、不发 HTTP、不看在线状态 —— 未绑定与离线的设备照样能改备注
+/// （设备右键菜单里这一项因此不受任何状态分档影响）。写完立刻落盘并广播 `devices://changed`，
+/// 让设备行、标签栏、会话标题一起换成新显示名。
+#[tauri::command]
+fn set_device_remark(
+    peer_id: String,
+    remark: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<String>, String> {
+    let stored = {
+        let mut config = state.config.lock();
+        let stored = config.set_device_remark(&peer_id, &remark);
+        config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
+        stored
+    };
+    state.emit_devices_changed();
+    info!(peer_id, set = stored.is_some(), "device remark updated");
+    Ok(stored)
 }
 
 #[tauri::command]
@@ -502,11 +557,11 @@ async fn start_http_server(state: State<'_, Arc<AppState>>) -> Result<u16, Strin
 
 /// 本机实际在听的 HTTP 端口：被占用时服务器从配置端口往上试到 +10，所以两者可能不同
 /// （mDNS 记录里播的必须是**实际**端口，否则对端拿到一个没人听的地址）。
+///
+/// 规则只有一份（`AppState::listening_port`）—— 判"一个来源地址是不是我自己"用的
+/// 也是它，两处各算各的迟早会分叉。
 fn bound_port(state: &AppState) -> u16 {
-    match state.server_port.load(std::sync::atomic::Ordering::SeqCst) {
-        0 => state.config.lock().port,
-        p => p,
-    }
+    state.listening_port()
 }
 
 /// 本机切到「离线」后，所有**对外**动作一律挡在门口。
@@ -713,6 +768,7 @@ pub async fn unpair_peer(state: &Arc<AppState>, peer_id: &str) -> Result<(), Str
 
     // 关系没了，BC 里那条指向它的 WebDAV profile 也就没用了（token 已作废）：按当前
     // 在册设备刷新一遍 —— prune 只删我们自己写下且已失效的条目（见 `bc::prune_webdav_profiles`）。
+    #[cfg(desktop)]
     bc::provision_profiles(state);
     // 指纹也一起忘掉：这一段关系结束了，地址再被别人拿到时不该还拿着旧指纹去比对
     // （那条地址现在是"没见过的对端"，走 TOFU 重新认）。
@@ -751,6 +807,7 @@ pub fn wipe_all_credentials(state: &Arc<AppState>) -> Result<usize, String> {
         state.ws.drop_peer(id);
         state.unpair(id);
     }
+    #[cfg(desktop)]
     bc::provision_profiles(state);
     // 凭据全清了，钉住的指纹也就没有归属了：Trust 表跟着清空，地址上的对端从此按
     // "没见过的身份"重新认（那正是"清空后重新配对"该有的样子）。
@@ -1374,6 +1431,7 @@ async fn open_path(path: String, app: AppHandle) -> Result<(), String> {
 /// 拖放循环要跟着按住的主键走，所以下载只能赶在起拖之前先跑起来。
 ///
 /// **保持 async**：对端项要在后台拉元数据/内容，这活儿得在运行时上跑。
+#[cfg(desktop)]
 #[tauri::command]
 async fn prepare_drag_out(
     req: drag::DragOutRequest,
@@ -1383,6 +1441,7 @@ async fn prepare_drag_out(
 }
 
 /// 起拖：等暂存备好后在主线程跑 OLE 拖放（阻塞到用户松手）。返回时拖放已经结束。
+#[cfg(desktop)]
 #[tauri::command]
 async fn start_drag_out(
     app: AppHandle,
@@ -1421,12 +1480,14 @@ fn get_app_state(state: State<'_, Arc<AppState>>) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 /// 悬浮球所在显示器的工作区（物理像素），用于决定面板往哪边展开。
+#[cfg(desktop)]
 #[tauri::command]
 fn orb_screen_metrics(window: WebviewWindow) -> Result<orb_window::ScreenMetrics, String> {
     orb_window::metrics(&window)
 }
 
 /// 一次性移动 + 缩放悬浮球窗口（物理像素）。
+#[cfg(desktop)]
 #[tauri::command]
 fn orb_set_rect(window: WebviewWindow, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
     orb_window::set_rect(&window, orb_window::Rect { x, y, w, h })
@@ -1436,12 +1497,14 @@ fn orb_set_rect(window: WebviewWindow, x: i32, y: i32, w: i32, h: i32) -> Result
 ///
 /// 校正与起拖必须在同一次调用里完成（OS 是在起拖那一刻把窗口钉在指针上的，中间多一趟往返，
 /// 指针就又走了一段）—— 见 `orb_window::drag_start`。
+#[cfg(desktop)]
 #[tauri::command]
 fn orb_drag_start(window: WebviewWindow, press_x: f64, press_y: f64) -> Result<(), String> {
     orb_window::drag_start(&window, press_x, press_y)
 }
 
 /// 鼠标主键是否仍按着：拖动悬浮球时页面收不到 mouseup，贴边落位得靠它等松手。
+#[cfg(desktop)]
 #[tauri::command]
 fn orb_mouse_down() -> bool {
     orb_window::mouse_down()
@@ -1452,6 +1515,7 @@ fn orb_mouse_down() -> bool {
 /// 窗口比看得见的那件东西大一圈（四周是 `--shadow` 的余量），而透明像素在 Windows 上照样算
 /// 命中 —— 余量里那一下点击会被我们的窗口吃掉，压在下面的东西收不到。所以由界面报「当前该吃
 /// 指针的是哪几个盒子」，后端按指针位置开关整窗的 `WS_EX_TRANSPARENT`（见 `hit_region`）。
+#[cfg(desktop)]
 #[tauri::command]
 fn orb_set_hit_region(window: WebviewWindow, rects: Vec<hit_region::RegionRect>) -> Result<(), String> {
     hit_region::set_region(&window, rects)
@@ -1461,6 +1525,7 @@ fn orb_set_hit_region(window: WebviewWindow, rects: Vec<hit_region::RegionRect>)
 ///
 /// 由界面在**几何落定之后**调用（拖动松手 → 吸附判定跑完 → 窗口不再动），见 App.svelte
 /// `rememberOrbCenter`；松手那一刻记下的是自由落点，贴边还会再挪一次窗口。位置没变就不落盘。
+#[cfg(desktop)]
 #[tauri::command]
 fn orb_save_center(x: i32, y: i32, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let mut config = state.config.lock();
@@ -1479,6 +1544,7 @@ fn orb_save_center(x: i32, y: i32, state: State<'_, Arc<AppState>>) -> Result<()
 ///
 /// 记的是**本体中心**，窗口左上角 = 中心 − `collapsed_center_inset`（跟随形态与 DPI）。
 /// 老配置存的是窗口左上角（`orbPos`）：这里顺手换算成本体中心并落盘，迁移只做一次。
+#[cfg(desktop)]
 fn place_orb_on_startup(app: &AppHandle) {
     let Some(win) = app.get_webview_window("main") else {
         warn!("未找到 main 窗口，跳过悬浮球落位");
@@ -1546,6 +1612,7 @@ fn place_orb_on_startup(app: &AppHandle) {
 /// 236×162 —— 它由卡片 176 + 右侧分页点那 30（间距 10 + 列宽 20）+ 四周阴影/角标余量拼出来，
 /// 前端在 `src/lib/orbShape.ts` 的 `rectLayout` 里算同一个尺寸。**两处必须逐值一致**：
 /// 这里只用来定首启的默认落位与首帧尺寸，界面起来后会按自己那份重设一次。
+#[cfg(desktop)]
 fn collapsed_logical(config: &tauri::Config, shape: OrbShape) -> (f64, f64) {
     match shape {
         OrbShape::Rect => (236.0, 162.0),
@@ -1586,6 +1653,18 @@ fn setup_server_task(app: &AppHandle) {
                     let (mdns_tx, mut mdns_rx) = mpsc::channel::<discover::PeerEvent>(64);
                     let own_id = arc_state.config.lock().device_id.clone();
                     tokio::spawn(discover::scan(mdns_tx, own_id));
+
+                    // 推送批次走完之后要在宽限期到了才真丢（留给"回执还在路上 / 链路回来才对账"
+                    // 的纠正，见 `push_job::SETTLED_GRACE`）—— 这里负责到点收掉。
+                    {
+                        let sweeper = arc_state.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                                sweeper.push.sweep_settled_batches();
+                            }
+                        });
+                    }
 
                     // Forward mDNS events to the state + UI.
                     let s2 = arc_state.clone();
@@ -1690,6 +1769,7 @@ fn setup_server_task(app: &AppHandle) {
                     });
 
                     // Apply autostart per saved config.
+                    #[cfg(desktop)]
                     if arc_state.config.lock().auto_start {
                         let _ = autostart::enable_autostart();
                     }
@@ -1724,8 +1804,15 @@ fn setup_server_task(app: &AppHandle) {
     });
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
+/// 按落盘配置把应用状态建起来：读配置 → 起本机身份 → 升级凭据格式 → 建 `AppState`。
+///
+/// **两端调用时机不同**：桌面端在 `Builder` 之前调用（数据目录是普通 known folder，随手
+/// 可得）；移动端必须等 Tauri 起来之后 —— Android 上应用私有目录只有 Tauri 的平台插件
+/// 知道（`dirs` 在 Android 上没有可用实现，会一路退到应用写不进去的 `/data/local/tmp`），
+/// 见 `run()` 里 `ORBDROP_DATA_DIR` 那一段。
+fn boot_state() -> Arc<AppState> {
+    // 日志目录挂在数据目录下（`log::init_log` 内部取 `config::data_dir`），所以这一步必须
+    // 排在数据目录确定之后 —— 移动端正是这个原因把 `boot_state` 推迟到 `setup()` 里。
     log::init_log();
 
     let config = config::load_config();
@@ -1750,6 +1837,17 @@ pub fn run() {
     if let Err(e) = net::init() {
         error!("本机身份不可用（TLS 无法启用）: {e}");
     }
+    // 本机的证书指纹绝不属于任何一台对端（来源是那条把本机自己的监听端点当对端地址的路，
+    // 见 `credential::drop_own_fingerprint`）：启动时清一次，坏记录不该留到某次连线才发作。
+    match net::load_or_create_identity() {
+        // 身份都读不出来 = 上面已经报过错了，这里没什么可比的。
+        Err(_) => {}
+        Ok(identity) => match credential::drop_own_fingerprint(&identity.fingerprint) {
+            Ok(0) => {}
+            Ok(n) => info!(peers = n, "已抹掉钉在本机自己证书上的对端指纹"),
+            Err(e) => warn!("清理本机指纹的记录失败（继续按原样用）: {e}"),
+        },
+    }
 
     // P1 写出的凭据文件是"头部 + base64 正文 + 署名"的明文遮挡，P2 是裸的 id→token 映射；
     // 现在每条记录还要带对端证书指纹。老文件照样读得回来，但只在启动时改写一次
@@ -1761,7 +1859,17 @@ pub fn run() {
     }
 
     let state = Arc::new(AppState::new(config, config_path));
+    // 移动端：修掉"平台兜底"留下的下载目录与设备名（见 `mobile` 里那两个函数的说明）。
+    #[cfg(mobile)]
+    {
+        mobile::repair_download_dir(&state);
+        mobile::repair_device_name(&state);
+    }
+    state
+}
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
     let builder = tauri::Builder::default();
 
     // 单实例：第二份进程由插件负责收敛，**不能**让它自己静默退出 ——
@@ -1772,7 +1880,9 @@ pub fn run() {
     // 是联调最省事的路子（真机验证"群发"至少要三个实例：A 发给 B、C）。多开时**每份
     // 必须有自己的 `ORBDROP_DATA_DIR` 和端口**：单实例锁按应用标识符取（插件在 Windows
     // 上开的是 `{identifier}-sim` 命名互斥体），同一个 exe 天然共享它，所以只能靠这个开关。
+    #[cfg(desktop)]
     let single_instance = std::env::var_os("ORBDROP_ALLOW_MULTI").is_none();
+    #[cfg(desktop)]
     let builder = {
         if single_instance {
             builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -1790,11 +1900,16 @@ pub fn run() {
         }
     };
 
-    builder
+    let builder = builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_dialog::init())
-        .manage(state)
+        .plugin(tauri_plugin_dialog::init());
+
+    // 桌面端：数据目录随时可得，状态在这里就建好，命令与 setup 都能直接用。
+    #[cfg(desktop)]
+    let builder = builder.manage(boot_state());
+
+    builder
         .invoke_handler(tauri::generate_handler![
             add_share,
             list_shares,
@@ -1803,15 +1918,22 @@ pub fn run() {
             toggle_broadcast,
             get_settings,
             update_settings,
+            #[cfg(desktop)]
             bc_status,
+            #[cfg(desktop)]
             bc_set_side,
+            #[cfg(desktop)]
             bc_clear_side,
+            #[cfg(desktop)]
             bc_compare,
             get_actual_port,
             local_addresses,
             list_devices,
+            set_device_remark,
             add_peer,
             remove_peer,
+            #[cfg(mobile)]
+            mobile::rename_peer,
             pair_start,
             pair_confirm,
             pair_invite,
@@ -1824,9 +1946,13 @@ pub fn run() {
             connect_peer,
             disconnect_peer,
             wipe_credentials,
+            #[cfg(desktop)]
             fs_browse::fs_drives,
+            #[cfg(desktop)]
             fs_browse::fs_list,
+            #[cfg(desktop)]
             list_picker_favorites,
+            #[cfg(desktop)]
             set_picker_favorites,
             push_paths,
             cancel_push_batch,
@@ -1851,56 +1977,101 @@ pub fn run() {
             group_leave,
             download_from_peer,
             download_file,
+            #[cfg(mobile)]
+            mobile::list_inbox,
+            #[cfg(mobile)]
+            mobile::delete_inbox_file,
             download_and_open,
             open_path,
+            #[cfg(desktop)]
             prepare_drag_out,
+            #[cfg(desktop)]
             start_drag_out,
             start_http_server,
             set_online,
             get_app_state,
+            #[cfg(desktop)]
             orb_screen_metrics,
+            #[cfg(desktop)]
             orb_set_rect,
+            #[cfg(desktop)]
             orb_drag_start,
+            #[cfg(desktop)]
             orb_mouse_down,
+            #[cfg(desktop)]
             orb_set_hit_region,
+            #[cfg(desktop)]
             orb_save_center,
         ])
         .setup(|app| {
+            // 移动端：应用私有目录只有 Tauri 的平台插件知道，所以状态推迟到这里建 —— 先把
+            // 目录经 `config::data_dir` 的既有覆盖口固定下来，再走同一条 `boot_state`。
+            #[cfg(mobile)]
+            {
+                let private_dir = app.path().app_data_dir();
+                if let Ok(dir) = &private_dir {
+                    // 再落一层同名叶子：`app_data_dir` 在 Android 上是应用数据根
+                    // （`/data/user/0/<包名>`），Android 自己会在那里放 `files/`、`cache/`、
+                    // `shared_prefs/` —— 我们的 `config.toml`/`identity.pem`/`logs/` 不该跟它们
+                    // 混在一起。加这一层后与桌面 `%LOCALAPPDATA%\OrbDrop` 同构。
+                    std::env::set_var("ORBDROP_DATA_DIR", dir.join("OrbDrop"));
+                }
+                // 顺序要紧：`boot_state` 第一件事就是 `log::init_log`，所以"数据目录落在哪"
+                // 这行只能在它之后记 —— 之前记还没有 subscriber，等于白记。
+                let state = boot_state();
+                match &private_dir {
+                    Ok(dir) => info!(dir = %dir.display(), "数据目录（应用私有）"),
+                    // 拿不到不是致命错误：退到临时目录照样能跑，只是不持久。
+                    Err(e) => error!("拿不到应用私有目录，数据将落在临时目录（不持久）: {e}"),
+                }
+                app.manage(state);
+            }
+
             // Store the AppHandle so WS events can be emitted.
             let state_arc = app.state::<Arc<AppState>>();
             *state_arc.app_handle.lock() = Some(app.handle().clone());
 
             // 透明无边框窗口在 Win11 上会带一条系统绘制的 1px 边框（沿 OS 圆角露在面板外，
             // 每次改窗口尺寸重画 → 表现为窗口最外缘闪烁的线），启动时抹掉。
-            match app.get_webview_window("main") {
-                Some(win) => match orb_window::strip_os_frame(&win) {
-                    Ok(()) => info!("已抹掉系统窗口边框与系统圆角"),
-                    Err(e) => warn!("抹掉系统窗口边框失败: {e}"),
-                },
-                None => warn!("未找到 main 窗口，跳过系统边框处理"),
-            }
+            #[cfg(desktop)]
+            {
+                match app.get_webview_window("main") {
+                    Some(win) => match orb_window::strip_os_frame(&win) {
+                        Ok(()) => info!("已抹掉系统窗口边框与系统圆角"),
+                        Err(e) => warn!("抹掉系统窗口边框失败: {e}"),
+                    },
+                    None => warn!("未找到 main 窗口，跳过系统边框处理"),
+                }
 
-            // 窗口不在任务栏露面了，托盘是唯一的窗口外入口 —— 菜单得在这里就位，
-            // 晚一步（比如等前端起来再挂）用户手上就有个没有出口的进程。
-            match tray::setup(app.handle()) {
-                Ok(()) => info!("托盘菜单已就绪（右键可退出）"),
-                Err(e) => warn!("托盘菜单挂载失败: {e}"),
+                // 窗口不在任务栏露面了，托盘是唯一的窗口外入口 —— 菜单得在这里就位，
+                // 晚一步（比如等前端起来再挂）用户手上就有个没有出口的进程。
+                match tray::setup(app.handle()) {
+                    Ok(()) => info!("托盘菜单已就绪（右键可退出）"),
+                    Err(e) => warn!("托盘菜单挂载失败: {e}"),
+                }
             }
 
             // 悬浮球回到上次的位置；没有记录（首启）就放到默认落位（右上 1/3）
+            #[cfg(desktop)]
             place_orb_on_startup(app.handle());
 
             // 镜像（拖对端项走这条路）：先按龄回收上次留下的项，再把 provider 接上
             // （注册 + 连接）。失败只记日志 —— 拖放那条路会当场把原因报给用户。
-            mirror::sweep();
-            mirror::ensure_ready(state_arc.inner().clone());
+            #[cfg(desktop)]
+            {
+                mirror::sweep();
+                mirror::ensure_ready(state_arc.inner().clone());
+            }
 
             setup_server_task(app.handle());
 
             // 尽早把 BC 的 profile 文件立起来（含所有已配对设备）：
             // BC 只在启动时登记 profile 文件，晚了就得等它重启才认。
-            let written = bc::provision_profiles(&state_arc);
-            info!(written, "启动预写 BeyondCompare profile 完成");
+            #[cfg(desktop)]
+            {
+                let written = bc::provision_profiles(&state_arc);
+                info!(written, "启动预写 BeyondCompare profile 完成");
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -1909,6 +2080,7 @@ pub fn run() {
             // 退出时松开镜像连接。**注册留着**：注册一次长期存在（注销是 O(N)，实测 10,100 个
             // 占位符 1.9 s），下次启动 `mirror::ensure_ready` 只做连接；注销属于卸载路径。
             if let tauri::RunEvent::Exit = event {
+                #[cfg(desktop)]
                 mirror::shutdown();
             }
         });

@@ -421,6 +421,35 @@ pub fn has_peer(id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 抹掉"钉着的是**本机自己**那张证书"的记录。
+///
+/// 这种记录只可能来自一条已经修掉的路：把**本机自己的监听端点**当成对端地址
+/// （安卓模拟器 / NAT 后面的对端把自己看到的本机地址回连进来，见 `net::observed_dial_target`）。
+/// 那时探活会问回自己，于是把**本机的**证书指纹钉到了对端名下。它是错的，而且有害：
+/// 以后真去连那台对端时（它换了网络、或换了真机）会判成"对端换了证书"
+/// （`StopReason::IdentityChanged` →「需配对」）—— 明明是我们的记录脏了。
+///
+/// 只认"与本机指纹逐字相同"这一种，启动时做一次；正常记录一个字节都不动。
+/// 抹掉之后那枚指纹回到"没钉住"（TOFU：下一次成功连上什么就认什么）。
+pub fn drop_own_fingerprint(own: &str) -> Result<usize> {
+    if own.is_empty() {
+        return Ok(0);
+    }
+    let _guard = STORE_LOCK.lock();
+    let mut peers = read_unlocked()?;
+    let mut dropped = 0;
+    for cred in peers.values_mut() {
+        if cred.fingerprint == own {
+            cred.fingerprint.clear();
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        save_credentials(&peers)?;
+    }
+    Ok(dropped)
+}
+
 /// 清空本机全部配对凭据（F-15）—— 删掉那个文件就是全清。
 ///
 /// 返回是否真的清掉了东西（本来就没有 = `Ok(false)`，不是错误）。调用方还要清地址簿里的

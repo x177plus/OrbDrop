@@ -331,6 +331,15 @@ impl AppState {
         self.config.lock().online
     }
 
+    /// 本机实际在听的 HTTP 端口：被占用时服务器从配置端口往上试到 +10，所以两者可能不同
+    /// （mDNS 记录里播的、`/pair/info` 报的、判"来源地址是不是我自己"用的都是这一个）。
+    pub fn listening_port(&self) -> u16 {
+        match self.server_port.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => self.config.lock().port,
+            p => p,
+        }
+    }
+
     /// 记住本机「在线 / 离线」并落盘（用户意图，跨重启有效）。
     ///
     /// 只写配置：运行时的连带动作（注销 mDNS、断链、拒收入站请求）在 `lib.rs::set_online`，
@@ -959,6 +968,9 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
             // 有一台链路活着但还欠着消息（那一跳当时没写进去）：每一拍都值得再试一次。
             // 有闸门，重复叫不会叠出一条并发的补发。
             crate::chat::flush_queued(state, &p.id);
+            // 推送同理：链路活着的时候把"还没落终态的邀请"问一遍，回执丢了就靠这一拍补回来
+            // （同样有闸门 —— `PushStore::ask_due` 把同一台设备的节奏按在 20 秒）。
+            crate::transfer::reconcile(state, &p.id);
             continue;
         }
         // 手里那条 token 一起捎上：对端顺带回答"它把本机认作谁"，那是配对关系
@@ -1003,20 +1015,24 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
             continue;
         }
         let seen = match probe {
-            IdentityProbe::Seen(identity) => {
-                // 这一问走的是 TLS：连上了就把这次见到的指纹补上（老记录、或首次连上）。
-                remember_peer_fingerprint(state, &p.id, &p.ip);
-                Some(identity)
-            }
+            IdentityProbe::Seen(identity) => Some(identity),
             _ => None,
         };
         match probe_step(&p.id, seen.clone()) {
             ProbeStep::Online => {
+                // 指纹只在这一档才认：这个地址上答话的确实是**这台设备**，见到的证书
+                // 才是它的。在 `Seen` 里就钉（不管 id 对不对）会把别台设备的证书记到
+                // 这一行名下 —— 安卓模拟器那条路上，被钉住的正是**本机自己的**证书
+                // （对端自报的地址恰好是本机的监听端点），下一次真去连它就成了
+                // "指纹与钉住的不一致"。
+                remember_peer_fingerprint(state, &p.id, &p.ip);
                 state.set_peer_online(&p.id, true);
                 // 排队等它的消息：够不着常常只是暂时的（它刚起来、或上一次那一跳正好撞上它的
                 // 重启），所以**每一拍**都再叫一次 —— 不只是"离线→在线"那一次翻转。闸门在，
                 // 已经在跑的那条不会被叠第二条。
                 crate::chat::flush_queued(state, &p.id);
+                // 推送那笔账也一样补一次（同一批调用点、同一套理由）。
+                crate::transfer::reconcile(state, &p.id);
                 // 顺带确认"配对还活不活着"：本机带着 token 问过去、它答话却说"不认这枚"
                 // （`pairedAs` 为空），而本机这一行还写着已配对 —— 那就是对端把本机解除配对
                 // / 清过数据的**它亲口的证据**。标成「需配对」（与拨号 401 落到同一个状态）：

@@ -488,6 +488,43 @@ pub fn peer_ws_url(ip: &str, port: u16, token: &str, manual: bool) -> String {
     )
 }
 
+/// 观察到的一对「TCP 来源地址 + 对端自报的服务端口」能不能当**对端的拨号地址**记下来。
+/// `None` = 那对地址指的其实是本机自己，记下来只会一路错下去（见 `is_own_endpoint`）。
+pub fn observed_dial_target(
+    source: StdIpAddr,
+    reported_port: u16,
+    listening: u16,
+) -> Option<(String, u16)> {
+    if is_own_endpoint(source, reported_port, listening, &crate::server::interface_addresses()) {
+        return None;
+    }
+    Some((source.to_string(), reported_port))
+}
+
+/// 这个「来源地址 + 对端自报端口」指的其实是本机自己在听的那个端点吗？
+///
+/// 反例是安卓模拟器（以及任何把自己看到的本机地址回连进来的对端）：模拟器把宿主回环
+/// 别名 `10.0.2.2` 拍成宿主的 `127.0.0.1`，于是**本机**看到的来源地址就是本机自己，
+/// 配上对端自报的端口（默认同样是 3890）正好是本机的监听端点。把它记进地址簿是一连串
+/// 错误的起点：探活问回自己、把**本机的**证书指纹钉到对端名下、最后那一行被当成
+/// "这个地址上换了设备"作废 —— 而它此后再没有任何地址可问，设备行就永远停在「离线」，
+/// 尽管对方的长连接一直好好地在。
+///
+/// 判据必须带上端口：同机多开（`ORBDROP_ALLOW_MULTI`）时 `127.0.0.1:<另一个端口>` 是
+/// **合法**的对端地址 —— 只有"地址是本机的、端口也正好是本机在听的那个"才是自己。
+///
+/// 拆成"判据 + 取本机地址"两步是为了能单测：真实网卡列表在测试里没法摆。
+fn is_own_endpoint(
+    source: StdIpAddr,
+    reported_port: u16,
+    listening: u16,
+    local: &[StdIpAddr],
+) -> bool {
+    reported_port != 0
+        && reported_port == listening
+        && (source.is_loopback() || local.contains(&source))
+}
+
 // ---------------------------------------------------------------------------
 // 监听：一个端口上分派 TLS / 明文
 // ---------------------------------------------------------------------------
@@ -740,6 +777,29 @@ mod tests {
         assert_eq!(trust.get("10.0.0.6".parse().unwrap()), None);
         trust.unpin(ip);
         assert_eq!(trust.get(ip), None);
+    }
+
+    /// 来源地址什么时候**不能**当对端的拨号地址：它指的就是本机在听的那个端点。
+    ///
+    /// 判据里的端口是全部要害：同机多开时 `127.0.0.1:<另一个端口>` 是合法对端（联调就是
+    /// 这么用的），一刀切按"回环就不是对端"会把这条路砍掉。
+    #[test]
+    fn own_endpoint_needs_the_port_and_a_local_address() {
+        let lo: StdIpAddr = "127.0.0.1".parse().unwrap();
+        let lan: StdIpAddr = "192.168.1.5".parse().unwrap();
+        let other: StdIpAddr = "10.0.0.7".parse().unwrap();
+        let local = [lan];
+
+        // 模拟器那条路：回环 + 本机端口 = 自己。
+        assert!(is_own_endpoint(lo, 3890, 3890, &local));
+        // 同机多开：回环 + 别的端口 = 另一份实例，地址可用。
+        assert!(!is_own_endpoint(lo, 3991, 3890, &local));
+        // 本机网卡地址 + 本机端口 = 自己（NAT 把来源改写成宿主自己的地址）。
+        assert!(is_own_endpoint(lan, 3890, 3890, &local));
+        // 别人的地址：哪怕端口撞上本机的，也是别人的。
+        assert!(!is_own_endpoint(other, 3890, 3890, &local));
+        // 端口未知（对端没自报）时不判成自己，否则会把一次正常的观察扔掉。
+        assert!(!is_own_endpoint(lo, 0, 3890, &local));
     }
 
     /// 校验器：没钉过的按 TOFU 认下并记住，钉过的必须一致，换了一枚就拒。

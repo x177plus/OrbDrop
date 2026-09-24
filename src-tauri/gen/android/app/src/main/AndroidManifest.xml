@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- AndroidTV support -->
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+
+    <application
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.orbdrop"
+        android:usesCleartextTraffic="${usesCleartextTraffic}">
+        <!-- 竖屏锁定：移动端界面是竖屏布局，而设备（模拟器/平板）开机时的显示方向可能是横的 ——
+             不锁的话应用一启动就跟着横过来（`mCurrentAppOrientation=UNSPECIFIED` 就是没锁的样子）。
+             注意 `configChanges` 里的 `orientation` 仍要留着：锁的是**应用**的方向，
+             屏幕本身的方向变化（分屏、外接屏）照样得由我们自己吞下、不让 Activity 重建。
+
+             `windowSoftInputMode="adjustResize"`：**不是**让它去缩窗口（`enableEdgeToEdge()` 之后
+             窗口不缩了），而是让软键盘的 inset 派发得下来 —— 少了它 `WindowInsetsCompat.Type.ime()`
+             恒为 0，MainActivity 里那段"给 WebView 让出键盘位置"就是空转（实测：键盘弹起、
+             输入框仍被压在键盘底下）。 -->
+        <activity
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
+            android:launchMode="singleTask"
+            android:label="@string/main_activity_title"
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <!-- AndroidTV support -->
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <provider
+          android:name="androidx.core.content.FileProvider"
+          android:authorities="${applicationId}.fileprovider"
+          android:exported="false"
+          android:grantUriPermissions="true">
+          <meta-data
+            android:name="android.support.FILE_PROVIDER_PATHS"
+            android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

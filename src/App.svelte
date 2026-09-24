@@ -1,11 +1,14 @@
 <script lang="ts">
+  // 桌面端样式表从**桌面入口**引：`index.html` 是平台共用的，放在那儿的 `<link>` 会被
+  // 移动端产物一并打包（实测 `dist-mobile` 里混进过整份 67KB 桌面样式）。各端只带走自己那份。
+  import "./styles/main.css";
   import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
   import { LogicalSize } from '@tauri-apps/api/dpi';
   import { onMount, tick } from 'svelte';
   import { fly } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
   import { listen } from '@tauri-apps/api/event';
-  import { getDevices, loadDevices, isLocalOnline, noteLocalOnline } from '$lib/stores/devices.svelte';
+  import { getDevices, loadDevices, isLocalOnline, noteLocalOnline, deviceDisplayName, peerDisplayName, saveDeviceRemark } from '$lib/stores/devices.svelte';
   import { getServerPort, setServerPort, loadShares, addShare, removeShare, getShares } from '$lib/stores/shares.svelte';
   import { loadSettings, getSettings } from '$lib/stores/settings.svelte';
   import { getPeerSharesState, loadPeerShares } from '$lib/stores/peers.svelte';
@@ -26,7 +29,6 @@
   import ContextMenu from '$lib/components/ContextMenu.svelte';
   import ConvoPanel from '$lib/components/ConvoPanel.svelte';
   import RecipientDialog from '$lib/components/RecipientDialog.svelte';
-  import PeekDialog from '$lib/components/PeekDialog.svelte';
   import Hint from '$lib/components/Hint.svelte';
   import HintLayer from '$lib/components/HintLayer.svelte';
 
@@ -72,8 +74,9 @@
   // 起始值取圆球那一档（首帧时设置还没回来，形态未知）；形态一到位，下面那个改窗口尺寸的
   // `$effect` 会把偏移与热区按真实形态重设一遍（`resetOrbDom`）。
   let orbOffset = $state({ x: START.widget.x, y: START.widget.y });
-  // 悬停热区（窗口内偏移 + 尺寸，CSS px）：贴边时覆盖「露出的半颗」到「完整球」的并集，
-  // 由 CSS :hover 触发球滑出/滑回；未贴边时（以及圆角矩形悬浮框）就是悬浮体本身
+  // 悬停热区（窗口内偏移 + 尺寸，CSS px）：**收起态屏上看得见的那一条** —— 贴边时是露出那截
+  // 弧的方框 / 那条竖条，呼出阈值就是它（见 `planDock` / `planRectDock` 的 `zone`）；悬浮体滑回
+  // 完整位之后由 `collapsedHitRects` 把它并进来。未贴边时就是悬浮体本身
   let orbZone = $state<ScreenRect>({ x: START.widget.x, y: START.widget.y, w: START.widget.w, h: START.widget.h });
   // 贴边收起时两颗角标各自绕球心的转角（度）：左 = 黄（通知数）、右 = 绿（长连接设备数）。
   // 数值由贴边方向定（`spinForDock`）：同号 = 整对一起扫、一正一负 = 两条臂各自荡开（贴上）
@@ -85,6 +88,23 @@
   // `zoneHot` = 指针在热区内、且这次进入允许显示；`zoneHold` = 落位之后压住的那一次。
   let zoneHot = $state(false);
   let zoneHold = $state(false);
+  /**
+   * `.reveal` 的最终开关 = 悬停呼出 **或** 拖着东西进来。
+   *
+   * 拖入这一路必须单独接：OS 的文件拖动（OLE 拖放）走的是自己的模态循环，WebView 收到的是
+   * Tauri 转来的 `onDragDropEvent`，**收不到 pointerenter / `:hover`** —— 只认指针的那套显示逻辑
+   * 在拖动下整个是哑的。而贴边收起时屏上看得见的只有那条竖条 / 露出的那截弧，用户拖过去
+   * 什么也看不到（`.orb-stage.drag` 那圈高亮描在球与卡片上，两者此刻都在窗口外），松手却真的
+   * 会登记成共享项 —— 有结果、没预告。
+   *
+   * 于是拖入沿用**与悬停同一档显示**：悬浮体滑回完整可见 + 那圈主色高亮。语义也对得上 ——
+   * 落下 = 登记为本机共享项，落点就是悬浮体本身。
+   *
+   * 但**不展开面板**：展开要在拖动模态循环中途 `SetWindowPos`，落点目标（`IDropTarget`）在
+   * 拖动期间被搬走/改尺寸，抖动与丢目标都是自找的；而面板本身没有落点语义（窗口内任意处落下
+   * 都是同一条 `addShares`），拖放不需要它。
+   */
+  let reveal = $derived(zoneHot || dragging);
   // 折叠态贴边方向（最近一次落位判定的结果，`{0,0}` = 未贴边）。只有展开时用一次：
   // 贴边那一档的中心点多半在屏幕外（悬浮体大半被推出去了），展开要改成"窗口贴住工作区边"
   // —— 见 `expand` 里给 `planExpansion` 的 margin。
@@ -211,6 +231,18 @@
   };
   let pairState = $state<PairDialog | null>(null);
   let pairTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * 设备备注对话框（F-101）：右键设备行 →「修改备注」开的那一个。
+   *
+   * `saved` 是**打开那一刻后端里存着的备注**（'' = 没备注）：用它决定画不画「清除备注」
+   * 那颗按钮，以及保存后该说"已设置"还是"已清除"——判断依据是后端给的值，不是输入框里
+   * 用户刚敲的东西。
+   *
+   * `rawName` 是对端自己的设备名（**不含**备注）：对话框里"当前设备名"与保存后的提示都报它。
+   * 报显示名的话，改备注这件事就变成"把「客厅台式机(DESKTOP-ABC)」的备注设为「书房笔记本」"
+   * —— 一句里两半都在说备注，反而看不出改的是哪台机器。
+   */
+  let remarkState = $state<{ peerId: string; rawName: string; value: string; saved: string; busy: boolean; error: string | null } | null>(null);
   // Toast messages
   let toasts = $state<{ id: number; msg: string; leaving: boolean }[]>([]);
   let toastId = $state(0);
@@ -224,10 +256,23 @@
   // 否则会出现"收起后角标还在、但组里明明有东西"的错位。
   // **一批多设备推送算一件**：用户点一次就得到一张卡，角标自然跟着"几次操作"走。
   let notifCount = $derived(notices.length + pushBatches.length);
-  // 悬浮球左上角那颗角标：**同一组东西再加上会话未读**。未读消息也是"有事等你"，而面板收着
-  // 的时候，那颗球是唯一还看得见的提示（铃铛只数它自己那组气泡里的东西 —— 会话不进那一组，
-  // 所以铃铛角标跟着涨就会「说 3 件、点开只有 2 件」）。打开那个会话即已读，数自己就掉。
-  let orbNotifCount = $derived(notifCount + chat.unreadTotal());
+  // 会话侧"等你处理"的数：未读 + 还没确认的群邀请（见 store 里的 `convoBadgeTotal`）。
+  // 邀请卡只画在会话列表那层 —— 不计数的话面板收着时它就完全没有提示。
+  let convoBadgeCount = $derived(chat.convoBadgeTotal());
+  // 底栏「会话」那颗角标的读屏文案：未读与群邀请是两个数，合成一个数字就说不清是哪一类。
+  let convoBadgeLabel = $derived(
+    [
+      chat.unreadTotal() > 0 ? `${chat.unreadTotal()} 条未读` : '',
+      chat.pendingGroups().length > 0 ? `${chat.pendingGroups().length} 个群邀请` : '',
+    ]
+      .filter(Boolean)
+      .join('，'),
+  );
+  // 悬浮球左上角那颗角标：**同一组东西再加上会话侧那一堆**。未读消息与群邀请也是"有事等你"，
+  // 而面板收着的时候，那颗球是唯一还看得见的提示（铃铛只数它自己那组气泡里的东西 —— 会话
+  // 不进那一组，所以铃铛角标跟着涨就会「说 3 件、点开只有 2 件」）。打开那个会话即已读、
+  // 群邀请点了「加入/不加入」即消失，数自己就掉。
+  let orbNotifCount = $derived(notifCount + convoBadgeCount);
   // 通知（面板右下角那组气泡）：未绑定的邀请、正在接收、已收到待确认、失败 —— **全都在
   // 这一组里**，形状统一（右对齐、2/3 面板宽，不占满）。要当场点的按钮（接收/拒绝/取消）
   // 就长在气泡里，所以它们不单独占一层。
@@ -303,7 +348,7 @@
     const path = c.path ?? '';
     if (c.kind === 'peer') {
       if (!c.peerId) return null;
-      const dev = getDevices().find((d) => d.id === c.peerId)?.name ?? c.peerId;
+      const dev = peerDisplayName(c.peerId);
       const item = path || c.name;                                  // 树内节点用累积相对路径，共享项根用共享项名
       return { kind: 'peer', peerId: c.peerId, shareId: c.shareId, path, label: item ? `${dev} · ${item}` : dev };
     }
@@ -463,7 +508,9 @@
         return {
           id: d.id,
           kind: 'peer',
-          name: d.name,
+          // 卡片上的设备名用显示名（F-101：设了备注就是「备注(设备名)」）—— 与本机页写
+          // 「本机」同一个目的：一眼看出这是哪一台。
+          name: deviceDisplayName(d),
           ip: `${d.ip}:${d.port}`,
           loading: drill.loading ?? st.loading,
           error: drill.error ?? st.error,
@@ -543,14 +590,28 @@
    * 所以这个"收窄"只在**没有点列**时发生：`layout.body` 正是 `layout.widget` 减去那 30px
    * （圆球那一档两者相同，`rectPages` 也是空的，同一条式子照样对）。
    *
-   * **贴边收起**时用整块热区（`--zone-*` =「露出的那段 ∪ 完整悬浮体」）：悬浮体在它里面滑出去/
-   * 滑回来，区域**必须固定不动** —— 跟着悬浮体走的话，指针会被滑走的它甩到区域外，窗口当场穿透、
-   * hover 丢掉，悬浮体又滑回来，一进一出抖个不停。
+   * **贴边收起**时只吃**屏上看得见的那一条**（`--zone-*` = 露出的半颗 / 竖条）：呼出阈值就是
+   * 看得见的那点儿 —— 悬浮体收进去之后**才会**占的那一大片（圆球一整颗的方框 / 卡片整张，
+   * 见 `planDock` / `planRectDock` 的 `zone`）也算进来的话，收起态就在屏幕边上圈着一大块：
+   * 指针从旁边路过就把悬浮体呼出来，压在下面的窗口也点不着。
+   * 呼出**之后**（`reveal`：悬停，或拖着东西进来 —— 见它的说明）才把悬浮体本体那一块并进来：
+   * 那时它已经滑回完整位、指针就落在它上面 —— 不含它的话，指针一离开那一条，窗口就当场穿透、
+   * hover 丢掉，滑回来的悬浮体又收回去，一进一出抖个不停。并集里两块都不动，只有悬浮体在中间滑。
    */
   function collapsedHitRects(): ScreenRect[] {
-    if (dockAxis.x !== 0 || dockAxis.y !== 0) return [{ ...orbZone }];
-    const w = rectPages.length > 1 ? layout.widget.w : layout.body.w;
-    return [{ x: orbOffset.x, y: orbOffset.y, w, h: layout.body.h }];
+    if (dockAxis.x !== 0 || dockAxis.y !== 0) {
+      return reveal
+        ? [{ ...orbZone }, bodyRect({ x: layout.widget.x, y: layout.widget.y })]
+        : [{ ...orbZone }];
+    }
+    return [bodyRect(orbOffset)];
+  }
+
+  /** 悬浮体**本体**在窗口里占的那一块（`at` = 它在窗口内的左上角）：
+   *  未贴边时它就是可点区域，贴边呼出后是并集里的第二块（那时它停在 `--orb-inset`，
+   *  也就是 `layout.widget` 的位置）。有点列时并上右侧那 30px，见 `collapsedHitRects`。 */
+  function bodyRect(at: { x: number; y: number }): ScreenRect {
+    return { x: at.x, y: at.y, w: rectPages.length > 1 ? layout.widget.w : layout.body.w, h: layout.body.h };
   }
 
   /**
@@ -565,7 +626,8 @@
    * - 折叠期：见 `collapsedHitRects`。
    *
    * 这个 `$effect` 会在它读到的每一个状态变化时重跑（形态/偏移/贴边方向/页数/展开/右键菜单…），
-   * 所以区域是**动态**的：点列随设备增减出现或消失，那一列的可点性当场跟着变。
+   * 所以区域是**动态**的：点列随设备增减出现或消失，那一列的可点性当场跟着变；贴边那一档收起时
+   * 只报看得见的那一条，指针落上来（`zoneHot`）再当场把悬浮体本体并进来。
    */
   $effect(() => {
     const rects: ScreenRect[] = expanded || holdOrb
@@ -746,7 +808,9 @@
     });
   }
 
-  /** 悬停热区（窗口内 CSS px）；贴边方向一并定下，球还没滑出去时它就先就位了 */
+  /** 悬停热区（窗口内 CSS px）= **收起态屏上看得见的那一条**；贴边方向一并定下，球还没滑出去时
+   *  它就先就位了。注意它不是呼出之后的热区 —— 那个是它 ∪ 悬浮体本体，由 `collapsedHitRects`
+   *  按 `zoneHot` 现拼（悬浮体滑回完整位后指针落在的那块在这儿之外）。 */
   function setDockZone(plan: DockPlan, sf: number) {
     orbZone = { x: plan.zone.x / sf, y: plan.zone.y / sf, w: plan.zone.w / sf, h: plan.zone.h / sf };
   }
@@ -986,7 +1050,7 @@
       plan = rectDockPlan(free, sf, metrics.workArea);
       await orbSetRect(plan.window);
       sizedShape = orbShape;      // 窗口已归到当前形态的尺寸，改尺寸那个 `$effect` 别再跑一趟
-      setDockZone(plan, sf);      // 热区先按「竖条 ∪ 完整卡」就位（球/框还没滑出去时它就在了）
+      setDockZone(plan, sf);      // 热区先按「看得见的那条竖条」就位（卡片还没滑出去时它就在了）
       parkOrb();                  // 先按"未贴边"露面：滑出去 + 卡片渐隐交给 `revealDock`
       await rememberOrbCenter(centerOf(plan, sf));   // 收起后的落位才是悬浮框下次该出现的地方
     } else {
@@ -1015,7 +1079,6 @@
     picker = null;        // 选择框和右键菜单一样属于面板：收起即作废
     chat.setChatOpen(false);
     chat.closeRecipients();
-    chat.closePeek();
     toasts = [];          // 提示是面板上的浮层：收起即作废，别等下次展开又冒出来
     holdOrb = true;
     if (foldTimer) clearTimeout(foldTimer);
@@ -1097,7 +1160,7 @@
     const live = batchLive(b);
     const sending = b.targets.some((t) => t.state === 'sending');
     if (b.targets.length > 1) {
-      const names = b.targets.map((t) => `「${t.target}」`);
+      const names = b.targets.map((t) => `「${targetName(t)}」`);
       const head = names.length <= 2 ? names.join('') : `${names[0]}${names[1]}等 ${names.length} 台设备`;
       return `推送给${head}`;
     }
@@ -1109,10 +1172,19 @@
     return sending ? `正在发送 · ${b.name}` : '等待对方同意';
   }
 
+  /**
+   * 一批推送里一台目标的**显示名**（F-101）：快照里的 `target` 是**发起那一刻**对端自报的
+   * 设备名，本机现在若给这台设备起了备注，就该按备注显示（`peerDisplayName` 找不到这台设备时
+   * 才回落到快照里那个名字 —— 设备可能已经被移除了）。
+   */
+  function targetName(t: PushTarget): string {
+    return peerDisplayName(t.peerId, t.target);
+  }
+
   /** 悬停里的完整名单（标题只放得下两个名字）。 */
   function batchTitleFull(b: PushBatch): string {
     if (b.targets.length < 3) return '';
-    return b.targets.map((t) => t.target).join('、');
+    return b.targets.map(targetName).join('、');
   }
 
   /**
@@ -1198,7 +1270,7 @@
   function requestPushMany(devices: PeerDevice[], chatBatchId = '', groupId = '') {
     const live = devices.filter((d) => d.online);
     if (live.length === 0) {
-      toast(devices.length === 1 ? `「${devices[0].name}」不在网上，推送未发送` : '所选设备都不在网上，推送未发送');
+      toast(devices.length === 1 ? `「${deviceDisplayName(devices[0])}」不在网上，推送未发送` : '所选设备都不在网上，推送未发送');
       return;
     }
     picker = {
@@ -1211,7 +1283,7 @@
 
   /** 「A」「B」等 3 台设备 —— 与卡片标题同一个规则（设备名一律用「」框住）。 */
   function pushTargetsLabel(devices: PeerDevice[]): string {
-    const names = devices.map((d) => `「${d.name}」`);
+    const names = devices.map((d) => `「${deviceDisplayName(d)}」`);
     if (names.length === 1) return names[0];
     if (names.length === 2) return names.join('');
     return `${names[0]}${names[1]}等 ${names.length} 台设备`;
@@ -1314,7 +1386,6 @@
       void chat.refresh();
     } else {
       chat.closeRecipients();
-      chat.closePeek();
     }
   }
 
@@ -1397,6 +1468,60 @@
     const id = ctxState?.deviceId;
     hideCtx();
     if (id) openDeviceChat(id);
+  }
+
+  /**
+   * 设备菜单的「修改备注」（F-101）：开对话框，预填当前备注。
+   *
+   * **不看在线状态**（与设备行状态分档无关）：备注只写本机配置，离线/未绑定的设备也能改。
+   * 设备已经不在列表里（右键后列表刚刷新过）就说清楚，别开出一个改不到任何东西的框。
+   */
+  function ctxRemark() {
+    const id = ctxState?.deviceId;
+    hideCtx();
+    if (!id) return;
+    const device = getDevices().find((d) => d.id === id);
+    if (!device) {
+      toast('该设备已被移除');
+      return;
+    }
+    const saved = device.remark ?? '';
+    remarkState = { peerId: id, rawName: device.name, value: saved, saved, busy: false, error: null };
+  }
+
+  /** 备注输入框一挂上就聚焦并**全选**：这一栏多半是来改的，全选省一次手动清空。 */
+  function focusAndSelect(node: HTMLInputElement) {
+    node.focus();
+    node.select();
+  }
+
+  function closeRemark() {
+    remarkState = null;
+  }
+
+  /** 保存（空串即清除）：提示里说的是**这台设备**的备注改成了什么，用户得看得出改的是哪台。 */
+  async function saveRemark() {
+    const rs = remarkState;
+    if (!rs?.peerId || rs.busy) return;
+    remarkState = { ...rs, busy: true, error: null };
+    try {
+      const stored = await saveDeviceRemark(rs.peerId, rs.value);
+      closeRemark();
+      toast(stored ? `已把「${rs.rawName}」的备注设为「${stored}」` : `已清除「${rs.rawName}」的备注`);
+    } catch (e) {
+      remarkState = { ...rs, busy: false, error: String(e) };
+    }
+  }
+
+  /** 「清除备注」：只清这一条，与"把输入框留空再保存"是同一条路（后端不认识空串以外的清除）。 */
+  async function clearRemark() {
+    const rs = remarkState;
+    if (!rs?.peerId || rs.busy) return;
+    // 先把输入框置空再走保存：清空动作与"手动删光再点保存"必须落到**同一段代码**上，
+    // 否则两条路的失败处理、提示文案迟早分叉（这里不要自己点 `busy` —— `saveRemark`
+    // 进门就查它，点上等于当场把自己挡回去）。
+    remarkState = { ...rs, value: '' };
+    await saveRemark();
   }
 
   /** 会话菜单的「查看该设备文件」：切到那台设备的浏览标签。 */
@@ -1672,7 +1797,7 @@
   }
 
   function openPair(device: PeerDevice | null) {
-    if (device) { void issuePairCode(device.id, device.name); return; }
+    if (device) { void issuePairCode(device.id, deviceDisplayName(device)); return; }
     // 还没选中设备：先手动添加（F-11），探测到身份后直接进入配对
     stopPairTimer();
     pairState = {
@@ -1702,8 +1827,8 @@
     try {
       const device = await addPeer(ip, portNum);
       await loadDevices();
-      toast(`已添加设备「${device.name}」`);
-      await issuePairCode(device.id, device.name);
+      toast(`已添加设备「${peerDisplayName(device.id, device.name)}」`);
+      await issuePairCode(device.id, peerDisplayName(device.id, device.name));
     } catch (e) {
       if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
     }
@@ -2013,7 +2138,7 @@
       notices = [...notices, {
         inviteId: inv.inviteId,
         kind: inv.auto ? 'receiving' : 'invite',
-        from: inv.sender.name,
+        from: peerDisplayName(inv.sender.id, inv.sender.name),
         name: inv.name,
         size: inv.size,
         isDir: inv.isDir,
@@ -2066,7 +2191,7 @@
         if (b && b.targets.length === 1) {
           // 已绑定设备那条路上没有"对方同意"这一步，说"已同意"会让人以为对面点过。
           const t = b.targets[0];
-          toast(t.paired ? `开始向「${t.target}」传输` : `「${t.target}」已同意接收，开始传输`);
+          toast(t.paired ? `开始向「${targetName(t)}」传输` : `「${targetName(t)}」已同意接收，开始传输`);
         }
         return;
       }
@@ -2146,12 +2271,11 @@
     document.addEventListener('pointerdown', closeStatus, true);
     document.addEventListener('keydown', escStatus);
 
-    // Esc 的层级：接收方视角预览 → 收件人选择框 → 会话菜单 → 会话浮层（原型同款顺序）。
+    // Esc 的层级：收件人选择框 → 会话菜单 → 会话浮层（原型同款顺序）。
     // 会话菜单那一下必须由这里先处理：菜单自己的 Esc 监听是**后挂**的（组件随菜单挂载），
     // 它只会把菜单关掉；先一步把菜单关掉并 return，就不会连带把浮层也关了。
     const escChat = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || e.defaultPrevented) return;
-      if (chat.getPeek()) { chat.closePeek(); return; }
       if (chat.getRecipientReq()) { chat.closeRecipients(); return; }
       if (ctxState?.kind === 'chat' || ctxState?.kind === 'convo') { hideCtx(); return; }
       if (chat.isChatOpen()) chat.setChatOpen(false);
@@ -2175,7 +2299,7 @@
       }
       const ps = pairState;
       if (ps?.peerId === ev.payload.peerId) {
-        const name = ps.peerName ?? ev.payload.peerName ?? '设备';
+        const name = peerDisplayName(ev.payload.peerId, ps.peerName ?? ev.payload.peerName ?? '设备');
         closePair();
         toast(`已与「${name}」配对成功（点「连接」建立长连接）`);
       }
@@ -2189,7 +2313,7 @@
         inviteId: p.inviteId,
         kind: 'pair',
         peerId: p.peerId,
-        from: p.peerName,
+        from: peerDisplayName(p.peerId, p.peerName),
         name: '',
         size: 0,
         isDir: false,
@@ -2280,16 +2404,22 @@
   class:docked-right={rectDock === 1}
   style="--panel-slack: {PANEL_SLACK}px; --orb-inset: {layout.widget.x}px; --orb-inset-y: {layout.widget.y}px; --foot-h: {footH}px; --notif-max-h: {notifMaxH}px; --orb-x: {orbOffset.x}px; --orb-y: {orbOffset.y}px; --zone-x: {orbZone.x}px; --zone-y: {orbZone.y}px; --zone-w: {orbZone.w}px; --zone-h: {orbZone.h}px; --spin-l: {badgeSpin.left}deg; --spin-r: {badgeSpin.right}deg"
 >
-  <!-- 悬停热区：贴边收起后，指针落在热区（「露出的那段」∪「完整悬浮体」那一带）就把悬浮体
-       滑出来。圆球 = 露出的半颗 ~ 完整球；圆角矩形悬浮框 = 露出的竖条 ~ 完整卡片
-       （见 orbLayout 的 planDock / planRectDock）。
-       圆球那一档的显隐还是 CSS 的 `:hover`（滑出来的是同一颗球，指针在不在上面差别不大）；
+  <!-- 悬停热区：**只有屏上看得见的那一条**（贴边收起后 = 露出那截弧的方框 / 那条竖条，
+       见 orbLayout 的 planDock / planRectDock 的 `zone`）—— 指针落在它上面才把悬浮体呼出来。
+       呼出之后指针落在滑回完整位的悬浮体上，而悬浮体在这块 div **里面**（子元素）：指针在子元素
+       上时 `pointerleave` 不会发给这里，所以这一条 `reveal` 挂得住，`collapsedHitRects` 也据此
+       把悬浮体本体并进可点区域（不含它的话，指针一离开那一条，窗口就当场穿透、hover 丢掉，
+       悬浮体又收回去）。圆球那一档的显隐还是 CSS 的 `:hover`（滑出来的是同一颗球，指针在不在
+       上面差别不大；球滑走后指针仍压在这块 div 上，`:hover` 也不会丢）；
        圆角矩形那一档走 `.reveal`（App 按这两个指针事件维护）：贴边落位时指针本来就压在上面，
        照 `:hover` 直接显示的话"贴到边上"这一步看不到结果（`zoneHold` 压住的那一次，
-       见 `setDockOrb`）。 -->
+       见 `setDockOrb`）。
+       两个形态在**拖入**时也走 `.reveal`（`reveal` = `zoneHot || dragging`，见它的说明）：
+       OS 的文件拖动收不到任何指针事件，贴边收起时那条竖条上给不出半点预告，而松手真的会登记
+       共享项 —— 拖入因此复用悬停那一档显示（滑回完整位 + 拖入高亮），只是**不展开面板**。 -->
   <div
     class="orb-zone"
-    class:reveal={zoneHot}
+    class:reveal={reveal}
     role="presentation"
     onpointerenter={() => { if (zoneHold) return; zoneHot = true; }}
     onpointerleave={() => { zoneHot = false; zoneHold = false; }}
@@ -2381,19 +2511,20 @@
 
     <footer class="panel-foot" bind:this={footEl}>
       <span class="foot-left">
-        <!-- 会话入口：常驻、不遮挡内容（原型 `.foot-msg`）。角标 = 未读总数（与页签上那颗点
-             同一个数）——「收起 ≠ 已读」：收起浮层不清未读，只有真打开那个会话才算读过。 -->
+        <!-- 会话入口：常驻、不遮挡内容（原型 `.foot-msg`）。角标 = 会话侧待处理总数
+             （未读 + 还没确认的群邀请，与悬浮球左上角那颗同一个数）——「收起 ≠ 已读」：
+             收起浮层不清未读，只有真打开那个会话才算读过；群邀请只能靠点「加入/不加入」消掉。 -->
         <button
           class="foot-msg"
           class:open={chat.isChatOpen()}
           type="button"
-          aria-label={chat.unreadTotal() > 0 ? `会话，${chat.unreadTotal()} 条未读` : '会话'}
+          aria-label={convoBadgeLabel ? `会话，${convoBadgeLabel}` : '会话'}
           aria-expanded={chat.isChatOpen()}
           onclick={toggleChat}
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.75" y="5.25" width="16.5" height="13.5" rx="4.25"/><circle cx="8.6" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="15.4" cy="12" r="1.15" fill="currentColor" stroke="none"/></svg>
           <span>会话</span>
-          {#if chat.unreadTotal() > 0}<span class="msg-fab-badge num">{chat.unreadTotal() > 99 ? '99+' : chat.unreadTotal()}</span>{/if}
+          {#if convoBadgeCount > 0}<span class="msg-fab-badge num">{convoBadgeCount > 99 ? '99+' : convoBadgeCount}</span>{/if}
         </button>
         {#if localAddrs.primary}
           <!-- 本机内网「IP:端口」：多网卡时只显示首个，悬停列出全部（跨网段手动添加要用）；点一下整串复制。 -->
@@ -2533,13 +2664,13 @@
                   {#each visibleTargets(b) as t (t.inviteId || t.peerId)}
                     <div class="batch-row" class:bad={t.state === 'failed' || t.state === 'rejected'}>
                       <span class={targetDot(t)}></span>
-                      <span class="br-name" title={t.target}>{t.target}</span>
+                      <span class="br-name" title={targetName(t)}>{targetName(t)}</span>
                       <span class="br-state">{targetLabel(t, batchPerTarget(b))}</span>
                       {#if t.state === 'invited' || t.state === 'sending'}
                         <button
                           class="br-x"
                           onclick={() => void cancelSending(t.inviteId)}
-                          aria-label="取消推送给「{t.target}」"
+                          aria-label="取消推送给「{targetName(t)}」"
                           title="取消这一台（其余几台照常）">✕</button>
                       {/if}
                     </div>
@@ -2649,6 +2780,47 @@
       </div>
     {/if}
 
+    <!-- 设备备注（F-101）：右键设备行 →「修改备注」。备注**只写本机**
+         （`config.toml` 的 `deviceRemarks`），对端看不到、也不改对方的设备名；
+         设了备注之后，本机界面上这台设备的名字显示成「备注(设备名)」。
+         留空保存 = 清除这一条（与「清除备注」同一件事）。 -->
+    {#if remarkState}
+      <div class="overlay open" id="remarkDialog">
+        <div class="dialog">
+          <h3 class="d-head">设备备注<Hint>
+            备注是<b>你</b>给这台设备起的名字，只保存在本机（`config.toml`），
+            <span class="hl">不会发给对端</span>，也不改对方自己的设备名。
+            设好之后本机到处都用「<b>备注(设备名)</b>」显示这台设备（设备行、标签栏、会话标题、
+            收件人选择框、推送卡都算）。备注跟着<b>设备</b>走，不跟地址走 ——
+            换网段、重新配对之后它还在；留空保存即清除。
+          </Hint></h3>
+          <p class="d-desc">当前设备名：{remarkState.rawName}</p>
+          <div class="field">
+            <label for="remarkInput">备注</label>
+            <input
+              id="remarkInput"
+              class="input"
+              bind:value={remarkState.value}
+              maxlength="24"
+              placeholder="例如：客厅台式机"
+              autocomplete="off"
+              spellcheck="false"
+              use:focusAndSelect
+              onkeydown={(e) => { if (e.key === 'Enter') void saveRemark(); }}
+            />
+          </div>
+          {#if remarkState.error}<p class="d-err">{remarkState.error}</p>{/if}
+          <div class="d-acts">
+            {#if remarkState.saved}
+              <button class="btn btn-secondary" onclick={() => void clearRemark()} disabled={remarkState.busy}>清除备注</button>
+            {/if}
+            <button class="btn btn-secondary" onclick={closeRemark}>取消</button>
+            <button class="btn btn-primary" onclick={() => void saveRemark()} disabled={remarkState.busy}>保存</button>
+          </div>
+        </div>
+      </div>
+    {/if}
+
     <!-- 会话浮层（左下角展开）与收件人选择框：与设置、配对、选择框同一套层叠，都在面板里 ——
          面板收起时整块跟着消失（浮层由 `collapse()` 一起关掉）。会话记录在后端，
          这里只画；浮层内部自己管列表 ↔ 详情两屏。 -->
@@ -2663,9 +2835,6 @@
     />
     {#if chat.getRecipientReq()}
       <RecipientDialog />
-    {/if}
-    {#if chat.getPeek()}
-      <PeekDialog />
     {/if}
 
     <!-- 文件选择框：文件与文件夹在同一个框里混选、选中项跨目录累积。推送与「添加共享项」
@@ -2699,7 +2868,8 @@
     deviceState={ctxState.deviceState}
     deviceOnline={ctxState.deviceOnline}
     deviceNeedsPair={ctxState.deviceNeedsPair}
-    peerName={ctxState.peerId ? getDevices().find((d) => d.id === ctxState?.peerId)?.name : undefined}
+    deviceRemark={ctxState.deviceId ? getDevices().find((d) => d.id === ctxState?.deviceId)?.remark ?? null : null}
+    peerName={ctxState.peerId ? peerDisplayName(ctxState.peerId) : undefined}
     bcAvailable={bcMenu.available}
     bcLeftLabel={bcMenu.leftLabel}
     bcRightLabel={bcMenu.rightLabel}
@@ -2720,6 +2890,7 @@
     onDisconnect={ctxDisconnect}
     onPair={ctxPair}
     onUnpair={ctxUnpair}
+    onRemark={ctxRemark}
     onMessage={ctxMessage}
     onChatCopy={ctxChatCopy}
     onConvoFiles={ctxConvoFiles}

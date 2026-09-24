@@ -10,7 +10,7 @@
 
   --ok:      oklch(58% 0.16 158);
   --warn:    oklch(62% 0.15 60);
-  /* 「待处理」角标的橙：悬浮球/悬浮框左上那颗待处理数（通知 + 在途推送 + 会话未读）
+  /* 「待处理」角标的橙：悬浮球/悬浮框左上那颗待处理数（通知 + 在途推送 + 会话未读 + 群邀请）
      与 footer 的铃铛角标都用它。
      与 `--warn` 分开：`--warn` 是那支琥珀色，给文案/图标用；直接把它压到 22px 的圆点上
      会发闷（`color-mix(warn 82%, black)` = #975100，看着是棕的）。这一档把明度与饱和度
@@ -96,9 +96,12 @@ input { font: inherit; }
   z-index: 20;
 }
 
-/* 悬停热区：贴边收起时覆盖「露出的半颗」与「悬停后完整球」的并集（由 App.svelte 算好
-   --zone-*）。热区固定不动，只有球在它里面滑 —— 热区若跟着球动，指针会被滑走的球甩下，
-   球随即滑回又被指针压到，一进一出抖个不停。未贴边时热区就是球本身，行为与从前一致。 */
+/* 悬停热区：**只有屏上看得见的那一条**（由 App.svelte 按 `planDock` / `planRectDock` 的 `zone`
+   算好 `--zone-*`）—— 贴边收起时是露出那截弧的方框 / 那条竖条，未贴边时就是球本身。
+   **呼出阈值就是它**：悬浮体收进去之后才会占的那一大片不算热区，收起态不会在屏幕边上圈着一大块
+   把路过的指针都接住。滑回完整位之后悬浮体大半落在这块 div 之外，但它在 div **里面**（子元素）：
+   指针在子元素上时 `pointerleave` 不会发给这里，所以 `:hover` / `.reveal` 都挂得住；
+   热区若跟着悬浮体走，指针会被滑走的它甩下、它随即滑回又被指针压到，一进一出抖个不停。 */
 .orb-zone {
   position: absolute;
   left: var(--zone-x, 14px);
@@ -107,16 +110,23 @@ input { font: inherit; }
   height: var(--zone-h, 62px);
   z-index: 1;
 }
-/* 展开/切窗口期间球不可见，热区不能截走面板的点击（贴边时热区比球大） */
+/* 展开/切窗口期间球不可见，热区不能截走面板的点击（贴边时热区与球不全等） */
 .orb-stage.open .orb-zone,
 .orb-stage.hold .orb-zone { pointer-events: none; }
 
 .orb {
-  position: absolute;
-  /* 相对热区的偏移：窗口内绝对偏移（App.svelte 按悬浮球在屏幕上的位置算好）减去热区原点。
-     left/top 不依赖 CSS 视口尺寸，因此 OS 窗口移动/缩放时不会因为视口尺寸滞后 1~2 帧而被画偏。 */
-  left: calc(var(--orb-x, 14px) - var(--zone-x, 14px));
-  top: calc(var(--orb-y, 14px) - var(--zone-y, 14px));
+  /* `position: fixed` + **窗口内绝对偏移**：`left/top` 就是 `--orb-x/y`（App.svelte 按悬浮球在
+     屏幕上的位置算好），不减去热区原点。
+     为什么要 fixed 而不是按热区定位：热区（`.orb-zone`）是这块 div 的包含块，它的原点在贴边
+     落位时会跟着球一起挪（热区就是"屏上看得见的那一条"）—— 定位写成 `--orb-x - --zone-x` 的话，
+     落位那一刻两个数一起变、差值不变，`left` 的过渡就**一帧都不跑**，球是瞬移过去的（拖动松手
+     到贴边那一下，实测 14px → 189px 一帧到位）。现在 `left` 直接是球在窗口里的位置，任何一次
+     几何变化都是一次真正的位移，过渡照跑。
+     也不依赖 CSS 视口尺寸：fixed 的包含块是视口**原点**，`left/top` 写的是像素 —— OS 窗口移动/
+     缩放时不会因为视口尺寸滞后 1~2 帧而被画偏。 */
+  position: fixed;
+  left: var(--orb-x, 14px);
+  top: var(--orb-y, 14px);
   z-index: 1;
   width: 62px; height: 62px;
   border-radius: 50%;
@@ -128,10 +138,13 @@ input { font: inherit; }
   transition: left 0.22s cubic-bezier(0.2, 0.8, 0.2, 1), top 0.22s cubic-bezier(0.2, 0.8, 0.2, 1),
     transform 0.15s ease, opacity 0.15s ease, box-shadow 0.2s ease;
 }
-/* 悬停：滑回完整可见（未贴边的轴 --orb-x/y 与 --orb-inset 相同，因此原地不动） */
-.orb-zone:hover .orb {
-  left: calc(var(--orb-inset, 14px) - var(--zone-x, 14px));
-  top: calc(var(--orb-inset-y, 14px) - var(--zone-y, 14px));
+/* 悬停 / 拖入：滑回完整可见（未贴边的轴 --orb-x/y 与 --orb-inset 相同，因此原地不动）。
+   拖入（`.reveal` 由 App 的 `dragging` 打开）与悬停走同一条规则：OLE 的文件拖动收不到
+   `:hover`，只认指针的话贴边收起时拖着东西靠近悬浮球什么也看不到。 */
+.orb-zone:hover .orb,
+.orb-zone.reveal .orb {
+  left: var(--orb-inset, 14px);
+  top: var(--orb-inset-y, 14px);
 }
 /* 悬停加深一档（几何与 --shadow 同量级，球是圆的、可见半径更小，仍落在折叠态余量内） */
 .orb:hover { box-shadow: 0 6px 18px -6px oklch(18% 0.012 250 / 0.30), 0 1px 3px -1px oklch(18% 0.012 250 / 0.14); }
@@ -192,14 +205,17 @@ input { font: inherit; }
   transform: rotate(calc(-1 * var(--arm-spin, 0deg)));
   transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
-/* 悬停把球滑回完整可见时（`.orb-zone:hover .orb`），臂与角标一起转回默认位（0°）。
+/* 悬停 / 拖入把球滑回完整可见时（`.orb-zone:hover .orb` / `.orb-zone.reveal .orb`），
+   臂与角标一起转回默认位（0°）。
    贴边这一档「收进去 ↔ 沿球缘转」本来就是同一个动作的两半：球收进屏幕边时转、球滑回来时
    转回去。少了这一条，球滑回来时角标会停在贴边那一档的朝向上 —— 对着完整的球读不出因果，
    而且下一段动画（指针离开）开始时角标已经转完了，看起来就是「先转完、再收进去」。
-   转回去必须**和球的滑动同时开始**，所以它跟着同一个 `:hover` 走，时长/缓动也一致。
-   选择器多一层 `:hover`（权重更高），不靠书写顺序压过上面两条。 */
+   转回去必须**和球的滑动同时开始**，所以它跟着同一个开关走，时长/缓动也一致。
+   选择器多一层（权重更高），不靠书写顺序压过上面两条。 */
 .orb-stage .orb-zone:hover .orb-arm,
-.orb-stage .orb-zone:hover .orb-badge { transform: rotate(0deg); }
+.orb-stage .orb-zone.reveal .orb-arm,
+.orb-stage .orb-zone:hover .orb-badge,
+.orb-stage .orb-zone.reveal .orb-badge { transform: rotate(0deg); }
 .orb-stage.live .orb .pulse { border-color: var(--ok); } /* 有长连接设备时脉冲转绿，节奏不变 */
 /* 本机切到「离线」（面板右上角那个状态框）：球心 logo 转灰、脉冲整条停掉。
    离线时本机对局域网隐身、也没有长连接可扩散，脉冲这时是个假信号 —— 它声称"有东西在外面活着"。
@@ -224,17 +240,20 @@ input { font: inherit; }
    逐值取自 design/orbdrop-rect-orb.html：卡片 176×134、两列列表可视 2.5 行、名字超出时右端
    渐隐（不用省略号）、右侧分页点列、翻页 400ms 的「抽出 / 被扫过」。只换令牌与定位方式：
    原型 `:root` 上的 `--rq-*` 挪到这个组件的根上（只有它在用），定位改用 `.orb` 那套
-   `--orb-x/y` − `--zone-*`（窗口内绝对偏移，见 App.svelte）。窗口多大、悬浮框在窗口里的
+   `--orb-x/y`（窗口内绝对偏移，见 App.svelte）。窗口多大、悬浮框在窗口里的
    哪一块由 `src/lib/orbShape.ts` 算。 */
 .orb-stage .rq {
-  position: absolute;
-  left: calc(var(--orb-x, 14px) - var(--zone-x, 14px));
-  top: calc(var(--orb-y, 14px) - var(--zone-y, 14px));
+  /* 与 `.orb` 同一条：`position: fixed` + 窗口内绝对偏移（`--orb-x/y`），不减去热区原点 ——
+     热区的原点在贴边落位时会跟着悬浮框一起挪，按它定位的话 `left` 的差值不变、过渡不跑，
+     贴边那一下就是瞬移（见 `.orb` 那条注释）。 */
+  position: fixed;
+  left: var(--orb-x, 14px);
+  top: var(--orb-y, 14px);
   z-index: 1;
   display: flex; align-items: stretch; gap: 10px;   /* gap = orbShape.ts 的 RECT_DOTS_GAP */
   /* left/top 的过渡 = 贴边收起 / 悬停滑回完整位的那次横向平移（与 `.orb` 同一条缓动与时长）。
      贴边时悬浮框被推到窗口外（窗口贴住工作区边缘，于是它就是被屏幕边裁掉的那一截），
-     悬停时滑回 `--orb-inset`；两处偏移都由 App 经 `--orb-x` / `--zone-*` 给。 */
+     悬停时滑回 `--orb-inset`；两处偏移都由 App 经 `--orb-x` / `--orb-inset` 给。 */
   transition: left 0.22s cubic-bezier(0.2, 0.8, 0.2, 1), top 0.22s cubic-bezier(0.2, 0.8, 0.2, 1),
     opacity 0.15s ease;
 
@@ -487,13 +506,16 @@ input { font: inherit; }
 /* 悬停：滑回完整位。与圆球是同一条规则（`--orb-inset` 就是悬浮框在窗口内的原位）——
    贴边时它把悬浮框从窗口外拉回来，卡片这才整个落在屏内；点列那 30px 与右侧余量留在卡片右边，
    所以贴右滑回之后卡片并不贴着屏幕边（这正是点列的位置）。
+   滑回来之后卡片大半在 `.orb-zone` 那块（= 屏上看得见的那条竖条）**之外**，但它在 div 里面
+   （子元素），指针落在它上面时 `pointerleave` 不会发给 div，`.reveal` 因此挂得住 ——
+   见 App markup 里 `.orb-zone` 的注释。
    走 `.reveal` 而不是 `:hover`：落位那一刻指针本来就压在上面，照 `:hover` 显示的话
    "贴到边上"这一步看不到结果（见 `App.setDockOrb` 的 `zoneHold`）。
    两轴各用各的内缩（`--orb-inset` / `--orb-inset-y`）：圆角矩形悬浮框上下是 10、左右是 14，
    拿左右那个值去算 `top` 会让它悬停时往下跳 4px。未贴边时两者与 `--orb-x/y` 相等，是空操作。 */
 .orb-zone.reveal .rq {
-  left: calc(var(--orb-inset, 14px) - var(--zone-x, 14px));
-  top: calc(var(--orb-inset-y, 14px) - var(--zone-y, 14px));
+  left: var(--orb-inset, 14px);
+  top: var(--orb-inset-y, 14px);
 }
 /* 收起态：卡片**不再整张淡出**（露在屏内那一条就是卡片本体），只把头与列表让位给那两列；
    但收起态它不吃指针（读数不是控件），悬停滑回来才恢复可点。 */
@@ -801,7 +823,17 @@ input { font: inherit; }
   transition: color 0.15s ease;
   white-space: nowrap;
 }
-.tab.peer-tab { max-width: 132px; overflow: hidden; text-overflow: ellipsis; }
+.tab.peer-tab { max-width: 132px; }
+/* 名字那一格必须自己裁（`overflow: hidden`），右端渐隐才落在自己的盒子上 —— mask 管不到
+   溢出盒子的部分，而 `text-overflow: ellipsis` 在 inline-flex 的按钮上本来就不生效
+   （以前写在这条里的那半句一直没起作用：长名字是被硬裁的，切在半截字上）。
+   渐隐只在真超出时挂（`is-clipped`，由 TabBar 的 `clipOnOverflow` 量出来）——
+   不加这个条件的话，短名字的最后 12px 也会被淡掉。 */
+.tab.peer-tab .tab-name { min-width: 0; overflow: hidden; }
+.tab.peer-tab .tab-name.is-clipped {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 12px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 12px), transparent);
+}
 .tab::after {
   content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
   border-radius: 2px 2px 0 0;
@@ -981,10 +1013,17 @@ input { font: inherit; }
 }
 .device-row.online .d-avatar { color: var(--fg); }
 .d-main { flex: 1; min-width: 0; }
-.d-name { display: flex; align-items: center; gap: 8px; font-family: var(--font-display); font-size: var(--fs-md); font-weight: 500; letter-spacing: -0.005em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+/* 名字与状态章同在一行：**名字可以淡掉，胶囊不能** —— 容器上写 `overflow` + `text-overflow`
+   会把胶囊一起裁掉（`text-overflow` 在 flex 容器上本来也不生效，长名字是被硬切在半截字上的）。
+   所以裁切与渐隐都落在名字那一格，胶囊 `flex: none` 保住完整。 */
+.d-name { display: flex; align-items: center; gap: 8px; font-family: var(--font-display); font-size: var(--fs-md); font-weight: 500; letter-spacing: -0.005em; white-space: nowrap; min-width: 0; }
+.d-name-txt { min-width: 0; overflow: hidden; }
+.d-name-txt.is-clipped {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 12px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 12px), transparent);
+}
+.d-name .state-chip { flex: none; }
 .d-ip { margin-top: 1px; font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.auto-tag { display:none; align-items:center; gap:3px; margin-left:2px; padding:0 6px; font-size:10px; line-height:1.6; color:var(--muted); background:var(--fg-soft); border-radius:999px; white-space:nowrap; }
-.device-row[data-state="connected"] .auto-tag { display:inline-flex; }
 
 /* ─── peer browse tab（对端设备标签）───────────────────────────── */
 /* 顶部设备条：来自哪台设备 + 连接状态 + 手动刷新兜底（F-33）。 */
@@ -1059,11 +1098,14 @@ input { font: inherit; }
   border: 1px solid var(--border); color: var(--muted);
 }
 .state-chip .dot { width: 6px; height: 6px; }
-/* 胶囊的档位跟着**状态点**走（`stores/devices` 的 `deviceState`）：能送到 = 绿（`live` 长连接 /
-   `online` 已配对在线，两者的点一实心一空心，字也不同），等 = 琥珀，要重新配对 = 红，
-   送不到 = 灰虚框。以前「已配对」是蓝的 —— 蓝留给"关系"这层意思的时代过去了：
-   聊天上线后用户问的是"它现在收得到吗"，胶囊答复那个问题，关系由文案（未绑定 / 已配对）说。 */
-.state-chip.live, .state-chip.online { color: color-mix(in oklch, var(--ok) 70%, black); border-color: color-mix(in oklch, var(--ok) 38%, transparent); background: var(--ok-soft); }
+/* 胶囊的档位跟着**状态点**走（`stores/devices` 的 `deviceState`）：颜色说"链路与广播范围"，
+   形状说"有没有实时链路"。**绿只给长连接**（`live`）—— 自动广播的对象就是它，而"实心绿 vs
+   绿环"在 6px 的点上第一眼分不出来（F-21/F-25：拖入的共享项只广播给长连接设备）。
+   `online`（已配对在线，消息照样收得到）取蓝：与 `.convo-mode[data-mode="group"]` 同一套
+   （`--accent-soft` + `--accent-deep`），浅底深字、读作状态不读作按钮；等 = 琥珀、
+   要重新配对 = 红、送不到 = 灰虚框。 */
+.state-chip.live { color: color-mix(in oklch, var(--ok) 70%, black); border-color: color-mix(in oklch, var(--ok) 38%, transparent); background: var(--ok-soft); }
+.state-chip.online { color: var(--accent-deep); border-color: color-mix(in oklch, var(--accent) 38%, transparent); background: var(--accent-soft); }
 /* 未绑定、离线 = 常态：中性描边 + 灰字，不参与"告警"配色。
    未绑定是局域网设备的**默认**状态（不配对也能推送，接收方同意即可），
    把它画成告警色会让"没配对"看起来像出了问题 —— 只有"正在变化 / 需要你处理"才用暖色。 */
@@ -1219,13 +1261,19 @@ input { font: inherit; }
 .shape-opt input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
 .so-frame { position: relative; display: block; width: calc(var(--w) * var(--s)); height: calc(var(--h) * var(--s)); overflow: hidden; }
 .so-scale { position: absolute; left: calc(5px * var(--s)); top: calc(5px * var(--s)); transform: scale(var(--s)); transform-origin: 0 0; }
-/* 缩略图里剥掉两样东西：
+/* 缩略图里剥掉/掰回这几处：
    ① 收起态/切窗口那几条隐藏规则（设置面板本来就是面板开着时看的，`.orb-stage.open` 正命中）——
       写成三层选择器（0,3,0）与 `.orb-stage.open .orb` 同权重，靠写在后面取胜；
+      **顺带把位置钉回框内原点**：实物 `.orb` / `.rq` 是 `position: fixed` + `--orb-x/y`
+      （窗口坐标，见 `.orb` 那条注释），缩略图里这两个变量没有值 —— 照实物的规则它会落到视口
+      原点上、跑出框外；缩略图里它们本来就没有意义，钉死在 `.so-scale` 已经推好角标出格的左上角；
    ② 投影（`--shadow`）——在缩略图里它要占掉四周 12/7/17px 的余量才不被框裁出硬边，
       而缩略图是示意图：留边框、去投影，框才能贴着实物往外框。 */
 .shape-picker .so-scale .orb,
-.shape-picker .so-scale .rq { opacity: 1; transform: none; pointer-events: none; }
+.shape-picker .so-scale .rq {
+  opacity: 1; transform: none; pointer-events: none;
+  position: absolute; left: 0; top: 0;
+}
 .shape-picker .so-scale .orb,
 .shape-picker .so-scale .rq-card,
 .shape-picker .so-scale .rq-shellbadge { box-shadow: none; }
@@ -1486,8 +1534,8 @@ input { font: inherit; }
   pointer-events: none;
 }
 
-/* 未读那一点（原型 `.tab .tab-dot`）：长连接那个绿点说的是"链路活着"，这一点说的是
-   "有人在跟你说话"——两者同时出现时靠颜色区分（绿 = 链接，蓝 = 未读）。 */
+/* 未读那一点（原型 `.tab .tab-dot`）：有人在跟你说话。设备标签栏里只剩这一种点 ——
+   原来还有一颗绿的「链路活着」，但这一栏只给长连接设备开，那条是个常量，已经去掉。 */
 .tab .tab-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; box-shadow: 0 0 0 3px var(--accent-soft); }
 
 /* 浮层：左下角展开（原型的位置与缩放原点）。`bottom` 贴 footer 上缘 —— App 量出的
@@ -1555,17 +1603,17 @@ input { font: inherit; }
 .recip-chip .rc-name { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .recip-chip .rc-st { flex: none; width: 6px; height: 6px; border-radius: 50%; }
 
-/* ─── 设备状态点：一处判据，四处共用（颜色 = 可达性，形状 = 链路）────────────────
+/* ─── 设备状态点：一处判据，四处共用（颜色 = 链路与广播范围，形状 = 有没有实时链路）─────
    档位与 `stores/devices.svelte.ts` 的 `deviceDotState` 一一对应：
-   `live` 长连接（**只有它填实心**，并带一圈浅绿光环）/ `online` 在线但没连长连接（绿环，
-   消息照样收得到）/ `offline` 不在网上（灰环）/ `retrying` 本机在等（琥珀环）/
-   `repair` 关系失效（红环）。会话列表行、会话标题旁、收件人栏、设备行胶囊里的那颗点，
-   画的都是这一套 —— 各画一套的话，"灰"迟早又变成两种意思。 */
+   `live` 长连接（**只有它填实心**，并带一圈浅绿光环，也只有它会收到自动广播）/
+   `online` 在线但没连长连接（蓝环，消息照样收得到）/ `offline` 不在网上（灰环）/
+   `retrying` 本机在等（琥珀环）/ `repair` 关系失效（红环）。会话列表行、会话标题旁、
+   收件人栏、设备行胶囊里的那颗点，画的都是这一套 —— 各画一套的话，"灰"迟早又变成两种意思。 */
 /* 环的粗细在 6px 的点上是实测取舍：1.5px 会被浏览器取整成 1px（环太细，和实心那档几乎分不出），
    2px 留下的 2px 内孔刚好看得见"这是个环"。 */
 .dot, .convo-dot, .conv-status, .rc-st { border: 2px solid transparent; background: transparent; }
 .dot.live, .convo-dot.live, .conv-status.live, .rc-st.live { background: var(--ok); border-color: var(--ok); }
-.dot.online, .convo-dot.online, .conv-status.online, .rc-st.online { border-color: var(--ok); }
+.dot.online, .convo-dot.online, .conv-status.online, .rc-st.online { border-color: var(--accent); }
 .dot.offline, .convo-dot.offline, .conv-status.offline, .rc-st.offline { border-color: color-mix(in oklch, var(--fg) 32%, transparent); }
 .dot.retrying, .convo-dot.retrying, .conv-status.retrying, .rc-st.retrying { border-color: var(--warn); }
 .dot.repair, .convo-dot.repair, .conv-status.repair, .rc-st.repair { border-color: var(--danger); }
@@ -1708,7 +1756,7 @@ input { font: inherit; }
 .convo-mode-chip.bc { background: var(--bc-soft); color: var(--bc-deep); }
 .convo-mode-chip.group { background: var(--accent-soft); color: var(--accent-deep); }
 
-/* 群发：单向台账（"这条条都是我发出去的"）+ 逐设备送达回执 + 接收方视角入口 */
+/* 群发：单向台账（"这条条都是我发出去的"）+ 逐设备送达回执 */
 .chat-ledger { display: flex; align-items: center; gap: 8px; padding: 4px 2px 2px; }
 .chat-ledger .cl-line { flex: 1; height: 1px; background: var(--border); }
 .chat-ledger .cl-txt {
@@ -1743,14 +1791,6 @@ input { font: inherit; }
 .cr-dev.off .cr-ic { color: var(--warn); }
 /* 还在路上的那几台（HTTP 兜底那一跳没回来）：中性灰，别跟"没送到"抢注意力。 */
 .cr-dev.pending .cr-ic { color: var(--muted); }
-.cr-peek {
-  flex: none; margin-left: auto; display: inline-flex; align-items: center;
-  height: 20px; padding: 0 8px; border-radius: 999px;
-  border: 1px dashed color-mix(in oklch, var(--bc) 48%, transparent);
-  color: var(--bc-deep); font-size: var(--fs-xxs); font-weight: 600;
-  transition: background 0.15s ease, border-style 0.15s ease;
-}
-.cr-peek:hover { background: var(--bc-soft); border-style: solid; }
 
 /* 群发：输入区与发送按钮也换成模式形态（喇叭 + 信号色） */
 .chat-compose.bc .chat-input { border-color: color-mix(in oklch, var(--bc) 34%, var(--border)); }
@@ -1784,38 +1824,6 @@ input { font: inherit; }
 .field-hint { margin: 0; font-size: var(--fs-xxs); color: var(--muted); }
 .field-hint b { color: var(--fg); font-weight: 600; }
 
-/* ── 接收方视角预览：证明群发对每台设备都只是一条单独消息 ── */
-.peek-frame {
-  border: 1px solid var(--border); border-radius: var(--radius-lg);
-  background: color-mix(in oklch, var(--fg) 3%, var(--surface));
-  padding: 10px; display: grid; gap: 8px;
-}
-.peek-head { display: flex; align-items: center; gap: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
-.peek-head .d-avatar { width: 28px; height: 28px; border-radius: 9px; font-size: var(--fs-sm); }
-.peek-who { flex: 1; min-width: 0; display: grid; gap: 1px; }
-.peek-who .pk-nm { font-family: var(--font-display); font-size: var(--fs-md); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.peek-who .pk-sub { font-size: var(--fs-xxs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.peek-badge {
-  flex: none; font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.06em;
-  padding: 2px 6px; border-radius: 999px; background: var(--fg-soft); color: var(--muted);
-}
-.peek-thread { display: grid; gap: 6px; }
-.peek-msg { display: flex; flex-direction: column; align-items: flex-start; max-width: 100%; }
-.peek-bubble {
-  max-width: 88%; padding: 7px 10px; border-radius: 12px 12px 12px 4px;
-  background: color-mix(in oklch, var(--fg) 6%, transparent);
-  color: var(--fg); font-size: var(--fs-sm); line-height: 1.55; overflow-wrap: anywhere;
-}
-.peek-bubble .pb-file { display: flex; align-items: center; gap: 8px; }
-.peek-bubble .pb-file svg { width: 16px; height: 16px; flex: none; color: var(--warn); }
-.peek-bubble .pb-main { min-width: 0; display: grid; gap: 1px; }
-.peek-bubble .pb-name { display: block; font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500; }
-.peek-bubble .pb-size { display: block; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
-.peek-meta { margin-top: 3px; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
-.peek-off { font-size: var(--fs-xxs); color: color-mix(in oklch, var(--ok) 70%, black); }
-.peek-off.bad { color: color-mix(in oklch, var(--warn) 72%, black); }
-.peek-note { margin: 12px 0 0; font-size: var(--fs-xs); color: var(--muted); line-height: 1.6; }
-
 @media (prefers-reduced-motion: reduce) {
-  .orb-stage, .panel, .orb, .orb-arm, .orb-badge, .rq, .rq-card, .rq-dock, .rq-dots, .rq-dotlist, .rq-dot, .rq-shellbadge, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin, .chat-msg, .convo-pop, .foot-msg, .cf-bar i, .chat-receipt, .cr-peek, .mode-opt, .cm-act { transition: none !important; animation: none !important; }
+  .orb-stage, .panel, .orb, .orb-arm, .orb-badge, .rq, .rq-card, .rq-dock, .rq-dots, .rq-dotlist, .rq-dot, .rq-shellbadge, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin, .chat-msg, .convo-pop, .foot-msg, .cf-bar i, .chat-receipt, .mode-opt, .cm-act { transition: none !important; animation: none !important; }
 }

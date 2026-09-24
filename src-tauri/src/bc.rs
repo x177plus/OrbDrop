@@ -109,7 +109,11 @@ fn clean_path(raw: &str) -> Option<PathBuf> {
 }
 
 fn common_candidates() -> Vec<PathBuf> {
+    // 两个平台块都为空时（Android）不需要 mut：按平台分开声明，避免 unused_mut。
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let mut out = Vec::new();
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let out: Vec<PathBuf> = Vec::new();
     #[cfg(target_os = "windows")]
     {
         for var in ["ProgramFiles", "ProgramFiles(x86)"] {

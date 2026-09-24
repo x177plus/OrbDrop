@@ -958,7 +958,7 @@ font-family: var(--font-body);
   .chat-who.sp-3 .cw-av { background: var(--sp-3-deep); }
   .chat-who.sp-3 .cw-nm { color: var(--sp-3-deep); }
 
-  /* 群发：单向台账 + 逐设备送达回执 + 接收方视角入口 */
+  /* 群发：单向台账 + 逐设备送达回执 */
   .chat-ledger { display: flex; align-items: center; gap: 8px; padding: 4px 2px 2px; }
   .chat-ledger .cl-line { flex: 1; height: 1px; background: var(--border); }
   .chat-ledger .cl-txt {
@@ -991,14 +991,6 @@ font-family: var(--font-body);
   .cr-dev.off { color: var(--warn); border-color: color-mix(in oklch, var(--warn) 40%, var(--border)); }
   .cr-dev.off .cr-av { background: var(--warn); }
   .cr-dev.off .cr-ic { color: var(--warn); }
-  .cr-peek {
-    flex: none; margin-left: auto; display: inline-flex; align-items: center;
-    height: 20px; padding: 0 8px; border-radius: 999px;
-    border: 1px dashed color-mix(in oklch, var(--bc) 48%, transparent);
-    color: var(--bc-deep); font-size: var(--fs-xxs); font-weight: 600;
-    transition: background 0.15s ease, border-style 0.15s ease;
-  }
-  .cr-peek:hover { background: var(--bc-soft); border-style: solid; }
 
   /* 群发：输入区与发送按钮也换成模式形态 */
   .chat-compose.bc .chat-input { border-color: color-mix(in oklch, var(--bc) 34%, var(--border)); }
@@ -1032,42 +1024,10 @@ font-family: var(--font-body);
   .field-hint { margin: 0; font-size: var(--fs-xxs); color: var(--muted); }
   .field-hint b { color: var(--fg); font-weight: 600; }
 
-  /* 接收方视角预览：证明群发对每台设备都只是一条单独消息 */
-  .peek-frame {
-    border: 1px solid var(--border); border-radius: var(--radius-lg);
-    background: color-mix(in oklch, var(--fg) 3%, var(--surface));
-    padding: 10px; display: grid; gap: 8px;
-  }
-  .peek-head { display: flex; align-items: center; gap: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
-  .peek-head .d-avatar { width: 28px; height: 28px; border-radius: 9px; font-size: var(--fs-sm); }
-  .peek-who { flex: 1; min-width: 0; display: grid; gap: 1px; }
-  .peek-who .pk-nm { font-family: var(--font-display); font-size: var(--fs-md); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .peek-who .pk-sub { font-size: var(--fs-xxs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .peek-badge {
-    flex: none; font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.06em;
-    padding: 2px 6px; border-radius: 999px; background: var(--fg-soft); color: var(--muted);
-  }
-  .peek-thread { display: grid; gap: 6px; }
-  .peek-msg { display: flex; flex-direction: column; align-items: flex-start; max-width: 100%; }
-  .peek-bubble {
-    max-width: 88%; padding: 7px 10px; border-radius: 12px 12px 12px 4px;
-    background: color-mix(in oklch, var(--fg) 6%, transparent);
-    color: var(--fg); font-size: var(--fs-sm); line-height: 1.55; overflow-wrap: anywhere;
-  }
-  .peek-bubble .pb-file { display: flex; align-items: center; gap: 8px; }
-  .peek-bubble .pb-file svg { width: 16px; height: 16px; flex: none; color: var(--warn); }
-  .peek-bubble .pb-main { min-width: 0; display: grid; gap: 1px; }
-  .peek-bubble .pb-name { display: block; font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500; }
-  .peek-bubble .pb-size { display: block; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
-  .peek-meta { margin-top: 3px; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
-  .peek-off { font-size: var(--fs-xxs); color: color-mix(in oklch, var(--ok) 70%, black); }
-  .peek-off.bad { color: color-mix(in oklch, var(--warn) 72%, black); }
-  .peek-note { margin: 12px 0 0; font-size: var(--fs-xs); color: var(--muted); line-height: 1.6; }
-
   @media (prefers-reduced-motion: reduce) {
     .orb-stage, .panel, .orb, .toast, .ctx, .push-card, .sheet, .dialog, .tree, .chev, .p-bar i, .pulse, .overlay,
     .picker-layer, .picker, .pk-spin, .chat-msg, .ws-seg::after, .tab::after, .foot-msg, .convo-pop,
-    .mode-opt, .chat-receipt, .cr-peek, .cm-act, .peek-frame, .peek-msg { transition: none !important; animation: none !important; }
+    .mode-opt, .chat-receipt, .cm-act { transition: none !important; animation: none !important; }
     .convo-mode .cm-live i { animation: none !important; opacity: 0.85; }
   }
 </style>
@@ -1493,26 +1453,6 @@ font-family: var(--font-body);
           <div class="d-acts">
             <button class="btn btn-secondary" id="recipCancelBtn">取消</button>
             <button class="btn btn-primary" id="recipConfirmBtn" disabled>进入会话</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="overlay" id="peekDialog" data-od-id="recipient-view" role="dialog" aria-modal="true" aria-labelledby="peekTitle">
-        <div class="dialog">
-          <h3 id="peekTitle">接收方看到的样子</h3>
-          <p class="d-desc">群发是单向的：每台设备只收到一条单独的一对一消息。</p>
-          <div class="peek-frame">
-            <header class="peek-head">
-              <span class="d-avatar" id="peekAvatar">B</span>
-              <span class="peek-who"><span class="pk-nm" id="peekName">PC-B</span><span class="pk-sub" id="peekSub"></span></span>
-              <span class="peek-badge">预览</span>
-            </header>
-            <div class="peek-thread" id="peekThread"></div>
-          </div>
-          <p class="peek-note" id="peekNote"></p>
-          <div class="d-acts">
-            <button class="btn btn-secondary" id="peekNextBtn" type="button">下一台</button>
-            <button class="btn btn-primary" id="peekCloseBtn" type="button">知道了</button>
           </div>
         </div>
       </div>
@@ -2985,7 +2925,7 @@ font-family: var(--font-body);
     });
     return { total: ids.length, delivered: delivered, offline: ids.length - delivered, states: states };
   }
-  /* 群发回执：逐设备状态，并可打开接收方视角预览 */
+  /* 群发回执：逐设备状态 */
   function receiptEl(key, m) {
     var box = document.createElement('div');
     box.className = 'chat-receipt';
@@ -3007,12 +2947,6 @@ font-family: var(--font-body);
       list.appendChild(chip);
     });
     box.appendChild(list);
-    var peek = document.createElement('button');
-    peek.type = 'button';
-    peek.className = 'cr-peek';
-    peek.textContent = '查看收件效果';
-    peek.addEventListener('click', function () { openPeek(key, m, 0); });
-    box.appendChild(peek);
     return box;
   }
   function chatMsgEl(m, opts) {
@@ -3656,68 +3590,6 @@ font-family: var(--font-body);
       : '已进入与「' + devNameById(ids[0]) + '」的会话');
   }
 
-  /* ── 接收方视角预览：每台设备只看到一条单独的一对一消息 ───── */
-  var peekDialog = $('#peekDialog');
-  var peekKey = null, peekMsg = null, peekIndex = 0;
-  function openPeek(key, m, index) {
-    peekKey = key;
-    peekMsg = m;
-    peekIndex = index || 0;
-    renderPeek();
-    peekDialog.classList.add('open');
-    $('#peekCloseBtn').focus();
-  }
-  function closePeek() { peekDialog.classList.remove('open'); peekKey = null; peekMsg = null; }
-  function myDeviceName() {
-    var el = $('#deviceName');
-    return (el && el.value.trim()) || '本机';
-  }
-  function renderPeek() {
-    var ids = convoParticipants(peekKey);
-    if (!ids.length || !peekMsg) return;
-    if (peekIndex >= ids.length) peekIndex = 0;
-    var id = ids[peekIndex];
-    var row = devById(id);
-    $('#peekAvatar').textContent = row ? devAvatarOf(row) : '?';
-    $('#peekName').textContent = row ? devName(row) : id;
-    $('#peekSub').textContent = '单独会话 · 来自 ' + myDeviceName();
-    var st = (peekMsg.receipt && peekMsg.receipt.states && peekMsg.receipt.states[id]) || 'off';
-    var thread = $('#peekThread');
-    thread.innerHTML = '';
-    var msg = document.createElement('div');
-    msg.className = 'peek-msg';
-    var bubble = document.createElement('div');
-    bubble.className = 'peek-bubble';
-    if (peekMsg.kind === 'file') {
-      bubble.innerHTML = '<span class="pb-file">' + CHAT_FILE_ICO + '</span><span class="pb-main"><span class="pb-name"></span><span class="pb-size"></span></span>';
-      bubble.querySelector('.pb-name').textContent = peekMsg.name;
-      bubble.querySelector('.pb-size').textContent = peekMsg.size || '文件';
-    } else {
-      bubble.textContent = peekMsg.text;
-    }
-    msg.appendChild(bubble);
-    var meta = document.createElement('div');
-    meta.className = 'peek-meta';
-    meta.textContent = peekMsg.t;
-    msg.appendChild(meta);
-    thread.appendChild(msg);
-    var off = document.createElement('div');
-    off.className = 'peek-off' + (st === 'ok' ? '' : ' bad');
-    off.textContent = st === 'ok' ? '该设备当时在线，已收到这条消息' : '该设备当时离线，这条消息未送达';
-    thread.appendChild(off);
-    $('#peekNote').textContent = '对方只看到这一条单独的一对一消息；群发中的其他收件人，以及你发出的其他内容，都不会出现在这里。';
-    var next = $('#peekNextBtn');
-    next.disabled = ids.length <= 1;
-    next.textContent = ids.length > 1 ? '下一台（' + (peekIndex + 1) + '/' + ids.length + '）' : '只有这一台';
-  }
-  $('#peekCloseBtn').addEventListener('click', closePeek);
-  $('#peekNextBtn').addEventListener('click', function () {
-    var n = convoParticipants(peekKey).length;
-    if (n < 2) return;
-    peekIndex = (peekIndex + 1) % n;
-    renderPeek();
-  });
-  peekDialog.addEventListener('click', function (e) { if (e.target === peekDialog) closePeek(); });
 
   function chatPush(m) {
     var key = chat.openKey;
@@ -3907,7 +3779,6 @@ font-family: var(--font-body);
   });
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape' || e.defaultPrevented) return;
-    if (peekDialog.classList.contains('open')) { closePeek(); return; }
     if (recipDialog.classList.contains('open')) { closeRecipientDialog(); return; }
     if (tabsMenu.classList.contains('show')) { hideTabsMenu(); return; }
     if (chatCtx.classList.contains('show')) { hideChatCtx(); return; }

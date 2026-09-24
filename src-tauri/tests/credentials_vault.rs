@@ -57,6 +57,9 @@ fn peer(id: &str, ip: &str, port: u16) -> PeerDevice {
 
 /// 一键清空：vault 文件、地址簿里的配对行、以及本机写进 BC 的 WebDAV profile 一起清；
 /// 用户**自己**在 BC 里建的 profile 一个都不能动（判定依据只有 `Username`）。
+///
+/// 前半段还走一遍**启动时的脏记录清理**（`credential::drop_own_fingerprint`）：钉在本机
+/// 自己那张证书上的对端指纹是错记录（来源见那个函数的说明），要抹掉，其余记录一个字不动。
 #[test]
 fn wipe_clears_vault_address_book_and_our_bc_profiles_only() {
     let data_dir = temp_dir("data");
@@ -81,6 +84,36 @@ fn wipe_clears_vault_address_book_and_our_bc_profiles_only() {
     .collect();
     credential::save_credentials(&seeded).unwrap();
     assert!(credential::vault_path().is_file());
+
+    // —— 启动时的脏记录清理：只有"指纹 = 本机自己"的那条被抹掉 ——
+    let own = "f".repeat(64);
+    credential::set_peer_credential("device-dirty", "tok-dirty", &own).unwrap();
+    assert_eq!(
+        credential::drop_own_fingerprint(&own).unwrap(),
+        1,
+        "本机指纹那条要被认出来"
+    );
+    assert_eq!(
+        credential::get_peer_fingerprint("device-dirty").unwrap(),
+        None,
+        "抹掉 = 回到「还没钉住」（下一次成功连线按 TOFU 重新认）"
+    );
+    assert_eq!(
+        credential::get_peer_token("device-dirty").unwrap().as_deref(),
+        Some("tok-dirty"),
+        "清的是指纹那一项，token（这段关系本身）不动"
+    );
+    assert_eq!(
+        credential::get_peer_fingerprint("device-a").unwrap(),
+        Some("a".repeat(64)),
+        "别人的指纹一个字节都不许动"
+    );
+    assert_eq!(
+        credential::drop_own_fingerprint(&own).unwrap(),
+        0,
+        "清过之后再跑一次不该有东西可清（启动每次都会调）"
+    );
+    credential::remove_peer("device-dirty").unwrap();
 
     // 状态与 profile 写入必须是**同一个** BC 目录，否则 prune 剪的不是这一份。
     let bc_exe = hermetic_bc_exe();

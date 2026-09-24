@@ -499,7 +499,6 @@ body {
 .rc-dev.ok .rc-ic { color: var(--ok); }
 .rc-dev.off { opacity: .62; }
 .rc-dev.off .rc-ic { color: var(--muted); }
-.rc-peek { justify-self: start; padding: 3px 0; font-size: 11px; font-weight: 620; color: var(--accent-deep); }
 
 .compose { flex: none; display: flex; align-items: center; gap: 8px; padding: 10px 12px; background: var(--bg); border-top: 1px solid var(--border); }
 .cbtn { flex: none; width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; transition: background .15s ease, transform .08s ease; }
@@ -710,16 +709,6 @@ body {
 .code-box { display: grid; gap: 8px; justify-items: center; padding: 16px; border-radius: 15px; background: var(--accent-soft); }
 .code { font-family: var(--font-mono); font-size: 40px; font-weight: 700; letter-spacing: .14em; color: var(--accent-deep); }
 .code-hint { font-size: var(--fs-xs); color: var(--accent-deep); opacity: .85; }
-
-.peek-thread { display: grid; gap: 8px; justify-items: start; padding: 14px; border-radius: 15px; background: var(--surface-2); }
-.peek-bubble {
-  max-width: 100%; padding: 9px 12px; border-radius: 16px; border-bottom-left-radius: 6px;
-  background: var(--surface); border: 1px solid var(--border);
-  font-size: var(--fs-md); line-height: 1.55; overflow-wrap: anywhere; user-select: text;
-}
-.peek-off { font-size: var(--fs-xs); font-weight: 560; color: color-mix(in oklch, var(--ok) 74%, black); }
-.peek-off.bad { color: var(--muted); }
-.peek-note { margin: 0; font-size: var(--fs-xs); color: var(--muted); line-height: 1.6; }
 
 /* ─────────────────────────── toasts ─────────────────────────── */
 .toasts { position: absolute; left: 0; right: 0; bottom: 92px; z-index: 30; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 0 24px; pointer-events: none; }
@@ -1290,8 +1279,7 @@ body {
         '<span class="rc-ic">' + ic(st === 'ok' ? 'check' : 'x') + '</span></span>';
     }).join('');
     return '<div class="receipt"><span class="rc-head">已送达 ' + r.delivered + '/' + r.total + ' 台' + (r.offline ? ' · ' + r.offline + ' 台离线' : '') + '</span>' +
-      '<span class="rc-list">' + chips + '</span>' +
-      '<button class="rc-peek" type="button" data-act="peek" data-key="' + esc(key) + '">查看收件效果</button></div>';
+      '<span class="rc-list">' + chips + '</span></div>';
   }
   function msgHTML(m, key) {
     var mode = modeOf(key);
@@ -1791,37 +1779,7 @@ function openDeviceActions(id) {
     });
     focusFirst(sheetLayer);
   }
-  function openPeek(key) {
-    var ids = partOf(key);
-    if (!ids.length) return;
-    var idx = 0;
-    function build() {
-      var id = ids[idx], d = dev(id);
-      var m = lastVisible(key) || msgs(key)[0];
-      var r = receiptOf(key);
-      var st = r.states[id] || 'off';
-      var bubble = m && m.kind === 'file'
-        ? '<span class="fbub"><span class="fio">' + ic('file') + '</span><span class="fmain"><span class="fname">' + esc(m.name) + '</span><span class="fsize num">' + esc(m.size || '文件') + '</span></span></span>'
-        : esc(m ? m.text : '');
-      sheetLayer.innerHTML = '<div class="sheet" role="dialog" aria-modal="true" aria-label="收件方视角"><div class="sheet-grip"></div>' +
-        '<div class="sheet-head"><div class="sht"><h3 class="sheet-title">' + esc(d ? d.name : id) + '</h3>' +
-        '<p class="sheet-desc">收件方视角 · 每台设备只看到单独的一对一消息</p></div>' +
-        '<button class="icon-btn" type="button" data-act="closeSheet" aria-label="关闭">' + ic('x') + '</button></div>' +
-        '<div class="sheet-body">' +
-          '<div class="peek-thread"><div class="peek-bubble">' + bubble + '</div>' +
-          '<span class="peek-off' + (st === 'ok' ? '' : ' bad') + '">' + (st === 'ok' ? '该设备当时在线，已收到这条消息' : '该设备当时离线，这条消息未送达') + '</span></div>' +
-          '<p class="peek-note">对方只看到这一条单独的一对一消息；群发中的其他收件人以及你发出的其他内容都不会出现在这里。</p>' +
-          '<div class="sheet-foot"><button class="btn btn-secondary" type="button" id="peekNext"' + (ids.length < 2 ? ' disabled' : '') + '>' +
-          (ids.length > 1 ? '下一台（' + (idx + 1) + '/' + ids.length + '）' : '只有这一台') + '</button>' +
-          '<button class="btn btn-primary" type="button" data-act="closeSheet">知道了</button></div>' +
-        '</div></div>';
-      showSheetLayer();
-      var nx = document.getElementById('peekNext');
-      if (nx) nx.addEventListener('click', function () { idx = (idx + 1) % ids.length; build(); });
-      focusFirst(sheetLayer);
-    }
-    build();
-  }
+
   function openChatActions(key) {
     var isThread = modeOf(key) !== 'direct';
     sheetLayer.innerHTML = '<div class="sheet" role="dialog" aria-modal="true" aria-label="会话操作"><div class="sheet-grip"></div>' +
@@ -1947,7 +1905,6 @@ function openDeviceActions(id) {
         break;
       }
       case 'closeSheet': closeSheet(); break;
-      case 'peek': openPeek(key); break;
       default: break;
     }
   }

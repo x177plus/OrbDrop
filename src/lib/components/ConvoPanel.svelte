@@ -233,6 +233,32 @@
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M7 12h10" /></svg>
 {/snippet}
 
+<!-- 群邀请卡：**只画在会话侧**（列表头顶 + 会话详情顶部），不进右下角那组通知气泡 ——
+     那组东西是"没有落点、有期限"的（推送/配对邀请 60s 自动作废），而这张卡没有期限、处理完
+     的落点就是它将要成为的那条会话。两处都渲染同一份（snippet），一处滚走另一处还在。 -->
+{#snippet inviteStrip(inhead: boolean)}
+  <div class="invite-strip" class:inhead={inhead} aria-label="群聊邀请">
+    {#each chat.pendingGroups() as pg (pg.id)}
+      {@const wait = pg.buffered > 0 ? ` · 已有 ${pg.buffered} 条消息在等你` : ''}
+      <div class="invite-card">
+        <div class="ic-row">
+          <span class="f-icon">{@render icGrp()}</span>
+          <span class="ic-main">
+            <span class="ic-name">「{pg.fromName}」邀请你加入群聊「{pg.name.trim() || '未命名群聊'}」</span>
+            <!-- 攒着几条是后端数的（`orphans`）：不说的话，用户不点「加入」就永远不知道
+                 里面已经有东西在等他了。 -->
+            <span class="ic-size">其他 {pg.members.length} 台设备{wait}</span>
+          </span>
+        </div>
+        <div class="ic-acts">
+          <button class="btn btn-secondary btn-sm" type="button" onclick={() => answerInvite(pg, false)}>不加入</button>
+          <button class="btn btn-primary btn-sm" type="button" onclick={() => answerInvite(pg, true)}>加入</button>
+        </div>
+      </div>
+    {/each}
+  </div>
+{/snippet}
+
 <!-- 浮层常驻 DOM（`inert` 关掉交互）：收起 / 展开那一下得靠 `class:open` 触发过渡，
      要是按需挂载，挂上时就已经是终态，缩放那一动画就没了。 -->
 <section
@@ -255,25 +281,11 @@
     </header>
 
     <!-- 群邀请：**收到但还没确认**的群就到这儿为止（用户没点「加入」就不算群，不占会话列表
-         一行）。卡长在列表头顶、不跟着列表滚：邀请是"等你处理"的东西，滚走就等于没看见。 -->
+         一行）。卡长在列表头顶、不跟着列表滚：邀请是"等你处理"的东西，滚走就等于没看见。
+         详情里也有一份（见下面 `.conv-headgroup` 里那颗 `inviteStrip(true)`）：两处都看得见，
+         点进哪条会话都不会让它离开视野。 -->
     {#if chat.pendingGroups().length > 0}
-      <div class="invite-strip" aria-label="群聊邀请">
-        {#each chat.pendingGroups() as pg (pg.id)}
-          <div class="invite-card">
-            <div class="ic-row">
-              <span class="f-icon">{@render icGrp()}</span>
-              <span class="ic-main">
-                <span class="ic-name">「{pg.fromName}」邀请你加入群聊「{pg.name.trim() || '未命名群聊'}」</span>
-                <span class="ic-size">其他 {pg.members.length} 台设备</span>
-              </span>
-            </div>
-            <div class="ic-acts">
-              <button class="btn btn-secondary btn-sm" type="button" onclick={() => answerInvite(pg, false)}>不加入</button>
-              <button class="btn btn-primary btn-sm" type="button" onclick={() => answerInvite(pg, true)}>加入</button>
-            </div>
-          </div>
-        {/each}
-      </div>
+      {@render inviteStrip(false)}
     {/if}
 
     <div class="convo-list" aria-label="会话列表">
@@ -356,6 +368,12 @@
               {thread.mode === 'broadcast' ? '编辑群发' : '编辑群聊'}
             </button>
           </div>
+        {/if}
+
+        <!-- 群邀请的"头"：它跟模式条同一层（不随消息流滚），因为待处理的邀请不该因为
+             "我正在读别的会话"而消失 —— 列表那份看不到的时候，就是它在顶着。 -->
+        {#if chat.pendingGroups().length > 0}
+          {@render inviteStrip(true)}
         {/if}
       </div>
 
@@ -499,8 +517,7 @@
               {/if}
               <div class="chat-meta">{metaOf(item)}</div>
 
-              <!-- 群发：这条当时发给了谁、每台走到哪一步（逐台读副本的送达状态，不按当前名单猜），
-                   外加一颗「查看收件效果」—— 看对方那边到底收到了什么。 -->
+              <!-- 群发：这条当时发给了谁、每台走到哪一步（逐台读副本的送达状态，不按当前名单猜）。 -->
               {#if thread.mode === 'broadcast' && item.fromMe}
                 {@const per = chat.perDeviceOf(item)}
                 {@const receipt = chat.receiptOf(item)}
@@ -521,7 +538,6 @@
                         </span>
                       {/each}
                     </span>
-                    <button class="cr-peek" type="button" onclick={() => chat.openPeek(thread.key, item.id)}>查看收件效果</button>
                   </div>
                 {/if}
               {/if}
@@ -602,6 +618,8 @@
   /* 群邀请卡长在列表头顶：`.invite-card`（全局）自带边框与底色，这里只补它需要的落位与
      内边距 —— 贴着浮层左右边缘会长得像个横幅。 */
   .invite-strip { flex: none; display: grid; gap: 8px; padding: 10px 12px 0; }
+  /* 详情里那一份（`.conv-headgroup` 内）：下面是收件人栏，补掉底边距，别两张卡贴在一起。 */
+  .invite-strip.inhead { padding-bottom: 10px; }
 
   /* 群聊的发言人行：只在换人说话时插一行（头像字 + 名字）。三种语义色按设备 id 哈希取，
      用的是本机主色 / 成功色 / 群发暖色（`--accent` / `--ok` / `--bc`）—— 与"这是谁"无关，

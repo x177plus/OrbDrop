@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::credential;
+use crate::net;
 use crate::pair;
 use crate::state::AppState;
 use crate::ws;
@@ -34,9 +35,8 @@ pub async fn pair_info(
         .and_then(|h| h.strip_prefix("Bearer "))
         .and_then(|t| crate::ws::session::peer_id_from_token(&state, t));
 
-    let listening = state.server_port.load(std::sync::atomic::Ordering::SeqCst);
+    let port = state.listening_port();
     let config = state.config.lock();
-    let port = if listening == 0 { config.port } else { listening };
     serde_json::json!({
         "id": config.device_id,
         "name": config.device_name,
@@ -141,21 +141,27 @@ pub async fn pair_handshake(
     // the address the link could only ever be dialled from a later discovery.
     let known = state.get_peer(&peer_id);
     let source = addr.ip();
-    let ip = if source.is_ipv4() {
-        source.to_string()
-    } else {
-        known.as_ref().map(|p| p.ip.clone()).unwrap_or_default()
-    };
-    let name = req
-        .peer_name
-        .clone()
-        .or_else(|| known.as_ref().map(|p| p.name.clone()))
-        .unwrap_or_else(|| peer_id.clone());
     let port = req
         .peer_port
         .filter(|p| *p != 0)
         .or_else(|| known.as_ref().map(|p| p.port).filter(|p| *p != 0))
         .unwrap_or(0);
+    let name = req
+        .peer_name
+        .clone()
+        .or_else(|| known.as_ref().map(|p| p.name.clone()))
+        .unwrap_or_else(|| peer_id.clone());
+    // 来源地址只有在"不是本机自己的监听端点"时才是一次可用的观察（见
+    // `net::observed_dial_target`）：模拟器/NAT 后面的对端会把自己看到的本机地址回连
+    // 进来，那一对记下来就是本机自己 —— 那种情况退回本机原先知道的地址（多半是空）。
+    let ip = if source.is_ipv4() {
+        match net::observed_dial_target(source, port, state.listening_port()) {
+            Some((ip, _)) => ip,
+            None => known.as_ref().map(|p| p.ip.clone()).unwrap_or_default(),
+        }
+    } else {
+        known.as_ref().map(|p| p.ip.clone()).unwrap_or_default()
+    };
 
     // 落库这一步与邀请那条路共用（写凭据 + 写地址簿 + 预写 BC profile + 广播事件）。
     let grant = pair::mint_grant(&state);
@@ -249,12 +255,18 @@ pub async fn pair_invite_handler(
     }
 
     let invite_id = req.invite_id.clone();
-    // 地址只信 TCP 来源：邀请体里的地址谁都能填。
+    // 地址只信 TCP 来源：邀请体里的地址谁都能填。**但本机自己的监听端点不能当对端地址**
+    // —— 安卓模拟器那类 NAT 后面的对端回连进来时，来源地址在**本机**这一侧就是本机自己
+    // （见 `net::observed_dial_target`）：记下来会让探活问回自己、把本机的证书钉到对端
+    // 名下，最后那一行被当成"这里换了设备"作废，设备行就永远停在「离线」。
+    // 地址要么成对记、要么一对都不记（`("", 0)` 是本仓库里"没有地址"的唯一写法）。
+    let (ip, port) =
+        net::observed_dial_target(addr.ip(), req.port, state.listening_port()).unwrap_or_default();
     let peer = pair::PairedPeer {
         id: req.peer_id.clone(),
         name: req.peer_name.clone(),
-        ip: addr.ip().to_string(),
-        port: req.port,
+        ip,
+        port,
     };
     info!(%invite_id, peer = %req.peer_name, paired, "inbound pair invite (http)");
     crate::ws::emit_ui(&state, ui::PAIR_INVITE, &serde_json::json!({

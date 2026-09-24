@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -300,6 +301,16 @@ pub struct Config {
     /// 显式打开，默认关（需求文档里那两条非目标也随之改写）。
     #[serde(default)]
     pub group_relay: bool,
+    /// 设备备注（F-101）：`设备 id → 备注`，**只存在本机**。
+    ///
+    /// 键是**对端自己的设备 id**（`PeerDevice::id`，与配对凭据、共享项广播寻址同一套），
+    /// 不是 IP —— 换网段、DHCP 换地址之后备注要跟着那台设备，不能跟着地址走。
+    ///
+    /// 单独一张表、而不是塞进 `peers` 条目：备注是**本机的看法**，不是那台设备的事实 ——
+    /// 解除配对（条目重建成"未绑定"）、重新配对（换 token）都不该把它抹掉；也不会随设备名
+    /// 广播出去（对端看到的始终是它自己的名字，见 `lib.rs::list_devices`）。
+    #[serde(default)]
+    pub device_remarks: HashMap<String, String>,
 }
 
 fn default_port() -> u16 {
@@ -362,7 +373,26 @@ impl Config {
         self.picker_favorites = kept.clone();
         kept
     }
+
+    /// 写一台设备的备注（F-101）：**空串 / 纯空白 = 清除这一条**（不留空字符串，免得配置里
+    /// 堆一地 `""`）；返回真正存下去的值（`None` = 已清除），让界面以后端为准。
+    ///
+    /// 超过 `REMARK_MAX_CHARS` 个字就截断：这是给人看的短标签（它会被拼进设备名里显示），
+    /// 不是自由文本 —— 一屏 20 台设备的名字里塞进一句 200 字的话，界面先垮。
+    pub fn set_device_remark(&mut self, peer_id: &str, remark: &str) -> Option<String> {
+        let remark = remark.trim();
+        if remark.is_empty() {
+            self.device_remarks.remove(peer_id);
+            return None;
+        }
+        let remark: String = remark.chars().take(REMARK_MAX_CHARS).collect();
+        self.device_remarks.insert(peer_id.to_string(), remark.clone());
+        Some(remark)
+    }
 }
+
+/// 备注最长多少个字（按**字符**数，不是字节：中文一个字算一个）。
+pub const REMARK_MAX_CHARS: usize = 24;
 
 impl Default for Config {
     fn default() -> Self {
@@ -385,6 +415,7 @@ impl Default for Config {
             online: true,
             auto_broadcast_new: false,
             group_relay: false,
+            device_remarks: HashMap::new(),
         }
     }
 }
@@ -430,21 +461,154 @@ pub fn config_file_path() -> PathBuf {
     data_dir().join("config.toml")
 }
 
-fn default_download_dir() -> PathBuf {
+pub(crate) fn default_download_dir() -> PathBuf {
+    // Android 上没有"桌面"这个概念：`dirs::desktop_dir()` 返回 None，而下面 Windows 那句
+    // 兜底会写出一个真机上根本不存在的路径 —— 接收推送时就会在那儿建目录并当场失败。
+    // 移动端一律落在应用私有的收件目录里；用户可见的外部目录（SAF）是 F-86 的后续需求。
+    #[cfg(mobile)]
+    {
+        return data_dir().join("received");
+    }
+    #[cfg(not(mobile))]
     dirs::desktop_dir().unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\Desktop"))
 }
 
-fn default_device_name() -> String {
+pub(crate) fn default_device_name() -> String {
+    #[cfg(target_os = "android")]
+    {
+        // 手机上既没有 `COMPUTERNAME` 也没有 `HOSTNAME`：早先那条非 Windows 兜底会让
+        // **每台安卓设备都叫 "OrbDrop-Mac"**（同一个局域网里两台手机还会重名）。默认名
+        // 从系统属性里挑一个"给人看的名字"（见 `pick_android_device_name`），一条都取不到
+        // 才退平台兜底。
+        return pick_android_device_name(android_property)
+            .unwrap_or_else(|| "OrbDrop-Android".into());
+    }
     #[cfg(target_os = "windows")]
     {
         std::env::var("COMPUTERNAME").unwrap_or_else(|_| "OrbDrop-PC".into())
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "android", target_os = "windows")))]
     {
         std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("HOST"))
             .unwrap_or_else(|_| "OrbDrop-Mac".into())
     }
+}
+
+/// 厂商放出来的"市场名"属性，按可信度从高到低排。
+///
+/// 为什么非要这些键：`ro.product.model` 在国行 ROM 上多是**型号代码** —— 小米 `24129PN74C`、
+/// vivo `V2502A`、三星 `SM-S928B`，一屏设备名里谁也认不出这是哪台机器；用户要的是
+/// `Xiaomi 15 Pro` / `vivo X300` 这种一眼认得出的名字，而它只在厂商自己放的那条属性里：
+///
+/// - 小米 / 红米（HyperOS、MIUI）：`ro.product.marketname`，分区的变体（`odm` / `vendor` /
+///   `system` / `product` / `bootimage`）各有机器在用；
+/// - OPPO / OnePlus / realme（ColorOS）：`ro.vendor.oplus.market.name`；
+/// - vivo / iQOO：`ro.vivo.market.name`。
+///
+/// 这些键**厂商私有、没有文档保证**，某个 ROM 上不存在很正常 —— 属性不存在时
+/// `__system_property_get` 返回 0（一次进程内的属性表查表，没有代价），所以整串探一遍划算。
+/// 三星、华为这类不放市场名的机器就落回"品牌 + 型号"（见 `pick_android_device_name`）。
+const ANDROID_MARKET_NAME_KEYS: [&str; 8] = [
+    "ro.product.marketname",
+    "ro.product.odm.marketname",
+    "ro.product.vendor.marketname",
+    "ro.product.system.marketname",
+    "ro.product.product.marketname",
+    "ro.product.bootimage.marketname",
+    "ro.vendor.oplus.market.name",
+    "ro.vivo.market.name",
+];
+
+/// 从一串系统属性里挑一个设备名；`None` = 一条可用属性都没有（调用方去用平台兜底）。
+///
+/// 顺序：**厂商市场名 → 品牌 + 型号 → 型号 → 品牌 → 厂商**。第二档是给"只有型号代码"的机器
+/// 兜的：`V2502A` 认不出是谁，`vivo V2502A` 至少认得出牌子。型号本身已经像个人话
+/// （`Pixel 7`、`Xiaomi 15`）或已经以品牌开头时不再叠品牌 —— 否则会长成 `Xiaomi Xiaomi 15`。
+///
+/// **刻意不 `#[cfg(target_os = "android")]`**：它只跟"属性表"打交道（拿的是闭包），
+/// 桌面测试塞一份假表就能把挑选规则钉死 —— 真机上的属性值在 CI 里造不出来。
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn pick_android_device_name(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    if let Some(market) = ANDROID_MARKET_NAME_KEYS.iter().find_map(|key| usable_property(get(key))) {
+        return Some(market);
+    }
+    let brand = usable_property(get("ro.product.brand"));
+    if let Some(model) = usable_property(get("ro.product.model")) {
+        // 只有"看起来是串代码"的型号才要品牌陪着（没有空格＝不是一句人话）。
+        let prefix = brand.filter(|b| !model.contains(' ') && !starts_with_ignore_case(&model, b));
+        return Some(match prefix {
+            Some(b) => format!("{b} {model}"),
+            None => model,
+        });
+    }
+    brand.or_else(|| usable_property(get("ro.product.manufacturer")))
+}
+
+/// 属性值算不算一个能用的名字：空串、纯空白、以及 ROM 上常见的占位值 `unknown` 都不算。
+fn usable_property(value: Option<String>) -> Option<String> {
+    let value = value?.trim().to_string();
+    (!value.is_empty() && !value.eq_ignore_ascii_case("unknown")).then_some(value)
+}
+
+fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
+    text.to_lowercase().starts_with(&prefix.to_lowercase())
+}
+
+/// 配置里存着的这个设备名，该不该被 `fixed`（现在能取到的好名字）换掉。
+///
+/// 只认**我们自己自动取名时落下的值**：平台兜底串（`OrbDrop-Mac`），或这台机器自己的
+/// 型号 / 品牌。判据是**逐字节相等** —— 用户手打的名字恰好等于其中之一的概率极低，而真撞上了
+/// 也只是"名字变回这台设备真正的型号"，方向是对的；反之（把用户起的名改掉）才是错的，
+/// 所以宁可漏改也不误改。
+#[cfg_attr(not(mobile), allow(dead_code))]
+pub(crate) fn should_replace_auto_name(current: &str, fixed: &str) -> bool {
+    current != fixed && auto_picked_names().iter().any(|n| n == current)
+}
+
+/// 早先的自动命名可能落下的值。安卓上还要算上型号与品牌本身（那时默认名就是 `ro.product.model`，
+/// 国行机器于是存着 `V2502A` 这种谁也认不出的串）。
+#[cfg_attr(not(mobile), allow(dead_code))]
+fn auto_picked_names() -> Vec<String> {
+    #[allow(unused_mut)]
+    let mut names = vec!["OrbDrop-Mac".to_string()];
+    #[cfg(target_os = "android")]
+    {
+        names.extend(
+            ["ro.product.model", "ro.product.brand"]
+                .iter()
+                .filter_map(|k| android_property(k)),
+        );
+    }
+    names
+}
+
+/// 读一条 Android 系统属性（`ro.product.model` 这类）。
+///
+/// 走 **bionic 的 `__system_property_get`**，不走 JNI：属性服务对普通应用可读、不需要
+/// 任何权限，也不需要在启动早期把 JavaVM 拿到手（`default_device_name` 是在配置默认值
+/// 那一刻调的，那时 JNI 环境未必就绪）。返回值的长度就是写入的字节数，0 = 这条属性
+/// 不存在或读不到。
+#[cfg(target_os = "android")]
+fn android_property(name: &str) -> Option<String> {
+    use std::ffi::{CStr, CString};
+    use std::os::raw::{c_char, c_int};
+
+    extern "C" {
+        fn __system_property_get(name: *const c_char, value: *mut c_char) -> c_int;
+    }
+
+    // bionic 的 `PROP_VALUE_MAX` 是 92（值最长 91 字节 + NUL）。缓冲区给宽一点：
+    // 这个函数只往里写"值 + NUL"，不比 `PROP_VALUE_MAX` 多写一个字节。
+    const BUF: usize = 128;
+    let name = CString::new(name).ok()?;
+    let mut buf = [0 as c_char; BUF];
+    let len = unsafe { __system_property_get(name.as_ptr(), buf.as_mut_ptr()) };
+    if len <= 0 {
+        return None;
+    }
+    let value = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().ok()?.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -832,6 +996,7 @@ mod tests {
                 PickerFavorite { name: "桌面".into(), path: "C:/Users/t/Desktop".into() },
                 PickerFavorite { name: "项目".into(), path: "D:/项目".into() },
             ],
+            device_remarks: HashMap::from([("peer-1".to_string(), "客厅台式机".to_string())]),
             shares: vec![ShareItem {
                 id: "share-1".into(),
                 name: "Projects".into(),
@@ -899,6 +1064,11 @@ mod tests {
         assert_eq!(
             loaded.auto_broadcast_new, true,
             "「添加后自动共享」要跨重启保留（开着就一直开着）"
+        );
+        assert_eq!(
+            loaded.device_remarks.get("peer-1").map(String::as_str),
+            Some("客厅台式机"),
+            "设备备注要跨重启保留（F-101：只在本机，重启后还在）"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1095,5 +1265,134 @@ mod tests {
         assert_eq!(p5.file_name().unwrap(), "README (1)");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 设备备注（F-101）：默认空、跨重启保留、空串即清除、超长截断。
+    ///
+    /// 前两条是**用户数据**的底线：老配置（没有这一节）解析出来必须是空表（不是解析失败 ——
+    /// 那会把共享项与配对表一起丢掉）；写下去的备注重启后要还在。
+    #[test]
+    fn device_remarks_round_trip_and_clear() {
+        let old: Config = toml::from_str("deviceId = \"device-1\"\n").unwrap();
+        assert!(old.device_remarks.is_empty(), "老配置没有这一节：没有备注");
+
+        let mut config = Config::default();
+        assert_eq!(config.set_device_remark("peer-a", "  客厅台式机 "), Some("客厅台式机".into()));
+        assert_eq!(config.set_device_remark("peer-a", ""), None, "空串 = 清除");
+        assert!(!config.device_remarks.contains_key("peer-a"));
+
+        config.set_device_remark("peer-a", "客厅台式机");
+        config.set_device_remark("peer-b", "会议室");
+        let text = toml::to_string_pretty(&config).unwrap();
+        let loaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(loaded.device_remarks.get("peer-a").map(String::as_str), Some("客厅台式机"));
+        assert_eq!(loaded.device_remarks.get("peer-b").map(String::as_str), Some("会议室"));
+
+        // 超长的按字符截断（中文一个字算一个，不能按字节切 —— 那会切出半个字）
+        let long = "备".repeat(REMARK_MAX_CHARS + 5);
+        let stored = config.set_device_remark("peer-c", &long).unwrap();
+        assert_eq!(stored.chars().count(), REMARK_MAX_CHARS);
+        assert_eq!(config.device_remarks.get("peer-c").unwrap(), &stored);
+    }
+
+    /// 安卓默认设备名（S-05）的挑选规则：**厂商市场名优先**，其次是"品牌 + 型号"。
+    ///
+    /// 这是"这台设备到底是谁"唯一的来源：`ro.product.model` 在国行 ROM 上是型号代码
+    /// （`24129PN74C` / `V2502A`），摆到设备列表里谁也认不出。假属性表代替真机（CI 里没有
+    /// 安卓机器），只钉规则本身。
+    #[test]
+    fn android_device_name_prefers_vendor_market_name() {
+        // 小米：市场名在，型号与品牌都不再参与
+        let xiaomi = fake_props(&[
+            ("ro.product.marketname", "Xiaomi 15 Pro"),
+            ("ro.product.model", "24129PN74C"),
+            ("ro.product.brand", "Xiaomi"),
+        ]);
+        assert_eq!(pick_android_device_name(xiaomi), Some("Xiaomi 15 Pro".into()));
+
+        // 市场名只落在分区变体里 / OPPO 系 / vivo 系各探一条：属性不存在时返回 None，
+        // 所以整串探一遍不亏（`ro.product.marketname` 缺席时下面的键才是答案）。
+        assert_eq!(
+            pick_android_device_name(fake_props(&[
+                ("ro.product.vendor.marketname", "Redmi Note 13 Pro+ 5G"),
+                ("ro.product.model", "2312DRAABC"),
+            ])),
+            Some("Redmi Note 13 Pro+ 5G".into())
+        );
+        assert_eq!(
+            pick_android_device_name(fake_props(&[
+                ("ro.vendor.oplus.market.name", "OnePlus 12"),
+                ("ro.product.model", "PJD110"),
+            ])),
+            Some("OnePlus 12".into())
+        );
+        assert_eq!(
+            pick_android_device_name(fake_props(&[
+                ("ro.vivo.market.name", "vivo X300"),
+                ("ro.product.model", "V2502A"),
+            ])),
+            Some("vivo X300".into())
+        );
+    }
+
+    /// 没有市场名的机器（三星、华为这类）落回"品牌 + 型号"：型号是代码时加品牌当路标，
+    /// 型号本身就是人话、或已经以品牌开头时不再叠加 —— 名字不该长成 `Xiaomi Xiaomi 15`。
+    #[test]
+    fn android_device_name_falls_back_to_brand_plus_model() {
+        assert_eq!(
+            pick_android_device_name(fake_props(&[
+                ("ro.product.brand", "samsung"),
+                ("ro.product.model", "SM-S928B"),
+            ])),
+            Some("samsung SM-S928B".into())
+        );
+        assert_eq!(
+            pick_android_device_name(fake_props(&[
+                ("ro.product.brand", "google"),
+                ("ro.product.model", "Pixel 7"),
+            ])),
+            Some("Pixel 7".into()),
+            "型号本身就是名字（有空格），不再叠品牌"
+        );
+        assert_eq!(
+            pick_android_device_name(fake_props(&[
+                ("ro.product.brand", "Xiaomi"),
+                ("ro.product.model", "Xiaomi 15"),
+            ])),
+            Some("Xiaomi 15".into()),
+            "型号已经以品牌开头，不重复叠"
+        );
+
+        // 一条属性都没有、或只有占位值：调用方拿 `None` 去用平台兜底
+        assert_eq!(pick_android_device_name(fake_props(&[])), None);
+        assert_eq!(
+            pick_android_device_name(fake_props(&[
+                ("ro.product.model", "unknown"),
+                ("ro.product.brand", "  "),
+            ])),
+            None,
+            "ROM 上常见的占位值不算名字"
+        );
+    }
+
+    /// `repair_device_name` 的判据：只换"我们自己自动取名写下的值"，用户起过的名字一个字不动。
+    #[test]
+    fn only_auto_picked_names_get_replaced() {
+        assert!(should_replace_auto_name("OrbDrop-Mac", "Pixel 7"), "平台兜底串要换");
+        assert!(
+            !should_replace_auto_name("OrbDrop-Mac", "OrbDrop-Mac"),
+            "换不出更好的就别写盘（否则每次启动都白落一次盘）"
+        );
+        assert!(
+            !should_replace_auto_name("王磊的手机", "Pixel 7"),
+            "用户自己起的名字不动 —— 哪怕它更好看"
+        );
+    }
+
+    /// 一张假的"系统属性表"，冒充 `__system_property_get`。
+    fn fake_props(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |key: &str| map.get(key).cloned()
     }
 }

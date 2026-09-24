@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { getShares, loadShares, toggleBroadcast } from '$lib/stores/shares.svelte';
-  import { getDevices } from '$lib/stores/devices.svelte';
+  import { getDevices, deviceDisplayName } from '$lib/stores/devices.svelte';
   import { getServerPort, setServerPort } from '$lib/stores/shares.svelte';
   import { getActualPort } from '$lib/api';
   import TreeNode from './TreeNode.svelte';
@@ -61,7 +61,7 @@
   function handleBroadcastToggle(shareId: string, checked: boolean) {
     toggleBroadcast(shareId, checked).catch(console.error);
     onToast(checked
-      ? (connectedDevices.length > 0 ? `已开启广播 · 自动广播至 ${connectedDevices.map(d => d.name).join('、')}` : '已开启广播')
+      ? (connectedDevices.length > 0 ? `已开启广播 · 自动广播至 ${connectedDevices.map(deviceDisplayName).join('、')}` : '已开启广播')
       : '已停止广播该共享项');
   }
 
@@ -91,7 +91,7 @@
 {#if connectedDevices.length > 0}
   <p class="bcast-hint">
     <span class="dot live"></span>
-    <span>{connectedDevices.map(d => `「${d.name}」`).join('、')} 已连接：在共享项上打开广播开关，对端才能看到</span>
+    <span>{connectedDevices.map(d => `「${deviceDisplayName(d)}」`).join('、')} 已连接：在共享项上打开广播开关，对端才能看到</span>
   </p>
 {/if}
 
@@ -132,7 +132,7 @@
             <div class="s-meta">
               <span class="num">{share.path}</span>
               {#if connectedDevices.length > 0 && share.broadcastEnabled}
-                <span class="bcast-chip" title="自动广播至 {connectedDevices.map(d => `「${d.name}」`).join('、')}">
+                <span class="bcast-chip" title="自动广播至 {connectedDevices.map(d => `「${deviceDisplayName(d)}」`).join('、')}">
                   <span class="dot live"></span>{connectedDevices.length}台设备
                 </span>
               {/if}

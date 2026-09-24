@@ -9,6 +9,7 @@
     deviceState,
     deviceOnline = true,
     deviceNeedsPair = false,
+    deviceRemark = null,
     peerName,
     bcAvailable = true,
     bcLeftLabel = null,
@@ -31,6 +32,7 @@
     onDisconnect,
     onPair,
     onUnpair,
+    onRemark,
     onPeerDownload,
     onBcCompare,
     onBcAddLeft,
@@ -53,6 +55,8 @@
     deviceOnline?: boolean;
     /** token 已失效（对端不认我们）：这一档的动作是「配对」，不是「连接」。 */
     deviceNeedsPair?: boolean;
+    /** 这台设备当前的备注（F-101）；`null`/缺省 = 没备注。菜单里顺手把它摆出来。 */
+    deviceRemark?: string | null;
     peerName?: string;
     /** 本机是否探测到 BeyondCompare（后端 `bc_status.exePath` 非空）；false = 整个 BC 菜单区不显示。 */
     bcAvailable?: boolean;
@@ -87,6 +91,8 @@
     onDisconnect: () => void;
     onPair: () => void;
     onUnpair: () => void;
+    /** 设备菜单：改本机给这台设备起的备注（F-101）—— 纯本机动作，任何状态的行都给。 */
+    onRemark: () => void;
     onPeerDownload: () => void;
     onBcCompare: () => void;
     onBcAddLeft: () => void;
@@ -243,6 +249,16 @@
     </button>
     {#if bcAvailable}{@render bcSection()}{/if}
   {:else}
+    <!-- 备注（F-101）**与在线状态无关**：它是纯本机数据（写进本机 `config.toml`，
+         不发给对端），离线行、未绑定的行照样能改 —— 所以它排在下面那段状态分档之前，
+         不受任何条件影响。当前备注就写在菜单里（`title` 给全，行内截断），
+         用户不用先点进去才知道自己起过什么名。 -->
+    <button class="ctx-item" title={deviceRemark ?? undefined} onclick={() => handleItem(onRemark)}>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M4 10h10M4 15h16M4 20h7"/></svg>
+      修改备注
+      {#if deviceRemark}<span class="ctx-current">{deviceRemark}</span>{/if}
+    </button>
+    <div class="ctx-sep"></div>
     {#if !deviceOnline}
       <!-- 离线设备：只有「解除配对」是本机动作（它不依赖长连接）。会话仍然打得开、消息也发得
            出去（排着队等它上线，见 chat::flush_queued），但设备页这一行按 F-14 的离线行规则
@@ -296,5 +312,18 @@
     color: var(--muted);
     cursor: default;
     pointer-events: none;
+  }
+
+  /* 菜单行里跟在文字后面的当前备注：菜单宽度不该被一句备注拉长（备注最长 24 个字），
+     所以这一行自己截断，全名在按钮的 `title` 里。 */
+  .ctx-current {
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: 132px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+    text-align: right;
   }
 </style>

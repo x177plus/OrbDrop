@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::credential;
 use crate::state::AppState;
@@ -699,6 +699,15 @@ fn reject_shared(state: &AppState, invite: InboundInvite, reason: &str) {
         "accepted": false,
         "reason": reason,
     }));
+    // 拒绝也是个结局：这条 `PushResponse` 现在只在有长连接时发得出去（没有 HTTP 兜底），
+    // 丢了的话发送方只能靠超时 —— 对账时把真话说出去。
+    state.push.record_outcome(
+        &invite.invite_id,
+        &invite.sender.id,
+        "rejected",
+        0,
+        Some(reason.to_string()),
+    );
 }
 
 /// 接收方：取消正在进行的接收（保留续传记录，下次可接着拉）。
@@ -722,7 +731,149 @@ pub fn cancel_receive(state: &AppState, invite_id: &str) {
         "inviteId": invite.invite_id,
         "status": "cancelled",
     }));
+    // 这条 `PushDone` 走的是"尽力而为"的回执路（链路断了就没了），对账时也要答得出来。
+    state.push.record_outcome(
+        &invite.invite_id,
+        &invite.sender.id,
+        "cancelled",
+        0,
+        Some("接收方已取消".into()),
+    );
     warn!(%invite_id, "receive cancelled; resume record kept");
+}
+
+// ---------------------------------------------------------------------------
+// 对账：回执丢了怎么办（`PushAsk` / `PushState`）
+// ---------------------------------------------------------------------------
+
+/// 发送方：把本机发出去的、**还没落终态**的邀请问一遍对端。
+///
+/// 调用点与文本消息的"排队补发"（`chat::flush_queued`）是同一批，理由也一样：
+/// **链路在的时候不主动对账，回执丢了就永远对不上账**。回执（进度/完成/拒绝）是"一次、
+/// 尽力而为"的 —— 长连接断在"检查有没有会话"与"真的发出去"之间、或那一跳 HTTP 补发失败，
+/// 发送方那一台就会一直停在「等待」，5 分钟后被判成「对方未响应」，而对面其实早就收完了。
+///
+/// 幂等 + 节流（`PushStore::ask_due`），所以每 5 秒一拍地叫它不会刷屏；没有待对账的邀请
+/// 就什么都不做（连闸门都不动）。只走长连接：对账的前提就是"链路在"。
+pub fn reconcile(state: &Arc<AppState>, peer_id: &str) {
+    if !state.ws.has_connection(peer_id) {
+        return;
+    }
+    let invite_ids = state.push.waiting_invites_of(peer_id);
+    if invite_ids.is_empty() || !state.push.ask_due(peer_id) {
+        return;
+    }
+    let ask_id = uuid::Uuid::new_v4().to_string();
+    debug!(%peer_id, count = invite_ids.len(), %ask_id, "推送对账：问对端这些邀请的结果");
+    if !state.ws.send(peer_id, WsEvent::PushAsk { ask_id, invite_ids }) {
+        debug!(%peer_id, "推送对账：问不出去（会话刚断），等下一拍");
+    }
+}
+
+/// 接收方：如实回答一条对账（`PushAsk`）—— 本机还拿着的答 `waiting`，
+/// 处理过的按结局答，没见过的答 `unknown`（= 那条邀请根本没送到）。
+pub fn answer_ask(state: &AppState, peer_id: &str, ask_id: &str, invite_ids: &[String]) -> WsEvent {
+    let states = invite_ids
+        .iter()
+        .map(|id| state.push.answer_invite_state(id, peer_id))
+        .collect::<Vec<_>>();
+    debug!(%peer_id, %ask_id, count = invite_ids.len(), "推送对账：答对端");
+    WsEvent::PushState {
+        ask_id: ask_id.to_string(),
+        states,
+    }
+}
+
+/// 发送方：把对账的答案落到批次上 —— 这就是"回执丢了"的补漏。
+///
+/// 只认**属于这台设备**的邀请（答案里塞了别人的 id 就记一句、不落账）。落到批次上的写法
+/// 与真实回执完全同路（`batch_set`），所以"本机推测的失败"能被对端的成功纠正，
+/// 而"用户取消 / 对端拒绝"这些明确意图改不动（见 `push_job::late_success`）。
+pub fn apply_push_states(
+    state: &AppState,
+    peer_id: &str,
+    ask_id: &str,
+    states: &[push_job::PushInviteStateWire],
+) {
+    use push_job::{batch_set, PushStatus, TargetState};
+    for s in states {
+        let Some(target) = state.push.target_of_invite(&s.invite_id) else {
+            // 批次已经收起（整批走完就丢了）或者这条不属于本机发出去的推送。
+            continue;
+        };
+        if target.peer_id != peer_id {
+            warn!(%peer_id, invite_id = %s.invite_id, "对账答案里混进了别的设备的邀请，忽略");
+            continue;
+        }
+        match s.state.as_str() {
+            "done" => {
+                state.push.remove_job(&s.invite_id);
+                batch_set(state, &s.invite_id, TargetState::Done, None, None, true);
+            }
+            "failed" => {
+                state.push.remove_job(&s.invite_id);
+                batch_set(
+                    state,
+                    &s.invite_id,
+                    TargetState::Failed,
+                    None,
+                    Some(s.reason.clone().unwrap_or_else(|| "对端接收失败".into())),
+                    true,
+                );
+            }
+            "rejected" => {
+                state.push.remove_job(&s.invite_id);
+                batch_set(
+                    state,
+                    &s.invite_id,
+                    TargetState::Rejected,
+                    None,
+                    // 用对端给的原因：同样是 `rejected`，"对方拒绝"和"超时未处理"是两件事，
+                    // 卡片上那句话该说准（`reject_shared` 两种都走这一档）。
+                    Some(
+                        s.reason
+                            .clone()
+                            .unwrap_or_else(|| "对方拒绝了这次推送".into()),
+                    ),
+                    true,
+                );
+            }
+            "cancelled" => {
+                state.push.remove_job(&s.invite_id);
+                batch_set(
+                    state,
+                    &s.invite_id,
+                    TargetState::Failed,
+                    None,
+                    Some("对方取消了接收".into()),
+                    true,
+                );
+            }
+            "waiting" => {
+                // 对端还拿着这条邀请：未绑定的是"等它点同意"（界面别改口），已配对的它自己
+                // 就开收了 —— 那就是"传输中"，卡片该从「等待开始」挪到进度那一档。
+                state.push.update_status(&s.invite_id, PushStatus::Accepted);
+                if target.paired {
+                    batch_set(state, &s.invite_id, TargetState::Sending, Some(s.received), None, false);
+                }
+            }
+            // 对端没有这条邀请（本机没见过 / 记录已过期）：它根本没送到 —— 当场收手，
+            // 不必再等满 5 分钟。发送方随后重试时对端会正常收到。
+            other => {
+                debug!(invite_id = %s.invite_id, state = %other, "对账：对端没有这条邀请");
+                state.push.remove_job(&s.invite_id);
+                batch_set(
+                    state,
+                    &s.invite_id,
+                    TargetState::Failed,
+                    None,
+                    Some("对端没有这条邀请（没送达）".into()),
+                    true,
+                );
+            }
+        }
+    }
+    debug!(%peer_id, %ask_id, "推送对账答案已落账");
 }
 
 // ---------------------------------------------------------------------------
@@ -732,6 +883,7 @@ pub fn cancel_receive(state: &AppState, invite_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("orbdrop_manifest_{tag}_{}", uuid::Uuid::new_v4()));
@@ -863,5 +1015,251 @@ mod tests {
 
         std::fs::remove_dir(&link).unwrap_or_else(|_| std::fs::remove_file(&link).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ── 对账：回执丢了怎么办（`PushAsk` / `PushState`）────────────────────────
+
+    /// 一台临时状态：对账的落账要真的批次与真的 store。
+    fn reconcile_state() -> Arc<AppState> {
+        let dir = std::env::temp_dir().join(format!(
+            "orbdrop_push_reconcile_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(AppState::new(crate::config::Config::default(), dir.join("config.toml")))
+    }
+
+    fn batch_with(targets: Vec<push_job::BatchTarget>) -> push_job::PushBatch {
+        push_job::PushBatch {
+            id: "b1".into(),
+            name: "a.txt".into(),
+            count: 1,
+            skipped: 0,
+            per_target_total: 10,
+            targets,
+            last_emit: Instant::now(),
+        }
+    }
+
+    fn target_of(peer: &str, invite: &str, state: push_job::TargetState) -> push_job::BatchTarget {
+        push_job::BatchTarget {
+            peer_id: peer.into(),
+            peer_name: peer.into(),
+            invite_id: invite.into(),
+            paired: true,
+            state,
+            received: 0,
+            error: None,
+        }
+    }
+
+    /// 一整个来回：发送方问 → 接收方按**自己的记录**答 → 发送方落账 —— 这就是"回执丢了"的补漏。
+    /// 两端在这一条里是同一个进程里的两个 `AppState`（生产里是两个进程，协议一样）。
+    #[tokio::test]
+    async fn reconcile_round_trip_lands_the_receivers_answer() {
+        // 发送方：一条还没落终态的邀请（回执丢了，界面还停在「等待」）
+        let sender = reconcile_state();
+        sender.push.insert_batch(batch_with(vec![target_of("p1", "i1", push_job::TargetState::Invited)]));
+        let ids = sender.push.waiting_invites_of("p1");
+        assert_eq!(ids, vec!["i1".to_string()], "要问的就是它");
+
+        // 接收方：这条邀请它早就处理完了（结局记录在案）
+        let receiver = reconcile_state();
+        receiver.push.record_outcome("i1", "p1", "done", 1024, None);
+
+        // 接收方答（对端 id 逐条校验）
+        let answer = answer_ask(&receiver, "p1", "ask-1", &ids);
+        let WsEvent::PushState { states, ask_id } = answer else {
+            panic!("对账的答案是 PushState");
+        };
+        assert_eq!(ask_id, "ask-1");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].state, "done");
+        assert_eq!(states[0].received, 1024);
+
+        // 发送方落账：那条「等待」变成「已成功」，会话气泡跟着改口（`push://batch` 全量快照）
+        apply_push_states(&sender, "p1", "ask-1", &states);
+        let target = sender.push.target_of_invite("i1").unwrap();
+        assert_eq!(target.state, push_job::TargetState::Done);
+        assert!(sender.push.batch_snapshot("b1").is_some(), "卡片还在（宽限期）");
+    }
+
+    /// 本机判的"失败"（超时/送不出去）是**推测**，对账拿到 `done` 就该改口 ——
+    /// 对面收完了、本机写着失败，那是假账。
+    #[tokio::test]
+    async fn reconcile_corrects_a_speculative_failure() {
+        let state = reconcile_state();
+        state.push.insert_batch(batch_with(vec![target_of("p1", "i1", push_job::TargetState::Invited)]));
+        // 5 分钟超时：本机先记成失败
+        push_job::batch_set(&state, "i1", push_job::TargetState::Failed, None, Some("对方未响应".into()), true);
+        assert_eq!(state.push.target_of_invite("i1").unwrap().state, push_job::TargetState::Failed);
+
+        // 对端其实收完了：对账答案（正常情况下这条是回执，丢了才需要问）
+        apply_push_states(
+            &state,
+            "p1",
+            "ask-1",
+            &[push_job::PushInviteStateWire {
+                invite_id: "i1".into(),
+                state: "done".into(),
+                received: 10,
+                reason: None,
+            }],
+        );
+
+        let target = state.push.target_of_invite("i1").unwrap();
+        assert_eq!(target.state, push_job::TargetState::Done, "推测的失败被对端的成功改写");
+        assert!(target.error.is_none(), "改口时要把上一次的原因抹掉");
+    }
+
+    /// 但"当事人明确表达的"不能被改写：对面拒绝过的那台，不会因为一条 `done` 就变成成功
+    /// （终态只落一次的纪律，见 `push_job::late_success`）。
+    #[tokio::test]
+    async fn reconcile_never_overwrites_an_explicit_rejection() {
+        let state = reconcile_state();
+        state.push.insert_batch(batch_with(vec![target_of("p1", "i1", push_job::TargetState::Invited)]));
+        push_job::batch_set(&state, "i1", push_job::TargetState::Rejected, None, Some("对方拒绝".into()), true);
+
+        apply_push_states(
+            &state,
+            "p1",
+            "ask-1",
+            &[push_job::PushInviteStateWire {
+                invite_id: "i1".into(),
+                state: "done".into(),
+                received: 10,
+                reason: None,
+            }],
+        );
+
+        assert_eq!(
+            state.push.target_of_invite("i1").unwrap().state,
+            push_job::TargetState::Rejected
+        );
+    }
+
+    /// 对端说"没见过这条邀请" = 那条邀请根本没送到：当场收手，不用等满 5 分钟。
+    #[tokio::test]
+    async fn reconcile_fails_an_invite_the_peer_never_saw() {
+        let state = reconcile_state();
+        state.push.insert_batch(batch_with(vec![target_of("p1", "i1", push_job::TargetState::Invited)]));
+        apply_push_states(
+            &state,
+            "p1",
+            "ask-1",
+            &[push_job::PushInviteStateWire {
+                invite_id: "i1".into(),
+                state: "unknown".into(),
+                received: 0,
+                reason: None,
+            }],
+        );
+        let target = state.push.target_of_invite("i1").unwrap();
+        assert_eq!(target.state, push_job::TargetState::Failed);
+        assert!(target.error.unwrap().contains("没送达"));
+    }
+
+    /// 答案里混进别的设备的邀请：不落账（对端的答案不能动到第三台那行）。
+    #[tokio::test]
+    async fn reconcile_ignores_invites_of_other_peers() {
+        let state = reconcile_state();
+        state.push.insert_batch(batch_with(vec![target_of("p2", "i1", push_job::TargetState::Invited)]));
+        apply_push_states(
+            &state,
+            "p1",
+            "ask-1",
+            &[push_job::PushInviteStateWire {
+                invite_id: "i1".into(),
+                state: "done".into(),
+                received: 10,
+                reason: None,
+            }],
+        );
+        assert_eq!(
+            state.push.target_of_invite("i1").unwrap().state,
+            push_job::TargetState::Invited,
+            "不是这台设备的答案，一个字都不该动"
+        );
+    }
+
+    /// 只问"还没落终态"的那几条，而且同一台设备有节流（每 5 秒一拍地叫不会刷屏）。
+    #[tokio::test]
+    async fn reconcile_asks_only_about_waiting_invites_and_is_throttled() {
+        let state = reconcile_state();
+        state.push.insert_batch(batch_with(vec![
+            target_of("p1", "waiting", push_job::TargetState::Invited),
+            target_of("p1", "done", push_job::TargetState::Done),
+            target_of("p2", "other-peer", push_job::TargetState::Invited),
+        ]));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.ws.register("p1", tx);
+
+        reconcile(&state, "p1");
+        let event = rx.try_recv().expect("问出去了一条 PushAsk");
+        match event {
+            WsEvent::PushAsk { invite_ids, .. } => {
+                assert_eq!(invite_ids, vec!["waiting".to_string()], "只问还没落终态的那条");
+            }
+            other => panic!("期望 PushAsk，得到 {}", other.type_name()),
+        }
+        // 节流：立刻再叫一次不该再问（回执丢了靠下一拍，20 秒后才又问）
+        reconcile(&state, "p1");
+        assert!(rx.try_recv().is_err(), "20 秒内不重复问");
+    }
+
+    /// 没有长连接就不问：对账的前提是"链路在"（问出去也得有人答）。
+    #[tokio::test]
+    async fn reconcile_does_nothing_without_a_link() {
+        let state = reconcile_state();
+        state.push.insert_batch(batch_with(vec![target_of("p1", "i1", push_job::TargetState::Invited)]));
+        reconcile(&state, "p1"); // 没注册会话 → 早退，不发也不占闸门
+        assert!(state.push.ask_due("p1"), "没问过就不该占掉闸门");
+    }
+
+    /// 回执的最后一道兜底：**"塞进 WS 队列"失败也要退回 HTTP**（以前只看"有没有会话"，
+    /// 于是"会话还在但已经写不进去"这一档会静默丢回执）。这里用"注册过、但接收端已经丢掉"
+    /// 的会话把这个分支逼出来。
+    ///
+    /// 对端地址是 `https://`（`net::peer_base`），所以监听端看到的是 TLS 握手的第一帧 ——
+    /// 这已经足够证明"回执确实往那个地址发了一次"（要连出握手，先得拨号成功）。
+    #[tokio::test]
+    async fn report_falls_back_to_http_when_the_ws_queue_is_dead() {
+        let state = reconcile_state();
+        let (tx, rx) = mpsc::unbounded_channel();
+        state.ws.register("p1", tx);
+        drop(rx); // 会话还在册，但队列已经没人接
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 5];
+            let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await.unwrap();
+            buf[..n].to_vec()
+        });
+
+        push_job::report_to_sender(
+            &state,
+            "p1",
+            &Some(("127.0.0.1".into(), port)),
+            WsEvent::PushDone { invite_id: "i1".into(), status: "completed".into(), reason: None },
+        );
+
+        let head = tokio::time::timeout(Duration::from_secs(5), seen)
+            .await
+            .expect("5 秒内该向回调地址发出回执")
+            .unwrap();
+        assert_eq!(head.first(), Some(&0x16), "TLS 握手：确实拨到了那个地址，head={head:?}");
+
+        // 有活儿干的会话不该走这条路：回执进的是 WS 队列。
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        state.ws.register("p2", tx2);
+        push_job::report_to_sender(
+            &state,
+            "p2",
+            &Some(("127.0.0.1".into(), 1)), // 故意指向一个没人听的端口：走了 HTTP 就会连不上
+            WsEvent::PushDone { invite_id: "i2".into(), status: "completed".into(), reason: None },
+        );
+        assert!(matches!(rx2.try_recv(), Ok(WsEvent::PushDone { .. })), "有会话就走 WS");
     }
 }

@@ -1,6 +1,6 @@
 <script lang="ts">
   import * as chat from '$lib/stores/chat.svelte';
-  import { getDevices, deviceState } from '$lib/stores/devices.svelte';
+  import { getDevices, deviceState, deviceDisplayName, peerDisplayName } from '$lib/stores/devices.svelte';
   import Hint from '$lib/components/Hint.svelte';
   import type { ConvoMode, PeerDevice } from '$lib/types';
 
@@ -45,7 +45,7 @@
   const namePreview = $derived(
     isBc
       ? `群发 · ${name.trim() || '未命名群发'}`
-      : `群聊 · ${name.trim() || selected.map((id) => getDevices().find((d) => d.id === id)?.name ?? id).join('、') || '设备名称'}`,
+      : `群聊 · ${name.trim() || selected.map((id) => peerDisplayName(id)).join('、') || '设备名称'}`,
   );
 
   function toggle(id: string, on: boolean) {
@@ -122,7 +122,7 @@
           共享群聊<Hint>
             群里任意一台设备发送的消息，所有参与者都能看到（同一条消息流）。
             <span class="hl">收到邀请的人点「加入」才算这个群的一员</span>；退群只影响自己
-            （已经收到的消息留在本机）。
+            （本机退出时这份记录也一并删掉，其他成员不受影响）。
           </Hint>
         </span>
       </label>
@@ -156,9 +156,9 @@
         {@const st = deviceState(d)}
         <label class="recip-row">
           <input type="checkbox" checked={selected.includes(d.id)} onchange={(e) => toggle(d.id, e.currentTarget.checked)} />
-          <span class="d-avatar">{(d.name.trim().charAt(0) || '?').toUpperCase()}</span>
+          <span class="d-avatar">{(deviceDisplayName(d).trim().charAt(0) || '?').toUpperCase()}</span>
           <span class="rr-main">
-            <span class="rr-name">{d.name}</span>
+            <span class="rr-name">{deviceDisplayName(d)}</span>
             <span class="rr-ip num">{d.ip}:{d.port}</span>
           </span>
           <span class="state-chip {st.chip}"><span class="dot {st.dot}"></span>{st.label}</span>

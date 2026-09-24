@@ -4,8 +4,25 @@ import { fileURLToPath, URL } from "node:url";
 import process from "node:process";
 const host = process.env.TAURI_DEV_HOST;
 
-export default defineConfig(() => ({
+export default defineConfig(({ mode }) => ({
   plugins: [svelte()],
+  // CSS **不交给 Lightning CSS**：它会对同属性的重复声明做去重 —— 而我们这套兼容性正是靠
+  // "重复声明"承载的（先 sRGB、后 oklch/color-mix），实测它会把回退整条删掉（自定义属性与普通
+  // 属性都删），于是老引擎又把配色丢光。回退由 `scripts/gen-color-tokens.mjs` 生成、
+  // 由 `scripts/check-compat.mjs` 门禁，构建期不再插手。
+  // 桌面端同样按下面这份配置走（它本来就不需要降级）。
+  // 平台产物分家：`--mode mobile` 出到 `dist-mobile/`（移动端那份，见
+  // `src-tauri/tauri.android.conf.json` 覆盖的 `frontendDist`），默认仍是 `dist/`（桌面端）。
+  // 两个目录各含它自己那套 UI —— `src/main.ts` 按 `import.meta.env.MODE` 静态二选一，
+  // 另一个分支连同它的动态 import 会被摇掉。
+  build: {
+    outDir: mode === "mobile" ? "dist-mobile" : "dist",
+    // JS 语法也钉到下限：默认目标是 Chrome 107+，不改的话新语法会被原样留在产物里。
+    target: mode === "mobile" ? "chrome90" : undefined,
+    // CSS 不压缩：压缩器（lightningcss 或 esbuild）会去重同属性的重复声明，而回退正是靠它们承载的。
+    // 样式表要随包走、由本地读，几十 KB 的体积无关紧要；换来的是回退声明 1:1 原样出货。
+    cssMinify: mode === "mobile" ? false : undefined,
+  },
   // index.html 里的 `/favicon.png` 指向 static/ —— 不声明的话这里面谁也不会被服务/拷进 dist
   publicDir: "static",
   resolve: {
