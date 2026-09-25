@@ -87,7 +87,9 @@ pub async fn file_handler(
     let read_len = len.map(|l| l.min(remaining)).unwrap_or(remaining);
 
     let limited = file.take(read_len);
-    let stream = ReaderStream::new(limited);
+    // 帧容量只影响**分帧大小**，不影响返回的字节总数，也不动"短读 = 到末尾"那条判据：
+    // 对端（含 CFAPI 镜像水合那条路）一次 `len` 要多少还是拿多少。
+    let stream = ReaderStream::with_capacity(limited, crate::net::STREAM_CHUNK);
     Ok(Body::from_stream(stream))
 }
 

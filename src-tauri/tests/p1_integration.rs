@@ -1211,6 +1211,8 @@ fn button_tasks_without_a_tokio_runtime_do_not_panic() {
         is_dir: false,
         count: 1,
         files: vec![],
+        // 老对端那条路（不带能力位）：这个用例测的是"没有 reactor 也不能 panic"。
+        caps: Vec::new(),
         callback: Some(("127.0.0.1".into(), 1)),
         responder: None,
     });

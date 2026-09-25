@@ -76,6 +76,13 @@ fn ip_rank(ip: &std::net::Ipv4Addr) -> u8 {
     }
 }
 
+/// 推送那条路允许的请求体上限（清单/回执）。
+///
+/// axum 的默认值是 2MB，而一份"推整个目录"的清单按每条 ~70 字节算，2MB 只够 3 万条 ——
+/// 更大的目录会在邀请那一步 413。长连接那条路的帧上限本来就是 64MB（tungstenite 默认），
+/// 这里与它对齐，两条通道的能力才一致。
+const MANIFEST_BODY_LIMIT: usize = 64 << 20;
+
 /// Build the axum Router with all routes, including the WS /events
 /// endpoint (outside the auth layer).
 fn build_router(state: Arc<AppState>) -> Router {
@@ -101,15 +108,28 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/events", axum::routing::get(events_ws_handler))
         .route(
             "/push/invite",
-            axum::routing::post(routes_push::push_invite_handler),
+            // axum 对 `Json` 提取器有一条 **2MB 默认上限**（`DefaultBodyLimit`），而这条
+            // 路由的请求体里装着**整份文件清单**（每条 `{"path":…,"size":…}` 约 70 字节）。
+            // 2MB 只够 3 万条：再大一点的目录会在"邀请"这一步直接 413，表现成"推不过去"
+            // 且看不出为什么。清单是发送方自己算出来的、有对端同意/取消两道闸，把它放开
+            // 到 64MB（与长连接那条路的 tungstenite 帧上限同量级）是安全且必要的。
+            axum::routing::post(routes_push::push_invite_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(MANIFEST_BODY_LIMIT)),
         )
         .route(
             "/push/report",
-            axum::routing::post(routes_push::push_report_handler),
+            axum::routing::post(routes_push::push_report_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(MANIFEST_BODY_LIMIT)),
         )
         .route(
             "/push/download",
             axum::routing::get(routes_push::push_download_handler),
+        )
+        .route(
+            // 新数据面：一批块任务 + 分帧记录流（老对端不会来，见 `InboundInvite::supports_stream`）。
+            "/push/stream",
+            axum::routing::post(routes_push::push_stream_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(MANIFEST_BODY_LIMIT)),
         )
         // 会话（聊天）没有长连接时的那一跳：同样挂在公开路由上、自己认人
         // （未绑定设备没有 token 可带），判断规则与 `/push/invite` 一模一样。
@@ -297,7 +317,10 @@ pub async fn start_server(state: Arc<AppState>, base_port: u16) -> Result<u16, S
     let identity = crate::net::load_or_create_identity()?;
     let tls = crate::net::server_config(&identity);
 
-    for port in base_port..=base_port + 10 {
+    // `saturating_add`：`base_port` 是 u16（配置里手写成 65530 也合法），`+ 10` 会溢出 panic
+    // —— 而这条路径是"启动监听"，panic 等于应用起不来。溢出时退化成"只试到 65535"。
+    let last = base_port.saturating_add(10);
+    for port in base_port..=last {
         let addr: SocketAddr = ([0, 0, 0, 0], port).into();
         match TcpListener::bind(addr).await {
             Ok(listener) => {
@@ -319,14 +342,13 @@ pub async fn start_server(state: Arc<AppState>, base_port: u16) -> Result<u16, S
                 info!(port, "HTTP server started");
                 return Ok(port);
             }
-            Err(e) if port < base_port + 10 => {
+            Err(e) if port < last => {
                 error!(port, "port busy, trying next: {e}");
                 continue;
             }
             Err(e) => {
                 return Err(format!(
-                    "端口 {base_port}~{} 均被占用: {e}",
-                    base_port + 10
+                    "端口 {base_port}~{last} 均被占用: {e}"
                 ));
             }
         }
@@ -351,7 +373,7 @@ pub async fn ensure_server(state: Arc<AppState>) -> Result<u16, String> {
     let current_port = state.server_port.load(std::sync::atomic::Ordering::SeqCst);
     let base_port = state.config.lock().port;
 
-    if current_port == 0 || current_port < base_port || current_port > base_port + 10 {
+    if current_port == 0 || current_port < base_port || current_port > base_port.saturating_add(10) {
         if current_port != 0 {
             stop_server(&state).await;
         }

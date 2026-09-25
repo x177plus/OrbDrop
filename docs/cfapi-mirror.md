@@ -189,6 +189,32 @@ WARN 把这次目录枚举判失败 {'why': '身份解不出来'}
 | `tests/mirror_hydrate.rs` | 端到端：占位符 → 分段读 → 拉 → 字节一致 → 目录按需填充 → 幂等 → 父链可列 → 拖放入口 → 不可共享 → 退出不留残骸 |
 | `tests/peer_metadata.rs` | 对端元数据这条共用面：`/shares` 的 isDir、`/stat` 优先、**老版本对端**退回列父目录 |
 
+## 4.5 与推送传输的边界（改推送之前先看这一节）
+
+镜像水合与「推送接收」是**两条互不相干的数据面**，共用面只有 TLS 配置与 token 反解：
+
+| | 镜像 / 拖出 | 推送接收 |
+|---|---|---|
+| 端点 | `GET /file?share&path&offset&len` + `/tree` `/stat` | `POST /push/stream`（新）/ `GET /push/download`（老对端） |
+| 客户端 | `peer_fs::client()`（独立超时：5s 连接 / 30s 总） | `net::client()`（无总超时，长传输要它） |
+| 落盘根 | `<数据目录>/mirror`（占位符 + 水合字节） | `<下载目录>/<发送方名>/…`（真文件） |
+| 状态 | `IDLE` 表、`CANCELLED` 表、`identity` | `PushStore`（jobs/inbound/resume/batches） |
+| 并发 | 平台按需回调，一区一段串行拉（4MB 一段） | 每邀请 N 路并行（设置项，默认 4） |
+
+**红线**（改推送时别越界）：
+
+- 不改 `/file` 的**语义**：`offset`/`len` 截断、短读 = 到末尾、4 KiB 对齐判据、错误状态码 ——
+  水合那头全靠它们（`transfer_range` 拿"短读"当 EOF、拿对齐当交付前提）。
+- 推送的并发闸门**只作用于推送**：水合是用户交互路径（资源管理器里一双击就要出字节），
+  不能被一批推送排队堵住；反过来推送也不去看镜像的流量。
+- 镜像根、`MIRROR_TTL`、`sweep`、`CANCELLED` 表都不动。
+- 唯一**共享且已改**的一处：`/file` 的**分帧容量**从 4KB 提到 256KB（`net::STREAM_CHUNK`）。
+  它只影响"一帧多少字节"，不改返回总量、不改短读语义 —— 但改完必须跑一次
+  `cargo test --test mirror_hydrate -- --nocapture`（见第 5 节）。
+- 另一处共享：`credential::peer_tokens()`（token → id 的**缓存**）。它服务 `/file`、`/tree`、
+  `/push/*` 的全部认人，失效靠 `write_vault` 里的版本号 —— **解除配对之后旧 token 必须立刻
+  查不出来**，这条是安全红线，不能为了省几次读盘把它降级成"按时间过期"。
+
 ## 5. 怎么验
 
 ```bash

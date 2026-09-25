@@ -154,6 +154,13 @@ pub struct UpdateSettingsRequest {
     /// 是否允许本机为群聊中转消息（设置里的「允许为群聊中转消息」，默认关）。
     #[serde(default)]
     pub group_relay: bool,
+    /// 接收推送的并发数（设置里的「传输并发数」）。缺省 4，取值域由
+    /// `config::clamp_transfer_workers` 夹住（手改配置文件也不会越界）。
+    #[serde(default = "config::default_transfer_workers")]
+    pub transfer_workers: u32,
+    /// 大文件分块大小（MB，设置里的「分块大小」）。缺省 4。
+    #[serde(default = "config::default_transfer_block_mb")]
+    pub transfer_block_mb: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +356,8 @@ async fn update_settings(
         config.orb_shape = req.orb_shape;
         config.auto_broadcast_new = req.auto_broadcast_new;
         config.group_relay = req.group_relay;
+        config.transfer_workers = config::clamp_transfer_workers(req.transfer_workers);
+        config.transfer_block_mb = config::clamp_transfer_block_mb(req.transfer_block_mb);
         config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
     }
 
@@ -1287,6 +1296,21 @@ async fn peer_tree(
 // Download commands (F-40 / F-44)
 // ---------------------------------------------------------------------------
 
+/// 对端文件坐标（`peer_fs` 只认这个结构）：远端下载按它一段段要字节。
+fn peer_file_of(
+    peer: &crate::config::PeerDevice,
+    share_id: &str,
+    path_in_share: &str,
+    token: &str,
+) -> peer_fs::PeerFile {
+    peer_fs::PeerFile {
+        base: net::peer_base(&peer.ip, peer.port),
+        token: token.to_string(),
+        share_id: share_id.to_string(),
+        path: path_in_share.to_string(),
+    }
+}
+
 /// Download a file from a remote peer (P1 remote browsing download).
 #[tauri::command]
 async fn download_from_peer(
@@ -1320,28 +1344,95 @@ async fn download_from_peer(
         }
         DownloadMode::Direct => config::unique_path(&download_dir, &file_name),
     };
-    let url = format!(
-        "{}/file?share={}&path={}",
-        net::peer_base(&peer.ip, peer.port),
-        share_id,
-        urlencode(&path_in_share)
-    );
-
-    let resp = net::client()
-        .get(&url)
-        .bearer_auth(&token)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("下载失败: HTTP {}", resp.status()));
-    }
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-    if let Some(parent) = target_dir.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
-    }
-    tokio::fs::write(&target_dir, &bytes).await.map_err(|e| e.to_string())?;
+    let file_ref = peer_file_of(&peer, &share_id, &path_in_share, &token);
+    let bytes = stream_peer_file(&peer_fs::client(), &file_ref, &target_dir).await?;
+    info!(target = %target_dir.display(), bytes, "file downloaded");
     Ok(target_dir.to_string_lossy().to_string())
+}
+
+/// 把对端共享项里的一个文件**流式**写到 `target`：先写 `<name>.orbdrop-part`、写完再原子改名。
+///
+/// 为什么不是"`resp.bytes()` 读到内存再写盘"（曾经就是这么写的）：一个 4GB 的蓝光原盘就是
+/// 4GB 常驻内存，内存不够时表现为"下载失败"甚至进程被杀。现在按 `peer_fs::READ_CHUNK`
+/// （4MB，与镜像水合同一条粒度）一段段要、顺着写，内存只与一块挂钩。
+///
+/// 返回落盘的字节数。失败时**不留残骸**：`.part` 会被删掉（这条路上没有续传记录，
+/// 留着一个"半成品"只会在下载目录里堆着）。
+///
+/// `pub`：它被集成测试直接调（这条路上过"整份进内存"的坑，得有东西钉着）。
+pub async fn stream_peer_file(
+    client: &reqwest::Client,
+    file: &peer_fs::PeerFile,
+    target: &std::path::Path,
+) -> Result<u64, String> {
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("建目录失败: {e}"))?;
+    }
+    let part = target.with_file_name(format!(
+        "{}.orbdrop-part",
+        target
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "download".into())
+    ));
+    let mut out = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&part)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => return Err(format!("建临时文件失败: {e}")),
+    };
+
+    let mut offset: u64 = 0;
+    let mut result: Result<(), String> = Ok(());
+    {
+        use tokio::io::AsyncWriteExt as _;
+        loop {
+            let want = peer_fs::READ_CHUNK;
+            match peer_fs::fetch_file_range(client, file, offset, want).await {
+                Ok(bytes) => {
+                    if bytes.is_empty() {
+                        break;
+                    }
+                    if let Err(e) = out.write_all(&bytes).await {
+                        result = Err(format!("写入失败: {e}"));
+                        break;
+                    }
+                    offset += bytes.len() as u64;
+                    // 短读 = 到文件末尾（服务端按 `len` 截断，见 `peer_fs::fetch_file_range`）。
+                    if (bytes.len() as u64) < want {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        if result.is_ok() {
+            if let Err(e) = out.flush().await {
+                result = Err(format!("落盘失败: {e}"));
+            } else if let Err(e) = out.sync_all().await {
+                result = Err(format!("落盘失败: {e}"));
+            }
+        }
+    }
+    drop(out);
+
+    if let Err(e) = result {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(e);
+    }
+    tokio::fs::rename(&part, target)
+        .await
+        .map_err(|e| format!("改名失败: {e}"))?;
+    Ok(offset)
 }
 
 #[tauri::command]

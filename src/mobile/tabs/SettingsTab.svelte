@@ -17,6 +17,13 @@
   // 下载模式与"添加后自动共享"是本页自己的编辑态，保存时一起写回。
   let downloadMode = $state<AppSettings["downloadMode"]>("Direct");
   let autoBroadcast = $state(false);
+  /**
+   * 「传输」两项（后端 `AppSettings.transferWorkers` / `transferBlockMb`）：与下载模式同一路数 ——
+   * 不在 `store.form()` 里，是本页自己的编辑态，保存时夹进后端的取值域再写回。
+   * 数字输入按字符串收（用户可以删空再填），与「监听端口」那一行同一个做法。
+   */
+  let transferWorkers = $state("4");
+  let transferBlockMb = $state("4");
 
   // 「本机在线」用本地镜像而不是那份拉取结果：改它的唯一入口就是下面那颗开关，
   // 失败要能弹回来，而拉取结果从拿到那一刻起就可能过期。
@@ -32,6 +39,8 @@
       saved = s;
       downloadMode = s.downloadMode;
       autoBroadcast = s.autoBroadcastNew;
+      transferWorkers = String(s.transferWorkers);
+      transferBlockMb = String(s.transferBlockMb);
       store.resetForm({ deviceName: s.deviceName, port: s.port });
     } catch (e) {
       loadError = e instanceof Error ? e.message : String(e);
@@ -71,6 +80,14 @@
     if (!(await setOnline(el.checked))) el.checked = online;
   }
 
+  /** 数字输入（传输那两项）：编辑态是字符串，保存时取数字并夹进后端的取值域；空 / 非法退回上次的值。 */
+  function clampNum(raw: string, lo: number, hi: number, fallback: number): number {
+    const digits = raw.replace(/\D/g, "");
+    if (!digits) return fallback;
+    const n = Number(digits);
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : hi;
+  }
+
   async function save(): Promise<void> {
     const f = form;
     if (!saved || !f || saving) return;
@@ -84,11 +101,15 @@
         downloadMode,
         autoBroadcastNew: autoBroadcast,
         online,
+        transferWorkers: clampNum(transferWorkers, 1, 8, saved.transferWorkers),
+        transferBlockMb: clampNum(transferBlockMb, 1, 32, saved.transferBlockMb),
       });
       // 后端会规范化（端口被占时顺延、名字裁剪），保存后再读一次让表单跟着真值走。
       saved = next;
       downloadMode = next.downloadMode;
       autoBroadcast = next.autoBroadcastNew;
+      transferWorkers = String(next.transferWorkers);
+      transferBlockMb = String(next.transferBlockMb);
       store.resetForm({ deviceName: next.deviceName, port: next.port });
       store.toast("设置已保存", "check");
     } catch (e) {
@@ -175,6 +196,34 @@
               <span class="rdesc">每次下载前选择保存位置。</span>
             </span>
           </label>
+        </div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-label"><span>传输</span></div>
+      <div class="card gcard">
+        <div class="srow">
+          <span class="slabel">传输并发数</span>
+          <input
+            class="input num"
+            inputmode="numeric"
+            aria-label="传输并发数"
+            value={transferWorkers}
+            oninput={(e: Event) => (transferWorkers = (e.currentTarget as HTMLInputElement).value)}
+          />
+          <p class="shelp">一次接收同时跑几路传输；取值 1–8，默认 4，超出范围保存时自动夹住。</p>
+        </div>
+        <div class="srow">
+          <span class="slabel">分块大小（MB）</span>
+          <input
+            class="input num"
+            inputmode="numeric"
+            aria-label="分块大小（MB）"
+            value={transferBlockMb}
+            oninput={(e: Event) => (transferBlockMb = (e.currentTarget as HTMLInputElement).value)}
+          />
+          <p class="shelp">大文件按它切片、片与片之间并行；取值 1–32，默认 4，超出范围保存时自动夹住。</p>
         </div>
       </div>
     </div>
