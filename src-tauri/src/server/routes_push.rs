@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -16,6 +17,7 @@ use tracing::{info, warn};
 use crate::net;
 use crate::state::AppState;
 use crate::transfer::push_job::{DownloadTarget, InboundInvite};
+use crate::transfer::stream::StreamRequest;
 use crate::transfer::{accept_invite, reject_invite_with, schedule_invite_timeout, INVITE_TTL};
 use crate::ws::events::{FileEntry, PeerInfo, WsEvent};
 use crate::ws::session::peer_id_from_token;
@@ -41,6 +43,9 @@ pub struct InviteBody {
     #[serde(default = "one_item")]
     count: usize,
     files: Vec<FileEntry>,
+    /// 发送方支持的能力位（见 `WsEvent::PushInvite::caps`）。老对端不带 → 空 → 走老循环。
+    #[serde(default)]
+    caps: Vec<String>,
 }
 
 fn one_item() -> usize {
@@ -100,6 +105,7 @@ pub async fn push_invite_handler(
         is_dir: body.is_dir,
         count: body.count,
         files: body.files,
+        caps: body.caps,
         // ip 取自 TCP 来源（不可伪造），端口用发送方自报的服务端口 —— 但**本机自己的监听
         // 端点不能记**：NAT 后面的对端（安卓模拟器）回连进来时，来源地址在**本机**这一侧
         // 就是本机自己（见 `net::observed_dial_target`）。留一个指向自己的回执地址，等于
@@ -217,7 +223,7 @@ pub async fn push_download_handler(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
 
-    let (source_path, peer_paired, peer_id) = match state.push.download_target(id, file_path) {
+    let (source_path, peer_paired, peer_id, cancel) = match state.push.download_target(id, file_path) {
         // 这条推送已经被发送方取消 / 传完了。
         DownloadTarget::Missing => {
             return Err((StatusCode::GONE, "推送不存在或已取消".into()));
@@ -227,26 +233,37 @@ pub async fn push_download_handler(
         DownloadTarget::NotInManifest => {
             return Err((StatusCode::NOT_FOUND, "文件不在这次推送里".into()));
         }
-        DownloadTarget::Found { path, peer_paired, peer_id } => (path, peer_paired, peer_id),
+        DownloadTarget::Found { path, peer_paired, peer_id, cancel } => {
+            (path, peer_paired, peer_id, cancel)
+        }
     };
     authorize(&state, &headers, peer_paired, &peer_id)?;
 
-    let canonical = source_path
-        .canonicalize()
-        .map_err(|_| (StatusCode::NOT_FOUND, "文件不存在".into()))?;
-    if !canonical.is_file() {
-        return Err((StatusCode::NOT_FOUND, "文件不存在".into()));
-    }
-
-    let mut file = tokio::fs::File::open(&canonical)
+    // 清单里存的**已经是解析过的绝对路径**（见 `manifest_for_paths`）：这里不再
+    // `canonicalize()`。那是每请求一次逐段路径解析（Windows 上一次几毫秒），而路径的
+    // 安全边界本来就是"清单白名单"，不是"再解析一遍" —— 清单里没有的路径一行都取不到。
+    let mut file = tokio::fs::File::open(&source_path)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("文件打开失败: {e}")))?;
 
-    let file_size = file
+    let meta = file
         .metadata()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("元数据读取失败: {e}")))?
-        .len();
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("元数据读取失败: {e}")))?;
+    // 打开之后再看一次类型：源目录被换成一个同名目录时，`open` 在 Windows 上可能成功。
+    if !meta.is_file() {
+        return Err((StatusCode::NOT_FOUND, "文件不存在".into()));
+    }
+    let file_size = meta.len();
+
+    // `offset` 越过当前长度 = 源文件在清单建好之后变小或被换掉了。
+    //
+    // **必须回一个明确的错**：老写法会返回一段 0 字节的 200，而接收端那边的循环是
+    // "没到 size 就再要一次"，于是两边进入死循环（对端狂发请求、我们狂回空包，谁也不报错）。
+    // 409 让接收端当场把这条文件判成"源已变"。
+    if offset > 0 && offset >= file_size {
+        return Err((StatusCode::CONFLICT, "源文件在传输中被修改".into()));
+    }
 
     if offset > 0 {
         use tokio::io::AsyncSeekExt;
@@ -258,13 +275,70 @@ pub async fn push_download_handler(
     use tokio::io::AsyncReadExt;
     let remaining = file_size.saturating_sub(offset);
     let limited = file.take(remaining);
-    let reader = CancelAwareReader {
-        inner: limited,
-        state: state.clone(),
-        invite_id: id.clone(),
-    };
-    Ok(Body::from_stream(ReaderStream::new(reader)))
+    let reader = CancelAwareReader { inner: limited, cancel };
+    Ok(Body::from_stream(ReaderStream::with_capacity(
+        reader,
+        crate::net::STREAM_CHUNK,
+    )))
 }
+
+/// POST /push/stream —— 新数据面（`caps` 里有 `stream1` 的对端才走这条）。
+///
+/// 一次请求带一批**块任务**（大文件的一块，或一批小文件各自的一整块），响应是一串分帧记录
+/// （见 `transfer::stream` 的模块注释）。认人与 `/push/download` 同一套：拿第一条任务定身份，
+/// 之后的每条任务再各自查一次清单白名单（发送端逐条查，见 `stream_send::serve`）。
+///
+/// 与老端点一样挂在**公开**路由上（未绑定的接收方没有 token 可带），认人就地做。
+pub async fn push_stream_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<StreamRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let Some(first) = req.tasks.first() else {
+        return Err((StatusCode::BAD_REQUEST, "没有任务".into()));
+    };
+    let (peer_paired, peer_id) = match state.push.download_target(&req.id, &first.path) {
+        DownloadTarget::Missing => {
+            return Err((StatusCode::GONE, "推送不存在或已取消".into()));
+        }
+        DownloadTarget::NotInManifest => {
+            return Err((StatusCode::NOT_FOUND, "文件不在这次推送里".into()));
+        }
+        DownloadTarget::Found { peer_paired, peer_id, .. } => (peer_paired, peer_id),
+    };
+    authorize(&state, &headers, peer_paired, &peer_id)?;
+
+    // 参数护栏：块大小与任务条数都来自对端，**必须有上限** ——
+    // 块大小决定接收端要预留/校验的区间（也是发送端要一口气算完的哈希范围），
+    // 任务条数决定这一条请求要活多久。
+    if req.block_size == 0 || req.block_size > MAX_STREAM_BLOCK {
+        return Err((StatusCode::BAD_REQUEST, "块大小非法".into()));
+    }
+    if req.tasks.len() > MAX_STREAM_TASKS {
+        return Err((StatusCode::BAD_REQUEST, "任务太多".into()));
+    }
+
+    // 响应体由一条后台任务喂：它按任务顺序读源文件、边读边发（不把整块攒在内存里）。
+    // 通道有界（8 帧 ≈ 2MB）：对端读得慢时，这里就自然地压住读盘速度，不会为了"发得快"
+    // 把内存吃掉。
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let serve_state = state.clone();
+    crate::task::spawn("push stream", async move {
+        crate::transfer::stream_send::serve(&serve_state, &req, &tx).await;
+    });
+
+    let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|chunk| (Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)), rx))
+    }));
+    Ok(body)
+}
+
+/// 一次请求最多几条任务（小文件批的上限 + 余量）。
+const MAX_STREAM_TASKS: usize = 1024;
+/// 单块上限：块大小由接收方定，但**发送方也要守一道**（对端不正常时别把这一条请求拖成小时级）。
+const MAX_STREAM_BLOCK: u32 = 64 * 1024 * 1024;
 
 /// 下载端点的认人规则。
 ///
@@ -289,14 +363,18 @@ fn authorize(
     }
 }
 
-/// 流式读文件的包装：推送被取消时**就地断流**（返回 EOF），而不是把剩下的字节读完。
+/// 流式读文件的包装：推送被取消（或这条 job 已经收尾被清掉）时**就地断流**（返回 EOF），
+/// 而不是把剩下的字节读完。
 ///
 /// 接收方看到的是"响应提前结束"，它会退回重试并拿到 410，于是两边在对端取消后
 /// 几百毫秒内一起收手；不这么做的话，取消一个正在传的大文件要等它传完才见效。
+///
+/// 判据是**原子量**（`PushJob::cancel`，由 `remove_job` 置位）而不是 `has_job()`：
+/// 这里每读一帧都要问一次（256KB 帧 = 千兆下每秒几百次），而 `has_job` 每次都要抢
+/// 全局互斥锁；原子读不碰锁，语义还更全（取消 / 完成 / 失败收尾全都是 `remove_job`）。
 struct CancelAwareReader {
     inner: tokio::io::Take<tokio::fs::File>,
-    state: Arc<AppState>,
-    invite_id: String,
+    cancel: Arc<AtomicBool>,
 }
 
 impl AsyncRead for CancelAwareReader {
@@ -305,7 +383,7 @@ impl AsyncRead for CancelAwareReader {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        if !self.state.push.has_job(&self.invite_id) {
+        if self.cancel.load(Ordering::Relaxed) {
             return Poll::Ready(Ok(())); // EOF
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)

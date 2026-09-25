@@ -63,6 +63,12 @@
    * 转一份（最多 3 跳），代价是本机的上行带宽 —— 所以默认关，由用户自己选。
    */
   let groupRelay = $state(false);
+  /**
+   * 接收推送时一次跑几路传输（后端 `AppSettings.transferWorkers`，默认 4，取值域 1..=8）。
+   */
+  let transferWorkers = $state(4);
+  /** 大文件的分块大小（MB，后端 `AppSettings.transferBlockMb`，默认 4，取值域 1..=32）。 */
+  let transferBlockMb = $state(4);
   let bcExePath = $state('');
   /** 折叠态悬浮形态：圆球（现有的 62px 球）/ 圆角矩形悬浮框（设备分页卡片）。 */
   let orbShape = $state<OrbShape>('circle');
@@ -117,11 +123,25 @@
         autoStart = s.autoStart;
         autoBroadcastNew = s.autoBroadcastNew;
         groupRelay = s.groupRelay;
+        transferWorkers = s.transferWorkers;
+        transferBlockMb = s.transferBlockMb;
         bcExePath = s.bcExePath ?? '';
         orbShape = s.orbShape;
       }
     });
   });
+
+  /**
+   * 数字输入框（传输的两项）的取值：进保存前一律取整并夹进后端的取值域。
+   * 输入框可以被手填、清空或贴进任意文本 —— 清空时 `bind:value` 给的是 `null`
+   * （Svelte 对 `<input type="number">` 的空值就是这么转的），非数字给 `undefined`，
+   * 两种都退回默认值，不把"清空"悄悄写成下限。
+   */
+  function clampNum(v: number | null | undefined, lo: number, hi: number, fallback: number): number {
+    if (v == null) return fallback;
+    const n = Math.trunc(Number(v));
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fallback;
+  }
 
   async function save() {
     saving = true;
@@ -134,6 +154,8 @@
         autoStart,
         autoBroadcastNew,
         groupRelay,
+        transferWorkers: clampNum(transferWorkers, 1, 8, 4),
+        transferBlockMb: clampNum(transferBlockMb, 1, 32, 4),
         bcExePath,
         orbShape,
       });
@@ -158,6 +180,8 @@
       autoStart = s.autoStart;
       autoBroadcastNew = s.autoBroadcastNew;
       groupRelay = s.groupRelay;
+      transferWorkers = s.transferWorkers;
+      transferBlockMb = s.transferBlockMb;
       bcExePath = s.bcExePath ?? '';
       orbShape = s.orbShape;
     }
@@ -208,6 +232,22 @@
     <div class="field">
       <label for="port">服务端口<Hint>被占用时自动 +1 探测，实际端口显示在底部状态栏。</Hint></label>
       <input class="input num" id="port" type="number" bind:value={port} />
+    </div>
+    <div class="field">
+      <label for="transferWorkers">传输并发数<Hint>
+        一次接收同时跑几路传输（一块 / 一个文件算一路）。局域网上 4 就够把千兆喂饱，
+        调到 <strong>8</strong> 以上只会把连接、句柄与磁盘队列都堆起来，反而互相拖。
+        取值 <strong>1–8</strong>，超出范围会在保存时夹住。
+      </Hint></label>
+      <input class="input num" id="transferWorkers" type="number" min="1" max="8" bind:value={transferWorkers} />
+    </div>
+    <div class="field">
+      <label for="transferBlockMb">分块大小（MB）<Hint>
+        大文件按它切片、片与片之间并行。<strong>4MB</strong> 在千兆下约 33ms 一块 ——
+        取消 / 失败的可感知延迟就在这个尺度，同时「一块要重传」的代价也不大。
+        取值 <strong>1–32</strong>，超出范围会在保存时夹住；再大就不是并行，而是「一次传半个文件」。
+      </Hint></label>
+      <input class="input num" id="transferBlockMb" type="number" min="1" max="32" bind:value={transferBlockMb} />
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">

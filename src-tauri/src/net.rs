@@ -458,13 +458,25 @@ pub fn trust() -> Arc<Trust> {
     TRUST.clone()
 }
 
+/// 流式响应一帧多大（`ReaderStream::with_capacity` 的容量）。
+///
+/// `ReaderStream::new` 用的是 tokio-util 的默认值 **4096**：每 4KB 就要过一次
+/// `tokio::fs::File` 的阻塞任务派发（`spawn_blocking`），而且 rustls 的 TLS 记录被压到 4KB
+/// —— 1GB 文件就是 26 万次派发 + 26 万条小记录。256KB 把这两项都除 64，且不会推迟首字节
+/// 送达（读满多少发多少，不等填满）。
+pub const STREAM_CHUNK: usize = 256 * 1024;
+
 /// 拨号到对端用的 reqwest 客户端构造器（已经装好 pinning 校验器）。
 ///
 /// 各处超时不同（探活 1.5s、配对邀请 75s、拖拽 30s），所以给的是 builder 而不是
 /// 一个成品客户端；`client()` 是"没有特殊超时需求"时的那一个。
 pub fn client_builder() -> reqwest::ClientBuilder {
     install_crypto_provider();
-    reqwest::Client::builder().use_preconfigured_tls((*client_config(trust())).clone())
+    reqwest::Client::builder()
+        .use_preconfigured_tls((*client_config(trust())).clone())
+        // 数据面全是小写入（256KB 帧、4MB 块），默认的 Nagle 会和延迟 ACK 互相等：
+        // 关掉它，写多少发多少。对端那一侧另有 `set_nodelay`（见 `dispatch_conn`）。
+        .tcp_nodelay(true)
 }
 
 pub fn client() -> reqwest::Client {
@@ -576,6 +588,10 @@ async fn dispatch_conn(
     if read == 0 {
         return Ok(()); // 对面连上就关了
     }
+
+    // 一进来就关 Nagle：这条连接上跑的是文件字节（256KB 帧）与 WebDAV 的小请求，两者都不
+    // 需要"攒一攒再发"，而 Nagle 撞上对端延迟 ACK 会平白多出几十毫秒的空等。
+    let _ = stream.set_nodelay(true);
 
     if head[0] == TLS_HANDSHAKE {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls);

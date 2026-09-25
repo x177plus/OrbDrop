@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// 凭据文件（vault）的名字：落在 `config::data_dir()` 里，也就是 `config.toml` 旁边
 /// （Windows `%LOCALAPPDATA%\OrbDrop\`，macOS `~/Library/Application Support/OrbDrop/`）。
@@ -52,6 +55,23 @@ pub struct PeerCredential {
 /// （或一个配对撞上一次解除配对）同时收尾时，各自基于同一份旧映射写回，会**静默丢掉**
 /// 对方那条 token。写路径自己用不取锁的 `read_unlocked`（parking_lot 的锁不可重入）。
 static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 每次 vault 落盘 +1（见 `write_vault`）。派生缓存的失效**只看它**，不看时间。
+static STORE_VERSION: AtomicU64 = AtomicU64::new(0);
+
+/// id → token 的派生缓存，附带它生成时的 `(vault 路径, 版本号)`。
+///
+/// 为什么要缓存：`peer_id_from_token` 在**每个** HTTP 请求上都被调一次（推送取文件、
+/// 浏览 `/tree`、镜像水合每 4MB 一次），而它下面那条路是"读整个 vault 文件 + 解析 +
+/// 建表"，还全程持 `STORE_LOCK` —— 一个 2 万文件的推送原本就是 2 万次读盘。
+///
+/// 为什么带路径：库内单元测试按**线程**分 vault 文件（见 `vault_path`），只key 版本号
+/// 会让 A 线程读到 B 线程的凭据表。路径参与比较后，每个测试自己的文件各缓存一份。
+///
+/// **读失败绝不入缓存**：瞬时读失败（文件被占）不是"本机没有配对"，缓存下来等于把
+/// 一次抖动变成"到下次写凭据之前谁都进不来"。
+static TOKEN_CACHE: Mutex<Option<(PathBuf, u64, Arc<HashMap<String, String>>)>> =
+    Mutex::new(None);
 
 fn b64() -> base64::engine::general_purpose::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
@@ -253,6 +273,10 @@ fn write_vault(path: &Path, peers: &HashMap<String, PeerCredential>) -> Result<(
     let text = render_vault(peers)?;
     crate::config::write_atomic(path, text.as_bytes())
         .with_context(|| format!("写入凭据文件失败: {}", path.display()))?;
+    // 每一次落盘都让派生缓存作废（见 `peer_tokens`）。**必须在这里**：所有写路径
+    // （配对/解除配对/改 token/换设备 id/启动期格式升级）都收敛到这一个函数，
+    // 将来新加的写路径也自动被覆盖 —— 漏一处的后果是"解除配对后旧 token 还能进"。
+    STORE_VERSION.fetch_add(1, Ordering::SeqCst);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -338,6 +362,34 @@ pub fn load_peers() -> Result<HashMap<String, String>> {
         .into_iter()
         .map(|(id, cred)| (id, cred.token))
         .collect())
+}
+
+/// `load_peers()` 的**热路径版本**：同一份语义，走一条版本号校验过的缓存。
+///
+/// 每个 HTTP 请求（`auth_middleware` 与 `/push/*` 的认人）都会用它，所以它不能每次
+/// 读盘。失效是**写路径驱动**的（`write_vault` 里 `STORE_VERSION.fetch_add`）：解除配对、
+/// 改 token 之后旧 token 立刻查不出来，这条不能含糊 —— 缓存比安全优先是错的。
+///
+/// 读失败返回空表（= "不认识任何 token"），与调用方原来的 `load_peers().ok()` 行为一致，
+/// 但**不写进缓存**。
+pub fn peer_tokens() -> Arc<HashMap<String, String>> {
+    let path = vault_path();
+    let version = STORE_VERSION.load(Ordering::SeqCst);
+    if let Some((cached_path, cached_version, map)) = TOKEN_CACHE.lock().as_ref() {
+        if *cached_version == version && *cached_path == path {
+            return map.clone();
+        }
+    }
+    let map = match load_peers() {
+        Ok(map) => map,
+        Err(e) => {
+            warn!("凭据读取失败（本次按“无配对”处理，不缓存）: {e}");
+            return Arc::new(HashMap::new());
+        }
+    };
+    let map = Arc::new(map);
+    *TOKEN_CACHE.lock() = Some((path, version, map.clone()));
+    map
 }
 
 /// Set (insert or update) a single peer's token. 指纹不在时（老记录）保持不变。

@@ -87,6 +87,16 @@ export interface AppSettings {
    * 每转一份就占一份上行带宽，而"转不转"是用户自己的取舍，不该由程序替他决定。
    */
   groupRelay: boolean;
+  /**
+   * 接收推送时的**传输并发数**（设置里的「传输并发数」，默认 4）：一次接收同时跑几路传输。
+   * 后端 `config::clamp_transfer_workers` 把取值域夹在 1..=8 —— 再高只会把连接、句柄与磁盘队列都堆起来。
+   */
+  transferWorkers: number;
+  /**
+   * 大文件的**分块大小**（MB，设置里的「分块大小（MB）」，默认 4）：大文件按它切片、片与片之间并行。
+   * 后端 `config::clamp_transfer_block_mb` 把取值域夹在 1..=32。
+   */
+  transferBlockMb: number;
 }
 
 /** 折叠态悬浮形态：圆球 / 圆角矩形悬浮框（后端 `config::OrbShape` 的同一套小写字面量）。 */

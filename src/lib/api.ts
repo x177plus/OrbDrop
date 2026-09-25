@@ -30,7 +30,7 @@ export function getSettings(): Promise<AppSettings> {
   return invoke('get_settings');
 }
 
-export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; downloadMode: string; deviceName: string; autoStart: boolean; bcExePath: string; autoBroadcastNew: boolean; groupRelay: boolean }): Promise<AppSettings> {
+export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; downloadMode: string; deviceName: string; autoStart: boolean; bcExePath: string; autoBroadcastNew: boolean; groupRelay: boolean; transferWorkers: number; transferBlockMb: number }): Promise<AppSettings> {
   return invoke('update_settings', { req: s });
 }
 

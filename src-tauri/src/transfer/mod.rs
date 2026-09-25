@@ -1,6 +1,10 @@
+pub mod download;
 pub mod push_job;
 pub mod resume;
+pub mod stream;
+pub mod stream_send;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,7 +46,11 @@ pub struct PushSource {
     pub name: String,
     pub files: Vec<FileEntry>,
     /// 清单相对路径 → 本机绝对路径（与 `files` 一一对应）。
-    pub sources: Vec<(String, PathBuf)>,
+    ///
+    /// 是**表**而不是列表：下载端点每次请求都要按路径找一条（见 `download_target`），
+    /// 列表就是每请求一次线性扫描 —— 2 万文件的目录配 2 万次请求，累计约 2×10⁸ 次
+    /// 字符串比较。路径在清单里唯一（同名去重保证了这一点），所以键不会撞。
+    pub sources: HashMap<String, PathBuf>,
     pub total: u64,
     /// 清单是否**权威**（下载端点按清单取文件）。单文件推送是唯一的例外：
     /// 对端只有一条名字，没有清单。
@@ -75,7 +83,7 @@ pub async fn manifest_for_paths(paths: &[PathBuf]) -> Result<PushSource, String>
     };
 
     let mut files: Vec<FileEntry> = Vec::new();
-    let mut sources: Vec<(String, PathBuf)> = Vec::new();
+    let mut sources: HashMap<String, PathBuf> = HashMap::new();
     let mut total = 0u64;
     let mut skipped = 0usize;
     let mut used: Vec<String> = Vec::new();
@@ -118,16 +126,32 @@ pub async fn manifest_for_paths(paths: &[PathBuf]) -> Result<PushSource, String>
 
         if meta.is_file() {
             single_file = paths.len() == 1;
-            files.push(FileEntry { path: prefix.clone(), size: meta.len() });
-            sources.push((prefix, path.clone()));
+            files.push(FileEntry {
+                path: prefix.clone(),
+                size: meta.len(),
+                mtime: stream::mtime_secs(&meta),
+            });
+            // 清单里存**已经解析过的绝对路径**：下载端点每次请求都要拿它开文件，而
+            // `canonicalize` 在 Windows 上是逐段解析（20 万次请求就是白白烧掉的时间）。
+            // 解析失败（清单建好前被删/ACL 挡住）退回原路径：这条文件照样进清单，
+            // 真取不到时由下载端点如实报"文件不存在"，而不是在这里静默把它抹掉。
+            let abs = tokio::fs::canonicalize(path)
+                .await
+                .unwrap_or_else(|_| path.clone());
+            sources.insert(prefix, abs);
             total += meta.len();
         } else {
             let (sub, sub_total, sub_skipped) = collect_dir_manifest(path).await?;
             skipped += sub_skipped;
+            // 目录**只解析根一次**：走查交回来的相对路径都是 `read_dir` 亲眼见过的条目，
+            // 逐条再 `canonicalize` 一遍（2 万条 = 2 万次逐段解析）换不到任何东西。
+            let root = tokio::fs::canonicalize(path)
+                .await
+                .unwrap_or_else(|_| path.clone());
             for f in sub {
                 let rel = format!("{prefix}/{}", f.path);
-                sources.push((rel.clone(), path.join(&f.path)));
-                files.push(FileEntry { path: rel, size: f.size });
+                sources.insert(rel.clone(), root.join(&f.path));
+                files.push(FileEntry { path: rel, size: f.size, mtime: f.mtime });
             }
             total += sub_total;
         }
@@ -244,7 +268,11 @@ async fn collect_dir_manifest(dir: &Path) -> Result<(Vec<FileEntry>, u64, usize)
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default();
             local_total += meta.len();
-            local.push(FileEntry { path: rel, size: meta.len() });
+            local.push(FileEntry {
+                path: rel,
+                size: meta.len(),
+                mtime: stream::mtime_secs(&meta),
+            });
         }
         if !intact {
             skipped += 1;
@@ -390,6 +418,7 @@ pub async fn push_paths(
             is_dir: source.is_dir,
             count: source.count,
             files: source.files.clone(),
+            caps: vec![push_job::CAP_STREAM.to_string()],
         };
         spawn_invite_delivery(state.clone(), peer, invite_id, event, server_port);
     }
@@ -655,6 +684,7 @@ pub fn accept_invite(state: Arc<AppState>, invite_id: &str) -> Result<(), String
                 is_dir: inv.is_dir,
                 count: inv.count,
                 files: inv.files.clone(),
+                caps: inv.caps.clone(),
                 callback: Some(callback),
                 responder: None,
             },
@@ -739,6 +769,8 @@ pub fn cancel_receive(state: &AppState, invite_id: &str) {
         0,
         Some("接收方已取消".into()),
     );
+    // 取消 = "下次接着传"，所以那些还没落盘的进度必须现在就落地（见 `ResumeStore::flush`）。
+    state.push.resume.flush();
     warn!(%invite_id, "receive cancelled; resume record kept");
 }
 

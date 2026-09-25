@@ -157,6 +157,10 @@ pub struct AppSettings {
     pub auto_broadcast_new: bool,
     /// 是否允许本机为群聊**中转**消息（跨网段那一档，默认关）。见 `Config::group_relay`。
     pub group_relay: bool,
+    /// 接收推送时的并发数（同时几路在拉）。见 `Config::transfer_workers`。
+    pub transfer_workers: u32,
+    /// 分块大小（MB）：大文件按它切块并行。见 `Config::transfer_block_mb`。
+    pub transfer_block_mb: u32,
 }
 
 impl Default for AppSettings {
@@ -172,6 +176,8 @@ impl Default for AppSettings {
             orb_shape: OrbShape::default(),
             auto_broadcast_new: false,
             group_relay: false,
+            transfer_workers: default_transfer_workers(),
+            transfer_block_mb: default_transfer_block_mb(),
         }
     }
 }
@@ -311,6 +317,39 @@ pub struct Config {
     /// 广播出去（对端看到的始终是它自己的名字，见 `lib.rs::list_devices`）。
     #[serde(default)]
     pub device_remarks: HashMap<String, String>,
+    /// 接收推送时的并发数（同一个邀请同时几路在拉）。
+    ///
+    /// 为什么要有这个旋钮：小文件多的时候，时间几乎全花在"每个文件的往返"上，几路并行
+    /// 是唯一能把这段压缩掉的手段；但同一台机器上同时收几笔推送、或磁盘本就吃紧时，并发
+    /// 太高反而互相拖。默认 4：局域网上足够把千兆喂饱，又不至于把机械盘压成随机读。
+    /// 上限 8（见 `clamp_transfer_workers`）—— 再高只会把连接、句柄与磁盘队列都堆起来。
+    #[serde(default = "default_transfer_workers")]
+    pub transfer_workers: u32,
+    /// 大文件的**分块大小**（MB）。大文件按它切片、片与片之间并行。
+    ///
+    /// 4MB：千兆下一块约 33ms（取消/失败的可感知延迟就在这个尺度），同时不至于让
+    /// "一块要重传"的代价太大。上限 32（见 `clamp_transfer_block_mb`）：再大就不是并行、
+    /// 是"一次传半个文件"，失败重试的代价也随之涨上去。
+    #[serde(default = "default_transfer_block_mb")]
+    pub transfer_block_mb: u32,
+}
+
+/// 并发数的取值域（配置里存的可能是手改的任意数：用之前一律夹一次）。
+pub fn clamp_transfer_workers(v: u32) -> u32 {
+    v.clamp(1, 8)
+}
+
+/// 分块大小的取值域（MB）。
+pub fn clamp_transfer_block_mb(v: u32) -> u32 {
+    v.clamp(1, 32)
+}
+
+pub fn default_transfer_workers() -> u32 {
+    4
+}
+
+pub fn default_transfer_block_mb() -> u32 {
+    4
 }
 
 fn default_port() -> u16 {
@@ -346,6 +385,8 @@ impl Config {
             orb_shape: self.orb_shape,
             auto_broadcast_new: self.auto_broadcast_new,
             group_relay: self.group_relay,
+            transfer_workers: clamp_transfer_workers(self.transfer_workers),
+            transfer_block_mb: clamp_transfer_block_mb(self.transfer_block_mb),
         }
     }
 
@@ -416,6 +457,8 @@ impl Default for Config {
             auto_broadcast_new: false,
             group_relay: false,
             device_remarks: HashMap::new(),
+            transfer_workers: default_transfer_workers(),
+            transfer_block_mb: default_transfer_block_mb(),
         }
     }
 }
@@ -988,6 +1031,8 @@ mod tests {
             bc_right: None,
             orb_center: Some(OrbPos { x: -1280, y: 40 }),
             orb_pos: None,
+            transfer_workers: default_transfer_workers(),
+            transfer_block_mb: default_transfer_block_mb(),
             orb_shape: OrbShape::Rect,
             online: false,
             auto_broadcast_new: true,

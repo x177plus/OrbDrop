@@ -15,6 +15,16 @@ pub struct FileEntry {
     /// Relative path from the pushed root, using '/' separators.
     pub path: String,
     pub size: u64,
+    /// 源文件的修改时刻（unix 秒）。
+    ///
+    /// 用来做**身份**：接收端拿它算续传键（`transfer::stream::resume_key`），并在传输前
+    /// 拿对端报的 `size`/`mtime` 核对"这份是不是清单里那一版" —— 源文件在邀请之后被改过就
+    /// 当场判这条失败，而不是拼出一份半新半旧的文件。
+    ///
+    /// `default`：老对端不带这个字段，读进来是 0 = "时间戳未知"（接收端据此跳过时间戳对账，
+    /// 行为退化成"只对大小"）。
+    #[serde(default)]
+    pub mtime: i64,
 }
 
 /// 「这次推送了几项」的缺省值：老对端不带这个字段时按"一项"算。
@@ -53,6 +63,12 @@ pub enum WsEvent {
         count: usize,
         /// Directory manifest; empty for single-file pushes.
         files: Vec<FileEntry>,
+        /// 发送方支持的能力位（`"stream1"` = 新的分帧并发协议 `POST /push/stream`）。
+        ///
+        /// 接收方据此选走哪条数据面：**不带**这个字段的对端（老版本）照旧走
+        /// `GET /push/download` 的逐文件串行循环，两边都能跑，滚动升级不需要同步。
+        #[serde(default)]
+        caps: Vec<String>,
     },
     /// Receiver → Sender: accept / reject an invitation.
     PushResponse {

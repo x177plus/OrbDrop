@@ -110,12 +110,13 @@ pub async fn run_inbound_session(state: Arc<AppState>, peer_id: String, ws: WebS
 /// online flag stale forever.
 pub fn peer_id_from_token(state: &AppState, token: &str) -> Option<String> {
     let own_id = state.config.lock().device_id.clone();
-    credential::load_peers().ok().and_then(|peers| {
-        peers
-            .iter()
-            .find(|(id, t)| t == &token && **id != own_id)
-            .map(|(id, _)| id.clone())
-    })
+    // `peer_tokens()` 是带版本失效的缓存版（见 `credential::peer_tokens`）：这条函数在
+    // **每个** HTTP 请求上都会被调一次，原来是"读盘 + 解析 + 建表"，2 万文件的推送就是
+    // 2 万次读盘。语义与 `load_peers()` 一字不差。
+    credential::peer_tokens()
+        .iter()
+        .find(|(id, t)| t == &token && *id != &own_id)
+        .map(|(id, _)| id.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +141,7 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
         WsEvent::PeerOffline { peer_id: _ } => {
             // WS drop itself drives offline; nothing to do here.
         }
-        WsEvent::PushInvite { invite_id, sender, name, size, is_dir, count, files } => {
+        WsEvent::PushInvite { invite_id, sender, name, size, is_dir, count, files, caps } => {
             // 身份以**这条会话**为准，不用载荷里自称的那个：长连接是 token 换来的，
             // 而载荷里的 sender.id 只是对端自己填的字符串。
             let known = state.get_peer(peer_id);
@@ -169,6 +170,7 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 is_dir,
                 count,
                 files,
+                caps,
                 callback,
                 responder: None,
             });

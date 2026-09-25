@@ -228,3 +228,64 @@ async fn old_peer_without_stat_falls_back_to_parent_listing() {
     let _ = std::fs::remove_file(&cfg);
     orbdrop_lib::server::stop_server(&state).await;
 }
+/// 对端文件**流式**落盘（`orbdrop_lib::stream_peer_file`）：分段要、写 `.part`、写完原子改名。
+///
+/// 钉住三件事：
+/// 1. 大于一个 `READ_CHUNK`（4MB）的文件能被**分段**拉全、逐字节一致（分段循环真的在转）；
+/// 2. 成功之后不留 `.part`；
+/// 3. 中途失败（对端说没有这个文件）**不留残骸** —— 下载目录里既没有目标文件、也没有 `.part`。
+#[tokio::test]
+async fn peer_file_streams_to_disk_in_chunks_and_leaves_no_litter() {
+    let root = std::env::temp_dir().join(format!("orbdrop_stream_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    // 9MB：跨 3 个 4MB 分片，正好把"短读 = 到末尾"这条判据走到。
+    let payload: Vec<u8> = (0..9 * 1024 * 1024).map(|b| (b % 251) as u8).collect();
+    std::fs::write(root.join("big.bin"), &payload).unwrap();
+
+    let (state, share_id, peer, _cfg) = state_with_share(3997, &root, 3997).await;
+    let port = orbdrop_lib::server::start_server(state.clone(), 3997)
+        .await
+        .expect("起服务");
+    credential::set_peer(&peer, "t").unwrap();
+
+    let out_dir = std::env::temp_dir().join(format!("orbdrop_stream_out_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let target = out_dir.join("copy.bin");
+    let file = peer_fs::PeerFile {
+        base: format!("http://127.0.0.1:{port}"),
+        token: "t".into(),
+        share_id: share_id.clone(),
+        path: "big.bin".into(),
+    };
+
+    let written = orbdrop_lib::stream_peer_file(&reqwest::Client::new(), &file, &target)
+        .await
+        .expect("流式下载应当成功");
+    assert_eq!(written, payload.len() as u64, "返回的字节数应当等于文件大小");
+    assert_eq!(std::fs::read(&target).unwrap(), payload, "内容必须逐字节一致");
+    assert!(
+        !out_dir.join("copy.bin.orbdrop-part").exists(),
+        "成功之后不该留 .part"
+    );
+
+    // 失败一次：对端没有这条路径 → 既不该有目标文件，也不该有 `.part`。
+    let missing = peer_fs::PeerFile {
+        path: "不存在.bin".into(),
+        ..file
+    };
+    let target2 = out_dir.join("missing.bin");
+    let err = orbdrop_lib::stream_peer_file(&reqwest::Client::new(), &missing, &target2)
+        .await
+        .expect_err("对端没有这个文件时应当报错");
+    assert!(err.contains("404") || err.contains("读取对端文件失败"), "错误信息要说清: {err}");
+    assert!(!target2.exists(), "失败不该留下目标文件");
+    assert!(
+        !out_dir.join("missing.bin.orbdrop-part").exists(),
+        "失败不该留下 .part"
+    );
+
+    orbdrop_lib::server::stop_server(&state).await;
+    credential::remove_peer(&peer).ok();
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}

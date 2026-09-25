@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -61,11 +62,19 @@ pub struct PushJob {
     pub name: String,
     pub is_dir: bool,
     /// 清单相对路径 → 本机绝对路径（服务端按它取文件，见 `download_target`）。
-    pub sources: Vec<(String, PathBuf)>,
+    ///
+    /// **表**而不是列表：下载端点每请求查一次（推一个 2 万文件的目录就是 2 万次查询）。
+    pub sources: HashMap<String, PathBuf>,
     pub status: PushStatus,
     pub created_at: Instant,
     /// 对端是否已配对：它决定了下载端点怎么认人（见 `routes_push`）。
     pub peer_paired: bool,
+    /// 这条 job 是不是已经作废（取消 / 已完成 / 失败被清掉）。
+    ///
+    /// 下载端点**每读一帧**都要问一次"还能不能继续发"，那是整份流的每一帧；拿
+    /// `PushStore::has_job` 问就是每 256KB 抢一次全局互斥锁。换成一个原子量：`remove_job`
+    /// 在这里置位，正在发的流下一帧就收手 —— 同样的即时性，零锁。
+    pub cancel: Arc<AtomicBool>,
 }
 
 impl PushJob {
@@ -77,7 +86,7 @@ impl PushJob {
         peer_name: String,
         name: String,
         is_dir: bool,
-        sources: Vec<(String, PathBuf)>,
+        sources: HashMap<String, PathBuf>,
         peer_paired: bool,
     ) -> Self {
         Self {
@@ -91,6 +100,7 @@ impl PushJob {
             status: PushStatus::Invited,
             created_at: Instant::now(),
             peer_paired,
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -105,6 +115,8 @@ pub struct InboundInvite {
     /// 发送方这次选了几项（>1 = 多选合并成的一条推送；通知文案用它）。
     pub count: usize,
     pub files: Vec<FileEntry>,
+    /// 发送方声明支持的能力位（见 `WsEvent::PushInvite::caps`）。
+    pub caps: Vec<String>,
     /// 发送方的地址（ip, 服务端口）：没有长连接时，进度/完成/取消这些回执要 POST 回去。
     ///
     /// ip 取自邀请请求的 TCP 来源（不可伪造），端口取自邀请体里发送方自报的服务端口 ——
@@ -118,7 +130,15 @@ pub struct InboundInvite {
     pub responder: Option<oneshot::Sender<bool>>,
 }
 
+/// 新数据面（分帧并发）的能力位。
+pub const CAP_STREAM: &str = "stream1";
+
 impl InboundInvite {
+    /// 走新协议还是老循环。判据只有一个：**对端说自己支持**（老对端不带这个位）。
+    pub fn supports_stream(&self) -> bool {
+        self.caps.iter().any(|c| c == CAP_STREAM)
+    }
+
     pub fn total_bytes(&self) -> u64 {
         if self.is_dir {
             self.files.iter().map(|f| f.size).sum()
@@ -138,7 +158,13 @@ pub enum DownloadTarget {
     Missing,
     /// 这条推送里没有这个相对路径（对端给错了，或想越过清单读别的文件）。
     NotInManifest,
-    Found { path: PathBuf, peer_paired: bool, peer_id: String },
+    Found {
+        path: PathBuf,
+        peer_paired: bool,
+        peer_id: String,
+        /// 这条 job 的作废标志（`remove_job` 置位）：流式读取按帧看它，见 `CancelAwareReader`。
+        cancel: Arc<AtomicBool>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -427,20 +453,15 @@ impl PushStore {
     }
 
     pub fn remove_job(&self, id: &str) {
-        self.jobs.lock().remove(id);
+        // 顺带置位"作废"标志：正在发的那条流是唯一看不到 `jobs` 变空的地方（它只按帧
+        // 检查那个原子量），不置位的话取消一个大文件要等它自己读完。
+        if let Some(job) = self.jobs.lock().remove(id) {
+            job.cancel.store(true, Ordering::SeqCst);
+        }
     }
 
     pub fn job(&self, id: &str) -> Option<PushJob> {
         self.jobs.lock().get(id).cloned()
-    }
-
-    /// 这条推送还在不在。
-    ///
-    /// 下载端点的流式读取**每读一块**都要问一次（发送方一取消就当场断流），
-    /// 所以它必须是查表，不能是 `job()` —— 那会把整份文件清单(`Vec<FileEntry>`)克隆一遍：
-    /// 推一个几万文件的目录时，每 64KB 克隆一次清单，进度条会慢到看起来卡在 0%。
-    pub fn has_job(&self, id: &str) -> bool {
-        self.jobs.lock().contains_key(id)
     }
 
     /// 下载端点的一次取文件请求：按**清单里的相对路径**精确查表。
@@ -452,11 +473,12 @@ impl PushStore {
         let Some(job) = jobs.get(id) else {
             return DownloadTarget::Missing;
         };
-        match job.sources.iter().find(|(p, _)| p == rel) {
-            Some((_, abs)) => DownloadTarget::Found {
+        match job.sources.get(rel) {
+            Some(abs) => DownloadTarget::Found {
                 path: abs.clone(),
                 peer_paired: job.peer_paired,
                 peer_id: job.peer_id.clone(),
+                cancel: job.cancel.clone(),
             },
             None => DownloadTarget::NotInManifest,
         }
@@ -738,12 +760,14 @@ pub fn report_to_sender(
 // ---------------------------------------------------------------------------
 
 /// 接收方：开始把对端的文件拉下来（F-52 / F-60）。
+///
+/// 两条数据面在这里分派（见 `InboundInvite::supports_stream`）：
+/// - 对端声明了 `stream1` → 新的分帧并发引擎（`transfer::download`）：块级并行 + 小文件打包；
+/// - 否则 → 老的逐文件串行循环（`spawn_download_legacy`），一字未改。
+///
+/// 认人的前置检查（token、已配对必须带 token）两条路共用，所以放在分派**之前**。
 pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: String) {
-    use futures_util::StreamExt;
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-
     let invite_id = invite.invite_id.clone();
-    let total_bytes = invite.total_bytes();
     let callback = invite.callback.clone();
 
     // 长连接那条路上的"同意"回执（HTTP 那条路走邀请请求的同步响应）。
@@ -769,6 +793,30 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
         return;
     }
 
+    if invite.supports_stream() {
+        super::download::spawn(state, invite, peer_id, token);
+        return;
+    }
+    spawn_download_legacy(state, invite, peer_id, token);
+}
+
+/// 老数据面：`GET /push/download`，一次一个文件、整份流、串行。
+///
+/// 保留它的唯一理由是**与老版本互通**（对端不在 `caps` 里声明 `stream1`）。新对端一律走
+/// `transfer::download`：那条路把"每个文件的固定开销"摊掉了（批 + 并行）。
+fn spawn_download_legacy(
+    state: Arc<AppState>,
+    invite: InboundInvite,
+    peer_id: String,
+    token: Option<String>,
+) {
+    use futures_util::StreamExt;
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    let invite_id = invite.invite_id.clone();
+    let total_bytes = invite.total_bytes();
+    let callback = invite.callback.clone();
+
     // 下载跑在运行时上：「同意接收」是 async 命令（`task::spawn` 另有"没有 reactor 就退到
     // Tauri 全局运行时"的兜底，见 task.rs）—— 这条任务绝不能被无声丢掉，否则两边都停在 0%。
     crate::task::spawn("push download", async move {
@@ -784,10 +832,18 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
 
         let mut total_received: u64 = 0;
         let mut last_report: Option<Instant> = None;
+        // 已经建过的目录（见下面 `made_dirs.insert`）：目录嵌套深、文件多时，
+        // "每文件问一次系统"是纯浪费。
+        let mut made_dirs: HashSet<PathBuf> = HashSet::new();
         let files = if invite.is_dir {
             invite.files.clone()
         } else {
-            vec![FileEntry { path: invite.name.clone(), size: invite.size }]
+            vec![FileEntry {
+                path: invite.name.clone(),
+                size: invite.size,
+                // 单文件推送这条路上对端只有名字与大小（没有清单），时间戳无从谈起。
+                mtime: 0,
+            }]
         };
 
         let base_url = format!(
@@ -807,14 +863,40 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
                 }
             };
             if let Some(p) = file_target.parent() {
-                let _ = tokio::fs::create_dir_all(p).await;
+                // 已建过的目录不再问系统一遍：`create_dir_all` 对**存在**的目录照样要逐段
+                // 打开+查询（Windows 上每段一次系统调用），2 万文件的目录就是 2 万次白干。
+                if made_dirs.insert(p.to_path_buf()) {
+                    let _ = tokio::fs::create_dir_all(p).await;
+                }
             }
 
             let mut offset = state.push.resume.load(&invite_id, &file.path);
             let mut last_saved = offset;
             let mut last_persist_time = Instant::now();
-            const PERSIST_CHUNK: u64 = 1_024_000;
+            // 8MB / 5s 一拍：`save` 自身是节流落盘的（见 `ResumeStore::save`），这个粒度
+            // 决定的是"崩溃后最多重传多少"，不再是磁盘写入次数。
+            const PERSIST_CHUNK: u64 = 8 * 1024 * 1024;
             const PERSIST_INTERVAL: Duration = Duration::from_secs(5);
+            // 连续几次"一个字节都没拿到"就判这条文件失败（见循环尾部的守卫）。
+            const MAX_STALLS: u32 = 3;
+            let mut stalled = 0u32;
+
+            // 句柄**一次开到底**：续传时它跨多次尝试复用，收尾那次 `sync_data` 也用它，
+            // 不必为了确认落盘再开一次。
+            let mut fh = match tokio::fs::OpenOptions::new()
+                .create(true).write(true).open(&file_target).await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    fail_download(&state, &peer_id, &callback, &invite_id, format!("打开文件失败: {e}"));
+                    return;
+                }
+            };
+            // 记录长度以外的尾巴一律截掉：上次可能崩在"字节写完"与"进度记上"之间，
+            // 那截尾巴没被记账，留着只会卡在文件中间当垃圾。
+            if fh.metadata().await.map(|m| m.len()).unwrap_or(0) > offset {
+                let _ = fh.set_len(offset).await;
+            }
 
             'file: loop {
                 if state.push.inbound.lock().get(&invite_id).is_none() {
@@ -841,6 +923,16 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
                         state.push.resume.clear(&invite_id);
                         return;
                     }
+                    Ok(r) if r.status().as_u16() == 409 => {
+                        // 源文件在建清单之后变小/被换掉了（对端语义见
+                        // `routes_push::push_download_handler`）。这是明确的错误，
+                        // 不能拿一个空包当"传完了"。
+                        fail_download(
+                            &state, &peer_id, &callback, &invite_id,
+                            format!("源文件在传输中被修改: {}", file.path),
+                        );
+                        return;
+                    }
                     Ok(r) if !r.status().is_success() => {
                         error!(%invite_id, status = %r.status(), "download failed");
                         sleep(Duration::from_secs(2)).await;
@@ -854,19 +946,15 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
                     }
                 };
 
-                let mut fh = match tokio::fs::OpenOptions::new()
-                    .create(true).write(true).open(&file_target).await
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        fail_download(&state, &peer_id, &callback, &invite_id, format!("打开文件失败: {e}"));
-                        return;
-                    }
-                };
-                if fh.metadata().await.map(|m| m.len()).unwrap_or(0) > offset {
-                    let _ = fh.set_len(offset).await;
+                if let Err(e) = fh.seek(std::io::SeekFrom::Start(offset)).await {
+                    fail_download(&state, &peer_id, &callback, &invite_id, format!("定位写入位置失败: {e}"));
+                    return;
                 }
-                let _ = fh.seek(std::io::SeekFrom::Start(offset)).await;
+                let attempt_start = offset;
+                // 一次尝试一个缓冲：客户端交给我们的块常常只有十几 KB（TLS 记录的粒度），
+                // 逐块写就是每 16KB 一次阻塞任务派发；256KB 缓冲把写系统调用除十几倍。
+                let mut out =
+                    tokio::io::BufWriter::with_capacity(crate::net::STREAM_CHUNK, &mut fh);
 
                 let mut stream = resp.bytes_stream();
                 while let Some(chunk) = stream.next().await {
@@ -875,11 +963,15 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
                         Err(e) => {
                             // 发送方中途取消时，流会就地断掉：退回外层重试，
                             // 下一次请求就会拿到 410，按"发送方已取消"收尾。
+                            //
+                            // **先把缓冲交出去再退**：`offset` 已经把缓冲里的字节算进去了，
+                            // 丢掉它们就等于"以为收过、其实没写"（后续续传直接从洞后面接着写）。
+                            let _ = out.flush().await;
                             warn!(%invite_id, %e, "stream error");
                             continue 'file;
                         }
                     };
-                    if let Err(e) = fh.write_all(&chunk).await {
+                    if let Err(e) = out.write_all(&chunk).await {
                         fail_download(&state, &peer_id, &callback, &invite_id, format!("写入失败: {e}"));
                         return;
                     }
@@ -889,6 +981,15 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
                     if offset - last_saved >= PERSIST_CHUNK
                         || Instant::now().duration_since(last_persist_time) >= PERSIST_INTERVAL
                     {
+                        // **先落盘、再记账**：记录里的 offset 必须是"盘上真有这些字节"。
+                        // 缓冲里留着的字节不算数 —— 不 flush 就写记录，崩溃之后续传会从
+                        // 一堆没写进去的"空位"后面接着写，最后交出一个长度对、内容是坏的
+                        // 文件（正是"传过来是损坏的"那条红线）。
+                        if let Err(e) = out.flush().await {
+                            fail_download(&state, &peer_id, &callback, &invite_id, format!("写入失败: {e}"));
+                            return;
+                        }
+                        let _ = out.get_mut().sync_data().await;
                         state.push.resume.save(&invite_id, &file.path, offset);
                         last_persist_time = Instant::now();
                         last_saved = offset;
@@ -914,11 +1015,36 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
                         }));
                     }
                 }
-                let _ = fh.flush().await;
+                if let Err(e) = out.flush().await {
+                    fail_download(&state, &peer_id, &callback, &invite_id, format!("写入失败: {e}"));
+                    return;
+                }
+                drop(out);
+
+                // 一次尝试零字节：等一拍再来；连续 `MAX_STALLS` 次判这条邀请失败。
+                //
+                // 没有这道守卫，只要"对端能回 200 空包"而清单又说还有字节，两边就会进入
+                // "狂发请求 / 狂回空包"的死循环 —— 谁也不报错，用户只看到永远停在某个百分比。
+                if offset == attempt_start {
+                    stalled += 1;
+                    if stalled >= MAX_STALLS {
+                        fail_download(
+                            &state, &peer_id, &callback, &invite_id,
+                            format!("传输没有进展（对端没有数据）: {}", file.path),
+                        );
+                        return;
+                    }
+                    sleep(Duration::from_secs(2)).await;
+                } else {
+                    stalled = 0;
+                }
             }
+            // 这个文件收完了：把最后的字节确认到盘上，再记终点（同上一条纪律）。
+            let _ = fh.sync_data().await;
             state.push.resume.save(&invite_id, &file.path, file.size);
         }
 
+        state.push.resume.flush();
         state.push.resume.clear(&invite_id);
         // 结局**先**落地、再摘邀请：对账可能正好撞在这一瞬（邀请已摘、记录还没写），
         // 那种窗口里答出去的是 `unknown`（"没送到"）——事实是"收到了"。
@@ -943,7 +1069,10 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
 }
 
 /// 接收失败：告诉发送方，并让本机的接收卡片变成失败态。
-fn fail_download(
+///
+/// `pub(super)`：新协议那条路（`transfer::download`）的会话级失败也走它 ——
+/// 两条路对发送方说的话必须一模一样，不能各写一套。
+pub(super) fn fail_download(
     state: &AppState,
     peer_id: &str,
     callback: &Option<(String, u16)>,
@@ -952,6 +1081,10 @@ fn fail_download(
 ) {
     error!(%invite_id, %reason, "push download failed");
     // 同"完成"那条：先落结局再摘邀请（对账撞在中间那一瞬不该答 `unknown`）。
+    //
+    // 顺带把续传记录落盘：失败之后**留下**的记录就是"下次接着传"的全部依据，
+    // 光在内存里记着，进程一退就白记了。
+    state.push.resume.flush();
     state
         .push
         .record_outcome(invite_id, peer_id, "failed", 0, Some(reason.clone()));
@@ -1084,6 +1217,7 @@ mod reconcile_tests {
             is_dir: false,
             count: 1,
             files: vec![],
+            caps: Vec::new(),
             callback: None,
             responder: None,
         }
