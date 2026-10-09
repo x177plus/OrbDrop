@@ -1,0 +1,3 @@
+# 本机演练用的产物缓存：镜像台（scripts/dev-mirror.mjs）直接伺服这个目录。
+# 正式发布的二进制在 GitHub/Gitee 的 Release 附件里，不进 git（十几 MB × 每个版本）。
+/assets/
