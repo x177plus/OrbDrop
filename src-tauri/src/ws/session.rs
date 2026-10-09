@@ -134,7 +134,7 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 port: 0,
                 online: true,
                 paired: true,
-                auto_connect: false, paused: false,
+                auto_connect: false, paused: false, relay: None,
             });
             emit_ui(state, ui::DEVICES_CHANGED, &serde_json::json!({}));
         }
@@ -171,6 +171,8 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 count,
                 files,
                 caps,
+                // 已配对设备的推送免同意自动收，没有"先挑目录"的时机 → 落盘根恒为下载目录。
+                root: None,
                 callback,
                 responder: None,
             });
@@ -186,7 +188,7 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             // 已配对的设备推送**不需要接收方同意**（token 就是那份信任）：直接开收 —
             // 界面那条通知是"正在接收"而不是"要不要收"。未绑定的才挂卡片等用户点。
             if paired {
-                if let Err(reason) = transfer::accept_invite(state.clone(), &invite_id) {
+                if let Err(reason) = transfer::accept_invite(state.clone(), &invite_id, None) {
                     warn!(%invite_id, %reason, "auto-accept failed");
                     // 本机那条"正在接收"的通知得收尾：这条邀请已经不可能变成完成了。
                     transfer::reject_invite_with(state, &invite_id, &reason);
@@ -268,10 +270,18 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
         }
         WsEvent::Unpair { peer_id: who } => {
             // 兼容旧版本对端（新版本走 POST /unpair，不依赖长连接）。
-            info!(%who, "received unpair over WS");
-            let _ = credential::remove_peer(&who);
-            state.ws.drop_peer(&who);
-            state.unpair(&who);
+            //
+            // **只用会话身份**（`peer_id` 是这条连接用 token 换来的），报文里那个 `who`
+            // 一律不采信：旧对端发的就是它自己，一致；不一致说明这一帧想借别人的连接
+            // 去解掉第三方的配对（删凭据 + 断链 + 移出地址簿），那是越权，丢掉。
+            if who != peer_id {
+                warn!(%peer_id, claimed = %who, "WS unpair 的自称 id 与连接身份不一致，忽略");
+                return;
+            }
+            info!(%peer_id, "received unpair over WS");
+            let _ = credential::remove_peer(peer_id);
+            state.ws.drop_peer(peer_id);
+            state.unpair(peer_id);
             emit_ui(state, ui::DEVICES_CHANGED, &serde_json::json!({}));
         }
         WsEvent::ChatText { id, text, at } => {
@@ -345,5 +355,58 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
         WsEvent::PushState { ask_id, states } => {
             crate::transfer::apply_push_states(state, peer_id, &ask_id, &states);
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn state(tag: &str) -> Arc<AppState> {
+        let path = std::env::temp_dir().join(format!("orbdrop_ws_{tag}_{}.toml", uuid::Uuid::new_v4()));
+        Arc::new(AppState::new(crate::config::Config::default(), path))
+    }
+
+    /// WS 上的 `Unpair` 只认**连接自己的身份**：报文里那个 id 一律不采信。
+    ///
+    /// 旧对端发的就是它自己（一致 → 照旧生效）；不一致的那一帧是在借别人的连接去解掉
+    /// 第三方的配对（删凭据 + 断链 + 移出地址簿）—— 必须丢掉。
+    #[tokio::test]
+    async fn unpair_over_ws_only_acts_on_the_session_identity() {
+        let st = state("unpair");
+        crate::credential::set_peer_credential("device-attacker", "tok-a", &"a".repeat(64)).unwrap();
+        crate::credential::set_peer_credential("device-victim", "tok-v", &"b".repeat(64)).unwrap();
+        let victim_seen = st.get_peer("device-victim").is_some();
+
+        // 攻击者拿自己的连接，声称要解掉"受害者"。
+        handle_inbound(
+            &st,
+            "device-attacker",
+            WsEvent::Unpair { peer_id: "device-victim".into() },
+        )
+        .await;
+        assert!(
+            crate::credential::get_peer_token("device-victim").unwrap().is_some(),
+            "第三方的凭据不许被别人的一帧解掉"
+        );
+        assert_eq!(
+            st.get_peer("device-victim").is_some(),
+            victim_seen,
+            "第三方的地址簿条目也不该被动"
+        );
+
+        // 自己的 id（旧对端的正常写法）照旧生效。
+        handle_inbound(
+            &st,
+            "device-attacker",
+            WsEvent::Unpair { peer_id: "device-attacker".into() },
+        )
+        .await;
+        assert!(
+            crate::credential::get_peer_token("device-attacker").unwrap().is_none(),
+            "自称与连接身份一致时按旧语义解掉"
+        );
+
+        crate::credential::remove_peer("device-victim").ok();
     }
 }

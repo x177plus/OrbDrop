@@ -1,8 +1,11 @@
 <script lang="ts">
   import * as chat from '$lib/stores/chat.svelte';
   import type { ChatItem } from '$lib/stores/chat.svelte';
-  import { getDevices, deviceDotState, deviceState, threadDotState } from '$lib/stores/devices.svelte';
-  import type { PendingGroup } from '$lib/types';
+  import { getDevices, deviceDotState, threadDotState } from '$lib/stores/devices.svelte';
+  import { getSettings } from '$lib/stores/settings.svelte';
+  import { undeliverableText, type PendingGroup, type Undeliverable } from '$lib/types';
+  import { listen } from '@tauri-apps/api/event';
+  import { onMount } from 'svelte';
 
   /**
    * 会话浮层（原型 `.convo-pop`）：两块视图共用一层 —— **会话列表 / 某个会话**。
@@ -38,6 +41,8 @@
   } = $props();
 
   const open = $derived(chat.isChatOpen());
+  /** 「每次询问」：接收一张需要同意的卡片时会先弹目录选择框（App 那边执行），文案跟着说清。 */
+  const askEachTime = $derived(getSettings()?.downloadMode === 'AskEachTime');
   const thread = $derived(chat.activeThread());
   const rows = $derived(chat.convoRows());
   const devices = $derived(getDevices());
@@ -80,6 +85,42 @@
   });
 
   /**
+   * 一条消息暂时送不出去时那句解释（F-106，`chat://undeliverable`）：一行小字，可关闭、
+   * 约 8s 自己消失。**不做成卡片、也不进右下角通知组** —— 它说的是"刚才那条为什么没反应"
+   * （消息已经在排队，不丢），不是一件要用户处理的待办，摆着反而占地方。
+   *
+   * 新的一条顶掉旧的并重置计时：连着发几条时，用户要看到的是最新那一台/那个原因。
+   */
+  let undeliverable = $state<{ id: number; text: string } | null>(null);
+  let undeliverableSeq = 0;
+  let undeliverableTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function showUndeliverable(text: string) {
+    const id = ++undeliverableSeq;
+    undeliverable = { id, text };
+    clearTimeout(undeliverableTimer);
+    undeliverableTimer = setTimeout(() => {
+      if (undeliverable?.id === id) undeliverable = null;
+    }, 8000);
+  }
+
+  function dismissUndeliverable() {
+    clearTimeout(undeliverableTimer);
+    undeliverable = null;
+  }
+
+  onMount(() => {
+    let off: (() => void) | undefined;
+    void listen<Undeliverable>('chat://undeliverable', (ev) => {
+      showUndeliverable(undeliverableText(ev.payload));
+    }).then((f) => (off = f));
+    return () => {
+      clearTimeout(undeliverableTimer);
+      off?.();
+    };
+  });
+
+  /**
    * 这一条要不要在上头插一行发言人（群聊里他人发的、且与上一条不是同一个人说的）。
    *
    * 同一个人连着说几句只在头一条上面标一次（原型也是这么分组的，一屏里就不会满眼都是名字）。
@@ -113,7 +154,7 @@
   }
 
   /**
-   * 一条消息那一刻（`HH:MM`）加上该说的话。
+   * 一条消息那一刻（`stamp`：今天/昨天 + `HH:MM`，更早写日期）加上该说的话。
    *
    * 一对一：自己发的带**这台设备自己的**送达状态（群发过去的副本在这屏也只写这一台，
    * 见 `chat.deliveryText`），对方发的只写时刻 —— 标题已经写着是谁了。
@@ -122,7 +163,7 @@
    * —— 是谁说的，上一行那枚发言人标已经写了。
    */
   function metaOf(item: ChatItem): string {
-    const when = chat.clock(item.at);
+    const when = chat.stamp(item.at);
     if (!item.fromMe) return when;
     if (directPeer) {
       const state = chat.deliveryText(directPeer, item);
@@ -233,6 +274,10 @@
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M7 12h10" /></svg>
 {/snippet}
 
+{#snippet icWarn()}
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5 2.6 20h18.8L12 3.5Z" /><path d="M12 10v4" /><path d="M12 17.4h.01" /></svg>
+{/snippet}
+
 <!-- 群邀请卡：**只画在会话侧**（列表头顶 + 会话详情顶部），不进右下角那组通知气泡 ——
      那组东西是"没有落点、有期限"的（推送/配对邀请 60s 自动作废），而这张卡没有期限、处理完
      的落点就是它将要成为的那条会话。两处都渲染同一份（snippet），一处滚走另一处还在。 -->
@@ -336,15 +381,13 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 6-6 6 6 6" /></svg>
           </button>
           <span class="conv-title">{thread.title}</span>
+          <!-- 标题旁**只有一枚状态点**（`docs/orb-functional-design.md` §12.2「状态栏」：header
+               除设备名外就带该设备的状态点）。未绑定的设备照样能收发（消息走"长连接优先 +
+               HTTP 兜底"），但它不需要再挂一枚「未绑定」章 —— 那会在标题旁并排摆出两颗点
+               （一枚裸的、一枚在胶囊里），看着就像画重了。 -->
           <span class="conv-status {directPeer ? deviceDotState(openDev) : threadDotState(thread.participants)}"></span>
           {#if thread.participants.length > 1}
             <span class="conv-count num">{thread.participants.length} 台</span>
-          {/if}
-          <!-- 未绑定的设备照样能收发（消息走"长连接优先 + HTTP 直达"），但"这台是谁"只有它
-               自己报的名字 + 一个真实 IP：把这件事摆在标题旁边，一眼能看出来。 -->
-          {#if openDev && !openDev.paired}
-            {@const st = deviceState(openDev)}
-            <span class="state-chip {st.chip}"><span class="dot {st.dot}"></span>{st.label}</span>
           {/if}
           <div class="conv-acts">
             <button class="icon-btn" type="button" aria-label="会话操作" onclick={convoMenu}>
@@ -374,6 +417,17 @@
              "我正在读别的会话"而消失 —— 列表那份看不到的时候，就是它在顶着。 -->
         {#if chat.pendingGroups().length > 0}
           {@render inviteStrip(true)}
+        {/if}
+
+        <!-- 「送不出去」的那句解释：贴在头部这一层（不随消息流滚），8s 自己消失、也能点掉。 -->
+        {#if undeliverable}
+          <div class="chat-note" role="status">
+            <span class="cn-ic" aria-hidden="true">{@render icWarn()}</span>
+            <span class="cn-txt">{undeliverable.text}</span>
+            <button class="icon-btn cn-x" type="button" aria-label="关闭提示" onclick={dismissUndeliverable}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
+            </button>
+          </div>
         {/if}
       </div>
 
@@ -478,7 +532,7 @@
                       <span class="ic-size">{item.size}</span>
                     </span>
                   </div>
-                  <div class="ic-sub">来自 {chat.deviceNameOf(item.peerId)} · 接收后保存到下载目录</div>
+                  <div class="ic-sub">来自 {chat.deviceNameOf(item.peerId)} · {askEachTime ? '接收时选保存位置' : '接收后保存到下载目录'}</div>
                   <div class="ic-acts">
                     <button class="btn btn-secondary btn-sm" type="button" onclick={() => onRejectInvite(item.inviteId)}>拒绝</button>
                     <button class="btn btn-primary btn-sm" type="button" onclick={() => onAcceptInvite(item.inviteId)}>接收</button>

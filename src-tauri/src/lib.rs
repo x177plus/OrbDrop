@@ -23,9 +23,12 @@ pub mod net;
 pub mod orb_window;
 pub mod pair;
 pub mod peer_fs;
+pub mod relay;
 pub mod server;
 pub mod share;
 pub mod state;
+/// IPv4 网段（CIDR）判定与自报（F-107 §5）。
+pub mod subnet;
 pub mod task;
 #[cfg(desktop)]
 pub mod tray;
@@ -154,6 +157,13 @@ pub struct UpdateSettingsRequest {
     /// 是否允许本机为群聊中转消息（设置里的「允许为群聊中转消息」，默认关）。
     #[serde(default)]
     pub group_relay: bool,
+    /// 是否允许本机替其它设备中转字节（设置里的「允许为其它设备中转」，默认关，F-106）。
+    #[serde(default)]
+    pub allow_relay: bool,
+    /// 记住并自动复用跨网段中转（设置里的「记住并自动复用跨网段中转」，默认开，F-107/S-10）。
+    /// 缺省用配置的缺省（**开**）而不是 `bool::default()`（关）：字段缺失不该替用户把它关掉。
+    #[serde(default = "config::default_relay_memory")]
+    pub relay_memory: bool,
     /// 接收推送的并发数（设置里的「传输并发数」）。缺省 4，取值域由
     /// `config::clamp_transfer_workers` 夹住（手改配置文件也不会越界）。
     #[serde(default = "config::default_transfer_workers")]
@@ -336,12 +346,14 @@ async fn update_settings(
     app: AppHandle,
 ) -> Result<AppSettings, String> {
     let (old_port, old_name);
+    let old_allow_relay;
     #[cfg(desktop)]
     let old_autostart;
     {
         let mut config = state.config.lock();
         old_port = config.port;
         old_name = config.device_name.clone();
+        old_allow_relay = config.allow_relay;
         #[cfg(desktop)]
         {
             old_autostart = config.auto_start;
@@ -356,6 +368,8 @@ async fn update_settings(
         config.orb_shape = req.orb_shape;
         config.auto_broadcast_new = req.auto_broadcast_new;
         config.group_relay = req.group_relay;
+        config.allow_relay = req.allow_relay;
+        config.relay_memory = req.relay_memory;
         config.transfer_workers = config::clamp_transfer_workers(req.transfer_workers);
         config.transfer_block_mb = config::clamp_transfer_block_mb(req.transfer_block_mb);
         config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
@@ -373,6 +387,19 @@ async fn update_settings(
 
     let name_changed = req.device_name != old_name;
     let port_changed = req.port != old_port;
+
+    // 关掉「允许为其它设备中转」→ **立刻收掉**本机正替别人转的每一条。
+    // 开关是用户意图：已经开出去的端点不能继续占本机上行带宽（开着的那几条 TCP
+    // 也要断，否则"关了开关还在替人搬字节"）。
+    if old_allow_relay && !req.allow_relay {
+        crate::relay::close_all(state.inner());
+    }
+    // 开关本身也在 mDNS TXT 里自报（F-107：同段的观察者零请求就知道本机愿不愿意中转），
+    // 所以它一变就重播一次广播 —— 否则对端要等自己的 5s 探活才知道，而没配对的同段设备
+    // 根本不会探本机（它们只读 TXT）。
+    if old_allow_relay != req.allow_relay && state.is_online() {
+        register_mdns(state.inner(), bound_port(state.inner()));
+    }
 
     // Device name changed（端口没动）→ 重注册 mDNS（丢掉旧 daemon、按新参数再注册一个）。
     // 播的是**实际**绑定端口，不是配置端口：配置端口被占时服务器会顺延到 +1..+10，
@@ -512,13 +539,38 @@ fn list_devices(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
     // 死锁面（两处顺序不同就够）。设备表本身很小（一屏设备数），拷一份不值一提。
     let peers = state.peers.lock().clone();
     let remarks = state.config.lock().device_remarks.clone();
-    peers.iter().map(|p| serde_json::json!({
+    // F-107：本机的中转记忆（网段级）—— 设备行要据此说一句"这一段经 <中转段> 中转"。
+    // 只读一次、按目标段建索引，避免在遍历设备时反复锁配置表。
+    let routes: std::collections::HashMap<String, (String, usize)> = state
+        .config
+        .lock()
+        .relay_routes
+        .iter()
+        .map(|r| (r.target_cidr.clone(), (r.via_cidr.clone(), r.pool_ids().len())))
+        .collect();
+    peers.iter().map(|p| {
+    // 这台设备属于哪一段（对端自报优先，其次按本机掩码算）—— 中转记忆的键。
+    let cidr = state.cidr_of(&p.id, &p.ip);
+    let transit = cidr
+        .as_ref()
+        .and_then(|c| routes.get(c))
+        .map(|(via_cidr, pool)| serde_json::json!({ "viaCidr": via_cidr, "poolSize": pool }));
+    serde_json::json!({
         "id": p.id,
         "name": p.name,
         "ip": p.ip,
         "port": p.port,
         "online": p.online,
         "paired": p.paired,
+        // 「看得见但连不上」（F-106）：记录还在（对端在喊），但探活没成 —— 界面据此把这一行
+        // 留在列表里，并在用户**发起连接**时补一句"这张网可能把单播隔开了"；**不是**一个状态档
+        // （那一行照常画「未绑定」/「离线」）。`online` 的定义不动（探活成功 = 真连得上）。
+        "seen": state.is_seen(&p.id),
+        // 此刻是不是经别人中转（F-106）：界面上标一句「经 X 中转」，用户才知道
+        // 这条路不是直连（而中转是自动接管/自动收起的）。
+        "relayVia": p.relay_via(),
+        // F-107：这一段的中转记忆（有的话）——悬停说明里那句"该网段经 … 中转"。
+        "transit": transit,
         // Real WS link state — "长连接" in the UI follows this, not `online`
         // (a peer can answer HTTP push invites without any WS session).
         "connected": state.ws.has_connection(&p.id),
@@ -528,7 +580,63 @@ fn list_devices(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
         // 本机给这台设备起的备注（F-101）：只存在本机，**不参与任何对外报文** ——
         // 界面把它拼成显示名「备注(设备名)」（前端 `deviceDisplayName`）。
         "remark": remarks.get(&p.id),
-    })).collect()
+    })
+    }).collect()
+}
+
+/// F-107：本机的中转记忆（网段级策略 + 各自的池 + 设备级链路）。
+///
+/// 界面「设置 → 高级」拿它列出「目标网段 → 中转网段 → 池 + 最后成功时间」，并支持逐条清除
+/// —— 记忆落了盘，就该让用户看得见、删得掉。
+#[tauri::command]
+fn relay_memory(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
+    state.relay_routes_json()
+}
+
+/// F-107：清掉中转记忆。`target_cidr` 给了就只清那一条网段级策略（连同挂在它上面的设备级
+/// 链路），不给就全清。返回清掉的条数。
+#[tauri::command]
+fn clear_relay_memory(
+    target_cidr: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> usize {
+    state.clear_relay_memory(target_cidr.as_deref())
+}
+
+/// F-106/F-107：本机此刻替别人开着的中转端点（设置里显示「正在替 N 台设备中转」并一键收掉）。
+#[tauri::command]
+fn relay_status(state: State<'_, Arc<AppState>>) -> serde_json::Value {
+    let active: Vec<serde_json::Value> = state
+        .relays
+        .snapshot()
+        .into_iter()
+        .map(|(requester, target, port)| {
+            serde_json::json!({ "requester": requester, "target": target, "port": port })
+        })
+        .collect();
+    serde_json::json!({
+        "active": active.len(),
+        "entries": active,
+        // 本机此刻看到的中转池（哪一段里有谁愿意中转）——排障用。
+        "pools": state.pool_json(),
+    })
+}
+
+/// F-106：立刻收掉本机替别人开着的全部中转（"一键收掉"，不改开关）。
+#[tauri::command]
+fn close_relays(state: State<'_, Arc<AppState>>) -> usize {
+    let n = state.relays.active();
+    crate::relay::close_all(state.inner());
+    n
+}
+
+/// F-106 / S-09：本机替别人中转的**累计流量**（字节，收发两方向之和）与连接数。
+///
+/// 设置里只显示这一个数（"替别人搬了多少"）—— 中转方的代价就是上行带宽。它是落了盘的记录
+/// （`Config::relay_bytes_total` / `relay_conns_total`），重启接着算。
+#[tauri::command]
+fn relay_traffic(state: State<'_, Arc<AppState>>) -> serde_json::Value {
+    state.relay_traffic_json()
 }
 
 /// 写一台设备的备注（F-101）。空串 / 纯空白 = 清除；返回真正存下去的值（`null` = 已清除），
@@ -586,16 +694,32 @@ fn ensure_online(state: &AppState) -> Result<(), String> {
     }
 }
 
+/// 切到「离线」时要做的本机副作用（**唯一入口**：`apply_online(false)`；集成测试也用它）。
+///
+/// 四件事：① 注销 mDNS 广播（对端发现不到本机）；② 掐掉全部长连接与拨号循环；③ **收掉本机
+/// 替别人开着的中转端点** —— 离线 = 隐身，对所有设备都不可见，中转不能例外（端点在 `relay`
+/// 里是个裸 TCP 监听，不归 HTTP 那层管，只有这里收得掉；`relay::serve` 另有一道 `is_online`
+/// 兜底）；④ 把现有设备行标成离线（显示层，切回在线后 5s 探活会纠正回来）。
+pub fn apply_offline(arc: &Arc<AppState>) {
+    unregister_mdns(arc);
+    arc.ws.drop_all();
+    crate::relay::close_all(arc);
+    let ids: Vec<String> = arc.peers.lock().iter().map(|p| p.id.clone()).collect();
+    for id in ids {
+        arc.set_peer_online(&id, false);
+    }
+}
+
 /// 重新挂上 mDNS 广播：设备名/端口改了之后要重注册，切回「在线」时也要。
 ///
 /// 注册的记录里带着端口与设备名，所以每次都是"丢掉旧 daemon、按新参数再注册一个"。
 fn register_mdns(state: &Arc<AppState>, port: u16) {
     *state.mdns_daemon.lock() = None;
-    let (device_name, device_id) = {
+    let (device_name, device_id, allow_relay) = {
         let cfg = state.config.lock();
-        (cfg.device_name.clone(), cfg.device_id.clone())
+        (cfg.device_name.clone(), cfg.device_id.clone(), cfg.allow_relay)
     };
-    if let Some(daemon) = discover::register(port, &device_name, &device_id) {
+    if let Some(daemon) = discover::register(port, &device_name, &device_id, allow_relay) {
         *state.mdns_daemon.lock() = Some(daemon);
     }
 }
@@ -643,14 +767,7 @@ pub(crate) fn apply_online(
         // 切回在线就把它们发出去（"在途"的那些不退 —— 它们是真的在飞）。
         chat::flush_all_queued(arc);
     } else {
-        unregister_mdns(arc);
-        arc.ws.drop_all();
-        // 离线期间一个动作也做不成（连接/推送都会被拒），绿色的「在线」pill 留着只会
-        // 让人以为还能操作。切回在线后 5s 探活会把这些行纠正回来，所以这里只是显示层。
-        let ids: Vec<String> = arc.peers.lock().iter().map(|p| p.id.clone()).collect();
-        for id in ids {
-            arc.set_peer_online(&id, false);
-        }
+        apply_offline(arc);
     }
 
     arc.emit_devices_changed();
@@ -734,42 +851,38 @@ async fn add_peer(ip: String, port: u16, state: State<'_, Arc<AppState>>) -> Res
     Ok(peer)
 }
 
-/// 解除配对（F-14）：先让对方也清掉（HTTP，尽力而为），再清本机。
+/// 解除配对（F-14）：**先清本机**（这是本机动作，对端在不在网上都不该挡在这里），
+/// 再尽力通知对端 —— 那条通知放到后台跑，调用方不等它。
 ///
 /// 走 HTTP 而不是 WS 事件：解除的那一刻链路可能已经断了，而且 WS 事件是**排队**
 /// 发送的，紧接着的 `drop_peer` 会把还没写出去的它一起丢掉 —— 对端就一直停在
 /// "已配对"（用户实际遇到的）。HTTP 不依赖长连接，谁拨的号也不影响。
+///
+/// **通知不挡在本机动作前面**：对端离线时那次 POST 要等到超时（3s）才回来，挡在前面
+/// 就是"点了解除配对，界面／凭据要愣好几秒才认"（离线设备必现）。token 在删除前读出来
+/// 就够了 —— 值就是两端共有的那一份，本机删掉自己那份不影响这次发送。
 ///
 /// 本机只清 token 与配对标记、**保留设备行**：对方还在网络上看得见，就该继续
 /// 以"未绑定"出现在列表里（离线时前端自然不显示）。
 pub async fn unpair_peer(state: &Arc<AppState>, peer_id: &str) -> Result<(), String> {
     let peer = state.get_peer(peer_id).ok_or_else(|| "设备不存在".to_string())?;
 
-    // 通知对端用的是本机手里"对它"的 token —— 必须在本机删除之前用掉。
-    if !peer.ip.is_empty() && peer.port != 0 {
-        if let Ok(Some(token)) = credential::get_peer_token(peer_id) {
-            let url = format!("{}/unpair", net::peer_base(&peer.ip, peer.port));
-            let client = net::client_builder()
-                .timeout(std::time::Duration::from_secs(3))
-                .build()
-                .map_err(|e| e.to_string())?;
-            // body 里的 peerId 是**本机自己的 id**：对端要解除的是"调用方这台设备"
-            // （与 WS 事件 `Unpair { peer_id: 本机 id }` 的语义一致）。远端调用时身份
-            // 由 token 反解、这个字段只是冗余；同机回环调用没有 token 可解，就靠它。
-            let own_id = state.config.lock().device_id.clone();
-            match client
-                .post(&url)
-                .bearer_auth(&token)
-                .json(&serde_json::json!({ "peerId": own_id }))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => info!(%peer_id, "peer notified of unpair"),
-                Ok(resp) => warn!(%peer_id, status = %resp.status(), "peer did not accept unpair"),
-                Err(e) => warn!(%peer_id, "peer unreachable for unpair: {e}"),
-            }
-        }
-    }
+    // 通知对端要用的三样东西（token 必须在本机删除之前读出来）。
+    // body 里的 peerId 是**本机自己的 id**：对端要解除的是"调用方这台设备"
+    // （与 WS 事件 `Unpair { peer_id: 本机 id }` 的语义一致）。远端调用时身份
+    // 由 token 反解、这个字段只是冗余；同机回环调用没有 token 可解，就靠它。
+    let notice = if peer.ip.is_empty() || peer.port == 0 {
+        None
+    } else {
+        credential::get_peer_token(peer_id)
+            .ok()
+            .flatten()
+            .map(|token| {
+                let url = format!("{}/unpair", net::peer_base(peer.dial().0, peer.dial().1));
+                let own_id = state.config.lock().device_id.clone();
+                (url, token, own_id)
+            })
+    };
 
     credential::remove_peer(peer_id).map_err(|e| e.to_string())?;
     state.ws.drop_peer(peer_id);
@@ -785,7 +898,42 @@ pub async fn unpair_peer(state: &Arc<AppState>, peer_id: &str) -> Result<(), Str
         net::trust().unpin(ip);
     }
     state::refresh_trust(state);
+
+    // 本机这一侧已经解除完毕（上面全是本地动作），通知对端是**尽力而为**的后话：
+    // 谁也不能保证它此刻在网上，最坏要等满 3s 超时 —— 所以在这里甩出去，不让它
+    // 拖住用户看到的"已解除"。
+    if let Some((url, token, own_id)) = notice {
+        crate::task::spawn("unpair notice", notify_unpair(peer_id.to_string(), url, token, own_id));
+    }
     Ok(())
+}
+
+/// 告诉对端"这段关系到此为止"（`POST /unpair`）：成功与否只落一条日志。
+///
+/// 与 `unpair_peer` 分开放，是因为调用方**不**等它（见那里的注释）。发不出去不等于
+/// 白做：对端下次拿旧 token 来拨号/请求时会吃 401，界面上就是「需重新配对」。
+async fn notify_unpair(peer_id: String, url: String, token: String, own_id: String) {
+    let client = match net::client_builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(%peer_id, "failed to build a client for the unpair notice: {e}");
+            return;
+        }
+    };
+    match client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "peerId": own_id }))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => info!(%peer_id, "peer notified of unpair"),
+        Ok(resp) => warn!(%peer_id, status = %resp.status(), "peer did not accept unpair"),
+        Err(e) => warn!(%peer_id, "peer unreachable for unpair: {e}"),
+    }
 }
 
 #[tauri::command]
@@ -859,7 +1007,7 @@ async fn pair_confirm(peer_id: String, code: String, state: State<'_, Arc<AppSta
     // 用户点了「配对」= 明确要（重新）建立关系：这个地址上钉着的旧指纹先让位，
     // 否则这次拨号会在 TLS 那一跳被"指纹不一致"直接拒掉（见 `pair::forget_stale_pin`）。
     pair::forget_stale_pin(&state, &peer_id);
-    let url = format!("{}/pair", net::peer_base(&peer.ip, peer.port));
+    let url = format!("{}/pair", net::peer_base(peer.dial().0, peer.dial().1));
     // Our own HTTP port: the peer we post to may be the side that dials the WS
     // link (smaller device id) and it has no other way to learn our address.
     let own_port = bound_port(&state);
@@ -973,9 +1121,17 @@ async fn cancel_push_batch(batch_id: String, state: State<'_, Arc<AppState>>) ->
 /// **必须是 async 命令**：下载任务要在运行时上跑。写成同步命令的话它跑在主线程上 —— 那里
 /// 没有 reactor，任务会被丢掉（用户侧："点了同意，两边都停在 0%"）。`task::spawn` 现在有
 /// 兜底（退到 Tauri 的全局运行时），但异步命令才是这里最自然的上下文。
+///
+/// `root` = 这次接收的落盘根目录：界面在「每次询问」（`DownloadMode::AskEachTime`）下问过
+/// 用户就带上，否则 `None`（用设置里的下载目录）。已配对设备那条路不问、也就恒为 `None`。
 #[tauri::command]
-async fn accept_push(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    transfer::accept_invite(state.inner().clone(), &invite_id)
+async fn accept_push(
+    invite_id: String,
+    root: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let root = root.map(PathBuf::from);
+    transfer::accept_invite(state.inner().clone(), &invite_id, root)
 }
 
 #[tauri::command]
@@ -1208,7 +1364,9 @@ fn group_leave(id: String, state: State<'_, Arc<AppState>>) -> Result<group::Sna
 // 对端浏览（前端不再直连对端）
 // ---------------------------------------------------------------------------
 
-/// 调对端某个端点要用的地址、token、以及它的 IP（IP 是给"把这次见到的指纹钉住"用的）。
+/// 调对端某个端点要用的地址、token、以及**刚拨的那个地址**（第三项是给"把这次见到的
+/// 指纹钉住"用的 —— 钉的必须是**实际拨到的主机**：走中转时那是中转端点的字面量，与
+/// 它自己的地址各占一个键位，见 `net::relay_host`）。
 ///
 /// 一处拼地址 = 一处改协议：到对端的那一跳是 TLS + 自签证书，而 WebView 既不会认我们的
 /// 证书、也不该让它认。所以对端浏览整体挪进后端（认证、指纹校验、token 只有一份实现）。
@@ -1220,10 +1378,11 @@ fn peer_endpoint(state: &AppState, peer_id: &str, path: &str) -> Result<(String,
     let token = credential::get_peer_token(peer_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "未配对，无法读取对方的共享项".to_string())?;
+    let (host, port) = peer.dial();
     Ok((
-        format!("{}{path}", net::peer_base(&peer.ip, peer.port)),
+        format!("{}{path}", net::peer_base(host, port)),
         token,
-        peer.ip,
+        host.to_string(),
     ))
 }
 
@@ -1304,7 +1463,7 @@ fn peer_file_of(
     token: &str,
 ) -> peer_fs::PeerFile {
     peer_fs::PeerFile {
-        base: net::peer_base(&peer.ip, peer.port),
+        base: net::peer_base(peer.dial().0, peer.dial().1),
         token: token.to_string(),
         share_id: share_id.to_string(),
         path: path_in_share.to_string(),
@@ -1312,6 +1471,9 @@ fn peer_file_of(
 }
 
 /// Download a file from a remote peer (P1 remote browsing download).
+///
+/// 返回落盘路径；**用户在保存框里取消时返回 `None`**（「每次询问」那一档）——
+/// 界面据此当"什么都没发生"，不弹提示、不当失败。
 #[tauri::command]
 async fn download_from_peer(
     peer_id: String,
@@ -1321,7 +1483,7 @@ async fn download_from_peer(
     file_name: Option<String>,
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     let (download_dir, mode) = {
         let cfg = state.config.lock();
         (cfg.download_dir.clone(), cfg.download_mode)
@@ -1338,16 +1500,20 @@ async fn download_from_peer(
     let target_dir = match mode {
         DownloadMode::AskEachTime => {
             use tauri_plugin_dialog::DialogExt;
-            let picked = app.dialog().file().set_file_name(&file_name)
-                .blocking_save_file().map(|p| PathBuf::from(p.to_string()));
-            picked.unwrap_or_else(|| config::unique_path(&download_dir, &file_name))
+            match app.dialog().file().set_file_name(&file_name)
+                .blocking_save_file().map(|p| PathBuf::from(p.to_string()))
+            {
+                Some(p) => p,
+                // 取消 = 不落盘（从前是"退回下载目录照下"：用户点了取消却还是拿到一份副本）。
+                None => return Ok(None),
+            }
         }
         DownloadMode::Direct => config::unique_path(&download_dir, &file_name),
     };
     let file_ref = peer_file_of(&peer, &share_id, &path_in_share, &token);
     let bytes = stream_peer_file(&peer_fs::client(), &file_ref, &target_dir).await?;
     info!(target = %target_dir.display(), bytes, "file downloaded");
-    Ok(target_dir.to_string_lossy().to_string())
+    Ok(Some(target_dir.to_string_lossy().to_string()))
 }
 
 /// 把对端共享项里的一个文件**流式**写到 `target`：先写 `<name>.orbdrop-part`、写完再原子改名。
@@ -1435,30 +1601,40 @@ pub async fn stream_peer_file(
     Ok(offset)
 }
 
+/// 返回落盘路径；**用户在保存框里取消时返回 `None`**（「每次询问」那一档，见
+/// `download_from_peer`）。与那条命令是同一套口径 —— 同一个设置、同一个行为。
 #[tauri::command]
 async fn download_file(
     share_id: String,
     path_in_share: String,
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
-) -> Result<String, String> {
-    let (_share, download_dir, mode) = {
+) -> Result<Option<String>, String> {
+    let (share, download_dir, mode) = {
         let config = state.config.lock();
         let share = config.shares.iter().find(|s| s.id == share_id)
             .ok_or_else(|| format!("共享项不存在: {share_id}"))?.clone();
         (share, config.download_dir.clone(), config.download_mode)
     };
 
+    // 空路径（或只有目录）时退成**共享项自己的名字**：那正是"共享项根就是一个文件"那一档，
+    // 旧写法退成 "download" —— 扩展名都没了，用户拿到一个打不开的文件。
     let file_name = Path::new(&path_in_share)
-        .file_name().map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "download".into());
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| share.name.clone());
 
     let target_dir = match mode {
         DownloadMode::AskEachTime => {
             use tauri_plugin_dialog::DialogExt;
-            let picked = app.dialog().file().set_file_name(&file_name)
-                .blocking_save_file().map(|p| PathBuf::from(p.to_string()));
-            picked.unwrap_or_else(|| config::unique_path(&download_dir, &file_name))
+            match app.dialog().file().set_file_name(&file_name)
+                .blocking_save_file().map(|p| PathBuf::from(p.to_string()))
+            {
+                Some(p) => p,
+                // 取消 = 不落盘（见 `download_from_peer`：同一个口径）。
+                None => return Ok(None),
+            }
         }
         DownloadMode::Direct => config::unique_path(&download_dir, &file_name),
     };
@@ -1481,25 +1657,28 @@ async fn download_file(
     }
     tokio::fs::write(&target_dir, &bytes).await.map_err(|e| e.to_string())?;
     info!(target = %target_dir.display(), "file downloaded");
-    Ok(target_dir.to_string_lossy().to_string())
+    Ok(Some(target_dir.to_string_lossy().to_string()))
 }
 
+/// 下载一份副本并在文件管理器里高亮它；用户在保存框里取消 → `None`（什么都不做）。
 #[tauri::command]
 async fn download_and_open(
     share_id: String,
     path_in_share: String,
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
-) -> Result<String, String> {
-    let path = download_file(share_id, path_in_share, state, app.clone()).await?;
+) -> Result<Option<String>, String> {
+    let Some(path) = download_file(share_id, path_in_share, state, app.clone()).await? else {
+        return Ok(None);
+    };
     if let Err(e) = app.opener().reveal_item_in_dir(&path) {
         error!("Failed to reveal item: {e}");
     }
-    Ok(path)
+    Ok(Some(path))
 }
 
 /// 用系统默认方式打开一个路径：目录就落在文件管理器里。收完推送那条通知上的「打开目录」
-/// 走这里（`dest` 是 `<下载目录>/<发送方名>`，是个目录）。
+/// 走这里（`dest` 是落盘那层 `<落盘目录>/<发送方名>`，是个目录）。
 ///
 /// 路径已被移走/删掉时 `open_path` 会真的报错（先做一次 `metadata()` 探活）—— 不当成
 /// 静默成功：界面要据此把那条通知**留住**，否则"东西落在哪"就随着气泡一起没了。
@@ -1770,25 +1949,38 @@ fn setup_server_task(app: &AppHandle) {
                                 continue;
                             }
                             match event {
-                                PeerEvent::Online { id, name, ip, port } => {
+                                PeerEvent::Online { id, name, ip, port, nets, relay } => {
+                                    // 「它在喊」这件事先记下（F-106）：探活成不成是另一回事 ——
+                                    // 列表要靠这一档把"在同一网段、但被 AP 隔开"的设备显示出来。
+                                    // 「第一次看见它」（下面那个接回/flush 的触发判据）。
+                                    let was_seen = s2.is_seen(&id);
+                                    s2.note_seen(&id);
+                                    // F-107：TXT 里自报的网段与中转能力。零请求就拿到了 ——
+                                    // 之后 5s 探活那一拍会用活回话把这两项刷新（网卡换了 TXT
+                                    // 不会重播，活回话才是权威）。
+                                    s2.note_peer_nets(&id, &nets);
+                                    if relay {
+                                        s2.set_relay_capable(&id, true);
+                                    }
                                     let is_paired = credential::has_peer(&id);
                                     // Already paired in our records → keep the flag.
                                     let paired = is_paired || {
                                         let peers = s2.peers.lock();
                                         peers.iter().any(|p| p.id == id && p.paired)
                                     };
-                                    // 之前是不是已经算在线：只有"重新出现"[离线→在线]才值得
-                                    // 触发一次接回（mDNS 反复重解析同一条记录很常见）。
-                                    let was_online = s2
-                                        .get_peer(&id)
-                                        .map(|p| p.online)
-                                        .unwrap_or(false);
+                                    // ⚠️ **mDNS 记录只说"看得见"，不说"连得上"**：`online` 是
+                                    // "5s 探活成功 = 真够得着"（DTO 与界面那颗点都这么读它）。
+                                    // 这里以前写 `online: true`，于是"同段但被 AP 隔离"的设备
+                                    // ——mDNS 看得见、单播全灭——会一直顶着"在线"的绿灯：而它
+                                    // 其实一条消息都收不到（`seen` 那一档才是这时的真相）。
+                                    // `upsert_peer` 对已有的行是 `||`（只增不减），所以这里给
+                                    // `false` 不会把链路/中转刚证实的在线状态打回去。
                                     s2.upsert_peer(&PeerDevice {
                                         id: id.clone(),
                                         name,
                                         ip: ip.to_string(),
                                         port,
-                                        online: true,
+                                        online: false,
                                         paired,
                                         // 发现条目不带长连接意图：这一行只是观察值，意图由
                                         // `AppState::set_link_intent` 一处写（`upsert_peer`
@@ -1801,7 +1993,7 @@ fn setup_server_task(app: &AppHandle) {
                                     // in: the link comes from a 「连接」 click or
                                     // from `restore_links_on_startup` on boot（或
                                     // 由下面这条"重新出现"的证据触发）。
-                                    if !was_online {
+                                    if !was_seen {
                                         ws::redial_if_remembered(&s2, &id);
                                     }
                                     // 刚才这一行还可能只是"把地址补上了"（之前地址簿里没有它，
@@ -1818,6 +2010,8 @@ fn setup_server_task(app: &AppHandle) {
                                 }
                                 PeerEvent::Offline(id) => {
                                     s2.set_peer_online(&id, false);
+                                    // 记录被撤（告别包 / TTL 过期）：不再"看得见"。
+                                    s2.clear_seen(&id);
                                 }
                             }
                         }
@@ -1856,6 +2050,31 @@ fn setup_server_task(app: &AppHandle) {
                                 continue;
                             }
                             state::probe_peers_once(&probe_state).await;
+                        }
+                    });
+
+                    // 本机网卡地址变了（插网线、开/关热点、切 Wi-Fi、VPN 起来）→ 通知界面
+                    // 重拉左下角「端口 · IP」。**后端只负责"发现变化"**：值仍由界面自己拉
+                    // （一份真相，不来回传），所以载荷是空的。
+                    //
+                    // mDNS 那一半不用这里管：`enable_addr_auto` 的 daemon 自己每 5s 查一次
+                    // 网卡列表（mdns-sd 的 `check_ip_changes`），新网卡当场把服务播上去、
+                    // 消失的网卡把地址撤掉。
+                    let addr_state = arc_state.clone();
+                    tokio::spawn(async move {
+                        let mut last = server::local_ipv4_addresses();
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            let now = server::local_ipv4_addresses();
+                            if now != last {
+                                info!(was = ?last, now = ?now, "本机网卡地址变化");
+                                last = now;
+                                ws::emit_ui(
+                                    &addr_state,
+                                    ws::events::ui::LOCAL_ADDRESSES,
+                                    &serde_json::json!({}),
+                                );
+                            }
                         }
                     });
 
@@ -2021,6 +2240,11 @@ pub fn run() {
             local_addresses,
             list_devices,
             set_device_remark,
+            relay_memory,
+            clear_relay_memory,
+            relay_status,
+            close_relays,
+            relay_traffic,
             add_peer,
             remove_peer,
             #[cfg(mobile)]

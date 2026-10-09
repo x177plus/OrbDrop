@@ -42,7 +42,7 @@ async fn state_with_share(port: u16, root: &std::path::Path, peer_port: u16) -> 
         online: true,
         paired: true,
         auto_connect: false,
-        paused: false,
+        paused: false, relay: None,
     });
     credential::set_peer(&peer, "t").unwrap();
     let cfg = state.config_path.clone();

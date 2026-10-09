@@ -1,4 +1,9 @@
 <resources>
     <string name="app_name">"OrbDrop"</string>
     <string name="main_activity_title">"OrbDrop"</string>
+    <!-- 常驻前台服务那条通知（F-81）：它的作用只是"别让系统把进程回收掉"。 -->
+    <string name="notif_channel_keepalive">保持互联</string>
+    <string name="notif_channel_keepalive_desc">让 OrbDrop 在后台保持在线，别人推过来的文件才不会错过。</string>
+    <string name="notif_keepalive_title">OrbDrop 正在运行</string>
+    <string name="notif_keepalive_text">保持局域网在线，随时接收文件。</string>
 </resources>

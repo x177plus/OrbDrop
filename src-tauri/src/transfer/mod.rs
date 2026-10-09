@@ -540,7 +540,7 @@ async fn deliver_invite_http(
 
     let url = format!(
         "{}/push/invite",
-        crate::net::peer_base(&peer.ip, peer.port)
+        crate::net::peer_base(peer.dial().0, peer.dial().1)
     );
     let mut req = crate::net::client()
         .post(&url)
@@ -654,7 +654,16 @@ pub fn schedule_invite_timeout(state: Arc<AppState>, invite_id: String) {
 }
 
 /// 接收方：同意一条邀请 → 开始拉取（F-52）。
-pub fn accept_invite(state: Arc<AppState>, invite_id: &str) -> Result<(), String> {
+///
+/// `root` = 这次接收的落盘根目录：`None` 用设置里的下载目录。只有界面在「每次询问」
+/// （`DownloadMode::AskEachTime`）下替用户问过目录时才带它 —— 已配对设备免同意自动收，
+/// 走的是 `None`。传进来就**先验一次**（必须绝对路径、能建出来），不合格当场返回错误、
+/// 这条邀请**原样留着**（卡片还在，用户能换个目录再点一次），也不放行发送方。
+pub fn accept_invite(
+    state: Arc<AppState>,
+    invite_id: &str,
+    root: Option<std::path::PathBuf>,
+) -> Result<(), String> {
     let (invite, sender_id) = {
         let mut inbound = state.push.inbound.lock();
         let inv = inbound
@@ -671,6 +680,17 @@ pub fn accept_invite(state: Arc<AppState>, invite_id: &str) -> Result<(), String
                     .and_then(|p| (!p.ip.is_empty() && p.port != 0).then(|| (p.ip.clone(), p.port)))
             })
             .ok_or_else(|| "发送方地址未知，无法接收".to_string())?;
+        if let Some(base) = root.as_deref() {
+            // 目录选择框给的一定是绝对路径；不是就不接（相对路径会挂在进程当前目录上，
+            // 落哪儿全凭启动方式，谁也不想要这种"接收方"）。
+            if !base.is_absolute() {
+                return Err("落盘目录必须是绝对路径".into());
+            }
+            // 就地验一次可写（不存在的建出来、拔掉的盘/只读目录当场报错）：失败时**什么都别动**，
+            // 用户换一个目录重按「接收」即可 —— 比"收了一半才发现写不进去"强。
+            let dir = resume::landing_root(base, &inv.sender.name);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("落盘目录不可用：{e}"))?;
+        }
         if let Some(tx) = inv.responder.take() {
             // 放行发送方；但**保留**这条邀请：下载循环拿它当"没被取消"的标志。
             let _ = tx.send(true);
@@ -685,6 +705,7 @@ pub fn accept_invite(state: Arc<AppState>, invite_id: &str) -> Result<(), String
                 count: inv.count,
                 files: inv.files.clone(),
                 caps: inv.caps.clone(),
+                root: root.clone(),
                 callback: Some(callback),
                 responder: None,
             },

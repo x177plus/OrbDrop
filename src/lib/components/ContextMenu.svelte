@@ -21,6 +21,9 @@
     convoBrowse = false,
     convoThread = false,
     convoBc = false,
+    compact = false,
+    pending = false,
+    pinned = false,
     onConvoUpgrade,
     onClose,
     onToast,
@@ -77,6 +80,27 @@
     /** 会话菜单：多台会话里这是**群发**（否则是群聊）—— 只影响文案。 */
     convoBc?: boolean;
     /**
+     * 共享项菜单的另一档：**折叠态卡片上开的那一份**（`ctxState.orb`）。只画装得进那扇
+     * 236×162 窗口的几项 —— 「下载到本地」与整片 BC 区留在面板里。
+     *
+     * 判据是**窗口**而不是"小不小气"：菜单是 `position: fixed`、夹取按窗口算（见 `bounds`），
+     * 超出窗口的部分会被窗口边硬裁掉。面板里那一份实测 205×278（装了 BC：7 项 + 2 条分隔；
+     * 没装 BC 那一档也是 172×162），折叠态窗口才 236×162 —— 全摆上去等于一个从中间被切掉的菜单；
+     * 这一份是 172×127。
+     */
+    compact?: boolean;
+    /**
+     * 还没定好落点：菜单**已经渲染、但先不显形**（`opacity: 0`），只为让人量出它真实多大
+     * （折叠态那一档要按它把窗口撑到装得下，见 `App.placeOrbMenu`）。定好落点后再放开显形，
+     * 于是那 0.12s 的淡入/缩放是从**最终位置**开始的，用户看不到菜单先盖在卡片上再挪开。
+     */
+    pending?: boolean;
+    /**
+     * 落点已由调用方按**屏幕工作区**定好（折叠态卡片那一档）：`ctxPlacement` 一个像素都不动。
+     * 那一档的窗口是照着菜单撑大的，拿窗口当夹取框只会把菜单又推回卡片上。
+     */
+    pinned?: boolean;
+    /**
      * 会话菜单：把这份**群发**升级成群聊（拿那份名单建群，历史不迁）。不传 = 不画这一项 ——
      * 菜单里不该出现"点了没反应"的项，只有调用方真接得上这条路时才长出来。
      */
@@ -122,10 +146,17 @@
    *
    * 用 pointerdown（捕获阶段）而不是 click：列表行会 stopPropagation 或消费 click，
    * 只有 pointerdown 能保证任何位置按下都先到这里。
+   *
+   * 按在菜单**外面**的那一下在关掉菜单之后**就地吃掉**（`stopPropagation`，捕获阶段挡住整条
+   * 下行/冒泡）：悬浮框上"第一下只关菜单"就靠它 —— 不然这一下会顺手把面板展开 / 把页翻过去，
+   * 而卡片侧没法自己判断"这一下是来关菜单的"（菜单已经关了，它读到的状态是关着的）。
+   * 只挡事件传播，不 `preventDefault`：焦点那类默认动作照旧。
    */
   onMount(() => {
     function onPointerDown(e: PointerEvent) {
-      if (!root?.contains(e.target as Node)) onClose();
+      if (root?.contains(e.target as Node)) return;
+      onClose();
+      e.stopPropagation();
     }
     function onKeyDown(e: KeyboardEvent) {
       if (e.key === 'Escape') onClose();
@@ -141,9 +172,14 @@
   /**
    * 菜单是 `position: fixed` 且挂在 `.orb-stage` 之外（跨层叠上下文永远在最上），
    * 参照系就是视口；面板窗口本身即视口，所以直接量 `innerWidth/innerHeight`。
-   * 每次打开都是一次新挂载，所以这个值跟着当前窗口大小走。
+   *
+   * 这两个数**每次落点都现读**（别抄成常量）：折叠态那一档菜单一开，窗口就先被撑大
+   * （`App.placeOrbMenu`），落点要用撑大之后的窗口算。
    */
-  const bounds = { width: window.innerWidth, height: window.innerHeight };
+  const bounds = {
+    get width() { return window.innerWidth; },
+    get height() { return window.innerHeight; },
+  };
 </script>
 
 <!-- BeyondCompare 菜单区：本机共享项与对端共享项共用同一份结构 -->
@@ -182,7 +218,7 @@
 {/snippet}
 
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-<div class="ctx show" bind:this={root} data-od-id="ctx-menu" use:ctxPlacement={{ x, y, bounds }} role="menu" tabindex="-1" onclick={onClose}>
+<div class="ctx" class:show={!pending} class:is-compact={compact} bind:this={root} data-od-id="ctx-menu" use:ctxPlacement={{ x, y, bounds: pinned ? null : bounds }} role="menu" tabindex="-1" onclick={onClose}>
   {#if kind === 'chat'}
     {#if chatSel}
       <button class="ctx-item" onclick={() => handleItem(() => onChatCopy('sel'))}>
@@ -230,24 +266,26 @@
     </button>
     {#if bcAvailable}{@render bcSection()}{/if}
   {:else if kind === 'share'}
-    <button class="ctx-item" onclick={() => handleItem(onDownload)}>
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
-      下载到本地
-    </button>
+    {#if !compact}
+      <button class="ctx-item" onclick={() => handleItem(onDownload)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
+        下载到本地
+      </button>
+    {/if}
     <button class="ctx-item" onclick={() => handleItem(onOpen)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>
-      打开所在文件夹
+      {compact ? '打开文件夹' : '打开所在文件夹'}
     </button>
     <button class="ctx-item" onclick={() => handleItem(onCopy)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11v13H4z"/><path d="M8 4h12v12"/></svg>
-      复制共享路径
+      {compact ? '复制路径' : '复制共享路径'}
     </button>
     <div class="ctx-sep"></div>
     <button class="ctx-item danger" onclick={() => handleItem(onRemove)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
-      移除共享项
+      {compact ? '移除共享' : '移除共享项'}
     </button>
-    {#if bcAvailable}{@render bcSection()}{/if}
+    {#if !compact && bcAvailable}{@render bcSection()}{/if}
   {:else}
     <!-- 备注（F-101）**与在线状态无关**：它是纯本机数据（写进本机 `config.toml`，
          不发给对端），离线行、未绑定的行照样能改 —— 所以它排在下面那段状态分档之前，
@@ -259,8 +297,19 @@
       {#if deviceRemark}<span class="ctx-current">{deviceRemark}</span>{/if}
     </button>
     <div class="ctx-sep"></div>
-    {#if !deviceOnline}
-      <!-- 离线设备：只有「解除配对」是本机动作（它不依赖长连接）。会话仍然打得开、消息也发得
+    {#if deviceState === 'unbound'}
+      <!-- 未绑定：只做两件事 —— 配对，或开会话发消息（消息走"长连接优先 + HTTP 兜底"，
+           未建链时对端还收不到就排队等它上线）；推送在会话里那颗「＋」，这里不再重复摆一份。
+           没有「立即连接」（未配对拨不动），也没有「解除配对」（没有关系可解）。
+           **排在"离线"之前**：未绑定的行（含只被 mDNS 看到过、还没连上的，F-106）
+           在列表里照样有一行，菜单就该给得出这一行能做的事（配对 / 发消息），
+           而不是只剩「修改备注」。 -->
+      <button class="ctx-item" onclick={() => handleItem(onPair)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+        配对
+      </button>
+    {:else if !deviceOnline}
+      <!-- 已配对但离线：只有「解除配对」是本机动作（它不依赖长连接）。会话仍然打得开、消息也发得
            出去（排着队等它上线，见 chat::flush_queued），但设备页这一行按 F-14 的离线行规则
            不给这两个动作。 -->
     {:else if deviceState === 'connected'}
@@ -274,21 +323,13 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
         重新配对
       </button>
-    {:else if deviceState === 'unbound'}
-      <!-- 未绑定：只做两件事 —— 配对，或开会话发消息（消息走"长连接优先 + HTTP 兜底"，
-           未建链时对端还收不到就排队等它上线）；推送在会话里那颗「＋」，这里不再重复摆一份。
-           没有「立即连接」（未配对拨不动），也没有「解除配对」（没有关系可解）。 -->
-      <button class="ctx-item" onclick={() => handleItem(onPair)}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
-        配对
-      </button>
     {:else}
       <button class="ctx-item" onclick={() => handleItem(onConnect)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/></svg>
         立即连接
       </button>
     {/if}
-    {#if deviceOnline}
+    {#if deviceOnline || deviceState === 'unbound'}
       <button class="ctx-item" onclick={() => handleItem(onMessage)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22 11 13 2 9 22 2Z"/></svg>
         发消息
@@ -305,6 +346,22 @@
 </div>
 
 <style>
+  /* ── 折叠态卡片上的那一份（`.is-compact`）─────────────────────────────
+     它长在桌面上、贴着悬浮框，比面板里的菜单要"小一号"：面板那份是 13px/7×10 的行，
+     这一份与**卡片里的目录名同一号**（`--fs-xxs`，见 `.rq-iname`），行距与内边距一并收紧。
+     三个数（字号 / 行内边距 / 图标）是这一档的全部：宽度由文字算（`min-width: 0` 撤掉
+     面板那份的 172px 下限），所以菜单整体比面板那份小一圈。
+     代价是**每一项的文案也得短**（打开文件夹 / 复制路径 / 移除共享）：11px 的行里摆
+     "打开所在文件夹" 这种长句，菜单又会被撑回去。
+     宽度**必须写成 `max-content`**：`.ctx` 是 `position: fixed` 且只给了 `left`，宽度默认是
+     shrink-to-fit —— 菜单还没定好落点时（`pending`）正好摆在指针那一格，右边剩多少它就缩多窄，
+     量出来的尺寸是"被窗口挤过的那一份"，撑窗与落点全跟着错（实测：97px 的菜单量成 63×272）。
+     `max-content` 与摆在哪儿无关。 */
+  .ctx.is-compact { min-width: 0; width: max-content; padding: 4px; }
+  .ctx.is-compact .ctx-item { gap: 6px; padding: 4px 7px; font-size: var(--fs-xxs); }
+  .ctx.is-compact .ctx-item svg { width: 12px; height: 12px; }
+  .ctx.is-compact .ctx-sep { margin: 4px 5px; }
+
   /* 比较位提示行 / 无可比对象的比较项：沿用 .ctx-item 排版，但不可点也不高亮。
      pointer-events:none 让点击落到菜单根节点上，等于「点空白关闭菜单」。 */
   .ctx-item:disabled {

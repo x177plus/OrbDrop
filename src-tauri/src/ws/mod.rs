@@ -545,12 +545,12 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
             };
 
             // manual=1 只在第一次尝试时带上：这是一次"用户让连"的请求，不是持续声明。
-            let url = crate::net::peer_ws_url(&peer.ip, peer.port, &token, manual_pending);
+            let url = crate::net::peer_ws_url(peer.dial().0, peer.dial().1, &token, manual_pending);
             manual_pending = false;
             state.ws.set_link_state(&peer_id, LinkState::Retrying);
             // 到对端要过 TLS，而"指纹对不上"发生在 WS 握手**之前** —— `stop_reason_for`
             // 只看得到 WS 层的错误，身份这一条只能在这里单独拦下来。
-            let dialed = match crate::net::connect_ws(&url, &peer.ip, peer.port).await {
+            let dialed = match crate::net::connect_ws(&url, peer.dial().0, peer.dial().1).await {
                 Err(crate::net::DialError::IdentityRejected) => {
                     warn!(%peer_id, "对端证书指纹与钉住的不一致：停手，需重新配对");
                     state.ws.set_link_state(
@@ -569,7 +569,7 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
                     info!(%peer_id, "outbound WS linked");
                     // 这条链路走的是 TLS：连上了就把这次见到的证书指纹补上（老记录、
                     // 或首次连上）。没有它，下一次拨号仍旧是"没见过这个地址"。
-                    crate::state::remember_peer_fingerprint(&state, &peer_id, &peer.ip);
+                    crate::state::remember_peer_fingerprint(&state, &peer_id, peer.dial().0);
                     state.set_peer_online(&peer_id, true);
                     // 长连接意图落盘（F-16）：链路一建立就记下，重启后自动接回来。
                     // 这一次写入同时清掉「断开」的暂停（`LinkIntent` 是同一个意图的两面）。

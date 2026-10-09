@@ -106,6 +106,9 @@ pub async fn push_invite_handler(
         count: body.count,
         files: body.files,
         caps: body.caps,
+        // 落盘根由用户在界面上定（「每次询问」时那颗目录选择框）—— 邀请到达时还不知道，
+        // 所以这里恒为 `None`，真要挑就等 `accept_invite` 带的那个 root。
+        root: None,
         // ip 取自 TCP 来源（不可伪造），端口用发送方自报的服务端口 —— 但**本机自己的监听
         // 端点不能记**：NAT 后面的对端（安卓模拟器）回连进来时，来源地址在**本机**这一侧
         // 就是本机自己（见 `net::observed_dial_target`）。留一个指向自己的回执地址，等于
@@ -120,7 +123,7 @@ pub async fn push_invite_handler(
     // 唯一安全兜底，不能一起取消。
     if paired {
         state.push.insert_invite(invite);
-        if let Err(reason) = accept_invite(state.clone(), &invite_id) {
+        if let Err(reason) = accept_invite(state.clone(), &invite_id, None) {
             warn!(%invite_id, %reason, "auto-accept failed");
             // 本机那条"正在接收"的通知得收尾（`reject_invite_with` 会把它变成一条
             // 失败通知），再把原因作为这次同步响应回给发送方。
@@ -162,6 +165,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 /// `push_progress` / `push_done` 事件，发送方用同一个 dispatcher 处理。
 pub async fn push_report_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(event): Json<WsEvent>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let (invite_id, kind) = match &event {
@@ -188,6 +192,12 @@ pub async fn push_report_handler(
             }
         }
     };
+    // 认人：与 `/push/invite`、`/push/download` 同一套 —— 这台对端是**已配对**设备时，
+    // 必须出示它的 token。否则只要知道 invite_id（v4 UUID，可能从日志/界面/别处漏出去），
+    // 任何人都能伪造一条 `push_done` 把在途传输判完成或判失败。
+    // 未绑定的对端手里没有 token（这正是"未绑定也能推"的前提），只能靠 invite_id。
+    let peer_paired = state.get_peer(&sender_id).is_some_and(|p| p.paired);
+    authorize(&state, &headers, peer_paired, &sender_id)?;
     info!(%invite_id, kind, "push report (http)");
     crate::ws::session::handle_inbound(&state, &sender_id, event).await;
     Ok(StatusCode::NO_CONTENT)
@@ -389,3 +399,95 @@ impl AsyncRead for CancelAwareReader {
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn state() -> Arc<AppState> {
+        let dir = std::env::temp_dir().join(format!("orbdrop_push_rep_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(AppState::new(crate::config::Config::default(), dir.join("config.toml")))
+    }
+
+    fn inbound_invite(id: &str, sender: &str) -> crate::transfer::push_job::InboundInvite {
+        crate::transfer::push_job::InboundInvite {
+            invite_id: id.into(),
+            sender: PeerInfo { id: sender.into(), name: "PC-B".into() },
+            name: "a.txt".into(),
+            size: 3,
+            is_dir: false,
+            count: 1,
+            files: Vec::new(),
+            caps: Vec::new(),
+            root: None,
+            callback: None,
+            responder: None,
+        }
+    }
+
+    /// `/push/report` 不是"知道 invite_id 就能改结果"（P1-4）。
+    ///
+    /// 已配对的对端必须出示它那枚 token（与 `/push/invite`、`/push/download` 同一道关）；
+    /// 未绑定的对端手里没有 token —— 那是"未绑定也能推"的前提，只能靠 invite_id。
+    #[tokio::test]
+    async fn push_report_needs_the_token_of_a_paired_peer() {
+        let st = state();
+        let port = crate::server::start_server(st.clone(), 4320)
+            .await
+            .expect("server start");
+        crate::credential::set_peer_credential("peer-paired", "tok-paired", &"c".repeat(64))
+            .unwrap();
+        st.mark_paired(&crate::config::PeerDevice {
+            id: "peer-paired".into(),
+            name: "PC-B".into(),
+            ip: "127.0.0.1".into(),
+            port: 1,
+            online: true,
+            paired: true,
+            ..Default::default()
+        });
+        st.push.insert_invite(inbound_invite("inv-paired", "peer-paired"));
+        st.push.insert_invite(inbound_invite("inv-unpaired", "peer-new"));
+
+        let url = format!("http://127.0.0.1:{port}/push/report");
+        let body = |invite: &str| {
+            serde_json::json!({
+                "type": "push_done", "invite_id": invite,
+                "status": "completed", "reason": null,
+            })
+        };
+        let client = reqwest::Client::new();
+
+        // 已配对 + 无凭据 → 401（原来这里只要 invite_id 对就能改结果）
+        let bare = client.post(&url).json(&body("inv-paired")).send().await.unwrap();
+        assert_eq!(bare.status(), StatusCode::UNAUTHORIZED);
+        // 已配对 + 别人的 token → 401
+        let wrong = client
+            .post(&url)
+            .bearer_auth("tok-other")
+            .json(&body("inv-paired"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        // 已配对 + 自己的 token → 收下
+        let ok = client
+            .post(&url)
+            .bearer_auth("tok-paired")
+            .json(&body("inv-paired"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+
+        // 未绑定：没有 token 可带，仍按 invite_id 收下（否则"未绑定也能推"就断了）
+        let unpaired = client.post(&url).json(&body("inv-unpaired")).send().await.unwrap();
+        assert_eq!(unpaired.status(), StatusCode::NO_CONTENT);
+
+        crate::server::stop_server(&st).await;
+        crate::credential::remove_peer("peer-paired").ok();
+    }
+}
+

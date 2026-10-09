@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { PeerDevice } from '$lib/types';
-  import { getDevices, loadDevices, deviceState, needsRepair, deviceDisplayName } from '$lib/stores/devices.svelte';
+  import { getDevices, loadDevices, deviceState, needsRepair, deviceDisplayName, unicastBlockedTip, transitHint } from '$lib/stores/devices.svelte';
   import { connectPeer, disconnectPeer } from '$lib/api';
   import * as chat from '$lib/stores/chat.svelte';
   import Hint from '$lib/components/Hint.svelte';
@@ -89,28 +89,38 @@
    * 的意思也只有这里说得下）。
    */
   function linkHint(d: PeerDevice): string {
+    // F-107：这一段有没有"中转记忆"（"直连不通时该走哪一段"的持久策略）。与「经 X 中转」
+    // （此刻这条路）是两件事，所以它**追加**在下面任何一种说明之后，自己不做状态档。
+    const transit = transitHint(d);
+    const withTransit = (text: string) => (transit ? (text ? `${text}\n${transit}` : transit) : text);
     if (!d.online) {
+      if (!d.paired) {
+        // 未绑定又离线：只有"看得见"过的设备才留得到这一行（见 `visibleDevices`）——
+        // 它只是最近还在这片网上的痕迹。"为什么连不上"（单播被 AP 隔开那类）不写在这里，
+        // 那是发起连接时的一句话（`unicastBlockedTip`）。
+        return withTransit('对方此刻联系不上（探活不成）。这一行只是它最近还在这片网上的痕迹；它上线后就能「配对」或「发消息」（消息会排队等它上线）。');
+      }
       // 「等上线」并进这一档：拨号待命 / 正在退避都只是"本机在等它"，pill 仍是「离线」。
       const waiting = d.linkState && (d.linkState.kind === 'waiting' || d.linkState.kind === 'retrying');
       const tail = waiting
         ? '本机还在等它：一出现在网上就自动接回长连接。'
         : '它上线后这一行会回到在线，长连接是否接回仍按本机「连接」记忆走。';
-      return `对方此刻不在网上（mDNS 和探活都看不到它）。这一行留在列表里是为了让你能「解除配对」（本机动作，不需要对方在线）；${tail}`;
+      return withTransit(`对方此刻不在网上（探活看不到它）。这一行留在列表里是为了让你能「解除配对」（本机动作，不需要对方在线）；${tail}`);
     }
     const s = d.linkState;
-    if (d.connected || !s || s.kind === 'connected') return '';
+    if (d.connected || !s || s.kind === 'connected') return withTransit('');
     switch (s.kind) {
-      case 'retrying': return '正在尝试建立长连接（失败后按 5→60s 退避重试）';
-      case 'waiting': return '对端此刻不在网上：不再空发连接，等它出现（探活/mDNS）或对方自己拨过来';
+      case 'retrying': return withTransit('正在尝试建立长连接（失败后按 5→60s 退避重试）');
+      case 'waiting': return withTransit('对端此刻不在网上：不再空发连接，等它出现（探活/mDNS）或对方自己拨过来');
       case 'stopped':
         switch (s.reason) {
-          case 'peerDisconnected': return '对端点过「断开」：它只是临时暂停这条链路，不是解除配对 —— 自动重拨会被暂时挡住，谁点一次「连接」就恢复';
-          case 'tokenRejected': return '对端不认本机的凭据（它清过数据或已解除配对）：需要重新配对';
-          case 'identityChanged': return '对端证书与本机记住的不一致（对方重装过 / 换过机器？）：需要重新配对才连得上';
-          case 'localDisconnected': return '本机点过「断开」：重启后也不会自动连，点「连接」即可恢复';
+          case 'peerDisconnected': return withTransit('对端点过「断开」：它只是临时暂停这条链路，不是解除配对 —— 自动重拨会被暂时挡住，谁点一次「连接」就恢复');
+          case 'tokenRejected': return withTransit('对端不认本机的凭据（它清过数据或已解除配对）：需要重新配对');
+          case 'identityChanged': return withTransit('对端证书与本机记住的不一致（对方重装过 / 换过机器？）：需要重新配对才连得上');
+          case 'localDisconnected': return withTransit('本机点过「断开」：重启后也不会自动连，点「连接」即可恢复');
         }
     }
-    return '';
+    return withTransit('');
   }
 
   /** 手动断开/连接：长连接只由用户点击发起（配对不再自动建链）。 */
@@ -118,7 +128,9 @@
     try {
       if (connect) {
         await connectPeer(d.id);
-        onToast(`正在与「${deviceDisplayName(d)}」建立长连接`);
+        // 这一台此刻"看得见却直连不通"时，那句解释在这里说 —— 它是"这一次为什么连不上"，
+        // 不该做成设备行上的一个常驻状态（见 `unicastBlocked`）。
+        onToast(unicastBlockedTip(d) ?? `正在与「${deviceDisplayName(d)}」建立长连接`);
       } else {
         await disconnectPeer(d.id);
         onToast(`已与「${deviceDisplayName(d)}」断开长连接（临时暂停，不是解除配对）：本机不再自动接回，对方点「连接」可立刻恢复`);
@@ -279,13 +291,19 @@
             </span>
           </div>
           <div class="d-ip">{addressLabel(d)}</div>
+          {#if d.relayVia}
+            <!-- 这条路不是直连：此刻经这台设备中转（后端自动接管/自动收起，用户不用管）。 -->
+            <div class="d-relay">经 {d.relayVia} 中转</div>
+          {/if}
         </div>
         <div class="d-acts">
-          {#if !d.online}
-            <!-- 离线设备唯一能做的本机动作：解除配对（后端不依赖长连接，见 unpair_peer）。
+          {#if !d.online && d.paired}
+            <!-- 已配对但离线：唯一能做的本机动作是「解除配对」（后端不依赖长连接，见 unpair_peer）。
                  「连接」在这里不提供：对端不在网上，只会开一个空转的拨号循环；
                  「发消息」也不给（同 F-14 的离线行规则）——设备页这一行不是消息的入口，
-                 会话列表里与它的那条会话一直在（那里的输入框照样能用，消息会排队等它上线）。 -->
+                 会话列表里与它的那条会话一直在（那里的输入框照样能用，消息会排队等它上线）。
+                 **注意这里是"且已配对"**：未绑定的那一档（含"看得见却直连不通"的，F-106）
+                 走下面的未绑定那一档 —— 它保留「配对」与「发消息」，但同样不给依赖链路的动作。 -->
             <button class="btn btn-ghost btn-sm" data-unpair>解除配对</button>
           {:else if d.connected}
             <button class="btn btn-ghost btn-sm" data-disconnect>断开</button>

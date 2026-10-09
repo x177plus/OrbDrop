@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Sheet } from "./store.svelte";
   import PairSheet from "./sheets/PairSheet.svelte";
+  import PairInviteSheet from "./sheets/PairInviteSheet.svelte";
   import AddDeviceSheet from "./sheets/AddDeviceSheet.svelte";
   import DeviceActionsSheet from "./sheets/DeviceActionsSheet.svelte";
   import RenameDeviceSheet from "./sheets/RenameDeviceSheet.svelte";
@@ -16,6 +17,8 @@
 
 {#if sheet.kind === "pair"}
   <PairSheet {onClose} />
+{:else if sheet.kind === "pairInvite"}
+  <PairInviteSheet {onClose} />
 {:else if sheet.kind === "addDevice"}
   <AddDeviceSheet {onClose} />
 {:else if sheet.kind === "deviceActions"}

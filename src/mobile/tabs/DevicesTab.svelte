@@ -60,6 +60,10 @@
             <span class="dmain">
               <span class="dname">{d.name}</span>
               <span class="dip num">{d.ip}:{d.port}</span>
+              {#if d.relayVia}
+                <!-- 这条路不是直连：此刻经这台设备中转（后端自动接管/自动收起）。 -->
+                <span class="drelay">经 {d.relayVia} 中转</span>
+              {/if}
               <StateChip state={devices.deviceState(d)} />
             </span>
             <span class="dacts">

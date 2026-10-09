@@ -11,6 +11,12 @@
      4. :has() 的选择器并联 `.is-checked`，由组件按已有状态挂类。
      5. **行尾必须是 LF**：`tokens:gen` / `tokens:check` 按整文件字符串比对，CRLF（或 CRLF/LF
         混杂）会被判成"回退未同步"——编辑器别把这个文件存成 CRLF。
+     6. **`color-mix()` 一律写 `in oklab`（直角插值），不写 `in oklch`**：Chrome 111–114 的极坐标
+        色相插值会把 `transparent` 的色相当 0 绕行，蓝色底纹被染成粉色（真机 Huawei WebView
+        114.0.5.302 实测：`--accent-soft` 叠白底 = rgb(243,221,237)，正确值 rgb(227,239,251)；
+        同引擎的 `oklch()` 本身是准的）。与 `transparent` / `black` 混时 `in oklab` 与 `in oklch`
+        等价，只有两个带色相的颜色互混才有差别 —— 那几处（`--hairline`/`.pend`/`.opt.danger`）
+        直角插值给出的正是设计意图，也正好等于本文件的 sRGB 回退值。
 
    文件末尾那条 `@supports` 是**生成区**（`scripts/gen-color-tokens.mjs` 产出）：
    改配色只改这套写法，然后 `npm run tokens:gen` 重算回退；`npm run check:compat` 是门禁
@@ -94,6 +100,14 @@
 *, *::before, *::after { box-sizing: border-box; }
 [hidden] { display: none !important; }
 html, body { margin: 0; min-height: 100%; }
+/* 手指按住元素时那层**蓝**，是 Android WebView 自己盖上去的，不是本套 UI 的样式：
+   `-webkit-tap-highlight-color` 的默认高亮 —— 真机（Huawei WebView / Android 12）实测按住
+   按钮时整个按钮被刷成 rgb(170,223,244)，正好是 `#33B5E5` 按 40% 不透明度叠在 --bg 上；
+   按下即现、抬手才退 —— 用户看到的就是"点击按钮出现一个蓝色的按压效果"。
+   UI 自己的按压反馈由各处 `:active` 的 scale 承担，不需要系统再叠一层。
+   该属性**可继承**，所以写在根上就覆盖整棵树；值只有 `transparent`，不涉及 oklch/color-mix，
+   不进兼容性门禁。桌面端（`src/styles/main.css`）不写：那边是鼠标，没有 tap highlight。 */
+html, body { -webkit-tap-highlight-color: transparent; }
 img, svg { display: block; }
 button { font: inherit; cursor: pointer; color: inherit; background: none; border: 0; padding: 0; }
 input { font: inherit; }
@@ -250,6 +264,21 @@ a { color: inherit; text-decoration: none; }
 .cv-dot { flex: none; width: calc(7 * var(--u)); height: calc(7 * var(--u)); border-radius: 50%; background: rgba(14, 18, 23, 0.24); }
 .cv-dot.ok { background: var(--ok); }
 .cv-dot.warn { background: var(--warn); }
+
+/* 会话列表 / 会话头那颗点与设备页的 `.dot` **同一套五档语义**（实心绿 = 长连接、
+   绿环 = 在线、灰环 = 离线、琥珀环 = 重连中、红环 = 需配对）。
+   这里以前把五档压成两颗（长连接与"在线"都是实心绿）—— 于是"经中转够得着"与"有长连接"
+   在同一颗绿点上分不出来，而同一台设备在设备页上又是另一套画法。两处必须同一套。 */
+.cv-dot.live,
+.cv-dot.online,
+.cv-dot.offline,
+.cv-dot.retrying,
+.cv-dot.repair { border: 2px solid transparent; background: transparent; }
+.cv-dot.live { background: var(--ok); border-color: var(--ok); }
+.cv-dot.online { border-color: var(--accent); }
+.cv-dot.offline { border-color: rgba(14, 18, 23, 0.32); }
+.cv-dot.retrying { border-color: var(--warn); }
+.cv-dot.repair { border-color: var(--danger); }
 .cv-time { margin-left: auto; flex: none; font-family: var(--font-mono); font-size: calc(11 * var(--u)); color: var(--muted); }
 .cv-prev { font-size: var(--fs-sm); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cv-unread {
@@ -449,6 +478,8 @@ a { color: inherit; text-decoration: none; }
 .dmain { flex: 1; min-width: 0; display: grid; gap: 2px; }
 .dname { font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 620; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dip { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 「经 X 中转」：与地址同一档小字，但取强调色 —— 它说的是"这条路不是直连"。 */
+.drelay { font-size: var(--fs-xs); color: var(--accent-deep); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .drow { width: 100%; display: flex; align-items: center; gap: calc(12 * var(--u)); padding: calc(11 * var(--u)) calc(12 * var(--u)); text-align: left; }
 .drow + .drow { border-top: 1px solid var(--border); }
 .drow:hover { background: var(--fg-soft); }
@@ -658,8 +689,11 @@ body {
 /* 规则级的 color-mix 为什么也在这里：老引擎**能解析**它（CSSOM 里留得住），失败发生在**计算期**，
    按规范属于 invalid at computed-value time → 结果是 unset，**不会回退到前一条声明**
    （实测 .toast / .scrim 的成对回退因此仍是透明）。放进 @supports 才会被整块跳过。
-   纯 oklch() 不同：它在解析期就非法、那条声明被丢掉、前一条生效，所以那些用成对声明就够。 */
-@supports (color: oklch(0% 0 0)) and (background: color-mix(in oklch, red, blue)) {
+   纯 oklch() 不同：它在解析期就非法、那条声明被丢掉、前一条生效，所以那些用成对声明就够。
+   另一条硬规矩：这块里的 color-mix() **一律 `in oklab`（直角插值）**，不用 `in oklch` ——
+   Chromium 111–114 的极坐标色相插值会把 transparent 的色相当 0 绕行，蓝色底纹会被染成粉色
+   （真机 Huawei WebView 114.0.5.302 实测）；与 transparent / black 混时两者等价，见 gen 脚本注释。 */
+@supports (color: oklch(0% 0 0)) and (background: color-mix(in oklab, red, blue)) {
   :root {
   --bg: oklch(99% 0.002 240);
   --surface: oklch(100% 0 0);
@@ -671,43 +705,43 @@ body {
   --ok: oklch(52% 0.15 158);
   --warn: oklch(58% 0.14 60);
   --danger: oklch(56% 0.20 25);
-  --accent-soft: color-mix(in oklch, var(--accent) 12%, transparent);
-  --accent-deep: color-mix(in oklch, var(--accent) 78%, black);
-  --accent-deeper: color-mix(in oklch, var(--accent) 70%, black);
-  --ok-soft: color-mix(in oklch, var(--ok) 13%, transparent);
-  --fg-soft: color-mix(in oklch, var(--fg) 6%, transparent);
-  --hairline: color-mix(in oklch, var(--fg) 20%, var(--border));
-  --danger-soft: color-mix(in oklch, var(--danger) 12%, transparent);
-  --danger-deep: color-mix(in oklch, var(--danger) 78%, black);
+  --accent-soft: color-mix(in oklab, var(--accent) 12%, transparent);
+  --accent-deep: color-mix(in oklab, var(--accent) 78%, black);
+  --accent-deeper: color-mix(in oklab, var(--accent) 70%, black);
+  --ok-soft: color-mix(in oklab, var(--ok) 13%, transparent);
+  --fg-soft: color-mix(in oklab, var(--fg) 6%, transparent);
+  --hairline: color-mix(in oklab, var(--fg) 20%, var(--border));
+  --danger-soft: color-mix(in oklab, var(--danger) 12%, transparent);
+  --danger-deep: color-mix(in oklab, var(--danger) 78%, black);
   --bc: oklch(58% 0.15 38);
-  --bc-soft: color-mix(in oklch, var(--bc) 13%, transparent);
-  --bc-deep: color-mix(in oklch, var(--bc) 74%, black);
+  --bc-soft: color-mix(in oklab, var(--bc) 13%, transparent);
+  --bc-deep: color-mix(in oklab, var(--bc) 74%, black);
   --sp-1: oklch(58% 0.18 255);
   --sp-2: oklch(56% 0.14 158);
   --sp-3: oklch(56% 0.16 320);
-  --sp-1-deep: color-mix(in oklch, var(--sp-1) 74%, black);
-  --sp-2-deep: color-mix(in oklch, var(--sp-2) 74%, black);
-  --sp-3-deep: color-mix(in oklch, var(--sp-3) 74%, black);
+  --sp-1-deep: color-mix(in oklab, var(--sp-1) 74%, black);
+  --sp-2-deep: color-mix(in oklab, var(--sp-2) 74%, black);
+  --sp-3-deep: color-mix(in oklab, var(--sp-3) 74%, black);
   --shadow: 0 24px 64px -28px oklch(18% 0.012 250 / 0.22), 0 2px 8px -2px oklch(18% 0.012 250 / 0.08);
   }
-  .tab-item.active:hover { background: color-mix(in oklch, var(--accent) 18%, transparent); }
-  .btn-danger:hover { background: color-mix(in oklch, var(--danger) 20%, transparent); }
-  .dot.off { background: color-mix(in oklch, var(--fg) 26%, transparent); }
-  .cv-dot { background: color-mix(in oklch, var(--fg) 24%, transparent); }
-  .fbub .fio { background: color-mix(in oklch, currentColor 15%, transparent); }
-  .fbar { background: color-mix(in oklch, currentColor 24%, transparent); }
-  .pend { background: color-mix(in oklch, var(--accent-soft) 55%, var(--surface)); border: 1px solid color-mix(in oklch, var(--accent) 26%, var(--border)); }
-  .ftile.doc { color: color-mix(in oklch, var(--ok) 72%, black); }
-  .ftile.folder { background: color-mix(in oklch, var(--warn) 14%, transparent); color: color-mix(in oklch, var(--warn) 68%, black); }
-  .node .ntile.folder { background: color-mix(in oklch, var(--warn) 14%, transparent); color: color-mix(in oklch, var(--warn) 68%, black); }
-  .state-chip.unbound { background: color-mix(in oklch, var(--warn) 15%, transparent); color: color-mix(in oklch, var(--warn) 68%, black); }
-  .switch .track { background: color-mix(in oklch, var(--fg) 18%, transparent); }
-  .scrim { background: color-mix(in oklch, var(--fg) 32%, transparent); }
-  .sheet-grip { background: color-mix(in oklch, var(--fg) 18%, transparent); }
-  .opt.danger { border-color: color-mix(in oklch, var(--danger) 28%, var(--border)); }
-  .toast { background: color-mix(in oklch, var(--fg) 93%, transparent); color: #fff; }
-  .state-chip.retrying { color: color-mix(in oklch, var(--warn) 62%, black); border-color: color-mix(in oklch, var(--warn) 30%, transparent); background: color-mix(in oklch, var(--warn) 8%, transparent); }
-  .state-chip.repair { color: color-mix(in oklch, var(--danger) 72%, black); border-color: color-mix(in oklch, var(--danger) 32%, transparent); background: color-mix(in oklch, var(--danger) 8%, transparent); }
-  .dot.offline { border-color: color-mix(in oklch, var(--fg) 32%, transparent); }
+  .tab-item.active:hover { background: color-mix(in oklab, var(--accent) 18%, transparent); }
+  .btn-danger:hover { background: color-mix(in oklab, var(--danger) 20%, transparent); }
+  .dot.off { background: color-mix(in oklab, var(--fg) 26%, transparent); }
+  .cv-dot { background: color-mix(in oklab, var(--fg) 24%, transparent); }
+  .fbub .fio { background: color-mix(in oklab, currentColor 15%, transparent); }
+  .fbar { background: color-mix(in oklab, currentColor 24%, transparent); }
+  .pend { background: color-mix(in oklab, var(--accent-soft) 55%, var(--surface)); border: 1px solid color-mix(in oklab, var(--accent) 26%, var(--border)); }
+  .ftile.doc { color: color-mix(in oklab, var(--ok) 72%, black); }
+  .ftile.folder { background: color-mix(in oklab, var(--warn) 14%, transparent); color: color-mix(in oklab, var(--warn) 68%, black); }
+  .node .ntile.folder { background: color-mix(in oklab, var(--warn) 14%, transparent); color: color-mix(in oklab, var(--warn) 68%, black); }
+  .state-chip.unbound { background: color-mix(in oklab, var(--warn) 15%, transparent); color: color-mix(in oklab, var(--warn) 68%, black); }
+  .switch .track { background: color-mix(in oklab, var(--fg) 18%, transparent); }
+  .scrim { background: color-mix(in oklab, var(--fg) 32%, transparent); }
+  .sheet-grip { background: color-mix(in oklab, var(--fg) 18%, transparent); }
+  .opt.danger { border-color: color-mix(in oklab, var(--danger) 28%, var(--border)); }
+  .toast { background: color-mix(in oklab, var(--fg) 93%, transparent); color: #fff; }
+  .state-chip.retrying { color: color-mix(in oklab, var(--warn) 62%, black); border-color: color-mix(in oklab, var(--warn) 30%, transparent); background: color-mix(in oklab, var(--warn) 8%, transparent); }
+  .state-chip.repair { color: color-mix(in oklab, var(--danger) 72%, black); border-color: color-mix(in oklab, var(--danger) 32%, transparent); background: color-mix(in oklab, var(--danger) 8%, transparent); }
+  .dot.offline { border-color: color-mix(in oklab, var(--fg) 32%, transparent); }
 }
 /* ↑↑↑ 生成区结束 ↑↑↑ */

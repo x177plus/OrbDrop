@@ -598,10 +598,14 @@ pub async fn deliver(state: &Arc<AppState>, peer_id: &str, event: &crate::ws::ev
 /// HTTP 那一跳：地址、token、钉过指纹的 TLS 客户端都与推送共用同一套。
 async fn deliver_http(state: &Arc<AppState>, peer_id: &str, event: &crate::ws::events::WsEvent) -> Outcome {
     let Some(peer) = state.get_peer(peer_id) else { return Outcome::Unreachable };
-    if peer.ip.is_empty() || peer.port == 0 {
-        // 地址簿里还没有它的地址（没被发现过 / 手动加的还没填）：够不着，等它自己出现。
+    // 判据是"此刻**拨得动**它吗"，不是"有没有它自己的地址"：只有一条借来的中转链、
+    // 而直连地址从没学到过的那类对端（AP 隔离下被中转的那一侧）照样得送得到 ——
+    // `dial()` 已经把手里那条路（直连地址，或中转端点）选好了。
+    if !peer.dialable() {
+        // 两条路都没有（没被发现过 / 手动加的还没填 / 中转也还没开出来）：够不着，等它出现。
         return Outcome::Unreachable;
     }
+    let (host, port) = peer.dial();
     let path = match event {
         crate::ws::events::WsEvent::ChatText { .. } => "/chat/message",
         crate::ws::events::WsEvent::ChatRead { .. } => "/chat/read",
@@ -625,7 +629,7 @@ async fn deliver_http(state: &Arc<AppState>, peer_id: &str, event: &crate::ws::e
     body["port"] = serde_json::json!(state.server_port.load(std::sync::atomic::Ordering::Relaxed));
     body["sender"] = serde_json::json!({ "id": own_id, "name": own_name });
 
-    let url = format!("{}{}", crate::net::peer_base(&peer.ip, peer.port), path);
+    let url = format!("{}{}", crate::net::peer_base(host, port), path);
     let mut req = crate::net::client().post(&url).timeout(HTTP_TIMEOUT).json(&body);
     // 已配对的对端要出示那枚 token（对端据此确认"是本机那个老搭档"）；未配对的没有 token。
     if peer.paired {
@@ -720,11 +724,23 @@ pub fn send_text(
         let (msg_id, text) = (id.clone(), text.to_string());
         crate::task::spawn("chat http", async move {
             let event = crate::ws::events::WsEvent::ChatText { id: msg_id.clone(), text, at };
-            let outcome = deliver(&state, &peer_id, &event).await;
+            let mut outcome = deliver(&state, &peer_id, &event).await;
+            // 够不着：**先当场试一次中转**（F-106）。探活每 5s 才会去开中转，等它来得及的话，
+            // 用户眼前就是"消息卡在那儿"；这里当场试一次，成了就把这一条立刻重发过去。
+            // `ensure_for` 自带限流、且"已经有路了就直接返回"，重复叫是安全的。
+            if outcome == Outcome::Unreachable {
+                if let Some(relay) = crate::relay::ensure_for(&state, &peer_id).await {
+                    debug!(peer_id = %peer_id, via = %relay.via_name, "这条够不着，已改走中转重发");
+                    outcome = deliver(&state, &peer_id, &event).await;
+                }
+            }
             settle(&state, &peer_id, &msg_id, outcome.delivery());
             if outcome == Outcome::Unreachable {
-                // 这一条排上队了。它有可能**就在这一跳的时间里**已经上线（对端的探活/链路
-                // 比这个请求慢半拍），顺手叫一次补发；叫不动就是它真的还没到（闸门在挡）。
+                // 这一条排上队了（直连不通、也没有可用的中转）。**告诉界面为什么** ——
+                // 排队本身是既有语义（F-95），缺的只是那句解释。
+                crate::relay::notify_undeliverable(&state, &peer_id);
+                // 顺手叫一次补发：它有可能**就在这一跳的时间里**上线了（探活/链路比这个
+                // 请求慢半拍），闸门在挡，叫不动就是它真的还没到。
                 flush_queued(&state, &peer_id);
             }
         });
@@ -764,7 +780,16 @@ pub fn flush_queued(state: &Arc<AppState>, peer_id: &str) {
                     text: msg.text.clone(),
                     at: msg.at,
                 };
-                let outcome = deliver(&state, &peer, &event).await;
+                let mut outcome = deliver(&state, &peer, &event).await;
+                if outcome == Outcome::Unreachable {
+                    // 够不着：**先当场试一次借中转**（与 `send_text` 里那一跳同一套）。排队等它
+                    // 上线的承诺要靠这一下 —— 只有一条借来的路、直连地址从没学到过的那类对端，
+                    // "它上线"这件事本来就只能由那条路成立；少了这一下，记录推到了、
+                    // 路也认得出来，可排队的消息要等用户再发一条才会动。
+                    if crate::relay::ensure_for(&state, &peer).await.is_some() {
+                        outcome = deliver(&state, &peer, &event).await;
+                    }
+                }
                 if outcome == Outcome::Unreachable {
                     break; // 还留在「排队」：等下一次触发
                 }

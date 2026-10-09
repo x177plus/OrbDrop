@@ -30,10 +30,18 @@ fn big_payload() -> Vec<u8> {
 const SUB_A: &[u8] = b"alpha from peer";
 const SUB_B: &[u8] = b"beta from peer";
 
+/// "读一页就撒手"那一幕用的文件：太小会整份一次拉完（撤销窗口就没有了），太大又白等。
+const CANCEL_LEN: usize = 256 * 1024;
+
+fn cancel_payload() -> Vec<u8> {
+    (0..CANCEL_LEN).map(|i| (i % 241) as u8).collect()
+}
+
 fn remote_share_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("orbdrop_mirror_src_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(dir.join("sub")).unwrap();
     std::fs::write(dir.join("big.bin"), big_payload()).unwrap();
+    std::fs::write(dir.join("cancel.bin"), cancel_payload()).unwrap();
     std::fs::write(dir.join("small.txt"), SMALL).unwrap();
     std::fs::write(dir.join("sub").join("a.txt"), SUB_A).unwrap();
     std::fs::write(dir.join("sub").join("b.bin"), SUB_B).unwrap();
@@ -81,8 +89,10 @@ use std::os::windows::ffi::OsStrExt;
 async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
     // 这条链路是"平台回调 → 我们"的，出问题时日志是唯一的线索（测试里默认不初始化 tracing，
     // 那些 warn 会凭空消失）。`cargo test -- --nocapture` 能看到。
+    // 平台回调那几句的 target 是 `orbdrop_lib::mirror::win`（`orbdrop=…` 只按 `::` 前缀匹配，
+    // 盖不到它），所以两个都要放进来。
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("orbdrop=debug"))
+        .with_env_filter(tracing_subscriber::EnvFilter::new("orbdrop=debug,orbdrop_lib=debug"))
         .with_writer(std::io::stdout)
         .try_init();
 
@@ -116,7 +126,7 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
         online: true,
         paired: true,
         auto_connect: false,
-        paused: false,
+        paused: false, relay: None,
     });
     credential::set_peer(&peer, "mirror-test-token").unwrap();
 
@@ -176,6 +186,52 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
     // 水合之后平台会不会把本地副本留在盘上，是策略/平台的账（我们开了 AUTO_DEHYDRATION_ALLOWED，
     // 它可以在读完之后自己脱水）——所以这里只记录、不断言。
     println!("水合后 磁盘上的大小 = {} 字节", on_disk_bytes(&local));
+
+    // ---- 2.5 平台撤销过的那一段，随后还得能拉回来 ----
+    //
+    // 真实的那条路（实机日志里就是这么卡死的）：资源管理器**落下时**要把 `CF_HDROP` 给出的路径
+    // 解析成 shell 条目，读一页文件头就撒手 —— 句柄一关，平台把还在拉的区间撤销掉；紧接着它为
+    // 真正的复制**重发**同一页。撤销只许作废它撤销的那**一次**请求：老实现把撤销记成"这个偏移
+    // 以后都别拉"，重发的这次就被上一张旧单子静默吞掉 —— 既不交数据也不报复，那个读一直挂在
+    // 平台上（目标侧现象：复制进度停在 0%、`DoDragDrop` 也不返回）。
+    //
+    // 这里用一个**子进程**读一页就退出（它的句柄一关，平台就会撤销还在飞的区间），再用本进程
+    // 把整份读回来 —— 撤销过的那段也得拿到字节，断言就这么下。
+    let cancel_item = MirroredItem {
+        peer_id: peer.clone(),
+        share_id: share_id.clone(),
+        path: "cancel.bin".into(),
+        name: "cancel.bin".into(),
+        is_dir: false,
+    };
+    let cancel_local = mirror::place(&state, &cancel_item).await.expect("放镜像（撤销场景）");
+    let probe = cancel_local.to_string_lossy().replace('\'', "''");
+    let status = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "$fs=[IO.File]::Open('{probe}','Open','Read','ReadWrite'); \
+                 $b=New-Object byte[] 4096; $fs.Read($b,0,4096)|Out-Null; $fs.Close()"
+            ),
+        ])
+        .status()
+        .expect("起子进程读一页就撒手");
+    assert!(status.success(), "子进程读一页应当成功（那一页得被交付）");
+
+    // 读回整份。**必须带死线**：老实现下这里会一直挂着（平台那个读没人交付也没人判失败），
+    // 而"挂住"正是用户看到的现象 —— 死线把"卡死"变成一条能读的失败信息。
+    let read_path = cancel_local.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::fs::read(&read_path));
+    });
+    let got = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("撤销之后平台重发的读没被交付：平台的请求一直挂着（= 实机上的卡死）")
+        .expect("读回被撤销过的占位符");
+    assert_eq!(got, cancel_payload(), "撤销只该作废那次请求，不该影响后来重发的同一段");
 
     // ---- 3. 目录镜像：目录占位符是"未填充"的，枚举它才长出子树 ----
     let dir_item = MirroredItem {

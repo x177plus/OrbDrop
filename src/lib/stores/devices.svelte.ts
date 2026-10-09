@@ -14,6 +14,9 @@ export function isDevicesLoading() { return loading; }
  * （`unpair_peer` 只是"尽力通知对端"，对端离线照样清干净本机 token）。
  *
  * 离线且未绑定的不列：它没有任何可做的动作，只会堆积曾经扫到的设备。
+ * **例外是"看得见但连不上"的**（`seen`，F-106）：它照样列出来 —— 用户的感受是"刚才还看到它、
+ * 现在没了"，稳定地摆一行比闪一下就没好。这一行**不带任何特殊状态**：关系没建立就是「未绑定」，
+ * 状态点照旧按 `offline` 画；"这张网把单播隔开了"只在**发起连接**时弹一句 tip（见 `unicastBlocked`）。
  *
  * 排序（用户要求）：**在线在前、离线在后**；在线组内 长连接 → 已配对 → 未绑定
  * （离线组内同理，只是没有长连接可言）。同级按名字排 —— 按**显示名**（设了备注就是
@@ -23,7 +26,7 @@ export function visibleDevices(all: PeerDevice[]): PeerDevice[] {
   const group = (d: PeerDevice) => (d.online ? 0 : 1);
   const rank = (d: PeerDevice) => (d.connected ? 0 : d.paired ? 1 : 2);
   return all
-    .filter((d) => d.online || d.paired)
+    .filter((d) => d.online || d.paired || d.seen)
     .sort(
       (a, b) =>
         group(a) - group(b) ||
@@ -132,6 +135,42 @@ export function needsRepair(d: PeerDevice): boolean {
 }
 
 /**
+ * 「看得见但连不上」的**唯一判据**（F-106）：mDNS 记录还在（对端在喊），探活却不成 ——
+ * 有些 AP 把同一网段里客户端之间的单播隔开了（组播还过得去，于是"设备看得见、连不上"）。
+ *
+ * **它只管一件事：发起连接那一刻说不说那句话**（`unicastBlockedTip`）。设备行本身不给这一档
+ * —— 关系没建立就是「未绑定」，点照旧按 `offline` 画；理由等到用户真要拨号时才说，那时它才是
+ * "这一次为什么连不上"的解释，而不是列表上一条要用户自己维护的标签。
+ *
+ * 经中转（`relayVia`）不算：那条路已经绕开直连这一跳，此刻拨的是中转端点。
+ */
+export function unicastBlocked(d: PeerDevice | undefined): boolean {
+  return !!d && d.seen && !d.online && !d.relayVia;
+}
+
+/**
+ * 「发起连接」（配对 / 连接 / 立即连接）却过不去时那一句 tip；判据不成立时 `null` ——
+ * 调用方照旧说它自己的话，别把这句话塞进每一条提示。
+ */
+export function unicastBlockedTip(d: PeerDevice | undefined): string | null {
+  if (!d || !unicastBlocked(d)) return null;
+  return `「${deviceDisplayName(d)}」直连不通：它在同一网段（能收到它的 mDNS 记录），但这张 Wi-Fi 可能把客户端之间的单播隔开了。要立刻连上它，得有一台两端都够得着的设备打开设置里的「允许为其它设备中转」——由它接管之后这一行会写「经 X 中转」。`;
+}
+
+/**
+ * F-107：这台设备**所在的网段**有没有中转记忆 —— 有就返回一句悬停说明，没有就 `null`。
+ *
+ * 与 `relayVia`（此刻经 X 中转）是两件事：那是"现在这条路"，这是"这一段直连不通时该走哪一段"
+ * 的**持久策略**（后端 `config.toml` 的 `relayRoutes`）。所以它跟 `unicastBlocked` 同一档：
+ * 只在悬停说明里说话，**不是**设备行上的状态档，也不参与排序。
+ */
+export function transitHint(d: PeerDevice | undefined): string | null {
+  const t = d?.transit;
+  if (!t) return null;
+  return `这一段有中转记忆：直连不通时走 ${t.viaCidr} 那一跳（池里 ${t.poolSize} 台，掉线会自动换一台）；直连一通就自动回到直连。`;
+}
+
+/**
  * 一台设备的状态点档位。
  *
  * 顺序就是优先级：本机隐身 > 离线 > 长连接 > 需配对 > 重连中 > 在线。
@@ -166,7 +205,11 @@ export function threadDotState(peerIds: string[]): DeviceDotState {
 export type DeviceState = { dot: DeviceDotState; chip: DeviceDotState | 'unbound' | 'offline'; label: string };
 
 /**
- * 设备行 / 收件人行那一整套状态（设备页、收件人选择框、会话标题旁的「未绑定」章共用）。
+ * 设备行 / 收件人行那一整套状态（桌面端=`DeviceTab` / `RecipientDialog`，
+ * 移动端=设备页 / 收件人表 / 配对表，都画同一枚胶囊）。
+ *
+ * **会话标题旁那枚状态点不在这里**：那里只画点（`deviceDotState`），不挂胶囊 ——
+ * 标题旁再挂一枚就是并排两颗点（见 `ConvoPanel.svelte` 标题那一段的注释）。
  *
  * 胶囊的配色跟**点**走（绿=长连接、蓝=已配对在线、在等=琥珀、要重新配对=红、送不到=灰虚框），
  * 文案说关系与链路 —— 一行里"点"和"胶囊"于是不会互相打架。**绿只给长连接**：自动广播的对象

@@ -95,6 +95,17 @@ input { font: inherit; }
   position: absolute; inset: 0;
   z-index: 20;
 }
+/* ── 折叠态右键菜单把窗口撑大的那一小段（2026-09-29）───────────────────────────
+   菜单要长在指针的右下（右边不够就翻到指针左侧、下边不够就翻上去），而折叠态窗口只有 236×162
+   —— 它只能先把窗口撑大。撑大时**窗口原点可能往左上挪**（翻边之后菜单顶出窗口那一档），
+   窗口内的东西必须反向平移同样的量才原地不动：整块 stage 一起 translate，球/卡片/热区/角标/
+   贴边那一套的位置一次全对（它们都是窗口内坐标）。菜单**不在** stage 里（App 把它挂在外面），
+   所以它的坐标仍是真窗口坐标 —— 落点与可点区域都不受这次平移影响。 */
+.orb-stage.menu { transform: translate(var(--menu-dx, 0px), var(--menu-dy, 0px)); }
+/* 原点在挪的那一帧：卡片不出镜。不藏的话，那一帧会被画成"卡片横跳一次"（窗口已到新位置、
+   内容还是旧的窗口内坐标）。过渡一并关掉 —— 这是"立刻"，不是"动画"。 */
+.orb-stage.menu-busy .rq,
+.orb-stage.menu-busy .orb { opacity: 0; transition: none; }
 
 /* 悬停热区：**只有屏上看得见的那一条**（由 App.svelte 按 `planDock` / `planRectDock` 的 `zone`
    算好 `--zone-*`）—— 贴边收起时是露出那截弧的方框 / 那条竖条，未贴边时就是球本身。
@@ -1024,6 +1035,9 @@ input { font: inherit; }
 }
 .d-name .state-chip { flex: none; }
 .d-ip { margin-top: 1px; font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 「经 X 中转」：与地址同一档小字，但取强调色 —— 它说的是"这条路不是直连"，
+   不该跟 ip:port 长得一模一样而被扫过去。 */
+.d-relay { margin-top: 1px; font-size: var(--fs-xs); color: var(--accent-deep); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* ─── peer browse tab（对端设备标签）───────────────────────────── */
 /* 顶部设备条：来自哪台设备 + 连接状态 + 手动刷新兜底（F-33）。 */
@@ -1734,6 +1748,23 @@ input { font: inherit; }
   transition: background 0.15s ease;
 }
 .convo-mode .cm-act:hover { background: color-mix(in oklch, currentColor 14%, transparent); }
+
+/* 「消息暂时送不出去」那一行（F-106，`chat://undeliverable`）：一行小字，贴着头不随消息流滚，
+   约 8s 自己消失、也能点掉。用琥珀色（与"本机在等"同一档）而不是红：消息没丢，只是暂时
+   送不出去，它已经在排队。*/
+.chat-note {
+  display: flex; align-items: flex-start; gap: 7px;
+  padding: 7px 12px;
+  font-size: var(--fs-xs); line-height: 1.5;
+  color: color-mix(in oklch, var(--warn) 62%, black);
+  background: color-mix(in oklch, var(--warn) 8%, transparent);
+  border-bottom: 1px solid var(--border);
+}
+.chat-note .cn-ic { flex: none; margin-top: 1px; display: grid; place-items: center; }
+.chat-note .cn-ic svg { width: 14px; height: 14px; }
+.chat-note .cn-txt { flex: 1; min-width: 0; }
+.chat-note .cn-x { flex: none; width: 20px; height: 20px; margin: -1px -4px 0 0; }
+.chat-note .cn-x svg { width: 12px; height: 12px; }
 
 /* 会话列表：三种身份各一套头像 —— 私聊=设备首字母（浅底），群聊=实心主色多人图标，
    群发=暖色底喇叭图标。 */

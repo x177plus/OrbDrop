@@ -554,10 +554,30 @@ function pushStateLabel(state: PushTargetState): string {
   return '等待同意';
 }
 
-/** `HH:MM`（会话里的时刻一律这个形状，原型也是）。 */
+/** `HH:MM`（会话列表行用：列表只关心"最近一条是什么时候"，日期在记录里给）。 */
 export function clock(at: number): string {
   const d = new Date(at);
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * 会话记录里一条消息的**日期 + 时刻**：`今天 14:30` / `昨天 14:30` / `10月3日 14:30`；
+ * 跨年写全 `2025年10月3日 14:30`。
+ *
+ * 与 [`clock`]（只要 `HH:MM`，列表行用）分开：翻记录时"哪一天"和"几点"一样要看得见 ——
+ * 只写 `HH:MM` 的话，昨天的消息和刚才的消息长得一模一样。相对口径与移动端收件箱
+ * （`FilesTab.shortTime`）同一套。
+ */
+export function stamp(at: number): string {
+  const d = new Date(at);
+  const now = new Date();
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  if (d.toDateString() === now.toDateString()) return `今天 ${hm}`;
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (d.toDateString() === yesterday.toDateString()) return `昨天 ${hm}`;
+  const md = `${d.getMonth() + 1}月${d.getDate()}日`;
+  return d.getFullYear() === now.getFullYear() ? `${md} ${hm}` : `${d.getFullYear()}年${md} ${hm}`;
 }
 
 /**
@@ -1027,12 +1047,20 @@ export function noteInviteAccepted(inviteId: string) {
 
 /** 接收进度（`push://progress`）。 */
 export function noteInviteProgress(inviteId: string, received: number, total: number) {
-  patchInvite(inviteId, (f) => ({
-    ...f,
-    received,
-    bytes: total || f.bytes,
-    inviteState: f.inviteState === 'pending' ? 'accepted' : f.inviteState,
-  }));
+  patchInvite(inviteId, (f) => {
+    const bytes = total || f.bytes;
+    // **百分比在这里算**（P1-13③）：桌面端的气泡是拿 `received/bytes` 现算的，而移动端的
+    // 「传输」页读的是 `pct` —— 只有发送侧那条路写它，接收侧一直是 0，于是手机上收到的
+    // 传输永远显示 0%、进度条不动。收侧与发侧共用这一份，两边就都对了。
+    const pct = bytes > 0 ? Math.min(100, Math.max(0, Math.round((received / bytes) * 100))) : f.pct;
+    return {
+      ...f,
+      received,
+      bytes,
+      pct,
+      inviteState: f.inviteState === 'pending' ? 'accepted' : f.inviteState,
+    };
+  });
 }
 
 /** 那条邀请的终局：已接收 / 已拒绝 / 接收失败。 */

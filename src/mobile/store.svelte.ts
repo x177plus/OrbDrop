@@ -11,6 +11,7 @@ import * as api from "$lib/api";
 import type { InboxEntry, PeerShareItem, TreeEntry } from "$lib/types";
 import * as chat from "$lib/stores/chat.svelte";
 import type { ChatFileMsg } from "$lib/stores/chat.svelte";
+import * as devices from "$lib/stores/devices.svelte";
 import type { IconName } from "./icons";
 
 // ── 导航 ────────────────────────────────────────────────────────────────────
@@ -277,12 +278,18 @@ export async function toggleShare(shareId: string): Promise<void> {
   }
 }
 
-/** 下载对端的一项到本机收件目录（后端自己决定落盘位置与命名）。 */
+/**
+ * 下载对端的一项到本机收件目录（后端自己决定落盘位置与命名）。
+ *
+ * 后端在「每次询问」下会弹保存框；用户在框里取消时返回 `null` —— 那什么都没发生，
+ * 不能报"已开始下载"、更不能把人送到传输页。
+ */
 export async function downloadEntry(shareId: string, path: string, name: string): Promise<void> {
   const peerId = browsePeer;
   if (!peerId) return;
   try {
-    await api.downloadFromPeer(peerId, shareId, path);
+    const saved = await api.downloadFromPeer(peerId, shareId, path);
+    if (!saved) return;
     toast(`已开始下载「${name}」`, "download");
     filesSeg = "transfer";
   } catch (e) {
@@ -294,9 +301,12 @@ export async function downloadEntry(shareId: string, path: string, name: string)
 
 /** 连接/断开、解除配对、手动添加：全部转发到后端，再由设备 store 的事件刷新列表。 */
 export async function toggleConnection(peerId: string, connected: boolean): Promise<void> {
+  // 这一台此刻"看得见却直连不通"时，那句解释在这里说（连接是一个动作，不是一个常驻状态）。
+  const tip = connected ? null : devices.unicastBlockedTip(devices.getDevices().find((d) => d.id === peerId));
   try {
     if (connected) await api.disconnectPeer(peerId);
     else await api.connectPeer(peerId);
+    if (tip) toast(tip);
   } catch (e) {
     failed(connected ? "断开" : "连接", e);
   }
@@ -363,6 +373,7 @@ export function editForm(patch: Partial<SettingsForm>): void {
 
 export type Sheet =
   | { kind: "pair" }
+  | { kind: "pairInvite" }
   | { kind: "addDevice" }
   | { kind: "deviceActions"; peerId: string }
   | { kind: "renameDevice"; peerId: string }
@@ -383,6 +394,89 @@ export function closeSheet(): void {
 
 export function currentSheet(): Sheet | null {
   return sheet;
+}
+
+// ── 配对邀请（两端）──────────────────────────────────────────────────────────
+//
+// **别人发来的**（`pair://invite`）：桌面端挂在右下角通知里等用户决定；移动端没有那组气泡，
+// 用一张底板接住 —— 配对邀请只有 60s（`pair::INVITE_TTL`），比推送邀请更需要当场处理。
+//
+// **本机发出去的**（`pair_invite` 的返回 = 邀请 id）：桌面端是通知组里一张「等待对方确认配对」
+// 的卡（带「取消」）；移动端在配对表里就地变成这一档，取消走 `cancel_pair_invite`（撤掉
+// 对端界面上那条通知）。结果由 `pair://completed` / `pair://invite_failed` 回来。
+
+export type IncomingPairInvite = {
+  inviteId: string;
+  peerId: string;
+  peerName: string;
+  /** 自称是本机已配对的设备却没带凭据：卡片上要把这件事说明白。 */
+  unproven: boolean;
+};
+
+let pairInvite = $state<IncomingPairInvite | null>(null);
+let pairWait = $state<{ inviteId: string; peerName: string } | null>(null);
+
+export function incomingPairInvite(): IncomingPairInvite | null {
+  return pairInvite;
+}
+
+/** 收到一条配对邀请：挂上并当场开那张表（`pair://invite`）。 */
+export function notePairInvite(invite: IncomingPairInvite): void {
+  pairInvite = invite;
+  openSheet({ kind: "pairInvite" });
+}
+
+/** 邀请作废了（超时 / 对方撤回）：把表和状态一起收掉。 */
+export function dropPairInvite(inviteId: string): void {
+  if (pairInvite?.inviteId !== inviteId) return;
+  pairInvite = null;
+  if (sheet?.kind === "pairInvite") closeSheet();
+}
+
+/** 用户在表上点了「接收 / 拒绝」。 */
+export async function answerPairInvite(accept: boolean): Promise<void> {
+  const invite = pairInvite;
+  if (!invite) return;
+  pairInvite = null;
+  try {
+    if (accept) {
+      const peerName = await api.acceptPairInvite(invite.inviteId);
+      toast(`已与「${peerName}」完成配对`);
+    } else {
+      await api.rejectPairInvite(invite.inviteId);
+      toast(`已拒绝「${invite.peerName}」的配对邀请`, "x");
+    }
+  } catch (e) {
+    failed(accept ? "接受配对邀请" : "拒绝配对邀请", e);
+  }
+}
+
+/** 本机发出去、还在等对方确认的邀请（空 = 没有）。 */
+export function pendingPairInvite(): { inviteId: string; peerName: string } | null {
+  return pairWait;
+}
+
+export function setPendingPairInvite(inviteId: string, peerName: string): void {
+  pairWait = { inviteId, peerName };
+}
+
+export function clearPendingPairInvite(inviteId?: string): void {
+  if (!pairWait) return;
+  if (inviteId && pairWait.inviteId !== inviteId) return;
+  pairWait = null;
+}
+
+/** 用户点了「取消邀请」：撤回对端界面上那条通知，然后收掉这一档。 */
+export async function cancelPendingPairInvite(): Promise<void> {
+  const pending = pairWait;
+  if (!pending) return;
+  pairWait = null;
+  try {
+    await api.cancelPairInvite(pending.inviteId);
+    toast(`已取消对「${pending.peerName}」的配对邀请`, "x");
+  } catch (e) {
+    failed("取消配对邀请", e);
+  }
 }
 
 // ── 本机地址（设备页那行「本机 · ip:port」）────────────────────────────────────

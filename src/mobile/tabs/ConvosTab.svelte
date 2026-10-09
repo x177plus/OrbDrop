@@ -1,6 +1,5 @@
 <script lang="ts">
   import * as chat from "$lib/stores/chat.svelte";
-  import type { DeviceDotState } from "$lib/stores/devices.svelte";
   import Icon from "../Icon.svelte";
   import * as store from "../store.svelte";
 
@@ -8,16 +7,6 @@
   // `convoLastTime` / `dotState` 是 mock 自己算的，这里一律不再重算一遍）。
   const rows = $derived(chat.convoRows());
   const invites = $derived(chat.pendingGroups());
-
-  /**
-   * 状态点：原型只有 `ok` / `warn` 两颗颜色，而真设备 store 有五档（颜色 = 可达性、形状 = 链路）。
-   * 压回原型那两颗：长连接 / 在线 = 绿，重连中 / 要重新配对 = 黄，离线 = 默认灰。
-   */
-  function dotCls(state: DeviceDotState): string {
-    if (state === "live" || state === "online") return "ok";
-    if (state === "retrying" || state === "repair") return "warn";
-    return "";
-  }
 
   /** 接受一条群邀请。 */
   async function join(id: string): Promise<void> {
@@ -99,7 +88,7 @@
                 {:else if row.mode === "group"}
                   <span class="cv-mode grp"><Icon name="group" />群聊</span>
                 {/if}
-                <span class="cv-dot {dotCls(row.dot)}"></span>
+                <span class="cv-dot {row.dot}"></span>
                 <span class="cv-time num">{row.time}</span>
               </span>
               <span class="cv-prev">{row.sub}</span>

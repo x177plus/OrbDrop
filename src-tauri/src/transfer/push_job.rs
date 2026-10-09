@@ -117,6 +117,13 @@ pub struct InboundInvite {
     pub files: Vec<FileEntry>,
     /// 发送方声明支持的能力位（见 `WsEvent::PushInvite::caps`）。
     pub caps: Vec<String>,
+    /// 这次接收的落盘**根目录**：`None` = 用设置里的下载目录（S-01）。
+    ///
+    /// 只有"需要用户同意"那条路（未绑定设备）才可能带它 —— 已配对设备免同意自动收，
+    /// "到了就收"没有让人先挑目录的时机（见 `transfer::accept_invite` 的 `root` 参数）。
+    ///
+    /// 它只是**根**：`<根>/<发送方名>/…` 这一层照样由 `resume::landing_root` 拼、照样净化。
+    pub root: Option<std::path::PathBuf>,
     /// 发送方的地址（ip, 服务端口）：没有长连接时，进度/完成/取消这些回执要 POST 回去。
     ///
     /// ip 取自邀请请求的 TCP 来源（不可伪造），端口取自邀请体里发送方自报的服务端口 ——
@@ -732,6 +739,14 @@ pub fn report_to_sender(
         return;
     };
     let url = format!("{}/push/report", crate::net::peer_base(&ip, port));
+    // 认人：对端那边**已配对**时，这条回执必须带上它那枚 token（与它认我们的规则对称，
+    // 见 `routes_push::authorize`）。手里有就带 —— 拿不到（未配对的推送）就照旧只靠邀请 id，
+    // 那是"未绑定也能推"的前提。丢下这一枚的后果是回执被 401 掉，发送方 5 分钟后把一次
+    // 成功的传输记成失败（假账）。
+    let token = crate::credential::get_peer_token(peer_id)
+        .ok()
+        .flatten()
+        .filter(|t| !t.is_empty());
     crate::task::spawn("push report", async move {
         for (attempt, delay) in [
             Duration::ZERO,
@@ -744,8 +759,13 @@ pub fn report_to_sender(
             if !delay.is_zero() {
                 sleep(delay).await;
             }
-            match crate::net::client().post(&url).json(&event).send().await {
-                Ok(_) => return,
+            let mut req = crate::net::client().post(&url).json(&event);
+            if let Some(token) = token.as_deref() {
+                req = req.bearer_auth(token);
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => return,
+                Ok(resp) => warn!(%url, attempt, status = %resp.status(), "推送回执被拒"),
                 Err(e) => warn!(%url, attempt, %e, "推送回执发送失败"),
             }
         }
@@ -768,7 +788,7 @@ pub fn report_to_sender(
 /// 认人的前置检查（token、已配对必须带 token）两条路共用，所以放在分派**之前**。
 pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: String) {
     let invite_id = invite.invite_id.clone();
-    let callback = invite.callback.clone();
+    let callback = state.dial_endpoint(&peer_id, invite.callback.clone());
 
     // 长连接那条路上的"同意"回执（HTTP 那条路走邀请请求的同步响应）。
     if state.ws.has_connection(&peer_id) {
@@ -815,19 +835,26 @@ fn spawn_download_legacy(
 
     let invite_id = invite.invite_id.clone();
     let total_bytes = invite.total_bytes();
-    let callback = invite.callback.clone();
+    let callback = state.dial_endpoint(&peer_id, invite.callback.clone());
 
     // 下载跑在运行时上：「同意接收」是 async 命令（`task::spawn` 另有"没有 reactor 就退到
     // Tauri 全局运行时"的兜底，见 task.rs）—— 这条任务绝不能被无声丢掉，否则两边都停在 0%。
     crate::task::spawn("push download", async move {
         let client = crate::net::client();
         let config = state.config.lock().clone();
-        // 落盘根 = 用户设的下载目录（S-01）：推送接收不再单独有「收件目录」。
+        // 落盘根 = `<落盘目录>/<发送方名>`。落盘目录默认是用户设的下载目录（S-01）；只有在
+        // 「每次询问」下由用户亲自挑过的那些邀请才带自己的根（`invite.root`）—— 已配对设备
+        // 免同意自动收，不会有这个根。推送接收不再单独有「收件目录」。
         //
         // 对端只往 <发送方名>/ 下面写 —— **没有"推送名子目录"**：清单里的相对路径就是落盘后
         // 的样子（单文件 `A.txt`、单目录 `D/…`、多选 `甲目录/…` + `散文件.txt`），
         // 发送方在 `manifest_for_paths` 里已经把每个源的名字放进路径了。
-        let sender_dir = config.download_dir.join(&invite.sender.name);
+        //
+        // 名字必须先净化：它是报文里的自由字符串，`C:\Windows\Temp`、`..\..\..\Users\Public`
+        // 之类会把基址顶掉（`PathBuf::push` 遇到带前缀的段会清空已累积的部分）。净化 +
+        // `safe_join` 两道闸都在 `landing_root` 里。
+        let base = invite.root.as_deref().unwrap_or(config.download_dir.as_path());
+        let sender_dir = super::resume::landing_root(base, &invite.sender.name);
         let _ = tokio::fs::create_dir_all(&sender_dir).await;
 
         let mut total_received: u64 = 0;
@@ -1218,6 +1245,7 @@ mod reconcile_tests {
             count: 1,
             files: vec![],
             caps: Vec::new(),
+            root: None,
             callback: None,
             responder: None,
         }

@@ -20,3 +20,4 @@ keystore.properties
 /tauri.settings.gradle
 # Rust 产物：官方流程是符号链接进来（Windows 需开发者模式），绝不能提交
 /app/src/main/jniLibs
+/keystore/
