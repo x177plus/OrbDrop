@@ -21,15 +21,25 @@
 //! - 交付数据时 offset/length 必须 **4 KiB 对齐**，除非这一段结束在文件末尾。
 //! - 失败必须用 `STATUS_CLOUD_FILE_*` 状态回报：否则平台一律折成 `UNSUCCESSFUL`，而**绝不能**
 //!   报成功 —— 那会让目标拷出一份静默残缺的文件。
+//! - **每条回调都必须有回音**：交付（`TRANSFER_DATA`）或判失败（`STATUS_CLOUD_FILE_*`）。静默
+//!   返回 = 平台那边的读一直挂在这次请求上（文档：每个回调请求有 60 秒超时，而任何一次有效
+//!   操作都会重置全部挂起请求的计时器）。实机踩死过一次：见 [`note_cancel`] —— 撤销不能记成
+//!   "这个偏移以后都别拉"，否则平台重发的同一段会被吞掉，目标侧表现就是拖放卡住。
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, OnceLock};
 
-use tracing::{info, warn};
+use parking_lot::Mutex;
+
+use tracing::{error, info, warn};
 use windows::core::{GUID, PCWSTR};
-use windows::Win32::Foundation::{STATUS_CLOUD_FILE_UNSUCCESSFUL, STATUS_SUCCESS};
+use windows::Win32::Foundation::{
+    ERROR_CLOUD_FILE_REQUEST_ABORTED, ERROR_CLOUD_FILE_REQUEST_CANCELED,
+    ERROR_CLOUD_FILE_REQUEST_TIMEOUT, STATUS_CLOUD_FILE_UNSUCCESSFUL, STATUS_SUCCESS,
+};
 use windows::Win32::Storage::CloudFilters::*;
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
@@ -69,13 +79,85 @@ static PROVIDER: OnceLock<&'static Provider> = OnceLock::new();
 /// （显式 `Free` 才会断开），所以在全局里存一份是安全的。
 static CONNECTION: OnceLock<CF_CONNECTION_KEY> = OnceLock::new();
 
-/// 已经不再需要的区间（目标撤了这次读）。拉取循环每次交付前看一眼，别白拉。
-static CANCELLED: LazyLock<Mutex<Vec<Cancelled>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+// ---------------------------------------------------------------------------
+// 撤销：只作废**在飞的那一次请求**，绝不记成"这个偏移以后都别拉"
+// ---------------------------------------------------------------------------
 
-struct Cancelled {
+/// 此刻在飞的水合请求。平台的 `CANCEL_FETCH_DATA` 只能按 `(file_id, 区间)` 报，所以撤销的
+/// 认领也只能靠这两样；认领的对象是**请求本身**，不是偏移（理由见 [`note_cancel`]）。
+static IN_FLIGHT: LazyLock<Mutex<Vec<InFlight>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// 请求在表里的编号：同一个 file_id 上同区间的两条请求也得分得开（两处读会各发一条）。
+static NEXT_FETCH_ID: AtomicU64 = AtomicU64::new(1);
+
+struct InFlight {
+    id: u64,
     file_id: i64,
     start: u64,
     end: u64,
+    /// 平台把这次请求作废了（`CANCEL_FETCH_DATA` 认领到了它）。
+    cancelled: bool,
+}
+
+/// 一次水合请求在表里的登记。`Drop` 时摘掉自己那条 —— 回调体里 panic 也不会留下垃圾。
+struct FetchGuard {
+    id: u64,
+}
+
+impl FetchGuard {
+    /// 登记一次请求，`[start, end)` 是这次要交付的对齐区间。
+    fn begin(file_id: i64, start: u64, end: u64) -> Self {
+        let id = NEXT_FETCH_ID.fetch_add(1, Ordering::Relaxed);
+        IN_FLIGHT
+            .lock()
+            .push(InFlight { id, file_id, start, end, cancelled: false });
+        Self { id }
+    }
+
+    /// 平台撤销了**这一次**请求？拉取循环每次交付前看一眼，别白拉。
+    fn cancelled(&self) -> bool {
+        IN_FLIGHT.lock().iter().any(|f| f.id == self.id && f.cancelled)
+    }
+}
+
+impl Drop for FetchGuard {
+    fn drop(&mut self) {
+        IN_FLIGHT.lock().retain(|f| f.id != self.id);
+    }
+}
+
+/// 平台撤销了一次读（`CANCEL_FETCH_DATA`）：只标**此刻在飞**、区间重叠的那些请求。
+///
+/// 撤销是"这一次请求"的事，不是"这个偏移永远别拉"。老实现把 `(file_id, 区间)` 永久记进一张
+/// 表、之后每次取数据都拿它挡 —— 实机就是这么卡死的：资源管理器在**落下时**解析 `CF_HDROP`
+/// 给出的路径，读一页文件头就撒手（→ 撤销），紧接着为真正的复制重发**同一页**；我们拿上一张
+/// 旧的撤销单把新请求也吞了，既不交数据也不报复，那个读就一直挂在平台上（官方文档：每个回调
+/// 请求有 60 秒超时，而**任何一次有效操作都会重置全部挂起请求的计时器**）—— 目标进程里的读
+/// 等下去，复制进度不动，`DoDragDrop` 也不返回。所以：**撤销单必须被它撤销的那次请求消费掉**，
+/// 绝不外溢到后来的请求。
+///
+/// 撤销回调**比**请求回调先到的那种竞态（两个回调都在平台线程池上跑，顺序没有保证）不在这里
+/// 兜：猜"这张撤销单属于哪一次请求"正是上面那条死路。让那次请求照常交付更安全 —— `CfExecute`
+/// 对已被平台作废的请求会返回错误（我们只当没发生），而猜错就是让一个没人作废的读永远挂着。
+fn note_cancel(file_id: i64, start: u64, end: u64) {
+    let mut table = IN_FLIGHT.lock();
+    let mut claimed = 0usize;
+    for fetch in table
+        .iter_mut()
+        .filter(|f| f.file_id == file_id && overlaps(f.start, f.end, start, end))
+    {
+        fetch.cancelled = true;
+        claimed += 1;
+    }
+    drop(table);
+    if claimed == 0 {
+        // 没有在飞的请求可作废：这次撤销对应的区间我们已经交付完了。记一行就够，不留在表里。
+        info!(file_id, start, end, "撤销到的区间没有在飞的请求（多半已经交付完）");
+    }
+}
+
+fn overlaps(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    a_start < b_end && b_start < a_end
 }
 
 /// 回调表必须以 `CF_CALLBACK_REGISTRATION_END`（= `{ CF_CALLBACK_TYPE_NONE, NULL }`）收尾；
@@ -362,81 +444,101 @@ fn create_placeholder(
 // 回调：水合、目录懒填充、取消、开关句柄
 // ---------------------------------------------------------------------------
 
+/// 回调是 FFI 边界：里面任何 panic 都会让**整个进程**直接退出（C 栈上没有 unwind 保护，
+/// Windows 上表现为"拖到一半应用消失"）。这里是最后一道网：panic 只算这一次回调失败，
+/// 留一行日志，进程继续活着。（`log::record_crash` 的 panic hook 仍会照常记一条 crash.log。）
+fn guarded(what: &str, f: impl FnOnce()) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "未知 panic".into());
+        error!(callback = what, panic = %msg, "同步根回调 panic（已拦下，进程继续）");
+    }
+}
+
 unsafe extern "system" fn fetch_data_cb(
     info: *const CF_CALLBACK_INFO,
     params: *const CF_CALLBACK_PARAMETERS,
 ) {
-    if let (Some(info), Some(params)) = (unsafe { info.as_ref() }, unsafe { params.as_ref() }) {
-        fetch_data(info, params);
-    }
+    guarded("fetch_data", || {
+        if let Some((info, params)) =
+            unsafe { info.as_ref() }.zip(unsafe { params.as_ref() })
+        {
+            fetch_data(info, params);
+        }
+    });
 }
 
 unsafe extern "system" fn fetch_placeholders_cb(
     info: *const CF_CALLBACK_INFO,
     params: *const CF_CALLBACK_PARAMETERS,
 ) {
-    if let (Some(info), Some(params)) = (unsafe { info.as_ref() }, unsafe { params.as_ref() }) {
-        fetch_placeholders(info, params);
-    }
+    guarded("fetch_placeholders", || {
+        if let Some((info, params)) =
+            unsafe { info.as_ref() }.zip(unsafe { params.as_ref() })
+        {
+            fetch_placeholders(info, params);
+        }
+    });
 }
 
 unsafe extern "system" fn cancel_fetch_data_cb(
     info: *const CF_CALLBACK_INFO,
     params: *const CF_CALLBACK_PARAMETERS,
 ) {
-    if let (Some(info), Some(params)) = (unsafe { info.as_ref() }, unsafe { params.as_ref() }) {
-        let range = unsafe { params.Anonymous.Cancel.Anonymous.FetchData };
-        let start = range.FileOffset.max(0) as u64;
-        let end = start.saturating_add(range.Length.max(0) as u64);
-        info!(file_id = info.FileId, start, end, "目标撤销了这段读，后续不再拉它");
-        let mut cancelled = CANCELLED.lock().unwrap();
-        // 只留最近的：撤销是"当前这次读"的事，堆着没有意义。
-        if cancelled.len() > 256 {
-            cancelled.drain(..128);
+    guarded("cancel_fetch_data", || {
+        if let Some((info, params)) =
+            unsafe { info.as_ref() }.zip(unsafe { params.as_ref() })
+        {
+            let range = unsafe { params.Anonymous.Cancel.Anonymous.FetchData };
+            let start = range.FileOffset.max(0) as u64;
+            let end = start.saturating_add(range.Length.max(0) as u64);
+            info!(file_id = info.FileId, start, end, "平台撤销了这段读（只作废在飞的这次请求）");
+            note_cancel(info.FileId, start, end);
         }
-        cancelled.push(Cancelled { file_id: info.FileId, start, end });
-    }
+    });
 }
 
 unsafe extern "system" fn open_completion_cb(
     info: *const CF_CALLBACK_INFO,
     _params: *const CF_CALLBACK_PARAMETERS,
 ) {
-    if let Some(info) = unsafe { info.as_ref() } {
-        let path = win_path(info);
-        info!(path = %path, process = %process_name(info), "镜像项被打开");
-        note_opened(&path);
-    }
+    guarded("open_completion", || {
+        if let Some(info) = unsafe { info.as_ref() } {
+            let path = win_path(info);
+            info!(path = %path, process = %process_name(info), "镜像项被打开");
+            note_opened(&path);
+        }
+    });
 }
 
 unsafe extern "system" fn close_completion_cb(
     info: *const CF_CALLBACK_INFO,
     params: *const CF_CALLBACK_PARAMETERS,
 ) {
-    if let (Some(info), Some(params)) = (unsafe { info.as_ref() }, unsafe { params.as_ref() }) {
-        let flags = unsafe { params.Anonymous.CloseCompletion.Flags };
-        let path = win_path(info);
-        info!(
-            path = %path, deleted = flags.contains(CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED),
-            process = %process_name(info),
-            "镜像项已关闭（此后可回收）"
-        );
-        // 记账：`mirror::sweep` 会在这之后按 grace 回收。删除型关闭不必记账 —— 文件已经没了。
-        if !flags.contains(CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) {
-            note_closed(&path);
+    guarded("close_completion", || {
+        if let Some((info, params)) =
+            unsafe { info.as_ref() }.zip(unsafe { params.as_ref() })
+        {
+            let flags = unsafe { params.Anonymous.CloseCompletion.Flags };
+            let path = win_path(info);
+            info!(
+                path = %path, deleted = flags.contains(CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED),
+                process = %process_name(info),
+                "镜像项已关闭（此后可回收）"
+            );
+            // 记账：`mirror::sweep` 会在这之后按 grace 回收。删除型关闭不必记账 —— 文件已经没了。
+            if !flags.contains(CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) {
+                note_closed(&path);
+            }
         }
-    }
+    });
 }
 
 /// 目标要读一段字节：按需从对端拉，交给平台。
 fn fetch_data(info: &CF_CALLBACK_INFO, params: &CF_CALLBACK_PARAMETERS) {
-    let Some(provider) = PROVIDER.get() else {
-        // 没连上（理论上不会走到这里；连上了才会收到回调）。不回报 = 平台的读会超时失败，
-        // 这比"回报成功但没数据"安全。
-        warn!("收到取数据回调，但 provider 没有连接");
-        return;
-    };
-
     let fetch = unsafe { params.Anonymous.FetchData };
     let size = info.FileSize.max(0) as u64;
     let required_start = fetch.RequiredFileOffset.max(0) as u64;
@@ -449,6 +551,16 @@ fn fetch_data(info: &CF_CALLBACK_INFO, params: &CF_CALLBACK_PARAMETERS) {
     let start = required_start & !(ALIGN - 1);
     let end = if required_end >= size { size } else { align_up(required_end) };
 
+    let Some(provider) = PROVIDER.get() else {
+        // 没连上（理论上不会走到这里；连上了才会收到回调）。**必须回一个失败**：什么也不回的话
+        // 平台那边的读会一直挂在这次请求上（见 [`note_cancel`]：回调请求有 60 秒超时，而且任何
+        // 一次有效操作都会重置全部挂起请求的计时器），目标进程就卡在那里；报成功则更糟 ——
+        // 目标会拷出一份静默残缺的文件。
+        warn!("收到取数据回调，但 provider 没有连接");
+        fail_range(info, start, end.saturating_sub(start), "provider 没有连接");
+        return;
+    };
+
     let Some(id) = decode_identity(info) else {
         fail_range(info, start, end.saturating_sub(start), "身份解不出来");
         return;
@@ -459,10 +571,16 @@ fn fetch_data(info: &CF_CALLBACK_INFO, params: &CF_CALLBACK_PARAMETERS) {
         return;
     }
 
+    // 登记这次请求：平台随后的撤销只认领**它**（见 [`note_cancel`]），落地时（含提前返回）摘掉。
+    let fetch_guard = FetchGuard::begin(info.FileId, start, end);
     info!(path = %id.path, start, end, size, resume = fetch.Flags.contains(CF_CALLBACK_FETCH_DATA_FLAG_RECOVERY), "开始水合");
-    match transfer_range(provider, info, &id, start, end) {
+    match transfer_range(provider, info, &id, start, end, &fetch_guard) {
         Ok(()) => {}
-        Err(e) => {
+        Err(Stop::Dropped) => {
+            // 平台自己把这次读收掉了（撤销/作废/超时）：平台那边已经收尾，我们不用再说什么。
+            info!(path = %id.path, start, end, "这次读已被平台收掉（撤销/作废），不再交付");
+        }
+        Err(Stop::Failed(e)) => {
             warn!(path = %id.path, start, end, error = %e, "水合失败");
             fail_range(info, start, end - start, &e);
         }
@@ -477,10 +595,11 @@ fn transfer_range(
     id: &identity::Identity,
     start: u64,
     end: u64,
-) -> Result<(), String> {
+    fetch: &FetchGuard,
+) -> Result<(), Stop> {
     let began = std::time::Instant::now();
     let client = provider.client.clone();
-    let (base, token) = peer_fs::coords(&provider.state, &id.peer_id)?;
+    let (base, token) = peer_fs::coords(&provider.state, &id.peer_id).map_err(Stop::Failed)?;
     let file = PeerFile {
         base,
         token,
@@ -492,10 +611,10 @@ fn transfer_range(
     let mut delivered = 0u64;
     while start + delivered < end {
         let offset = start + delivered;
-        if is_cancelled(info.FileId, offset) {
-            // 目标已经不要这一段了：停手但不算失败。
-            info!(file_id = info.FileId, offset, "这段读已被撤销，停止拉取");
-            return Ok(());
+        if fetch.cancelled() {
+            // 平台把**这一次**请求收掉了：停手就行，不用 `CfExecute`。只对"在飞的自己"成立
+            // —— 见 [`note_cancel`]，绝不拿撤销去挡后来的请求。
+            return Err(Stop::Dropped);
         }
         let want = READ_CHUNK.min(end - offset);
         // `run_blocking` 要求 future 是 'static：把客户端与坐标移进去（都是廉价的克隆）。
@@ -503,18 +622,19 @@ fn transfer_range(
         let bytes = crate::task::run_blocking_on(&provider.rt, async move {
             peer_fs::fetch_file_range(&task_client, &task_file, offset, want).await
         })
-        .ok_or_else(|| "取数据任务没能回到运行时".to_string())??;
+        .ok_or_else(|| Stop::Failed("取数据任务没能回到运行时".to_string()))?
+        .map_err(Stop::Failed)?;
         if bytes.is_empty() {
-            return Err(format!("对端「{}」在 {offset} 处读到 0 字节", id.path));
+            return Err(Stop::Failed(format!("对端「{}」在 {offset} 处读到 0 字节", id.path)));
         }
         // 平台要求 offset/length 4 KiB 对齐，**除非**这一段结束在文件末尾。对端那边文件变小了
         // （远端被改过）会让这条不成立 —— 那种情况必须报错，不能交一段错位的字节。
         let length = bytes.len() as u64;
         let ends_at_eof = offset + length >= (info.FileSize.max(0) as u64);
         if !ends_at_eof && (offset % ALIGN != 0 || length % ALIGN != 0) {
-            return Err(format!(
+            return Err(Stop::Failed(format!(
                 "对端返回的区间没有 4 KiB 对齐（offset={offset} len={length}），又不落在文件末尾"
-            ));
+            )));
         }
         execute_transfer(info, &bytes, offset, length)?;
         delivered += length;
@@ -534,12 +654,55 @@ fn transfer_range(
     Ok(())
 }
 
-fn is_cancelled(file_id: i64, offset: u64) -> bool {
-    CANCELLED
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|c| c.file_id == file_id && offset >= c.start && offset < c.end)
+/// 拉取收兵的原因。
+enum Stop {
+    /// 平台已经把这次读自己收掉了（撤销 / 作废 / 超时）：不停手也没用，而且**不用** `CfExecute`
+    /// —— 平台那边的读已经作废，交付只会返回错误。这不是我们的失败。
+    Dropped,
+    /// 真失败：必须 `fail_range`，绝不能让平台那个读挂着（见模块头"失败必须用 `STATUS_CLOUD_FILE_*`"）。
+    Failed(String),
+}
+
+/// 一个子占位符的三件套：本地名（宽字符）、身份 blob、大小、修改时间、是否目录。
+///
+/// **三样必须同进同出**：调用方按下标一起用（名字配身份），任何一条备不齐就整条丢，
+/// 由 `dropped` 决定"这一层要不要整体报错"。老实现把名字与身份分成两个数组各自
+/// `filter_map` 再按下标取 —— 丢一个就整体错位，身份少一个还会越界 panic（在平台回调里
+/// 等于进程退出）。这个函数把"对齐"这件事收在一处，也让它能被单测直接盯住。
+type PreparedChild = (Vec<u16>, Vec<u8>, u64, Option<i64>, bool);
+
+fn prepare_children(
+    parent: &identity::Identity,
+    entries: &[peer_fs::TreeEntry],
+) -> (Vec<PreparedChild>, usize) {
+    let mut prepared: Vec<PreparedChild> = Vec::with_capacity(entries.len());
+    let mut dropped = 0usize;
+    for entry in entries.iter() {
+        // 本地文件名用清洗过的（对端给的原始名可能带路径分隔符之类的怪东西）。
+        let Some(clean) = peer_fs::plain_component(&entry.name) else {
+            dropped += 1;
+            continue;
+        };
+        // 远端路径必须用**原始**名字（对端按它找文件）。
+        let child = identity::Identity {
+            peer_id: parent.peer_id.clone(),
+            share_id: parent.share_id.clone(),
+            path: peer_fs::join_slash(&parent.path, &entry.name),
+            is_dir: entry.is_dir,
+        };
+        match child.encode() {
+            Ok(blob) => prepared.push((
+                to_wide(OsStr::new(&clean)),
+                blob,
+                entry.size,
+                peer_fs::parse_rfc3339_secs(&entry.modified),
+                entry.is_dir,
+            )),
+            // 身份过长（远端路径 > IDENTITY_MAX）这类条目本机表示不了。
+            Err(_) => dropped += 1,
+        }
+    }
+    (prepared, dropped)
 }
 
 /// 目标在枚举一个"未填充"的目录：把那一层的条目交给平台，由它建子占位符。
@@ -551,7 +714,9 @@ fn is_cancelled(file_id: i64, offset: u64) -> bool {
 /// 或目标应用（另一个进程），那条路是通的（集成测试用 `cmd /c dir` 顶替它来验）。
 fn fetch_placeholders(info: &CF_CALLBACK_INFO, _params: &CF_CALLBACK_PARAMETERS) {
     let Some(provider) = PROVIDER.get() else {
+        // 和取数据那条一样的规矩：**必须有回音**。什么也不回会让目标那边的目录枚举一直挂着。
         warn!("收到填充目录回调，但 provider 没有连接");
+        fail_placeholders(info, "provider 没有连接");
         return;
     };
     let Some(id) = decode_identity(info) else {
@@ -580,45 +745,34 @@ fn fetch_placeholders(info: &CF_CALLBACK_INFO, _params: &CF_CALLBACK_PARAMETERS)
         }
     };
 
-    // 两趟：先把名字与身份 blob 建好，再取指针 —— 边 push 边取指针会在扩容时悬空。
-    let names: Vec<String> = entries
-        .iter()
-        .filter_map(|e| peer_fs::plain_component(&e.name).map(|clean| clean))
-        .collect();
-    let blobs: Vec<Vec<u8>> = entries
-        .iter()
-        .filter_map(|e| {
-            identity::Identity {
-                peer_id: id.peer_id.clone(),
-                share_id: id.share_id.clone(),
-                // 远端路径必须用**原始**名字（对端按它找文件），本地名字才用清洗过的。
-                path: peer_fs::join_slash(&id.path, &e.name),
-                is_dir: e.is_dir,
-            }
-            .encode()
-            .ok()
-        })
-        .collect();
-    if names.len() != entries.len() || blobs.len() != entries.len() {
-        warn!(path = %path, "有条目的名字本机用不了或身份过长，这一层只填充能填的");
+    // **一个条目三样一起备齐**：名字、身份 blob、元数据必须一一对应。分成三个数组各自
+    // `filter_map` 再按下标取是错的 —— 名字被过滤掉一个，后面的名字与身份就整体错位
+    // （A 的名字配 B 的身份 = 目标按错的身份去拉另一个文件的字节）；身份编码失败让数组变短，
+    // 按下标取还会越界 panic，而这里跑在平台的回调里（C 栈上没有 unwind 保护）= **进程直接退出**。
+    // 备不齐的条目一律**整条丢掉**（绝不留半条），由下面那道 `dropped > 0` 的闸决定整层成败。
+    let (prepared, dropped) = prepare_children(&id, &entries);
+
+    // 有一条备不齐就**整层报错**：下面那条 `DISABLE_ON_DEMAND_POPULATION` 是在告诉平台
+    // "这个目录的内容就是这些、不用再要了"，少交一条等于目标那边**悄悄**少一个文件/目录
+    // （复制出来的目录树缺东西，还没有任何提示）。宁可不给，也不给一份不全的。
+    if dropped > 0 {
+        warn!(
+            path = %path, dropped, kept = prepared.len(),
+            "远端目录里有本机表示不了的条目（名字非法或身份过长），这一层整层报错"
+        );
+        fail_placeholders(info, "远端目录里有本机无法表示的条目");
+        return;
     }
 
-    // 指针数组要保活到 `CfExecute` 返回。
-    let wide_names: Vec<Vec<u16>> = names.iter().map(|n| to_wide(OsStr::new(n))).collect();
-    let entries_used = names.len();
-    let (names, blobs, entries) = (&wide_names, &blobs, &entries);
-    let mut array: Vec<CF_PLACEHOLDER_CREATE_INFO> = (0..entries_used)
-        .map(|i| {
-            let entry = &entries[i];
+    // 指针数组要保活到 `CfExecute` 返回（`prepared` 在本函数里活着）。
+    let mut array: Vec<CF_PLACEHOLDER_CREATE_INFO> = prepared
+        .iter()
+        .map(|(name, blob, size, mtime, is_dir)| {
             let mut ci = CF_PLACEHOLDER_CREATE_INFO::default();
-            ci.RelativeFileName = PCWSTR(names[i].as_ptr());
-            ci.FsMetadata = fs_metadata(
-                entry.size,
-                peer_fs::parse_rfc3339_secs(&entry.modified),
-                entry.is_dir,
-            );
-            ci.FileIdentity = blobs[i].as_ptr() as *const core::ffi::c_void;
-            ci.FileIdentityLength = blobs[i].len() as u32;
+            ci.RelativeFileName = PCWSTR(name.as_ptr());
+            ci.FsMetadata = fs_metadata(*size, *mtime, *is_dir);
+            ci.FileIdentity = blob.as_ptr() as *const core::ffi::c_void;
+            ci.FileIdentityLength = blob.len() as u32;
             // 子目录同样保持"未填充"（不加 DISABLE_ON_DEMAND_POPULATION），树才会边复制边长。
             ci.Flags = CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC;
             ci
@@ -652,7 +806,7 @@ fn execute_transfer(
     buffer: &[u8],
     offset: u64,
     length: u64,
-) -> Result<(), String> {
+) -> Result<(), Stop> {
     let op_info = operation_info(info, CF_OPERATION_TYPE_TRANSFER_DATA);
     let mut params = CF_OPERATION_PARAMETERS::default();
     params.ParamSize = param_size::<CF_OPERATION_PARAMETERS_0_0>();
@@ -663,7 +817,27 @@ fn execute_transfer(
         Offset: offset as i64,
         Length: length as i64,
     };
-    unsafe { CfExecute(&op_info, &mut params) }.map_err(|e| format!("交付数据失败: {e:?}"))
+    match unsafe { CfExecute(&op_info, &mut params) } {
+        Ok(()) => Ok(()),
+        Err(e) if platform_dropped(&e) => Err(Stop::Dropped),
+        Err(e) => Err(Stop::Failed(format!("交付数据失败: {e:?}"))),
+    }
+}
+
+/// 这个 `CfExecute` 失败是"平台已经把这次读自己收掉了"吗（撤销/作废/超时）？
+///
+/// 实测：`CANCEL_FETCH_DATA` 与拉取同时发生（撤销到的那次请求正在路上）时，交付会拿到
+/// `ERROR_CLOUD_FILE_REQUEST_CANCELED`（`0x8007018E`，"用户已取消云操作。"）。这不是我们的
+/// 失败 —— 平台那边早就把读作废了，交付只是白跑一趟。把它当失败去 `fail_range` 会灌两条
+/// 误导性的 WARN（"水合失败"、"把这一段读判失败"），下次查日志的人会以为真出了故障。
+fn platform_dropped(e: &windows::core::Error) -> bool {
+    [
+        ERROR_CLOUD_FILE_REQUEST_ABORTED,
+        ERROR_CLOUD_FILE_REQUEST_CANCELED,
+        ERROR_CLOUD_FILE_REQUEST_TIMEOUT,
+    ]
+    .iter()
+    .any(|code| windows::core::HRESULT::from_win32(code.0) == e.code())
 }
 
 /// 让挂在这个区间上的读**明确失败**。
@@ -821,6 +995,104 @@ fn now_filetime() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 名字里的本地名与身份 blob 必须**一条对一条**：老实现把名字、身份分成两个数组各自
+    /// 过滤再按下标取，丢一条就整体错位（A 的名字配 B 的身份 = 目标按错的身份去拉另一个文件
+    /// 的字节）。这里直接盯住"第 i 条的 blob 解出来就是第 i 条那个远端路径"。
+    #[test]
+    fn prepared_children_stay_aligned_with_their_own_identity() {
+        let parent = identity::Identity {
+            peer_id: "device-a".into(),
+            share_id: "share-1".into(),
+            path: "sub".into(),
+            is_dir: true,
+        };
+        let entry = |name: &str, is_dir: bool, size: u64| peer_fs::TreeEntry {
+            name: name.into(),
+            is_dir,
+            size,
+            modified: "2026-09-26T00:00:00Z".into(),
+        };
+        // 中间夹两条本机表示不了的（`.` 与空名），再加一条超长远端路径（身份编码会失败）。
+        let long = "x".repeat(identity::IDENTITY_MAX);
+        let entries = vec![
+            entry("a.txt", false, 11),
+            entry(".", false, 0),
+            entry("目录", true, 0),
+            entry("", false, 0),
+            entry(&long, false, 5),
+            entry("z.bin", false, 33),
+        ];
+
+        let (prepared, dropped) = prepare_children(&parent, &entries);
+        assert_eq!(dropped, 3, "`.`、空名、超长路径各算一条备不齐");
+        assert_eq!(prepared.len(), 3, "能备齐的三条要留下来");
+
+        let pulled: Vec<(String, u64, bool)> = prepared
+            .iter()
+            .map(|(name, blob, size, _mtime, is_dir)| {
+                let decoded = identity::Identity::decode(blob).expect("身份必须解得回来");
+                let local = String::from_utf16_lossy(name)
+                    .trim_end_matches('\0')
+                    .to_string();
+                // 本地名是清洗过的、远端路径是原始的 —— 两者都得是**这一条**自己的。
+                let remote_leaf = decoded.path.rsplit('/').next().unwrap_or_default().to_string();
+                (format!("{local}|{remote_leaf}"), *size, *is_dir)
+            })
+            .collect();
+        assert_eq!(
+            pulled,
+            vec![
+                ("a.txt|a.txt".to_string(), 11, false),
+                ("目录|目录".to_string(), 0, true),
+                ("z.bin|z.bin".to_string(), 33, false),
+            ],
+            "每一条的本地名与身份必须配得上"
+        );
+        assert!(
+            prepared.iter().all(|(_, blob, ..)| !blob.is_empty()),
+            "身份 blob 不能是空的（空 blob 会让平台按空身份去拉）"
+        );
+    }
+
+    /// 撤销必须**只作废它撤销的那一次请求**，绝不外溢成"这个偏移以后都别拉"。
+    ///
+    /// 这就是实机那次卡住的根因（日志：`开始水合 start=4096` → `平台撤销了这段读` → 又一次
+    /// `开始水合 start=4096` → 立刻"停止拉取"、一个字节都没交）。老实现把撤销记成永久的偏移
+    /// 黑名单，平台**重发**的同一页被上一张旧单子静默吞掉：既不交数据也不报复，那个读就一直
+    /// 挂在平台上 → 目标进程里复制进度不动、`DoDragDrop` 也不返回。
+    ///
+    /// （这条测试碰的是进程内的登记表；`mod tests` 里只有它用它。）
+    #[test]
+    fn a_cancel_only_kills_the_request_it_cancels() {
+        const FILE: i64 = 77;
+
+        // 在飞的请求被撤销 → 它自己停手（这就是撤销的本意）。
+        let first = FetchGuard::begin(FILE, 4096, 8192);
+        note_cancel(FILE, 4096, 8192);
+        assert!(first.cancelled(), "被撤销的那次请求必须知道");
+        drop(first);
+
+        // 平台随后重发同一区间（另一处读要它）→ 必须照常拉：旧单子已经被消费掉了。
+        let second = FetchGuard::begin(FILE, 4096, 8192);
+        assert!(!second.cancelled(), "新请求不能被上一张已经消费掉的撤销单拦住");
+
+        // 撤销只认自己那个 placeholder：别的 file_id 的同区间请求不受影响。
+        note_cancel(FILE, 0, 4096);
+        assert!(!second.cancelled(), "别的文件的撤销不该撤到这一条");
+        drop(second);
+
+        // 同文件、区间有重叠的在飞请求：认领（撤销报的是区间，不是精确边界）。
+        let overlapping = FetchGuard::begin(FILE, 0, 8192);
+        note_cancel(FILE, 4096, 8192);
+        assert!(overlapping.cancelled(), "区间重叠的在飞请求就该被撤到");
+        drop(overlapping);
+
+        // 没有在飞请求时的撤销（那一段早就交付完了）不该留下任何后患。
+        note_cancel(FILE, 12288, 16384);
+        let after = FetchGuard::begin(FILE, 12288, 16384);
+        assert!(!after.cancelled(), "没人认领的撤销单不能留在表里");
+    }
 
     #[test]
     fn data_ranges_are_4k_aligned_unless_they_end_at_eof() {

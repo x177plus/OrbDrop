@@ -42,6 +42,10 @@
 
   async function start(): Promise<void> {
     if (busy || !target) return;
+    // 发起配对 = 发起与这一台的连接：它此刻"看得见却直连不通"时（F-106），那句话在这里说
+    // ——码由本机持有、对方拨进来，这张网不让两个客户端互相说话时这一趟就是白等。
+    const tip = devices.unicastBlockedTip(target);
+    if (tip) store.toast(tip);
     busy = true;
     try {
       // 码由**本机**生成、显示在本机屏幕上，由对方在它那边输入：`pair_confirm` 是对方那侧的事。
@@ -69,6 +73,10 @@
       onClose();
     } catch (e) {
       store.failed("配对", e);
+      // 这一跳就是拨到对端的一次 POST：失败时那台"看得见却直连不通"要说清楚，
+      // 否则用户只会看到一句"配对失败"然后反复试。
+      const tip = devices.unicastBlockedTip(target);
+      if (tip) store.toast(tip);
     } finally {
       busy = false;
     }
@@ -83,11 +91,31 @@
       // `pair_invite` 返回时就代表邀请已经投到对端（它自己起了后台任务等回执），
       // 对方点不点「接收」走 `pair://completed` / `pair://invite_failed` 事件回来 ——
       // 所以这里只报"已发出"，别在这里等结果、更别报"已配对"。
-      await api.pairInvite(peer.id);
+      //
+      // **表不关**（P1-13⑤）：发出去的邀请只有 60s，而撤回的唯一入口就是这一张表 ——
+      // 收起它等于把"取消"这颗按钮藏起来（对端界面上那条通知只能等它超时）。
+      const inviteId = await api.pairInvite(peer.id);
+      store.setPendingPairInvite(inviteId, peer.name);
       store.toast(`已向「${peer.name}」发起配对邀请`);
-      onClose();
     } catch (e) {
       store.failed("发起配对邀请", e);
+      // 邀请是一次到对端的 POST：投不出去、而那台"看得见却直连不通"时，说清这条路为什么不通。
+      const tip = devices.unicastBlockedTip(peer);
+      if (tip) store.toast(tip);
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** 本机发出去、还在等对方确认的那一条（`pair://completed`/`invite_failed` 回来时会清掉）。 */
+  const waiting = $derived(store.pendingPairInvite());
+
+  async function cancelInvite(): Promise<void> {
+    if (busy) return;
+    busy = true;
+    try {
+      await store.cancelPendingPairInvite();
+      onClose();
     } finally {
       busy = false;
     }
@@ -142,9 +170,22 @@
       <p class="field-hint">对方在「设备 → 配对设备」中显示。</p>
     </div>
 
-    <button class="btn btn-secondary btn-block" type="button" onclick={() => void invite()}>
-      <Icon name="bell" />发起配对邀请
-    </button>
+    {#if waiting}
+      <div class="opt">
+        <span class="oi"><Icon name="bell" /></span>
+        <span class="om">
+          <span class="on">等待「{waiting.peerName}」确认</span>
+          <span class="od">对方在它的配对通知里点「接收」即完成；60 秒没人处理自动作废。</span>
+        </span>
+      </div>
+      <button class="btn btn-secondary btn-block" type="button" onclick={() => void cancelInvite()}>
+        <Icon name="x" />取消邀请
+      </button>
+    {:else}
+      <button class="btn btn-secondary btn-block" type="button" onclick={() => void invite()}>
+        <Icon name="bell" />发起配对邀请
+      </button>
+    {/if}
   {/if}
 
   {#snippet foot()}

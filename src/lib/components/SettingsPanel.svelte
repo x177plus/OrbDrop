@@ -1,11 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { open as openDialog } from '@tauri-apps/plugin-dialog';
-  import { wipeCredentials } from '$lib/api';
+  import { wipeCredentials, relayTraffic } from '$lib/api';
   import Hint from '$lib/components/Hint.svelte';
   import Logo from '$lib/components/Logo.svelte';
   import { getSettings, loadSettings, updateSettings } from '$lib/stores/settings.svelte';
-  import type { OrbShape, RectPage } from '$lib/types';
+  import { formatFileSize } from '$lib/types';
+  import type { OrbShape, RectPage, RelayTraffic } from '$lib/types';
   import Orb from '$lib/components/Orb.svelte';
   import RectOrb from '$lib/components/RectOrb.svelte';
 
@@ -58,11 +59,19 @@
    * 只影响之后新登记的共享项，已在列表里的开关不受影响。
    */
   let autoBroadcastNew = $state(false);
-  /**
-   * 替群聊中转消息（后端 `AppSettings.groupRelay`，默认关）。开着才在本机替够不着的同群成员
-   * 转一份（最多 3 跳），代价是本机的上行带宽 —— 所以默认关，由用户自己选。
+/**
+   * 允许本机替别人中转（后端 `AppSettings.allowRelay` + `groupRelay`，默认关）。
+   *
+   * **一个开关管住"本机替别人做事"的两条路**：① 替其它设备盲转字节（两台设备单播不通但
+   * 都连得上本机时，本机替它们搬字节，两端 TLS 端到端不变、本机看不到内容）；② 替够不着的
+   * 同群成员转一份群消息（最多 3 跳）。代价都是本机的上行带宽 —— 所以默认关，由用户自己选。
+   *
+   * 「记住并自动复用跨网段中转」（`relayMemory`）不在这颗开关里：它不替别人做事、也不向对端
+   * 暴露本机的新能力，只是本机自己的选路提示，**默认开、不给控制**（保存时一律写成开）。
    */
-  let groupRelay = $state(false);
+  let relay = $state(false);
+  /** 本机替别人中转的累计流量（`relay_traffic`）：只读的用量记录，打开面板时现拉。 */
+  let traffic = $state<RelayTraffic | null>(null);
   /**
    * 接收推送时一次跑几路传输（后端 `AppSettings.transferWorkers`，默认 4，取值域 1..=8）。
    */
@@ -112,6 +121,18 @@
     }
   }
 
+  /**
+   * 读一次"本机替别人中转了多少"（打开面板时、以及面板开着期间轮询）。
+   * 它是**只读的用量记录**：不是设置项，不参与保存。
+   */
+  async function refreshTraffic() {
+    try {
+      traffic = await relayTraffic();
+    } catch (e: any) {
+      console.error('Relay traffic load failed:', e);
+    }
+  }
+
   onMount(() => {
     loadSettings().then(() => {
       const s = getSettings();
@@ -122,13 +143,23 @@
         deviceName = s.deviceName;
         autoStart = s.autoStart;
         autoBroadcastNew = s.autoBroadcastNew;
-        groupRelay = s.groupRelay;
+        relay = s.allowRelay || s.groupRelay;
         transferWorkers = s.transferWorkers;
         transferBlockMb = s.transferBlockMb;
         bcExePath = s.bcExePath ?? '';
         orbShape = s.orbShape;
       }
     });
+  });
+
+  // 「中转流量」是**实时视图**：本机替别人搬的字节随时在涨（长连接中途也会涨）。而本组件从
+  // 应用启动起就常驻 DOM，原先只在 `onMount` 读一次的话，用户打开设置看到的永远是**启动
+  // 那一刻**的快照。中转没有可订阅的界面事件，面板开着时按 5s 轮询，关掉即停。
+  $effect(() => {
+    if (!open) return;
+    void refreshTraffic();
+    const t = setInterval(() => void refreshTraffic(), 5000);
+    return () => clearInterval(t);
   });
 
   /**
@@ -153,7 +184,11 @@
         deviceName,
         autoStart,
         autoBroadcastNew,
-        groupRelay,
+        // 一颗开关管两条路：替其它设备盲转字节 + 替群聊转消息（`allowRelay` / `groupRelay`）。
+        groupRelay: relay,
+        allowRelay: relay,
+        // 「记住并自动复用跨网段中转」不给控制、默认开：一律写开。
+        relayMemory: true,
         transferWorkers: clampNum(transferWorkers, 1, 8, 4),
         transferBlockMb: clampNum(transferBlockMb, 1, 32, 4),
         bcExePath,
@@ -179,7 +214,7 @@
       deviceName = s.deviceName;
       autoStart = s.autoStart;
       autoBroadcastNew = s.autoBroadcastNew;
-      groupRelay = s.groupRelay;
+      relay = s.allowRelay || s.groupRelay;
       transferWorkers = s.transferWorkers;
       transferBlockMb = s.transferBlockMb;
       bcExePath = s.bcExePath ?? '';
@@ -207,7 +242,8 @@
     </div>
     <div class="field">
       <label for="downloadDir">下载目录<Hint>
-        手动「下载到本地」和对端「推送」接收都存这里；推送落在 <strong>发送方名</strong>
+        手动「下载到本地」和对端「推送」接收都默认存这里（选了「每次询问」时，接收推送那条
+        会先让你挑一个目录，挑的那个就是这次接收的根）；推送一律落在 <strong>发送方名</strong>
         目录下，按你选中的那些项各自的名字展开（不会和下载的文件混在一层）。
       </Hint></label>
       <div class="path-input">
@@ -221,11 +257,11 @@
       <div class="radio-group">
         <label class="radio">
           <input type="radio" name="dlMode" bind:group={downloadMode} value="Direct" />
-          <span class="r-label">直接下载<span class="r-sub">收下文件并保存到下载目录</span></span>
+          <span class="r-label">直接下载<span class="r-sub">收下文件并保存到下载目录（不问）</span></span>
         </label>
         <label class="radio">
           <input type="radio" name="dlMode" bind:group={downloadMode} value="AskEachTime" />
-          <span class="r-label">每次询问<span class="r-sub">手动下载时每次弹窗选保存位置</span></span>
+          <span class="r-label">每次询问<span class="r-sub">下载、以及接收未配对设备的推送时，都先弹窗选位置</span></span>
         </label>
       </div>
     </div>
@@ -288,6 +324,7 @@
                 onDragStart={() => {}}
                 onActivate={() => {}}
                 onUp={() => {}}
+                onContext={() => {}}
                 onToast={() => {}}
               />
             </span>
@@ -330,19 +367,43 @@
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
-      <label>允许为群聊中转消息<Hint>
-        群里两个成员互相够不着时（跨网段、只有本机跟它们都连得上），本机替它们把消息转一份，
-        最多 3 跳；同一份消息转过一次就不再转（不来回绕圈）。<br />
-        <strong>默认关闭</strong>：转一份就占一份本机的上行带宽，而这笔开销该不该出，由你来定 ——
-        对端之间直连得了时，这个开关开不开都一样。
+      <label>允许中转<Hint>
+        打开后本机替别人做事，两条路都在这**一个**开关里：<br />
+        <strong>① 替其它设备盲转字节</strong>：两台设备在同一张 Wi-Fi 上互相连不上时（有些 AP
+        会把客户端之间的流量隔开），本机连着 A 也连着 B，就替它们搬字节 —— 能直连就直连，
+        数据端到端加密，本机只搬字节、看不到内容。<strong>不限已配对设备</strong>：开着就允许，
+        同网段里能到达本机的任意设备都可以借（强制保留的只有"到对方给的那个地址核实目标身份"
+        这一关，少了它本机就成了给任意局域网地址开隧道的工具）。<br />
+        <strong>② 替群聊中转消息</strong>：群里两个成员互相够不着时（跨网段、只有本机跟它们都
+        连得上），本机替它们把消息转一份，最多 3 跳，同一份转过一次就不再转（不来回绕圈）。<br />
+        <strong>默认关闭</strong>：两条路都占本机上行带宽 —— 这笔开销该不该出由你定；对端之间
+        直连得了时，这个开关开不开都一样。关闭会<strong>立刻收掉</strong>本机正在替别人转的每一条。
       </Hint></label>
       <div style="display:flex; align-items:center; justify-content:space-between;">
-        <span style="font-size:var(--fs-sm); color:var(--muted);">开启后本机会把同群消息转给其他成员（最多 3 跳），用于跨网段；会占用本机上行带宽</span>
+        <span style="font-size:var(--fs-sm); color:var(--muted);">本机替够不着彼此的其它设备搬字节、替够不着的同群成员转消息；会占用本机上行带宽</span>
         <label class="switch">
-          <input type="checkbox" bind:checked={groupRelay} data-grouprelay />
+          <input type="checkbox" bind:checked={relay} data-relay />
           <span class="track"></span>
         </label>
       </div>
+    </div>
+    <!-- 中转流量（F-106 / S-09）：替别人搬了多少 —— 只读的累计记录，不随保存写。 -->
+    <div class="field">
+      <label>中转流量<Hint>
+        本机替别人中转<strong>累计搬过的数据量</strong>（收发两个方向之和）与连接数 —— 中转方的
+        代价就是上行带宽，这里就是这笔账。<br />
+        只统计<strong>本机当中转方</strong>替别人搬的那部分：替其它设备<strong>盲转的字节</strong>，
+        以及替群聊<strong>转发出去的消息</strong>。本机自己发出去、经别人中转，不在这个数里。<br />
+        连接数只数盲转的连接（消息中转不算一条连接）。它是落了盘的记录（`config.toml` 的
+        `relayBytesTotal` / `relayConnsTotal`），重启接着算。
+      </Hint></label>
+      {#if traffic && (traffic.bytes > 0 || traffic.connections > 0)}
+        <span style="font-size:var(--fs-sm); color:var(--muted);">
+          累计 {formatFileSize(traffic.bytes)}{traffic.connections > 0 ? ` · ${traffic.connections} 条连接` : ''}
+        </span>
+      {:else}
+        <span style="font-size:var(--fs-sm); color:var(--muted);">还没有替别人中转 —— 有设备借本机中转之后才会有</span>
+      {/if}
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">

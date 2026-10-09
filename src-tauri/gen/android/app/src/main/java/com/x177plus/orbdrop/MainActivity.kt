@@ -1,6 +1,10 @@
-package com.orbdrop.app
+package com.x177plus.orbdrop
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.ViewGroup
 import android.webkit.WebView
 import androidx.activity.OnBackPressedCallback
@@ -40,6 +44,13 @@ class MainActivity : TauriActivity() {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
 
+    // 前台保活要它，Android 13+ 的通知权限要它（见各自的函数）。
+    // **组播锁不在这里**：它属于"应用在局域网上活着"这件事，归 `OrbDropService` —— 界面
+    // 走得比进程早（常驻服务还在，界面已经销毁），锁跟着界面走就会在那一刻默默失效
+    // （表现：设备列表不再更新、地址再也学不到；真机上查了半天就是这个）。
+    OrbDropService.start(this)
+    requestNotificationPermissionIfNeeded()
+
     // 系统栏/软键盘的 inset 从 decorView 上读（值还没被下游消费，见 `applyInsetsAsMargins`）。
     // **不吃掉**（返回原 insets）：系统的与 AppCompat 自己的那套处理照旧。
     ViewCompat.setOnApplyWindowInsetsListener(window.decorView) { _, insets ->
@@ -72,6 +83,29 @@ class MainActivity : TauriActivity() {
     // WebView 是建在这里的（Rust 那边 `setContentView`），而 inset 是在窗口刚起来时就派发的 ——
     // 补一次派发，免得第一帧少了状态栏那份留白。
     ViewCompat.requestApplyInsets(window.decorView)
+  }
+
+  override fun onDestroy() {
+    super.onDestroy()
+  }
+
+  /**
+   * Android 13+ 的通知权限（P1-13④）。
+   *
+   * 前台服务在 13+ 上**没有**这个权限也照旧运行（系统不会杀它），只是那一条常驻通知不显示 ——
+   * 也就是说"保活"本身不依赖用户的这一次授权。这里仍要问一句：不给的话用户就看不到
+   * "OrbDrop 正在后台运行"这件事，卸载/排查时会一头雾水。
+   */
+  private fun requestNotificationPermissionIfNeeded() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+    if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return
+    runCatching { requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICATIONS) }
+      .onFailure { Log.w(TAG, "申请通知权限失败：${it.message}") }
+  }
+
+  private companion object {
+    const val TAG = "orbdrop-mdns"
+    const val REQ_NOTIFICATIONS = 1701
   }
 
   /**

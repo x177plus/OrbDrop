@@ -41,6 +41,28 @@ export interface PeerDevice {
   paired: boolean;
   /** WS long connection is live (paired only) — this is what "长连接" means. */
   connected: boolean;
+  /**
+   * 此刻**看得见**这台设备吗：收到过它的 mDNS 记录、且记录还没被撤。
+   *
+   * 与 `online` 不是一回事（`online` = 探活成功 = 真连得上）。这一位**只干两件事**：
+   * ① 离线且未绑定的那一行照旧列出来（否则"刚才还看到它、现在没了"）；② 发起连接时
+   * 说不说那句「直连不通」的 tip（`unicastBlocked` / `unicastBlockedTip`）。
+   * **它不再是一个状态档**：那一行的胶囊就是「未绑定」/「离线」，点照旧按 `offline` 画。
+   */
+  seen: boolean;
+  /**
+   * 非空 = 此刻**经这台设备中转**（值是中转方的名字，后端 `relay_via`）：
+   * 行上加一句小字「经 <名字> 中转」，用户才知道这条路不是直连。
+   */
+  relayVia: string | null;
+  /**
+   * F-107：**这一段设备的中转记忆**（有的话）——`viaCidr` = 中转网段，`poolSize` = 池里有几台。
+   *
+   * 与本行的 `relayVia`（此刻经谁中转）是两件事：这一位是"这段装不通时该走哪一段"的
+   * 持久策略（`config.toml` 的 `relayRoutes`），所以它在这一行**即使当前直连通着**也会在。
+   * 行上只说一句小字（`transitHint`），别把它做成状态档。
+   */
+  transit?: { viaCidr: string; poolSize: number } | null;
   /** 自动重连的现状；缺省 = 没有拨号意图（已配对但没人点过「连接」）。 */
   linkState?: LinkState | null;
   /**
@@ -55,8 +77,11 @@ export interface PeerDevice {
 
 export interface AppSettings {
   port: number;
-  /** 唯一的落盘目录：手动下载（受 downloadMode 影响）与推送接收都写这里。 */
+  /** 默认的落盘目录：手动下载（受 downloadMode 影响）与推送接收都默认写这里；
+   *  「每次询问」时接收未配对设备的推送会先挑一个目录，那次就用挑的那个作根。 */
   downloadDir: string;
+  /** `AskEachTime` = 下载前弹保存框；接收未配对设备的推送前也弹一次目录框（取消即拒绝）。
+   *  已配对设备的推送免同意自动收，与它无关。 */
   downloadMode: 'Direct' | 'AskEachTime';
   deviceName: string;
   autoStart: boolean;
@@ -88,6 +113,27 @@ export interface AppSettings {
    */
   groupRelay: boolean;
   /**
+   * 本机是否为其它设备**盲转字节**（设置里的「允许为其它设备中转」，默认 `false`）。
+   *
+   * 某些 AP 把客户端之间的流量隔开，两台设备单播不通但都连得上本机 —— 本机替它们搬字节
+   * （两端 TLS 端到端不变，本机看不到内容）；请求方也只在直连不通时才回退走中转。
+   * **默认关**：代价落在本机 —— 每转一份就占一份上行带宽，该不该出由用户自己定。
+   */
+  allowRelay: boolean;
+  /**
+   * 本机是否**记住并自动复用跨网段中转**（设置里的「记住并自动复用跨网段中转」，默认 `true`，F-107/S-10）。
+   *
+   * 开着：直连探不通的设备一旦经中转真的到达，本机就把「这一段设备经哪一段中转」记进地址簿
+   * （设备级链路 + 网段级策略 + 中转池），同段的其他设备直接复用；C 掉线自动换池内的另一台；
+   * 并把这条路由推给被中转的那一侧。
+   *
+   * 关着 = **完全退回 F-106**：端点每次现开、用完即收，不落盘、不泛化、不传播。
+   *
+   * **默认开**（与上面几条"默认关"不同）：这一条不替别人做事、也不向对端暴露本机的新能力
+   * （花带宽、暴露能力的那一侧由中转方的 `allowRelay` 把关），只影响本机自己的选路效率。
+   */
+  relayMemory: boolean;
+  /**
    * 接收推送时的**传输并发数**（设置里的「传输并发数」，默认 4）：一次接收同时跑几路传输。
    * 后端 `config::clamp_transfer_workers` 把取值域夹在 1..=8 —— 再高只会把连接、句柄与磁盘队列都堆起来。
    */
@@ -101,6 +147,21 @@ export interface AppSettings {
 
 /** 折叠态悬浮形态：圆球 / 圆角矩形悬浮框（后端 `config::OrbShape` 的同一套小写字面量）。 */
 export type OrbShape = 'circle' | 'rect';
+
+/**
+ * F-106 / S-09：本机替别人中转的**累计流量记录**（`relay_traffic` 命令；后端
+ * `AppState::relay_traffic_json`）。
+ *
+ * 中转方的唯一代价就是上行带宽，设置里就显示这两个数（"替别人搬了多少"）。字节数两处合流：
+ * 盲转的连接字节 + 替群聊转发出去的消息字节。它是落了盘的记录（`config.toml` 的
+ * `relayBytesTotal` / `relayConnsTotal`），重启接着算。
+ */
+export interface RelayTraffic {
+  /** 收发两个方向之和的字节数（盲转连接 + 替别人转发的群消息）。 */
+  bytes: number;
+  /** 累计中转连接数（只数盲转的连接，不含消息中转）。 */
+  connections: number;
+}
 
 /**
  * 会话模式（原型的三张身份）：一对一 / 单向群发 / 共享群聊。
@@ -547,4 +608,33 @@ export function formatTime(iso: string): string {
   try {
     return new Date(iso).toLocaleString();
   } catch { return iso; }
+}
+
+/**
+ * `chat://undeliverable` 事件的载荷（后端 `relay::notify_undeliverable`，F-106）：
+ * 一条消息**直连不通、也没有可用的中转**时发出来（消息已按既有语义排队，不丢）。
+ */
+export interface Undeliverable {
+  peerId: string;
+  /** 目标设备的显示名（后端给的是它自报的名字，界面上要「」框住）。 */
+  name: string;
+  /** `no_relay` = 找不到愿意中转的设备；`relay_failed` = 有候选但这次没转成。 */
+  reason: 'no_relay' | 'relay_failed';
+  /** 目标此刻"看得见"吗（mDNS 记录还在）——据此补一句"可能这张 Wi-Fi 隔离了客户端"。 */
+  seen: boolean;
+}
+
+/**
+ * 一条消息暂时送不出去时给用户的那句话（**桌面与移动共用同一份文案**）。
+ *
+ * 以前是静默的：消息照排队，界面上却什么都没说，用户只看到"发了没反应"。这里只补解释 ——
+ * 排队本身是既有语义（等它上线再发，不丢）。
+ */
+export function undeliverableText(u: Undeliverable): string {
+  const why = u.reason === 'no_relay' ? '没有可用的中转方' : '中转方这次没转成';
+  let text = `发给「${u.name}」的消息暂时送不出去：${why}。已排队，等它上线会自动发出。`;
+  if (u.seen) {
+    text += '它在同一网段，可能这张 Wi-Fi 隔离了客户端 —— 让一台两端都够得着的设备打开设置里的「允许为其它设备中转」就能自动接管。';
+  }
+  return text;
 }

@@ -512,11 +512,20 @@ pub fn drop_own_fingerprint(own: &str) -> Result<usize> {
 pub fn wipe() -> Result<bool> {
     let _guard = STORE_LOCK.lock();
     let path = vault_path();
-    if !path.exists() {
-        return Ok(false);
-    }
-    std::fs::remove_file(&path).with_context(|| format!("删除凭据文件失败: {}", path.display()))?;
-    Ok(true)
+    // **无论删没删成功，都要让派生缓存作废**：删文件与自增版本号是两件事，而认人走的是缓存
+    // （见 `peer_tokens`）。漏掉这一下的后果是"点了清空，旧 token 还能进" —— 对端几秒后的
+    // 自动重拨会被接受，HTTP/DAV/推送照旧放行，直到之后某次别的写凭据动作才真正失效。
+    // 文件本来就不在（`Ok(false)`）时同样要作废：缓存里可能还留着上一次读到的表。
+    let existed = path.exists();
+    let result = if existed {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("删除凭据文件失败: {}", path.display()))?;
+        Ok(true)
+    } else {
+        Ok(false)
+    };
+    STORE_VERSION.fetch_add(1, Ordering::SeqCst);
+    result
 }
 
 #[cfg(test)]
@@ -775,5 +784,40 @@ mod tests {
         assert_eq!(identity.fingerprint, after.fingerprint);
 
         let _ = std::fs::remove_file(crate::net::identity_path());
+    }
+
+    /// **清空之后旧 token 必须立刻认不出来**（F-15）。
+    ///
+    /// 认人走的是带版本号失效的缓存（`peer_tokens`）；`wipe()` 只删文件、不自增版本号时，
+    /// 缓存里那张表还在 —— 用户点了"清空全部凭据"，对端几秒后的自动重拨照样被接受，
+    /// HTTP/DAV/推送照旧放行。这条测试就盯住那一下。
+    #[test]
+    fn wipe_invalidates_the_derived_token_cache() {
+        set_peer_credential("device-cache", "tok-cache", &"a".repeat(64)).unwrap();
+        // 先把缓存喂热（真实调用顺序：认人先读一次，用户再点清空）。
+        assert_eq!(
+            peer_tokens().get("device-cache").map(|t| t.as_str()),
+            Some("tok-cache"),
+            "配对后应当查得到这枚 token"
+        );
+
+        assert!(wipe().unwrap());
+        assert!(
+            peer_tokens().get("device-cache").is_none(),
+            "清空之后缓存里不能再留着这枚 token"
+        );
+        assert!(!has_peer("device-cache"));
+
+        // 文件本来就不在时也要作废缓存：先把缓存喂热，再绕过 `wipe` 把文件删掉
+        // （模拟"文件已丢 / 已被手工清掉"），此时 `wipe()` 返回 false，但缓存里那张表
+        // 仍然会放行旧 token —— 也必须作废。
+        set_peer_credential("device-cache", "tok-again", &"b".repeat(64)).unwrap();
+        assert!(peer_tokens().contains_key("device-cache"));
+        std::fs::remove_file(vault_path()).unwrap();
+        assert!(!wipe().unwrap(), "文件已经不在 = 没清掉东西");
+        assert!(
+            !peer_tokens().contains_key("device-cache"),
+            "文件不在时的那次 wipe 也必须让缓存作废"
+        );
     }
 }

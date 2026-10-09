@@ -192,13 +192,28 @@ struct GroupConvo {
     /// 只能做一次 —— 否则每一轮定时补拉都会再要一批回来（内容一样、被去重，纯浪费带宽）。
     #[serde(default)]
     bootstrapped: bool,
+    /// 每个发送方**被本地裁剪掉的下界**：`seq <= 这个号`的消息是本机为了控制体积主动丢掉的
+    /// （见 `prune`），**不是"没收到"**。
+    ///
+    /// 补拉找洞要从这个下界之上开始（`holes_in`）：否则超过每群上限之后，被裁掉的那些号会被
+    /// 永远当成缺口 —— 顶部常驻一条"有 N 条消息未能同步（来源设备不在线）"的假告警，而且每收到
+    /// 一条新消息都会再点名去要那几个永远不会回来的号（F-99 的 `holes` 是逐条点名，点的是
+    /// 要不到的名字），变成一条持续的后台流量。
+    #[serde(default)]
+    pruned_below: HashMap<String, u64>,
 }
 
 /// 补拉闸门（内存，重启即忘）：同一（群，设备）的节奏与轮数。
 #[derive(Debug, Default, Clone, Copy)]
 struct SyncGate {
     last: Option<std::time::Instant>,
-    rounds: u32,
+    /// **连续追批**已经追了几轮（"对方说还有更多"那一串）；普通一问会把它清零。
+    ///
+    /// 旧字段叫 `rounds`，普通一问也累加、唯一的清零点在"对方回话"（`sync_gate_note`）——
+    /// 于是一台**有地址但离线**的成员，被 60s 兜底扫每轮 +1，约 6 分钟后就永远不再被问
+    /// （`rounds >= MAX_SYNC_ROUNDS` 之后 `sync_gate_note` 再也不会被调用，到进程重启为止），
+    /// F-99 承诺的"必然收敛"静默失效。现在只有追批占额度，普通一问把它重置。
+    chase_rounds: u32,
 }
 
 /// 收到但**还没被用户确认**的群邀请。
@@ -670,7 +685,21 @@ impl GroupStore {
             debug!(group = %roster.id, "群名册被忽略：本机明确拒绝过这个群");
             return RosterOutcome::Ignored;
         }
+        // 发名册的这台设备必须**本来就是这个群的人**（P1-7）：名册是 LWW（rev 大者胜），谁都能写一个
+        // 更大的 rev —— 不校验发送者身份，任何知道群 id 的局域网主机都能把别人的群改写掉
+        // （改群名、踢人、把自己加进去）。
+        //
+        // 判据用**本机手上那份名册**，不是它自己送来的这份（攻击者当然会把自己写进去）。
+        // 自己退群（广播一份"没有我"的名册）那一档也照样成立：发送者在**本机手上的旧名册**里。
+        // 中转（F-100）那一跳的发送者同样是成员，所以正常路径不受影响。
         if let Some(idx) = guard.groups.iter().position(|g| g.id == roster.id) {
+            if !guard.groups[idx].is_member(&from.id) {
+                warn!(
+                    group = %roster.id, sender = %from.id,
+                    "名册被忽略：发送者不是本机手上这份名册的成员"
+                );
+                return RosterOutcome::Ignored;
+            }
             let stale = {
                 let g = &guard.groups[idx];
                 // LWW：`(rev, updated_by)` 大者胜。并发变更只留一个胜者（结果是确定的、各端收敛）。
@@ -699,6 +728,18 @@ impl GroupStore {
             return RosterOutcome::Updated;
         }
         // 没见过的群：**要用户点一下才算加入**（未知来源也能邀请，但得有人确认）。
+        //
+        // 这里手上没有"旧名册"可查，只能要求发送者出现在**它自己送来的**成员表里 ——
+        // 一份把自己排除在外的名册没有任何正常含义（自己退群那条路只对已知的群有意义）。
+        // 这不构成信任，只是把"随便编一份名册来弹卡片"这件事收窄到"至少自称是成员"；
+        // 真正的门槛仍然是用户点「加入」。
+        if !unique.iter().any(|m| m.id == from.id) {
+            warn!(
+                group = %roster.id, sender = %from.id,
+                "陌生群的名册被忽略：发送者不在它自己给的成员表里"
+            );
+            return RosterOutcome::Ignored;
+        }
         let invite = {
             let mut others = unique;
             others.retain(|m| m.id != own_id);
@@ -841,6 +882,19 @@ impl GroupStore {
     /// 这个群此刻正挂着邀请卡（等用户点「加入」）。
     pub fn has_pending(&self, group_id: &str) -> bool {
         self.inner.lock().pending.iter().any(|p| p.group_id == group_id)
+    }
+
+    /// 这台设备是不是"挂着的那张群邀请卡"里的成员之一（含发起人）。
+    ///
+    /// 用在校验入站帧的发送者时（P1-7）：群还没加入、名册还没落库，手边只有邀请卡上的成员表；
+    /// 把它也算进"成员"，挂着期间的群消息才能照旧攒进 `orphans`（而不是被当成陌生人丢掉）。
+    pub fn pending_has_member(&self, group_id: &str, peer_id: &str) -> bool {
+        let guard = self.inner.lock();
+        guard
+            .pending
+            .iter()
+            .find(|p| p.group_id == group_id)
+            .is_some_and(|p| p.from == peer_id || p.members.iter().any(|m| m.id == peer_id))
     }
 
     /// 邀请挂着期间攒下的消息条数（界面与测试都能看）。
@@ -1028,32 +1082,44 @@ impl GroupStore {
         Some((anchor, holes))
     }
 
-    /// 补拉的闸门：现在能不能问这台设备，能就问。`chase` = 这是"对方说还有更多"的追批 ——
-/// 不受冷却限制（一来一回可能只有几毫秒，冷却会把追批挡在门外），但照样记轮数。
+    /// 补拉的闸门：现在能不能问这台设备，能就问。
+    ///
+    /// `chase` = 这是"对方说还有更多"的追批 —— 不受冷却限制（一来一回可能只有几毫秒，
+    /// 冷却会把追批挡在门外），但**连续追批的轮数**封顶（`MAX_SYNC_ROUNDS`）：对方手里
+    /// 总有更多时不能无限追下去。上限只作用在"这一串追批"上，而**普通一问把这一串清零**
+    /// （用户点、链路恢复、60s 兜底扫都走这条）—— 否则对一台离线但有地址的成员，
+    /// 兜底扫每轮 +1，几分钟后这个 (群, 设备) 就再也不问了（P1-10）。
     pub fn sync_gate_open(&self, group_id: &str, peer_id: &str, chase: bool) -> bool {
         let mut sync = self.sync.lock();
-        let gate = sync.entry((group_id.to_string(), peer_id.to_string())).or_default();
-        if gate.rounds >= MAX_SYNC_ROUNDS {
-            return false;
-        }
-        if !chase {
+        let gate = sync
+            .entry((group_id.to_string(), peer_id.to_string()))
+            .or_default();
+        if chase {
+            if gate.chase_rounds >= MAX_SYNC_ROUNDS {
+                return false;
+            }
+            gate.chase_rounds += 1;
+        } else {
             if let Some(last) = gate.last {
                 if last.elapsed() < SYNC_COOLDOWN {
                     return false;
                 }
             }
+            // 新的一串从这里开始。
+            gate.chase_rounds = 0;
         }
         gate.last = Some(std::time::Instant::now());
-        gate.rounds += 1;
         true
     }
 
     /// 这一轮问完了：对方还有更多（`has_more`）就**继续追**，追完把轮数清零（下一次从头算）。
     pub fn sync_gate_note(&self, group_id: &str, peer_id: &str, has_more: bool) {
         let mut sync = self.sync.lock();
-        let gate = sync.entry((group_id.to_string(), peer_id.to_string())).or_default();
+        let gate = sync
+            .entry((group_id.to_string(), peer_id.to_string()))
+            .or_default();
         if !has_more {
-            gate.rounds = 0;
+            gate.chase_rounds = 0;
         }
     }
 
@@ -1175,6 +1241,15 @@ fn normalize_members(members: &mut Vec<Member>, add: Vec<Member>) {
 fn prune(convo: &mut GroupConvo) {
     let excess = convo.messages.len().saturating_sub(MAX_PER_GROUP);
     if excess > 0 {
+        // 砍之前先记下"这些号是本机主动丢的"（每个发送方各记一个下界）：补拉找洞要从
+        // 下界之上开始，否则被裁掉的老号会被永远当成缺口（见 `pruned_below`）。
+        for m in convo.messages.iter().take(excess) {
+            if m.seq == 0 {
+                continue;
+            }
+            let slot = convo.pruned_below.entry(m.from.clone()).or_insert(0);
+            *slot = (*slot).max(m.seq);
+        }
         convo.messages.drain(..excess);
         // 读位指的那条可能正好被砍掉了：清掉，别让未读算出一个不存在的位置。
         if let Some(pos) = convo.read_pos.clone() {
@@ -1191,6 +1266,10 @@ fn sort_key(m: &GroupMsg) -> (u64, &str, u64) {
 }
 
 /// 会话里"明确知道的缺口"：每个发送方的号从 1 数到它自己的最大号，中间没到手的那些。
+///
+/// **从本地裁剪的下界之上开始数**（`pruned_below`）：被 `prune` 主动丢掉的老号不是"没收到"，
+/// 点名去要也要不到（对方手里同样只留最近一批）。不扣掉这个下界的话，超过每群上限之后
+/// 顶部会常驻一条"有 N 条消息未能同步"的假告警，每条新消息还都会再触发一次补拉（P1-11）。
 ///
 /// 只看**已经在手上的人**：一条都没有的发送方不算"缺"（那可能是本机还没追过的历史，
 /// 由冷启动那一批补拉解决，不是这里的洞）。
@@ -1210,7 +1289,11 @@ fn holes_in(convo: &GroupConvo) -> Vec<SyncHole> {
         have.sort_unstable();
         have.dedup();
         let Some(max) = have.last().copied() else { continue };
-        let missing: Vec<u64> = (1..=max).filter(|seq| !have.contains(seq)).take(MAX_HOLES_PER_SENDER).collect();
+        let floor = convo.pruned_below.get(*from).copied().unwrap_or(0);
+        let missing: Vec<u64> = (floor + 1..=max)
+            .filter(|seq| !have.contains(seq))
+            .take(MAX_HOLES_PER_SENDER)
+            .collect();
         if !missing.is_empty() {
             out.push(SyncHole { from: (*from).to_string(), seqs: missing });
         }
@@ -1720,6 +1803,22 @@ fn resolve_members(state: &AppState, ids: &[String], own_id: &str) -> Vec<Member
 /// 收到一条群消息。
 pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -> bool {
     let own_id = state.config.lock().device_id.clone();
+    // **本帧的对端必须是这个群的成员**（P1-7）：群消息允许未配对设备发（成员不必配对），
+    // 于是"谁都能往群里塞字"这件事只能靠这一条挡 —— 原来只校验自称的作者在名册里，
+    // 任何局域网主机都能拿一个真实成员的 id 冒名发言（信封上写自己）。
+    // 中转（F-100）那一跳的发送者也是成员，所以正常路径不受影响；被移出的人同样进不来。
+    //
+    // 两种"成员"都算：名册已经落库的，以及**挂着还没加入**那张邀请卡上的（后者也要能收消息，
+    // 否则 F-97 的"挂着期间先攒着"就没了）。
+    if !state.groups.is_member(&event.group_id, peer_id)
+        && !state.groups.pending_has_member(&event.group_id, peer_id)
+    {
+        warn!(
+            group = %event.group_id, %peer_id,
+            "群消息被丢弃：这帧的发送者不在名册（也不在挂着的邀请卡）里"
+        );
+        return false;
+    }
     // 作者是谁：直发时就是本帧的对端；**中转来的**那一条作者是别人（搬运工才是本帧对端）——
     // 载荷里自称的那个 id 只在它确实是名册成员时才采信，否则谁都能借一台成员设备往群里冒名塞字。
     let author = if event.sender_id.is_empty() || event.sender_id == peer_id {
@@ -1782,7 +1881,8 @@ pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -
 /// 最多转一次，环路由 `(from, id)` 与跳数（`MAX_HOPS`）一起收住。够不着的成员这里不管 ——
 /// 补拉那一档会兜住（对方自己来要）。
 ///
-/// **替别人搬消息要用户点头**（`Config::group_relay`，默认关）：它占用本机上行带宽。
+/// **替别人搬消息要用户点头**（`Config::group_relay`，默认关）：它占用本机上行带宽 ——
+/// 搬出去的字节按序列化后的消息体大小计入「中转流量」（S-11，`AppState::note_relay_message`）。
 fn maybe_relay(state: &Arc<AppState>, own_id: &str, author: &str, author_name: &str, event: &GroupTextIn) {
     if !state.config.lock().group_relay || event.hops >= MAX_HOPS {
         return;
@@ -1796,6 +1896,9 @@ fn maybe_relay(state: &Arc<AppState>, own_id: &str, author: &str, author_name: &
         reached.push(own_id.to_string());
     }
     let mut forwarded = 0usize;
+    // 这一跳替别人搬出去的字节（序列化后的消息体大小）：与盲转的字节合流进「中转流量」
+    // （S-11）—— 消息中转占的也是本机上行带宽，不该在这一格上不记账。
+    let mut relayed_bytes: u64 = 0;
     for peer in group.others(own_id) {
         // 作者自己、以及这一路上已经经手过的成员都不再打扰。
         if peer == author || reached.iter().any(|r| r == &peer) || !reachable(state, &peer) {
@@ -1812,11 +1915,15 @@ fn maybe_relay(state: &Arc<AppState>, own_id: &str, author: &str, author_name: &
             hops: event.hops + 1,
             reached: reached.clone(),
         };
+        if let Ok(body) = serde_json::to_vec(&ev) {
+            relayed_bytes += body.len() as u64;
+        }
         spawn_group_event(state, &peer, ev, None);
         forwarded += 1;
     }
     if forwarded > 0 {
-        debug!(group = %event.group_id, msg = %event.id, hops = event.hops + 1, forwarded, "群消息中转");
+        state.note_relay_message(relayed_bytes);
+        debug!(group = %event.group_id, msg = %event.id, hops = event.hops + 1, forwarded, bytes = relayed_bytes, "群消息中转");
     }
 }
 
@@ -1943,6 +2050,12 @@ pub fn on_sync_ask(
         debug!(group = %group_id, %peer_id, "补拉请求被忽略：本机不在这个群里");
         return false;
     }
+    // **问的人也得是这个群的成员**（P1-7）：原来只校验"本机自己是不是成员"，于是任何知道群 id
+    // 的局域网主机（包括被移出、但还记得 id 的那台）都能要走最多 200 条群消息 + 完整名册。
+    if !state.groups.is_member(group_id, peer_id) {
+        warn!(group = %group_id, %peer_id, "补拉请求被忽略：问的人不在名册里");
+        return false;
+    }
     let (mut messages, has_more) = state.groups.messages_after(group_id, since_at, MAX_SYNC_MESSAGES);
     let extra = state.groups.messages_by_holes(group_id, &holes, MAX_SYNC_MESSAGES);
     for m in extra {
@@ -2021,7 +2134,9 @@ fn reachable(state: &AppState, peer_id: &str) -> bool {
     if state.ws.has_connection(peer_id) {
         return true;
     }
-    state.get_peer(peer_id).is_some_and(|p| !p.ip.is_empty() && p.port != 0)
+    // 「有地址」= 「此刻拨得动」：只有一条借来的中转链、直连地址从没学到过的那类对端
+    // （AP 隔离下被中转的那一侧）照样够得着，别把它当成"不在网上"。
+    state.get_peer(peer_id).is_some_and(|p| p.dialable())
 }
 
 /// 入站群消息的载荷（`handle_inbound` 与 HTTP 兜底把各自的形状收敛到这里）。
@@ -2327,6 +2442,267 @@ mod tests {
         assert!(!s.has_backlog_for("a"), "发出去就不欠了");
         assert!(!s.has_queued(&gid));
         assert!(s.peers_with_backlog().is_empty());
+    }
+
+    /// 一台**不在名册里**的设备不能改写别人的群（P1-7）。
+    ///
+    /// 名册是 LWW（rev 大者胜）：不校验发送者身份时，任何知道群 id 的局域网主机发一份
+    /// 更大 rev 的名册就能改群名、踢人、把自己加进去 —— 他连配对都不需要。
+    #[test]
+    fn a_foreign_peer_cannot_rewrite_a_known_roster() {
+        let s = store("roster_gate");
+        assert_eq!(
+            s.apply_roster("me", &roster("g1", 1, "a", &["a", "me", "b"]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(s.accept_pending("g1", "me"));
+        let before = s.group("g1").expect("加入后有群");
+
+        // 陌生人 c：自称成员、rev 拉高 → 丢掉，名册一个字不动。
+        let attacked = roster("g1", 99, "c", &["c", "a"]);
+        assert_eq!(
+            s.apply_roster("me", &attacked, &PeerInfo { id: "c".into(), name: "PC-C".into() }),
+            RosterOutcome::Ignored,
+            "不在名册里的发送者改不动这个群"
+        );
+        let after = s.group("g1").expect("群还在");
+        assert_eq!(after.rev, before.rev, "rev 不动");
+        assert_eq!(after.name, before.name, "群名不动");
+        assert_eq!(
+            after.members.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            before.members.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            "成员表不动（既没被踢人，也没被塞进陌生人）"
+        );
+
+        // 成员照旧能改（对等 LWW 没有被这条挡住）。
+        assert_eq!(
+            s.apply_roster("me", &roster("g1", 2, "a", &["a", "me"]), &inviter()),
+            RosterOutcome::Updated
+        );
+        assert_eq!(s.group("g1").expect("群还在").rev, 2);
+
+        // 自己退群（广播一份"没有我"的名册）也照旧成立：发送者在本机手上的旧名册里。
+        assert_eq!(
+            s.apply_roster("me", &roster("g1", 3, "a", &["me"]), &inviter()),
+            RosterOutcome::Updated,
+            "成员发来的名册照旧生效（哪怕是把自己移出去那种）"
+        );
+    }
+
+    /// 陌生群的邀请卡也要"发送者自称是成员"，但真正的门槛仍是用户点「加入」。
+    #[test]
+    fn an_unknown_group_roster_from_a_non_member_never_shows_a_card() {
+        let s = store("pending_gate");
+        let hostile = roster("g9", 1, "c", &["a", "b"]);
+        assert_eq!(
+            s.apply_roster("me", &hostile, &PeerInfo { id: "c".into(), name: "PC-C".into() }),
+            RosterOutcome::Ignored,
+            "名册里没有发送者自己 → 连卡片都不该弹出"
+        );
+        assert!(!s.has_pending("g9"), "没有挂着的邀请");
+    }
+
+    /// 不在名册里的人：拉不走历史（`on_sync_ask`）、也塞不进消息（`on_group_text`）（P1-7）。
+    #[tokio::test]
+    async fn a_foreign_peer_gets_no_history_and_cannot_post() {
+        // 自己的目录：群/会话那些状态文件都落在**配置所在目录**，共用 temp 目录会被套件里
+        // 别的用例写脏（本轮就撞上过：另一个用例把 g1 记进了"拒绝过的群"）。
+        let dir = std::env::temp_dir().join(format!("orbdrop_group_gate_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        let own = state.config.lock().device_id.clone();
+        assert_eq!(
+            state.groups.apply_roster(&own, &roster("g1", 1, "a", &["a", &own, "b"]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.accept_pending("g1", &own));
+
+        // ① 陌生人问补拉：不给（原来只校验"本机自己是不是成员"，谁问都给 200 条 + 名册）。
+        assert!(
+            !on_sync_ask(&state, "c", "g1", "ask-1", 0, Vec::new()),
+            "不在名册里的人问不到历史"
+        );
+        // 成员问：照旧答。
+        assert!(on_sync_ask(&state, "a", "g1", "ask-2", 0, Vec::new()));
+
+        // ② 陌生人借一个真实成员的 id 冒名发言：这一帧的**发送者**不是成员 → 丢。
+        let forged = GroupTextIn {
+            group_id: "g1".into(),
+            id: "forged-1".into(),
+            text: "假装是 a 说的".into(),
+            at: 100,
+            seq: 1,
+            rev: 1,
+            sender_id: "a".into(),
+            sender_name: "PC-A".into(),
+            hops: 0,
+            reached: Vec::new(),
+        };
+        assert!(
+            !on_group_text(&state, "c", forged),
+            "冒充成员发言要丢掉"
+        );
+        assert!(
+            state.groups.messages_after("g1", 0, 50).0.is_empty(),
+            "伪造的那条不该落进会话"
+        );
+
+        // ③ 成员自己发：照旧收下。
+        let real = GroupTextIn {
+            group_id: "g1".into(),
+            id: "real-1".into(),
+            text: "真的".into(),
+            at: 200,
+            seq: 1,
+            rev: 1,
+            sender_id: String::new(),
+            sender_name: "PC-A".into(),
+            hops: 0,
+            reached: Vec::new(),
+        };
+        assert!(on_group_text(&state, "a", real), "成员发言照旧收下");
+
+    }
+
+    /// 替别人转发的群消息要**记账**（S-11）：字节进「中转流量」，但不算一条连接。
+    ///
+    /// 判据是"占了本机上行带宽就该在那个数里看得见" —— 原先群消息中转完全不计账：开着
+    /// 「允许中转」替别的成员搬了半天消息，设置里那个数一直是 0。
+    #[tokio::test]
+    async fn relaying_a_group_message_counts_into_relay_traffic() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_group_acct_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = crate::config::Config::default();
+        config.group_relay = true;
+        let state = Arc::new(crate::state::AppState::new(config, dir.join("config.toml")));
+        let own = state.config.lock().device_id.clone();
+        // 群：作者 a、本机、成员 b。`others(own)` 里 a 是作者（不回头转）、b 够得着 → 转一份。
+        assert_eq!(
+            state.groups.apply_roster(&own, &roster("g1", 1, "a", &["a", &own, "b"]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.accept_pending("g1", &own));
+        // b 够得着（有直连地址就够）：投递本身会失败（127.0.0.1:1 没人听），记账在投递之前。
+        state.upsert_peer(&crate::config::PeerDevice {
+            id: "b".into(),
+            name: "PC-B".into(),
+            ip: "127.0.0.1".into(),
+            port: 1,
+            online: true,
+            ..Default::default()
+        });
+
+        let inbound = GroupTextIn {
+            group_id: "g1".into(),
+            id: "relay-1".into(),
+            text: "替别人搬的这条".into(),
+            at: 300,
+            seq: 1,
+            rev: 1,
+            sender_id: "a".into(),
+            sender_name: "PC-A".into(),
+            hops: 0,
+            reached: Vec::new(),
+        };
+        assert!(on_group_text(&state, "a", inbound), "成员发的这条要收下");
+
+        let traffic = state.relay_traffic_json();
+        let bytes = traffic["bytes"].as_u64().expect("字节数是数");
+        assert!(bytes > 0, "转发出去的消息字节要进「中转流量」");
+        assert_eq!(traffic["connections"], 0, "消息中转不是一条连接");
+        // 转过去的正是那条线上事件（含正文），所以怎么算都不该小于正文本身。
+        assert!(bytes >= "替别人搬的这条".len() as u64, "至少把正文那几字节算进去");
+    }
+
+    /// **普通一问永远不会被"6 轮"锁死**（P1-10）。
+    ///
+    /// 兜底扫是 60s 一轮、目标可能长期离线（有地址但连不上）：旧实现让普通一问也累加轮数，
+    /// 而唯一的清零点在"对方回话"上 —— 6 分钟后就再也不问了，到进程重启为止（F-99 的
+    /// "必然收敛"静默失效）。这里把时钟拨快 20 轮，每一轮都必须放行。
+    #[test]
+    fn repeated_sweeps_never_lock_the_sync_gate_shut() {
+        let s = store("gate_sweep");
+        let gate_key = ("g1".to_string(), "peer-offline".to_string());
+        let backdate = || {
+            let mut sync = s.sync.lock();
+            if let Some(gate) = sync.get_mut(&gate_key) {
+                gate.last = Some(
+                    std::time::Instant::now() - SYNC_COOLDOWN - std::time::Duration::from_secs(1),
+                );
+            }
+        };
+        for round in 0..20 {
+            backdate(); // 等价于"又过了 60 秒，兜底扫再来一次"
+            assert!(
+                s.sync_gate_open("g1", "peer-offline", false),
+                "第 {round} 轮兜底扫就该照常问"
+            );
+        }
+
+        // 追批的额度仍然封顶（不能因为对方总说"还有更多"就无限追下去）。
+        let mut chased = 0;
+        for _ in 0..(MAX_SYNC_ROUNDS + 5) {
+            if s.sync_gate_open("g1", "peer-live", true) {
+                chased += 1;
+            }
+        }
+        assert_eq!(chased, MAX_SYNC_ROUNDS, "连续追批封顶 {} 轮", MAX_SYNC_ROUNDS);
+        // 对方回一句"没有更多" → 预算复位，能接着追。
+        s.sync_gate_note("g1", "peer-live", false);
+        assert!(s.sync_gate_open("g1", "peer-live", true), "回话之后重新开始算");
+        // 普通一问也会把追批串清掉（下一串从头算）。
+        s.sync_gate_note("g1", "peer-live", true);
+        backdate_for(&s, "g1", "peer-live");
+        assert!(s.sync_gate_open("g1", "peer-live", false), "普通一问照常放行");
+        assert!(s.sync_gate_open("g1", "peer-live", true), "新的一串可以从头追");
+    }
+
+    /// 把某个闸门的冷却时间戳往回拨（测试里模拟"又过了一轮"）。
+    fn backdate_for(s: &GroupStore, group_id: &str, peer_id: &str) {
+        let mut sync = s.sync.lock();
+        if let Some(gate) = sync.get_mut(&(group_id.to_string(), peer_id.to_string())) {
+            gate.last = Some(
+                std::time::Instant::now() - SYNC_COOLDOWN - std::time::Duration::from_secs(1),
+            );
+        }
+    }
+
+    /// **被本地裁剪掉的老消息不算缺口**（P1-11）。
+    ///
+    /// 每个群只留最近 `MAX_PER_GROUP` 条：超过之后最老的被 `prune` 丢掉，那不是"没收到"。
+    /// 旧实现把它们当成永远的洞 —— 顶部常驻"有 N 条消息未能同步"的假告警，而且每来一条
+    /// 新消息都会再点名去要那几个号（持续的后台流量）。
+    #[test]
+    fn pruned_history_is_not_reported_as_a_hole() {
+        let s = store("pruned_holes");
+        let gid = s.create(member("me"), vec![member("a")], "");
+        let total = MAX_PER_GROUP + 120;
+        for seq in 1..=total as u64 {
+            s.record_inbound(&gid, "a", "PC-A", &format!("m{seq}"), "字", seq * 10, seq);
+        }
+        assert_eq!(
+            s.view(&gid, "me").unwrap().messages.len(),
+            MAX_PER_GROUP,
+            "本地只留最近 {MAX_PER_GROUP} 条"
+        );
+        assert!(
+            s.holes(&gid).is_empty(),
+            "连号收进来的历史被裁掉之后不该冒出缺口：{:?}",
+            s.holes(&gid)
+        );
+        assert_eq!(s.missing_count(&gid), 0, "界面顶部那条提示靠它");
+        assert!(!s.has_holes(&gid, "a"));
+        // 真的漏了一条（号在裁剪下界之上）照旧认得出来。
+        let last_seq = total as u64 + 2;
+        s.record_inbound(&gid, "a", "PC-A", &format!("m{last_seq}"), "字", 0, last_seq);
+        assert_eq!(
+            s.holes(&gid)[0].seqs,
+            vec![total as u64 + 1],
+            "裁剪下界之上的洞照旧要认出来"
+        );
     }
 
     /// 「在途」在启动时退回「排队」；重启之后同一份文件还能读回来。

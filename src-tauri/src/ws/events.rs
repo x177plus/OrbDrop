@@ -272,6 +272,11 @@ pub mod ui {
     pub const PUSH_RESPONSE: &str = "push://response";
     pub const PUSH_PROGRESS: &str = "push://progress";
     pub const PUSH_DONE: &str = "push://done";
+    /// 一条消息**暂时送不出去**（直连不通、也没有可用的中转方，F-106）：界面挂一句提示。
+    ///
+    /// 排队本身是既有语义（F-95：等它上线再发），这条事件补的是**为什么现在送不出去** ——
+    /// 少了它，用户在"被隔离的 Wi‑Fi 上发给一台没配上的设备"时看到的只是"发了没反应"。
+    pub const CHAT_UNDELIVERABLE: &str = "chat://undeliverable";
     pub const SHARE_CHANGED: &str = "share://changed";
     /// 对端共享项清单变化（新增/移除/改名/开播开关）——设备标签里的列表需要重新拉取。
     pub const SHARES_CHANGED: &str = "shares://changed";
@@ -281,6 +286,10 @@ pub mod ui {
     pub const ORB_SHOW: &str = "orb://show";
     /// 本机「在线 / 离线」变了（面板右上角状态框）：界面更新那个框。载荷 `{ online: bool }`。
     pub const LOCAL_ONLINE: &str = "local://online";
+    /// 本机网卡地址变了（插网线、开/关热点、切 Wi-Fi、VPN 起来）：界面重新拉一次
+    /// `local_addresses`（左下角「端口 · IP」那一条）。载荷为空 —— 值由界面自己拉
+    /// （一份真相，不来回传）。
+    pub const LOCAL_ADDRESSES: &str = "local://addresses";
     /// 会话状态变了（收到消息 / 自己发出 / 送达状态推进 / 已读 / 建群退群）。
     ///
     /// 载荷是**整份会话快照**（和 `chat_snapshot` 命令同一个形状）：会话是人的打字速度，

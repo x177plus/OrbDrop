@@ -2,6 +2,26 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- mDNS 发现（F-10）在安卓上要额外两样东西（P1-13①）：
+         ① `CHANGE_WIFI_MULTICAST_STATE` —— 拿 Wi-Fi 组播锁的权限。安卓的 Wi-Fi 驱动默认
+            **过滤组播**，不拿锁就收不到 mDNS 的组播应答（本机发得出去、收不回来），
+            表现是"设备列表永远是空的"，只能手动敲 IP；
+         ② `ACCESS_WIFI_STATE` —— `getSystemService(WIFI_SERVICE)` 本身要它。
+         锁在 `OrbDropService` 里申请/释放（生命周期 = "应用在局域网上活着"）：界面会先走
+         （常驻服务还在、进程还在），锁跟着界面走就会在那一刻默默失效 —— 设备表不再更新、
+         地址学不到，而且看不出任何异常。 -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- 常驻前台服务（F-81）：界面切后台之后进程要活着，否则长连接与服务器一起停，
+         谁推来的文件都收不到（推送不排队，见 F-53）。`dataSync` 这一档对应
+         "应用在后台同步数据"，是 Android 14+ 对 `startForeground` 的硬要求。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Android 13+ 的通知权限：没有它前台服务照旧能跑，但那一条常驻通知不会显示。
+         运行时在 MainActivity 里申请。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
@@ -44,5 +64,13 @@
             android:name="android.support.FILE_PROVIDER_PATHS"
             android:resource="@xml/file_paths" />
         </provider>
+
+        <!-- 常驻前台服务（F-81）：让进程在后台活着，长连接与服务器才不会跟着界面一起停。
+             `foregroundServiceType="dataSync"` 是 Android 14+ 的硬要求（与上面那条
+             FOREGROUND_SERVICE_DATA_SYNC 权限配对）。 -->
+        <service
+            android:name=".OrbDropService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>

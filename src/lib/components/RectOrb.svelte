@@ -18,11 +18,14 @@
    * 与圆球（`Orb.svelte`）的分工：
    *  - 内容格 = 拖出源（原生 OLE 拖出，复用 `drag.rs` 那条路；本机项给磁盘真实路径、对端项给
    *    镜像里的真实路径，字节等目标读了才拉）；**单击不做事**，**双击** = 目录钻进去（整张列表换成那一层的内容）、文件打开
-   *    （策略在 App 的 `activateRectSlot`）；
+   *    （策略在 App 的 `activateRectSlot`）；**右键 = 那一格的菜单**（本机页最外那一层的共享项
+   *    才有，见 `onContext`）；「↰ 上一级」那格没有菜单 —— 它是出口，不是某一层里的东西；
    *  - header / 分页点 / 卡内空白 = 窗口拖动（与 `Orb.svelte` 同一套手动拖拽：位移过阈值
    *    才交给 OS 拖窗口，否则松手当单击 = 展开/收起面板）；
    *  - 三种意图靠**空间与手势**分开：内容格（含「↰ 上一级」那格）不参与移窗、也不吃单击
    *    （按下就 `stopPropagation`），拖动它们只会拖出/无动作；要移窗就抓 header、点列或空白。
+   *  - 右键菜单开着时，**第一下按下只关菜单**：那一下由菜单自己在捕获阶段吃掉（`ContextMenu`），
+   *    卡片这边收不到、也就不会顺手展开面板或起拖。
    *
    * 形状本身不在这里算：窗口多大、悬浮框在窗口里的哪一块由 `orbShape.ts` 给，`App.svelte`
    * 换算成 CSS 变量传下来（与圆球共用同一套变量）。
@@ -37,6 +40,7 @@
     onDragStart,
     onActivate,
     onUp,
+    onContext,
     onToast,
   }: {
     /** 第一页永远是本机；空 = 数据还没到位（渲染一张本机空态卡）。 */
@@ -56,6 +60,12 @@
     onActivate: (pageIdx: number, slotIdx: number) => void;
     /** 双击「↰ 上一级」那一格、或按 Esc：回上一层（`App.upRect`） */
     onUp: (pageIdx: number) => void;
+    /**
+     * 右键**内容格**（第几页的第几格 + 指针在窗口里的坐标）：菜单长不长、长什么，全在 App 的
+     * `openRectCtx` —— 卡片只负责说"哪一格被右键了"（它不知道共享项、也不知道折叠窗口只有
+     * 236×162 那点地方）。「↰ 上一级」那格、空态与卡内空白都不报（它们不是某一层的条目）。
+     */
+    onContext: (pageIdx: number, slotIdx: number, x: number, y: number) => void;
     /** 拖出准备/失败时的提示 */
     onToast: (msg: string) => void;
   } = $props();
@@ -332,6 +342,20 @@
     }
   }
 
+  /**
+   * 右键一个内容格：位置（指针在**窗口**里的坐标，菜单是 `position: fixed`、夹取也按窗口算）
+   * 与"第几页第几格"一起交出去。
+   *
+   * `preventDefault` 关掉 webview 自带的那份右键菜单（App 在捕获阶段已经全局关过一次，这里
+   * 再关一次是为了这两条路各自自洽）；`stopPropagation` 与内容格那套「按下即断」同一条口径 ——
+   * 右键不该被卡上任何手势（移窗/单击展开都只认主键，见 `onPointerDown`）。
+   */
+  function onContextMenu(e: MouseEvent, i: number, j: number) {
+    e.preventDefault();
+    e.stopPropagation();
+    onContext(i, j, e.clientX, e.clientY);
+  }
+
   /* ─── 手势：移窗 / 单击 / 拖出 ───────────────────────────────────────
      与 `Orb.svelte` 同一套手动拖拽（不能用 `data-tauri-drag-region`：Tauri 的拖拽脚本在
      mousedown 当场上交 OS，本次按下的 pointerup/click 全丢，单击就永远不生效）。
@@ -539,6 +563,7 @@ bind:this={cardEls[i]}
                     }}
                     onpointerdown={(e) => e.stopPropagation()}
                     ondblclick={() => onActivate(i, j)}
+                    oncontextmenu={(e) => onContextMenu(e, i, j)}
                   >
                     <span class="rq-ic" aria-hidden="true">{@html it.isDir ? ICON_FOLDER : ICON_FILE}</span>
                     <span class="rq-itxt">

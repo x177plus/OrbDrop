@@ -251,12 +251,14 @@ async fn accept(
     // 不可伪造；端口用它自报的服务端口）。已经配对的那些原样保留（`upsert_peer` 只增不减）。
     //
     // 来源地址是本机自己的监听端点时（模拟器/NAT 后面的对端回连进来，见
-    // `net::observed_dial_target`）**一处都不记**：那种行没有可拨的地址，它的可达性只能
-    // 由长连接证明（`ws::session` 在链路断开时把这种行标回离线）——这里也不替它声明
-    // "在线"，否则设备行会在"离线"与"已配对"之间来回跳。
+    // `net::observed_dial_target`）、或者来源是**本机认识的另一台设备**时（这条连接是
+    // 经它中转来的，F-106），**一处都不记**：前者没有可拨的地址；后者记下来就把中转方
+    // 的地址当成了发送方的地址（本机以后会拿它去"拨发送方"，实际拨到中转方身上）。
+    // 两种情形的可达性都只能由长连接证明（`ws::session` 在链路断开时把这种行标回离线），
+    // 这里也不替它声明"在线"，否则设备行会在"离线"与"已配对"之间来回跳。
     let (ip, port, online) = match net::observed_dial_target(addr.ip(), port, state.listening_port()) {
-        Some((ip, port)) => (ip, port, true),
-        None => (String::new(), 0, false),
+        Some((ip, port)) if !state.is_relayed_source(addr.ip(), &sender.id) => (ip, port, true),
+        _ => (String::new(), 0, false),
     };
     state.upsert_peer(&PeerDevice {
         id: sender.id.clone(),
@@ -267,6 +269,7 @@ async fn accept(
         paired,
         auto_connect: false,
         paused: false,
+        relay: None,
     });
 
     info!(sender = %sender.id, name = %sender.name, paired, "inbound chat over http");

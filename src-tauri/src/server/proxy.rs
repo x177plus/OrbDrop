@@ -187,7 +187,7 @@ async fn forward(
         return unauthorized("Invalid credentials");
     }
 
-    let peer_base = crate::net::peer_base(&peer.ip, peer.port);
+    let peer_base = crate::net::peer_base(peer.dial().0, peer.dial().1);
     let url = upstream_url(&peer_base, &rest);
     let own_prefix = format!("{PREFIX}/{peer_id}");
 
@@ -457,6 +457,7 @@ mod tests {
             paired: true,
             auto_connect: false,
             paused: false,
+            relay: None,
         });
 
         let client = crate::net::client();
@@ -527,6 +528,38 @@ mod tests {
         assert!(
             sub_body.contains(&format!("<D:href>{PREFIX}/{caller_id}/{share_id}/sub/</D:href>")),
             "子目录自己的 href 也要落在代理前缀上: {sub_body}"
+        );
+
+        // 6. **能力协商**：BC 对 profile 的根先发 `OPTIONS`，要看到 `DAV: 1,2` 才认为这是
+        //    WebDAV 位置（看不到就直接加载不了远端目录）。这一条曾经被本机自己的 CORS 层
+        //    抢答（返回 200 + `Access-Control-Allow-Methods: *`，一个 `DAV:` 头都没有），
+        //    所以它必须**经过**代理一路打到对端的 `/dav` 上。
+        let options = creds(
+            client.request(
+                Method::from_bytes(b"OPTIONS").unwrap(),
+                format!("{base}{share_id}/"),
+            ),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(options.status(), StatusCode::OK, "OPTIONS 应当由对端的 DAV 面回答");
+        assert!(
+            options
+                .headers()
+                .get("dav")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .contains("1,2"),
+            "对端的能力协商必须原样穿透代理（被本机 CORS 抢答时会只剩 Access-Control-*）：{:?}",
+            options.headers()
+        );
+        assert!(
+            options
+                .headers()
+                .get("access-control-allow-methods")
+                .is_none(),
+            "这条路上不该再出现 CORS 的 preflight 抢答"
         );
 
         crate::server::stop_server(&peer_state).await;

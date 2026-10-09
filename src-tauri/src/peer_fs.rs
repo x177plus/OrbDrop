@@ -45,7 +45,7 @@ pub fn coords(state: &Arc<AppState>, peer_id: &str) -> Result<(String, String), 
     let token = crate::credential::get_peer_token(peer_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "未配对，无法读取对方的共享项".to_string())?;
-    Ok((crate::net::peer_base(&peer.ip, peer.port), token))
+    Ok((crate::net::peer_base(peer.dial().0, peer.dial().1), token))
 }
 
 /// 对端 `/tree` 回 400 = "这不是目录"（区别于"共享项不可见/不存在"的 404）。

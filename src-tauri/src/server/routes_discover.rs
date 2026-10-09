@@ -7,26 +7,30 @@
 //! 于是跨段那半边换个传输：**已配对的两台设备，各自把自己 mDNS 视野里的同伴报给对方**
 //! —— 一台锚点换回一整个网段，之后本机直连那些设备（不经过锚点转发）。
 //!
-//! 三条边界决定了它必须长这样：
+//! 四条边界决定了它必须长这样：
 //!
 //! - **要 token**：只有已配对才拿得到表。没交换过凭据的设备只能看见本机自己
 //!   （`/pair/info`），看不到本机认识了谁。这既是安全边界，也正是"匹配上之后才发现"。
-//! - **只回本机这一段的**：A 是用哪个地址拨过来的（看 `Host` 头），就只给那个地址所在
-//!   子网的设备。本机多网卡（有线 + 无线 + VPN）上其它网段的设备，对 A 未必可达 ——
-//!   那台机器可能正是它自己内网的那扇门（NAT/二级路由），回过去只会让 A 拿着一个
-//!   通不了的地址空转。
-//! - **只回在线的**：这一层不判断"这个地址通不通"（那是拿到表那一方 `state::probe_*`
-//!   的职责），只回答"本机这一段此刻有谁在"。
+//! - **整份视野，不按拨号地址划段**：本机多网卡（有线 + 无线 + 热点 + VPN）时，每一块
+//!   网卡上看到的设备都要报出去。只回"呼叫方拨过来的那个地址所在的段"是旧的写法，
+//!   它让一台锚点只能换回**一个**网段：对端明明还有一块网卡看得见别的设备，那些设备却
+//!   永远换不过来（用户报的就是这个）。要哪一段就都给它，由拿到表的那一方自己判断
+//!   可达性（`state::probe_*`，以及"本机压根不会去拨学来的行"这条）。
+//! - **只回本机自己发现的**：表里的行如果不是本机 mDNS 看到的、而是**别台设备转述**来的
+//!   （`state.learned`），就不再往外报 —— 发现只走单播、**不做多跳**：不然 A 从 B 学到的
+//!   东西会被 C 再学一遍，链路上就是"一台锚点自动蔓延到整张网"，与 F-11a 的边界不符。
+//!   要看第三段就再与那一段的某台配对。
+//! - **只回在线的**：这一层只回答"本机此刻看得见谁"（mDNS 视野本来就是实时的）。
 
-use std::net::Ipv4Addr;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::debug;
 
 use crate::server::auth::Caller;
 use crate::state::AppState;
@@ -43,6 +47,17 @@ pub struct PeerEntry {
     pub name: String,
     pub ip: String,
     pub port: u16,
+    /// F-107：**报出它的那一方**认为它属于哪一段（`192.168.1.0/24`）。
+    ///
+    /// 由报出方填：它只报自己 L2 视野里的设备（F-11a 的"只回本机自己发现的"），那些设备
+    /// 必然落在它某块网卡的段里 —— 但**跨网段那一侧只有对端能说**（本机的掩码对远端网段
+    /// 不适用），所以这一格是"这一段是哪一段"的权威来源。算不出来时省略（老版本读成未知）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cidr: Option<String>,
+    /// F-107：它是否允许替别人中转（报出方所知：`/pair/info`、mDNS TXT 或它自己的探活）。
+    /// 老版本不报 = `false`（与 S-09 默认关一致）。收到的一侧据此构造"中转池"。
+    #[serde(default)]
+    pub relay: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,10 +67,17 @@ pub struct DiscoverResponse {
     pub name: String,
     pub port: u16,
     pub ver: u32,
+    /// 本机此刻是否愿意替别人中转（F-106，设置项 S-09）。与 `/pair/info` 的 `relay` 同义：
+    /// 请求方靠它挑中转方（已配对的对端每 5s 走这条探活，能力位跟着这一拍刷新）。
+    pub relay: bool,
+    /// F-107：本机**自报**的网段（`192.168.1.0/24,10.0.0.0/8`）。跨网段时"这台设备属于哪
+    /// 一段"只能由它自己说 —— 收到的一侧据此把设备分到各段、构造中转池。
+    #[serde(default)]
+    pub nets: String,
     pub peers: Vec<PeerEntry>,
 }
 
-/// GET /discover — 已配对对端来要「本机这一段里在线的设备」。
+/// GET /discover — 已配对对端来要「本机此刻看得见的设备」。
 ///
 /// 失败路径都要想清楚：**本机离线（隐身）时**由 `presence_middleware` 拦成 503，
 /// 对端据此判本机不在网上（与探活同一套语义）；**没带/带错 token** 由 `auth_middleware`
@@ -63,39 +85,21 @@ pub struct DiscoverResponse {
 pub async fn discover(
     State(state): State<Arc<AppState>>,
     Extension(caller): Extension<Caller>,
-    headers: HeaderMap,
 ) -> Response {
     // 本机 UI（回环）没有"从哪个网段拨进来"这回事，也不需要这张表：它读共享项走 /shares。
     let Caller::Peer(caller_id) = caller else {
         return (StatusCode::FORBIDDEN, "discover 只对已配对对端开放").into_response();
     };
 
-    let (own_id, own_name) = {
+    let (own_id, own_name, allow_relay) = {
         let config = state.config.lock();
-        (config.device_id.clone(), config.device_name.clone())
+        (config.device_id.clone(), config.device_name.clone(), config.allow_relay)
     };
     let port = listening_port(&state);
 
-    // A 拨的是本机的哪个地址，就按哪个地址划段 —— `Host` 头里那个 IP 就是它。
-    let local_ip = match header_host_ip(&headers) {
-        Some(ip) => ip,
-        None => {
-            // 认不出拨的是哪个地址（自定义 Host / 走代理 / IPv6 字面量）：给不出可靠的
-            // 网段。宁可不回，也不回一批对面根本到不了的地址。
-            info!("discover: Host 头里取不出本机地址，回空表");
-            return Json(DiscoverResponse {
-                id: own_id,
-                name: own_name,
-                port,
-                ver: 1,
-                peers: vec![],
-            })
-            .into_response();
-        }
-    };
-
-    let mask = netmask_for(local_ip).unwrap_or(Ipv4Addr::new(255, 255, 255, 0));
-    let subnet = u32::from(local_ip) & u32::from(mask);
+    // 「学来的」行不进表（发现只走单播、不做多跳）。**先锁 `learned` 再锁 `peers`**：
+    // `state::learn_peers` 就是那个顺序，反着来是白送一个死锁面。
+    let learned: HashSet<String> = state.learned.lock().keys().cloned().collect();
 
     let peers: Vec<PeerEntry> = {
         let peers = state.peers.lock();
@@ -106,22 +110,34 @@ pub async fn discover(
                     && p.id != caller_id
                     && p.online
                     && p.port != 0
-                    && same_subnet(&p.ip, subnet, mask)
+                    && !p.ip.is_empty()
+                    && !learned.contains(&p.id)
             })
             .map(|p| PeerEntry {
                 id: p.id.clone(),
                 name: p.name.clone(),
                 ip: p.ip.clone(),
                 port: p.port,
+                // F-107：这一段是哪一段 —— 对端自报的优先，否则按本机掩码算（同段场景）。
+                cidr: state.cidr_of(&p.id, &p.ip),
+                // 它允不允许中转：本机从 `/pair/info` / TXT 学到的（5s 探活刷新）。
+                relay: state.is_relay_capable(&p.id),
             })
             .collect()
     };
+
+    // 每 5s 一拍都会走这里（长连接活着也走），记成 debug：info 会把日志刷满。
+    debug!(caller = %caller_id, peers = peers.len(), "discover: 报出本机视野");
 
     Json(DiscoverResponse {
         id: own_id,
         name: own_name,
         port,
-        ver: 1,
+        // F-107 起表里多了 `cidr`/`relay`、回话里多了 `nets`。老对端不读这些字段（serde
+        // 忽略未知键），新对端按 `ver >= 2` 记日志用。
+        ver: 2,
+        relay: allow_relay,
+        nets: crate::subnet::format_list(&crate::subnet::host_nets()),
         peers,
     })
     .into_response()
@@ -135,37 +151,5 @@ fn listening_port(state: &AppState) -> u16 {
         state.config.lock().port
     } else {
         serving
-    }
-}
-
-/// `Host: 172.16.0.7:3890` → `172.16.0.7`。取不出来（名称、IPv6 字面量、代理改写过的头）
-/// 就回 `None`。
-fn header_host_ip(headers: &HeaderMap) -> Option<Ipv4Addr> {
-    let host = headers.get(header::HOST)?.to_str().ok()?;
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    // 端口是可选的：`ip` 与 `ip:port` 两种写法都要认。
-    let host = match host.rsplit_once(':') {
-        Some((head, tail)) if tail.parse::<u16>().is_ok() => head,
-        _ => host,
-    };
-    host.parse().ok()
-}
-
-/// 本机哪块网卡上带着这个地址 —— 拿它的掩码，才知道"同一个网段"的边界在哪
-/// （可能是 /24，也可能被管理员配成 /22、/16）。
-fn netmask_for(ip: Ipv4Addr) -> Option<Ipv4Addr> {
-    if_addrs::get_if_addrs()
-        .ok()?
-        .into_iter()
-        .find_map(|i| match i.addr {
-            if_addrs::IfAddr::V4(v4) if v4.ip == ip => Some(v4.netmask),
-            _ => None,
-        })
-}
-
-fn same_subnet(ip: &str, subnet: u32, mask: Ipv4Addr) -> bool {
-    match ip.parse::<Ipv4Addr>() {
-        Ok(v4) => u32::from(v4) & u32::from(mask) == subnet,
-        Err(_) => false,
     }
 }

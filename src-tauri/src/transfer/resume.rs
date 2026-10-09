@@ -206,12 +206,118 @@ fn persist_locked(path: &Path, guard: &mut Inner) {
     debug!(path = %path.display(), "resume state persisted");
 }
 
+/// 对端自报的名字**不能**直接当目录名用。
+///
+/// 落盘根是 `<下载目录>/<对端自报的名字>`，而那个名字是报文里的自由字符串（HTTP/WS 两条路
+/// 都一样），它可以是 `C:\Windows\Temp`、`..\..\..\Users\Public`、`\\?\C:\x` 甚至
+/// `run:evil`。`Path::join` 对带盘符前缀的入参会**清空**已累积的基址（`PathBuf::push` 的
+/// 内部规则：`path.prefix().is_some()` 就 `clear()`），于是"下载目录"那一层直接被丢掉。
+///
+/// 这里把名字净化成一个**只可能是单个普通目录名**的串：路径分隔符与 Windows 禁用字符换成
+/// `_`、去掉结尾的点和空格（Windows 会在建目录时把它们悄悄吃掉，`".. "` 于是退化成 `..`）、
+/// 撞上 Windows 保留设备名时加前缀、限长。净化后为空则退成 `unknown-device`。
+///
+/// 幂等：`safe_dir_name(safe_dir_name(x)) == safe_dir_name(x)`。
+pub fn safe_dir_name(raw: &str) -> String {
+    /// 单层目录名的长度上限：设备名再长也没有必要（路径总长才是 Windows 的硬限制）。
+    const MAX: usize = 64;
+    const FALLBACK: &str = "unknown-device";
+
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        // 控制字符与 Windows 禁用字符（含 `:` —— 它既是盘符也是 NTFS 数据流的分隔符）。
+        let bad = ch.is_control()
+            || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*');
+        out.push(if bad { '_' } else { ch });
+    }
+
+    // 首尾空白，以及**结尾的圆点**（Windows 会静默丢掉，`".. "` 这类就危险了）。
+    let mut name = out.trim().to_string();
+    while name.ends_with('.') {
+        name.pop();
+    }
+    name = name.trim_end().to_string();
+
+    if name.chars().count() > MAX {
+        name = name.chars().take(MAX).collect();
+    }
+    // 截断之后可能又冒出结尾的点/空格。
+    while name.ends_with('.') || name.ends_with(' ') {
+        name.pop();
+    }
+
+    // `CON`、`NUL`、`COM1`… 在 Windows 上是设备名，建不出普通目录（`CON.txt` 同样中招）。
+    if name.is_empty() || is_reserved_device_name(&name) {
+        return if name.is_empty() {
+            FALLBACK.to_string()
+        } else {
+            format!("_{name}")
+        };
+    }
+    name
+}
+
+/// Windows 保留设备名（大小写不敏感，取第一个圆点之前的词干）。
+fn is_reserved_device_name(name: &str) -> bool {
+    let stem: String = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$") {
+        return true;
+    }
+    let mut chars = stem.chars();
+    let (Some(a), Some(b), Some(c), Some(d), None) =
+        (chars.next(), chars.next(), chars.next(), chars.next(), chars.next())
+    else {
+        return false;
+    };
+    (a == 'C' && b == 'O' && c == 'M' || a == 'L' && b == 'P' && c == 'T')
+        && d.is_ascii_digit()
+        && d != '0'
+}
+
+/// 推送落盘的根目录：`<下载目录>/<净化过的发送方名>`。
+///
+/// **唯一**的落盘根算法（新引擎 `download::run` 与老循环 `push_job` 共用）：名字先净化，
+/// 再用 `safe_join` 兜一道 —— 净化保证它不含分隔符/盘符，`safe_join` 保证拼出来的东西
+/// 仍然钉在下载目录里面。两条路都改了才算堵住。
+pub fn landing_root(download_dir: &Path, sender_name: &str) -> PathBuf {
+    let name = safe_dir_name(sender_name);
+    safe_join(download_dir, &name).unwrap_or_else(|| download_dir.join("unknown-device"))
+}
+
 /// Sanitize a relative path so it cannot escape the save root (下载目录 / 推送落盘根).
+///
+/// 清单里的相对路径也是对方给的，逐段校验：
+/// - 空段、`.`、`..`、含反斜杠或 NUL → 拒；
+/// - 含 `:` → 拒（Windows 上 `a.txt:evil` 会写进 NTFS 数据流，`C:` 是盘符）；
+/// - 以圆点或空格结尾 → 拒（Windows 会把它们吃掉，`".. "` 于是变成 `..`）；
+/// - **不是单个普通名字**（`Path::components()` 给出前缀/根/父目录）→ 拒。这一条是真正的闸门：
+///   `PathBuf::push` 遇到带前缀的段会清空已累积的基址，`safe_join(root,"C:/Windows/Temp")`
+///   原本会得到 `C:Windows\Temp`（基址消失）。
+/// - Windows 保留设备名 → 拒。
 pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     let mut out = root.to_path_buf();
     for part in rel.split('/') {
-        if part.is_empty() || part == "." || part == ".." || part.contains('\\') {
+        if part.is_empty()
+            || part == "."
+            || part == ".."
+            || part.contains('\\')
+            || part.contains('\0')
+            || part.contains(':')
+            || part.ends_with('.')
+            || part.ends_with(' ')
+            || is_reserved_device_name(part)
+        {
             return None;
+        }
+        // 平台自己的判据：Windows 上 `C:`、`\\?\C:`、`/foo` 都不是普通名。
+        let mut components = Path::new(part).components();
+        match (components.next(), components.next()) {
+            (Some(std::path::Component::Normal(_)), None) => {}
+            _ => return None,
         }
         out.push(part);
     }
@@ -335,6 +441,123 @@ pub fn bitmap_hex_len(bits: &str) -> usize {
 /// Track progress bookkeeping: returns true when the offset advanced.
 pub fn progress_delta(prev: u64, next: u64) -> u64 {
     next.saturating_sub(prev)
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    /// 落盘根必须**永远**在下载目录里面 —— 不管对端把名字报成什么样。
+    #[test]
+    fn landing_root_cannot_escape_the_download_dir() {
+        let dl = PathBuf::from("C:\\Users\\u\\Downloads");
+        for raw in [
+            "PC-B",
+            "C:\\Windows\\Temp",
+            "C:foo\\bar",
+            "\\\\?\\C:\\Windows",
+            "..\\..\\..\\Users\\Public",
+            "..",
+            ".",
+            "",
+            "   ",
+            "../../etc",
+            "/etc",
+            "..\\..\\x",
+            "设备名（家里那台）",
+            "NUL",
+            "con.txt",
+            "COM1",
+            "x. ",
+            "x.",
+            "run:evil",
+            &"长".repeat(300),
+        ] {
+            let dir = landing_root(&dl, raw);
+            assert!(
+                dir.starts_with(&dl),
+                "名字 {raw:?} 逃出了下载目录：{dir:?}"
+            );
+            // 且必须只多一层（不是多级嵌套，更不是绝对路径）。
+            assert_eq!(
+                dir.parent(),
+                Some(dl.as_path()),
+                "名字 {raw:?} 拼出了非单层的落盘根：{dir:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_dir_name_keeps_device_names_readable() {
+        assert_eq!(safe_dir_name("PC-B"), "PC-B", "正常名字一个字不动");
+        assert_eq!(safe_dir_name("笔记本（客厅）"), "笔记本（客厅）", "中文原样保留");
+        assert_eq!(safe_dir_name("  spaced  "), "spaced");
+        assert_eq!(safe_dir_name(""), "unknown-device");
+        assert_eq!(safe_dir_name(".."), "unknown-device", "全是点 → 退成兜底名");
+        // 分隔符与禁用字符换成下划线，绝不留下来。
+        let cleaned = safe_dir_name("C:\\Windows\\Temp");
+        assert!(!cleaned.contains(['\\', '/', ':']), "净化后不该留分隔符/冒号: {cleaned}");
+        // 净化后剩下的 `..` 只是普通字符（分隔符已经没了），真正要守的判据是：
+        // 结果必须是**单个普通目录名** —— `safe_join` 会再验一次，落盘根因此钉在下载目录里。
+        let dotted = safe_dir_name("..\\..\\..\\Users\\Public");
+        assert!(!dotted.contains(['\\', '/', ':']), "分隔符必须消失: {dotted}");
+        assert!(
+            safe_join(Path::new("C:\\dl"), &dotted).is_some(),
+            "净化结果必须是单个普通目录名: {dotted}"
+        );
+        assert_eq!(safe_dir_name("NUL"), "_NUL");
+        assert_eq!(safe_dir_name("com1.TXT"), "_com1.TXT");
+        assert_eq!(safe_dir_name("x."), "x", "结尾的点 Windows 会吃掉，先去掉");
+        assert!(safe_dir_name(&"长".repeat(300)).chars().count() <= 64);
+        // 幂等：再净化一次结果不变。
+        for raw in ["PC-B", "C:\\x\\y", "", "..", "NUL", "x. ", "设备名"] {
+            let once = safe_dir_name(raw);
+            assert_eq!(safe_dir_name(&once), once, "净化不幂等：{raw:?}");
+        }
+    }
+
+    #[test]
+    fn safe_join_rejects_everything_that_is_not_a_plain_relative_path() {
+        let root = PathBuf::from("C:\\Users\\u\\Downloads\\PC-B");
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/../b",
+            "../a.txt",
+            "a/..",
+            "//server/share/x",
+            "C:/Windows/Temp/x.txt",
+            "C:foo/x",
+            "\\\\?\\C:\\x",
+            "a\\b.txt",
+            "a.txt:evil",
+            "x./y",
+            "x /y",
+            "CON/x",
+            "a//b",
+            "nul.txt",
+        ] {
+            assert!(safe_join(&root, bad).is_none(), "{bad:?} 必须被拒");
+        }
+        for (ok, want) in [
+            ("a.txt", "a.txt"),
+            ("目录/子目录/文件.txt", "目录/子目录/文件.txt"),
+            (".gitkeep", ".gitkeep"),
+            ("a.b.c", "a.b.c"),
+            ("..a", "..a"),
+            ("a..b", "a..b"),
+            ("中文 空格.txt", "中文 空格.txt"),
+            ("COM0", "COM0"),
+        ] {
+            let joined = safe_join(&root, ok).expect(ok);
+            assert!(joined.starts_with(&root));
+            assert_eq!(
+                joined.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"),
+                want
+            );
+        }
+    }
 }
 
 #[cfg(test)]

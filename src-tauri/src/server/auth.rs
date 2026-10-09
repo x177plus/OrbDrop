@@ -7,7 +7,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::http::StatusCode;
 use parking_lot::Mutex;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::config::ShareItem;
 use crate::state::AppState;
@@ -52,8 +52,29 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Response {
     // Loopback bypass: local UI fetches /shares /tree /file directly.
+    //
+    // **但要过 Origin 这道门**：回环 = "本机自己的界面"，而网页的请求也会从回环发出
+    // （页面在 127.0.0.1 上、或浏览器按回环连本机端口）。带**外来** Origin 的回环请求一律
+    // 不认 —— 否则任何网页都能无凭据读走 /shares、/tree、/file，甚至 PUT/DELETE /dav
+    // 改写共享文件（详见 `server::is_trusted_origin`）。无 Origin 的（curl、本机进程、
+    // 我们自己 Rust 侧的 loopback 调用、BC）照旧按本机 UI 处理。
     if addr.ip().is_loopback() {
-        return next.run(with_caller(request, Caller::Local)).await;
+        let foreign_origin = request
+            .headers()
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|origin| !crate::server::is_trusted_origin(origin));
+        if !foreign_origin {
+            return next.run(with_caller(request, Caller::Local)).await;
+        }
+        debug!(
+            origin = %request
+                .headers()
+                .get(axum::http::header::ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            "回环请求带了外来 Origin：按远端处理（要凭据）"
+        );
     }
 
     let headers = request.headers();

@@ -10,6 +10,10 @@
  *   右边放不下 → **翻到指针左侧**（菜单右边缘贴着指针，光标仍落在菜单角上）；
  *   下边放不下 → 同理翻到上边；
  *   翻过去还越界（菜单比容器还大之类）→ 夹进容器，四周留 `MARGIN`。
+ *
+ * `bounds` 传 `null` = **落点已定，一个像素都别动**：折叠态卡片上那一份就是这么用的 ——
+ * 它按**屏幕工作区**（而不是窗口）算好了落点，窗口还是照着菜单撑大的；拿窗口当夹取框
+ * 只会把菜单又推回卡片上（那正是"菜单盖住了悬浮框"的成因，见 `App.placeOrbMenu`）。
  */
 type Bounds = { width: number; height: number };
 
@@ -17,8 +21,8 @@ type Args = {
   /** 期望位置：指针在**定位参照系**里的坐标（元素 `fixed` = 视口；`absolute` = 容器内）。 */
   x: number;
   y: number;
-  /** 允许占用的区域（与 x/y 同一参照系）。 */
-  bounds: Bounds;
+  /** 允许占用的区域（与 x/y 同一参照系）；`null` = 调用方已定好落点，不再翻边/夹取。 */
+  bounds: Bounds | null;
 };
 
 export function ctxPlacement(node: HTMLElement, initial: Args) {
@@ -29,6 +33,11 @@ export function ctxPlacement(node: HTMLElement, initial: Args) {
   const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(v, Math.max(lo, hi)));
 
   function place() {
+    if (!args.bounds) {
+      node.style.left = `${args.x}px`;
+      node.style.top = `${args.y}px`;
+      return;
+    }
     // 量**真实**尺寸再定：菜单的项目数差得很远（设备菜单十几条、芯片菜单两条），
     // 按"约 200×250"估一个必然有一半情况不准 —— 那正是菜单顶出边界的直接原因。
     const w = node.offsetWidth;

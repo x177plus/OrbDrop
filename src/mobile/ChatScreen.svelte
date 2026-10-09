@@ -2,7 +2,6 @@
   import * as chat from "$lib/stores/chat.svelte";
   import type { ChatItem, Receipt } from "$lib/stores/chat.svelte";
   import * as devices from "$lib/stores/devices.svelte";
-  import type { DeviceDotState } from "$lib/stores/devices.svelte";
   import Icon from "./Icon.svelte";
   import * as store from "./store.svelte";
 
@@ -21,27 +20,31 @@
 
   const draft = $derived(chat.draftOf(convoKey));
   const dot = $derived(devices.threadDotState(participants));
-  const online = $derived(
-    participants.filter((id) => devices.getDevices().some((d) => d.id === id && d.connected)).length,
-  );
-  /** 原型 `subText`：一对一按长连接写，多台会话写"几台在线"。 */
+  const peers = $derived(devices.getDevices().filter((d) => participants.includes(d.id)));
+  /** 有长连接的那几台（"长连接"是这一档唯一的判据）。 */
+  const linked = $derived(peers.filter((d) => d.connected).length);
+  /**
+   * **送得到吗**：与设备页那颗点同一档 —— 在线（探活过的）与经中转都算送得到，
+   * 只有"离线・无路"才算送不到（那时消息会排队，见 F-95）。
+   *
+   * 这里以前只认 `connected`（长连接），于是"经中转够得着、消息真的送得到"的一对一会话
+   * 顶着「离线 · 消息不会送达」—— 与同一行那颗绿点自相矛盾，也正是真机上"明明能发消息，
+   * 却写着离线"的那一句。
+   */
+  const reachable = $derived(peers.filter((d) => devices.deviceDotState(d) !== "offline").length);
+  const relayed = $derived(peers.find((d) => d.relayVia));
+  /** 原型 `subText`：一对一按链路/可达性写，多台会话写"几台送得到"。 */
   const sub = $derived(
     mode === "direct"
-      ? online > 0
+      ? linked > 0
         ? "长连接 · 在线"
-        : "离线 · 消息不会送达"
-      : `${online}/${participants.length} 台在线`,
+        : reachable > 0
+          ? relayed
+            ? `经 ${relayed.relayVia} 中转 · 在线`
+            : "在线"
+          : "离线 · 消息不会送达"
+      : `${reachable}/${participants.length} 台在线`,
   );
-
-  /**
-   * 状态点：原型只有 `ok` / `warn` 两颗颜色，真设备 store 有五档（颜色 = 可达性、形状 = 链路）——
-   * 这里压回原型那两颗（会话列表那颗点用的是同一套压缩，两处不能各写一个样）。
-   */
-  function dotCls(state: DeviceDotState): string {
-    if (state === "live" || state === "online") return "ok";
-    if (state === "retrying" || state === "repair") return "warn";
-    return "";
-  }
 
   /** 发言人的设备 id：群消息带 `from`，本机内存里的文件消息带 `peerId`（群里的文件只会是本机发的）。 */
   function speakerOf(item: ChatItem): string {
@@ -58,9 +61,9 @@
     return chat.deviceNameOf(speakerOf(item));
   }
 
-  /** 一条消息底下那行小字（原型 `msgHTML` 里的 `meta`；时刻一律 `HH:MM`）。 */
+  /** 一条消息底下那行小字（原型 `msgHTML` 里的 `meta`；`chat.stamp` = 日期 + 时刻）。 */
   function metaOf(item: ChatItem): string {
-    const time = chat.clock(item.at);
+    const time = chat.stamp(item.at);
     if (item.fromMe) {
       // 群发那条视图里只有"我发出去的"：没有"某台的送达状态"可言，逐台都在下面那张回执卡里。
       if (mode === "broadcast") return time;
@@ -130,7 +133,7 @@
   </button>
   <div class="cb-main">
     <span class="cb-title">{title}</span>
-    <span class="cb-sub"><i class="cv-dot {dotCls(dot)}"></i>{sub}</span>
+    <span class="cb-sub"><i class="cv-dot {dot}"></i>{sub}</span>
   </div>
   <button
     class="icon-btn"

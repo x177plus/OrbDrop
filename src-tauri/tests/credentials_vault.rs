@@ -51,7 +51,7 @@ fn peer(id: &str, ip: &str, port: u16) -> PeerDevice {
         online: true,
         paired: true,
         auto_connect: false,
-        paused: false,
+        paused: false, relay: None,
     }
 }
 

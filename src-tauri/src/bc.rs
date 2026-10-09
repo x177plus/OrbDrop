@@ -713,7 +713,8 @@ pub fn resolve_side(state: &AppState, exe: &Path, target: &BcTarget) -> Result<R
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "未与对方配对，拿不到 token".to_string())?;
 
-            let host_port = format!("{}:{}", peer.ip, peer.port);
+            let (dial_host, dial_port) = peer.dial();
+            let host_port = format!("{}:{}", dial_host, dial_port);
             let own_port = state
                 .server_port
                 .load(std::sync::atomic::Ordering::SeqCst);

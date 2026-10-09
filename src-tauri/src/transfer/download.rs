@@ -204,20 +204,50 @@ impl Session {
     /// 顺序是刻意的：先 `bitmap_set` 再 `save_file`（`save_file` 会把记录写进内存并节流落盘），
     /// 而调用方保证"字节已经在盘上"—— 位图里的每一位就是那个承诺。
     fn complete_block(&self, fw: &Arc<FileWork>, index: u32, len: u32, digest: &[u8; 32]) -> bool {
-        let (key, rec) = {
+        let (key, rec, already_done) = {
             let mut rec = fw.record.lock();
+            // **幂等**：重试会把同一批块再走一遍（一次响应断在中间时，前面那些块早就置位了）。
+            // 位图置位本身是幂等的，但计数不是 —— 再加一次 `done_blocks` 就会**超过总块数**，
+            // 于是成功判据（`+1 == total_blocks`，以及收尾兜底里的 `== total_blocks`）永远不成立：
+            // 一个字节不差、每块都校验过的文件被判成"没有收到全部数据"，`.part` 永远不改名。
+            // `received` 同理（进度会超过 total）。
+            let already_done = bitmap_has(&rec.blocks, index);
             bitmap_set(&mut rec.blocks, index);
             // 摘要存进记录：收尾时要把文件**再读一遍**逐块复核（见 `finalize`），
             // 也是跨会话续传时那些早先收下的块唯一的校验依据。
             rec.set_hash(index, digest);
             rec.updated = now_secs();
-            (fw.key.clone(), rec.clone())
+            (fw.key.clone(), rec.clone(), already_done)
         };
         self.state.push.resume.save_file(&key, rec);
+        if already_done {
+            return fw.done_blocks.load(Ordering::Acquire) >= fw.total_blocks;
+        }
         if len > 0 {
             self.received.fetch_add(len as u64, Ordering::Relaxed);
         }
         fw.done_blocks.fetch_add(1, Ordering::AcqRel) + 1 == fw.total_blocks
+    }
+
+    /// 一条任务重试到底仍然失败：**只标"没收全"的那些文件**。
+    ///
+    /// 一次响应断在中间时，同一批里可能已经有文件整份收完并逐块校验过了（`complete_block` 全部
+    /// 到位，只差响应末尾那个 `END`）；把它们一起标失败，收尾兜底扫描（`:880` 那段"跳过 failed"）
+    /// 就不会再碰它们 —— 明明收全的文件永远停在 `.part`。没收全的照旧如实记失败。
+    fn fail_task_files(&self, task: &Task, reason: &str) {
+        let fail_if_incomplete = |fw: &Arc<FileWork>| {
+            if fw.done_blocks.load(Ordering::Relaxed) < fw.total_blocks {
+                self.mark_failed(&fw.rel, reason.to_string());
+            }
+        };
+        match task {
+            Task::Block(fw, _) => fail_if_incomplete(fw),
+            Task::Bundle(items) => {
+                for (fw, _) in items {
+                    fail_if_incomplete(fw);
+                }
+            }
+        }
     }
 
     /// 文件收尾：长度核对 → 截齐 → fsync → **原子改名** → 丢掉续传记录。
@@ -630,7 +660,12 @@ async fn run(
     }
 
     let config = state.config.lock().clone();
-    let dir = config.download_dir.join(&invite.sender.name);
+    // 落盘根 = `<落盘目录>/<对端名字>`。落盘目录默认是设置里的下载目录；只有在「每次询问」
+    // 下由用户亲自挑过的邀请才带自己的根（`invite.root`，见 `accept_invite`）。
+    // 名字先净化（对端自报的串不能直接当目录名用，
+    // 否则 `C:\Windows\Temp` / `..\..\Users\Public` 会把基址那一层整个顶掉）。
+    let base = invite.root.as_deref().unwrap_or(config.download_dir.as_path());
+    let dir = super::resume::landing_root(base, &invite.sender.name);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| format!("建目录失败: {e}"))?;
@@ -642,10 +677,12 @@ async fn run(
         * 1024;
     let workers = crate::config::clamp_transfer_workers(config.transfer_workers) as usize;
     let callback = invite.callback.clone();
-    let base_url = crate::net::peer_base(
-        callback.as_ref().map(|(ip, _)| ip.as_str()).unwrap_or_default(),
-        callback.as_ref().map(|(_, port)| *port).unwrap_or(0),
-    );
+    // 数据面拨谁：优先地址簿里此刻的拨号地址（可能是中转端点，F-106），
+    // 拿不到才用邀请里带来的那个（对端自报的旧地址）。
+    let dial = state
+        .dial_endpoint(&peer_id, callback.clone())
+        .unwrap_or_default();
+    let base_url = crate::net::peer_base(&dial.0, dial.1);
 
     // ---- 准备每个文件：路径、身份、续传记录 ----------------------------------------
     let mut files: Vec<Arc<FileWork>> = Vec::new();
@@ -1036,15 +1073,9 @@ async fn worker(session: Arc<Session>) {
             }
         }
         if !done {
-            // 重试到底还是失败：把这一批涉及的文件都记成失败（一条坏文件不该拖垮整批）。
-            match &task {
-                Task::Block(fw, _) => session.mark_failed(&fw.rel, "取块失败（重试后仍失败）".into()),
-                Task::Bundle(items) => {
-                    for (fw, _) in items {
-                        session.mark_failed(&fw.rel, "取文件失败（重试后仍失败）".into());
-                    }
-                }
-            }
+            // 重试到底还是失败：把这一批里**没传完**的文件记成失败（一条坏文件不该拖垮整批；
+            // 已经收全的那些不标 —— 它们只差收尾，交给兜底扫描）。
+            session.fail_task_files(&task, "取文件失败（重试后仍失败）");
         }
     }
 }
@@ -1071,3 +1102,125 @@ fn clear_bit(bits: &str, index: u32) -> String {
     out.replace_range(at..at + 2, &format!("{next:02x}"));
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BLOCK: u32 = 4 * 1024 * 1024;
+
+    fn work(rel: &str, size: u64, total_blocks: u32) -> Arc<FileWork> {
+        let dir = std::env::temp_dir();
+        Arc::new(FileWork {
+            rel: rel.into(),
+            size,
+            mtime: 0,
+            target: dir.join(format!("orbdrop_dl_test_{rel}")),
+            part: dir.join(format!("orbdrop_dl_test_{rel}.part")),
+            key: format!("key-{rel}"),
+            total_blocks,
+            done_blocks: AtomicU32::new(0),
+            record: Mutex::new(FileResume::new(size, 0, BLOCK, String::new())),
+            failed: AtomicBool::new(false),
+            retried: Mutex::new(Vec::new()),
+            finalized: AtomicBool::new(false),
+            adopted: String::new(),
+        })
+    }
+
+    fn session(files: Vec<Arc<FileWork>>) -> Session {
+        let dir = std::env::temp_dir().join(format!("orbdrop_dl_sess_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        Session {
+            state,
+            peer_id: "device-test".into(),
+            invite_id: "inv-test".into(),
+            callback: None,
+            base_url: String::new(),
+            token: None,
+            block_size: BLOCK,
+            workers: 1,
+            files: files.clone(),
+            by_path: files.iter().map(|f| (f.rel.clone(), f.clone())).collect(),
+            queue: Mutex::new(VecDeque::new()),
+            notify: tokio::sync::Notify::new(),
+            received: Arc::new(AtomicU64::new(0)),
+            total: files.iter().map(|f| f.size).sum(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            local_cancel: AtomicBool::new(false),
+            sender_cancel: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            failed: Mutex::new(Vec::new()),
+            bufs: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 重试会重发同一批块：同一块完成两次**不能**记两次数（P1-9）。
+    ///
+    /// 记两次的后果不是"进度多点"这么轻：`done_blocks` 会超过总块数，"`+1 == total_blocks`"
+    /// 与收尾兜底里的 `== total_blocks` 就永远不成立 —— 一个字节不差、每块都校验过的文件
+    /// 被判成"没有收到全部数据（传输被中断）"，`.part` 永远停在原地。
+    #[test]
+    fn a_retried_block_is_not_counted_twice() {
+        let fw = work("a.bin", 2 * BLOCK as u64, 2);
+        let s = session(vec![fw.clone()]);
+        let digest = [7u8; 32];
+
+        assert!(!s.complete_block(&fw, 0, BLOCK, &digest), "还差一块，没完成");
+        assert_eq!(fw.done_blocks.load(Ordering::Acquire), 1);
+        assert_eq!(s.received.load(Ordering::Relaxed), BLOCK as u64);
+
+        // 同一块再来一次（断流重试）：计数不动、字节不动，仍然"没完成"。
+        assert!(!s.complete_block(&fw, 0, BLOCK, &digest), "重复的那块不该让它变成完成");
+        assert_eq!(fw.done_blocks.load(Ordering::Acquire), 1, "重复的块不能再记一次数");
+        assert_eq!(
+            s.received.load(Ordering::Relaxed),
+            BLOCK as u64,
+            "进度也不能跟着涨（会超过 total）"
+        );
+        assert_eq!(
+            fw.record.lock().done_bytes(),
+            BLOCK as u64,
+            "位图里仍然只有一块"
+        );
+
+        // 第二块到位 → 真的完成。
+        assert!(s.complete_block(&fw, 1, BLOCK, &digest));
+        assert_eq!(fw.done_blocks.load(Ordering::Acquire), 2);
+        assert_eq!(s.received.load(Ordering::Relaxed), 2 * BLOCK as u64);
+    }
+
+    /// 一批任务重试到底仍失败时，**已经收全**的成员不能被标失败（P1-9）。
+    ///
+    /// 标了就会掉进收尾兜底扫描的"跳过 failed"分支：收全的文件永远不改名（明明只差 END 那一步）。
+    #[test]
+    fn only_incomplete_files_are_failed_when_a_task_dies() {
+        let digest = [3u8; 32];
+        let done = work("done.txt", BLOCK as u64, 1);
+        let broken = work("broken.txt", 2 * BLOCK as u64, 2);
+        let s = session(vec![done.clone(), broken.clone()]);
+        assert!(s.complete_block(&done, 0, BLOCK, &digest), "这份整份收完了（只差收尾）");
+        assert!(!s.complete_block(&broken, 0, BLOCK, &digest), "这份只收了一半");
+
+        s.fail_task_files(
+            &Task::Bundle(vec![(done.clone(), 0), (broken.clone(), 1)]),
+            "取文件失败（重试后仍失败）",
+        );
+
+        let failed = s.failed.lock().clone();
+        assert_eq!(
+            failed.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+            vec!["broken.txt".to_string()],
+            "只有没收全的那份该被标失败"
+        );
+        assert!(!done.failed.load(Ordering::SeqCst), "收全的那份不能被标 failed");
+        assert!(broken.failed.load(Ordering::SeqCst));
+        // 收全的那份照旧参与收尾（兜底扫描只看 `failed`/`finalized`）。
+        assert!(!done.finalized.load(Ordering::SeqCst));
+    }
+}
+

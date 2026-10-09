@@ -15,6 +15,12 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
+    "android:dev": "tauri android dev",
+    "android:build": "tauri android build --apk --aab",
+    "android:build:split": "tauri android build --apk --aab --split-per-abi",
+    "android:build:debug": "tauri android build --apk --debug",
+    "android:release": "tauri android build --apk --target aarch64 && node scripts/install-android.mjs",
+    "android:install": "node scripts/install-android.mjs",
     "commit": "omp commit -c \"摘要首词用英文过去式动词（Added、Fixed、Updated），其余摘要与全部明细用简体中文\"",
     "commit:dry": "npm run commit -- --dry-run"
   },

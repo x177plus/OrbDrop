@@ -66,6 +66,129 @@ pub struct ShareItem {
     pub broadcast_enabled: bool,
 }
 
+/// 本机为"直连够不着的对端"开好的**中转端点**（F-106）。
+///
+/// **运行时状态，不落盘**：中转是"此刻有没有路"的事实，不是用户意图 —— 重启、换网、
+/// 直连恢复都该重算，落盘只会留下一串指向别人中转端口的死地址。
+///
+/// `host` 是**带方括号的 URL 主机字面量**（IPv4 映射的 IPv6，见 `net::relay_host`）：
+/// 中转端点上呈现的是**被中转那台设备**的证书，而指纹表按地址字面量索引
+/// （`net::Trust`）—— 直接用中转方的 IPv4 会与"中转方自己的服务"撞同一个键位，
+/// 同一地址两枚指纹按现有规则会退到 TOFU（见 `Trust::seed`）。换了字面量就各占一档，
+/// TLS 端到端照旧，信任模型一个字都不用改。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayAddr {
+    /// 中转端点主机（URL 用，IPv6 形式带方括号）。
+    pub host: String,
+    pub port: u16,
+    /// 中转方设备 id（本机与它之间**已配对**：控制面要凭据）。
+    pub via: String,
+    /// 中转方显示名（界面文案用）。
+    pub via_name: String,
+}
+
+/// 设备级链路记忆（F-107 §4.1）：**这台设备上一次是怎么被本机够着的**。
+///
+/// 与网段级策略（[`RelayRoute`]）是刻意分开的两级：设备级给"首跳与例外"（某台设备上次实际
+/// 经手的那台中转设备），网段级给"泛化"（同段的 B1/B2/B3 复用同一条策略）。
+///
+/// 单独一张表、而不是塞进 `peers` 条目 —— 与 `device_remarks` 同一条理由：它是"本机跟它
+/// 之间"的关系，键是**设备 id**（跟着设备走、不跟着地址走），而且 `PeerDevice` 的构造点
+/// 全仓有几十处（含全部集成测试），往那个结构上加字段会把每一处都拖下水。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayLink {
+    /// 上一次把本机送到它的中转设备 id。
+    #[serde(default)]
+    pub via_id: String,
+    /// 那台中转设备所在的网段（= 这条链路的中转段）。
+    #[serde(default)]
+    pub via_cidr: String,
+    /// 最近一次经这条链路成功够着它的时刻（RFC3339）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok_at: Option<String>,
+}
+
+/// 网段级中转策略（F-107 §4.1）：**这一段设备要经哪一段中转**。
+///
+/// `target_cidr` 是这一条的主键；网段一律存字符串（见 `subnet` 模块头：一个坏网段不能让
+/// 整份 `config.toml` 作废）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayRoute {
+    /// 目标网段（直连探不通、需要中转的那一段）。
+    #[serde(default)]
+    pub target_cidr: String,
+    /// 中转网段（池里的设备都在这段里）。
+    #[serde(default)]
+    pub via_cidr: String,
+    /// 中转池：该段里「允许中转」的设备 id（经中转成功那一刻、或收到反向记录时写）。
+    ///
+    /// 与 [`RelayRoute::via_addrs`] 是同一批设备的**两半**（id / 地址），读的时候取并集
+    /// （[`RelayRoute::pool_ids`]）。池一律按**并**更新（`state::merge_pool`）：一份新快照里
+    /// 没有它，不代表它没了 —— 它可能只是离线一会儿。
+    #[serde(default)]
+    pub via_devices: Vec<String>,
+    /// 池里那些设备的**最后已知地址**（与 `via_devices` 同一批设备，id 为键）。
+    ///
+    /// 为什么池必须自己带地址：`via_devices` 只是一串 id，而"拨得动"原先唯一依赖设备表里
+    /// 对应的那一行 —— 那些行是**锚点带来的**（`learned` 20s、`adopted` 15min）。锚点一离线，
+    /// 行就跟着没了，池里剩下的 id 谁也拨不动：于是"锚点掉线后自动换同段的另一台中转方"
+    /// 这条路在真机上断掉（设计 §8.2 的失效转移形同虚设）。这一段是"那一段里谁允许中转、
+    /// 各自在哪"的**最后已知事实**，与 `via_devices` 一起落盘（锚点离散、甚至本机重启之后
+    /// 仍然试着借）。它只是提示：借的时候目标身份由中转方到地址上核实，地址陈旧最多白试一次。
+    #[serde(default)]
+    pub via_addrs: Vec<crate::relay::RouteDevice>,
+    /// 池里本机**已配对**的那些（控制面更稳、优先用）。
+    #[serde(default)]
+    pub via_paired: Vec<String>,
+    /// 最近一次经这条策略成功到达某台目标的时刻（RFC3339）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ok_at: Option<String>,
+    /// 成功次数（诊断/界面用）。
+    #[serde(default)]
+    pub ok_count: u32,
+    /// 池最后一次刷新的时刻（锚点的 `/discover` 回话）。太旧 = stale，选路时不参与。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_at: Option<String>,
+}
+
+/// 网段级策略的条数上限：一张表被塞满就按"最久没成功过"淘汰。
+///
+/// 每一条都指向"某一段"—— 家用/办公场景不会有几十段需要中转的网段。没有上限时，一个
+/// 乱报网段的（伪）对端能靠反向记录把配置文件撑大。
+pub const MAX_RELAY_ROUTES: usize = 32;
+
+impl RelayRoute {
+    /// 池的成员 id：`via_devices` 与 `via_addrs` 的**并集**（顺序稳定，`via_devices` 在前）。
+    ///
+    /// 读池一律走这一份：两处写入点各写一半（经中转成功那一刻写 id 列表，活视野/锚点自报
+    /// 刷地址），单看哪一份都会漏一台 —— 漏掉的那台就"拨不动"（真机反馈第五轮与第七轮
+    /// 都是这一格：记忆里有它、手里却没有它的地址）。
+    pub fn pool_ids(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::with_capacity(self.via_devices.len() + self.via_addrs.len());
+        for id in &self.via_devices {
+            if !id.is_empty() && !out.contains(id) {
+                out.push(id.clone());
+            }
+        }
+        for d in &self.via_addrs {
+            if !d.id.is_empty() && !out.contains(&d.id) {
+                out.push(d.id.clone());
+            }
+        }
+        out
+    }
+
+    /// 池里某一台的**最后已知地址**（`via_addrs` 里那一条；没有就 `None`）。
+    pub fn pool_addr(&self, id: &str) -> Option<&crate::relay::RouteDevice> {
+        self.via_addrs
+            .iter()
+            .find(|d| d.id == id && !d.ip.is_empty() && d.port != 0)
+    }
+}
+
 /// 注：`u16`/`String`/`bool` 各有 Default，`PeerDevice` 因此可以 `..Default::default()`
 /// 补齐 —— 只在"这一行只是观察值、意图字段不由构造方决定"的地方用（如对端换 id 时
 /// 迁行的输入，见 `AppState::rekey_peer`）。
@@ -99,6 +222,47 @@ pub struct PeerDevice {
     /// 唯一写点是 `AppState::set_link_intent`：分开写早晚会出现"不拨但照收"。
     #[serde(default)]
     pub paused: bool,
+    /// 直连不通时改走的中转端点（F-106，见 [`RelayAddr`]）。**运行时字段，不落盘**：
+    /// `#[serde(skip)]` 双向忽略，加载/保存都只经 `dial()` 之外的正规地址字段。
+    ///
+    /// 只在"直连刚被探活判死、而本机找到了一台能到它的中转方"时写入；直连恢复即清掉。
+    /// `upsert_peer` 的 mDNS 覆盖不碰它（它只覆盖 `ip`/`port`），所以中转生效期间来一条
+    /// mDNS 记录不会把这条路打回重来。
+    #[serde(skip)]
+    pub relay: Option<RelayAddr>,
+}
+
+impl PeerDevice {
+    /// **所有对端拨号的唯一取址处**（F-106）：直连有路就是直连地址；直连不通、且本机
+    /// 已为它开好中转端点时，用中转端点。
+    ///
+    /// 为什么值只在这里算：地址被十几处 HTTP 调用点与 WS 拨号用到（`peer_fs::coords`、
+    /// 推送、聊天兜底、BC 代理…），任何一处漏判都会变成"这条数据面还往那条死路上走"，
+    /// 而且只在"被 AP 隔开"的网络里才暴露。取址收成一个函数，改一次就全改到。
+    ///
+    /// ⚠️ **广播/上报类**的地方（`/discover` 的表、mDNS 之后再 `upsert`）用的是
+    /// `ip`/`port`：那是"这台设备自己长什么样"，不是"本机怎么走到它"。
+    pub fn dial(&self) -> (&str, u16) {
+        match &self.relay {
+            Some(relay) => (relay.host.as_str(), relay.port),
+            None => (self.ip.as_str(), self.port),
+        }
+    }
+
+    /// 这台设备此刻**拨得动**吗：直连地址，或手里那条借来的中转端点，二者有其一。
+    ///
+    /// 与"它自己有没有地址"是两回事：只经中转见过一面的对端（AP 隔离下被中转的那一侧，
+    /// F-107 §10）从来没有过直连地址，但它照样收得到消息 —— 数据面按这个判据走，
+    /// 别各自读 `ip`/`port`（那是"这台设备自己长什么样"，不是"本机怎么走到它"）。
+    pub fn dialable(&self) -> bool {
+        let (host, port) = self.dial();
+        !host.is_empty() && port != 0
+    }
+
+    /// 这台设备此刻是不是经别人中转（界面文案「经 X 中转」用）。
+    pub fn relay_via(&self) -> Option<&str> {
+        self.relay.as_ref().map(|r| r.via_name.as_str())
+    }
 }
 
 /// BeyondCompare 的"比较位"目标（F-41）：本机共享项，或长连接设备上的共享项。
@@ -157,6 +321,10 @@ pub struct AppSettings {
     pub auto_broadcast_new: bool,
     /// 是否允许本机为群聊**中转**消息（跨网段那一档，默认关）。见 `Config::group_relay`。
     pub group_relay: bool,
+    /// 是否允许本机**替其它设备中转字节**（F-106，默认关）。见 `Config::allow_relay`。
+    pub allow_relay: bool,
+    /// 记住并自动复用跨网段中转（F-107，S-10，默认开）。见 `Config::relay_memory`。
+    pub relay_memory: bool,
     /// 接收推送时的并发数（同时几路在拉）。见 `Config::transfer_workers`。
     pub transfer_workers: u32,
     /// 分块大小（MB）：大文件按它切块并行。见 `Config::transfer_block_mb`。
@@ -176,6 +344,8 @@ impl Default for AppSettings {
             orb_shape: OrbShape::default(),
             auto_broadcast_new: false,
             group_relay: false,
+            allow_relay: false,
+            relay_memory: true,
             transfer_workers: default_transfer_workers(),
             transfer_block_mb: default_transfer_block_mb(),
         }
@@ -230,13 +400,19 @@ pub fn orb_center_from_legacy(pos: OrbPos, shape: OrbShape, scale_factor: f64) -
 pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
-    /// **唯一**的落盘位置：手动「下载到本地」（S-01，受 `download_mode` 影响）和对端
+    /// **默认**的落盘位置：手动「下载到本地」（S-01，受 `download_mode` 影响）和对端
     /// 「推送」接收（F-52）都写这里。推送一律落在 `<发送方名>/` 下，路径由发送方给的
     /// 清单决定（选中项各自的名字，见 `transfer::manifest_for_paths`）—— 没有"推送名
     /// 子目录"那一层。不再单设「收件目录」——两个预设位置对用户是同一种操作。
+    ///
+    /// **例外**：`download_mode = AskEachTime` 时，接收**未绑定设备**的推送会先让用户挑一个
+    /// 目录，挑的那个只是这次接收的**根**（`InboundInvite::root`，`<根>/<发送方名>/…` 那层
+    /// 照旧）—— 已配对设备免同意自动收，永远用这里。
     #[serde(default = "default_download_dir")]
     pub download_dir: PathBuf,
-    /// 下载模式（S-02）：只作用于手动下载；推送一直是弹窗同意后就落盘。
+    /// 下载模式（S-02）：手动下载弹出保存框；`AskEachTime` 时，接收**需要同意的**推送
+    /// （未绑定设备那条）也会先弹一次目录选择框，取消即拒绝这次接收。已配对设备的推送
+    /// 免同意、到了就收，与它无关。
     #[serde(default)]
     pub download_mode: DownloadMode,
     #[serde(default = "default_device_name")]
@@ -307,6 +483,46 @@ pub struct Config {
     /// 显式打开，默认关（需求文档里那两条非目标也随之改写）。
     #[serde(default)]
     pub group_relay: bool,
+    /// 是否允许本机**替其它设备中转字节**（设置里的「允许为其它设备中转」，默认关，F-106）。
+    ///
+    /// 用在一种网络里：AP 把同一 Wi‑Fi 上客户端之间的单播隔开了（组播还能过、单播全灭），
+    /// 于是两台设备各自只够得着本机。开着时本机会为它们开一条**盲转**的中转端点：
+    /// 两端 TLS 端到端不变，本机只搬字节、看不到内容。代价是本机替别人占用上行带宽 ——
+    /// 与自己"只走单播、不做多跳"的取舍相冲，所以必须由用户显式打开，默认关。
+    ///
+    /// 关着时 `POST /relay/open` 一律拒绝（见 `server::routes_relay`）。
+    ///
+    /// **不限已配对设备**（F-107）：开着就允许 —— 本网段内**能到达本机**的任意设备都可以
+    /// 请本机开中转，不再要求它与本机已配对；强制保留的只剩"到请求方给的那个地址核实目标
+    /// 身份"这一关（少了它，本机就成了给任意局域网地址开隧道的工具）。代价如实写在设置项
+    /// 副文案里：同一张网里谁都能借本机的上行带宽。
+    #[serde(default)]
+    pub allow_relay: bool,
+    /// 设备级链路记忆（F-107）：`设备 id → 上一次是怎么够着它的`。见 [`RelayLink`]。
+    #[serde(default)]
+    pub relay_links: HashMap<String, RelayLink>,
+    /// 网段级中转策略（F-107）：`目标网段 → 中转网段 + 中转池`。见 [`RelayRoute`]。
+    #[serde(default)]
+    pub relay_routes: Vec<RelayRoute>,
+    /// 记住并自动复用跨网段中转（F-107，S-10，**默认开**）。
+    ///
+    /// 与 S-07/S-08/S-09 的"默认关"口径不同：这一条**不替别人做事**（花带宽的是中转方的
+    /// S-09），也不向对端暴露本机的新能力（记忆存在本机配置里），只影响本机自己的选路效率。
+    /// 关着时行为**完全退回 F-106**：端点每次现开、用完/直连恢复就收，不落盘、不泛化、不传播。
+    #[serde(default = "default_relay_memory")]
+    pub relay_memory: bool,
+    /// 本机替别人中转**累计搬过的字节**（收发两个方向之和；F-106 / S-09 的用量记录）。
+    ///
+    /// 中转方唯一的代价就是上行带宽 —— 设置里就显示这一个数（"替别人搬了多少"）。两处合流到
+    /// 这一格：盲转的连接字节（`AppState::note_relay_traffic`，连接结束时累加）与替群聊转发出去
+    /// 的消息字节（`AppState::note_relay_message`），都随记账落盘，重启接着算。
+    #[serde(default)]
+    pub relay_bytes_total: u64,
+    /// 本机替别人中转过的**连接数**（累计；与 [`Config::relay_bytes_total`] 同一份记录）。
+    ///
+    /// 只数**盲转的连接**：消息中转不是连接，不计入这一格。
+    #[serde(default)]
+    pub relay_conns_total: u64,
     /// 设备备注（F-101）：`设备 id → 备注`，**只存在本机**。
     ///
     /// 键是**对端自己的设备 id**（`PeerDevice::id`，与配对凭据、共享项广播寻址同一套），
@@ -360,6 +576,12 @@ fn default_online() -> bool {
     true
 }
 
+/// S-10 的缺省：**开**。旧配置里没有这一项（升级上来的）也按"开"读 —— 它是本机的选路
+/// 优化，不是替别人做事，默认开才让 F-107 的"记忆/泛化/反向"在用户升级后直接生效。
+pub fn default_relay_memory() -> bool {
+    true
+}
+
 fn default_auto_start() -> bool {
     true
 }
@@ -385,6 +607,8 @@ impl Config {
             orb_shape: self.orb_shape,
             auto_broadcast_new: self.auto_broadcast_new,
             group_relay: self.group_relay,
+            allow_relay: self.allow_relay,
+            relay_memory: self.relay_memory,
             transfer_workers: clamp_transfer_workers(self.transfer_workers),
             transfer_block_mb: clamp_transfer_block_mb(self.transfer_block_mb),
         }
@@ -430,6 +654,75 @@ impl Config {
         self.device_remarks.insert(peer_id.to_string(), remark.clone());
         Some(remark)
     }
+
+    // ------------------------------------------------------------------
+    // 中转记忆（F-107）：设备级链路 + 网段级策略
+    // ------------------------------------------------------------------
+
+    /// 这台设备上一次是怎么够着的（设备级链路记忆）。
+    pub fn relay_link(&self, peer_id: &str) -> Option<&RelayLink> {
+        self.relay_links.get(peer_id).filter(|l| !l.via_id.is_empty())
+    }
+
+    /// 记下（或刷新）一条设备级链路。`at` 是成功时刻（RFC3339）。
+    pub fn set_relay_link(&mut self, peer_id: &str, via_id: &str, via_cidr: &str, at: &str) {
+        self.relay_links.insert(
+            peer_id.to_string(),
+            RelayLink {
+                via_id: via_id.to_string(),
+                via_cidr: via_cidr.to_string(),
+                ok_at: Some(at.to_string()),
+            },
+        );
+    }
+
+    /// 清掉一条设备级链路（直连恢复、或对端解除配对）。返回"之前确实有"。
+    pub fn clear_relay_link(&mut self, peer_id: &str) -> bool {
+        self.relay_links.remove(peer_id).is_some()
+    }
+
+    /// 找/建一条网段级策略（主键是 `target_cidr`）。
+    ///
+    /// 满了（[`MAX_RELAY_ROUTES`]）就先淘汰"最久没成功过"的那一条 —— 没有上限时，一个乱
+    /// 报网段的对端能靠反向记录把配置文件撑大。
+    pub fn relay_route_mut(&mut self, target_cidr: &str) -> &mut RelayRoute {
+        if !self.relay_routes.iter().any(|r| r.target_cidr == target_cidr)
+            && self.relay_routes.len() >= MAX_RELAY_ROUTES
+        {
+            // 排序：先淘汰没有 `last_ok_at` 的，其次淘汰最旧的那个。
+            if let Some(idx) = self
+                .relay_routes
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, r)| r.last_ok_at.clone().unwrap_or_default())
+                .map(|(i, _)| i)
+            {
+                self.relay_routes.remove(idx);
+            }
+        }
+        if let Some(idx) = self.relay_routes.iter().position(|r| r.target_cidr == target_cidr) {
+            return &mut self.relay_routes[idx];
+        }
+        self.relay_routes.push(RelayRoute {
+            target_cidr: target_cidr.to_string(),
+            ..RelayRoute::default()
+        });
+        self.relay_routes
+            .last_mut()
+            .expect("刚 push 过，必然存在")
+    }
+
+    /// 按主键找一条策略（只读）。
+    pub fn relay_route(&self, target_cidr: &str) -> Option<&RelayRoute> {
+        self.relay_routes.iter().find(|r| r.target_cidr == target_cidr)
+    }
+
+    /// 退休一条策略（该段直连恢复、或锚点长期不再担保）。返回"之前确实有"。
+    pub fn drop_relay_route(&mut self, target_cidr: &str) -> bool {
+        let before = self.relay_routes.len();
+        self.relay_routes.retain(|r| r.target_cidr != target_cidr);
+        self.relay_routes.len() != before
+    }
 }
 
 /// 备注最长多少个字（按**字符**数，不是字节：中文一个字算一个）。
@@ -456,6 +749,12 @@ impl Default for Config {
             online: true,
             auto_broadcast_new: false,
             group_relay: false,
+            allow_relay: false,
+            relay_links: HashMap::new(),
+            relay_routes: Vec::new(),
+            relay_memory: true,
+            relay_bytes_total: 0,
+            relay_conns_total: 0,
             device_remarks: HashMap::new(),
             transfer_workers: default_transfer_workers(),
             transfer_block_mb: default_transfer_block_mb(),
@@ -490,14 +789,32 @@ pub fn data_dir() -> PathBuf {
 ///
 /// 写到一半被打断（崩溃、断电、被杀）**不会**留下半截目标文件 —— 凭据文件和 BC 的
 /// profile 文件都靠它：半截凭据文件 = 读不出来 = 用户眼里"配对全没了"。
+///
+/// 临时名**每次都不同**（pid + 递增序号）：同一个文件被两处同时写是常事（配置每拍都在
+/// 存、凭据库被 HTTP 处理线程写、身份文件被并发的 `start_server` 写）。共用一个临时名时，
+/// 先完成的那次 `rename` 会把临时文件搬走，后一次 `rename` 就报 ENOENT
+/// （"系统找不到指定的文件"）—— 保存偶发失败、还看不出原因（测试里就撞上了）。
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "orbdrop".to_string());
-    let tmp = path.with_file_name(format!("{name}.orbdrop-tmp"));
+    let tmp = path.with_file_name(format!(
+        "{name}.{}.{}.orbdrop-tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // 别把没搬成的临时文件留在数据目录里。
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 pub fn config_file_path() -> PathBuf {
@@ -1037,6 +1354,41 @@ mod tests {
             online: false,
             auto_broadcast_new: true,
             group_relay: true,
+            allow_relay: false,
+            relay_links: HashMap::from([(
+                "peer-1".to_string(),
+                RelayLink {
+                    via_id: "peer-c".into(),
+                    via_cidr: "192.168.50.0/24".into(),
+                    ok_at: Some("2026-09-30T12:00:00Z".into()),
+                },
+            )]),
+            relay_routes: vec![RelayRoute {
+                target_cidr: "192.168.1.0/24".into(),
+                via_cidr: "192.168.50.0/24".into(),
+                via_devices: vec!["peer-c".into(), "peer-d".into()],
+                via_addrs: vec![
+                    crate::relay::RouteDevice {
+                        id: "peer-c".into(),
+                        name: "PC-C".into(),
+                        ip: "192.168.50.7".into(),
+                        port: 3890,
+                    },
+                    crate::relay::RouteDevice {
+                        id: "peer-d".into(),
+                        name: "PC-D".into(),
+                        ip: "192.168.50.8".into(),
+                        port: 3890,
+                    },
+                ],
+                via_paired: vec!["peer-c".into()],
+                last_ok_at: Some("2026-09-30T12:00:00Z".into()),
+                ok_count: 3,
+                seen_at: Some("2026-09-30T12:05:00Z".into()),
+            }],
+            relay_memory: false,
+            relay_bytes_total: 12_345,
+            relay_conns_total: 7,
             picker_favorites: vec![
                 PickerFavorite { name: "桌面".into(), path: "C:/Users/t/Desktop".into() },
                 PickerFavorite { name: "项目".into(), path: "D:/项目".into() },
@@ -1081,6 +1433,40 @@ mod tests {
             Some(PathBuf::from("D:/Tools/BCompare/BCompare.exe")),
             "BC 路径要跨重启保留（便携版 BC 只能靠它）"
         );
+        // F-107：中转记忆（设备级链路 + 网段级策略）要跨重启保留 —— 那正是"记忆"的意义。
+        assert!(
+            !loaded.relay_memory,
+            "S-10 的显式值要读回来（这里是 false；缺此项的旧配置才按默认的 true 读）"
+        );
+        assert_eq!(
+            (loaded.relay_bytes_total, loaded.relay_conns_total),
+            (12_345, 7),
+            "中转流量记录（累计字节 + 连接数）要跨重启保留"
+        );
+        assert_eq!(
+            loaded.relay_links.get("peer-1").map(|l| l.via_id.as_str()),
+            Some("peer-c"),
+            "设备级链路记忆要落盘"
+        );
+        assert_eq!(loaded.relay_routes.len(), 1);
+        assert_eq!(loaded.relay_routes[0].target_cidr, "192.168.1.0/24");
+        assert_eq!(loaded.relay_routes[0].via_cidr, "192.168.50.0/24");
+        assert_eq!(
+            loaded.relay_routes[0].via_devices,
+            vec!["peer-c".to_string(), "peer-d".to_string()],
+            "中转池（设备 id 列表）要落盘，冷启动靠它"
+        );
+        assert_eq!(
+            loaded.relay_routes[0].via_addrs[1],
+            crate::relay::RouteDevice {
+                id: "peer-d".into(),
+                name: "PC-D".into(),
+                ip: "192.168.50.8".into(),
+                port: 3890,
+            },
+            "池里那些设备的地址也要落盘 —— 锚点离散后 id 是拨不动的（真机就卡在这里）"
+        );
+        assert_eq!(loaded.relay_routes[0].ok_count, 3);
         assert_eq!(
             loaded.bc_left,
             Some(BcTarget::Share {
@@ -1439,5 +1825,121 @@ mod tests {
         let map: HashMap<String, String> =
             pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         move |key: &str| map.get(key).cloned()
+    }
+
+    /// 取址只在一处（`PeerDevice::dial`）：没有中转走它自己的地址，挂了中转走中转端点。
+    /// 十几处数据面都从这一个函数取值，错了就是"整条数据面还往死路上走"。
+    #[test]
+    fn dial_prefers_the_relay_only_when_one_is_set() {
+        let mut peer = PeerDevice {
+            id: "p".into(),
+            name: "P".into(),
+            ip: "10.0.0.5".into(),
+            port: 3890,
+            ..Default::default()
+        };
+        assert_eq!(peer.dial(), ("10.0.0.5", 3890), "没有中转时拨它自己的地址");
+        assert_eq!(peer.relay_via(), None);
+
+        peer.relay = Some(RelayAddr {
+            host: "[::ffff:10.198.71.106]".into(),
+            port: 41000,
+            via: "relay-node".into(),
+            via_name: "书房的台式机".into(),
+        });
+        assert_eq!(peer.dial(), ("[::ffff:10.198.71.106]", 41000), "挂了中转就走中转端点");
+        assert_eq!(peer.relay_via(), Some("书房的台式机"), "界面文案用中转方的名字");
+    }
+
+    /// F-107：记忆能落盘读回，而且**绝不**变成拨号地址 —— `dial()` 只认"此刻这条路"
+    /// （`PeerDevice::relay`），记忆只是"下次直连不通时先试谁"的提示。
+    #[test]
+    fn relay_memory_round_trips_and_never_becomes_a_dial_address() {
+        // 记忆是"下次直连不通时先试谁"的提示，**不是**拨号地址：`dial()` 只认此刻这条路
+        // （`PeerDevice::relay`），地址簿条目照旧只有它自己的 ip/port。
+        let mut peer = PeerDevice {
+            id: "peer-b".into(),
+            name: "B".into(),
+            ip: "192.168.1.6".into(),
+            port: 3890,
+            online: false,
+            paired: true,
+            auto_connect: false,
+            paused: false,
+            relay: None,
+        };
+        assert_eq!(peer.dial(), ("192.168.1.6", 3890), "没有端点时 dial 用直连地址");
+
+        let mut config = Config::default();
+        config.set_relay_link("peer-b", "peer-c", "192.168.50.0/24", "2026-09-30T12:00:00Z");
+        {
+            let route = config.relay_route_mut("192.168.1.0/24");
+            route.via_cidr = "192.168.50.0/24".into();
+            route.via_devices = vec!["peer-c".into()];
+            route.via_paired = vec!["peer-c".into()];
+            route.last_ok_at = Some("2026-09-30T12:00:00Z".into());
+            route.ok_count = 1;
+            route.seen_at = Some("2026-09-30T12:00:00Z".into());
+        }
+        let toml = toml::to_string_pretty(&config).unwrap();
+        let back: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(
+            back.relay_links.get("peer-b").map(|l| l.via_id.as_str()),
+            Some("peer-c")
+        );
+        assert_eq!(back.relay_route("192.168.1.0/24").map(|r| r.via_cidr.clone()), Some("192.168.50.0/24".into()));
+        assert!(back.relay_memory, "默认开：S-10 是选路优化，不替别人做事");
+        assert_ne!(peer.dial(), ("[::ffff:192.168.50.7]", 1234), "记忆不是地址");
+        peer.relay = Some(RelayAddr {
+            host: "[::ffff:192.168.50.7]".into(),
+            port: 1234,
+            via: "peer-c".into(),
+            via_name: "C".into(),
+        });
+        assert_eq!(
+            peer.dial(),
+            ("[::ffff:192.168.50.7]", 1234),
+            "有端点时 dial 走端点（唯一取址处）"
+        );
+    }
+
+    /// 网段级策略有条数上限：一个乱报网段的对端不能靠反向记录把配置撑大。
+    #[test]
+    fn relay_routes_are_capped() {
+        let mut config = Config::default();
+        for i in 0..(MAX_RELAY_ROUTES + 5) {
+            let route = config.relay_route_mut(&format!("10.{}.0.0/24", i % 250));
+            route.last_ok_at = Some(format!("2026-09-30T12:00:{:02}Z", i % 60));
+        }
+        assert_eq!(
+            config.relay_routes.len(),
+            MAX_RELAY_ROUTES,
+            "超过上限要按最久没成功过的淘汰"
+        );
+    }
+
+    /// 中转端点**不落盘**：它是"此刻有没有路"的事实，重启/换网都该由探活重算。
+    /// 落到地址簿里的话，下一次启动会拿一个指向别人中转端口的死地址去拨。
+    #[test]
+    fn relay_addr_never_hits_the_address_book() {
+        let mut peer = PeerDevice {
+            id: "p".into(),
+            name: "P".into(),
+            ip: "10.0.0.5".into(),
+            port: 3890,
+            ..Default::default()
+        };
+        peer.relay = Some(RelayAddr {
+            host: "[::ffff:10.198.71.106]".into(),
+            port: 41000,
+            via: "relay-node".into(),
+            via_name: "R".into(),
+        });
+        let toml = toml::to_string(&peer).expect("序列化");
+        assert!(!toml.contains("relay"), "中转端点不该写进地址簿:\n{toml}");
+        assert!(toml.contains("10.0.0.5"), "它自己的地址照旧在:\n{toml}");
+
+        let back: PeerDevice = toml::from_str(&toml).expect("反序列化");
+        assert!(back.relay.is_none(), "读回来没有中转（重启后由探活重算）");
     }
 }

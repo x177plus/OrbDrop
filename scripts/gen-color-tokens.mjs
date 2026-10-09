@@ -24,7 +24,11 @@
  *    （实测 `.toast` / `.scrim` 的成对回退因此仍算作透明）。所以这类也必须进 `@supports`：
  *
  *        .toast { background: rgba(14, 18, 23, .93); }
- *        @supports (…) { .toast { background: color-mix(in oklch, var(--fg) 93%, transparent); } }
+ *        @supports (…) { .toast { background: color-mix(in oklab, var(--fg) 93%, transparent); } }
+ *
+ * 另外：本文件里**所有 `color-mix()` 都写 `in oklab`（直角插值），不写 `in oklch`** —— 极坐标色相
+ * 插值在 Chromium 111–114 上会把 `transparent` 的色相当 0 参与绕行，把蓝色底纹染成粉色（真机
+ * Huawei WebView 114.0.5.302 实测）。等价性与理由见 `SUPPORTS_COND` 上方那段注释。
  *
  * 配色仍只有**一处来源**（原型那套 oklch/color-mix 写法），sRGB 值是它的机械派生。
  * 计算自己实现（OKLab ↔ sRGB + `color-mix` 的预乘插值），不引依赖；生成值已用 Chromium 的 canvas
@@ -44,7 +48,20 @@ const isLegacySafe = (value) => !MODERN.test(value);
 
 const BEGIN_MARK = "/* ↓↓↓ 生成区：高保真颜色（Chrome 111+），老引擎整块跳过 —— 见 scripts/gen-color-tokens.mjs ↓↓↓ */";
 const END_MARK = "/* ↑↑↑ 生成区结束 ↑↑↑ */";
-const SUPPORTS_COND = "@supports (color: oklch(0% 0 0)) and (background: color-mix(in oklch, red, blue))";
+/**
+ * 生成区里**只用直角插值**（`in oklab`），不用 `in oklch`。
+ *
+ * `in oklch` 是极坐标色相插值：Chromium 111–114 会把 `transparent`（`rgb(0 0 0 / 0)`，转到 oklch 后
+ * 色相是 0）的色相当成"有值"参与绕行 —— 真机 Huawei WebView 114.0.5.302 实测：`--accent-soft`
+ * （`var(--accent) 12% + transparent`）叠在白底上得 rgb(243,221,237)（粉），正确值 rgb(227,239,251)（浅蓝）。
+ * 该引擎的 `oklch()` 本身是准的（同一个包里的 `--accent` 实测仍是蓝 rgb(23,120,225)），坏的只是极坐标混合。
+ *
+ * `in oklab` 与 `in oklch` 的差别只在**两个带色相的颜色**互混时出现：本仓那几处（`--hairline`、
+ * `.pend`、`.opt.danger`）用极坐标会沿色相绕行（实测 `.pend` 绕到 302°、`.opt.danger` 绕到 288°，
+ * 一个发紫一个发紫蓝），直角插值给出的才是设计意图（也正好等于本脚本派生的 sRGB 回退值）。
+ * 与 `transparent` / `black` 混时两者结果一致，所以这条规则对所有既有取值是**等价**的。
+ */
+const SUPPORTS_COND = "@supports (color: oklch(0% 0 0)) and (background: color-mix(in oklab, red, blue))";
 
 // ── OKLab ↔ linear sRGB（矩阵取自 Björn Ottosson 的 OKLab 定义，与 CSS Color 4 一致）──
 function oklabToLinearSrgb(L, a, b) {
@@ -102,8 +119,10 @@ function parseColor(text) {
   return null;
 }
 
-/** `color-mix`：在 oklab 里按**预乘 alpha** 插值（与 `transparent` 混时这条规则决定语义）。 */
-function mixOklch(a, b, aWeightPercent) {
+/** `color-mix(in oklab, …)` 的插值：在 oklab 的**直角分量**上按预乘 alpha 混合。
+    与 `transparent` 混时结果与色彩空间无关（只有 alpha 起作用）；与 `black` 混时与 `in oklch` 等价；
+    与带色相的哑色（`var(--surface)` 这种显式 h=0 的颜色）混时，`in oklch` 会沿色相绕行，直角插值不会。 */
+function mixOklab(a, b, aWeightPercent) {
   const wa = aWeightPercent / 100;
   const wb = 1 - wa;
   const pa = a.ok.map((v) => v * a.alpha);
@@ -190,14 +209,14 @@ function resolveColor(text) {
   if (t.startsWith("color-mix(")) {
     const { inner } = sliceCall(t, 0);
     const parts = inner.split(",").map((x) => x.trim());
-    if (!/^in\s+oklch$/i.test(parts.shift() ?? "")) throw new Error(`只支持 in oklch：${text}`);
+    if (!/^in\s+oklab$/i.test(parts.shift() ?? "")) throw new Error(`只支持 in oklab（直角插值）：${text}`);
     const [aText, bText] = parts;
     const weightOf = (x) => {
       const m = /([\d.]+)%$/.exec(x ?? "");
       return m ? Number(m[1]) : null;
     };
     const wa = weightOf(aText) ?? (weightOf(bText) === null ? 50 : 100 - weightOf(bText));
-    return mixOklch(resolveColor(aText), resolveColor(bText), wa);
+    return mixOklab(resolveColor(aText), resolveColor(bText), wa);
   }
   const varMatch = /^var\(\s*(--[\w-]+)\s*\)$/.exec(t);
   if (varMatch) {
@@ -218,14 +237,14 @@ function downlevelValue(value) {
     if (start < 0) break;
     const { inner, end } = sliceCall(out, start);
     const parts = inner.split(",").map((x) => x.trim());
-    if (!/^in\s+oklch$/i.test(parts.shift() ?? "")) throw new Error(`只支持 in oklch：${value}`);
+    if (!/^in\s+oklab$/i.test(parts.shift() ?? "")) throw new Error(`只支持 in oklab（直角插值）：${value}`);
     const [aText, bText] = parts;
     const weightOf = (x) => {
       const m = /([\d.]+)%$/.exec(x ?? "");
       return m ? Number(m[1]) : null;
     };
     const wa = weightOf(aText) ?? (weightOf(bText) === null ? 50 : 100 - weightOf(bText));
-    const mixed = toSrgb(mixOklch(resolveColor(aText), resolveColor(bText), wa));
+    const mixed = toSrgb(mixOklab(resolveColor(aText), resolveColor(bText), wa));
     delta = Math.max(delta, mixed.delta);
     out = out.slice(0, start) + mixed.text + out.slice(end + 1);
   }
@@ -427,7 +446,10 @@ const hiFiBlock = [
   "/* 规则级的 color-mix 为什么也在这里：老引擎**能解析**它（CSSOM 里留得住），失败发生在**计算期**，",
   "   按规范属于 invalid at computed-value time → 结果是 unset，**不会回退到前一条声明**",
   "   （实测 .toast / .scrim 的成对回退因此仍是透明）。放进 @supports 才会被整块跳过。",
-  "   纯 oklch() 不同：它在解析期就非法、那条声明被丢掉、前一条生效，所以那些用成对声明就够。 */",
+  "   纯 oklch() 不同：它在解析期就非法、那条声明被丢掉、前一条生效，所以那些用成对声明就够。",
+  "   另一条硬规矩：这块里的 color-mix() **一律 `in oklab`（直角插值）**，不用 `in oklch` ——",
+  "   Chromium 111–114 的极坐标色相插值会把 transparent 的色相当 0 绕行，蓝色底纹会被染成粉色",
+  "   （真机 Huawei WebView 114.0.5.302 实测）；与 transparent / black 混时两者等价，见 gen 脚本注释。 */",
   SUPPORTS_COND + " {",
   "  :root {",
   ...[...hiFiTokens, ...extraCustomProps].join("\n").split("\n"),

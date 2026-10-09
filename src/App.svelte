@@ -8,14 +8,15 @@
   import { fly } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
   import { listen } from '@tauri-apps/api/event';
-  import { getDevices, loadDevices, isLocalOnline, noteLocalOnline, deviceDisplayName, peerDisplayName, saveDeviceRemark } from '$lib/stores/devices.svelte';
+  import { open as openDialog } from '@tauri-apps/plugin-dialog';
+  import { getDevices, loadDevices, isLocalOnline, noteLocalOnline, deviceDisplayName, peerDisplayName, saveDeviceRemark, unicastBlockedTip } from '$lib/stores/devices.svelte';
   import { getServerPort, setServerPort, loadShares, addShare, removeShare, getShares } from '$lib/stores/shares.svelte';
   import { loadSettings, getSettings } from '$lib/stores/settings.svelte';
   import { getPeerSharesState, loadPeerShares } from '$lib/stores/peers.svelte';
   import { getBcStatus, loadBcStatus, setBcSide, clearSide, compare } from '$lib/stores/bc.svelte';
   import * as chat from '$lib/stores/chat.svelte';
-  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, openPath, fetchTree, peerTree } from '$lib/api';
-  import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape } from '$lib/types';
+  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree } from '$lib/api';
+  import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem } from '$lib/types';
   import { shareMeta } from '$lib/types';
   import { planExpansion, planCollapse, planDock, planRectDock, spinForDock, type BadgeSpin, type DockAxis, type DockPlan, type ScreenRect } from '$lib/orbLayout';
   import { circleLayout, collapsedLayout, ORB_SIZE, RECT_CARD_W, RECT_DOCK_W } from '$lib/orbShape';
@@ -84,6 +85,31 @@
   // 圆角矩形悬浮框的贴边方向（-1 贴左 / 1 贴右 / 0 未贴）：收起态的竖条钉在悬浮框哪一端、
   // 两枚角标落在竖条的哪两条边、卡与竖条谁渐显，全由它定。是 `badgeSpin` 在那一档的对应物。
   let rectDock = $state<DockAxis>(0);
+  // 右键菜单：开在哪（窗口 CSS px）、开的是什么（`kind` 决定菜单画哪一组），外加一个"这次是
+  // 折叠态卡片上开的那一份"的标记（`orb`，见 `orbCtxOpen`）。开与关只有两条路：面板里的各行
+  // 派 `od:ctx` 事件（见 `handleCtx`），卡片那一档直接调 `openRectCtx`。
+  type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer' | 'chat' | 'convo'; el?: HTMLElement; shareId?: string; path?: string; isDir?: boolean; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; name?: string; chatId?: string; chatFull?: string; chatSel?: string; convoKey?: string; convoPeerId?: string; convoThread?: boolean; convoBc?: boolean; convoBrowse?: boolean; orb?: boolean; placed?: boolean; menuW?: number; menuH?: number };
+  let ctxState = $state<CtxState | null>(null);
+  /**
+   * 折叠态卡片上那个右键菜单是不是开着（`ctxState.orb`，见 `openRectCtx`）。
+   *
+   * 它只有一个用处，且只在**贴边收起**那一档：**保持 `reveal`**（指针从卡片挪到菜单上时，
+   * 卡片不许缩回竖条 —— 缩回去的同一刻可点区域也只剩那条竖条，菜单当场变得点不着，见
+   * `collapsedHitRects`）。未贴边时卡片本来就一直在，这个标记等于没作用。
+   */
+  let orbCtxOpen = $derived(ctxState?.orb === true);
+  /**
+   * 菜单那一档的**窗口账**：菜单要长在指针的右下（右边不够就左下），而折叠态窗口只有 236×162 ——
+   * 只能先把窗口撑大（见 `placeOrbMenu`）。`grown` = 撑过（关菜单时要缩回去）；`shift` = 窗口原点
+   * 反向挪过多少（CSS px）：窗口内的东西要整体平移这个量才在原地不动，值交给 `--menu-dx/dy`
+   * （`.orb-stage.menu` 的 transform，见 main.css）。菜单**不在** stage 里，坐标不受它影响。
+   */
+  let orbMenuGeo = $state<{ grown: boolean; shift: { x: number; y: number } }>({ grown: false, shift: { x: 0, y: 0 } });
+  /** 撑窗那一两帧里卡片先不出镜：原点在挪，画面上会跳（见 main.css 的 `.menu-busy`）。 */
+  let orbMenuBusy = $state(false);
+  /** 缩窗那一趟还在飞（窗口还没回到折叠态那一档）：新一次落点得先等它 —— 两次 `SetWindowPos`
+   *  同时在飞，后到的说了算，窗口会停在错的那一档。 */
+  let orbMenuRestoring: Promise<void> | null = null;
   // 贴边态"悬停显示"的两个开关（`--orb-zone` 的 `.reveal`，见 `setDockOrb` 与 markup）：
   // `zoneHot` = 指针在热区内、且这次进入允许显示；`zoneHold` = 落位之后压住的那一次。
   let zoneHot = $state(false);
@@ -103,8 +129,13 @@
    * 但**不展开面板**：展开要在拖动模态循环中途 `SetWindowPos`，落点目标（`IDropTarget`）在
    * 拖动期间被搬走/改尺寸，抖动与丢目标都是自找的；而面板本身没有落点语义（窗口内任意处落下
    * 都是同一条 `addShares`），拖放不需要它。
+   *
+   * 第三路是**卡片上开着的右键菜单**（`orbCtxOpen`）：菜单画在卡片外面（窗口坐标，可能压着
+   * 卡片右下那圈余量），指针从卡片挪到菜单上那一刻 `pointerleave` 就把这一档关掉了 ——
+   * 卡片缩回竖条的同时可点区域也只剩那条竖条，菜单落在那块「不吃了」的区域里，点下去穿到桌面。
+   * 菜单开着 = 这次交互还在悬浮体上，所以它也算一档"呼出"。
    */
-  let reveal = $derived(zoneHot || dragging);
+  let reveal = $derived(zoneHot || dragging || orbCtxOpen);
   // 折叠态贴边方向（最近一次落位判定的结果，`{0,0}` = 未贴边）。只有展开时用一次：
   // 贴边那一档的中心点多半在屏幕外（悬浮体大半被推出去了），展开要改成"窗口贴住工作区边"
   // —— 见 `expand` 里给 `planExpansion` 的 margin。
@@ -246,9 +277,6 @@
   // Toast messages
   let toasts = $state<{ id: number; msg: string; leaving: boolean }[]>([]);
   let toastId = $state(0);
-  // Context menu
-  type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer' | 'chat' | 'convo'; el?: HTMLElement; shareId?: string; path?: string; isDir?: boolean; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; name?: string; chatId?: string; chatFull?: string; chatSel?: string; convoKey?: string; convoPeerId?: string; convoThread?: boolean; convoBc?: boolean; convoBrowse?: boolean };
-  let ctxState = $state<CtxState | null>(null);
 
   let connectedCount = $derived(getDevices().filter(d => d.connected).length);
   // 铃铛的角标：面板右下角那组气泡里还有几件事（通知 + 在途推送）。
@@ -330,6 +358,16 @@
       ? `本机有 ${localAddrs.all.length} 个内网地址（点一下复制第一个）：\n${localAddrs.all.join('\n')}`
       : '点一下复制「IP:端口」',
   );
+
+  /** 左下角「端口 · IP」的地址：后端枚举，本机在**启动**与**网卡变化**时各拉一次
+   *  （`local://addresses` 只在真的变了的时候发，见 lib.rs 那条 5s 网卡巡检）。 */
+  async function refreshLocalAddrs() {
+    try {
+      localAddrs = await localAddresses();
+    } catch (e) {
+      console.error('本机内网地址获取失败:', e);
+    }
+  }
 
   /** 复制「IP:端口」—— 手动添加设备（F-11）时直接粘到对面就行。 */
   function copyAddr() {
@@ -568,7 +606,9 @@
   /**
    * 右键菜单自己的盒子（窗口坐标，CSS px）。菜单是 `position: fixed`，而夹取按**窗口**算
    * （`ctxPlacement` 的 `bounds` = 视口，见 ContextMenu.svelte）—— 所以它可能压在那圈阴影余量上，
-   * 报可点区域时得把它并进来，否则探进余量的那一截点不着（点下去穿到桌面去了）。
+   * 报可点区域时得把它并进来，否则探进余量的那一截点不着（点下去穿到桌面去了）。两档都要并：
+   * 面板里那一份（余量在面板四周）与**折叠态卡片上那一份**（窗口只有 236×162，菜单很容易探出
+   * 卡片本身那几块）。
    *
    * 量 `offset*` 而不是 `getBoundingClientRect()`：菜单出现时带 0.12s 的 `scale(0.96)`
    * （转心在左上角），实时盒子会是缩小后的那一格；`offset*` 就是 `ctxPlacement` 写下的定位值与
@@ -576,6 +616,14 @@
    */
   function ctxMenuRects(): ScreenRect[] {
     if (!ctxState) return [];
+    // 折叠态那一份：落点与尺寸都是 App 自己算出来的（`placeOrbMenu`），直接用，**不去 DOM 里读** ——
+    // action 把新的 left/top 写进元素与这个 `$effect` 跑在同一批更新里，读 DOM 会读到**上一格**
+    // （菜单还没搬过去，报出去的却是旧位置：那一小段屏幕就点不着了）。还没定好落点时它不可见，
+    // 也就没有要吃指针的盒子。
+    if (ctxState.orb) {
+      const w = ctxState.menuW ?? 0, h = ctxState.menuH ?? 0;
+      return ctxState.placed && w > 0 && h > 0 ? [{ x: ctxState.x, y: ctxState.y, w, h }] : [];
+    }
     const el = document.querySelector<HTMLElement>('[data-od-id="ctx-menu"]');
     return el ? [{ x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight }] : [];
   }
@@ -599,12 +647,17 @@
    * hover 丢掉，滑回来的悬浮体又收回去，一进一出抖个不停。并集里两块都不动，只有悬浮体在中间滑。
    */
   function collapsedHitRects(): ScreenRect[] {
+    // 菜单撑窗那一档：窗口原点挪过，窗口内的东西整体反向平移过（`.orb-stage` 的 `--menu-dx/dy`）——
+    // 这里报的是**窗口**坐标，所以几块都得跟着挪；不挪的话卡片画在一处、吃点击的却是另一处
+    // （整张卡都不响应，点下去穿到桌面）。关着菜单时 `d` 是零，同一条式子照走。
+    const d = orbMenuGeo.shift;
     if (dockAxis.x !== 0 || dockAxis.y !== 0) {
-      return reveal
-        ? [{ ...orbZone }, bodyRect({ x: layout.widget.x, y: layout.widget.y })]
-        : [{ ...orbZone }];
+      const card = bodyRect({ x: layout.widget.x, y: layout.widget.y });
+      const rects = reveal ? [{ ...orbZone }, card] : [{ ...orbZone }];
+      return rects.map((r) => ({ ...r, x: r.x + d.x, y: r.y + d.y }));
     }
-    return [bodyRect(orbOffset)];
+    const body = bodyRect(orbOffset);
+    return [{ x: body.x + d.x, y: body.y + d.y, w: body.w, h: body.h }];
   }
 
   /** 悬浮体**本体**在窗口里占的那一块（`at` = 它在窗口内的左上角）：
@@ -623,7 +676,9 @@
    * - 面板期（含切窗口那一小段 `holdOrb`：面板还画着、窗口还没缩回去）：面板的可视盒，外加开着的
    *   右键菜单（见 `ctxMenuRects`）。面板里的对话框/设置/选择框都挂在面板里，被它的
    *   `overflow: hidden` 裁在面板内，不用另算。
-   * - 折叠期：见 `collapsedHitRects`。
+   * - 折叠期：见 `collapsedHitRects`，**同样并上开着的右键菜单** —— 卡片那一档的菜单可能压着
+   *   `collapsedHitRects` 那几块之外的余量（菜单比卡片宽/靠下时都会），不并进来，探出卡片的那一截
+   *   点下去就穿到桌面了。
    *
    * 这个 `$effect` 会在它读到的每一个状态变化时重跑（形态/偏移/贴边方向/页数/展开/右键菜单…），
    * 所以区域是**动态**的：点列随设备增减出现或消失，那一列的可点性当场跟着变；贴边那一档收起时
@@ -632,8 +687,28 @@
   $effect(() => {
     const rects: ScreenRect[] = expanded || holdOrb
       ? [{ x: PANEL_SLACK, y: PANEL_SLACK, w: PANEL.w, h: PANEL.h }, ...ctxMenuRects()]
-      : collapsedHitRects();
+      : [...collapsedHitRects(), ...ctxMenuRects()];
     void orbSetHitRegion(rects).catch((e) => console.error('设置可点区域失败:', e));
+  });
+
+  /**
+   * 折叠态菜单的落点：菜单先渲染出来（`pending`，不可见）→ 量出它多大 → 撑窗 + 定位 →
+   * 放开显形（`placeOrbMenu`）。这个 `$effect` 读的是 `ctxState`，所以它跑在 DOM 更新之后 ——
+   * 那一刻菜单已经在文档里，量得到。
+   */
+  $effect(() => {
+    const c = ctxState;
+    if (!c?.orb || c.placed !== false) return;
+    void placeOrbMenu(c);
+  });
+
+  /**
+   * 菜单关掉（或被面板那一份顶掉）之后，窗口缩回折叠态那一档。读 `orbCtxOpen` 即可：
+   * 它一变就说明这一档结束了，而 `restoreOrbWindow` 自己会看 `grown` 决定要不要动手。
+   */
+  $effect(() => {
+    if (orbCtxOpen) return;
+    void restoreOrbWindow();
   });
 
   /**
@@ -666,6 +741,137 @@
   }
 
   /**
+   * 右键卡上的一格：与面板里右键一个共享项**同一个菜单、同一套处理**（`kind: 'share'`，
+   * 于是「打开所在文件夹 / 复制共享路径 / 移除共享项」全落到已有的那几个 `ctx*` 上）。
+   *
+   * **只有本机页最外那一层**才长菜单：钻进去之后列的是共享项**里面**的东西（那是路径，
+   * 不是登记项 —— 没有"移除"这回事），设备页列的是别人的共享项（本机删不掉它）。两处右键
+   * 都不做事，与卡片上"单击不做事"同一套克制。
+   *
+   * `orb: true` 是"这次开在折叠态卡片上"的标记，它带来三件事：`.reveal` 那一档要多算一路
+   * （`orbCtxOpen`）、可点区域要把菜单盒并进来、以及**落点由 `placeOrbMenu` 现算**（先撑窗，
+   * 再把菜单摆到指针的右下/左下）—— 所以这里先给 `placed: false`：菜单先渲染成不可见，
+   * 等落点定好再显形（否则用户会看到它先盖在卡片上、再跳到旁边去）。
+   */
+  function openRectCtx(pageIdx: number, slotIdx: number, x: number, y: number) {
+    const page = rectPages[pageIdx];
+    const slot = page?.items[slotIdx];
+    if (!page || page.kind !== 'local' || page.dir || !slot) return;
+    ctxState = { x, y, kind: 'share', shareId: slot.id, name: slot.name, orb: true, placed: false };
+  }
+
+  /** 菜单与屏幕边留的余量（CSS px）：与 `ctxPlacement` 的 `MARGIN` 同一个数。 */
+  const MENU_MARGIN = 8;
+  /** 撑窗时额外给菜单阴影留的余量（CSS px）：`--shadow` 的可见半径左右 12 / 上 7 / 下 17，
+   *  取 16 —— 正好贴着窗口边的话阴影会被硬裁成一条切线。 */
+  const MENU_SLACK = 16;
+
+  /**
+   * 折叠态那份菜单的**落点与撑窗**：指针的右下（右边的屏幕位置不够就翻到指针左侧，下边同理
+   * 翻上去），再按工作区夹一次；随后**把折叠态窗口撑到装得下这一枚菜单**。
+   *
+   * 为什么要撑窗：菜单是 `position: fixed`，超出窗口的部分会被窗口边硬裁 —— 夹在那 236×162 里
+   * 就只能压着卡片本身（用户看到的是"菜单盖住了悬浮框"）。撑出来的那块是**透明**的，也不吃点击
+   * （可点区域只报卡片与菜单，见 `collapsedHitRects` / `ctxMenuRects`），所以它只是"菜单够得着
+   * 的地方"，不是第二件看得见的东西。
+   *
+   * 窗口只长大、不缩小：新矩形 = **当前窗口** ∪ 菜单盒，于是卡片、分页点、阴影余量一个都不会
+   * 被挤出窗口。原点则**尽量不动**（右下展开那一档根本不动）—— 只有翻到左侧那一档需要把原点
+   * 往左挪，而窗口内坐标得反向平移同样的量才在原地不动（`.orb-stage` 的 `--menu-dx/dy`，
+   * 见 main.css）；菜单挂在 stage 外面，坐标不受那次平移影响，所以它按**真窗口坐标**摆就是了。
+   *
+   * 原点要挪的那一两帧里卡片先不出镜（`orbMenuBusy`）：窗口已经到新位置、内容还是旧的窗口内
+   * 坐标，不藏就是"卡片横跳一次"。那几帧里菜单也还没显形，所以整扇窗口是空的 —— 换位置看不见。
+   */
+  async function placeOrbMenu(c: CtxState) {
+    const el = document.querySelector<HTMLElement>('[data-od-id="ctx-menu"]');
+    if (!el) return;                       // 菜单已经不在了（刚被关掉）：无事可做
+    const mw = el.offsetWidth, mh = el.offsetHeight;   // 尺寸随字号/文本缩放变，量出来才算数
+    if (orbMenuRestoring) await orbMenuRestoring;      // 上一趟缩窗还没落地：等它，否则两次 SetWindowPos 打架
+    try {
+      const sf = await appWindow.scaleFactor();
+      const pos = await appWindow.outerPosition();
+      const work = (await orbScreenMetrics()).workArea;
+      const m = Math.round(MENU_MARGIN * sf);
+      const sl = Math.round(MENU_SLACK * sf);
+      const pw = Math.round(mw * sf), ph = Math.round(mh * sf);
+      const cw = Math.round(window.innerWidth * sf), ch = Math.round(window.innerHeight * sf);
+      // 指针在**屏幕**上的位置（`c.x/y` 是右键那一刻报上来的窗口内坐标）
+      const px = pos.x + Math.round(c.x * sf);
+      const py = pos.y + Math.round(c.y * sf);
+      let mx = px + pw + m > work.x + work.w ? px - pw : px;      // 右边装不下 → 翻到指针左侧
+      let my = py + ph + m > work.y + work.h ? py - ph : py;      // 下边装不下 → 翻到指针上边
+      mx = Math.max(work.x + m, Math.min(mx, work.x + work.w - pw - m));   // 翻过去还越界（工作区比菜单还小）：夹住
+      my = Math.max(work.y + m, Math.min(my, work.y + work.h - ph - m));
+      // 窗口还要给菜单的**阴影**留出可见半径（`--shadow` 左右 12 / 上 7 / 下 17）：正好贴着窗口边
+      // 的话，阴影会被窗口边硬裁成一条切线。这块多出来的透明区域不吃点击（可点区域只报菜单盒本身）。
+      const rect = {
+        x: Math.min(mx - sl, pos.x),
+        y: Math.min(my - sl, pos.y),
+        w: Math.max(mx + pw + sl, pos.x + cw) - Math.min(mx - sl, pos.x),
+        h: Math.max(my + ph + sl, pos.y + ch) - Math.min(my - sl, pos.y),
+      };
+      const dx = (rect.x - pos.x) / sf, dy = (rect.y - pos.y) / sf;   // 原点挪了多少（往左/上是负）
+      if (rect.x !== pos.x || rect.y !== pos.y || rect.w !== cw || rect.h !== ch) {
+        orbMenuBusy = dx !== 0 || dy !== 0;    // 只往右下长时画面上本来就看不出来，不必藏
+        await orbSetRect(rect);
+        // **累加**：右键点另一格时窗口多半已经撑过一次（原点也挪过），这次挪的是相对**当前**原点的
+        // 增量 —— 把它加到已有的那一段上，不然 stage 的平移会被清零，卡片当场横跳一段。
+        orbMenuGeo = { grown: true, shift: { x: orbMenuGeo.shift.x - dx, y: orbMenuGeo.shift.y - dy } };
+      }
+      // 落点换算到（新的）窗口坐标里：窗口原点就是 `rect.x/y`，菜单不受 stage 那个平移影响。
+      // 这里**不等** `waitForViewport`：菜单是 `pinned` 的（`ctxPlacement` 一个像素都不动），
+      // 落点与它无关；而那个等待是数 rAF 的 —— 窗口被遮住/后台时 rAF 会被节流，菜单就迟迟不显形。
+      const left = (mx - rect.x) / sf, top = (my - rect.y) / sf;
+      if (ctxState?.orb) {
+        ctxState.x = left;
+        ctxState.y = top;
+        ctxState.menuW = mw;
+        ctxState.menuH = mh;
+        ctxState.placed = true;
+      }
+    } catch (e) {
+      console.error('右键菜单落点/撑窗失败:', e);
+      if (ctxState?.orb) ctxState.placed = true;   // 撑不动就按现状显形（夹在窗口里，总比不显示强）
+    } finally {
+      orbMenuBusy = false;
+    }
+  }
+
+  /**
+   * 菜单关掉之后，把窗口缩回折叠态该有的那一档：尺寸回到布局尺寸、原点回到"没挪过"的位置。
+   *
+   * 两个一起改，卡片在屏幕上原地不动（原点回到基础位 ⇔ 窗口内坐标去掉那次平移）。`shift` 要等
+   * 窗口真的挪回去之后再清 —— 先清的话，卡片会带着还没归位的窗口先跳一下。
+   */
+  async function restoreOrbWindow() {
+    if (orbMenuRestoring) return orbMenuRestoring;
+    if (!orbMenuGeo.grown) return;
+    const shift = orbMenuGeo.shift;
+    orbMenuRestoring = (async () => {
+      try {
+        // 面板接管了几何（展开那一趟自己会把窗口摆正）时不用再缩 —— `expand` 已经把账结清了
+        if (!(expanded || holdOrb || opening)) {
+          const sf = await appWindow.scaleFactor();
+          const pos = await appWindow.outerPosition();
+          await orbSetRect({
+            x: pos.x + Math.round(shift.x * sf),
+            y: pos.y + Math.round(shift.y * sf),
+            w: Math.round(layout.size.w * sf),
+            h: Math.round(layout.size.h * sf),
+          });
+        }
+      } catch (e) {
+        console.error('缩回折叠态窗口失败:', e);
+      } finally {
+        orbMenuGeo = { grown: false, shift: { x: 0, y: 0 } };
+        orbMenuRestoring = null;
+      }
+    })();
+    await orbMenuRestoring;
+  }
+
+  /**
    * 双击一个文件 = 用系统默认程序打开它。
    *
    * 本机项**直接开原文件**（零拷贝：文件本来就在这台机器上，开一份副本只会让人对着两份文件
@@ -681,6 +887,8 @@
         return;
       }
       const copy = await downloadFromPeer(page.id, slot.id, slot.path, slot.name);
+      // 「每次询问」下用户在保存框里取消：什么都没发生，别去打开一个不存在的路径。
+      if (!copy) return;
       await openPath(copy);
       toast(`已下载「${slot.name}」的副本并打开`);
     } catch (e) {
@@ -700,15 +908,23 @@
     if (opening || expanded) return;
     opening = true;
     holdOrb = true;
+    // 面板要长出来了，折叠态那份菜单（如果开着）当场作废：窗口马上从 236×162 变成面板，
+    // 菜单还按旧坐标飘在卡片原位就成了面板上的一块残影。菜单那一档的撑窗账也当场结清
+    // （下面算参考点要用它，算完就得清零 —— 平移留在 stage 上会把面板也画歪；卡片此刻已被
+    // `holdOrb` 藏住，所以这一步看得见的是"面板摆正"，不是"卡片跳一下"）。
+    ctxState = null;
+    const menuShift = orbMenuGeo.shift;
+    orbMenuGeo = { grown: false, shift: { x: 0, y: 0 } };
     try {
       const sf = await appWindow.scaleFactor();
       const pos = await appWindow.outerPosition();
       // 参考点 = 悬浮体本体中心此刻在屏幕上的位置 = 窗口左上角 + 它在窗口内的偏移 + 半个本体。
       // 偏移用 `orbOffset`（贴边收起时是贴边那一档的偏移 —— 悬浮体大半在窗口外，中心也就在
-      // 屏幕外一点；下面按贴边档给 margin 0，让面板贴住屏幕边）。
+      // 屏幕外一点；下面按贴边档给 margin 0，让面板贴住屏幕边）。`menuShift` 那一段必须算进去：
+      // 菜单撑窗时窗口原点挪过、窗口内坐标反向平移过，`orbOffset` 本身不变。
       const center = {
-        x: pos.x + Math.round((orbOffset.x + layout.body.w / 2) * sf),
-        y: pos.y + Math.round((orbOffset.y + layout.body.h / 2) * sf),
+        x: pos.x + Math.round((orbOffset.x + menuShift.x + layout.body.w / 2) * sf),
+        y: pos.y + Math.round((orbOffset.y + menuShift.y + layout.body.h / 2) * sf),
       };
       const metrics = await orbScreenMetrics();
       const plan = planExpansion({
@@ -912,6 +1128,9 @@
    */
   async function beginOrbDrag(info: OrbDragInfo) {
     // 起拖当场把球放回「完整可见」位（内缩 + 角标不转），热区也收回球自己身上。
+    // 右键菜单也当场作废：它是按**窗口**坐标画在那一刻的位置上的（折叠态那一份的锚点就是
+    // 卡片上被右键的那一格），窗口一被拖走，菜单要么跟着卡片飘、要么指着一个已经不存在的锚点 ——
+    // 与"收起面板时菜单作废"同一条口径（见 `collapse`）。
     //
     // 拖动期间球是跟着窗口（指针）走的，而球偏移只有落位判定（`settleDrag`）才会更新 ——
     // 上一次贴边收起的偏移（`--orb-x` = 69 那种）会一直挂在球上：指针一旦离开球，悬停那层
@@ -922,6 +1141,7 @@
     // 窗口对齐（`orbDragStart` → Rust 的 `drag_align`）也是按「球在完整位」算的：按下点本就
     // 落在完整位上的球上，偏移一清，球才真钉在指针下。
     resetOrbDom();
+    ctxState = null;
     try {
       await orbDragStart(info.pressX, info.pressY);
     } catch (e) {
@@ -962,6 +1182,9 @@
    */
   async function settleDrag() {
     if (settling || holdOrb || opening) return;
+    // 菜单撑窗期间窗口的几何是菜单说了算（那一趟 `orbSetRect` 自己也会触发一次 `onMoved`）：
+    // 这一档不能按"折叠态窗口"去重判落位 —— 撑出来的那一块会被当成用户拖出来的位置。
+    if (orbMenuGeo.grown) return;
     settling = true;
     const from = expanded;
     try {
@@ -1602,13 +1825,20 @@
       await acceptNotice(notice);
       return;
     }
+    // 通知不在了（用户手动清过）也走同一套：该问目录就问，取消就拒绝。
+    let ok = false;
     try {
-      await acceptPush(inviteId);
-      chat.noteInviteAccepted(inviteId);
+      ok = await acceptInviteWithAsk(inviteId);
     } catch (e) {
       toast(String(e));
       chat.noteInviteDone(inviteId, 'failed');
+      return;
     }
+    if (!ok) {
+      await chatRejectInvite(inviteId);
+      return;
+    }
+    chat.noteInviteAccepted(inviteId);
   }
 
   async function chatRejectInvite(inviteId: string) {
@@ -1690,13 +1920,45 @@
     return n.error ?? '接收失败';
   }
 
-  /** 同意接收：卡片立刻转成"正在接收"，进度随后由 push://progress 推进。 */
+  /**
+   * 接收一条**需要同意**的推送（未绑定设备那条）：设置了「每次询问」就先问落盘目录。
+   *
+   * - 目录选择框打开即设置里的下载目录（`defaultPath`），省掉一层层点；
+   * - 框里取消 = **拒绝**这次接收（返回 false）—— 发送方那边正挂着等回执，不能让它干等到
+   *   60 秒超时；调用方接着走 `rejectNotice` / `chatRejectInvite` 把话带回去；
+   * - 「直接下载」那一档照旧不问，`root` 不带 → 后端落在设置里的下载目录。
+   *
+   * **已配对设备那条路根本不会走到这里**：它免同意自动收，界面上连「接收」按钮都没有。
+   */
+  async function acceptInviteWithAsk(inviteId: string): Promise<boolean> {
+    const s = getSettings();
+    let root: string | null = null;
+    if (s?.downloadMode === 'AskEachTime') {
+      const picked = await openDialog({
+        title: '选择接收位置',
+        directory: true,
+        multiple: false,
+        defaultPath: s.downloadDir || undefined,
+      });
+      const dir = Array.isArray(picked) ? picked[0] : picked;
+      if (!dir) return false;
+      root = dir;
+    }
+    await acceptPush(inviteId, root ?? undefined);
+    return true;
+  }
+
   async function acceptNotice(n: PushNotice) {
+    let ok = false;
     try {
-      await acceptPush(n.inviteId);
+      ok = await acceptInviteWithAsk(n.inviteId);
     } catch (e) {
       toast(String(e));
       dropNotice(n.inviteId);
+      return;
+    }
+    if (!ok) {
+      await rejectNotice(n);
       return;
     }
     notices = notices.map((x) => (x.inviteId === n.inviteId ? { ...x, kind: 'receiving' } : x));
@@ -1797,7 +2059,14 @@
   }
 
   function openPair(device: PeerDevice | null) {
-    if (device) { void issuePairCode(device.id, deviceDisplayName(device)); return; }
+    if (device) {
+      // 发起配对 = 发起与这一台的连接：它此刻"看得见却直连不通"时，那句话在这里说
+      // （配对码由本机持有、对方拨进来，拨不动这张网就是白等）。设备行本身不带这个状态。
+      const tip = unicastBlockedTip(device);
+      if (tip) toast(tip);
+      void issuePairCode(device.id, deviceDisplayName(device));
+      return;
+    }
     // 还没选中设备：先手动添加（F-11），探测到身份后直接进入配对
     stopPairTimer();
     pairState = {
@@ -1851,7 +2120,10 @@
       toast(`已与「${ps.peerName ?? '设备'}」配对成功（点「连接」建立长连接）`);
     } catch (e) {
       if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
-      toast('配对失败，请核对配对码');
+      // 拨过去就没通的：那一台此刻"看得见却直连不通"时，这句解释比"请核对配对码"有用
+      // （码很可能是对的，是这张网不让两个客户端互相说话）。
+      const tip = unicastBlockedTip(getDevices().find((d) => d.id === ps.peerId));
+      toast(tip ?? '配对失败，请核对配对码');
     } finally {
       pairConfirming = false;
     }
@@ -1879,6 +2151,9 @@
       inviteId = await pairInvite(ps.peerId);
     } catch (e) {
       if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
+      // 邀请就是一次到对端的 POST：投不出去时，这一台是不是"看得见却直连不通"要说清楚。
+      const tip = unicastBlockedTip(getDevices().find((d) => d.id === ps.peerId));
+      if (tip) toast(tip);
       return;
     }
     const name = ps.peerName ?? '设备';
@@ -1914,16 +2189,68 @@
 
   function hideCtx() { ctxState = null; }
 
-  async function ctxDownload() {
-    const c = ctxState;
-    if (!c) return;
-    toast('已开始下载到下载目录');
-    hideCtx();
+  /** 本机共享项在磁盘上的真实位置（绝对路径 + 是不是目录）。
+ *
+ *  树节点传的是**共享项内**的相对路径（用 `/` 分隔，见 `TreeNode` 的 `ownPath`），共享项根
+ *  那一档没有 `path`；把两者拼起来才是磁盘上的那个东西。拼法与后端一致（`/file` 也是
+ *  `share_root.join(rel)`）。 */
+  function localShareItem(c: CtxState): { abs: string; isDir: boolean; share: ShareItem } | null {
+    if (c.kind !== 'share' || !c.shareId) return null;
+    const share = getShares().find((s) => s.id === c.shareId);
+    if (!share) return null;
+    const rel = (c.path ?? '').replace(/\\/g, '/');
+    const root = share.path.replace(/[\\/]+$/, '');
+    return {
+      abs: rel ? `${root}/${rel}` : share.path,
+      // 根那一档看共享项自己的元数据，树节点看它自己的。
+      isDir: rel ? c.isDir === true : share.isDir,
+      share,
+    };
   }
 
-  async function ctxOpen() {
+  /** 一个路径的所在文件夹（两种分隔符都要认）。 */
+  function parentDir(path: string): string {
+    const cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+    return cut > 0 ? path.slice(0, cut) : path;
+  }
+
+  /** 「下载到本地」（本机共享项）：真的复制进下载目录，落盘名与位置都由后端给。
+   *
+   *  **目录项不复制**：本机目录已经在磁盘上，复制一份整棵树是另一个语义（而且 S-02 的
+   *  "选位置"是文件保存框，对目录无从下手）。这里如实说明并把用户引到「打开所在文件夹」，
+   *  而不是像从前那样报一句"已开始下载"却什么都不做。 */
+  async function ctxDownload() {
+    const c = ctxState;
     hideCtx();
-    toast('已在访达中打开所在文件夹');
+    if (!c || c.kind !== 'share' || !c.shareId) return;
+    const item = localShareItem(c);
+    if (item?.isDir) {
+      toast('本机目录不复制到下载目录（它已经在磁盘上）——用「打开所在文件夹」查看');
+      return;
+    }
+    try {
+      const saved = await downloadFile(c.shareId, c.path ?? '');
+      // 保存框里取消 = 不落盘：静默收场（不是失败，所以不弹提示）。
+      if (!saved) return;
+      toast(`已下载到 ${saved}`);
+    } catch (e) {
+      toast(`下载失败：${e}`);
+    }
+  }
+
+  /** 「打开所在文件夹」：目录直接打开它自己，文件打开它所在的文件夹。
+   *  走系统的默认打开方式（`open_path`），失败时报错而不是假装成功。 */
+  async function ctxOpen() {
+    const c = ctxState;
+    hideCtx();
+    const item = c ? localShareItem(c) : null;
+    if (!item) return;
+    const target = item.isDir ? item.abs : parentDir(item.abs);
+    try {
+      await openPath(target);
+    } catch (e) {
+      toast(`打开失败：${e}`);
+    }
   }
 
   /** 对端文件下载：走后端命令（token 取凭据库、落盘按下载目录设置都在 Rust 侧）。 */
@@ -1933,15 +2260,27 @@
     if (c?.kind !== 'peer' || !c.peerId || !c.shareId) return;
     try {
       const saved = await downloadFromPeer(c.peerId, c.shareId, c.path ?? '', c.name);
+      // 保存框里取消 = 不落盘（与「本机共享项下载」同一个口径）。
+      if (!saved) return;
       toast(`已下载到 ${saved}`);
     } catch (e) {
       toast(`下载失败：${e}`);
     }
   }
 
-  function ctxCopy() {
+  /** 「复制共享路径」：真的写剪贴板（从前只弹一句"已复制"，粘出来还是旧内容）。
+   *  复制的是这项在磁盘上的**绝对路径** —— 拿它喂脚本/工具链才有用。 */
+  async function ctxCopy() {
+    const c = ctxState;
     hideCtx();
-    toast('已复制共享路径');
+    const item = c ? localShareItem(c) : null;
+    if (!item) return;
+    try {
+      await navigator.clipboard.writeText(item.abs);
+      toast('已复制共享路径');
+    } catch (e) {
+      toast(`复制失败：${e}`);
+    }
   }
 
   async function ctxRemove() {
@@ -1959,7 +2298,9 @@
     if (!deviceId) return;
     try {
       await connectPeer(deviceId);
-      toast('正在建立长连接，拖入文件将自动广播');
+      // 与行内那颗「长连接」同一句话（`DeviceTab.setLink`）：拨之前先看这一台此刻通不通。
+      const tip = unicastBlockedTip(getDevices().find((d) => d.id === deviceId));
+      toast(tip ?? '正在建立长连接，拖入文件将自动广播');
     } catch (e) {
       toast(`建立长连接失败：${e}`);
     }
@@ -2102,9 +2443,9 @@
           setServerPort(port);
         }
         await loadShares();
-        // 左下角「端口 · 本机 IP」：内网地址启动时取一次 —— 换网/插网线属于罕见情形，
-        // 重启 App 就刷新了，不值得为它在界面上常驻一个网卡监听。
-        localAddrs = await localAddresses();
+        // 左下角「端口 · 本机 IP」：启动时取一次，之后只在**网卡真的变了**的时候
+        // 由 `local://addresses` 叫一次（见下面的监听）。
+        await refreshLocalAddrs();
       } catch (e) { console.error('Init failed:', e); }
     })();
 
@@ -2258,6 +2599,12 @@
       noteLocalOnline(ev.payload.online);
     });
 
+    // 本机网卡地址变了（插网线、开/关热点、切 Wi-Fi、VPN 起来）：左下角「端口 · IP」
+    // 重拉一次。后端只在**变化时**发这条（5s 巡检一次网卡），值仍由这里自己拉。
+    const unLocalAddrs = listen('local://addresses', () => {
+      void refreshLocalAddrs();
+    });
+
     // 状态框展开后，点别处 / 按 Esc 收起。用 **捕获阶段的 pointerdown**：标签栏、
     // 列表里的按钮都可能 `stopPropagation`，冒泡阶段会漏掉一半的"点别处"。
     const closeStatus = (e: PointerEvent) => {
@@ -2376,6 +2723,7 @@
       unPushDone.then(fn => fn());
       unPaired.then(fn => fn());
       unLocalOnline.then(fn => fn());
+      unLocalAddrs.then(fn => fn());
       document.removeEventListener('pointerdown', closeStatus, true);
       document.removeEventListener('keydown', escStatus);
       document.removeEventListener('keydown', escChat);
@@ -2402,7 +2750,9 @@
   class:docked={rectDock !== 0}
   class:docked-left={rectDock === -1}
   class:docked-right={rectDock === 1}
-  style="--panel-slack: {PANEL_SLACK}px; --orb-inset: {layout.widget.x}px; --orb-inset-y: {layout.widget.y}px; --foot-h: {footH}px; --notif-max-h: {notifMaxH}px; --orb-x: {orbOffset.x}px; --orb-y: {orbOffset.y}px; --zone-x: {orbZone.x}px; --zone-y: {orbZone.y}px; --zone-w: {orbZone.w}px; --zone-h: {orbZone.h}px; --spin-l: {badgeSpin.left}deg; --spin-r: {badgeSpin.right}deg"
+  class:menu={orbMenuGeo.shift.x !== 0 || orbMenuGeo.shift.y !== 0}
+  class:menu-busy={orbMenuBusy}
+  style="--panel-slack: {PANEL_SLACK}px; --orb-inset: {layout.widget.x}px; --orb-inset-y: {layout.widget.y}px; --foot-h: {footH}px; --notif-max-h: {notifMaxH}px; --orb-x: {orbOffset.x}px; --orb-y: {orbOffset.y}px; --zone-x: {orbZone.x}px; --zone-y: {orbZone.y}px; --zone-w: {orbZone.w}px; --zone-h: {orbZone.h}px; --spin-l: {badgeSpin.left}deg; --spin-r: {badgeSpin.right}deg; --menu-dx: {orbMenuGeo.shift.x}px; --menu-dy: {orbMenuGeo.shift.y}px"
 >
   <!-- 悬停热区：**只有屏上看得见的那一条**（贴边收起后 = 露出那截弧的方框 / 那条竖条，
        见 orbLayout 的 planDock / planRectDock 的 `zone`）—— 指针落在它上面才把悬浮体呼出来。
@@ -2442,6 +2792,7 @@
           const page = rectPages[i];
           if (page) upRect(page.id);
         }}
+        onContext={openRectCtx}
         onToast={toast}
       />
     {:else}
@@ -2880,6 +3231,9 @@
     convoBrowse={ctxState.convoBrowse === true}
     convoThread={ctxState.convoThread === true}
     convoBc={ctxState.convoBc === true}
+    compact={ctxState.orb === true}
+    pending={ctxState.orb === true && ctxState.placed === false}
+    pinned={ctxState.orb === true}
     onClose={hideCtx}
     onToast={toast}
     onDownload={ctxDownload}

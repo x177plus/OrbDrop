@@ -64,12 +64,24 @@ fn entry_of(path: &Path, from: &str) -> Option<InboxEntryDto> {
 ///
 /// **只列两层**，不递归：推送过来的目录在清单里是一条，它里面的东西属于那一条 ——
 /// 铺开成几百行既看不出层级，也点不动（打开那条目录才是正路）。
+///
+/// **必须 async**（P1-13⑥）：这条命令要读下载目录、每个发送方目录各一次 `read_dir`、每一项
+/// 一次 `symlink_metadata` —— 手机上那是应用私有的外部存储，几百上千项时够卡住主线程好几帧。
+/// 项目自己的规矩写在 `fs_browse.rs:216`：**同步命令跑在主线程上**，阻塞 IO 一律
+/// `spawn_blocking` 挪走。
 #[tauri::command]
-pub fn list_inbox(state: State<'_, Arc<AppState>>) -> Vec<InboxEntryDto> {
+pub async fn list_inbox(state: State<'_, Arc<AppState>>) -> Result<Vec<InboxEntryDto>, String> {
     let root = state.config.lock().download_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || list_inbox_at(&root))
+        .await
+        .map_err(|e| format!("列收件目录失败：{e}"))
+}
+
+/// 真正的读取逻辑（同步、在阻塞线程池上跑）。
+fn list_inbox_at(root: &Path) -> Vec<InboxEntryDto> {
     let mut out: Vec<InboxEntryDto> = Vec::new();
 
-    let Ok(dir) = std::fs::read_dir(&root) else {
+    let Ok(dir) = std::fs::read_dir(root) else {
         return out;
     };
     for item in dir.flatten() {
@@ -105,15 +117,21 @@ pub fn list_inbox(state: State<'_, Arc<AppState>>) -> Vec<InboxEntryDto> {
 /// 两道闸：路径必须落在下载目录之内（前端传来的字符串是不可信输入，`..` 与绝对路径都要挡住），
 /// 且只删文件 —— 目录是"一台设备给我的一批东西"或用户自己放进来的文件夹，误删整棵树的代价
 /// 远大于收益。
+/// **同样必须 async**（P1-13⑥）：`canonicalize` 与 `remove_file` 都是阻塞系统调用，
+/// 在掉线的外置卡/慢存储上会卡成"点了没反应"。判据与删除动作一起挪到阻塞线程池上跑。
 #[tauri::command]
-pub fn delete_inbox_file(path: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let root = state
-        .config
-        .lock()
-        .download_dir
+pub async fn delete_inbox_file(path: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let root = state.config.lock().download_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || delete_inbox_file_at(&root, &path))
+        .await
+        .map_err(|e| format!("删除失败：{e}"))?
+}
+
+fn delete_inbox_file_at(root: &Path, path: &str) -> Result<(), String> {
+    let root = root
         .canonicalize()
         .map_err(|e| format!("下载目录不可用: {e}"))?;
-    let target = PathBuf::from(&path)
+    let target = PathBuf::from(path)
         .canonicalize()
         .map_err(|e| format!("文件不存在: {e}"))?;
     if !target.starts_with(&root) {

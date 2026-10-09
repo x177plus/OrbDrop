@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, PickerFavorite, ChatSnapshot, InboxEntry } from './types';
+import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, PickerFavorite, ChatSnapshot, InboxEntry, RelayTraffic } from './types';
 import type { ScreenMetrics, ScreenRect } from './orbLayout';
 
 // Share management
@@ -30,7 +30,7 @@ export function getSettings(): Promise<AppSettings> {
   return invoke('get_settings');
 }
 
-export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; downloadMode: string; deviceName: string; autoStart: boolean; bcExePath: string; autoBroadcastNew: boolean; groupRelay: boolean; transferWorkers: number; transferBlockMb: number }): Promise<AppSettings> {
+export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; downloadMode: string; deviceName: string; autoStart: boolean; bcExePath: string; autoBroadcastNew: boolean; groupRelay: boolean; allowRelay: boolean; relayMemory: boolean; transferWorkers: number; transferBlockMb: number }): Promise<AppSettings> {
   return invoke('update_settings', { req: s });
 }
 
@@ -49,6 +49,11 @@ export function localAddresses(): Promise<{ primary: string | null; all: string[
 
 export function listDevices(): Promise<PeerDevice[]> {
   return invoke('list_devices');
+}
+
+// 中转（F-106 / S-09）：本机替别人中转的**累计流量**与连接数 —— 设置里显示"替别人搬了多少"。
+export function relayTraffic(): Promise<RelayTraffic> {
+  return invoke('relay_traffic');
 }
 
 export function startHttpServer(): Promise<number> {
@@ -178,8 +183,14 @@ export function cancelPushBatch(batchId: string): Promise<void> {
   return invoke('cancel_push_batch', { batchId });
 }
 
-export function acceptPush(inviteId: string): Promise<void> {
-  return invoke('accept_push', { inviteId });
+/**
+ * 接收方点「同意接收」：起下载任务。
+ *
+ * `root` = 这次的落盘根目录（设置里「每次询问」时，界面先弹目录选择框再带上来）；
+ * 不带就用设置里的下载目录。**已配对设备那条免同意自动收的路不问**，也就恒不带它。
+ */
+export function acceptPush(inviteId: string, root?: string): Promise<void> {
+  return invoke('accept_push', { inviteId, root: root ?? null });
 }
 
 export function rejectPush(inviteId: string): Promise<void> {
@@ -317,15 +328,17 @@ export function bcCompare(a: BcTarget, b: BcTarget): Promise<null> {
 }
 
 // Download
-export function downloadFile(shareId: string, pathInShare: string): Promise<string> {
+/** 三条都返回落盘路径；**「每次询问」下用户在保存框里取消时返回 `null`** —— 不落盘，
+ *  调用方当"什么都没发生"（别弹失败提示，也别打开不存在的路径）。 */
+export function downloadFile(shareId: string, pathInShare: string): Promise<string | null> {
   return invoke('download_file', { shareId, pathInShare });
 }
 
-export function downloadFromPeer(peerId: string, shareId: string, pathInShare: string, fileName?: string): Promise<string> {
+export function downloadFromPeer(peerId: string, shareId: string, pathInShare: string, fileName?: string): Promise<string | null> {
   return invoke('download_from_peer', { peerId, shareId, pathInShare, fileName: fileName ?? null });
 }
 
-export function downloadAndOpen(shareId: string, pathInShare: string): Promise<string> {
+export function downloadAndOpen(shareId: string, pathInShare: string): Promise<string | null> {
   return invoke('download_and_open', { shareId, pathInShare });
 }
 

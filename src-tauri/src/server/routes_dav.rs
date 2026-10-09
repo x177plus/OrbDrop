@@ -420,6 +420,10 @@ async fn read_response(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("定位失败: {e}")))?;
     }
     let len = end.saturating_sub(start) + 1;
+    // 空文件那一档：`total == 0` 时 `parse_range` 给的是 `(0, 0)`（`last` 是 `saturating_sub(1)`），
+    // 直接套 `end - start + 1` 会算出 **1** —— 响应头声明 1 字节、正文 0 字节。按 HTTP 规范读的
+    // 客户端（curl、BC 保存一个被清空的文件、任意 DAV 客户端）会当场报"传输提前结束"。
+    let len = if total == 0 { 0 } else { len };
 
     let body = if head_only {
         Body::empty()
@@ -970,6 +974,43 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
         assert!(!root.join("newdir").exists(), "目录删除要递归");
+
+        crate::server::stop_server(&state).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// **空文件**：GET/HEAD 都必须是「0 字节」，不能声明 1 字节（P1-8）。
+    ///
+    /// `parse_range` 对 `total == 0` 给的是 `(0, 0)`，旧写法 `end - start + 1` 于是算出 1 ——
+    /// 响应头写 1、正文 0，客户端（curl 直接 `transfer closed with 1 bytes remaining to read`）
+    /// 与 BC（保存一个被清空的文件）都会读失败。空文件很常见（`.gitkeep`、刚 truncate 的写回）。
+    #[tokio::test]
+    async fn an_empty_file_is_served_as_zero_bytes() {
+        let (state, port, root, share_id) = serve(4140).await;
+        let client = Client::new();
+        let url = format!("http://127.0.0.1:{port}/dav/{share_id}/empty.txt");
+
+        let put = client.put(&url).body("").send().await.unwrap();
+        assert_eq!(put.status(), HttpStatus::CREATED);
+        assert_eq!(std::fs::metadata(root.join("empty.txt")).unwrap().len(), 0);
+
+        let get = client.get(&url).send().await.unwrap();
+        assert_eq!(get.status(), HttpStatus::OK);
+        assert_eq!(
+            get.headers()["content-length"], "0",
+            "声明 1 字节就是错的：正文只有 0 字节，客户端会当传输提前结束"
+        );
+        assert_eq!(get.text().await.unwrap(), "");
+
+        let head = client.head(&url).send().await.unwrap();
+        assert_eq!(head.status(), HttpStatus::OK);
+        assert_eq!(head.headers()["content-length"], "0");
+
+        // 非空文件照旧（别把空文件那条修到别的档上）。
+        let big = format!("http://127.0.0.1:{port}/dav/{share_id}/one.txt");
+        client.put(&big).body("x").send().await.unwrap();
+        let one = client.get(&big).send().await.unwrap();
+        assert_eq!(one.headers()["content-length"], "1");
 
         crate::server::stop_server(&state).await;
         let _ = std::fs::remove_dir_all(root);

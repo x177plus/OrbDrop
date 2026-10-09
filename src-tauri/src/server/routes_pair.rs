@@ -43,6 +43,14 @@ pub async fn pair_info(
         "port": port,
         "ver": 1,
         "pairedAs": paired_as,
+        // 中转能力位（F-106）：本机此刻是否愿意替别人搬字节（设置里 S-09，默认关）。
+        // 这是个**能力**不是**关系**：回话本来就不带鉴权，谁问都答；发出去的只有"愿不愿意"，
+        // 不含任何一台设备的信息。请求方据此挑中转方（还要它自己在线、已配对）。
+        "relay": config.allow_relay,
+        // F-107：本机**自报**的网段（`192.168.1.0/24,10.0.0.0/8`）。跨网段时"这台设备属于
+        // 哪一段"只能由它自己说 —— 本机的掩码对远端网段不适用。与 mDNS TXT 的 `nets` 同义，
+        // 但这是**活回话**（网卡换了当场就变），TXT 只是注册那一刻的快照。
+        "nets": crate::subnet::format_list(&crate::subnet::host_nets()),
     }).into()
 }
 
@@ -128,10 +136,23 @@ pub async fn pair_handshake(
     if peer_id.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "缺少 peerId".into()));
     }
+    // 猜码限流（P1-5）：6 位码 + 2 分钟有效期，不限次数时局域网里每秒几千发就能扫完，
+    // 用户正把码显示在屏幕上时被陌生设备配上。按**来源地址**记账（TCP 来源不可伪造），
+    // 一分钟内错满 `CODE_FAILURE_LIMIT` 次就先拒一段时间；猜对则把账清掉。
+    let from = addr.ip();
+    if !state.pair.code_attempt_allowed(from) {
+        warn!(%peer_id, %from, "配对码尝试次数超限，暂时拒绝");
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "配对码尝试次数过多，请稍后再试".into(),
+        ));
+    }
     if !state.pair.verify_code(&req.code) {
+        state.pair.note_code_failure(from);
         warn!(%peer_id, "pairing code rejected (unknown or expired)");
         return Err((StatusCode::UNAUTHORIZED, "配对码错误或已过期".into()));
     }
+    state.pair.clear_code_failures(from);
 
     let token = pair::generate_token();
 
@@ -154,7 +175,9 @@ pub async fn pair_handshake(
     // 来源地址只有在"不是本机自己的监听端点"时才是一次可用的观察（见
     // `net::observed_dial_target`）：模拟器/NAT 后面的对端会把自己看到的本机地址回连
     // 进来，那一对记下来就是本机自己 —— 那种情况退回本机原先知道的地址（多半是空）。
-    let ip = if source.is_ipv4() {
+    // 同理，**经中转过来的**握手（F-106：来源是那台中转设备，而不是对端自己）也不能
+    // 当观察值用：记下来本机就会拿中转方的地址去拨对端。
+    let ip = if source.is_ipv4() && !state.is_relayed_source(source, &peer_id) {
         match net::observed_dial_target(source, port, state.listening_port()) {
             Some((ip, _)) => ip,
             None => known.as_ref().map(|p| p.ip.clone()).unwrap_or_default(),
@@ -251,6 +274,19 @@ pub async fn pair_invite_handler(
         return Err((StatusCode::UNAUTHORIZED, "身份校验失败".into()));
     }
     if paired && !proven {
+        // 这条是"关系已经断了"的例外，但仍然是一条**没有身份证明**的邀请：它可能是换了
+        // 新地址的老搭档，也可能是同网段的人先制造一次 401 再借这个例外冒充。所以：
+        // ① 通知里带上 `unproven`（界面要写明"身份未经校验"）；
+        // ② 频率约束 —— 同一个 peer id 每 `UNPROVEN_INVITE_COOLDOWN` 只放行一条，
+        //    页面级别地挡住"连点刷卡片"。修不了"它是谁"，但把窗口收到很小。
+        if !state.pair.unproven_invite_allowed(&req.peer_id) {
+            info!(peer = %req.peer_id, "配对邀请被拒：无凭据的重新配对请求太频繁");
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "无凭据的配对邀请过于频繁，请稍后再试".into(),
+            ));
+        }
+        state.pair.note_unproven_invite(&req.peer_id);
         info!(peer = %req.peer_id, "配对邀请放行：本机已知需重新配对（对端已不认这枚凭据）");
     }
 
@@ -260,8 +296,13 @@ pub async fn pair_invite_handler(
     // （见 `net::observed_dial_target`）：记下来会让探活问回自己、把本机的证书钉到对端
     // 名下，最后那一行被当成"这里换了设备"作废，设备行就永远停在「离线」。
     // 地址要么成对记、要么一对都不记（`("", 0)` 是本仓库里"没有地址"的唯一写法）。
-    let (ip, port) =
-        net::observed_dial_target(addr.ip(), req.port, state.listening_port()).unwrap_or_default();
+    // **经中转过来的**邀请同理（F-106）：来源是那台中转设备，记下来就是把它的地址
+    // 当成了邀请方的地址。
+    let (ip, port) = if state.is_relayed_source(addr.ip(), &req.peer_id) {
+        (String::new(), 0)
+    } else {
+        net::observed_dial_target(addr.ip(), req.port, state.listening_port()).unwrap_or_default()
+    };
     let peer = pair::PairedPeer {
         id: req.peer_id.clone(),
         name: req.peer_name.clone(),
@@ -387,6 +428,63 @@ mod tests {
             asked.status(),
             StatusCode::FORBIDDEN,
             "邀请要挂到通知里等用户决定（由撤回/超时收场），不能是 401"
+        );
+
+        crate::server::stop_server(&state).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 配对码**猜错要限流**（P1-5）：6 位码 + 120s 有效期内，不限次数时局域网里每秒几千发
+    /// 就能把 9e5 的空间扫完 —— 用户正把码显示在屏幕上时被陌生设备配上。
+    /// 同一个来源地址错满 `CODE_FAILURE_LIMIT` 次之后先拒一段时间（429），而**猜对**那条
+    /// 正常路径不受影响。
+    #[tokio::test]
+    async fn pairing_code_attempts_are_throttled_per_source() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_pair_thr_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(AppState::new(Config::default(), dir.join("config.toml")));
+        let port = crate::server::start_server(state.clone(), 4319)
+            .await
+            .expect("server start");
+        let url = format!("http://127.0.0.1:{port}/pair");
+        let post = |code: &str| {
+            let url = url.clone();
+            let code = code.to_string();
+            async move {
+                reqwest::Client::new()
+                    .post(&url)
+                    .json(&serde_json::json!({
+                        "peerId": "peer-t", "peerName": "PC-T", "code": code,
+                    }))
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        for _ in 0..crate::pair::CODE_FAILURE_LIMIT {
+            assert_eq!(
+                post("000000").await.status(),
+                StatusCode::UNAUTHORIZED,
+                "限流阈值内的错码都是 401"
+            );
+        }
+        assert_eq!(
+            post("000000").await.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "错满 {} 次之后这个地址要被挡住",
+            crate::pair::CODE_FAILURE_LIMIT
+        );
+        // 挡的是**来源地址**，不是"配对"这件事本身：别的地址照旧能试。
+        assert!(state.pair.code_attempt_allowed(std::net::IpAddr::from([10, 0, 0, 9])));
+
+        // 猜对那条路不受影响（清掉这个地址的账之后，正常配对照旧成功）。
+        let issued = state.pair.create_code();
+        state.pair.clear_code_failures(std::net::IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(
+            post(&issued).await.status(),
+            StatusCode::OK,
+            "正常配对不该被限流误伤"
         );
 
         crate::server::stop_server(&state).await;

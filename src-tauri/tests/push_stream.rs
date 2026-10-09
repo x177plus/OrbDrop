@@ -180,7 +180,7 @@ fn pair_without_ws(
         online: true,
         paired: true,
         auto_connect: false,
-        paused: false,
+        paused: false, relay: None,
     });
     state_b.add_peer_book(PeerDevice {
         id: id_a.into(),
@@ -190,7 +190,7 @@ fn pair_without_ws(
         online: true,
         paired: true,
         auto_connect: false,
-        paused: false,
+        paused: false, relay: None,
     });
 }
 
@@ -378,7 +378,7 @@ async fn source_changed_before_consent_fails_only_that_file() {
         online: true,
         paired: false,
         auto_connect: false,
-        paused: false,
+        paused: false, relay: None,
     });
 
     // **注意**：未绑定那条路上，`push_paths` 会一直等到"对方点同意"才返回（HTTP 邀请是
@@ -393,7 +393,7 @@ async fn source_changed_before_consent_fails_only_that_file() {
     // 清单已经生成了，这时把其中一个源文件改掉（大小变了 → 块布局也不成立了）。
     std::fs::write(src.join("改过的.bin"), vec![9u8; 2 * 1024 * 1024 + 5]).unwrap();
 
-    transfer::accept_invite(state_b.clone(), &invite_id).expect("同意接收");
+    transfer::accept_invite(state_b.clone(), &invite_id, None).expect("同意接收");
     let invite_id = pushing.await.expect("邀请任务不该 panic");
 
     let name = src.file_name().unwrap().to_string_lossy().to_string();

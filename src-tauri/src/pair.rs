@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,7 +31,30 @@ pub struct PairStore {
     invites: Mutex<Vec<PendingInvite>>,
     /// 本机发出、还没结束的邀请：invite id → 对端 id（撤回时要凭它找到对端）。
     outbound: Mutex<HashMap<String, String>>,
+    /// 配对码**猜错**的记账：来源地址 → 这个窗口里已经错了几次（P1-5）。
+    code_failures: Mutex<HashMap<IpAddr, Attempts>>,
+    /// "自称已配对却拿不出凭据"的邀请记账：对端 id → 上次放行到通知的时刻（P1-6）。
+    unproven_invites: Mutex<HashMap<String, Instant>>,
 }
+
+/// 一个来源地址在一个窗口里猜错了几次（窗口过期即清零）。
+struct Attempts {
+    count: u32,
+    window: Instant,
+}
+
+/// 配对码每分钟允许猜错几次。
+///
+/// 6 位码 = 9e5 种、`CODE_TTL` 120s：不限次数时，局域网里每秒几千发就能在有效期内扫完
+/// —— 用户正把码显示在屏幕上，陌生设备把他自己配上。5 次/分钟把爆破从分钟级拉到按天算，
+/// 而正常人输错一两次完全不受影响（同一个地址也可能是家里几台设备在试）。
+pub const CODE_FAILURE_LIMIT: u32 = 5;
+/// 失败计数的时间窗。
+pub const CODE_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// 同一个设备 id 的"无凭据邀请"最短间隔（P1-6）：同网段的人只要能制造一次 401（拨号被拒）
+/// 就能让本机放行邀请，那就别让他连点 —— 用户最多每两分钟看到一条，而且卡片上写明
+/// 身份未经校验、仍要他自己点「接收」。
+pub const UNPROVEN_INVITE_COOLDOWN: Duration = Duration::from_secs(120);
 
 struct PendingPair {
     code: String,
@@ -58,7 +82,47 @@ impl PairStore {
             pending: Mutex::new(Vec::new()),
             invites: Mutex::new(Vec::new()),
             outbound: Mutex::new(HashMap::new()),
+            code_failures: Mutex::new(HashMap::new()),
+            unproven_invites: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 这个来源地址现在还能不能试配对码（`false` = 已经错太多，先歇一会儿）。
+    pub fn code_attempt_allowed(&self, from: IpAddr) -> bool {
+        let mut map = self.code_failures.lock();
+        map.retain(|_, a| a.window.elapsed() < CODE_FAILURE_WINDOW);
+        map.get(&from)
+            .map(|a| a.count < CODE_FAILURE_LIMIT)
+            .unwrap_or(true)
+    }
+
+    /// 记一次配对码猜错。
+    pub fn note_code_failure(&self, from: IpAddr) {
+        let mut map = self.code_failures.lock();
+        map.retain(|_, a| a.window.elapsed() < CODE_FAILURE_WINDOW);
+        let entry = map
+            .entry(from)
+            .or_insert(Attempts { count: 0, window: Instant::now() });
+        entry.count += 1;
+    }
+
+    /// 猜对一次就把这个地址的账清掉（用户自己输错的那些不该一直攒着）。
+    pub fn clear_code_failures(&self, from: IpAddr) {
+        self.code_failures.lock().remove(&from);
+    }
+
+    /// 一条"自称已配对却没带凭据"的邀请现在能不能放行到通知里（P1-6 的频率约束）。
+    pub fn unproven_invite_allowed(&self, peer_id: &str) -> bool {
+        let mut map = self.unproven_invites.lock();
+        map.retain(|_, at| at.elapsed() < UNPROVEN_INVITE_COOLDOWN);
+        !map.contains_key(peer_id)
+    }
+
+    /// 记下一条已经放行到通知的无凭据邀请。
+    pub fn note_unproven_invite(&self, peer_id: &str) {
+        self.unproven_invites
+            .lock()
+            .insert(peer_id.to_string(), Instant::now());
     }
 
     /// Issue a fresh 6-digit code (dropping everything already expired).
@@ -242,7 +306,7 @@ pub fn commit_pairing(
         port: peer.port,
         online: dialable,
         paired: true,
-        auto_connect: false, paused: false,
+        auto_connect: false, paused: false, relay: None,
     });
     // 刚拿到 token：把 BC 的 WebDAV profile 预写好（BC 只在启动时登记 profile 文件，
     // 所以要抢在用户下次启动 BC 之前落盘）。
@@ -408,7 +472,7 @@ pub async fn withdraw_invite_remote(state: Arc<AppState>, invite_id: &str) -> Re
     };
     let url = format!(
         "{}/pair/invite/withdraw",
-        crate::net::peer_base(&peer.ip, peer.port)
+        crate::net::peer_base(peer.dial().0, peer.dial().1)
     );
     let resp = crate::net::client()
         .post(&url)
@@ -435,7 +499,7 @@ async fn deliver_invite_http(
     own_id: &str,
     own_name: &str,
 ) -> Result<PairGrant, String> {
-    let url = format!("{}/pair/invite", crate::net::peer_base(&peer.ip, peer.port));
+    let url = format!("{}/pair/invite", crate::net::peer_base(peer.dial().0, peer.dial().1));
     let mut req = crate::net::client()
         .post(&url)
         .timeout(HTTP_INVITE_TIMEOUT)

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="108" height="108" viewBox="0 0 108 108">
+  <title>OrbDrop 自适应前景：一枚白 D（与 src/lib/components/Logo.svelte 同一段路径、同一变换，落点与原前景那个 D 形洞完全重合）</title>
+  <g transform="translate(54 54) scale(3.375) translate(-16 -16)">
+    <path d="M13 9.4H16.4A6.6 6.6 0 0 1 16.4 22.6H13Z" fill="#fff"/>
+  </g>
+</svg>

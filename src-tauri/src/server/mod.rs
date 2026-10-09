@@ -19,6 +19,7 @@ pub mod proxy;
 mod routes_chat;
 mod routes_dav;
 mod routes_discover;
+mod routes_relay;
 mod routes_file;
 mod routes_pair;
 mod routes_push;
@@ -86,8 +87,19 @@ const MANIFEST_BODY_LIMIT: usize = 64 << 20;
 /// Build the axum Router with all routes, including the WS /events
 /// endpoint (outside the auth layer).
 fn build_router(state: Arc<AppState>) -> Router {
+    // **只允许本机自己的前端来源**，不再是 `*`。
+    //
+    // 回环那条路是免认证的（本机 UI 自验用，见 `auth_middleware`），而 `*` 意味着**任何**
+    // 网页都能读到 /shares、/tree、/file 的响应 —— 用户访问的恶意页面于是能枚举并下载
+    // 共享文件（Chrome 的 Private Network Access 会拦，Firefox/Safari 目前不拦）。
+    // 白名单只收本机来源：`localhost`（dev 的 vite 在 1420）、`tauri.localhost`（Tauri v2
+    // 在 Windows 上的 webview 来源）。别的来源跨域读不到任何东西。
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(tower_http::cors::AllowOrigin::predicate(
+            |origin: &axum::http::HeaderValue, _req: &axum::http::request::Parts| {
+                is_trusted_origin(origin.to_str().unwrap_or_default())
+            },
+        ))
         .allow_methods(Any)
         .allow_headers(Any);
 
@@ -133,6 +145,21 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         // 会话（聊天）没有长连接时的那一跳：同样挂在公开路由上、自己认人
         // （未绑定设备没有 token 可带），判断规则与 `/push/invite` 一模一样。
+        // 中转（F-106 / S-09）：请本机替它连另一台设备（端点由本机开、本机盲转）。
+        //
+        // **挂在公开路由上**（F-107 §12.1）：S-09 的语义放宽成"开着就允许，不限已配对设备"，
+        // 而未配对设备本来就没有 token 可带 —— 所以认人规则写在 handler 里：凭据优先，
+        // 没有凭据就必须自报身份并被核实（见 `routes_relay::relay_open`）。
+        .route(
+            "/relay/open",
+            axum::routing::post(routes_relay::relay_open),
+        )
+        // 反向路由记录（F-107 §10）：**同样在公开面上**、自己认人 —— 要送达的那一侧
+        // （被中转的 B）通常从来没跟锚点配过（见 `routes_relay::relay_route`）。
+        .route(
+            "/relay/route",
+            axum::routing::post(routes_relay::relay_route),
+        )
         .route(
             "/chat/message",
             axum::routing::post(routes_chat::chat_message_handler),
@@ -166,11 +193,19 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/chat/group-ack",
             axum::routing::post(routes_chat::group_ack_handler),
-        )
-        // Beyond Compare 的 WebDAV 入口：让 BC 连**本机**（回环），由这里加密转发到对端。
-        // 挂在公开路由上是因为它自己校验凭据（它要的挑战/凭据形状必须与对端 DAV 面一致，
-        // 而 `auth_middleware` 对回环是直接免认证的 —— 那是给本机 UI 自验用的，不能用在这里）。
-        // handler 内部另有一道"只认回环"的闸门。
+        );
+
+    // Beyond Compare 的 WebDAV 入口：让 BC 连**本机**（回环），由这里加密转发到对端。
+    // 挂在公开路由上是因为它自己校验凭据（它要的挑战/凭据形状必须与对端 DAV 面一致，
+    // 而 `auth_middleware` 对回环是直接免认证的 —— 那是给本机 UI 自验用的，不能用在这里）。
+    // handler 内部另有一道"只认回环"的闸门。
+    //
+    // **不能挂 CORS 层**（和 `/dav` 同一条理由）：tower-http 的 CORS 会把**所有** OPTIONS
+    // 抢答成它自己的 preflight 响应（`200` + `Access-Control-Allow-Methods: *`），而 BC 正是
+    // 用 `OPTIONS` 协商 DAV 能力（要看到 `DAV: 1,2`）——被抢答就等于"这不是 WebDAV"，
+    // 远端目录在 BC 里直接加载不了。profile 的 BaseURL 指的就是这里（`server::proxy::base_url`），
+    // 所以这条路是 BC 的**唯一**入口，它被吞掉 BC 就整体不可用。
+    let proxy_routes = Router::new()
         .route(
             "/proxy/{peer_id}",
             axum::routing::any(proxy::dav_proxy_root),
@@ -191,11 +226,14 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/unpair", axum::routing::post(routes_pair::unpair))
         .route("/file", axum::routing::get(routes_file::file_handler))
         .route("/shares", axum::routing::get(routes_shares::shares_handler))
-        // 跨网段发现（F-10 延伸）：已配对对端来取「本机这一段里在线的设备」。
+        // 跨网段发现（F-10 延伸）：已配对对端来取「本机此刻看得见的设备」（整份视野）。
         .route(
             "/discover",
             axum::routing::get(routes_discover::discover),
         )
+        // 中转（F-106）：已配对对端来请本机替它连另一台设备（端点由本机开、本机盲转）。
+        // F-107 起 `/relay/open` 与 `/relay/route` 都移到公开路由（未配对设备也能借 / 也能收到
+        // 记录，认人规则在 handler 里），见 `public_routes`。
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,
@@ -207,9 +245,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .layer(cors);
 
     // WebDAV 面（F-41 ~ F-43）：Beyond Compare 直连共享项。
-    // **不能挂 CORS 层**：tower-http 的 CORS 会把 OPTIONS 直接抢答（返回它自己的 preflight
-    // 响应），而 BC 正是用 `OPTIONS` 协商 DAV 能力（要看到 `DAV: 1,2`）——被抢答就等于
-    // "这不是 WebDAV"，远端目录在 BC 里直接加载不了（实测过）。
+    // **不能挂 CORS 层**（同 `proxy_routes` 那条）：tower-http 的 CORS 会把 OPTIONS 直接
+    // 抢答成 preflight 响应，而 BC 正是用 `OPTIONS` 协商 DAV 能力（`DAV: 1,2`）。
     // 路径命名空间用 shareId：共享项名字带空格/中文且会和上面的 REST 路由抢前缀。
     let dav_routes = Router::new()
         .route(
@@ -231,12 +268,45 @@ fn build_router(state: Arc<AppState>) -> Router {
             auth::auth_middleware,
         ));
 
-    http_routes.merge(dav_routes)
+    // CORS 层只盖在"本机 UI 用的那几条 REST 路由"上（见上面对 `proxy_routes` 的说明）：
+    // BC 的两个面（`/proxy` 与 `/dav`）都在它之外单挂，OPTIONS 才能原样到对端。
+    http_routes
+        .merge(proxy_routes)
+        .merge(dav_routes)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             presence_middleware,
         ))
         .with_state(state)
+}
+
+/// 这个 `Origin` 是不是**本机自己的界面**发出来的。
+///
+/// 用途有两处（两处都不能用 `*`）：① CORS 白名单 —— 只把响应交给自己的来源；② 回环免认证
+/// 的闸门 —— 带**外来** Origin 的回环请求（来自用户浏览器里的某个网页）不算"本机 UI"。
+///
+/// 判据只看**主机名**：`localhost` / `*.localhost`（含 `tauri.localhost`）/ `127.0.0.1` /
+/// `::1`。端口与协议不管 —— dev 的 vite 在 1420、Tauri 在 Windows 上用 `http://tauri.localhost`、
+/// macOS/Linux 上是 `tauri://localhost`，钉死某一个都会在某条路上把自己挡掉。
+pub(crate) fn is_trusted_origin(origin: &str) -> bool {
+    fn host_of(origin: &str) -> Option<&str> {
+        let rest = origin.split_once("://")?.1;
+        let authority = rest.split('/').next().unwrap_or(rest);
+        // IPv6 是 `[::1]:1420` 这种形状。
+        if let Some(bracketed) = authority.strip_prefix('[') {
+            return bracketed.split(']').next();
+        }
+        Some(authority.split(':').next().unwrap_or(authority))
+    }
+    match host_of(origin) {
+        Some(host) => {
+            host == "localhost"
+                || host.ends_with(".localhost")
+                || host == "127.0.0.1"
+                || host == "::1"
+        }
+        None => false,
+    }
 }
 
 /// 本机切到「离线」（隐身）时，对**一切**入站请求回 503。
@@ -549,5 +619,83 @@ mod tests {
 
         stop_server(&state).await;
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 回环免认证**只给本机自己的界面**：带外来 Origin 的回环请求要凭据（P1-3）。
+    ///
+    /// 否则任何网页都能无凭据读走 /shares、/file（`access-control-allow-origin: *` 还会
+    /// 把响应交给它），甚至用 PUT/DELETE /dav 改写共享文件。
+    #[tokio::test]
+    async fn loopback_needs_no_token_but_a_foreign_origin_does() {
+        let (state, port, root) = start_test_server().await;
+        let url = format!("http://127.0.0.1:{port}/shares");
+        let client = reqwest::Client::new();
+
+        // ① 无 Origin（curl / 本机进程 / Rust 侧 loopback 调用）：照旧免认证。
+        let bare = client.get(&url).send().await.unwrap();
+        assert_eq!(bare.status(), StatusCode::OK, "本机 UI 的那条路不能变");
+
+        // ② 本机自己的来源：放行，且 CORS 只回给这个来源（不再是 `*`）。
+        let ours = client
+            .get(&url)
+            .header(axum::http::header::ORIGIN, "http://localhost:1420")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ours.status(), StatusCode::OK);
+        assert_eq!(
+            ours.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("http://localhost:1420"),
+            "只回白名单里的那个来源，不能是 *"
+        );
+
+        // ③ 外来网页的来源：不再算"本机 UI" → 要凭据（401），CORS 也不给它放行头。
+        let foreign = client
+            .get(&url)
+            .header(axum::http::header::ORIGIN, "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            foreign.status(),
+            StatusCode::UNAUTHORIZED,
+            "网页从回环发起的请求必须出示凭据"
+        );
+        assert!(
+            foreign
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "外来来源不该拿到 CORS 放行头"
+        );
+
+        stop_server(&state).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_local_origins_are_trusted() {
+        for ok in [
+            "http://localhost:1420",
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+            "http://127.0.0.1:3890",
+            "http://[::1]:3890",
+        ] {
+            assert!(is_trusted_origin(ok), "{ok} 应当被信任");
+        }
+        for bad in [
+            "https://evil.example",
+            "http://evil.example:1420",
+            "https://localhost.evil.example",
+            "null",
+            "",
+            "http://192.168.1.5:1420",
+        ] {
+            assert!(!is_trusted_origin(bad), "{bad} 不该被信任");
+        }
     }
 }

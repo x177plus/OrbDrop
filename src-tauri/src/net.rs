@@ -246,7 +246,7 @@ impl Trust {
         let mut map: HashMap<StdIpAddr, String> = HashMap::new();
         let mut conflicted: Vec<StdIpAddr> = Vec::new();
         for (ip, fp) in entries {
-            let Ok(ip) = ip.parse::<StdIpAddr>() else { continue };
+            let Some(ip) = parse_host(&ip) else { continue };
             match map.get(&ip) {
                 Some(existing) if *existing != fp => {
                     if !conflicted.contains(&ip) {
@@ -281,9 +281,7 @@ impl Trust {
 
     /// 本次进程里为某个地址见过的指纹（落库用）。
     pub fn observed_at(&self, ip: &str) -> Option<String> {
-        ip.parse::<StdIpAddr>()
-            .ok()
-            .and_then(|ip| self.observed.lock().get(&ip).cloned())
+        parse_host(ip).and_then(|ip| self.observed.lock().get(&ip).cloned())
     }
 
     /// 忘掉某个地址的指纹（解除配对时用；地址换了主人也一样）。
@@ -500,6 +498,33 @@ pub fn peer_ws_url(ip: &str, port: u16, token: &str, manual: bool) -> String {
     )
 }
 
+/// 地址字面量 → `IpAddr`，**容忍 URL 主机里的方括号写法**（`[::ffff:10.0.0.1]`）。
+///
+/// 中转端点的字面量是 IPv4 映射的 IPv6（见 [`relay_host`]）：拼进 URL 必须带方括号
+/// （RFC 3986），而指纹表要拿 `IpAddr` 当键 —— 两处必须认同一个写法，否则钉不住。
+pub fn parse_host(host: &str) -> Option<StdIpAddr> {
+    let trimmed = host.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    inner.parse().ok()
+}
+
+/// 中转端点的主机字面量：**同一个 IPv4，写成 IPv4 映射的 IPv6**（`[::ffff:a.b.c.d]`）。
+///
+/// 为什么要换字面量（F-106）：中转端点上呈现的是**被中转那台设备**的证书，而指纹表
+/// （`net::Trust`）按**地址**索引 —— 直接用中转方的 IPv4，就会与"中转方自己的服务"
+/// 共用同一个键位：同一地址上出现两枚不同指纹时按现有规则**不钉**（退到 TOFU，见
+/// `Trust::seed`），等于把中转方和自己的两跳身份都放松了。换一种字面量（同一个地址）
+/// 就让中转端点各占一档键位，TLS 端到端不变、信任模型一个字都不用改。
+///
+/// 传输层也认：IPv4 映射地址的 `connect()` 会落到同一个 IPv4（Windows/macOS/Android 实测）。
+pub fn relay_host(ipv4: &str) -> Option<String> {
+    let v4: std::net::Ipv4Addr = ipv4.trim().parse().ok()?;
+    Some(format!("[{}]", v4.to_ipv6_mapped()))
+}
+
 /// 观察到的一对「TCP 来源地址 + 对端自报的服务端口」能不能当**对端的拨号地址**记下来。
 /// `None` = 那对地址指的其实是本机自己，记下来只会一路错下去（见 `is_own_endpoint`）。
 pub fn observed_dial_target(
@@ -699,9 +724,8 @@ pub async fn connect_ws(
     let request = url
         .into_client_request()
         .map_err(|e| DialError::Unreachable(format!("WS 地址无效: {e}")))?;
-    let ip: StdIpAddr = ip
-        .parse()
-        .map_err(|_| DialError::Unreachable(format!("地址无效: {ip}")))?;
+    let ip: StdIpAddr = parse_host(ip)
+        .ok_or_else(|| DialError::Unreachable(format!("地址无效: {ip}")))?;
 
     let tcp = TcpStream::connect(SocketAddr::new(ip, port))
         .await
@@ -853,5 +877,34 @@ mod tests {
         assert!(verifier
             .verify_server_cert(&cert(&impostor), &[], &name, &[], now)
             .is_err());
+    }
+
+    /// 中转端点的字面量（F-106）：**同一个地址的另一种写法**，但在指纹表里占独立键位。
+    ///
+    /// 这一条是整个中转方案的地基：端点上呈现的是被中转那台设备的证书，要是它与中转方
+    /// 自己的服务共用键位，`Trust::seed` 就会因为"同一地址两枚指纹"把那条路整个放弃
+    /// （退到 TOFU）—— 也就是把中转这一跳的身份校验悄悄关掉。
+    #[test]
+    fn relay_host_is_a_distinct_pinning_key() {
+        let host = relay_host("10.198.71.106").expect("IPv4 能转");
+        assert_eq!(host, "[::ffff:10.198.71.106]", "URL 主机必须带方括号");
+
+        let direct = parse_host("10.198.71.106").expect("直连字面量");
+        let relay = parse_host(&host).expect("带方括号的中转字面量也要认得");
+        assert_ne!(
+            direct, relay,
+            "两者必须是**不同的键**，否则同一地址上钉两枚指纹 → 不钉 → TOFU"
+        );
+        assert!(
+            matches!(relay, StdIpAddr::V6(v6) if v6.to_ipv4_mapped() == Some("10.198.71.106".parse().unwrap())),
+            "键位是 IPv4 映射的 IPv6，地址还是同一个: {relay:?}"
+        );
+
+        // 非 IPv4 的字面量（域名/垃圾）不产出中转主机：这条路上我们只认 IPv4。
+        assert!(relay_host("example.com").is_none());
+        assert!(relay_host("").is_none());
+        assert!(parse_host("[::ffff:10.198.71.106]").is_some());
+        assert!(parse_host("10.198.71.106").is_some());
+        assert!(parse_host("[]").is_none());
     }
 }

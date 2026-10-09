@@ -332,8 +332,8 @@ struct PeerDevice {
 #[derive(Serialize, Deserialize)]
 struct Settings {
     port: u16,                           // S-06 默认 3890
-    download_dir: PathBuf,               // S-01 默认桌面（唯一的落盘位置：下载 + 推送接收）
-    download_mode: DownloadMode,         // S-02 默认 Direct
+    download_dir: PathBuf,               // S-01 默认桌面（默认落盘位置：下载 + 推送接收；「每次询问」时未绑定那条可逐次挑根）
+    download_mode: DownloadMode,         // S-02 默认 Direct；AskEachTime = 下载弹保存框 + 接收未绑定推送时弹目录框（取消即不落盘/拒绝）
     auto_start: bool,                    // S-04 默认 true
     device_name: String,                 // S-05 默认主机名；安卓没有主机名 → 取设备型号/厂商名
 }
