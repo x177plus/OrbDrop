@@ -2,12 +2,12 @@
   "version": "0.0.1",
   "versionCode": 1,
   "notes": "首个版本：局域网文件中转（拖入可见 / 推送两条通路），Windows 桌面端单文件 exe + Android（通用包 / arm64 包）。",
-  "pubDate": "2026-10-10T06:56:27Z",
+  "pubDate": "2026-10-10T07:20:16Z",
   "desktop": {
     "windows-x86_64": {
       "size": 13819904,
-      "sha256": "b43ddeac240000b958d02b896e2a1e4a90e1f04e33eaa2178de430d6bac8592d",
-      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NHZTUjNpSnlMVHJoNGxhNGFxcTV1SC93cWZvd2NHZzZsbjM0bzROWFV0ajVLd0JjQU9Xd2xlaFlvQ1ZaampFais5SzhnVmlIMDZsY1FCby94bjI3bEFVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNjE1Mzg3CWZpbGU6b3JiZHJvcC5leGUKSmZGM1FnYkRHK3FOTEhhZGFvc0Uyam5CUEllR1h6ZkJ6RmxucHVjRjd5UVJOVzdpb21sM0dEUEJOeFpDOTlod3AyaG9rY3VMVjBRNG52Mmp6ZExJQmc9PQo=",
+      "sha256": "9ab4d9f61f2e97c716a8484bbb9bedb664f8a88893ba89b9aa230ffae4c00684",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NHBnVDNGRkcvcnYvd0NxdFB0SzRvTzFSRTdMYi91ay9TemxYQjVXOUZDSndMUDdmUStQNWllSGc1dG90WlN1Sjl2Mmc4b1RXMFpiODhsaWFGdUcyeXdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNjE2ODE2CWZpbGU6b3JiZHJvcC5leGUKTHh1bnVyMGNLeTJLaU9CcG1SN3A0VjJtZWVxY1V4MVE4TERCUWd5dkFqOCtuL2RaVDlDTjdSQmNrdWJIeGdnLzVzdTVzMW9aZ1c4ZFhKNC9nRkRjQ0E9PQo=",
       "mirrors": [
         "https://github.com/x177plus/OrbDrop/releases/download/v0.0.1/orbdrop.exe",
         "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.1/orbdrop.exe"
