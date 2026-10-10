@@ -1631,3 +1631,186 @@ A/B 时把 `dist-mobile/assets/MobileApp-*.css` 的文本原样 `appendChild` �
   真回声服务器：验 403/401/404 三档、端点字面量（`[::ffff:` 前缀）、以及字节**真的搬过去又搬回来**。
 - 真机（两台手机在同一张被 AP 隔离的 Wi‑Fi 上、桌面端打开 S-09）：请求方直连探不通后经桌面端拿到
   端点、把那台设备判成在线（日志 `直连不通，改走中转` + 端点键位上的指纹钉住）；关掉开关 → 403、不再开。
+
+## 19. 收到消息的通知（F-108）
+
+### 目标
+
+人没看着屏幕的时候，收到对端消息要知道（"可以做到吗，应用在后台的话" —— 可以，见下）。
+一对一标题 = 设备名、正文 = 消息；群聊标题 = 群名、正文 = `发言人：内容`；点一下**直接进那条会话**。
+
+### 为什么通知在后端发，而不是界面发
+
+这是整件事的**唯一关键决定**。应用切到后台时，`WryActivity.onPause` 会 `webView.onPause()`
+（WebView 的 JS 定时器全停），界面本身也可能被系统回收；而后端一直在收消息。通知要是写成
+"前端 `listen('chat://changed')` 再调插件"，后台这一档正好是它最不可靠的那一档。
+
+所以通知从**消息落账那一步**发出（`ws::session::handle_inbound` 的 `ChatText` / `GroupText`），
+Rust → Kotlin 一路直达，不经过界面：
+
+- `src-tauri/src/notify.rs`：一个插件句柄 + `message()`。句柄在 `run()` 里注册插件时放进
+  `OnceLock`（`register_android_plugin("com.x177plus.orbdrop", "MessageNotifierPlugin")`）——
+  注册发生在 `setup` 之前，句柄只能在那一刻拿，所以没走 `AppState`。
+- `MessageNotifierPlugin.kt`：渠道、图标、点击要落到哪条会话，都是安卓那一侧的事。
+- 桌面端 `message()` 是空操作：桌面本来就有一块看得见的面板，右下角那组气泡说的是别的事
+  （推送与配对邀请），消息塞进去会把面板变成第二个通知中心。
+
+### 三处"不该响"
+
+1. **重复投递**：投递是"至少一次"（补发、重连重投、HTTP 到了但对端没来得及回话），同一条
+   消息响两遍比不响更烦人。判据是落账那一步的返回值 —— `ChatStore::record_inbound` 现在返回
+   `(bool, Snapshot)`（第一格 = 确实新记下），`group::on_group_text` 本来就返回 bool。
+2. **界面在眼前**：用户正看着聊天记录，角标也跳了，再响一声只是噪音。
+   `AppVisibility.foreground` 由 `MainActivity.onResume` / `onPause` 写 —— 后端只知道收到了消息，
+   不知道用户在看哪一屏。
+3. **没给通知权限**（Android 13+ 那次询问被拒）：`areNotificationsEnabled()` 为假时直接不发。
+
+### 两个渠道是故意分开的
+
+`orbdrop.keepalive`（`IMPORTANCE_LOW`、不可撤、点一下回应用）与 `orbdrop.messages`
+（`IMPORTANCE_HIGH`、可撤、点一下进会话）各是一条：用户可以在系统设置里**单独关掉消息提醒**，
+而"保持互联"那条照旧 —— 后台在线不跟着一起丢。
+
+### 一条会话一张卡
+
+通知 id = `-"orbdrop.msg:<kind>:<id>".hashCode()`：同一条会话连着来几条只更新那张卡（内容是最新
+那条），不堆成一排把别的应用的通知挤下去。**取负**是因为常驻通知用的是正数 id（1701）——
+撞上会把"我正在运行"那条顶掉。
+
+### 点通知进会话：只带 `kind` + `id`
+
+后端带 `kind`（`dev` / `grp`）+ 后端那份 id，**不带**前端那串会话键（`dev:` / `grp:`）：键的拼法
+是界面的约定，后端复制一份就成了两处得同时改的东西。界面拿这两样自己拼（`chat.convoKeyOf`）。
+交付走的是与返回键同一条路（原生问界面）：`MainActivity.deliverPendingConvo` 调
+`window.__orbdropOpen(kind, id)`，界面回 `true` 表示进去了。
+
+### 坑
+
+- **Rust 叫 Kotlin 那条路会 panic，而 release 档是 `panic = "abort"`**：wry 的 `dispatch`
+  在"一个 Activity 都不剩"时 `expect("no available activity")`，而本仓 `[profile.release]`
+  写着 `panic = "abort"` —— 直接整个进程倒地（连前台服务一起）。所以 Rust 那边记着一份
+  "界面还在不在"（`notify::set_ui_alive`，由 `Builder::on_window_event` 的
+  `Destroyed` / `Resumed` 翻转），界面没了就**不去碰那条会 panic 的原生调用** ——
+  消息照收、账照落，只是不再指望通知栏。
+- **交付要重试**：点通知那一刻界面可能还不存在（冷启动，Rust 那侧才刚开始建 WebView），
+  `window.__orbdropOpen` 是 `MobileApp` 挂上去的 —— 一次调用会石沉大海，用户看到的是
+  "点了通知，应用开了，却停在列表里"。所以每 300ms 问一次、最多约 6 秒；界面站起来就当场交付。
+  试完还没成**不清掉**那个目标：下一次 `onResume` 或新的通知重新试。
+- **`onNewIntent` 也要接**：Activity 是 `singleTask`，应用开着（哪怕在别的 tab）时点通知走的是
+  `onNewIntent` 而不是 `onCreate`（`onResume` 也不一定再派发一次）。
+- **`invoke.parseArgs` 的字段名就是 Rust 那侧 JSON 的键**（`kind`/`id`/`title`/`body`），
+  少一个就抛在 Kotlin 里、Rust 只看到一句 reject。
+
+### 校验
+
+- 单测：`chat::tests::a_redelivered_inbound_message_is_recorded_once`（重复投递不再算"新的"，
+  通知靠它去重）。
+- 真机（`adb shell dumpsys notification --noredact`）：应用切到后台 → 从另一台发一条消息 →
+  通知栏出现 `设备名 / 消息内容`，渠道 `orbdrop.messages`、`importance=HIGH`；应用切回前台再发
+  一条 → 不再出新的通知；同一条会话连发两条 → 只有一张卡、内容是最新那条；点通知 → 应用到前台
+  且落在那条会话上。
+
+## 20. 安卓：收件里的文件点开，APK 点一下就装（F-109）
+
+### 目标
+
+收件（`<下载目录>/<发送方名>/…`，见 `mobile::list_inbox`）里的东西点开要用系统应用打开；
+**`.apk` 那一档直接进系统安装器** —— "收到 APK 点一下直接装"。
+
+### 原来是废的（实测，不是推断）
+
+这一版之前，界面上那一项叫「打开」，后端 `open_path` 在移动端走 `tauri_plugin_opener`：
+
+1. Rust 侧移动分支是 `run_mobile_plugin("open", path.into())` —— 把路径当**裸字符串**发过去；
+2. Kotlin 侧 `OpenerPlugin.OpenArgs` 要的是 `{url, with}` 这个对象。
+
+于是 `parseArgs` 当场抛。拿同构的类 + 同一个 `ObjectMapper` 实测（`java -cp jackson-databind…`）：
+
+```
+MismatchedInputException: Cannot construct instance of `OpenArgs` (although at least one
+Creator exists): no String-argument constructor/factory method to deserialize from String
+value ('/storage/emulated/0/Download/app.apk')
+```
+
+也就是安卓上按「打开」**任何**文件都只会拿到 `打开失败：…`。（桌面端走 `open::that_detached`，
+没这回事 —— 所以只换移动端那条定义，见 `lib.rs` 里两份 `open_path`。）上游 `v2` 分支与 2.7.0
+里这行一模一样，升插件不会修好。
+
+就算参数形状对上也不够：它交给 `ACTION_VIEW` 的是**没有 scheme 的路径**、也不带 MIME ——
+系统解析不出任何 activity。
+
+### 怎么做
+
+- Kotlin 侧新插件 `FileOpenPlugin`（`gen/android/…/com/x177plus/orbdrop/`），Rust 侧
+  `mobile::open_file` 调它（与 `notify` 那条同款：`register_android_plugin` + 静态句柄 +
+  `run_mobile_plugin_async`）。
+- 递出去的是 `FileProvider` 的 `content://`：`getUriForFile(activity, "<包名>.fileprovider", file)`
+  + `setDataAndType(uri, mime)` + `FLAG_GRANT_READ_URI_PERMISSION`。少了那个读权限，接收方读不了
+  这份 URI —— 安装器会当场失败。
+- MIME 按扩展名问系统（`MimeTypeMap`），问不到给 `*/*`：让用户自己选"用什么打开"，与安卓惯例
+  一致（比"没有应用可执行此操作"有用）。`apk` 先钉死成 `application/vnd.android.package-archive`
+  —— 不依赖 ROM 自带那张表里有没有它。
+- **"安装"不是另一条路**：那个 MIME 正是系统安装器（PackageInstaller）认领的，`ACTION_VIEW`
+  一到就进安装界面。走它、而不是自己开 `PackageInstaller` 会话：后者要自己处理确认 UI 与
+  `REQUEST_INSTALL_PACKAGES` 的运行时语义；这里清单声明那条权限只为让
+  「设置 → 应用 → 特殊应用权限 → 安装未知应用」**能列出 OrbDrop**（只声明了它的应用才在列表里，
+  Android 8 起那个开关默认关着）。首装时系统自己引用户去开一次。
+- 手机端界面：收件行 → 文件操作表，`.apk` 的第一项写「安装」、其余写「打开」
+  （`FileActionsSheet.svelte` 的 `isApk`）。
+
+### 坑
+
+- **`path="."` 那种根是废的。** 模板原来那两条（`<external-path path="."/>`、`<cache-path path="."/>`）
+  写的是 `"."`，而 `File(根, ".")` 不消点段 —— 拼出来是 `<根>/.`；`getUriForFile` 里拿
+  `root.getPath()` 做 `startsWith` / `endsWith("/")` 比对，`<根>/.` 谁也匹配不上（会抛
+  `Failed to find configured root that contains …`）。所以 `path` **一律不写**（那两条也顺手改掉了）：
+  `buildPath` 跳过 null 段，根就是它自己（反编译 androidx 1.13.1 的 `FileProvider` 核对过：
+  `root-path → DEVICE_ROOT = File("/")`，`buildPath` 对 null 段直接跳过，`getUriForFile` 用
+  `endsWith("/")` 决定取 `substring(len)` 还是 `substring(len + 1)`）。
+- **收件目录在应用私有数据目录下**（`app_data_dir` + `OrbDrop/received`），FileProvider 预定义的
+  那几个根（`files-path` = `getFilesDir`、`cache-path` = `getCacheDir`、`external-*`）**一个都不覆盖
+  它** —— 这是非 `root-path` 不可的原因。怕太宽的话：这个 provider 是 `exported="false"` +
+  `grantUriPermissions="true"`，也不是 `DocumentsProvider`（给不出目录枚举），外部只能拿到我们主动
+  随 Intent 授出去的那**一个**文件的读权限。
+- **文件夹那一档**：`content://` 换不来一个能"浏览"它的应用，丢一个解析不出的 Intent 只会让用户
+  看到系统的"没有应用可执行此操作"。所以 Kotlin 里显式拒绝，给一句人话
+  （`这是文件夹：安卓上没有能打开应用私有目录的应用`）—— ui 侧拼出来是 `打开失败：…`。
+- **前端那条更要命：`onClose()` 之后 props 就读不到了。** `FileActionsSheet` 那三项动作原来是
+  `onClose(); await api.openPath(entry.path)` —— 表一关，这个组件的 props 当场变成 null，
+  实测界面上只会出一条 `复制路径失败：Cannot read properties of null (reading 'entry')`，
+  而「打开/安装」更安静：`entry.path` 在 `await` 求值那一刻就抛，命令**根本没发出去**，
+  连 toast 都没有（拒绝没人接）。所以三项动作都改成**先把要用的值取出来、再关表**。
+  以前没人撞见是因为后端那条路本来就坏着（上面那个 Jackson 的坑）—— 两个 bug 互相遮住了。
+- `invoke.parseArgs` 的字段名就是 Rust 那侧 JSON 的键（这里是 `path`），少一个就抛在 Kotlin 里、
+  Rust 只看到一句 reject。
+
+### 校验（真机实测：Meizu 17 / Android 13，界面那条路）
+
+构建与静态检查：`npm run build:mobile` 与 `npm run check`（svelte-check，138 文件 0 错）干净；
+`cargo check`（桌面）干净；`npx tauri android build --apk --debug --target aarch64` 与发行包
+`npx tauri android build --apk --target aarch64`（R8 + minify）都通过（Rust aarch64 + Kotlin + 清单合并）。
+发行包的 `classes.dex` 里 `FileOpenPlugin` / `OpenFileArgs` 都在：keep 规则来自 tauri-android 那份
+`proguard-rules.pro`（`@TauriPlugin` 类保 `@Command` 方法与公开构造、`@InvokeArg` 类整个保留）。
+
+**debug 包**（重签成发行密钥后 `adb install -r`，所以 `run-as` 可用，往收件目录里塞了真 APK 与一个 txt）：
+
+1. 收件页出现这两条；点那份 APK → 表里第一项就是**「安装」**（描述"交给系统安装器安装这个 APK
+   （首次需先允许 OrbDrop 安装未知应用）。"）；点 `note.txt` 那一档是「打开」+ "用系统应用打开这份文件。"；
+2. 点「安装」→ 界面上出 toast **"已交给系统安装器安装「Via-browser.apk」"**，系统安装器随即到前台
+   （`topResumedActivity=com.android.packageinstaller/.FlymePackageInstallerActivity`），界面上写着
+   **`Via` / 正在安装** —— 它能从 `content://` 里读出包名，说明 FileProvider 的根与那个读权限都对；
+   装完 `mark.via` 的 `lastUpdateTime` 变成刚刚、`codePath` 换到新的安装目录、`firstInstallTime` 不变
+   （是更新不是重装）；
+3. 同一个包里另外两项也过了一遍：「删除本地副本」→ 原生确认框 → OK → 文件从盘上与界面上同时消失；
+   「复制路径」仍然是失败的，但已经是**另一件事**：`复制路径失败：Document is not focused.`
+   （`navigator.clipboard` 在 webview 里要求文档有焦点；与本条需求无关，没动它）；
+4. 落盘之外的几档**不静默**（直接调命令验的）：文件夹 → `这是文件夹：安卓上没有能打开应用私有目录的应用`；
+   文件不在 → `文件不在了：<路径>`；非 APK → 系统的"打开方式"选择器（`ResolverActivity`）。
+
+**发行包**（minify 之后同一个包、同一个密钥的升级安装；`run-as` 已不可用，所以全走 `input tap`）：
+文件页 → 点 `Via-browser.apk` 那一行 → 表里点「安装」→ 活动栈里出现
+`com.android.packageinstaller/.FlymePackageInstallerActivity`，装完 `mark.via` 的 `lastUpdateTime`
+再次更新 —— **R8 之后这条路一样通**。
+
+> 界面上那些 toast 与错误是同一个出口（`store.failed` → `打开/安装失败：…`），所以凡是后端 reject
+> 的句子都会原样出现在收件页上。

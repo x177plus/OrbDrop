@@ -1,6 +1,6 @@
 {
   "name": "orbdrop",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "OrbDrop — LAN file sharing tool",
   "type": "module",
   "scripts": {
@@ -21,10 +21,14 @@
     "android:build:debug": "tauri android build --apk --debug",
     "android:release": "tauri android build --apk --target aarch64 && node scripts/install-android.mjs",
     "android:install": "node scripts/install-android.mjs",
+    "bump": "node scripts/bump-version.mjs",
+    "release": "node scripts/release.mjs",
+    "release:local": "node scripts/release.mjs --local --skip-build",
+    "mirror": "node scripts/dev-mirror.mjs",
     "commit": "omp commit -c \"摘要首词用英文过去式动词（Added、Fixed、Updated），其余摘要与全部明细用简体中文\"",
     "commit:dry": "npm run commit -- --dry-run"
   },
-  "license": "MIT",
+  "license": "GPL-3.0-or-later",
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",

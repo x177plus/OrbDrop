@@ -231,7 +231,10 @@ impl ChatStore {
     /// **按 id 幂等**：这条路的投递是"至少一次"（补发、重连后重投、HTTP 到了但对端没来得及
     /// 回话、进程中途被杀又重投），同一个 id 进来第二次不能再写一条 —— 否则对方一句"在吗"
     /// 会变成两句。已存在就整条不动（内容一样，`at` 是对方给的发送时刻，本来就该原样）。
-    pub fn record_inbound(&self, peer_id: &str, from_name: &str, id: &str, text: &str, at: u64) -> Snapshot {
+    ///
+    /// 返回值第一格是"这一条**确实新记下**"（重复投递 = `false`）：手机通知栏响不响看它
+    /// （见 `notify`）—— 同一条消息因为重投响第二遍，比不响更烦人。
+    pub fn record_inbound(&self, peer_id: &str, from_name: &str, id: &str, text: &str, at: u64) -> (bool, Snapshot) {
         let duplicate = {
             let guard = self.inner.lock();
             guard
@@ -241,7 +244,7 @@ impl ChatStore {
         };
         if duplicate {
             debug!(id, %peer_id, "inbound chat already recorded (redelivery)");
-            return self.snapshot();
+            return (false, self.snapshot());
         }
         {
             let mut guard = self.inner.lock();
@@ -259,7 +262,7 @@ impl ChatStore {
             prune(convo);
             persist(&self.path, &guard);
         }
-        self.snapshot()
+        (true, self.snapshot())
     }
 
     /// 把一条副本的送达状态落定（HTTP 兜底那一跳、补发那一跳回来时用）。
@@ -985,9 +988,12 @@ mod tests {
     #[test]
     fn a_redelivered_inbound_message_is_recorded_once() {
         let s = store("dedupe");
-        s.record_inbound("a", "PC-A", "m1", "在吗", 100);
+        let (first, _) = s.record_inbound("a", "PC-A", "m1", "在吗", 100);
         s.record_inbound("a", "PC-A", "m2", "在不", 200);
-        let snap = s.record_inbound("a", "PC-A", "m1", "在吗", 100);
+        let (again, snap) = s.record_inbound("a", "PC-A", "m1", "在吗", 100);
+
+        assert!(first, "头一次投递是新的一条");
+        assert!(!again, "重复投递不是新的（手机那边靠它决定通不通知）");
 
         let convo = snap.convos.iter().find(|c| c.peer_id == "a").unwrap();
         assert_eq!(convo.messages.len(), 2, "重复投递不再写一条");

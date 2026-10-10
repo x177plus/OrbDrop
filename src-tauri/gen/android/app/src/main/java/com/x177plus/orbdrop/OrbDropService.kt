@@ -7,6 +7,11 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
@@ -21,36 +26,53 @@ import androidx.core.app.NotificationCompat
  * 谁推过来的文件都收不到（还不会补投：推送不排队，见 F-53）。前台服务 + 一条常驻通知
  * 是安卓给"我正在为用户做一件持续的事"的标准答案，也是唯一能把进程留在后台的办法。
  *
+ * 这一版把"尽量活着"这件事做到底，四件事缺一不可：
+ *  1. **类型选 `connectedDevice`**（清单里）：`dataSync` 在 Android 15 上每 24 小时只给 6 小时，
+ *     到点被系统停掉；`connectedDevice` 没有这个上限。
+ *  2. **`START_STICKY`**：被系统回收后自己回来。
+ *  3. **两把 Wi-Fi 锁**（组播锁 + 高性能锁）：灭屏、后台时不让 Wi-Fi 芯片睡过去 ——
+ *     组播锁是 mDNS 收得到的前提，高性能锁是连接不掉的前提。
+ *  4. **网络回调**：Wi-Fi 关掉再打开时系统会把锁收回去，得在网络恢复的那一刻重新拿。
+ *
  * 通知**不带按钮**：它的作用是"让系统别杀我"，不是给用户操作入口；点一下把应用调回前台即可。
  * 渠道重要性用 LOW：不响、不震、不在锁屏上亮 —— 一条常驻的"正在运行"提示而已。
+ *
+ * **有意的取舍**：不做电池优化（Doze）白名单引导 —— 用户没点那个开关就被系统在 Doze 里
+ * 切断网络、甚至回收进程，属于"被杀了就被杀了"的可接受结果；这里的全部努力只是把
+ * 能活的时间尽量拉长，且不给用户弹任何东西。
  */
 class OrbDropService : Service() {
   /** Wi-Fi 组播锁（P1-13①）：生命周期 = "应用在局域网上活着"，正是这条服务的意义。 */
   private var multicastLock: WifiManager.MulticastLock? = null
+
+  /** Wi-Fi 高性能锁：灭屏/后台时别让 Wi-Fi 进省电档（掉包、断连的常见根因）。 */
+  private var wifiLock: WifiManager.WifiLock? = null
+
+  /** Wi-Fi 网络回调：关开 Wi-Fi 后重新拿锁（见 [watchWifi]）。 */
+  private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onCreate() {
     super.onCreate()
     ensureChannel()
-    acquireMulticastLock()
+    acquireLocks()
+    watchWifi()
   }
 
   override fun onDestroy() {
-    // 服务没了（用户退应用/被系统回收）才还回去：它是**进程内**的资源，留着不放会让 Wi-Fi
-    // 芯片一直收组播（耗电）。
-    multicastLock?.let { lock ->
-      if (lock.isHeld) runCatching { lock.release() }
-    }
-    multicastLock = null
+    // 服务没了（用户退应用/被系统回收）才还回去：它们是**进程内**的资源，留着不放会让 Wi-Fi
+    // 芯片一直全速（耗电）。
+    unwatchWifi()
+    releaseLocks()
     super.onDestroy()
   }
 
   /**
-   * 拿 Wi-Fi 组播锁（P1-13①）。
+   * 拿两把 Wi-Fi 锁（幂等：已经握着就跳过）。
    *
    * 安卓的 Wi-Fi 驱动默认**过滤组播帧**（省电），而 mDNS 的发现应答全走组播 ——
-   * 没有这把锁时本机发得出去、收不回来，表现就是设备列表永远空着（只能手动敲 IP）。
+   * 没有组播锁时本机发得出去、收不回来，表现就是设备列表永远空着（只能手动敲 IP）。
    * 权限是 `CHANGE_WIFI_MULTICAST_STATE`（清单里已声明）。
    *
    * **为什么在服务里而不是 `MainActivity`**：锁要的是"应用在网上的这段时间"，而界面走得
@@ -58,27 +80,122 @@ class OrbDropService : Service() {
    * 锁跟着界面一放，mDNS 就再也收不到任何东西，而且**看不出任何异常**：设备表停在原地、
    * 地址学不到、面板永远显示旧状态。真机上"明明能发消息，设备行却一直是 `:0`"就是这一条。
    *
-   * Wi-Fi 关着时 `acquire()` 不会报错（等于没拿），用户打开 Wi-Fi 之后需要重新触发 ——
-   * 所以这里对失败/无 Wi-Fi 都只记一行日志，不打断启动。
+   * Wi-Fi 关着时 `acquire()` 不会报错（等于没拿）；Wi-Fi 关掉时系统会把这两把锁**自动收回**，
+   * 所以恢复联网后必须重拿 —— 由 [watchWifi] 的回调负责。这里对失败只记一行日志，不打断启动。
    */
-  private fun acquireMulticastLock() {
-    if (multicastLock?.isHeld == true) return
+  private fun acquireLocks() {
     val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
     if (wifi == null) {
-      Log.w(LOCK_TAG, "没有 WIFI_SERVICE：跳过组播锁")
+      Log.w(TAG, "没有 WIFI_SERVICE：跳过 Wi-Fi 锁")
       return
     }
-    multicastLock = wifi.createMulticastLock(LOCK_TAG).apply {
-      // 不去数引用：拿一次、放一次，重复调 `acquire()` 不该需要配平。
-      setReferenceCounted(false)
-      runCatching { acquire() }.onFailure { Log.w(LOCK_TAG, "组播锁获取失败：${it.message}") }
+    // 组播锁。对象只造一次，之后按 isHeld 补拿（系统在 Wi-Fi 关闭时收回后 isHeld 会变回 false）。
+    if (multicastLock == null) {
+      multicastLock = wifi.createMulticastLock(LOCK_TAG).apply {
+        // 不去数引用：拿一次、放一次，重复调 `acquire()` 不该需要配平。
+        setReferenceCounted(false)
+      }
+    }
+    multicastLock?.let { lock ->
+      if (!lock.isHeld) {
+        runCatching { lock.acquire() }.onFailure { Log.w(TAG, "组播锁获取失败：${it.message}") }
+      }
+    }
+
+    // 高性能 Wi-Fi 锁。`WIFI_MODE_FULL_HIGH_PERF` 自 API 29 起标记废弃，但语义（"别让 Wi-Fi
+    // 睡过去"）正是我们要的，且仍然生效；替代项 LOW_LATENCY 是给实时音视频的，语义不符。
+    if (wifiLock == null) {
+      @Suppress("DEPRECATION")
+      wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, WIFI_LOCK_TAG).apply {
+        setReferenceCounted(false)
+      }
+    }
+    wifiLock?.let { lock ->
+      if (!lock.isHeld) {
+        runCatching { lock.acquire() }.onFailure { Log.w(TAG, "Wi-Fi 锁获取失败：${it.message}") }
+      }
     }
   }
 
+  /** 放掉 [acquireLocks] 拿的两把锁。 */
+  private fun releaseLocks() {
+    multicastLock?.let { if (it.isHeld) runCatching { it.release() } }
+    multicastLock = null
+    wifiLock?.let { if (it.isHeld) runCatching { it.release() } }
+    wifiLock = null
+  }
+
+  /**
+   * 监听 Wi-Fi 的可用性，恢复时重新拿锁。
+   *
+   * 为什么需要：用户关掉 Wi-Fi 再打开（或换热点）时，系统会把上一轮的组播锁/Wi-Fi 锁收回 ——
+   * 现在没有这一步的话，服务活着但 mDNS 从此收不到任何东西，**且不报任何错**（设备表停住、
+   * 地址学不到）。`onAvailable` 是"Wi-Fi 又通了"的时刻，在这里重拿即可。
+   *
+   * 只关心 `TRANSPORT_WIFI`：以太网/蜂窝不在本应用的场景内。
+   */
+  private fun watchWifi() {
+    if (networkCallback != null) return
+    val cm = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+    if (cm == null) {
+      Log.w(TAG, "没有 CONNECTIVITY_SERVICE：跳过网络回调")
+      return
+    }
+    val cb = object : ConnectivityManager.NetworkCallback() {
+      override fun onAvailable(network: Network) {
+        acquireLocks()
+      }
+    }
+    val request = NetworkRequest.Builder()
+      .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+      .build()
+    runCatching { cm.registerNetworkCallback(request, cb) }
+      .onSuccess { networkCallback = cb }
+      .onFailure { Log.w(TAG, "网络回调注册失败：${it.message}") }
+  }
+
+  /** 撤掉 [watchWifi] 注册的回调。 */
+  private fun unwatchWifi() {
+    val cb = networkCallback ?: return
+    networkCallback = null
+    val cm = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+    runCatching { cm.unregisterNetworkCallback(cb) }
+  }
+
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-    startForeground(NOTIFICATION_ID, buildNotification())
+    val notification = buildNotification()
+    try {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        // Android 14+ 起 `startForeground` 必须带上类型，且要与清单里声明的一致。
+        startForeground(
+          NOTIFICATION_ID,
+          notification,
+          ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+        )
+      } else {
+        startForeground(NOTIFICATION_ID, notification)
+      }
+    } catch (e: Exception) {
+      // 极端情况下（后台启动限制）会抛 `ForegroundServiceStartNotAllowedException`。那就别赖着
+      // 不走 —— 被判"没在 5 秒内 startForeground"会崩掉整个进程，比丢连接更糟；交给系统别的
+      // 重启策略（START_STICKY）去处理。
+      Log.w(TAG, "startForeground 失败：${e.message}")
+      stopSelf()
+    }
     // 被系统回收之后自己回来：这条服务的全部意义就是"别让进程死掉"，START_STICKY 是它的前提。
     return START_STICKY
+  }
+
+  /**
+   * Android 15 的前台服务超时回调。
+   *
+   * 只对 `dataSync` / `mediaProcessing` / `shortService` 计时，我们用 `connectedDevice`，
+   * 正常永远不会触发。留着是防呆：一旦哪天类型被改回计时的那几种，这里若不主动 `stopSelf()`，
+   * 会被系统判成"超时未停"并抛 `RemoteServiceException` 崩掉整个进程。
+   */
+  override fun onTimeout(startId: Int, fgsType: Int) {
+    Log.w(TAG, "前台服务超时（type=$fgsType）：主动停止，避免进程崩溃")
+    stopSelf(startId)
   }
 
   private fun ensureChannel() {
@@ -119,12 +236,19 @@ class OrbDropService : Service() {
   }
 
   companion object {
-    /** 组播锁的名字（`dumpsys wifi` 里能看到它；与 `MainActivity` 的日志 tag 同一个串）。 */
-    const val LOCK_TAG = "orbdrop-mdns"
+    /** 日志 tag；与 `MainActivity.TAG` 同一串（`adb logcat -s orbdrop-mdns` 一处看全）。 */
+    private const val TAG = "orbdrop-mdns"
+
+    /** 组播锁的名字（`dumpsys wifi` 里能看到它；与上面的日志 tag 同一个串）。 */
+    const val LOCK_TAG = TAG
+
+    /** 高性能 Wi-Fi 锁的名字（`dumpsys wifi` 里能看到它）。 */
+    const val WIFI_LOCK_TAG = "orbdrop-wifi"
+
     private const val CHANNEL_ID = "orbdrop.keepalive"
     private const val NOTIFICATION_ID = 1701
 
-    /** 起服务（幂等：重复调不会叠出第二条通知）。 */
+    /** 起服务（幂等：重复调不会叠出第二条通知）。由 `MainActivity.onCreate` 调用。 */
     fun start(context: Context) {
       val intent = Intent(context, OrbDropService::class.java)
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

@@ -244,18 +244,34 @@ export async function selectBrowsePeer(peerId: string): Promise<void> {
   await loadBrowseShares();
 }
 
+/**
+ * 收掉整个浏览状态：正在浏览的那台不在可浏览集合里了（掉线 / 断开长连接）时由界面调用。
+ * 留着选中会让底下列着已经读不到的旧共享项 —— 设备都没了，那份数据不该再挂在那儿。
+ */
+export function clearBrowsePeer(): void {
+  browsePeer = null;
+  browseShares = [];
+  browseChildren = {};
+  browseError = null;
+  browseLoading = false;
+}
+
 export async function loadBrowseShares(): Promise<void> {
   const peerId = browsePeer;
   if (!peerId) return;
   browseLoading = true;
   browseError = null;
   try {
-    browseShares = await api.peerShares(peerId);
+    const items = await api.peerShares(peerId);
+    // 期间换了设备（或被 `clearBrowsePeer` 收掉）：这一份属于上一个 peer，作废。
+    if (browsePeer !== peerId) return;
+    browseShares = items;
   } catch (e) {
+    if (browsePeer !== peerId) return;
     browseShares = [];
     browseError = e instanceof Error ? e.message : String(e);
   } finally {
-    browseLoading = false;
+    if (browsePeer === peerId) browseLoading = false;
   }
 }
 

@@ -5,7 +5,8 @@
   import Hint from '$lib/components/Hint.svelte';
   import Logo from '$lib/components/Logo.svelte';
   import { getSettings, loadSettings, updateSettings } from '$lib/stores/settings.svelte';
-  import { formatFileSize } from '$lib/types';
+  import * as upd from '$lib/stores/update.svelte';
+  import { formatFileSize, updateStatusText } from '$lib/types';
   import type { OrbShape, RectPage, RelayTraffic } from '$lib/types';
   import Orb from '$lib/components/Orb.svelte';
   import RectOrb from '$lib/components/RectOrb.svelte';
@@ -85,6 +86,43 @@
   /** 「清空全部凭据」的二次确认：点一下变成确认条，再点才真删。 */
   let wipeArmed = $state(false);
   let wiping = $state(false);
+  /** 「检查更新」这颗按钮按住期间（后端在跑，事件会先把状态推过来）。 */
+  let checking = $state(false);
+
+  /**
+   * 自更新那一份状态：**不是设置项** —— 它不由 `update_settings` 写，也不参与 `save()`，
+   * 归后端的 `update::UpdateState` 管（事件 `update://state` 推过来）。这里只读它来画。
+   */
+  const update = $derived(upd.getUpdateState());
+  /** 后端正在忙（检查/下载/校验/落地）：重复点没有意义，按钮按住。 */
+  const updateBusy = $derived(
+    update != null && ['checking', 'downloading', 'verifying', 'applying'].includes(update.phase),
+  );
+  /** 下载进度百分比（不知道总长时是 0，界面退化成"已下载多少"）。 */
+  const updatePct = $derived(
+    update?.size ? Math.min(100, Math.round((update.received / update.size) * 100)) : 0,
+  );
+
+  async function checkUpdateNow() {
+    checking = true;
+    try {
+      await upd.checkUpdate(true);
+    } catch (e: any) {
+      // 检查失败是**用户主动要求的结果**，必须弹出来（启动那次静默检查失败是不弹的）。
+      onToast(`检查更新失败：${String(e)}`);
+    } finally {
+      checking = false;
+    }
+  }
+
+  async function installUpdateNow() {
+    try {
+      await upd.installUpdate();
+    } catch (e: any) {
+      console.error('Update install failed:', e);
+      onToast(`更新失败：${String(e)}`);
+    }
+  }
 
   async function wipeNow() {
     wiping = true;
@@ -134,6 +172,8 @@
   }
 
   onMount(() => {
+    // 订阅一次自更新状态（重复调用没有副作用）：设置面板是唯一能看到"有新版 / 下载进度"的地方。
+    void upd.watchUpdate();
     loadSettings().then(() => {
       const s = getSettings();
       if (s) {
@@ -403,6 +443,49 @@
         </span>
       {:else}
         <span style="font-size:var(--fs-sm); color:var(--muted);">还没有替别人中转 —— 有设备借本机中转之后才会有</span>
+      {/if}
+    </div>
+    <!-- 版本与更新：与上面那些设置项不同，它**不走** `update_settings`、也不参与 `save()` ——
+         它是"看 + 点"的一格（与下面「配对凭据」同一个性质），状态由后端推。 -->
+    <div class="field">
+      <label>版本与更新<Hint>
+        更新包**先试 GitHub、连不上或太慢（几 KB/s）自动切 Gitee**，两条都是同一个包。<br />
+        装之前会校验 sha256 与开发者签名：签名对不上的一律拒装（发布仓被换包也装不进来）。<br />
+        桌面端是<strong>单文件 exe</strong>：更新时用新版本覆盖当前这个文件并自动重启，更新完
+        依旧只有一个 exe（设置、日志、传输记录都在数据目录里，不受影响）。<br />
+        安卓端下的是 APK，装的时候系统会弹一次确认 —— 非系统应用不能静默安装。
+      </Hint></label>
+      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        <span style="font-size:var(--fs-sm); color:var(--muted);">当前 v{update?.current ?? '…'}</span>
+        <button
+          class="btn btn-secondary btn-sm"
+          onclick={checkUpdateNow}
+          disabled={checking || updateBusy}
+        >
+          {checking ? '检查中…' : '检查更新'}
+        </button>
+        {#if update?.phase === 'available'}
+          <button class="btn btn-primary btn-sm" onclick={installUpdateNow} disabled={upd.isApplying()}>
+            {upd.isApplying() ? '准备中…' : '立即更新'}
+          </button>
+        {/if}
+      </div>
+      {#if update?.phase === 'available'}
+        <span style="font-size:var(--fs-sm); color:var(--muted);">
+          有新版 v{update.version}{update.size ? ` · ${formatFileSize(update.size)}` : ''}{update.notes ? ` · ${update.notes}` : ''}
+        </span>
+      {/if}
+      {#if update?.phase === 'downloading' || update?.phase === 'verifying'}
+        <div style="height:6px; border-radius:3px; background:var(--fg-soft); overflow:hidden;">
+          <div style="height:100%; width:{updatePct}%; background:var(--accent); transition:width .15s linear;"></div>
+        </div>
+      {/if}
+      {#if update && updateStatusText(update)}
+        <span
+          style="font-size:var(--fs-sm); color:{update.phase === 'error' ? 'var(--danger)' : 'var(--muted)'};"
+        >
+          {updateStatusText(update)}
+        </span>
       {/if}
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->

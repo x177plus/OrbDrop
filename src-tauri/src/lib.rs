@@ -19,6 +19,9 @@ pub mod mirror;
 #[cfg(mobile)]
 pub mod mobile;
 pub mod net;
+// 收到消息时手机通知栏里那一条（F-108）：桌面端是空操作，模块本身两平台都有
+// （收消息那条路是共用的，调用点不该被 `cfg` 切成两半）。
+pub mod notify;
 #[cfg(desktop)]
 pub mod orb_window;
 pub mod pair;
@@ -34,6 +37,7 @@ pub mod task;
 pub mod tray;
 pub mod transfer;
 pub mod unsendable;
+pub mod update;
 pub mod ws;
 
 use std::path::{Path, PathBuf};
@@ -1685,11 +1689,26 @@ async fn download_and_open(
 ///
 /// 不用 `reveal_item_in_dir`：那是"在父目录里高亮这一项"（还要再点一下才进去），
 /// 而这里按的就是"打开目录"。
+///
+/// 移动端是**另一份定义**（下面那一条）：收件落在应用私有目录里，`file://` 递不出去
+/// （安卓 7 起直接抛 `FileUriExposedException`），那边要的是 FileProvider 的 `content://`，
+/// 而且 `.apk` 还得落到系统安装器上（F-109）。
+#[cfg(not(mobile))]
 #[tauri::command]
 async fn open_path(path: String, app: AppHandle) -> Result<(), String> {
     app.opener()
         .open_path(path, None::<&str>)
         .map_err(|e| e.to_string())
+}
+
+/// 移动端的 `open_path`（同一条命令；上面那份说明里除了"打开方式"都还适用）。
+///
+/// `content://`（FileProvider，根声明在 `res/xml/file_paths.xml`）+ 按扩展名给的 MIME：
+/// **`.apk` 那一档因此落到系统安装器上 —— 收到 APK 点一下就直接装**（F-109）。
+#[cfg(mobile)]
+#[tauri::command]
+async fn open_path(path: String) -> Result<(), String> {
+    mobile::open_file(path).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2215,6 +2234,27 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init());
 
+    // 收到消息的通知（F-108）：只有手机有通知栏。注册得在 `setup` 之前 —— 句柄在那一刻
+    // 才拿得到，而收消息可能在 `setup` 之后任何一刻发生。
+    #[cfg(mobile)]
+    let builder = builder.plugin(notify::plugin());
+
+    // 「用系统应用打开一个文件」在安卓上得自己递（`content://` + MIME），TAURI 那个 opener 插件
+    // 的移动端分支是坏的 —— 见 `mobile::open_file`。
+    #[cfg(mobile)]
+    let builder = builder.plugin(mobile::open_plugin());
+
+    // 界面（Activity / WebView）还在不在：安卓把 Activity 销毁之后，Rust 叫 Kotlin 那条路
+    // （wry 的 `dispatch`）会 panic，而 release 档 `panic = "abort"` 是整个进程倒地 ——
+    // 见 `notify::set_ui_alive`。这里只记账，判断在发通知那一步。
+    #[cfg(mobile)]
+    let builder = builder.on_window_event(|_window, event| match event {
+        tauri::WindowEvent::Destroyed => notify::set_ui_alive(false),
+        // 界面又回来了（换配置重建、从最近任务点回来）：通知这条路跟着恢复。
+        tauri::WindowEvent::Resumed => notify::set_ui_alive(true),
+        _ => {}
+    });
+
     // 桌面端：数据目录随时可得，状态在这里就建好，命令与 setup 都能直接用。
     #[cfg(desktop)]
     let builder = builder.manage(boot_state());
@@ -2317,6 +2357,10 @@ pub fn run() {
             orb_set_hit_region,
             #[cfg(desktop)]
             orb_save_center,
+            // 自更新（桌面端 + 安卓端同一套，见 `src/update/`）。
+            update::update_state,
+            update::update_check,
+            update::update_apply,
         ])
         .setup(|app| {
             // 移动端：应用私有目录只有 Tauri 的平台插件知道，所以状态推迟到这里建 —— 先把
@@ -2345,6 +2389,11 @@ pub fn run() {
             // Store the AppHandle so WS events can be emitted.
             let state_arc = app.state::<Arc<AppState>>();
             *state_arc.app_handle.lock() = Some(app.handle().clone());
+
+            // 自更新：填本机版本、清上次更新留下的残渣、安排一次静默检查（延迟 8 秒）。
+            // 放在这里而不是更早：两条平台路径的状态都已经建好（上面 desktop 的
+            // `boot_state` / mobile 的私有目录那条），`update` 里要读配置也读得到。
+            update::init(app.handle());
 
             // 透明无边框窗口在 Win11 上会带一条系统绘制的 1px 边框（沿 OS 圆角露在面板外，
             // 每次改窗口尺寸重画 → 表现为窗口最外缘闪烁的线），启动时抹掉。

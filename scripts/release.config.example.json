@@ -1,0 +1,39 @@
+{
+  "$说明": "发布配置模板（提交进仓库）。复制成 scripts/release.local.json 后填本机信息；release.local.json 已 gitignore。token 不写进文件，只从 tokenEnv 指的环境变量读。",
+  "$必读": "github/gitee 的 owner+repo 必须与客户端**编译期常量**一致（src-tauri/src/update/mod.rs 的 MANIFEST_ENDPOINTS 写死的是 github.com/x177plus/OrbDrop 与 gitee.com/x177plus/OrbDrop）；填错的话清单地址与资产 URL 会指到别的仓库，客户端永远读不到更新。",
+  "$字段": {
+    "releasesRepo": "发布仓路径；相对路径按源码仓根目录解析（'../OrbDrop-releases' 就是旁边那个目录）",
+    "github/gitee.owner+repo": "发布仓在 GitHub/Gitee 上的账号与仓库名；owner 为空时只能用 --local 演练",
+    "github/gitee.remote": "发布仓里的 git 远端名（git remote add 时用的名字）",
+    "github/gitee.tokenEnv": "去哪读 token（环境变量名）",
+    "gitee.manifestBranch": "客户端读 Gitee 清单走 raw/<分支>/update.json，这个分支必须是发布仓的默认分支",
+    "signingKeyPath": "tauri 更新签名私钥（不在仓库里）；公钥已编译进 Rust，换了私钥客户端就得重发",
+    "localMirrorBase": "--local 演练时清单里 mirrors 的前缀（scripts/dev-mirror.mjs 默认就监听它）",
+    "notes": "远端发布时如果没给 --notes，用这个当更新说明；留空则远端模式强制要求 --notes",
+    "artifacts": "三种产物的构建输出路径（客户端认的固定文件名在清单 mirrors 里，别改 basename）"
+  },
+  "releasesRepo": "../OrbDrop-releases",
+  "github": {
+    "owner": "x177plus",
+    "repo": "OrbDrop",
+    "remote": "github",
+    "tokenEnv": "GITHUB_TOKEN"
+  },
+  "gitee": {
+    "owner": "x177plus",
+    "repo": "OrbDrop",
+    "remote": "gitee",
+    "tokenEnv": "GITEE_TOKEN",
+    "manifestBranch": "master"
+  },
+  "tagPrefix": "v",
+  "signingKeyPath": "C:/Users/<你的用户名>/.tauri/orbdrop.key",
+  "signingKeyPassword": "",
+  "localMirrorBase": "http://127.0.0.1:8788",
+  "notes": "",
+  "artifacts": {
+    "desktopExe": "src-tauri/target/release/orbdrop.exe",
+    "androidUniversalApk": "src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk",
+    "androidArm64Apk": "src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release.apk"
+  }
+}

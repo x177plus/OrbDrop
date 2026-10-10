@@ -1,6 +1,7 @@
 package com.x177plus.orbdrop
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -11,6 +12,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import org.json.JSONObject
 
 /**
  * 返回键先问界面，界面说"没有了"才退出应用。
@@ -40,6 +42,17 @@ import androidx.core.view.WindowInsetsCompat
 class MainActivity : TauriActivity() {
   private var webView: WebView? = null
 
+  /**
+   * 点**消息通知**进来时要落在哪条会话（`MessageNotifierPlugin` 写进 intent 的 extras）。
+   *
+   * 交付成功（界面回 `true`）就清空；交付不了（界面还没起来）就留着，下一次 `onResume`
+   * 或新的通知再试 —— 见 [deliverPendingConvo]。
+   */
+  private var pendingConvo: Pair<String, String>? = null
+
+  /** [deliverPendingConvo] 已经试了几次（每个新的触发点重置，见那里的说明）。 */
+  private var convoAttempts = 0
+
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
@@ -50,6 +63,10 @@ class MainActivity : TauriActivity() {
     // （表现：设备列表不再更新、地址再也学不到；真机上查了半天就是这个）。
     OrbDropService.start(this)
     requestNotificationPermissionIfNeeded()
+
+    // 点消息通知把应用拉起来的那一次：通知里带着"要进哪条会话"。冷启动时界面（WebView 与
+    // `MobileApp`）都还在路上，所以这里只记下来，由 `onResume` 去交付（见 `deliverPendingConvo`）。
+    pendingConvo = convoOf(intent)
 
     // 系统栏/软键盘的 inset 从 decorView 上读（值还没被下游消费，见 `applyInsetsAsMargins`）。
     // **不吃掉**（返回原 insets）：系统的与 AppCompat 自己的那套处理照旧。
@@ -83,10 +100,84 @@ class MainActivity : TauriActivity() {
     // WebView 是建在这里的（Rust 那边 `setContentView`），而 inset 是在窗口刚起来时就派发的 ——
     // 补一次派发，免得第一帧少了状态栏那份留白。
     ViewCompat.requestApplyInsets(window.decorView)
+    // 界面刚出现：点通知进来的那条会话此刻才交得出去（`MobileApp` 还没挂上时它会自己重试）。
+    deliverPendingConvo()
+  }
+
+  /**
+   * 提醒那一条要不要出，看的就是这个标记（见 `AppVisibility`）：界面在眼前时不响。
+   *
+   * 交付"点通知要进的会话"也挂在 `onResume`：冷启动与从最近任务回来都会经过它，
+   * 而那时界面才可能已经挂好。
+   */
+  override fun onResume() {
+    super.onResume()
+    AppVisibility.foreground = true
+    convoAttempts = 0
+    deliverPendingConvo()
+  }
+
+  override fun onPause() {
+    AppVisibility.foreground = false
+    super.onPause()
+  }
+
+  /**
+   * `singleTask` 的实例已经在运行时，点通知走的是这里（而不是 `onCreate`）：
+   * 应用开着（哪怕在别的 tab）、用户在通知栏里点了那条消息。
+   */
+  override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    convoOf(intent)?.let {
+      pendingConvo = it
+      convoAttempts = 0
+      deliverPendingConvo()
+    }
   }
 
   override fun onDestroy() {
     super.onDestroy()
+  }
+
+  /** intent 里那份"要进哪条会话"（没有 = 不是从消息通知进来的）。 */
+  private fun convoOf(intent: Intent?): Pair<String, String>? {
+    val kind = intent?.getStringExtra(EXTRA_CONVO_KIND) ?: return null
+    val id = intent.getStringExtra(EXTRA_CONVO_ID) ?: return null
+    return kind to id
+  }
+
+  /**
+   * 把"点通知要进的那条会话"交给界面（`window.__orbdropOpen`，与返回键那条路同一个套路：
+   * 原生问界面，界面回 `true` 表示它办到了）。
+   *
+   * **为什么要重试**：点通知那一刻界面可能还不存在（进程刚被拉起，Rust 那侧才刚开始建 WebView），
+   * 而 `window.__orbdropOpen` 是 `MobileApp` 挂上去的 —— 一次调用会石沉大海，用户看到的就是
+   * "点了通知，应用开了，却停在列表里"。所以每 300ms 问一次，最多约 6 秒；界面一旦站起来
+   * 就当场交付。试完还没成也**不清掉**：下一次 `onResume` 或新的通知会重新试。
+   */
+  private fun deliverPendingConvo() {
+    val target = pendingConvo ?: return
+    val (kind, id) = target
+    val view = webView ?: return
+    val js = "window.__orbdropOpen ? window.__orbdropOpen(${JSONObject.quote(kind)}, ${JSONObject.quote(id)}) : false"
+    view.evaluateJavascript(js) { result ->
+      // 一轮跑完时目标可能已经不是它了：`onNewIntent` 与 `onResume` 会各叫一次（点通知那一刻
+      // 两个回调都在），晚到的那次回调不该再动（也不该把新目标当成自己交付过了）。
+      if (pendingConvo != target) return@evaluateJavascript
+      if (result?.trim() == "true") {
+        Log.i(TAG, "通知那条会话已交给界面：$kind/$id")
+        pendingConvo = null
+        convoAttempts = 0
+        return@evaluateJavascript
+      }
+      if (++convoAttempts <= CONVO_DELIVER_ATTEMPTS) {
+        view.postDelayed({ deliverPendingConvo() }, CONVO_DELIVER_INTERVAL_MS)
+      } else {
+        // 试满一轮还交不出去：应用开了却停在列表上，是用户唯一看得见的现象 —— 日志里留一句，
+        // 免得下次只能在"点了没反应"和"界面没起来"之间猜。
+        Log.w(TAG, "通知那条会话没交出去（界面还没起来？）：$kind/$id")
+      }
+    }
   }
 
   /**
@@ -103,9 +194,22 @@ class MainActivity : TauriActivity() {
       .onFailure { Log.w(TAG, "申请通知权限失败：${it.message}") }
   }
 
-  private companion object {
-    const val TAG = "orbdrop-mdns"
-    const val REQ_NOTIFICATIONS = 1701
+  companion object {
+    /**
+     * 消息通知带过来的"要进哪条会话"（`MessageNotifierPlugin` 写、这里读）。
+     *
+     * 只带"哪一种 + 后端那份 id"，不带界面那串会话键（`dev:` / `grp:`）—— 键是界面的约定，
+     * 交给 `window.__orbdropOpen` 那一侧去拼（`chat.convoKeyOf`）。
+     */
+    const val EXTRA_CONVO_KIND = "orbdrop.convo.kind"
+    const val EXTRA_CONVO_ID = "orbdrop.convo.id"
+
+    private const val TAG = "orbdrop-mdns"
+    private const val REQ_NOTIFICATIONS = 1701
+
+    /** 交付那条会话最多试几次、每次隔多久（见 [deliverPendingConvo]）。 */
+    private const val CONVO_DELIVER_ATTEMPTS = 20
+    private const val CONVO_DELIVER_INTERVAL_MS = 300L
   }
 
   /**

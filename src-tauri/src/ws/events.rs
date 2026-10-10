@@ -290,6 +290,12 @@ pub mod ui {
     /// `local_addresses`（左下角「端口 · IP」那一条）。载荷为空 —— 值由界面自己拉
     /// （一份真相，不来回传）。
     pub const LOCAL_ADDRESSES: &str = "local://addresses";
+    /// 自更新的状态变了（检查中 / 已是最新 / 有新版 / 下载进度 / 校验 / 落地 / 出错）。
+    ///
+    /// 载荷是**整份 `update::UpdateState` 快照**（含已下载字节数），与 `PUSH_PROGRESS`
+    /// 同一个取舍：进度是高频事件，增量事件会让前端自己攒状态，迟早对不上；快照每拍都全，
+    /// 界面只负责画。
+    pub const UPDATE_STATE: &str = "update://state";
     /// 会话状态变了（收到消息 / 自己发出 / 送达状态推进 / 已读 / 建群退群）。
     ///
     /// 载荷是**整份会话快照**（和 `chat_snapshot` 命令同一个形状）：会话是人的打字速度，

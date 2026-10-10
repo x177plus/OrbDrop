@@ -1,5 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider 允许对外授权的"根"。`getUriForFile` 只认声明在这里的根里的文件，
+     不在根里的会当场抛 IllegalArgumentException("Failed to find configured root that contains …")。
+
+     `root-path`（= 文件系统根 `/`）是给**收件目录里的文件**用的：安卓上收件目录落在应用私有
+     数据目录下（`app_data_dir` + `OrbDrop/received`，见 `config.rs::default_download_dir` 与
+     `lib.rs` 里写 `ORBDROP_DATA_DIR` 那一段），而 FileProvider 预定义的那几个根
+     （`files-path` = getFilesDir、`cache-path` = getCacheDir、`external-*`）**一个都不覆盖它**
+     —— 少了这一条，"打开收件里的文件"（含 APK 直装，F-109）连 `content://` 都换不出来。
+
+     为什么敢用根：这个 provider 是 `exported="false"` + `grantUriPermissions="true"`，别的应用
+     既拿不到 URI、也问不出目录（FileProvider 不是 DocumentsProvider，没有目录枚举）；我们只把
+     **用户自己点开的那一个文件**的只读权限随 Intent 授出去（见 `FileOpenPlugin.kt`）。
+
+     另外两条是 Tauri 模板留下的，本仓没有用到；模板给它们写的是 `path="."`，而那个写法其实
+     匹配不上任何文件：`File(根, ".")` 不消点段（同一条 `java.io.File` 逻辑，实测 `getPath()`
+     原样留着这个点段），于是根的字面串成了 `<根>/.`，而 `getUriForFile` 拿它做
+     `startsWith` / `endsWith("/")` 比对 —— `<根>/.` 谁也匹配不上，等于这条根不存在。
+     所以这里一律不写 `path`：`buildPath` 跳过 null 段（反编译 androidx 1.13.1 的 `FileProvider`
+     核对过），根就是它自己。 -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-  <external-path name="my_images" path="." />
-  <cache-path name="my_cache_images" path="." />
+  <external-path name="my_images" />
+  <cache-path name="my_cache_images" />
+  <root-path name="orbdrop_files" />
 </paths>

@@ -1,8 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import * as api from "$lib/api";
+  import { formatFileSize, updateStatusText } from "$lib/types";
   import type { AppSettings } from "$lib/types";
   import * as devices from "$lib/stores/devices.svelte";
+  import * as upd from "$lib/stores/update.svelte";
   import Icon from "../Icon.svelte";
   import * as store from "../store.svelte";
 
@@ -25,9 +27,44 @@
   let transferWorkers = $state("4");
   let transferBlockMb = $state("4");
 
-  // 「本机在线」用本地镜像而不是那份拉取结果：改它的唯一入口就是下面那颗开关，
+// 「本机在线」用本地镜像而不是那份拉取结果：改它的唯一入口就是下面那颗开关，
   // 失败要能弹回来，而拉取结果从拿到那一刻起就可能过期。
   let online = $state(true);
+
+  /**
+   * 自更新那份状态（后端 `update::UpdateState`，事件 `update://state` 推过来）。
+   *
+   * 与桌面端**共用同一个 store**：状态归后端，两端只是画法不同 —— 桌面那句"立即更新"会覆盖
+   * exe 并重启，手机这句要交给系统安装器。
+   */
+  const update = $derived(upd.getUpdateState());
+  const updateBusy = $derived(
+    update != null && ["checking", "downloading", "verifying", "applying"].includes(update.phase),
+  );
+  const updatePct = $derived(
+    update?.size ? Math.min(100, Math.round((update.received / update.size) * 100)) : 0,
+  );
+  let checking = $state(false);
+
+  async function checkUpdateNow(): Promise<void> {
+    checking = true;
+    try {
+      await upd.checkUpdate(true);
+    } catch (e) {
+      // 用户主动点的那次失败要说出来（启动时的静默检查失败不打扰）。
+      store.toast(`检查更新失败：${e instanceof Error ? e.message : String(e)}`, "download");
+    } finally {
+      checking = false;
+    }
+  }
+
+  async function installUpdateNow(): Promise<void> {
+    try {
+      await upd.installUpdate();
+    } catch (e) {
+      store.toast(`更新失败：${e instanceof Error ? e.message : String(e)}`, "download");
+    }
+  }
 
   const form = $derived(store.form());
 
@@ -52,6 +89,8 @@
   onMount(() => {
     // 每次进设置页重灌一次：后端可能被别的窗口/事件改过（端口被占后顺延、名字被裁剪）。
     online = devices.isLocalOnline();
+    // 自更新状态：订阅一次（重复调用没有副作用）。
+    void upd.watchUpdate();
     void load();
   });
 
@@ -256,6 +295,62 @@
           </div>
           <p class="shelp">只影响之后新添加的共享项；已经在列表里的开关一个都不动。</p>
         </div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-label"><span>版本与更新</span></div>
+      <div class="card gcard">
+        <div class="srow">
+          <div class="srow-top" style="justify-content:space-between;">
+            <span class="slabel">当前版本 v{update?.current ?? "…"}</span>
+            <button
+              class="btn btn-secondary btn-sm"
+              type="button"
+              disabled={checking || updateBusy}
+              onclick={() => void checkUpdateNow()}
+            >
+              {checking ? "检查中…" : "检查更新"}
+            </button>
+          </div>
+          <p class="shelp">
+            更新包先试 GitHub、连不上或太慢自动切 Gitee；装之前校验 sha256 与开发者签名。
+          </p>
+        </div>
+        {#if update?.phase === "available"}
+          <div class="srow">
+            <div class="srow-top" style="justify-content:space-between;">
+              <span class="slabel">v{update.version}{update.size ? ` · ${formatFileSize(update.size)}` : ""}</span>
+              <button
+                class="btn btn-primary btn-sm"
+                type="button"
+                disabled={upd.isApplying()}
+                onclick={() => void installUpdateNow()}
+              >
+                {upd.isApplying() ? "准备中…" : "下载并安装"}
+              </button>
+            </div>
+            <p class="shelp">
+              {update.notes ?? "下载完会打开系统安装器，需要你确认一次安装（非系统应用不能静默安装）。"}
+            </p>
+          </div>
+        {/if}
+        {#if update?.phase === "downloading" || update?.phase === "verifying"}
+          <div class="srow">
+            <div style="height:calc(6 * var(--u)); border-radius:calc(3 * var(--u)); background:var(--fg-soft); overflow:hidden;">
+              <div
+                style="height:100%; width:{updatePct}%; background:var(--accent); transition:width .15s linear;"
+              ></div>
+            </div>
+          </div>
+        {/if}
+        {#if update && updateStatusText(update)}
+          <div class="srow">
+            <p class="shelp" style="color:{update.phase === "error" ? "var(--danger)" : "var(--muted)"};">
+              {updateStatusText(update)}
+            </p>
+          </div>
+        {/if}
       </div>
     </div>
 

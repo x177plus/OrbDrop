@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, PickerFavorite, ChatSnapshot, InboxEntry, RelayTraffic } from './types';
+import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, PickerFavorite, ChatSnapshot, InboxEntry, RelayTraffic, UpdateState } from './types';
 import type { ScreenMetrics, ScreenRect } from './orbLayout';
 
 // Share management
@@ -32,6 +32,22 @@ export function getSettings(): Promise<AppSettings> {
 
 export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; downloadMode: string; deviceName: string; autoStart: boolean; bcExePath: string; autoBroadcastNew: boolean; groupRelay: boolean; allowRelay: boolean; relayMemory: boolean; transferWorkers: number; transferBlockMb: number }): Promise<AppSettings> {
   return invoke('update_settings', { req: s });
+}
+
+// 自更新（桌面端 + 安卓端共用同一套后端逻辑，见 `src-tauri/src/update/`）。
+// 三条命令都只是"发起"：真正的进展靠 `update://state` 事件推回来（整份快照）。
+export function updateState(): Promise<UpdateState> {
+  return invoke('update_state');
+}
+
+/** `force = true`（用户手动点）忽略后端的静默检查缓存与镜像记忆。 */
+export function updateCheck(force: boolean): Promise<UpdateState> {
+  return invoke('update_check', { force });
+}
+
+/** 下载并安装：桌面端会覆盖当前 exe 并重启（进程随之结束），安卓端拉起系统安装器。 */
+export function updateApply(): Promise<void> {
+  return invoke('update_apply');
 }
 
 // Server info

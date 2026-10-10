@@ -1,8 +1,9 @@
 [package]
 name = "orbdrop"
-version = "0.1.0"
+version = "0.0.1"
 description = "OrbDrop — LAN file sharing tool"
 authors = ["you"]
+license = "GPL-3.0-or-later"
 edition = "2021"
 
 [lib]
@@ -64,6 +65,13 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
 pathdiff = "0.2"
+# 自更新（见 `src/update/`）：版本比较用 `semver`，产物签名校验用 `minisign-verify`
+# （与 `tauri-plugin-updater` 自己那份实现同一个 crate，签名格式才是对得上的那一套）。
+semver = "1"
+minisign-verify = "0.2"
+# 清单里的下载地址要做协议/主机判定（只放行 https 与环回 http），所以直接依赖 `url`
+# （reqwest 里那份就是它，不会重复编）。
+url = "2"
 
 [dev-dependencies]
 # 集成测试里那个"老版本对端"桩要自己起一个 **TLS** 服务端（对端那一跳已经全是 TLS，
