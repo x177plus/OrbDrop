@@ -2,33 +2,33 @@
   "version": "0.0.1",
   "versionCode": 1,
   "notes": "首个版本：局域网文件中转（拖入可见 / 推送两条通路），Windows 桌面端单文件 exe + Android（通用包 / arm64 包）。",
-  "pubDate": "2026-10-09T11:03:11Z",
+  "pubDate": "2026-10-10T05:49:29Z",
   "desktop": {
     "windows-x86_64": {
-      "size": 13692416,
-      "sha256": "48b95ab7ab1c77158e9e648f1620a18f496b95ac0215c97cd11f2d6fb957db66",
-      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NHRpQzVUOEZ2dS84clhIdzJNdXR0ZjFPaTZ3NkJEMGk0NnZnWXJFZlFRRlFMNmUwMXNDcjAxU1EwVXhTdUZLY1VGb1FsMVV3Z3FpMGxvSnV2MnR6YkE0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNTQzNzkxCWZpbGU6b3JiZHJvcC5leGUKdGYyQllYWDhlNFlCVTByK3FrZlBaTmdWYnl6Y3FmcEZnU1hyYllQSW5yck5hS2pyQnFrYnRsQ2k1UkNOVEd4S0tUcUVnUnI4THVZdHV3YVJ6M1hGQkE9PQo=",
+      "size": 13689344,
+      "sha256": "dac429cd4c0a862d97c152ad25b78d348a39cf94da3e568f1f17687e65563873",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NHA3ajdrME1hQ1dQTklJNUhhL3gxaXJBQmY5d1hyUTIwUTEzZnRDRzNRTU1jdEpXL3p2WXVrWk51bm5UZFlyU3hIbDcyWDl1SmJlZ3YwSnhCM1JSQlF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNjExMzY5CWZpbGU6b3JiZHJvcC5leGUKMDBNRmZzQjNmVGNWcE5Kbm9yNnJjdmsxaUtiVk1YcGhkOUNnZ0JVZlZaNlNxTFdqWmRMdTZsc252d01BVklnUElUZFNWSmJqTk5qQ2s2d0lEazVBQlE9PQo=",
       "mirrors": [
-        "http://127.0.0.1:8788/gh/assets/v0.0.1/orbdrop.exe",
-        "http://127.0.0.1:8788/gitee/assets/v0.0.1/orbdrop.exe"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.1/orbdrop.exe",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.1/orbdrop.exe"
       ]
     }
   },
   "android": {
     "universal": {
-      "size": 15156563,
-      "sha256": "aa139f52d6c2079854eb4c1feec7695025e7afd040b54527730c9cbcc78b0d4c",
+      "size": 53172271,
+      "sha256": "6203991026c095f8a771945ac701e0405bbd119e92a7a3ee2c480250efabec59",
       "mirrors": [
-        "http://127.0.0.1:8788/gh/assets/v0.0.1/app-universal-release.apk",
-        "http://127.0.0.1:8788/gitee/assets/v0.0.1/app-universal-release.apk"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.1/app-universal-release.apk",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.1/app-universal-release.apk"
       ]
     },
     "arm64-v8a": {
-      "size": 14824479,
-      "sha256": "b1895a822c9e57431e2cdb5a5f035515dea34c25de56432992fdb0ad357d957a",
+      "size": 15301791,
+      "sha256": "e246de138e30f02bcfd94c1b340323e56c1102aee336699d1463e775646d4ffb",
       "mirrors": [
-        "http://127.0.0.1:8788/gh/assets/v0.0.1/app-arm64-release.apk",
-        "http://127.0.0.1:8788/gitee/assets/v0.0.1/app-arm64-release.apk"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.1/app-arm64-release.apk",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.1/app-arm64-release.apk"
       ]
     }
   }
