@@ -126,6 +126,18 @@ function groupKey(id: string): string {
   return `grp:${id}`;
 }
 
+/**
+ * 通知点进来的落点：后端给的 `kind`（`dev` / `grp`）+ 它那份 id → 会话键
+ * （`notify::Convo` 只带这两样，键怎么拼是界面自己的约定，后端不复制一份）。
+ *
+ * 认不出的 `kind` 返回 `null`：宁可不跳，也别跳到一条不存在的会话上。
+ */
+export function convoKeyOf(kind: string, id: string): string | null {
+  if (kind === 'dev') return deviceKey(id);
+  if (kind === 'grp') return groupKey(id);
+  return null;
+}
+
 /** 键 → `{ 模式, id }`（认不出来的键 = `null`，界面上什么都不画）。 */
 function refOf(key: string | null): { mode: ConvoMode; id: string } | null {
   if (!key) return null;
@@ -352,8 +364,12 @@ function threadSummary(items: ChatItem[]): string {
 /**
  * 会话列表里的一行：一对一 / 群发 / 群聊三种身份混排。
  *
- * 动过的按最近一条倒序在前，没动过的排在后面（设备按设备表顺序、名单按各自的顺序），
- * 且不会每次刷新乱跳。
+ * **一对一那行要有过消息才画**：设备表里"刚配对、或刚跟对端互报了设备表（F-11a）学到、
+ * 一句话都没说过"的设备不进会话列表 —— 互报一次能把对端视野里的设备全带进来，全列出来的话
+ * 会话页就成了设备页的副本。要跟没说过话的设备开聊走「＋ 新建会话」（桌面端设备页那一行
+ * 也还有「发消息」）。群发/群聊照旧列：它们本来就是用户自己建/加入的，还没说话也该看得见。
+ *
+ * 动过的按最近一条倒序在前，没动过的排在后面（名单按各自的顺序），且不会每次刷新乱跳。
  */
 export type ConvoRow = {
   /** 会话键（点它开哪条会话）。 */
@@ -373,20 +389,23 @@ export type ConvoRow = {
 };
 
 export function convoRows(): ConvoRow[] {
-  const rows: ConvoRow[] = getDevices().map((d) => {
+  // 一对一：**有过消息才算一条会话**（见上面那段说明）—— 没说过话的设备不进这个列表。
+  const rows: ConvoRow[] = [];
+  for (const d of getDevices()) {
     const last = lastOf(d.id);
-    return {
+    if (!last) continue;
+    rows.push({
       key: deviceKey(d.id),
       mode: 'direct' as const,
-      at: last?.at ?? 0,
+      at: last.at,
       label: deviceNameOf(d.id),
       sub: summaryOf(d.id),
       time: timeOf(d.id),
       unread: unreadForPeer(d.id),
       dot: deviceDotState(d),
       initial: peerInitial(d.id),
-    };
-  });
+    });
+  }
   for (const b of snapshot.batches) {
     const t = threadOf(batchKey(b.id));
     if (!t) continue;

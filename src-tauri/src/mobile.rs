@@ -12,8 +12,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
+#[cfg(mobile)]
+use std::sync::OnceLock;
 use tauri::State;
+#[cfg(mobile)]
+use tauri::plugin::{PluginHandle, TauriPlugin};
 use tracing::info;
+#[cfg(mobile)]
+use tracing::warn;
 
 use crate::config::PeerDevice;
 use crate::state::AppState;
@@ -215,4 +221,48 @@ pub fn rename_peer(peer_id: String, name: String, state: State<'_, Arc<AppState>
         ..Default::default()
     });
     Ok(())
+}
+
+// ── 「用系统应用打开一个文件」（`open_path`）─────────────────────────────────────
+
+/// 文件打开插件的句柄。与 `notify` 那边同款：注册在插件 `setup` 那一刻，用在使用那一刻。
+#[cfg(mobile)]
+static OPEN_HANDLE: OnceLock<PluginHandle<tauri::Wry>> = OnceLock::new();
+
+/// 「打开文件」插件（只在安卓构建里挂，见 `lib.rs`）。
+#[cfg(mobile)]
+pub fn open_plugin() -> TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("orbdrop-file-open")
+        .setup(|_app, api| {
+            // 类名与 Kotlin 那边的 `@TauriPlugin class FileOpenPlugin` 对应。
+            let handle = api.register_android_plugin("com.x177plus.orbdrop", "FileOpenPlugin")?;
+            if OPEN_HANDLE.set(handle).is_err() {
+                warn!("文件打开插件重复注册：沿用第一份句柄");
+            }
+            Ok(())
+        })
+        .build()
+}
+
+/// 用系统应用打开一个路径（安卓侧）。
+///
+/// **为什么不用 `tauri_plugin_opener` 的 `open_path`**（桌面端那条路还在用它）：它移动端那一条
+/// 把路径当**裸字符串**发给 Kotlin（`run_mobile_plugin("open", path.into())`），而 Kotlin 侧
+/// `OpenArgs` 要的是 `{url, with}` 那个对象 —— Jackson 当场反序列化失败，也就是安卓上"打开"
+/// 任何文件都只会拿到一个报错；就算参数形状对上，它递给 `ACTION_VIEW` 的也是没有 scheme、不带
+/// MIME 的东西，系统解析不出 activity。细节与实测见 `FileOpenPlugin.kt` 与
+/// `docs/p1-implementation.md` §20。
+///
+/// 自己这条走 FileProvider 的 `content://`（根声明在 `res/xml/file_paths.xml`）+ 按扩展名给的
+/// MIME：`.apk` 因此落到系统安装器上 —— 也就是"收到 APK 点一下直接装"（F-109）。
+#[cfg(mobile)]
+pub async fn open_file(path: String) -> Result<(), String> {
+    let Some(handle) = OPEN_HANDLE.get() else {
+        return Err("文件打开插件没注册上（内部错误）".into());
+    };
+    handle
+        .run_mobile_plugin_async::<serde_json::Value>("openFile", serde_json::json!({ "path": path }))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }

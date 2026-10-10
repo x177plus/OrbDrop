@@ -292,8 +292,13 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| peer_id.to_string());
             debug!(%id, %peer_id, "inbound chat text");
-            state.chat.record_inbound(peer_id, &name, &id, &text, at);
+            let (fresh, _) = state.chat.record_inbound(peer_id, &name, &id, &text, at);
             crate::group::emit(state);
+            // 手机上人没看着屏幕时，这条通知才是他知道"有人在说话"的唯一途径（进程活着、
+            // 界面可能早就没了）—— 见 `notify` 的说明。重复投递不再响一遍。
+            if fresh {
+                crate::notify::message(&crate::notify::Convo::Direct(peer_id.to_string()), &name, &text).await;
+            }
             // 界面是不是**正开着**这个会话，只有界面知道（它自己会来 `chat_mark_read`）；
             // 这里不回已读回执 —— 收到 ≠ 读过。
         }
@@ -306,13 +311,17 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
         // 所以这里只有转发）。
         WsEvent::GroupText { group_id, id, text, at, seq, rev, author, hops, reached } => {
             debug!(%group_id, %id, %peer_id, hops, "inbound group text");
-            crate::group::on_group_text(
+            // 通知里要"哪个群、谁说的"，这两样都得在 `author` 被搬进事件里之前留一份
+            // （发言人那半截用 `group::display_name`：与落账写进消息里的**同一个名字**）。
+            let notify_author = author.id.clone();
+            let notify_claimed = author.name.clone();
+            let fresh = crate::group::on_group_text(
                 state,
                 peer_id,
                 crate::group::GroupTextIn {
-                    group_id,
+                    group_id: group_id.clone(),
                     id,
-                    text,
+                    text: text.clone(),
                     at,
                     seq,
                     rev,
@@ -322,6 +331,23 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                     reached,
                 },
             );
+            if fresh {
+                // 群名给标题（没起名的那一档界面也是回落到成员名，这里退回中性的一档）、
+                // 发言人给正文。
+                let title = state
+                    .groups
+                    .group(&group_id)
+                    .map(|g| g.name.trim().to_string())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "群聊".to_string());
+                let who = crate::group::display_name(state, &notify_author, &notify_claimed);
+                crate::notify::message(
+                    &crate::notify::Convo::Group(group_id),
+                    &title,
+                    &format!("{who}：{text}"),
+                )
+                .await;
+            }
         }
         WsEvent::GroupRead { group_id, up_to } => {
             debug!(%group_id, %peer_id, up_to, "inbound group read receipt");

@@ -67,11 +67,21 @@
 
   // ── 浏览段 ────────────────────────────────────────────────────────────────
 
-  // 只有「已配对」的能浏览：未绑定那几台连身份都没换过，后端拿不到它们的共享项。
-  const browseDevices = $derived(devices.getDevices().filter((d) => d.paired));
+  // 只有**长连接**设备能浏览（F-25）：对端的共享项只发给与它保持长连接的设备，没建链的
+  // 设备根本没有可列的东西。判据与桌面端 `App.svelte` 那个 `browsers` 完全一样 ——
+  // 两端说同一句话：芯片/标签在不在，本身就是那一档状态（`connected` 已蕴含 `paired`）。
+  const browseDevices = $derived(devices.getDevices().filter((d) => d.connected));
   const browsePeer = $derived(store.getBrowsePeer());
   const shares = $derived(store.browseSharesOf());
   const browseState = $derived(store.browseState());
+
+  // 正在浏览的那台断开长连接（掉线 / 手动断开）后就不在可浏览集合里了：清掉选中，
+  // 别让底下列着已经读不到的旧共享项（桌面端同样自动回落，见 App.svelte 那条 $effect）。
+  $effect(() => {
+    const peer = browsePeer;
+    const live = browseDevices;
+    if (peer !== null && !live.some((d) => d.id === peer)) store.clearBrowsePeer();
+  });
 
   // 进浏览段时替用户挑第一台：原型 `browseDev` 一开始就指着 d1。不挑的话底下列的是
   // 「对方还没有共享项」—— 看着像对端没共享，其实是本机还没选设备（store 里没选就拉不了）。
@@ -250,8 +260,8 @@
   <div class="body">
     <div class="empty">
       <Icon name="devices" />
-      <p>没有可浏览的设备</p>
-      <p class="es">先配对一台 PC，就能浏览对方共享的目录。</p>
+      <p>没有处于长连接的设备</p>
+      <p class="es">在「设备」页选一台已配对的 PC 点「连接」，建立长连接后就能浏览它共享的目录。</p>
     </div>
   </div>
 {:else}

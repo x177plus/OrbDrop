@@ -395,6 +395,20 @@ pub fn orb_center_from_legacy(pos: OrbPos, shape: OrbShape, scale_factor: f64) -
     }
 }
 
+/// 上一次**成功**用过的更新镜像（主机名 + 时刻，epoch 毫秒）。
+///
+/// 只服务一件事：下次检查/下载先试这一条。国内直连 github.com 实测 connect 21 秒才失败，
+/// 每次都从同一个坑里爬一遍没必要；但也不能永久记住 —— 用户挂上代理、或 Gitee 自己抽风时
+/// 得能自己爬回来，所以带 24 小时保质期（见 `update::MIRROR_PREF_TTL`）。
+///
+/// 存**主机名**而不是整条 URL：同一台主机同时是清单地址和产物地址的来源，一条就够用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateMirror {
+    pub host: String,
+    pub at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -548,6 +562,10 @@ pub struct Config {
     /// 是"一次传半个文件"，失败重试的代价也随之涨上去。
     #[serde(default = "default_transfer_block_mb")]
     pub transfer_block_mb: u32,
+    /// 上次成功的更新镜像（见 [`UpdateMirror`]）。**不作为设置项**：它是本机对网络状况的
+    /// 观察，不是用户意图，界面只读它（显示出"正在从 X 下载"），不给人改。
+    #[serde(default)]
+    pub update_mirror: Option<UpdateMirror>,
 }
 
 /// 并发数的取值域（配置里存的可能是手改的任意数：用之前一律夹一次）。
@@ -758,6 +776,7 @@ impl Default for Config {
             device_remarks: HashMap::new(),
             transfer_workers: default_transfer_workers(),
             transfer_block_mb: default_transfer_block_mb(),
+            update_mirror: None,
         }
     }
 }
@@ -1394,6 +1413,9 @@ mod tests {
                 PickerFavorite { name: "项目".into(), path: "D:/项目".into() },
             ],
             device_remarks: HashMap::from([("peer-1".to_string(), "客厅台式机".to_string())]),
+            // 镜像记忆必须能落盘：它就是靠"重启后还记得上次哪条路走得通"来免掉
+            // 国内每次检查都白等一遍 GitHub 超时的（见 `update::read_pref`）。
+            update_mirror: Some(UpdateMirror { host: "gitee.com".into(), at: 1_791_000_000_000 }),
             shares: vec![ShareItem {
                 id: "share-1".into(),
                 name: "Projects".into(),

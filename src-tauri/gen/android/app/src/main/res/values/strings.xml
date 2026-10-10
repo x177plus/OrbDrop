@@ -6,4 +6,8 @@
     <string name="notif_channel_keepalive_desc">让 OrbDrop 在后台保持在线，别人推过来的文件才不会错过。</string>
     <string name="notif_keepalive_title">OrbDrop 正在运行</string>
     <string name="notif_keepalive_text">保持局域网在线，随时接收文件。</string>
+    <!-- 收到消息那一条（F-108）：与上面那条常驻通知**两个渠道** —— 用户可以在系统设置里
+         单独把消息提醒关掉，而"保持互联"那条照旧，后台在线不跟着一起丢。 -->
+    <string name="notif_channel_messages">消息通知</string>
+    <string name="notif_channel_messages_desc">收到设备发来的消息时提醒你；关掉不影响 OrbDrop 在后台保持在线。</string>
 </resources>

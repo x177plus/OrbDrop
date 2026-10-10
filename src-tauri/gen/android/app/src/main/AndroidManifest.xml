@@ -13,14 +13,41 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
+    <!-- 收件里的 APK 点一下就能装（F-109）：`.apk` 那条走 `ACTION_VIEW` +
+         `application/vnd.android.package-archive`，落到系统安装器上（见 `FileOpenPlugin.kt`）。
+
+         这条权限不是给"自己开 `PackageInstaller` 会话直接装"用的（那条路我们不走），而是：
+         **只有声明了它的应用才出现在「设置 → 应用 → 特殊应用权限 → 安装未知应用」那张列表里**
+         —— Android 8 起那个开关默认关着，装不上时用户得能自己打开它。它也是普通安装权限
+         （不是运行时弹框那种），声明本身不弹任何东西；首次点安装时系统自己引用户去开。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <!-- 常驻前台服务（F-81）：界面切后台之后进程要活着，否则长连接与服务器一起停，
-         谁推来的文件都收不到（推送不排队，见 F-53）。`dataSync` 这一档对应
-         "应用在后台同步数据"，是 Android 14+ 对 `startForeground` 的硬要求。 -->
+         谁推来的文件都收不到（推送不排队，见 F-53）。
+
+         类型选 `connectedDevice`（"与外部设备保持连接"）而不是 `dataSync`：`dataSync` 在
+         Android 15（targetSdk 35+）上有**每 24 小时只有 6 小时**的硬上限 —— 到点系统回调
+         `Service.onTimeout`，不主动停就抛 `RemoteServiceException` 把进程崩掉（见
+         `OrbDropService.onTimeout` 的注释）；`connectedDevice` **没有这个上限**，这才对得上
+         "一直在线"。它的运行时前提是清单里声明 `CHANGE_NETWORK_STATE / CHANGE_WIFI_STATE /
+         CHANGE_WIFI_MULTICAST_STATE / NFC / TRANSMIT_IR` 之一（见下面 mDNS 那一段，
+         我们已经有 `CHANGE_WIFI_MULTICAST_STATE`，天然满足）。 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <!-- Android 13+ 的通知权限：没有它前台服务照旧能跑，但那一条常驻通知不会显示。
          运行时在 MainActivity 里申请。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 监听网络变化（`ConnectivityManager.registerNetworkCallback`）：Wi-Fi 关掉再打开时，
+         系统会把组播锁/Wi-Fi 锁收回去，得在网络恢复的那一刻重新拿回来，否则 mDNS 又聋了
+         （见 `OrbDropService.watchWifi`）。 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- 高性能 Wi-Fi 锁（`WifiManager.createWifiLock().acquire()`）要它 —— 没有的话
+         `acquire()` 直接抛 `SecurityException`："Neither user … nor current process has
+         android.permission.WAKE_LOCK"。普通权限，安装即授予，不弹框。
+         注意：**组播锁**不需要它（那条走 `CHANGE_WIFI_MULTICAST_STATE`），只有 Wi-Fi 锁要。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
@@ -66,11 +93,11 @@
         </provider>
 
         <!-- 常驻前台服务（F-81）：让进程在后台活着，长连接与服务器才不会跟着界面一起停。
-             `foregroundServiceType="dataSync"` 是 Android 14+ 的硬要求（与上面那条
-             FOREGROUND_SERVICE_DATA_SYNC 权限配对）。 -->
+             `foregroundServiceType="connectedDevice"`（见上面权限处的理由：无 6 小时上限）。
+             `stopWithTask` 默认 false ＝ 用户从最近任务划掉也不停服务，保持默认即可。 -->
         <service
             android:name=".OrbDropService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="connectedDevice" />
     </application>
 </manifest>

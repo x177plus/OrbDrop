@@ -90,6 +90,22 @@
       return false;
     };
 
+    /**
+     * 点**消息通知**进来的落点（`MainActivity.deliverPendingConvo` 调它，见那一段 Kotlin）：
+     * 返回 `true` = 进去了，别的地方不用管；`false` = 这条键现在进不去（后端那份 id 对应的
+     * 会话不在了），原生那边会隔一会儿再试。
+     *
+     * 后端只给 `kind` + `id`（键的拼法是这边的事，见 `chat.convoKeyOf`）。先把 tab 拨到「会话」：
+     * 从「文件」页点了通知进来，返回键该退回会话列表，而不是退回文件页。
+     */
+    (window as unknown as Record<string, unknown>).__orbdropOpen = (kind: string, id: string) => {
+      const key = chat.convoKeyOf(kind, id);
+      if (!key) return false;
+      store.navigateTab("convos");
+      store.navigateChat(key);
+      return true;
+    };
+
     const sync = () => {
       const h = location.hash || "#/convos";
       const chatPrefix = "#/chat/";
@@ -117,6 +133,7 @@
     return () => {
       window.removeEventListener("hashchange", sync);
       delete (window as unknown as Record<string, unknown>).__orbdropBack;
+      delete (window as unknown as Record<string, unknown>).__orbdropOpen;
     };
   });
 </script>

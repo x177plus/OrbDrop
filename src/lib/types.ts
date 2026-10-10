@@ -625,6 +625,74 @@ export interface Undeliverable {
 }
 
 /**
+ * 自更新的阶段（后端 `update::Phase`，两侧枚举值逐字对应；`uptodate` 在后端叫
+ * `Uptodate`，序列化成小写就是它）。
+ */
+export type UpdatePhase =
+  | 'idle'
+  | 'checking'
+  | 'uptodate'
+  | 'available'
+  | 'downloading'
+  | 'verifying'
+  | 'applying'
+  | 'error';
+
+/**
+ * 自更新的一整份状态快照（后端 `update::UpdateState`）。
+ *
+ * 后端把这**整份**随 `update://state` 事件发（不是增量）：进度是高频事件，增量事件会让界面
+ * 自己攒状态、迟早对不上；快照每拍都全，界面只负责画。
+ */
+export interface UpdateState {
+  /** 本机版本，如 `0.0.1`。 */
+  current: string;
+  /** `desktop` 桌面端（覆盖 exe 并重启）/ `mobile` 安卓端（拉起系统安装器）。 */
+  platform: 'desktop' | 'mobile';
+  phase: UpdatePhase;
+  /** 远端版本（检查到之后才有）。 */
+  version: string | null;
+  notes: string | null;
+  pubDate: string | null;
+  /** 要下载的字节数。 */
+  size: number | null;
+  /** 已下载字节（画进度条用）。 */
+  received: number;
+  /** 当前正在用的镜像主机名（`gitee.com` / `github.com`）。 */
+  mirror: string | null;
+  error: string | null;
+}
+
+/**
+ * 那一刻该给用户看的一句话（桌面与移动**共用同一份文案**）。
+ *
+ * 与 `undeliverableText` 同一个口径：状态机归后端，文案归这里 —— 两端各写一份的话，
+ * "正在校验"在桌面上叫 A、在手机上叫 B 是迟早的事。
+ */
+export function updateStatusText(u: UpdateState): string {
+  switch (u.phase) {
+    case 'idle':
+      return '';
+    case 'checking':
+      return '正在检查更新…';
+    case 'uptodate':
+      return '已是最新版';
+    case 'available':
+      return `有新版本 v${u.version ?? ''}`;
+    case 'downloading':
+      return `正在从 ${u.mirror ?? '镜像'} 下载 ${formatFileSize(u.received)}${
+        u.size ? ` / ${formatFileSize(u.size)}` : ''
+      }`;
+    case 'verifying':
+      return '正在校验更新包…';
+    case 'applying':
+      return u.platform === 'desktop' ? '正在替换并重启…' : '正在打开系统安装器…';
+    case 'error':
+      return u.error ? `更新失败：${u.error}` : '更新失败';
+  }
+}
+
+/**
  * 一条消息暂时送不出去时给用户的那句话（**桌面与移动共用同一份文案**）。
  *
  * 以前是静默的：消息照排队，界面上却什么都没说，用户只看到"发了没反应"。这里只补解释 ——

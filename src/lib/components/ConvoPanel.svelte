@@ -338,7 +338,7 @@
         <div class="empty">
           {@render icChat()}
           <p>还没有会话</p>
-          <p class="e-sub">到「设备」页配对或建立长连接后，每台设备就是一条会话；要同时发几台就用「＋ 新建会话」。</p>
+          <p class="e-sub">用「＋ 新建会话」选设备开始，或到「设备」页那一行点「发消息」；对方先发来消息也会出现在这里。</p>
         </div>
       {:else}
         {#each rows as row (row.key)}

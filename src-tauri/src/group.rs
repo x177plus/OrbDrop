@@ -2157,8 +2157,12 @@ pub struct GroupTextIn {
     pub reached: Vec<String>,
 }
 
-/// 显示名：**本机设备表优先**（长连接是 token 换来的身份；载荷里自称的名字只在没见过时用）。
-fn display_name(state: &AppState, peer_id: &str, claimed: &str) -> String {
+/// 显示名：**本机设备表优先**（长连接是 token 换来的身份；载荷里自称的名字只在没见过时用）——
+/// 没学到或已被移除的那台才退回名册里带来 / 载荷里自称的那个。
+///
+/// `pub(crate)`：入站那条通知（`notify`）要跟落账时用的是**同一个名字**，否则通知栏与群里
+/// 那条消息会显示成两个人。
+pub(crate) fn display_name(state: &AppState, peer_id: &str, claimed: &str) -> String {
     state
         .get_peer(peer_id)
         .map(|p| p.name)
