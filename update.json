@@ -1,34 +1,34 @@
 {
-  "version": "0.0.1",
-  "versionCode": 1,
-  "notes": "首个版本：局域网文件中转（拖入可见 / 推送两条通路），Windows 桌面端单文件 exe + Android（通用包 / arm64 包）。\n\n同版本重发（2026-10-10）：修好「检查更新」拿不到更新信息（两端 https 的 TLS 信任库是空的，两条清单地址都报 UnknownIssuer）；安卓设置页去掉底部的「OrbDrop 移动端」卡片与版本提示小字，版本号留在「版本与更新」里。",
-  "pubDate": "2026-10-10T09:25:20Z",
+  "version": "0.0.2",
+  "versionCode": 2,
+  "notes": "修复：0.0.1 里「检查更新」一条地址都拿不到（TLS 信任库为空）——已装 0.0.1 的用户请手动下载本版安装，应用内升不上来。\n安卓：设备页可直接「发消息」（未配对设备也能建会话）、长按整行开设备操作菜单、新增「后台与通知」自查页（电池优化白名单 / 自启动 / 通知横幅）、设置里新增「允许中转」与中转流量；原生库改压缩存储，两个包体积约减半（通用包 51→24MB、arm64 15→8MB）。\n桌面：把文件拖到会话浮层上松手即发送到这条会话；群聊无群名时标题显示成员名；底栏版本号改读真实版本；点「会话」总是从会话列表开始。",
+  "pubDate": "2026-10-12T04:08:11Z",
   "desktop": {
     "windows-x86_64": {
-      "size": 13883392,
-      "sha256": "1b7ce6d3bf2014813627efbc97aff8da245720c75f1d6f70bb0b56dc5a31ee7e",
-      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NGpmQWEzeUJQL2Jhd0E1QzdUOGRjOHZveDVicWdqOHZNODJBNGdXK2ZZRHl4ZUZ0TkMrcWFxV1A0Y0hNR0NadWx2RW80VWhHOXBFNVprdWdIaStyc0FrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNjI0MzIwCWZpbGU6b3JiZHJvcC5leGUKN3FkMG5BZERwNnVMM2R2TWcxNjBTNk41Z0Yydi9qT21hZEh2SVh1ZXc4QWJQaHVIREs1WEdGTU15M3kzbmpaMFNvS2tjRERZYVFMT3hVUGt1VVBtRHc9PQo=",
+      "size": 13899264,
+      "sha256": "5391b24ef5df43fc90b1597c2a914b41074ad81873a1c1173e3181c59e23bcac",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NG1ETGJIZklibEthcHN0dGJWNUZvUVdWRHV1eVZvbU9paXR1bjFKcmlTNUVLT011MHUxWWorb05QVkJ3M1pHdGNQSjc5ajJGcUlFY1JySjUvbUtqWmdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNzc4MDkxCWZpbGU6b3JiZHJvcC5leGUKK2FDNUZRd29vaXRCT1MxMjVCR2M3N0wvOXlRZTcwL1R2TkRIeHcxeG5xaW9TQnhuMlpHY3BvMVJSVlpNWTJ2WTNCREQrckVYTzgwa3RkUnBTMWJMQ2c9PQo=",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.1/orbdrop.exe",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.1/orbdrop.exe"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.2/orbdrop.exe",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.2/orbdrop.exe"
       ]
     }
   },
   "android": {
     "universal": {
-      "size": 53423191,
-      "sha256": "8ea6de470e8a13994e22df7d85dd3b9b4cb0654beacb57b7a5fa255d7282551d",
+      "size": 25071799,
+      "sha256": "42fe51cbf5087314d654816de58a01b99d6e692ab7bcc9457e31c784c86271a0",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.1/app-universal-release.apk",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.1/app-universal-release.apk"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.2/app-universal-release.apk",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.2/app-universal-release.apk"
       ]
     },
     "arm64-v8a": {
-      "size": 15368671,
-      "sha256": "0a9f0014727b3374b63b989471cc36b1474e5d2dd0a900f5cc94211aa646d947",
+      "size": 8165787,
+      "sha256": "02b939793db75505c6b3313503a4ba4500f5bbaac3f62ac0c8f7d888af023758",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.1/app-arm64-release.apk",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.1/app-arm64-release.apk"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.2/app-arm64-release.apk",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.2/app-arm64-release.apk"
       ]
     }
   }
