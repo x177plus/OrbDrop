@@ -1,11 +1,13 @@
 # 中转功能（现状 F-106 + 跨网段中转记忆 F-107）
 
-> **状态**：**已实现**（F-106 是既有现状，F-107 的"记忆/泛化/失效转移/反向"本轮落地 —— 见 §15 的用例与 §16 的清单；与设计的偏离、平台限制、还没验的部分见 §17）。
+> **状态**：**已实现**（F-106 是既有现状，F-107 的"记忆/泛化/失效转移/反向"本轮落地 —— 见 §15 的用例与 §16 的清单；与设计的偏离、平台限制、还没验的部分见 §17。**安卓端当锚点**：后端本来就支持，缺的是设置里那颗开关，本轮补上 —— §22）。
 > **需求条目**：F-106（现状）、F-107（本文档新增）、S-09（开关，语义放宽）、S-10（新开关）—— 都在 `requirements.md`。
 > **实现现状**：`p1-implementation.md` §18。
 > **代码**：`src-tauri/src/relay.rs`、`src-tauri/src/server/routes_relay.rs`、
 > `src-tauri/src/state.rs`（`probe_peers_once` 的中转分支）、`src-tauri/src/discover/mod.rs`、
-> `src-tauri/src/server/routes_discover.rs`、`src-tauri/src/config.rs`（`PeerDevice` / `RelayAddr`）。
+> `src-tauri/src/server/routes_discover.rs`、`src-tauri/src/config.rs`（`PeerDevice` / `RelayAddr`）；
+> 两端的设置界面：`src/lib/components/SettingsPanel.svelte`（桌面端）、`src/mobile/tabs/SettingsTab.svelte`
+> （安卓端，§22）。
 
 ---
 
@@ -383,12 +385,13 @@ B 落库后：`relayRoutes[AB 段] = { viaCidr: CD 段, viaDevices: [C, D] }` �
 - **开**：按 §7–§11 建立、复用、泛化、传播中转记忆。
 - **关**：行为**完全退回现状 F-106** —— 端点仍然每次现开、用完/直连恢复就收，不落盘、不泛化、不传播。
 - 默认给"开"的理由：这条开关**不花别人的带宽**（花带宽的是中转方的 S-09），也不向对端暴露本机的新信息（配置是本地的）；它只影响本机自己的选路效率。**与 S-07/S-08/S-09 的"默认关"口径不同**，是因为那三条都是**本机替别人做事 / 向网络暴露本机能力**。
-- **桌面端设置里不再单列开关**（本轮）：它只影响本机自己的选路，用户没有"要不要"的余地，保存时一律写开（`Config::relay_memory` 保留：旧配置缺此项按"开"读；移动端保存时原样往返）。
+- **两端设置里都不单列开关**（本轮）：它只影响本机自己的选路，用户没有"要不要"的余地，保存时一律写开（`Config::relay_memory` 保留：旧配置缺此项按"开"读；安卓端保存时整份回传，跟着后端真值往返）。
 
 ### 12.3 界面
 
-- **设置里只有一颗「允许中转」开关**（本轮）：同时控制 S-08（替群聊转消息）与 S-09（替其它设备盲转字节）—— 二者语义都是"本机替别人做事、花本机上行带宽"，就没有理由分成两颗。默认关；关掉立刻收掉本机正替别人转的每一条（`update_settings` → `close_all`，现状）。
-- **中转流量（S-11，本轮）**：设置里只读显示本机替别人中转的**累计流量**（收发两方向之和）与连接数。中转方的代价就是上行带宽，这里就是这笔账。字节数两处合流：盲转的连接字节 + 替群聊**转发出去的消息**字节（S-08 的中转那一跳，`AppState::note_relay_message`）；**连接数只数盲转的连接**。落盘在 `Config::relay_bytes_total` / `relay_conns_total`，重启接着算；面板开着时按 5s 轮询刷新（没有可订阅的中转事件）。
+- **两端设置里各有一颗「允许中转」开关**（桌面端 `SettingsPanel`、安卓端 `tabs/SettingsTab` 的「中转」一格，同一口径）：同时控制 S-08（替群聊转消息）与 S-09（替其它设备盲转字节）—— 二者语义都是"本机替别人做事、花本机上行带宽"，就没有理由分成两颗。默认关；关掉立刻收掉本机正替别人转的每一条（`update_settings` → `close_all`，现状）。
+- **安卓端本来就是合格的中转方**（本轮补上界面）：中转那一套实现（`relay.rs`）、`POST /relay/open` 的认人规则与服务器本身（`server::start_server` 在两端都跑）全是**平台无关的同一份代码**（这几处没有任何 `cfg(desktop)` 门控），所以手机不配对就能借中转、也能被借。两端唯一的差别是**存活**：手机得先活着等到别人来借，后台被系统冻结就没人借得到 —— 靠 F-81 的前台服务（`OrbDropService`）与电池优化白名单撑着，设置里「后台与通知」那一格就在提示这件事。
+- **中转流量（S-11，本轮）**：两端设置里都只读显示本机替别人中转的**累计流量**（收发两方向之和）与连接数。中转方的代价就是上行带宽（手机上是流量），这里就是这笔账。字节数两处合流：盲转的连接字节 + 替群聊**转发出去的消息**字节（S-08 的中转那一跳，`AppState::note_relay_message`）；**连接数只数盲转的连接**。落盘在 `Config::relay_bytes_total` / `relay_conns_total`，重启接着算；面板/设置页开着时按 5s 轮询刷新（没有可订阅的中转事件）。
 - **设备行**：走中转时仍是「经 X 中转」（现状 `relayVia`）。记忆生效后悬停说明再加一句：「该网段经 `<viaCidr>` 中转；C 离线时自动改走 D」。
 - **被隔离的未配对行**：`seen && !online && !relayVia` → 发起连接时提示"这张 Wi-Fi 可能把客户端之间的单播隔开了"（现状）；中转接管后自动回到在线行。
 - **不再在设置里显示"中转记忆"清单与"正在替 N 台设备中转"**（本轮）：两者都只是本机自己的运行状态（记忆 = 选路提示、正在中转 = 此刻的端点），后端照常维护，用户不需要看 —— 设置里只留那颗开关与上面那条用量记录。命令（`relay_memory` / `clear_relay_memory` / `relay_status` / `close_relays`）保留在后端，随时可再接界面或用它排障。
@@ -510,6 +513,7 @@ B 落库后：`relayRoutes[AB 段] = { viaCidr: CD 段, viaDevices: [C, D] }` �
 | `src-tauri/src/server/{mod,routes_discover,routes_pair}.rs`、`src-tauri/src/discover/mod.rs` | 路由表调整 + 三处自报字段 |
 | `src-tauri/src/lib.rs` | 四个新命令（`relay_memory` / `clear_relay_memory` / `relay_status` / `close_relays`）、`list_devices` 加 `transit`、设置项 `relayMemory`、开关变化时重播 TXT |
 | `src/lib/{types,api}.ts`、`src/lib/stores/devices.svelte.ts`、`src/lib/components/{SettingsPanel,DeviceTab}.svelte` | 界面（S-10 开关、中转记忆列表、正在中转 + 一键收掉、设备行悬停说明 `transitHint`） |
+| `src/mobile/tabs/SettingsTab.svelte` | 安卓端设置页的「中转」一格（S-08 + S-09 的「允许中转」开关 + S-11 的只读中转流量），与桌面端同一口径 —— 见 §22 |
 
 **与设计的两处偏离**：
 
@@ -539,7 +543,7 @@ B 落库后：`relayRoutes[AB 段] = { viaCidr: CD 段, viaDevices: [C, D] }` �
   不算"（一台设备不能用自己身份认证自己），所以**请求方侧的池/记忆**在集成测试里由"中转方自报的
   池"（`Opened.viaDevices`）与"未配对对端写的记录"这两条**真 HTTP** 路径驱动；真机上请求方与应答方
   各有一份凭据库，没有这条约束。
-- **S-10 的开关已从桌面端设置里移除**（本轮）：桌面端保存时一律写开；移动端本来就没有这一项，保存设置时整份回传，`relayMemory` 跟着后端真值往返，不会被改回默认。
+- **S-10 的开关两端都不单列**：桌面端保存时一律写开；安卓端设置页同样没有这一项（它有的是与桌面端同一颗「允许中转」，管 S-08 + S-09），保存设置时整份回传，`relayMemory` 跟着后端真值往返，不会被改回默认。
 - **池的刷新**只在拿到锚点 `/discover` 活视野时发生；锚点离散后池按"最后已知"保留，靠 TTL 收走
   （§11）。这也是 `relay_pool` 不落盘、只把 id 列表写进 `relayRoutes.viaDevices` 的原因。
 
@@ -868,3 +872,62 @@ mDNS 从此收不到任何东西，且**没有任何异常可看**（设备表�
   200 台设备只有 1 台允许中转 → 池里就 1 台）。它是防炸/防积累的兜底（池要落盘，而"谁都在线"
   这种正常刷新不该让 `config.toml` 无限长大），不是新鲜度规则：超了才按"最久没露面"淘汰，
   刚被报过的那几台排最前、不会先掉。
+
+---
+
+## 22. 安卓端也能当中转方（本轮）：设置里补上与桌面端同一颗开关
+
+**问题**（用户提出）：安卓设备能不能像 PC 一样当**中转方**？能不能在手机设置里也加一颗开关？
+
+**答案：后端本来就能 —— 缺的只有界面上那颗开关。**
+
+| 环节 | 桌面端 | 安卓端 | 结论 |
+|---|---|---|---|
+| 服务器（`server::start_server`） | 起 | 起（`setup` → `setup_server_task`，无 `cfg` 门控） | 同一份代码 |
+| 中转实现（`relay.rs`、`server/routes_relay.rs`） | 有 | 有（`relay.rs` 里唯一带 `cfg` 的是 `#[cfg(test)]`） | 同一份代码 |
+| mDNS 自报能力位（TXT `relay=1/0`） | 有 | 有（`discover::register` 收的就是 `Config::allow_relay`） | 同一份代码 |
+| 入站可达 | 常开进程 | 靠 F-81 前台服务（`OrbDropService`，含 `WifiManager.MulticastLock`）+ 电池优化白名单 | **手机唯一的差别：得先活着等到别人来借** |
+| 设置里的开关 | `SettingsPanel` 一颗「允许中转」 | **本轮补上**（`tabs/SettingsTab` 的「中转」一格） | 口径一致 |
+
+**怎么改**（只有前端一处 + 文档）：
+
+- `src/mobile/tabs/SettingsTab.svelte` 新增「中转」一格：**「允许中转」开关**（一颗管两条路 ——
+  `allowRelay` + `groupRelay`，与桌面端 `SettingsPanel::save` 逐字同一口径）＋ S-11 的**只读中转
+  流量**（`relay_traffic`，进页读一次 + 5s 轮询，离开即停）。读法也照桌面端：`allowRelay || groupRelay`
+  任一条开着就显示成开；保存时两颗一起写。
+- **不改后端**：`update_settings` 收的字段与所有平台同一条路径（写 `Config::allow_relay`、落盘、
+  `old && !new` 时 `relay::close_all`、开关变化重播 mDNS TXT）。
+- `relayMemory`（S-10）照旧整份往返，手机设置里**不单列**。
+
+**校验（真机 + 本机，全部跑过）**：
+
+- `npx svelte-check` 0 错误 0 警告；`npm run build:mobile` 通过。
+- **真实产物 + 真实 Chromium**：起 `vite preview --mode mobile` 服务 `dist-mobile`，用 `init_scripts`
+  注入 `window.__TAURI_INTERNALS__`（假 IPC），393×852 下实测：① 后端默认关 → 开关是关的；
+  ② 点开 → 保存 → 后端收到的 `update_settings` 里 `allowRelay=true`、`groupRelay=true`，
+  `relayMemory` 与设备名/端口原样带回；③ 后端 `allowRelay=true`（或只有 `groupRelay=true`）→
+  开关显示成开；④ 中转流量有值 / 为 0 两种画法都对。
+- **真机（用户的两台安卓手机，本轮）**：构建 `tauri android build --apk` → universal release APK，
+  装机后**核对过 `base.apk` 的 sha256 与本地产物逐字节相同**（`7adb0b73…`），再逐台操作：
+  - **设置里那颗开关真的在**：`uiautomator dump` 里能看到「中转 / 允许中转（CheckBox）/ 中转流量」；
+    点开关 → 滚动到「保存设置」→ 点它 → **设备的 `/pair/info` 从 `relay:false` 变成 `relay:true`**
+    （后端真的收下了，不是只有界面变了）。两台都验过（魅族 17、HUAWEI JAD-AL80）。
+  - **手机真的在替别人搬字节**：用一份临时探针（复刻请求方的控制面与数据面，不启动第二个 OrbDrop
+    实例）对手机发 `POST /relay/open`：请求方自报 = 本机桌面端 D1159（来源 `10.198.71.106` + 端口
+    `3890`，手机会到那个地址核实身份），目标 = 另一台桌面端 D0622（`31f36e0e…`，手机能到达、
+    但从没认识过它 → 走"请求方捎来的 `addr` + 到那儿核实身份"这条真实分支）。两台手机都回
+    `200`，端点为 `[::ffff:172.20.21.27]:…` / `[::ffff:172.20.21.198]:…`；**从本机拨进端点、在隧道里
+    做一次 TLS + `/pair/info`，回来的 373 字节里对端 id 就是 D0622**。
+  - 手机侧自己的证据：logcat `开了中转端点 requester=72c80a87… target=31f36e0e… host=[::ffff:…]`；
+    设置页「中转流量」变成**「累计 2.8 KB · 1 条连接」**（两台都有）。
+  - **熄屏也在**：`KEYCODE_POWER` 熄屏 8 秒后再走一遍，两台手机都照样 `200` + 373 字节 ——
+    前台服务（`OrbDropService`）把进程活着，中转端点跟着活。
+
+**已知的拓扑限制（不是本功能的问题，但决定了真机能验出什么）**：
+
+- 用户这张 Wi‑Fi **隔离客户端单播**（实测：手机 → 手机 `curl` 直接 `exit=7`；两台手机 → 桌面端都通）。
+  于是"**另一台手机当请求方**去借某台手机的中转"在这张网上**不可能发生** —— 请求方连锚点的 3890 都
+  连不上。所以本轮的真机验证是：**手机当锚点**（手机当中转方那一侧，全部走通）、**桌面端当请求方**、
+  **另一台桌面端当目标**；"手机 ↔ 手机借手机中转"要等换一张不隔离的网，或三台都在这个网段里。
+- 手机被系统冻结（电池优化没放开）时端点会随进程一起停：请求方那侧表现为"这一拍不通 → 30s 后重选"，
+  记忆与换锚点的逻辑不受影响。长期当锚点要按设置里「后台与通知」把电池优化与自启动放开。

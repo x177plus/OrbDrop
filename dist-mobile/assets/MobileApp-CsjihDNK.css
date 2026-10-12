@@ -211,6 +211,10 @@ a { color: inherit; text-decoration: none; }
 .btn-primary:hover { background: var(--accent-deep); }
 .btn-secondary { background: var(--surface); border-color: var(--border); color: var(--fg); }
 .btn-secondary:hover { background: var(--fg-soft); border-color: var(--hairline); }
+/* 行内的次要动作（F-59 的「发消息」、离线行的「解除配对」）：不描边、不着色，压过主按钮的分量
+   —— 一行里主按钮只该有一颗（配对 / 连接 / 断开），其余的都走这一档。与桌面端 `.btn-ghost` 同名同义。 */
+.btn-ghost { background: transparent; color: var(--muted); }
+.btn-ghost:hover { background: var(--fg-soft); color: var(--fg); }
 .btn-danger { background: var(--danger-soft); color: var(--danger-deep); }
 .btn-danger:hover { background: rgba(208, 43, 49, 0.2); }
 .btn-block { width: 100%; }
@@ -476,22 +480,23 @@ a { color: inherit; text-decoration: none; }
 }
 .dcard .dav .ic { width: calc(24 * var(--u)); height: calc(24 * var(--u)); }
 .dmain { flex: 1; min-width: 0; display: grid; gap: 2px; }
-.dname { font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 620; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 名字那一排：名字 + 状态胶囊（胶囊跟着名字走、自适应宽度，不再被 grid 拉成整列宽的空壳）。
+   名字长到装不下时**胶囊不被挤掉**：`.dname` 可缩可省略，胶囊 `flex: none`（在它自己的规则里）。 */
+.dnrow { display: flex; align-items: center; gap: calc(6 * var(--u)); min-width: 0; }
+.dname { flex: 0 1 auto; min-width: 0; font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 620; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dip { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* 「经 X 中转」：与地址同一档小字，但取强调色 —— 它说的是"这条路不是直连"。 */
+/* 「经 X 中转」：与地址**同一行、同一档小字**（两行恒定的第二行就靠它替地址那一位），
+   取强调色 —— 它说的是"这条路不是直连"。 */
 .drelay { font-size: var(--fs-xs); color: var(--accent-deep); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.drow { width: 100%; display: flex; align-items: center; gap: calc(12 * var(--u)); padding: calc(11 * var(--u)) calc(12 * var(--u)); text-align: left; }
+/* 设备行：**头像与「⋯」都不做了**（见 docs/p1-implementation.md §21）——名字与地址因此拿回
+   98px（393 宽下 98 → 197）。长按整行 = 设备操作，所以这一行要挡住 WebView 自己的长按：
+   `user-select` 挡文本选择、`-webkit-touch-callout` 挡长按弹窗（不挡的话长按只会选中文字，
+   我们那条手势永远轮不上）。`is-pressing` 是按住 500ms 期间的浅底 —— 这条手势唯一的可见提示。 */
+.drow { width: 100%; display: flex; align-items: center; gap: calc(12 * var(--u)); padding: calc(11 * var(--u)) calc(12 * var(--u)); text-align: left; user-select: none; -webkit-touch-callout: none; }
 .drow + .drow { border-top: 1px solid var(--border); }
 .drow:hover { background: var(--fg-soft); }
-.drow .dav2 {
-  flex: none; width: calc(42 * var(--u)); height: calc(42 * var(--u)); border-radius: calc(13 * var(--u));
-  display: grid; place-items: center;
-  background: var(--fg-soft); color: var(--fg); font-family: var(--font-display); font-size: calc(16 * var(--u)); font-weight: 650;
-}
-/* 长连接行的头像底色跟长连接同色（绿）：蓝归「已配对」之后，一行里不能再有"蓝 = 连上了"这层意思
-   （胶囊与状态点都在这一行，蓝色出现两次会互相打架）。 */
-.drow.connected .dav2 { background: var(--ok-soft); color: rgb(0, 78, 39); }
-.state-chip { display: inline-flex; align-items: center; gap: calc(5 * var(--u)); height: calc(22 * var(--u)); padding: 0 calc(8 * var(--u)); border-radius: 99px; background: var(--fg-soft); color: var(--muted); font-size: calc(10 * var(--u)); font-weight: 600; }
+.drow.is-pressing { background: var(--fg-soft); }
+.state-chip { flex: none; display: inline-flex; align-items: center; gap: calc(5 * var(--u)); height: calc(22 * var(--u)); padding: 0 calc(8 * var(--u)); border-radius: 99px; background: var(--fg-soft); color: var(--muted); font-size: calc(10 * var(--u)); font-weight: 600; }
 .state-chip.unbound { background: rgba(180, 98, 0, 0.15); color: rgb(106, 55, 0); }
 .dacts { flex: none; display: flex; align-items: center; gap: calc(4 * var(--u)); }
 
@@ -525,9 +530,6 @@ a { color: inherit; text-decoration: none; }
 .switch input:checked + .track { background: var(--accent); }
 .switch input:checked + .track::after { transform: translateX(calc(18 * var(--u))); }
 .switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
-.about { display: grid; gap: 2px; padding: calc(14 * var(--u)); }
-.about .an { font-family: var(--font-display); font-size: var(--fs-md); font-weight: 620; }
-.about .av2 { font-size: var(--fs-xs); color: var(--muted); }
 /* ─────────────────────────── overlays ─────────────────────────── */
 .scrim {
   position: absolute; inset: 0; z-index: 12;

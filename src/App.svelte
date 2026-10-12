@@ -15,7 +15,9 @@
   import { getPeerSharesState, loadPeerShares } from '$lib/stores/peers.svelte';
   import { getBcStatus, loadBcStatus, setBcSide, clearSide, compare } from '$lib/stores/bc.svelte';
   import * as chat from '$lib/stores/chat.svelte';
-  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree } from '$lib/api';
+  import type { ConvoThread } from '$lib/stores/chat.svelte';
+  import * as upd from '$lib/stores/update.svelte';
+  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree } from '$lib/api';
   import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem } from '$lib/types';
   import { shareMeta } from '$lib/types';
   import { planExpansion, planCollapse, planDock, planRectDock, spinForDock, type BadgeSpin, type DockAxis, type DockPlan, type ScreenRect } from '$lib/orbLayout';
@@ -68,6 +70,14 @@
   let showSettings = $state(false);
   let activeTab = $state<TabKey>({ kind: 'local' });
   let dragging = $state(false);
+  /**
+   * 拖入的落点正在**那条开着的会话**上（`dropInConvo`）：松手即推送给这条会话的收件人，
+   * 不再登记成共享项（F-111）。
+   *
+   * 只用来画预告（会话浮层描一圈主色 + 一句提示）。**真正走哪条路不读它** —— `drop` 那一刻
+   * 按坐标现判：`over` 与 `drop` 之间指针还在动，拿上一次 `over` 的结果去决定结果是错的。
+   */
+  let convoDropHot = $state(false);
   // 折叠态悬浮形态（设置里选的那一档，落盘在后端 `AppSettings.orbShape`）：
   // circle = 62px 圆球（`Orb.svelte`），rect = 圆角矩形悬浮框（`RectOrb.svelte`）。
   let orbShape = $derived(getSettings()?.orbShape ?? 'circle');
@@ -127,8 +137,9 @@
    * 落下 = 登记为本机共享项，落点就是悬浮体本身。
    *
    * 但**不展开面板**：展开要在拖动模态循环中途 `SetWindowPos`，落点目标（`IDropTarget`）在
-   * 拖动期间被搬走/改尺寸，抖动与丢目标都是自找的；而面板本身没有落点语义（窗口内任意处落下
-   * 都是同一条 `addShares`），拖放不需要它。
+   * 拖动期间被搬走/改尺寸，抖动与丢目标都是自找的；而"面板上的落点"只有会话浮层那一块
+   * （见 `dropInConvo`），它本来就只在面板**已经展开**时才看得见、才谈得上落点，所以这一路
+   * 永远不会因为"面板收着"而缺预告。
    *
    * 第三路是**卡片上开着的右键菜单**（`orbCtxOpen`）：菜单画在卡片外面（窗口坐标，可能压着
    * 卡片右下那圈余量），指针从卡片挪到菜单上那一刻 `pointerleave` 就把这一档关掉了 ——
@@ -284,6 +295,11 @@
   // 否则会出现"收起后角标还在、但组里明明有东西"的错位。
   // **一批多设备推送算一件**：用户点一次就得到一张卡，角标自然跟着"几次操作"走。
   let notifCount = $derived(notices.length + pushBatches.length);
+  // 底栏右下角那格版本号：**与设置里「当前版本」同一个源**（后端 `UpdateState.current`，
+  // 也就是 `tauri.conf.json` 的 version）。写死字面量的话，`npm run bump` 之后底栏就停在
+  // 上一版上，跟设置里那格对不上 —— 版本号只该有一处真源。
+  // 还没读到（后端那条命令没回来）时跟设置里一样显示 `…`。
+  let appVersion = $derived(upd.getUpdateState()?.current ?? '…');
   // 会话侧"等你处理"的数：未读 + 还没确认的群邀请（见 store 里的 `convoBadgeTotal`）。
   // 邀请卡只画在会话列表那层 —— 不计数的话面板收着时它就完全没有提示。
   let convoBadgeCount = $derived(chat.convoBadgeTotal());
@@ -1481,6 +1497,16 @@
   }
 
   /**
+   * 一台目标都不在网上：这句话说一次。「＋」选文件那条路（开框之前先挡）与拖入会话浮层
+   * 那条路（`sendDroppedToConvo`）共用它 —— 同一件事在两处各写一句，文案迟早会分叉。
+   */
+  function toastNoLiveTarget(devices: PeerDevice[]) {
+    toast(devices.length === 1
+      ? `「${deviceDisplayName(devices[0])}」不在网上，推送未发送`
+      : '所选设备都不在网上，推送未发送');
+  }
+
+  /**
    * 推送（唯一入口：会话里那颗「＋」）：给这个会话的每台各开一条 —— **只开一次选择框**
    * （文件与文件夹混选、可跨目录累积），同一批文件并发给每台（各台一条邀请、各自同意、
    * 各自进度；清单只建一次）。1:1 会话就是单台推送。
@@ -1493,7 +1519,7 @@
   function requestPushMany(devices: PeerDevice[], chatBatchId = '', groupId = '') {
     const live = devices.filter((d) => d.online);
     if (live.length === 0) {
-      toast(devices.length === 1 ? `「${deviceDisplayName(devices[0])}」不在网上，推送未发送` : '所选设备都不在网上，推送未发送');
+      toastNoLiveTarget(devices);
       return;
     }
     picker = {
@@ -1625,22 +1651,82 @@
   }
 
   /**
+   * 这条会话该发给谁、那批记录归到哪里 —— 「＋」选文件与拖入浮层（F-111）两条路共用这一份。
+   *
+   * `chatBatchId` = 群发那份名单的 id（这批文件记进那份群发的记录），`groupId` = 群聊的 id
+   * （记进群那条视图），两者互斥，一对一都为空。名册成员要还在本机设备表里才推得动
+   * （推送是按设备寻址的），不在的那些在这里就掉出去。
+   */
+  function convoSendTargets(t: ConvoThread) {
+    return {
+      peers: getDevices().filter((d) => t.participants.includes(d.id)),
+      chatBatchId: t.mode === 'broadcast' ? t.id : '',
+      groupId: t.mode === 'group' ? t.id : '',
+    };
+  }
+
+  /**
    * 会话里「＋」：选文件就是推送（`requestPushMany` 那条路，一次选、分头发）。
    *
    * 目标是**当前开着的那条会话**的参与者 —— 一对一发给这一台；群发那条会话发给名单上的
    * 每台，并把这批文件记到那份群发的记录里（`chatBatchId`）；群聊也是同一招：**拿群成员当
    * 收件人跑一次多目标推送**（群里发文件没有单独的后端命令），本机这条记录挂上 `groupId`
-   * 就落在群那条视图里。名册成员要还在本机设备表里才推得动（推送是按设备寻址的），
-   * 不在的那些会在下面的过滤里掉出去。
+   * 就落在群那条视图里。谁在名单里、记录挂哪儿，见上面那份 `convoSendTargets`。
    */
   function chatSendFiles() {
     const t = chat.activeThread();
     if (!t) return;
-    requestPushMany(
-      getDevices().filter((d) => t.participants.includes(d.id)),
-      t.mode === 'broadcast' ? t.id : '',
-      t.mode === 'group' ? t.id : '',
-    );
+    const { peers, chatBatchId, groupId } = convoSendTargets(t);
+    requestPushMany(peers, chatBatchId, groupId);
+  }
+
+  /**
+   * OS 拖放的落点（窗口内的**物理像素**坐标，Tauri 转来的）是不是落在会话浮层上。
+   *
+   * 两条都要成立：会话浮层开着、**且已经进了某一条会话**。列表那一屏没有"发给谁"可言
+   * （一条都没选），落上去照旧登记成共享项 —— 那正是这里返回 false 的情形。
+   *
+   * 坐标得除以 `devicePixelRatio`：`position` 是物理像素（Windows 的 OLE 落点，
+   * wry 在 `DragOver`/`Drop` 里做的 `ScreenToClient`），而 `getBoundingClientRect()` 是 CSS
+   * 像素。不除这一下，缩放不是 100% 的机器上落点判定整体偏移（150% 时偏出去一半）。
+   */
+  function dropInConvo(pos: { x: number; y: number }): boolean {
+    if (!chat.isChatOpen() || !chat.activeThread()) return false;
+    // 会话浮层的根节点（`ConvoPanel` 上那个 `data-od-id`）。关着时它 `inert` 且
+    // `pointer-events: none`，但上面两条已经挡掉了那种情形。
+    const el = document.querySelector<HTMLElement>('[data-od-id="convo-sheet"]');
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const x = pos.x / dpr;
+    const y = pos.y / dpr;
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  }
+
+  /**
+   * 拖进会话浮层的那批文件：**当场按这条会话推过去**（F-111），与「＋」同一套落点 ——
+   * 同一份收件人、同一处会话记录、同一批推荐逻辑，只是清单来自拖放而不是选择框。
+   * **不再弹一次选择框**：用户用拖放表达完了"发什么"，再问一遍是白费一遍手。
+   *
+   * 名字 / 大小 / 是否目录得问后端（拖放只给路径，`pathPicks`）；能不能推（链接、系统目录、
+   * 自家数据目录、镜像）不在前端判 —— `push_paths` 那条路会报出原话，判据只有那一份。
+   */
+  async function sendDroppedToConvo(paths: string[]) {
+    const t = chat.activeThread();
+    if (!t) return;
+    const { peers, chatBatchId, groupId } = convoSendTargets(t);
+    const live = peers.filter((d) => d.online);
+    if (live.length === 0) {
+      toastNoLiveTarget(peers);
+      return;
+    }
+    try {
+      const items = await pathPicks(paths);
+      const batch = await pushPaths(paths, live.map((d) => d.id));
+      chat.noteOutgoingFiles(live.map((d) => d.id), items, batch, chatBatchId, groupId);
+    } catch (e) {
+      toast(String(e));    // 清单建不起来（链接 / 数据目录 / 路径没了）：就地失败，不登记共享项
+    }
   }
 
   /** 会话菜单的「查看该设备文件」：切到那台设备的浏览标签（标签只给长连接设备开）。 */
@@ -2410,6 +2496,9 @@
   }
 
   onMount(() => {
+    // 底栏那格版本号要靠这份状态（与设置里「当前版本」同一个源）；订阅是幂等的，
+    // 设置面板挂载时也会叫一次 —— 谁先叫都行，但不能只靠它：面板收着时底栏照样要显示。
+    void upd.watchUpdate();
     // 设置只拉一次：形态（折叠态尺寸）与其余初始化都等这一份。
     const settingsReady = loadSettings();
     // 折叠态窗口 = 悬浮球/悬浮框 + 四周余量：尺寸在这里归位，**位置**由后端在首帧之前按上次的
@@ -2451,14 +2540,22 @@
 
     // Tauri drag-drop
     const unlisten = appWindow.onDragDropEvent((event) => {
-      if (event.payload.type === 'over') {
+      if (event.payload.type === 'over' || event.payload.type === 'enter') {
         dragging = true;
+        // 预告：落点是不是会话浮层（一眼看出松手会发生什么，见 `dropInConvo`）。
+        convoDropHot = dropInConvo(event.payload.position);
       } else if (event.payload.type === 'leave') {
         dragging = false;
+        convoDropHot = false;
       } else if (event.payload.type === 'drop') {
         dragging = false;
+        convoDropHot = false;
         const paths = event.payload.paths;
-        if (paths.length > 0) void addShares(paths);
+        if (paths.length === 0) return;
+        // 落点在**开着的那条会话**上 = 往这条会话推（F-111，与「＋」同一条路）；
+        // 其余落点照旧登记成共享项（F-20）。现判坐标：这一次落点的位置只有 `drop` 自己知道。
+        if (dropInConvo(event.payload.position)) void sendDroppedToConvo(paths);
+        else void addShares(paths);
       }
     });
 
@@ -2885,7 +2982,7 @@
         {/if}
       </span>
       <span class="foot-right">
-        <span>OrbDrop v0.1.0</span>
+        <span>OrbDrop v{appVersion}</span>
         <!-- 通知铃铛（最右下角、版本号右边）：点一下收起/展开右下角那组通知气泡。
              角标 = 未处理的通知数，与悬浮球左上角黄标是同一个数 —— **收起 ≠ 已读**。 -->
         <button
@@ -3177,6 +3274,7 @@
          这里只画；浮层内部自己管列表 ↔ 详情两屏。 -->
     <ConvoPanel
       pickedId={ctxState?.kind === 'chat' ? ctxState.chatId ?? null : null}
+      dropHot={convoDropHot}
       onToast={toast}
       onSendFiles={chatSendFiles}
       onAcceptInvite={chatAcceptInvite}

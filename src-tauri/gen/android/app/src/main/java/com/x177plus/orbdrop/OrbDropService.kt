@@ -14,7 +14,10 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 
@@ -37,9 +40,12 @@ import androidx.core.app.NotificationCompat
  * 通知**不带按钮**：它的作用是"让系统别杀我"，不是给用户操作入口；点一下把应用调回前台即可。
  * 渠道重要性用 LOW：不响、不震、不在锁屏上亮 —— 一条常驻的"正在运行"提示而已。
  *
- * **有意的取舍**：不做电池优化（Doze）白名单引导 —— 用户没点那个开关就被系统在 Doze 里
- * 切断网络、甚至回收进程，属于"被杀了就被杀了"的可接受结果；这里的全部努力只是把
- * 能活的时间尽量拉长，且不给用户弹任何东西。
+ * **这四条只够 AOSP**：国产 ROM 另有一层自己的权限位（华为「应用启动管理」、小米「自启动」…），
+ * 留在默认档时进程会在后台被**冻结** —— 实测（华为 JAD-AL80）表现是通知栏那条常驻通知还在，
+ * 而 mDNS 与 HTTP 一起停。那一层是 ROM 私有的，应用改不了也读不到，只能引导用户去开：
+ * 引导与状态读取在界面那一侧（`SystemSettingsPlugin` + 移动端「后台与通知」，F-87，
+ * 见 `docs/p1-implementation.md` §22）。这里只做"能做的都做了"，并留一条可查的证据 ——
+ * [watchdog]（进程被冻过就会在日志里留下间隔异常）。
  */
 class OrbDropService : Service() {
   /** Wi-Fi 组播锁（P1-13①）：生命周期 = "应用在局域网上活着"，正是这条服务的意义。 */
@@ -51,6 +57,40 @@ class OrbDropService : Service() {
   /** Wi-Fi 网络回调：关开 Wi-Fi 后重新拿锁（见 [watchWifi]）。 */
   private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
+  /** 冻结看门狗的时钟（主线程 Handler；见 [watchdog]）。 */
+  private val handler = Handler(Looper.getMainLooper())
+
+  /** 上一拍的时刻（`elapsedRealtime`：含休眠时间，正因为它才量得出"进程中间没跑"）。 */
+  private var lastTick = 0L
+
+  /**
+   * 冻结看门狗：**"用户没开 ROM 那层开关"唯一可查的证据**（F-87，见 `docs/p1-implementation.md` §22）。
+   *
+   * 为什么需要：华为「应用启动管理」留在默认的"自动管理"时，进程会在后台被**冻结** —— 而冻结的
+   * 表现与"网络被切"一模一样（mDNS 收不到、HTTP 不答话），通知栏那条常驻通知还挂着（它由系统栏
+   * 画，进程冻了它也在），从外面看不出区别。那三个开关是 ROM 私有的，应用读不到，所以只能从
+   * "我们本该在跑、却没跑"反推：每一拍记一次时刻，下一拍真的回来时看中间隔了多久 —— 被冻过的话
+   * 这个间隔会**远大于**定时器间隔（定时器挂在主线程，进程一冻它跟着停）。
+   *
+   * 一拍只做一次减法、一分钟唤醒一次主线程，不持任何唤醒锁（持了反而会改变被观察的行为）——
+   * 与 N-04「常驻低资源占用」不冲突。
+   */
+  private val watchdog = object : Runnable {
+    override fun run() {
+      val now = SystemClock.elapsedRealtime()
+      if (lastTick != 0L && now - lastTick > WATCHDOG_TRIP_MS) {
+        Log.w(
+          TAG,
+          "进程疑似被系统冻结过：上一拍在 ${(now - lastTick) / 1000}s 前" +
+            "（定时器 ${WATCHDOG_INTERVAL_MS / 1000}s 一拍）。" +
+            "若对端在此期间看到本机离线，去系统设置里打开自启动/关联启动/后台活动",
+        )
+      }
+      lastTick = now
+      handler.postDelayed(this, WATCHDOG_INTERVAL_MS)
+    }
+  }
+
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onCreate() {
@@ -58,11 +98,13 @@ class OrbDropService : Service() {
     ensureChannel()
     acquireLocks()
     watchWifi()
+    handler.postDelayed(watchdog, WATCHDOG_INTERVAL_MS)
   }
 
   override fun onDestroy() {
     // 服务没了（用户退应用/被系统回收）才还回去：它们是**进程内**的资源，留着不放会让 Wi-Fi
     // 芯片一直全速（耗电）。
+    handler.removeCallbacks(watchdog)
     unwatchWifi()
     releaseLocks()
     super.onDestroy()
@@ -144,6 +186,19 @@ class OrbDropService : Service() {
     val cb = object : ConnectivityManager.NetworkCallback() {
       override fun onAvailable(network: Network) {
         acquireLocks()
+        Log.i(TAG, "Wi-Fi 又通了：重新拿锁（组播锁 + 高性能锁）")
+      }
+
+      /**
+       * Wi-Fi 没了（关掉、掉线、被 ROM 在熄屏时收走）。**只记一行日志**，不做别的。
+       *
+       * 为什么留着这一行：真机排障时"对端看到本机离线"有两种完全不同的成因 —— 进程被冻结
+       * （[watchdog] 那一路）与**本机离开了这个网段**（ROM 的 WLAN+ 智能切到移动数据、或熄屏
+       * 断 WLAN）。后者的第一手证据就是这一行：Wi-Fi 没了。日志里两条时间线并排一看就知道
+       * 是哪一种，不必再靠 ping/curl 反推。
+       */
+      override fun onLost(network: Network) {
+        Log.w(TAG, "Wi-Fi 断了：本机的组播锁/Wi-Fi 锁会随之下线，对端在此期间会看到本机离线")
       }
     }
     val request = NetworkRequest.Builder()
@@ -247,6 +302,10 @@ class OrbDropService : Service() {
 
     private const val CHANNEL_ID = "orbdrop.keepalive"
     private const val NOTIFICATION_ID = 1701
+
+    /** 冻结看门狗（[watchdog]）：一拍多久、间隔超出多少算"中间没跑"。 */
+    private const val WATCHDOG_INTERVAL_MS = 60_000L
+    private const val WATCHDOG_TRIP_MS = 180_000L
 
     /** 起服务（幂等：重复调不会叠出第二条通知）。由 `MainActivity.onCreate` 调用。 */
     fun start(context: Context) {

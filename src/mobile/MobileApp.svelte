@@ -130,6 +130,9 @@
     void chat.refresh();
     void store.loadInbox();
     void store.loadLocalAddr();
+    // 首次运行引导（F-87）：装完那一刻国产 ROM 的「应用启动管理」会在后台把进程冻掉，而通知栏
+    // 那条常驻通知照旧挂着（用户看不出毛病）。只问一次，记在配置里 —— 见 `store.offerKeepAliveGuide`。
+    void store.offerKeepAliveGuide();
     return () => {
       window.removeEventListener("hashchange", sync);
       delete (window as unknown as Record<string, unknown>).__orbdropBack;

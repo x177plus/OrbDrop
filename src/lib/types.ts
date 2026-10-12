@@ -219,6 +219,30 @@ export interface TreeEntry {
   modified: string;
 }
 
+// ── 移动端：系统那一层（F-87 / F-108 的横幅那半）──────────────────────────────
+
+/** 后台保活状态：**唯一能读到的系统状态**（电池优化白名单，Google 官方 API）。 */
+export interface KeepAliveState {
+  batteryOptimizationIgnored: boolean;
+}
+
+/** 一次"跳系统设置页"的结果：`opened` = 实际打开的是哪一页（ROM 的类名各版本不同）。 */
+export interface OpenedPage {
+  opened: string;
+}
+
+/**
+ * 通知这一层此刻的真实状态（后端 `notify::NotifyState`）。
+ *
+ * `messageChannelImportance` 是 `NotificationManager.IMPORTANCE_*`（2=低 3=默认 4=高 5=紧急）；
+ * **`-1` = 渠道还没建**。横幅的判据是"重要程度 ≥ 高 **且** 这条通知真的会响/震" —— ROM 自己
+ * 那层（华为「静默通知」/「横幅」开关）不在这两个字段里，读不到，只能引导用户去看。
+ */
+export interface NotifyState {
+  enabled: boolean;
+  messageChannelImportance: number;
+}
+
 export interface TreeResponse {
   entries: TreeEntry[];
 }
@@ -411,6 +435,11 @@ export interface ChatPeerConvo {
 /** 群成员（名册里的一行）。 */
 export interface ChatGroupMember {
   id: string;
+  /**
+   * 名册带来的名字。**可能是设备 id 本身**：后端写名册时（`resolve_members`）拿不到名字
+   * 就拿 id 顶着 —— 群成员不需要配对，本机可能压根没发现过那一台。界面因此是"设备表优先
+   * （含备注）、这份名字次之、最后才是 id"（见 `stores/chat` 的 `groupTitle`）。
+   */
   name: string;
 }
 
@@ -423,7 +452,7 @@ export interface ChatGroupMember {
  */
 export interface ChatGroup {
   id: string;
-  /** 群名；空 = 标题回落到成员名（与 `titleOf('group', …)` 一致）。 */
+  /** 群名；空 = 标题回落到成员名（与 `groupTitle` 一致）。 */
   name: string;
   /** 名册版本（LWW 用，前端只读）。 */
   rev: number;

@@ -163,8 +163,21 @@ export interface ConvoThread {
 
 function titleOf(mode: ConvoMode, name: string, participants: string[]): string {
   if (mode === 'broadcast') return `群发 · ${name.trim() || '未命名群发'}`;
-  if (mode === 'group') return name.trim() ? `群聊 · ${name.trim()}` : participants.map(deviceNameOf).join('、') || '群聊';
   return deviceNameOf(participants[0] ?? '');
+}
+
+/**
+ * 群标题：有群名就用群名；**没群名时是成员名**（顺序按名册），不是成员 id。
+ *
+ * 回落必须走名册带来的名字（`ChatGroupMember.name`）：群成员**不需要配对**、也可能本机压根
+ * 没发现过它，这种条目在设备表里查不到 —— `deviceNameOf` 会**原样退回设备 id**，标题于是
+ * 变成「群聊 · 3f9c2a…、a11b7d…」。优先级：**设备表优先**（本机备注 F-101 就在这条路上）
+ * → 名册里那个名字 → id（名册自己的名字也可能是 id：后端 `resolve_members` 拿不到名字时
+ * 就是这么写的，那不是本机多出来的错）。
+ */
+function groupTitle(g: ChatGroup): string {
+  if (g.name.trim()) return `群聊 · ${g.name.trim()}`;
+  return g.members.map((m) => peerDisplayName(m.id, m.name.trim() || m.id)).join('、') || '群聊';
 }
 
 /** 本机已知的那个群（找不到 = `undefined`：退出了、或这条键本来就过期了）。 */
@@ -205,7 +218,7 @@ function threadOf(key: string | null): ConvoThread | null {
   const g = groupOf(ref.id);
   if (!g) return null;
   const participants = g.members.map((m) => m.id);
-  return { key: groupKey(g.id), mode: 'group', id: g.id, name: g.name, participants, title: titleOf('group', g.name, participants) };
+  return { key: groupKey(g.id), mode: 'group', id: g.id, name: g.name, participants, title: groupTitle(g) };
 }
 
 /** 详情里开着的那条会话（底下那份键失效时 `null`：界面回到列表）。 */
@@ -649,8 +662,26 @@ export function isChatOpen(): boolean {
   return open;
 }
 
-export function setChatOpen(v: boolean) {
-  open = v;
+/**
+ * 底栏那颗「会话」的开合。**打开一律落在会话列表**上 —— 每次开都先把会话键（`openKey`）清掉。
+ *
+ * 不在这里清的话，收起面板之后那个键还留着（"收起"只是收起，不是"离开这条会话"的声明），
+ * 下次点「会话」落到的就是上次那条会话的详情：用户点的是"会话"，看到的却是上一次的落点。
+ * 移动端那边子屏由 hash 决定，退回列表走 `backToList`，冷启动也停在列表 —— 这里是同一套落点。
+ *
+ * **清在"开"这一侧、而不是"关"那一侧**：关的那一下浮层还在淡出（`.convo-pop` 0.18s），
+ * 此刻换屏会在这段时间里把列表闪给用户看（详情 ↔ 列表是两块完全不同的屏）；开的时候才换就
+ * 看不见 —— 那一下浮层正从 `scale(0.2)` / `opacity: 0` 长出来。
+ *
+ * 只有这一条路会清：会话自己是走 `openConversation` 开的（那里把 `open` 直接置真），
+ * 设备行的「发消息」、通知点进来、群邀请的「加入」都照旧直接落在那条会话上。
+ *
+ * 代价只有一个：收起前那条会话不再自动续上（要回去就再点一次那一行）。草稿按会话留着
+ * （`draft`），列表 ↔ 详情来回都不丢字。
+ */
+export function setChatOpen(next: boolean) {
+  open = next;
+  if (next) openKey = null;
 }
 
 export function draftOf(key: string): string {

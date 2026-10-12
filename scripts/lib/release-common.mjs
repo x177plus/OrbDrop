@@ -225,11 +225,43 @@ export function requireRemoteConfig(cfg) {
   const tokens = {};
   for (const platform of ["github", "gitee"]) {
     const envName = cfg[platform].tokenEnv;
-    const value = process.env[envName];
-    if (!value) die(`环境变量 ${envName} 没有值（远端模式要它来调 ${platform} API）`, `例如：${envName}=xxx node scripts/release.mjs ...`);
+    // 环境变量优先（CI、别人的机器、一次性发布会话），其次本机那个不进仓库的 token 文件。
+    const value = process.env[envName] ?? tokenFromSecretsFile(envName);
+    if (!value) {
+      die(
+        `${envName} 没有值（远端模式要它来调 ${platform} API：建 Release、传附件）`,
+        `两种给法：环境变量（${envName}=xxx node scripts/release.mjs …），或写进 ${rel(SECRETS_LOCAL)}（已 gitignore，一行一个 KEY=VALUE）。`,
+      );
+    }
     tokens[platform] = value;
   }
   return tokens;
+}
+
+/** 本机 token 文件的位置。整体换个地方就设 `ORBDROP_RELEASE_SECRETS=<路径>`。 */
+export const SECRETS_LOCAL = path.join(ROOT, "scripts", "release.local.env");
+
+/**
+ * 从本机 token 文件里取一个值（没有这个文件、或里面没有这一项 → null）。
+ *
+ * 为什么要有这条：`release.local.json` 刻意不装 token（那是要提交进仓库的模板的同名文件，
+ * 而且 token 混进 JSON 很容易被顺手贴进 issue），环境变量又只活在当前这个终端里 ——
+ * 天天在这台机器上发版时，"一个不进仓库的 env 文件"是最好用的中间形态。
+ * **它绝不能进仓库**：`.gitignore` 里那条与本注释是一对。
+ */
+function tokenFromSecretsFile(envName) {
+  const file = process.env.ORBDROP_RELEASE_SECRETS || SECRETS_LOCAL;
+  if (!fs.existsSync(file)) return null;
+  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+    const text = line.trim();
+    if (!text || text.startsWith("#")) continue;
+    const eq = text.indexOf("=");
+    if (eq < 0) continue;
+    if (text.slice(0, eq).trim() !== envName) continue;
+    const value = text.slice(eq + 1).trim().replace(/^(["'])(.*)\1$/, "$2");
+    if (value) return value;
+  }
+  return null;
 }
 
 /** 私钥校验：不在仓库里，所以只能查本机路径与配置。 */

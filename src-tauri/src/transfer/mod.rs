@@ -170,7 +170,7 @@ pub async fn manifest_for_paths(paths: &[PathBuf]) -> Result<PushSource, String>
     })
 }
 
-fn file_name_of(path: &Path) -> String {
+pub(crate) fn file_name_of(path: &Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "未命名".into())

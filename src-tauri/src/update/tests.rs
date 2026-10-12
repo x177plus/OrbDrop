@@ -9,6 +9,9 @@
 //! 2. **篡改必拒**：同一份字节改一个字符就得校验失败（这是"清单被改也换不掉包"的全部依据）。
 //! 3. **地址策略**：只放行 https 与环回 http。清单里的地址是远端可控的字符串，这一关松了
 //!    就等于允许别人把用户导到任意 http 源上。
+//!
+//! 第 4 条（[`manifest_endpoints_really_load_over_https`]）默认不跑：它要联网，而 CI / 离线机器
+//! 上必然红。它钉的是**只在真机上出事、本地全部绿**的那一格 —— 证书信任库。
 
 use super::*;
 
@@ -137,6 +140,48 @@ fn host_extraction() {
     assert_eq!(host_of("https://gitee.com/a/b"), "gitee.com");
     assert_eq!(host_of("http://127.0.0.1:8788/x"), "127.0.0.1");
     assert_eq!(host_of("不是一个地址"), "");
+}
+
+/// **联网的**回归：编译期那两条清单地址，用**客户端自己的** reqwest 拿一遍。
+///
+/// 为什么值得留着一条要联网的测试：其余测试全在离线夹具与明文回环上跑，而 2026-10-10 真机上
+/// 出事的那一格恰恰是"**https 能不能过证书校验**" —— `reqwest` 当时是按 `rustls-tls-no-provider`
+/// （= 空信任库）编的，每条 https 都在握手时 `invalid peer certificate: UnknownIssuer`，
+/// 而本机演练走明文、发布侧回读走 `curl`（系统信任库），**两边都看不见**。改回那个 feature
+/// 的话，只有这一条会红。
+///
+/// `#[ignore]`：它要真的连公网，离线/CI 环境必然失败，所以不进默认那一轮。
+/// 跑法：`cargo test --lib update:: -- --ignored`（真机上验证自更新时按 `docs/update.md` §11 走）。
+///
+/// **判据与客户端一致：两条里至少一条能拿到**（客户端自己就是"第一个能解析成清单的赢"）。
+/// 不要求两条都通 —— 国内直连 github.com 时通时不通是常态，那是网络的事，不该让这条测试变红；
+/// 而信任库坏掉时**两条会一起死**，所以它照样抓得住。
+#[tokio::test]
+#[ignore = "要联网：离线环境必然失败，只在真的验证自更新链路时跑"]
+async fn manifest_endpoints_really_load_over_https() {
+    crate::net::install_crypto_provider();
+    let mut ok = 0;
+    let mut failures = Vec::new();
+    for url in MANIFEST_ENDPOINTS {
+        match fetch_manifest_at(url).await {
+            Ok(manifest) => {
+                // 拿到的不只是"有响应"：还得是一份能解析、版本号读得出来的清单。
+                parse_version(&manifest.version)
+                    .unwrap_or_else(|e| panic!("{url} 的版本号读不出来：{e}"));
+                ok += 1;
+            }
+            Err(e) => failures.push(format!("{url}：{e}")),
+        }
+    }
+    assert!(
+        ok > 0,
+        "两条清单地址一条都没拿到（信任库/网络？）：\n  {}",
+        failures.join("\n  ")
+    );
+    if !failures.is_empty() {
+        // 只剩一条通不算失败（就是 GitHub 那种时通时不通），但要知道是哪条、为什么。
+        println!("这一条没能拿到（不判失败）：\n  {}", failures.join("\n  "));
+    }
 }
 
 /// 镜像偏好只影响**顺序**，不会把候选丢掉或凭空加一个。

@@ -9,8 +9,11 @@
 
   let { onClose }: { onClose: () => void } = $props();
 
-  // 未配对的设备在这里没有意义：没有它的 token，一条也发不出去（原型是 mock，每台都能勾）。
-  const selectable = $derived(getDevices().filter((d) => d.paired));
+  // **不按配对过滤**（桌面端的收件人框同样列全部设备）：未配对的对端也收得下消息 —— 一对一走
+  // "长连接优先、HTTP 兜底"（对方名字是它自报的），群聊的名册里本来就只存 `{id, 名字}`。
+  // 以前这里只列已配对的，于是"设备页没有发消息入口 + 新建会话里看不见这台"叠在一起，
+  // 未配对的设备在移动端一条会话也开不出来。
+  const candidates = $derived(getDevices());
 
   let picked = $state<string[]>([]);
   // 原型两张卡初始都不勾、但语义回落到"群聊"，于是按钮写「进入群聊」而高亮的却是空 —— 这里预选群聊，
@@ -20,7 +23,7 @@
 
   const many = $derived(picked.length > 1);
   /** 标题预览里那串设备名（原型 `ids.map(devName).join('、')`）。 */
-  const pickedNames = $derived(selectable.filter((d) => picked.includes(d.id)).map((d) => d.name));
+  const pickedNames = $derived(candidates.filter((d) => picked.includes(d.id)).map((d) => d.name));
   const preview = $derived(
     (mode === "broadcast" ? "群发 · " : "群聊 · ") +
       (name.trim() || (mode === "broadcast" ? "未命名群发" : pickedNames.join("、") || "设备名称")),
@@ -43,8 +46,7 @@
       if (ids.length === 1) {
         const id = ids[0];
         onClose();
-        chat.openDeviceChat(id);
-        store.navigateChat(chat.deviceKey(id));
+        store.openChat(id);
         return;
       }
       if (mode === "broadcast") {
@@ -97,17 +99,17 @@
   <div class="sec-label" style="padding-bottom:0">
     <span>选择设备</span><span class="num">已选 {picked.length} 台</span>
   </div>
-  {#if selectable.length === 0}
+  {#if candidates.length === 0}
     <div class="card list">
       <div class="empty">
         <Icon name="devices" />
-        <p>还没有已配对的设备</p>
-        <p class="es">先完成配对，才建得起会话。</p>
+        <p>还没有设备</p>
+        <p class="es">等局域网里的设备出现，或到「设备」页手动添加。</p>
       </div>
     </div>
   {:else}
     <div class="stack">
-      {#each selectable as d (d.id)}
+      {#each candidates as d (d.id)}
         <label class="pick" class:is-checked={picked.includes(d.id)}>
           <input
             type="checkbox"

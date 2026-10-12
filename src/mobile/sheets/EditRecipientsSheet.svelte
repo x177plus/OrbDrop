@@ -25,8 +25,12 @@
    */
   const groupName = $derived(mode === "group" ? (chat.groupOf(listId)?.name ?? thread?.name ?? "") : "");
 
-  // 未配对的设备进不了名册（后端没有它的 token），和新建会话那张表一样只列已配对的。
-  const selectable = $derived(getDevices().filter((d) => d.paired));
+  // **不按配对过滤**（与新建会话那张表、桌面端的收件人框同一条规则）：群聊名册里只存
+  // `{id, 名字}`，成员本来就不需要配对（见 `group.rs` 的 D6=b）；群发也只是逐台各发一条
+  // 一对一的普通消息，未配对的对端同样收得下（长连接优先、HTTP 兜底）。
+  // 只列已配对的会让名册里那台未配对的成员在表上**看不见**——标记还留在 `picked` 里，
+  // 用户既看不到也改不掉它。
+  const candidates = $derived(getDevices());
 
   // 勾选是**开表那一刻**拍下来的快照，不是跟着视图走的派生值：会话里随时可能来新消息，
   // 视图一重算就把用户刚改的勾选冲掉。保存时再回头看视图要最新的 id 与名字。
@@ -74,17 +78,17 @@
   <div class="sec-label" style="padding-bottom:0">
     <span>参与设备</span><span class="num">已选 {picked.length} 台</span>
   </div>
-  {#if selectable.length === 0}
+  {#if candidates.length === 0}
     <div class="card list">
       <div class="empty">
         <Icon name="devices" />
-        <p>还没有已配对的设备</p>
-        <p class="es">名册里的设备都解除了配对。</p>
+        <p>还没有设备</p>
+        <p class="es">名册里的设备都不在本机设备表里了。</p>
       </div>
     </div>
   {:else}
     <div class="stack">
-      {#each selectable as d (d.id)}
+      {#each candidates as d (d.id)}
         <label class="pick" class:is-checked={picked.includes(d.id)}>
           <input
             type="checkbox"

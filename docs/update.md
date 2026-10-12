@@ -66,6 +66,13 @@ arm64 包，armv7/x86 的机器装上去只会得到 `INSTALL_FAILED_NO_MATCHING
 
 - **清单地址是编译期常量**（`update::MANIFEST_ENDPOINTS`），与版本无关：GitHub 走
   `releases/latest/download/update.json`、Gitee 走仓库根 `raw/master/update.json`。
+  - 发行版页上那个 `releases/download/v0.0.1/update.json` 与 GitHub 这条是**同一份文件**：`latest`
+    是别名，服务器 302 到当前最新那一版（`draft`/`prerelease` 不指）。Gitee 那条则**不是**发行版附件，
+    而是仓库文件 —— 发布脚本会把同一份清单**两处都写**（仓库根 + 本次发行版附件），所以内容一致、
+    地址不同。
+- **这两条连的是公网域名，靠 reqwest 内置的公共 CA 列表校验**（`rustls-tls-webpki-roots-no-provider`）。
+  到对端那一跳用指纹判身份、用不到信任库，但自更新只能走普通证书校验 —— 别把那条 reqwest 特性
+  改回 `rustls-tls-no-provider`（= manual-roots = **空**信任库），出事的样子见 §13。
 - **产物地址由清单给**，且钉住 tag（`releases/download/v0.0.2/...`）：老客户端不会因为新版本发布
   而下错包。两条镜像都指向同一份内容。
 - `versionCode` 是安卓的安装门槛（`major*1000000 + minor*1000 + patch`，Tauri 的算法）。客户端在
@@ -147,8 +154,26 @@ Windows 上**运行中的 exe 不能被写**（进程映像还映射着它，是
 `node scripts/release.mjs --version 0.0.2 --notes "…"`（构建 → 签名 → 生成清单 → 写发布仓 → commit/tag →
 push → 建 Release 传附件 → 回读校验）；本机演练用 `--local --skip-build`（不联网、不 push），
 配套 `scripts/dev-mirror.mjs` 起镜像台，按打印出来的命令启动客户端即可。
+远端模式要两个 token 调 API：**先读环境变量**（`GITHUB_TOKEN` / `GITEE_TOKEN`），**没有就读
+`scripts/release.local.env`**（已 gitignore，一行一个 `KEY=VALUE`，模板里写了去哪申请与要勾的权限；
+整体换路径用 `ORBDROP_RELEASE_SECRETS`）。token 只给到这一个发布仓的写权限就够。
 随时复核某个已发布的版本：`node scripts/release.mjs --verify-only --version 0.0.1`（只读远端，
 不构建、不 push、不调 API）。
+
+**同版本重发**（版本号不动、**产物必须换掉**的那种补发 —— 比如发布之后才发现客户端有缺陷）：
+`node scripts/release.mjs --version 0.0.1 --republish --notes "…"`。它与普通发布的差别只有两处，
+都跟"这一版已经存在"有关：
+
+- **仓库里的 tag 不新建、也不移动**：只往发布仓的分支上追加一个提交（`update.json` 与 `CHANGELOG.md`
+  变了）。于是 tag 指向的那次提交与 Release 的附件不再一致 —— 客户端读的是清单（GitHub 走 Release
+  附件、Gitee 走分支上的仓库文件），两处都是新的；只有"拿 git 去核对 tag 内容"的场合要知道这一层。
+- **Release 是复用的**：GitHub 先 `DELETE` 掉旧附件再传新的（不删的话同名附件会 422）；Gitee 直接
+  删掉整个 Release（连同附件，顺带释放配额）再建一个同 tag 的。**这是脚本唯一会删远端东西的地方**，
+  只在显式给了 `--republish` 时才发生。
+
+注意它**解决不了"已装的旧客户端"**：客户端拿去和本机版本比的是清单里的版本号，同版本重发之后
+0.0.1 的客户端只会说"已是最新版"。重发的作用是"让**新装**的人拿到修好的包"（本机与真机重装、
+README/发行版页的下载链接）；要让老客户端自己升上来，只能发一个更高的版本号。
 
 回读校验里 **GitHub 那几条"本机够不着"只报警告、不算失败**：发布是从你本机发起的，而国内直连
 github.com 时通时不通（实测同一条命令上一秒 200、下一秒 connect timeout）——那说明这台机器此刻的
@@ -156,7 +181,8 @@ github.com 时通时不通（实测同一条命令上一秒 200、下一秒 conn
 
 Gitee 侧有两道容量约束（官方帮助中心）：单附件 ≤ 100MB、仓库附件总量 ≤ 1GB。一次发布约 78MB
 （exe 13 + 通用包 51 + arm64 15），**所以攒到十来个版本就该去 Gitee 删旧发行版**；脚本每次发布都会
-打印三个附件的实际大小，但它**不自动删**任何东西（删发行版是不可逆操作，交给用户自己按)。
+打印三个附件的实际大小，但它**不自动删**任何东西（删发行版是不可逆操作，交给用户自己按；唯一例外是
+显式给了 `--republish` 的同版本重发，见上)。
 脚本反而会拦住几类"发错包"：产物不存在、产物是空的，以及 **APK 里烙的 versionCode/versionName 与清单要写的不一致**（最常见的事故就是忘了 bump）。产物 mtime 只当**提示**不当把关：增量构建在输入没变时本来就不会重写输出（cargo 判定 crate 无事可做、Gradle 判定打包任务 up-to-date，字节相同的产物连 mtime 都不动），拿它当失败条件会误伤 —— 实测撞过一次，那次两个 APK 确实是当前源码编出来的。
 
 Gitee 的公开仓需人工审核，审核期仓库"仅限成员访问"——所以首版发布前先把仓建好过审，GitHub 那条路
@@ -203,7 +229,9 @@ Gitee 的公开仓需人工审核，审核期仓库"仅限成员访问"——所
    `/manifest.json`、`ORBDROP_ALLOW_MULTI=1`、`ORBDROP_DATA_DIR` 指到临时目录），点界面上的
    「立即更新」；确认 exe 被换掉、重启后版本变了、`<数据目录>/logs/update.log` 里有 helper 的记录。
 4. 重跑 §10 的镜像三档（`--gh-hang` / `--gh-kbps 5` / 两者都坏）：该成功的成功，该失败的一次都不装。
-5. `cargo test --lib update::`：签名与地址策略的回归。
+5. `cargo test --lib update::`：签名与地址策略的回归。**联网的那条另跑**：
+   `cargo test --lib update:: -- --ignored`（`manifest_endpoints_really_load_over_https` —— 用客户端
+   自己的 reqwest 拿一遍编译期那两条清单地址，钉住 §13 那个信任库；两条里至少一条通就算过）。
 6. 安卓：`npm run tauri -- android build --apk`（通用包）与 `--apk --split-per-abi`（arm64 包）→ 装到
    设备上确认能起来（旧的 versionCode 更大时要先卸载）；清单地址与仓库建好后，在手机上点一次
    「检查更新 → 下载并安装」，确认走到系统安装器。
@@ -230,8 +258,59 @@ Gitee 的公开仓需人工审核，审核期仓库"仅限成员访问"——所
    Gradle 判定打包任务 up-to-date），于是"包确实是当前源码编的"也被判成旧包。现在 mtime 只当提示，
    真正的把关是 APK 内部 versionCode/versionName 与清单一致。
 
-## 13. 还没被真实验证过的那一格
+## 13. https 清单这条路走过一次真机（2026-10-10）
 
-**安卓端"检查到新版本 → 下载 → 拉起系统安装器"**：清单地址是编译期常量，而 0.0.1 就是当前版本，
-设备上只会报"已是最新版"（那本身说明真机上的检查链路是通的）。要真的走一遍下载与安装，需要**再发
-一个 0.0.2**（发完在手机上点一次「检查更新 → 下载并安装」），或把清单地址临时指到本机镜像台重建 APK。
+**0.0.1 发出去的两端，检查更新一条地址都拿不到**，界面上只有一句：
+
+```
+所有清单地址都拿不到更新信息（https://github.com/x177plus/OrbDrop/releases/latest/download/update.json：
+error sending request for url (…)：client error (Connect)：tcp connect error：deadline has elapsed；
+https://gitee.com/x177plus/OrbDrop/raw/master/update.json：
+error sending request for url (…)：client error (Connect)：invalid peer certificate: UnknownIssuer）
+```
+
+两条都失败，但**原因不是同一个**，而且 Gitee 那条根本不是网络问题：
+
+- **Gitee：`invalid peer certificate: UnknownIssuer`**。`reqwest` 是按 `rustls-tls-no-provider`
+  （= manual-roots）编的，**信任库是空的**。到对端那一跳（`net::client_builder`）自带 pinning
+  校验器、用不到信任库，所以整条内网链路一直是好的；而自更新这两条清单地址连的是**公网域名**，
+  只能走普通证书校验 —— 于是每条 https 都在握手这一步死掉。改成 reqwest 的
+  `rustls-tls-webpki-roots-no-provider` 后修复（默认 `Client::builder()` 带上内置的公共 CA 列表；
+  带 `-no-provider` 的那个变体才不会顺带把 quinn 一族解进 `Cargo.lock`）。同时也挡掉了
+  "设备上装个根证书就能 MITM 更新"。
+- **GitHub：`tcp connect error … deadline has elapsed`**。3 秒连接超时按设计走完（国内直连
+  github.com 的常态），切 Gitee —— 切过去撞上上面那条。
+
+**为什么之前三次演练都没抓到**：本机镜像台是**明文 http**（`http://127.0.0.1:8788/manifest.json`），
+§10 那三档镜像行为演练全跑在明文上（明文不碰证书，所以对这条缺陷完全免疫）；发布侧的回读核验用的是
+`curl`，走的是系统信任库，不是客户端那条路。结论写进验收清单：**§11 第 6 条那句"点一次检查更新"
+是这条路上唯一有效的验证**，别用明文镜像台替代它。
+
+同一趟还修掉了**报错本身**：`reqwest::Error` 的 `Display` 只有一句 `error sending request for url`，
+真因全挂在 `source()` 链上，客户端原先直接 `to_string()` —— 所以连 `UnknownIssuer` 都看不见。
+现在 `update::err_chain()` 把整条链拼进错误信息（清单与下载两条路都用它）。
+
+**影响面（必须知道）**：**发出去了的** 0.0.1（exe 与两个 APK）都带着这个缺陷，它们**无法从应用内更新** ——
+发布 0.0.2 解决不了已装 0.0.1 的用户，README/发行版页手动下一次装上是唯一的路。0.0.1 的清单里
+`version` 又正好等于本机版本，所以修好之后的第一台 0.0.1 客户端也只会报"已是最新版"：这条链路
+只能用**更高的版本号**验。
+
+**补发记录（2026-10-10，同版本重发）**：用 `--republish` 把修好的 0.0.1 重发了一遍 ——
+GitHub Release `#408765799`（复用，四个附件先删后传）、Gitee Release `#1195098`（旧的 `#1194710`
+删掉重建），发布仓 `master` 前进一个提交 `2459e41`（**tag `v0.0.1` 不动**，仍指向 `bf6537e`）。
+独立核验（不信脚本自己的输出）：
+
+- Gitee 三个附件下载回来与本地构建产物**逐字节相同**，且与清单里的 sha256/大小逐项一致；
+- GitHub 侧用 `api.github.com` 读四项附件的体积与**服务端算的 sha256 digest**，与清单逐项一致；
+- 仓库根 `update.json`（Gitee raw 那条路）与本地清单**逐字段一致**；
+- 两个安卓包与**两台真机上跑的那份 APK**哈希相同（arm64 `0a9f0014…46d947`）—— 真机验过的那一份
+  就是发出去的那一份。
+
+于是"新装的人拿到修好的 0.0.1"，而"已经装着旧 0.0.1 的人"仍需手动装一次（同版本号重发不会让
+客户端认为自己有更新）。
+
+## 14. 还没被真实验证过的那一格
+
+**安卓端"检查到新版本 → 下载 → 拉起系统安装器"**：需要一个比本机高的版本（发一个 0.0.2，或把清单
+地址临时指到本机镜像台重建 APK —— 但那条是明文 http，验不了 §13 那个信任库，只能验下载与安装器
+那一段）。发完在手机上点一次「检查更新 → 下载并安装」，确认走到系统安装器（§11 第 6 条）。

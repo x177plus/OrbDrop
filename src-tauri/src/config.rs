@@ -489,6 +489,14 @@ pub struct Config {
     /// 和「在线 / 离线」「开机自启」同一个道理。
     #[serde(default)]
     pub auto_broadcast_new: bool,
+    /// 「后台保活」首次引导（F-87）给他看过了没有：**移动端**用，界面起来时问一次。
+    ///
+    /// 为什么在配置文件里而不是 webview 的 localStorage（与 `picker_favorites` 同一个理由）：
+    /// 它是**跨重启要有效**的一件事，该和其余状态躺在同一个数据目录；而且卸载重装之后它必须
+    /// **重新问一次** —— 装完那三个开关（华为「应用启动管理」…）又回到默认档了，重装等于回到
+    /// 同一个坑里（重装会清数据目录，于是这个标记也跟着没了，正好）。
+    #[serde(default)]
+    pub keepalive_guided: bool,
     /// 是否允许本机**为群聊中转消息**（设置里的「允许为群聊中转消息」，默认关）。
     ///
     /// 只在**群消息**上生效，而且是"本机也在那个群里"时才转（见 `group::relay_to`）：
@@ -766,6 +774,7 @@ impl Default for Config {
             picker_favorites: Vec::new(),
             online: true,
             auto_broadcast_new: false,
+            keepalive_guided: false,
             group_relay: false,
             allow_relay: false,
             relay_links: HashMap::new(),
@@ -1372,6 +1381,7 @@ mod tests {
             orb_shape: OrbShape::Rect,
             online: false,
             auto_broadcast_new: true,
+            keepalive_guided: true,
             group_relay: true,
             allow_relay: false,
             relay_links: HashMap::from([(
@@ -1649,6 +1659,25 @@ mod tests {
 
         let offline: Config = toml::from_str("deviceId = \"device-1\"\nonline = false\n").unwrap();
         assert!(!offline.online);
+    }
+
+    /// 「后台保活引导已看过」跨重启有效；**旧配置**（没有这一项）读出来是"没看过"（F-87）。
+    ///
+    /// 默认值必须是 `false`：一句"看过"会让用户再也见不到那个引导，而默认档的国产 ROM
+    /// 会在后台把进程冻掉（真机实测过）。漏 `#[serde(default)]` 则更糟 —— 旧配置整份解析失败，
+    /// 被改名成 `.toml.bad` 再写默认值，用户的共享项与配对表一起没。
+    #[test]
+    fn keepalive_guided_round_trips_and_defaults_to_false() {
+        let old: Config = toml::from_str("deviceId = \"device-1\"\n").unwrap();
+        assert!(!old.keepalive_guided, "老配置没有这一项：还没引导过");
+
+        let guided: Config =
+            toml::from_str("deviceId = \"device-1\"\nkeepaliveGuided = true\n").unwrap();
+        assert!(guided.keepalive_guided);
+
+        let back = toml::to_string(&guided).unwrap();
+        let again: Config = toml::from_str(&back).unwrap();
+        assert!(again.keepalive_guided, "落盘再读回来还在");
     }
 
     /// 悬浮形态跨重启有效；**旧配置**（没有这一项）读出来是圆球。

@@ -5,14 +5,19 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
+import android.provider.Settings
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
+import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 
 /**
@@ -47,6 +52,10 @@ class NotifyMessageArgs {
  * 与 `OrbDropService` 那条常驻通知分开：那条的活是"别让系统杀我"（`IMPORTANCE_LOW`、不可撤、
  * 点一下回应用），这条的活是"有人找你"（`IMPORTANCE_HIGH`、可撤、点一下**直接进那条会话**）。
  * 两个渠道也是**故意分开**的：用户可以在系统设置里单独关掉消息通知，而保住后台在线。
+ *
+ * 这条「消息通知」渠道不是在第一次发通知时才建的 —— 装完（通知授权落定）那一刻
+ * `MainActivity` 就会调这儿把它建出来，理由见 [ensureChannel]（用户在系统设置里得先看得见它，
+ * 才有得开横幅）。这里的调用只是兜底。
  */
 @TauriPlugin
 class MessageNotifierPlugin(private val activity: Activity) : Plugin(activity) {
@@ -65,24 +74,90 @@ class MessageNotifierPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.resolve()
       return
     }
-    ensureChannel()
+    // 兜底：正常情况下这条渠道在装完（授权落定）那一刻就由 `MainActivity` 建好了（见
+    // `ensureChannel` 的说明），这里再叫一次只是保证"通知这条路永远不依赖界面跑没跑过"。
+    ensureChannel(activity)
     manager.notify(notificationId(args.kind, args.id), buildNotification(args))
     invoke.resolve()
   }
 
-  private fun ensureChannel() {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-    val system = activity.getSystemService(NotificationManager::class.java) ?: return
-    if (system.getNotificationChannel(CHANNEL_MESSAGES) != null) return
-    val channel = NotificationChannel(
-      CHANNEL_MESSAGES,
-      activity.getString(R.string.notif_channel_messages),
-      NotificationManager.IMPORTANCE_HIGH,
-    ).apply {
-      description = activity.getString(R.string.notif_channel_messages_desc)
-      setShowBadge(true)
+  /**
+   * 通知这一层此刻的真实状态：**总开关** + 「消息通知」渠道的重要程度（F-108 的自查，见
+   * `docs/p1-implementation.md` §19）。
+   *
+   * 为什么值得读：横幅不是权限，是"渠道重要程度 ≥ 高 且 这条通知真的会响/震"的派生表现
+   * （AOSP `NotificationInterruptStateProviderImpl.shouldHeadsUpWhenAwake` 里那道
+   * `entry.getImportance() < IMPORTANCE_HIGH → 不弹`）。而渠道的重要性**建完只能降不能升**，
+   * 所以要区分"我们声明得不对"与"系统/用户在别处关了它"，界面只能拿这个值说真话。
+   *
+   * `messageChannelImportance` 用 `-1` 表示"渠道还没建"（`NotificationManager.IMPORTANCE_*`
+   * 的取值是 0–5，没有负数）—— 那说明用户还没给通知权限、或者渠道被系统清过。
+   */
+  @Command
+  fun notificationState(invoke: Invoke) {
+    val manager = NotificationManagerCompat.from(activity)
+    val channel = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      activity.getSystemService(NotificationManager::class.java)?.getNotificationChannel(CHANNEL_MESSAGES)
+    } else {
+      null
     }
-    system.createNotificationChannel(channel)
+    val out = JSObject()
+    out.put("enabled", manager.areNotificationsEnabled())
+    out.put("messageChannelImportance", channel?.importance ?: -1)
+    invoke.resolve(out)
+  }
+
+  /** 跳到本应用的通知设置页（`ACTION_APP_NOTIFICATION_SETTINGS`；Android 8 以下只有应用详情页）。 */
+  @Command
+  fun openNotificationSettings(invoke: Invoke) {
+    val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+        .putExtra(Settings.EXTRA_APP_PACKAGE, activity.packageName)
+    } else {
+      Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${activity.packageName}"))
+    }
+    try {
+      activity.startActivity(intent)
+      invoke.resolve()
+    } catch (e: Exception) {
+      invoke.reject("打不开通知设置：请手动进入 设置 → 通知和状态栏 → OrbDrop")
+    }
+  }
+
+  /**
+   * 跳到「消息通知」**那一条渠道**自己的设置页：横幅、铃声、锁屏、勿扰，全挂在这一页上
+   * （华为那一层是把渠道映射成"通知类型"的，同一批开关换了个名字）。
+   *
+   * 先 `ensureChannel` 再跳：渠道不在时那一页是空的 —— 用户被送到一个什么都没有的页面上，
+   * 比不引导更糟。渠道建不出来（没给通知权限）时退回应用通知页，好歹能看到总开关。
+   */
+  @Command
+  fun openChannelSettings(invoke: Invoke) {
+    try {
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+        activity.startActivity(
+          Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${activity.packageName}")),
+        )
+        invoke.resolve()
+        return
+      }
+      ensureChannel(activity)
+      val system = activity.getSystemService(NotificationManager::class.java)
+      val hasChannel = system?.getNotificationChannel(CHANNEL_MESSAGES) != null
+      activity.startActivity(
+        if (hasChannel) {
+          Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+            .putExtra(Settings.EXTRA_APP_PACKAGE, activity.packageName)
+            .putExtra(Settings.EXTRA_CHANNEL_ID, CHANNEL_MESSAGES)
+        } else {
+          Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+            .putExtra(Settings.EXTRA_APP_PACKAGE, activity.packageName)
+        },
+      )
+      invoke.resolve()
+    } catch (e: Exception) {
+      invoke.reject("打不开通知设置：请手动进入 设置 → 通知和状态栏 → OrbDrop")
+    }
   }
 
   private fun buildNotification(args: NotifyMessageArgs): Notification {
@@ -123,8 +198,42 @@ class MessageNotifierPlugin(private val activity: Activity) : Plugin(activity) {
     return -kotlin.math.abs("orbdrop.msg:$kind:$id".hashCode())
   }
 
-  private companion object {
+  companion object {
     /** 消息通知的渠道（与 `OrbDropService` 那条 `orbdrop.keepalive` 分开，见类注释）。 */
     const val CHANNEL_MESSAGES = "orbdrop.messages"
+
+    /**
+     * 建「消息通知」这条渠道（幂等：已存在就直接返回）。
+     *
+     * **为什么是 companion、为什么要在界面起来那一刻就建**（调用点：`MainActivity`）：
+     * 渠道不只是"发通知时的路由"，它同时是**用户在系统设置里唯一能看到、能调的东西** ——
+     * 只按需在建在 `notifyMessage` 里的话，装完那一刻渠道表是空的（另一条 `orbdrop.keepalive`
+     * 是 `IMPORTANCE_LOW`、而且它在系统那一页里本来也没什么可调的），于是
+     * "设置 → 通知和状态栏 → OrbDrop"里看不到「消息通知」这一条：**横幅/提醒方式无从开起**
+     * （华为那一层的默认值也是在"这个应用有哪些通知类型"的那一刻定下的，见 docs/p1-implementation.md §19）。
+     *
+     * 重要性只有**建渠道那一刻**能定：AOSP 之后只允许应用把它**降**下去，不允许升
+     * （`PreferencesHelper.createNotificationChannel`：`existing.getUserLockedFields() == 0 &&
+     * channel.getImportance() < existing.getImportance()` 才写，且删了再用同一个 id 重建
+     * 会走"反删除"、保留原设置）——所以这条渠道要么一开始就是 HIGH，要么永远不是。
+     */
+    fun ensureChannel(context: Context) {
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+      val system = context.getSystemService(NotificationManager::class.java) ?: return
+      if (system.getNotificationChannel(CHANNEL_MESSAGES) != null) return
+      val channel = NotificationChannel(
+        CHANNEL_MESSAGES,
+        context.getString(R.string.notif_channel_messages),
+        NotificationManager.IMPORTANCE_HIGH,
+      ).apply {
+        description = context.getString(R.string.notif_channel_messages_desc)
+        setShowBadge(true)
+      }
+      system.createNotificationChannel(channel)
+      Log.i(TAG, "消息通知渠道已建：$CHANNEL_MESSAGES（importance=HIGH）")
+    }
+
+    /** 日志 tag；与 `MainActivity` / `OrbDropService` 同一串（`adb logcat -s orbdrop-mdns` 一处看全）。 */
+    private const val TAG = "orbdrop-mdns"
   }
 }

@@ -68,6 +68,18 @@ export function navigateBackToList(): void {
   location.hash = `#/${tab}`;
 }
 
+/**
+ * 打开与一台设备的会话（设备行的「发消息」、设备操作底板那一项、新建会话底板都走这一条）。
+ *
+ * **两件事必须一起做**：打开会话（共享 store 的 `openDeviceChat`，它把这条键摆到
+ * `activeThread` 上）与拨 hash（会话子屏只在 `#/chat/<键>` 上挂，见 `navigateChat`）。
+ * 只做前者的话路由还停在原地 —— 界面看着像"点了没反应"。
+ */
+export function openChat(peerId: string): void {
+  chat.openDeviceChat(peerId);
+  navigateChat(chat.deviceKey(peerId));
+}
+
 // ── 提示条 ──────────────────────────────────────────────────────────────────
 
 export interface Toast {
@@ -328,12 +340,22 @@ export async function toggleConnection(peerId: string, connected: boolean): Prom
   }
 }
 
-export async function unpair(peerId: string, name: string): Promise<void> {
+/**
+ * 解除配对：会清掉两侧保存的 token（对端下次推送/拨号就认不出本机了），误触代价高，
+ * 后端也没有"撤销" —— 所以先问一句。**这一句只写在这里**：设备行与设备操作底板都调它，
+ * 两处各写一遍的话文案与判据迟早分叉。
+ *
+ * 返回"真的解除了"：在问一句那里被用户取消时，调用方（设备的操作底板）不该跟着关表。
+ */
+export async function unpair(peerId: string, name: string): Promise<boolean> {
+  if (!confirm(`解除与「${name}」的配对？对端将不再认得本机，需要重新配对。`)) return false;
   try {
     await api.removePeer(peerId);
     toast(`已解除与「${name}」的配对`);
+    return true;
   } catch (e) {
     failed("解除配对", e);
+    return false;
   }
 }
 
@@ -396,7 +418,8 @@ export type Sheet =
   | { kind: "fileActions"; entry: InboxEntry }
   | { kind: "chatActions"; key: string }
   | { kind: "convo" }
-  | { kind: "editRecipients"; key: string };
+  | { kind: "editRecipients"; key: string }
+  | { kind: "keepAlive" };
 
 let sheet = $state<Sheet | null>(null);
 
@@ -410,6 +433,31 @@ export function closeSheet(): void {
 
 export function currentSheet(): Sheet | null {
   return sheet;
+}
+
+/**
+ * 首次运行引导（F-87）：装完那一刻，国产 ROM 的「应用启动管理」默认会在后台把进程冻掉 ——
+ * 用户看到的是"别人推不过来"，而通知栏那条常驻通知还挂着（从外面看不出毛病）。所以第一次进
+ * 应用就把这件事说清楚，并把话说到"去哪一页、开哪几个开关"。
+ *
+ * 只问一次：`Config::keepalive_guided` 落盘、跨重启有效。**已经在白名单里的机器也记一笔** ——
+ * 它没什么可引导的，不该每次开机都被问一遍。读不到（例如命令没注册）就安静地什么都不做：
+ * 这是"多说一句"，不是功能，不该在这里弹错误。
+ */
+let keepAliveAsked = false;
+
+export async function offerKeepAliveGuide(): Promise<void> {
+  if (keepAliveAsked) return;
+  keepAliveAsked = true;
+  try {
+    if (await api.keepaliveGuided()) return;
+    await api.markKeepaliveGuided();
+    const state = await api.keepAliveState();
+    if (state.batteryOptimizationIgnored) return;
+    openSheet({ kind: "keepAlive" });
+  } catch {
+    return;
+  }
 }
 
 // ── 配对邀请（两端）──────────────────────────────────────────────────────────

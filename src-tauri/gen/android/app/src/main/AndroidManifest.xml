@@ -38,6 +38,14 @@
          运行时在 MainActivity 里申请。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- 电池优化白名单（F-87）：**只为了让界面能直接弹系统的那个"允许后台运行"对话框**
+         （`ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`）—— 没有这条权限的话那条 action 当场
+         `SecurityException`，只能退到白名单列表页让用户自己找。
+         它是普通权限（安装即授予，不弹任何东西），真正弹框的是那个 action 本身。
+         在 Google Play 上这条权限属于**受限用法**（政策要求应用确实需要常驻）——本应用不经商店
+         分发，且承诺就是"后台保持在线"（见 `OrbDropService` 的类注释）。 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <!-- 监听网络变化（`ConnectivityManager.registerNetworkCallback`）：Wi-Fi 关掉再打开时，
          系统会把组播锁/Wi-Fi 锁收回去，得在网络恢复的那一刻重新拿回来，否则 mDNS 又聋了
          （见 `OrbDropService.watchWifi`）。 -->

@@ -10,6 +10,7 @@ import android.view.ViewGroup
 import android.webkit.WebView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import org.json.JSONObject
@@ -113,8 +114,28 @@ class MainActivity : TauriActivity() {
   override fun onResume() {
     super.onResume()
     AppVisibility.foreground = true
+    ensureMessageChannel()
     convoAttempts = 0
     deliverPendingConvo()
+  }
+
+  /**
+   * 让「消息通知」这条渠道**装完就存在**（F-108；渠道本身在 `MessageNotifierPlugin.ensureChannel`）。
+   *
+   * 为什么挂在这里、为什么必须挂：
+   *
+   * - **挂在 `onResume` 而不是 `onCreate`**：Android 13+ 的通知授权是一个对话框，它让本 Activity
+   *   `onPause`，用户点完之后再 `onResume` —— 那一下正好是"权限已经落定"的时刻。比它早建没有意义
+   *   （`areNotificationsEnabled()` 还是 false，渠道建出来也是关着的、用户白看），比它晚（原来那样：
+   *   等后台第一条消息）用户就**在系统设置里看不到这条渠道**，"横幅/提醒方式"也就无从开起 ——
+   *   华为那一层的默认值正是在"这个应用有哪些通知类型"的那一刻定下的（见 `docs/p1-implementation.md` §19）。
+   * - **幂等**：渠道已存在时 `ensureChannel` 直接返回，所以每次回到前台叫一次没有代价。
+   * - 没给权限时**不建**：那时用户看不见通知，渠道建出来只会让系统设置页多一条"关着的"；
+   *   等他在系统设置里把通知打开、再回到应用这一刻，这里就会把它建好。
+   */
+  private fun ensureMessageChannel() {
+    if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) return
+    MessageNotifierPlugin.ensureChannel(this)
   }
 
   override fun onPause() {
