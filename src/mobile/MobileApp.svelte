@@ -15,6 +15,7 @@
   import * as store from "./store.svelte";
   import * as chat from "$lib/stores/chat.svelte";
   import * as devices from "$lib/stores/devices.svelte";
+  import * as upd from "$lib/stores/update.svelte";
   import type { IconName } from "./icons";
 
   const tab = $derived(store.currentTab());
@@ -29,6 +30,19 @@
   const onlineCount = $derived(devices.getDevices().filter((d) => d.connected).length);
   const deviceCount = $derived(devices.getDevices().length);
   const addr = $derived(store.getLocalAddr());
+
+  /**
+   * 启动时的静默检查发现新版 → **主动弹一张底板**（后端 `check(force = false)`，起来 8 秒后跑，
+   * 见 `src-tauri/src/update/mod.rs` 的 `init`/`check`）。移动端没有桌面那组右下角气泡，
+   * 这张板就是它的通知位；设置页「版本与更新」那格照旧是同一份状态。
+   *
+   * **只在没有别的底板时弹**：配对邀请（有效期 60 秒）也占着同一个槽位，那种时候它优先 ——
+   * 这张板等它关掉之后自己会补上（`currentSheet` 一变这个 effect 就重跑）。
+   * 「稍后」按过之后 `updatePrompt` 就空了，本次运行内不再弹。
+   */
+  $effect(() => {
+    if (upd.updatePrompt() && !store.currentSheet()) store.openSheet({ kind: "update" });
+  });
 
   /** 顶部那一行：标题、副标题、右侧动作 —— 四个 tab 各一份，与原型一致。 */
   const bar = $derived.by((): { title: string; sub: string; act?: { icon: IconName; label: string; run: () => void } } => {
@@ -130,6 +144,9 @@
     void chat.refresh();
     void store.loadInbox();
     void store.loadLocalAddr();
+    // 自更新那份状态：**从启动就订阅**（设置页挂载时也会叫一次，那个是幂等的）——
+    // 启动那次静默检查的结论要能落在这张板上，而不是等用户先点进设置页才第一次听说。
+    void upd.watchUpdate();
     // 首次运行引导（F-87）：装完那一刻国产 ROM 的「应用启动管理」会在后台把进程冻掉，而通知栏
     // 那条常驻通知照旧挂着（用户看不出毛病）。只问一次，记在配置里 —— 见 `store.offerKeepAliveGuide`。
     void store.offerKeepAliveGuide();

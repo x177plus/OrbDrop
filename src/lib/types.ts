@@ -679,6 +679,13 @@ export interface UpdateState {
   /** `desktop` 桌面端（覆盖 exe 并重启）/ `mobile` 安卓端（拉起系统安装器）。 */
   platform: 'desktop' | 'mobile';
   phase: UpdatePhase;
+  /**
+   * 这份结论是不是**启动时那次静默检查**得的（后端 `check(force = false)`）。
+   *
+   * 界面据它决定要不要主动弹一格：静默检查在后台自己跑，用户没问过这件事，查到新版就得
+   * 主动说一声；用户自己点的那次已经有设置面板在显示，再弹一遍就是把同一件事说两次。
+   */
+  silent: boolean;
   /** 远端版本（检查到之后才有）。 */
   version: string | null;
   notes: string | null;
@@ -718,6 +725,27 @@ export function updateStatusText(u: UpdateState): string {
       return u.platform === 'desktop' ? '正在替换并重启…' : '正在打开系统安装器…';
     case 'error':
       return u.error ? `更新失败：${u.error}` : '更新失败';
+  }
+}
+
+/**
+ * 主动弹出的那一格（桌面通知组里的气泡 / 手机那张底板）的标题。
+ *
+ * 与 `updateStatusText` 同一个口径（两端一份）：那一格**从提示变成进度**，标题跟着换 ——
+ * "有新版本"是等用户决定，"正在更新到"是已经在动手了，进度与失败都靠 `updateStatusText` 说。
+ */
+export function updateTitleText(u: UpdateState): string {
+  switch (u.phase) {
+    case 'available':
+      return `有新版本 v${u.version ?? ''}`;
+    case 'downloading':
+    case 'verifying':
+    case 'applying':
+      return `正在更新到 v${u.version ?? ''}`;
+    case 'error':
+      return '更新失败';
+    default:
+      return `版本 v${u.version ?? u.current}`;
   }
 }
 

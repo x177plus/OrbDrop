@@ -3,7 +3,7 @@ import * as api from '$lib/api';
 import type { UpdateState } from '$lib/types';
 
 /**
- * 自更新的**唯一**状态源（桌面设置面板与移动设置页共用）。
+ * 自更新的**唯一**状态源（桌面设置面板/通知气泡与移动设置页/底板共用）。
  *
  * 状态本身归后端（`src-tauri/src/update/`），这里只做两件事：拿一次初值、然后跟着
  * `update://state` 事件走。所以两端都不需要自己攒状态，"桌面看到的进度"和"手机看到的进度"
@@ -15,7 +15,36 @@ import type { UpdateState } from '$lib/types';
 let state = $state<UpdateState | null>(null);
 /** "安装"这条命令还没返回（桌面端点下去进程就要重启了，按钮得先按住）。 */
 let applying = $state(false);
+/**
+ * 用户把这一格按下去了（「稍后」/关掉那张底板）：**本次运行内不再自动弹**。
+ *
+ * 下次启动是另一个进程，那份静默检查会重新弹一次 —— "每次启动都提示"就是这个意思
+ * （状态本来就不落盘，`Ctl` 是内存里的）。
+ */
+let dismissed = $state(false);
+/**
+ * 「更新这件事」已经在动手了（下载/校验/落地已经露过头）。
+ *
+ * 有了它，"提示"才能在用户点下「立即更新」之后**就地变成进度**：不然点完那一下这一格就没了，
+ * 界面上剩下的只有一个两分钟后才出现的系统安装器（手机），或一次突然的重启（桌面）。
+ */
+let engaged = $state(false);
 let watching = false;
+
+/**
+ * 所有状态都从这一个口子进来（命令的返回、事件、初值三条路）。
+ *
+ * 除了写 `state`，它还要维护 [`engaged`] —— 那是"这一格该不该留着"的判据，只有一处能算。
+ */
+function setState(next: UpdateState): void {
+  // 下载/校验/落地一露头就记下"动手了"；回到待决定/收工则清掉，下一件事重新弹。
+  if (next.phase === 'downloading' || next.phase === 'verifying' || next.phase === 'applying') {
+    engaged = true;
+  } else if (next.phase === 'available' || next.phase === 'uptodate' || next.phase === 'idle') {
+    engaged = false;
+  }
+  state = next;
+}
 
 export function getUpdateState(): UpdateState | null {
   return state;
@@ -23,6 +52,37 @@ export function getUpdateState(): UpdateState | null {
 
 export function isApplying(): boolean {
   return applying;
+}
+
+/**
+ * 该不该**主动提示**：启动时的静默检查（后端 `check(force = false)`，起来 8 秒后跑）发现了
+ * 新版，而且用户还没按掉它。
+ *
+ * `silent` 那道门是必须的：用户自己点「检查更新」得来的结论已经有设置面板在显示，
+ * 再弹一张板/一个气泡就是把同一件事说两遍。
+ */
+export function updatePrompt(): UpdateState | null {
+  const s = state;
+  if (!s || dismissed) return null;
+  return s.phase === 'available' && s.silent ? s : null;
+}
+
+/**
+ * 「更新这件事」该不该在界面上占一格：主动提示的那一档，**外加**已经点过「立即更新」之后的
+ * 进度与结果（那时这一格从"提示"变成"进度"，见 [`engaged`]）。
+ *
+ * 桌面端那条通知气泡按它决定显不显示；手机那边弹的是底板，弹出去之后就由 [`getUpdateState`]
+ * 接着画进度（底板不会因为阶段变了就自己消失）。
+ */
+export function updateTask(): UpdateState | null {
+  const s = state;
+  if (!s || dismissed) return null;
+  return engaged ? s : updatePrompt();
+}
+
+/** 用户按掉了这次提示（「稍后」/关掉那张底板）。 */
+export function dismissUpdatePrompt(): void {
+  dismissed = true;
 }
 
 /**
@@ -36,18 +96,18 @@ export async function watchUpdate(): Promise<void> {
   watching = true;
   try {
     const s = await api.updateState();
-    if (!state) state = s;
+    if (!state) setState(s);
   } catch (e) {
     console.error('读取更新状态失败:', e);
   }
   await listen<UpdateState>('update://state', (e) => {
-    state = e.payload;
+    setState(e.payload);
   });
 }
 
 /** 检查更新（失败时把后端的报错原样抛给调用方，界面自己决定怎么显示）。 */
 export async function checkUpdate(force = true): Promise<void> {
-  state = await api.updateCheck(force);
+  setState(await api.updateCheck(force));
 }
 
 /** 下载并安装。桌面端这条命令返回后进程很快会重启（helper 覆盖 exe）。 */

@@ -19,7 +19,7 @@
   import * as upd from '$lib/stores/update.svelte';
   import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree } from '$lib/api';
   import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem } from '$lib/types';
-  import { shareMeta } from '$lib/types';
+  import { shareMeta, updateStatusText, updateTitleText } from '$lib/types';
   import { planExpansion, planCollapse, planDock, planRectDock, spinForDock, type BadgeSpin, type DockAxis, type DockPlan, type ScreenRect } from '$lib/orbLayout';
   import { circleLayout, collapsedLayout, ORB_SIZE, RECT_CARD_W, RECT_DOCK_W } from '$lib/orbShape';
   import Orb from '$lib/components/Orb.svelte';
@@ -293,8 +293,17 @@
   // 铃铛的角标：面板右下角那组气泡里还有几件事（通知 + 在途推送）。
   // 铃铛收起的不只是"通知"—— 发送方的进度卡也在同一组里，所以角标得一起算，
   // 否则会出现"收起后角标还在、但组里明明有东西"的错位。
+  // 「更新这件事」此刻该不该占一格（提示 → 点过「立即更新」之后的进度/失败）：后端那份
+  // 状态归 store，这里只读。`silent` 那道门在 store 里 —— 用户自己检查来的结论不进这一格。
+  let updateTask = $derived(upd.updateTask());
+  /** 下载进度百分比（不知道总长时是 0，那一格退化成"正在下载 + 已下多少"）。 */
+  let updatePct = $derived(
+    updateTask?.size ? Math.min(100, Math.round((updateTask.received / updateTask.size) * 100)) : 0,
+  );
   // **一批多设备推送算一件**：用户点一次就得到一张卡，角标自然跟着"几次操作"走。
-  let notifCount = $derived(notices.length + pushBatches.length);
+  // 「更新这件事」也算一件：启动时的静默检查发现新版（或已经点过「立即更新」）时，
+  // 它就和那些"等你确认"的通知一样占着右下角一格（见上面的 `upd.updateTask`）。
+  let notifCount = $derived(notices.length + pushBatches.length + (updateTask ? 1 : 0));
   // 底栏右下角那格版本号：**与设置里「当前版本」同一个源**（后端 `UpdateState.current`，
   // 也就是 `tauri.conf.json` 的 version）。写死字面量的话，`npm run bump` 之后底栏就停在
   // 上一版上，跟设置里那格对不上 —— 版本号只该有一处真源。
@@ -325,6 +334,7 @@
   $effect(() => {
     void notices.length;
     void pushBatches.length;
+    void updateTask;
     if (notifEl) notifEl.scrollTop = notifEl.scrollHeight;
   });
   // footer 的实际高度 + 通知组能用的最大高度：两个都量，不写死数字。
@@ -1351,6 +1361,19 @@
       toasts = toasts.map(t => (t.id === id ? { ...t, leaving: true } : t));
       setTimeout(() => { toasts = toasts.filter(t => t.id !== id); }, 260);
     }, 2200);
+  }
+
+  // ── 自更新（F-110）─────────────────────────────────────────────────────
+  // 启动时的静默检查发现新版（后端 `state.silent` 认这一档）时，右下角那组通知里就多一格
+  // 等用户决定 —— 见 `upd.updateTask` 与上面 `notifCount` 那一带的注释。桌面端点「立即更新」
+  // = 下载 → 校验 → 新 exe 覆盖当前 exe 并重启（进程随之中断，进度只在这一格与设置面板里说）。
+  async function installUpdateNow() {
+    try {
+      await upd.installUpdate();
+    } catch (e) {
+      // 失败必须说出来：那条命令的报错讲的是真因（镜像都不通 / 校验不过 / helper 起不来）。
+      toast(`更新失败：${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   // ── 推送（F-50 ~ F-54）────────────────────────────────────────────────
@@ -3005,12 +3028,69 @@
          这一列结构上就不可能画进那个 90px 的悬浮球窗口。 -->
     <div class="panel-bottom">
       <!-- 通知组（面板右下角的气泡组）：未绑定的邀请（带接收/拒绝）、正在接收（进度 + 取消）、
-           已收到待确认、接收失败，外加**发送侧的进度卡**（"等待对方同意"要等很久，
-           它也是右下角的一件事）—— 全都同一形状：右对齐、2/3 面板宽（不占满）。
+           已收到待确认、接收失败，外加**发送侧的进度卡**与**「更新这件事」**（启动时的静默
+           检查发现新版）—— 全都同一形状：右对齐、2/3 面板宽（不占满）。
            来一条甩入一条、收起时整组甩回右侧（`fly`）；footer 最右侧的铃铛整体收起/展开它，
            **收起 ≠ 已读**（角标照旧挂着，与悬浮球左上角黄标同一个数）。 -->
-      {#if notifOpen && (notices.length > 0 || pushBatches.length > 0)}
+      {#if notifOpen && (notices.length > 0 || pushBatches.length > 0 || updateTask)}
         <div class="notif-group" bind:this={notifEl}>
+          <!-- 「更新这件事」（F-110）：启动时的静默检查发现新版时它就在这儿等用户决定，
+               点过「立即更新」之后**就地变成进度**（见 store 的 `updateTask`）—— 这一格是
+               "提示 → 进度 → 失败"同一格三种画法，与那些等你确认的通知同一个形状、同一个
+               铃铛与角标。面板收着时，悬浮球左上角那颗黄标就是唯一还看得见的提示。 -->
+          {#if updateTask}
+            <div
+              class="notif-bubble"
+              class:fail={updateTask.phase === 'error'}
+              in:fly={{ x: 32, duration: MOTION, easing: cubicOut }}
+              out:fly={{ x: 32, duration: MOTION }}
+            >
+              <div class="p-top">
+                <span class="nb-title">{updateTitleText(updateTask)}</span>
+                <span class="nb-size num">
+                  {#if updateTask.phase === 'downloading' || updateTask.phase === 'verifying'}
+                    {updatePct}%
+                  {:else if updateTask.size}
+                    <!-- 提示那一档给"要下多大"；正在收尾/已经失败时不报百分比 -->
+                    {fmtBytes(updateTask.size)}
+                  {/if}
+                </span>
+              </div>
+
+              {#if updateTask.phase === 'downloading' || updateTask.phase === 'verifying'}
+                <div class="p-bar"><i style="width:{updatePct}%"></i></div>
+                <p class="nb-body">{updateStatusText(updateTask)}</p>
+              {:else if updateTask.phase === 'available'}
+                <!-- 版本号已经写在标题里了，正文说"更新什么 / 点下去会发生什么"。 -->
+                <p class="nb-body">{updateTask.notes ?? '下载完会用新版本覆盖当前程序并重启。'}</p>
+              {:else}
+                <p class="nb-body">{updateStatusText(updateTask)}</p>
+              {/if}
+
+              <div class="nb-acts">
+                {#if updateTask.phase === 'available'}
+                  <button class="btn btn-secondary btn-sm" onclick={() => upd.dismissUpdatePrompt()}>稍后</button>
+                  <button
+                    class="btn btn-primary btn-sm"
+                    disabled={upd.isApplying()}
+                    onclick={() => void installUpdateNow()}
+                  >
+                    {upd.isApplying() ? '准备中…' : '立即更新'}
+                  </button>
+                {:else if updateTask.phase === 'error'}
+                  <button class="btn btn-secondary btn-sm" onclick={() => upd.dismissUpdatePrompt()}>知道了</button>
+                  <button
+                    class="btn btn-primary btn-sm"
+                    disabled={upd.isApplying()}
+                    onclick={() => void installUpdateNow()}
+                  >
+                    重试
+                  </button>
+                {/if}
+              </div>
+            </div>
+          {/if}
+
           {#each notices as n, i (n.inviteId)}
             <div
               class="notif-bubble"
