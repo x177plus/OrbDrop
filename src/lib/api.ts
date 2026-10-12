@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, PickerFavorite, ChatSnapshot, InboxEntry, RelayTraffic, UpdateState } from './types';
+import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, ChatSnapshot, InboxEntry, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState } from './types';
 import type { ScreenMetrics, ScreenRect } from './orbLayout';
 
 // Share management
@@ -182,6 +182,16 @@ export function fsDrives(): Promise<FsDrive[]> {
 /** 列一层目录。失败时 reject 的是整个 `FsError`（按 `kind` 选状态页）。 */
 export function fsList(path: string): Promise<FsListing> {
   return invoke('fs_list', { path });
+}
+
+/**
+ * 一批本机路径的展示元数据（名字 / 是否目录 / 大小）。
+ *
+ * **只有拖放那条路用**：选择框里挑的项自带这三样（`FsEntry` → `LocalPick`），而 OS 拖放
+ * 交给界面的只有路径 —— 会话里那条文件消息要显示"发的什么、多大"，得在这儿现问一次。
+ */
+export function pathPicks(paths: string[]): Promise<LocalPick[]> {
+  return invoke('path_picks', { paths });
 }
 
 // Push (F-50 ~ F-54)
@@ -373,6 +383,49 @@ export function listInbox(): Promise<InboxEntry[]> {
 /** 删掉收件目录里的一项**文件**（后端会挡住下载目录之外的路径与目录本身）。 */
 export function deleteInboxFile(path: string): Promise<void> {
   return invoke('delete_inbox_file', { path });
+}
+
+// 「让应用在后台活着」所需的系统那一层（F-87）：全是"读回状态 + 跳系统页"，只有安卓有实体
+// （后端那两条命令只在移动端构建里注册，见 `src-tauri/src/system_settings.rs`）。
+
+/** 电池优化白名单在不在 —— 这一层里**唯一能读到**的状态。 */
+export function keepAliveState(): Promise<KeepAliveState> {
+  return invoke('keepalive_state');
+}
+
+/** 弹系统的"允许后台运行"对话框（ROM 不认那条 action 时退到白名单列表页）。 */
+export function requestIgnoreBatteryOptimizations(): Promise<void> {
+  return invoke('request_ignore_battery_optimizations');
+}
+
+/** 跳到 ROM 的「自启动 / 后台活动」页；返回实际打开的是哪一页（华为那三个开关都在那一页上）。 */
+export function openAutoStartSettings(): Promise<OpenedPage> {
+  return invoke('open_autostart_settings');
+}
+
+/** 首次引导给他看过了没有（写在配置文件里，跨重启有效；重装会清掉、于是重新问一次）。 */
+export function keepaliveGuided(): Promise<boolean> {
+  return invoke('keepalive_guided');
+}
+
+/** 记一笔"引导已经给他看过"。 */
+export function markKeepaliveGuided(): Promise<boolean> {
+  return invoke('mark_keepalive_guided');
+}
+
+/** 通知这一层的真实状态：总开关 + 「消息通知」渠道的重要性（`-1` = 渠道还没建）。 */
+export function notificationState(): Promise<NotifyState> {
+  return invoke('notification_state');
+}
+
+/** 跳本应用的通知设置页（华为那一层「静默通知 / 横幅」就在这页上）。 */
+export function openNotificationSettings(): Promise<void> {
+  return invoke('open_notification_settings');
+}
+
+/** 跳「消息通知」那一条渠道自己的设置页（横幅、铃声、锁屏）。 */
+export function openMessageChannelSettings(): Promise<void> {
+  return invoke('open_message_channel_settings');
 }
 
 // 拖拽下载（F-46）：把树里的任意文件/目录拖到资源管理器里，落在拖到的那个目录。

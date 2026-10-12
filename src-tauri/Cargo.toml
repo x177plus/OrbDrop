@@ -1,6 +1,6 @@
 [package]
 name = "orbdrop"
-version = "0.0.1"
+version = "0.0.2"
 description = "OrbDrop — LAN file sharing tool"
 authors = ["you"]
 license = "GPL-3.0-or-later"
@@ -57,11 +57,19 @@ base64 = "0.22"
 aes-gcm = "0.10"
 parking_lot = "0.12"
 dirs = "5"
-# `rustls-tls-no-provider`：reqwest 不自带 crypto provider 决策 —— 由本机在启动时显式安装
-# 一份（`net::install_crypto_provider`，用 `ring`），到对端那几条路再叠上装着 pinning
-# 校验器的预配置 `rustls::ClientConfig`（见 `net::client_builder`）。
-# 也因此**不再有 native-tls**：对一个只连内网自签证书的应用，系统信任库本就用不上。
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-no-provider", "stream", "json"] }
+# crypto provider 决策仍然由本机做（`-no-provider`）：启动时显式装一份 `ring`
+# （`net::install_crypto_provider`），到对端那几条路再叠上装着 pinning 校验器的预配置
+# `rustls::ClientConfig`（`net::client_builder`）。
+# **但信任库必须带上**：到对端那一跳靠指纹判身份、用不到信任库，而自更新要连公网的
+# github.com / gitee.com —— 原先那条 `rustls-tls-no-provider` 等价于 manual-roots，给的是
+# **空**信任库，表现是每条 https 都 `invalid peer certificate: UnknownIssuer`（2026-10-10
+# 真机上就是这么炸的：两条清单地址一条不落地全挂，而本机演练走的是明文回环 http、发布侧
+# 回读走 `curl`，两边都看不见）。
+# 用带 `-no-provider` 的变体而不是 `rustls-tls-webpki-roots`：后者会叠上 `__rustls-ring`，
+# 顺手把 quinn 那一族弱依赖解进 `Cargo.lock`（一个都不会编，但锁文件里凭空多出十几个包）。
+# 内置的公共 CA 列表也顺手挡掉了"设备上装个根证书就能 MITM 更新"。
+# 也因此**不再有 native-tls**：除自更新之外都只连内网自签证书，系统信任库用不上。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "stream", "json"] }
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
 pathdiff = "0.2"

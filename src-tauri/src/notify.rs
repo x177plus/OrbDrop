@@ -15,6 +15,8 @@
 #[cfg(mobile)]
 use std::sync::OnceLock;
 #[cfg(mobile)]
+use serde::{Deserialize, Serialize};
+#[cfg(mobile)]
 use tauri::plugin::{PluginHandle, TauriPlugin};
 #[cfg(mobile)]
 use tracing::warn;
@@ -117,3 +119,64 @@ pub async fn message(convo: &Convo, title: &str, body: &str) {
 /// 桌面端：没有通知栏这回事，空操作。
 #[cfg(not(mobile))]
 pub async fn message(_convo: &Convo, _title: &str, _body: &str) {}
+
+// ---------------------------------------------------------------------------
+// 通知这一层的**自查与跳转**（F-108 / F-87 那一半：用户去系统设置里把横幅打开）
+// ---------------------------------------------------------------------------
+
+/// 通知这一层此刻的真实状态（Kotlin `MessageNotifierPlugin.notificationState`）。
+///
+/// **为什么要读**：横幅不是权限，而是"渠道重要程度 ≥ 高 **且** 这条通知真的会响/震"的派生表现
+/// （AOSP `NotificationInterruptStateProviderImpl.shouldHeadsUpWhenAwake` 里那道
+/// `entry.getImportance() < IMPORTANCE_HIGH → 不弹`）。而渠道的重要性**建完只能降不能升**，
+/// 所以要区分"我们声明得不对"与"用户在别处关了它"，界面只能拿这个值说真话。
+#[cfg(mobile)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotifyState {
+    /// 应用级通知总开关（Android 13+ 的 `POST_NOTIFICATIONS` / 系统设置里那条"允许通知"）。
+    pub enabled: bool,
+    /// 「消息通知」渠道此刻的重要程度（`NotificationManager.IMPORTANCE_*`，2=低 3=默认 4=高）；
+    /// `-1` = 渠道还没建（重要性的取值域是 0–5，负数不会撞上）。
+    pub message_channel_importance: i32,
+}
+
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn notification_state() -> Result<NotifyState, String> {
+    let Some(handle) = HANDLE.get() else {
+        return Err("通知插件句柄不在（内部错误）".into());
+    };
+    handle
+        .run_mobile_plugin_async::<NotifyState>("notificationState", serde_json::json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 跳到本应用的通知设置页（Kotlin `openNotificationSettings`）。
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn open_notification_settings() -> Result<(), String> {
+    let Some(handle) = HANDLE.get() else {
+        return Err("通知插件句柄不在（内部错误）".into());
+    };
+    handle
+        .run_mobile_plugin_async::<serde_json::Value>("openNotificationSettings", serde_json::json!({}))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// 跳到「消息通知」那一条渠道自己的设置页 —— 横幅开关就在那儿（Kotlin `openChannelSettings`）。
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn open_message_channel_settings() -> Result<(), String> {
+    let Some(handle) = HANDLE.get() else {
+        return Err("通知插件句柄不在（内部错误）".into());
+    };
+    handle
+        .run_mobile_plugin_async::<serde_json::Value>("openChannelSettings", serde_json::json!({}))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}

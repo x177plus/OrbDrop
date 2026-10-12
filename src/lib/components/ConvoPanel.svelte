@@ -20,6 +20,7 @@
    */
   let {
     pickedId,
+    dropHot,
     onToast,
     onSendFiles,
     onAcceptInvite,
@@ -29,6 +30,8 @@
   }: {
     /** 右键菜单正指着的那条消息（高亮它，菜单收掉就清空）。 */
     pickedId: string | null;
+    /** 拖进来的文件正落在这块浮层上（F-111）：描一圈主色 + 一句"松手会发生什么"。 */
+    dropHot: boolean;
     onToast: (msg: string) => void;
     /** 「＋」：给这条会话的每台选文件发过去（App 开文件选择框，走推送那条路）。 */
     onSendFiles: () => void;
@@ -309,6 +312,7 @@
 <section
   class="convo-pop"
   class:open
+  class:drop-hot={dropHot}
   aria-label="会话"
   aria-hidden={!open}
   inert={!open}
@@ -655,6 +659,14 @@
         </button>
       </form>
     </div>
+  {/if}
+
+  <!-- 拖入预告（F-111）：落点就是这条会话 —— 松手即推送，不再登记成共享项。
+       盖一层浅底把底下的消息流压下去：这句话要读得清，`pointer-events: none` 让它不吃任何
+       指针事件（拖动期间本来也收不到）。它只在该出现时挂上（`dropHot` 只在浮层开着、
+       且已经进了某条会话时才为真，见 `App.dropInConvo`）。 -->
+  {#if dropHot}
+    <div class="drop-hint"><b>松手即发送到这条会话</b></div>
   {/if}
 </section>
 

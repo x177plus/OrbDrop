@@ -32,6 +32,7 @@ pub mod share;
 pub mod state;
 /// IPv4 网段（CIDR）判定与自报（F-107 §5）。
 pub mod subnet;
+pub mod system_settings;
 pub mod task;
 #[cfg(desktop)]
 pub mod tray;
@@ -2244,6 +2245,11 @@ pub fn run() {
     #[cfg(mobile)]
     let builder = builder.plugin(mobile::open_plugin());
 
+    // 「让应用在后台活着」所需的系统那一层（F-87）：电池优化白名单、ROM 的自启动/后台活动页。
+    // 那一层是 ROM 私有的，应用改不了只能引导 —— 见 `system_settings` 的模块注释。
+    #[cfg(mobile)]
+    let builder = builder.plugin(system_settings::plugin());
+
     // 界面（Activity / WebView）还在不在：安卓把 Activity 销毁之后，Rust 叫 Kotlin 那条路
     // （wry 的 `dispatch`）会 panic，而 release 档 `panic = "abort"` 是整个进程倒地 ——
     // 见 `notify::set_ui_alive`。这里只记账，判断在发通知那一步。
@@ -2306,6 +2312,8 @@ pub fn run() {
             #[cfg(desktop)]
             fs_browse::fs_list,
             #[cfg(desktop)]
+            fs_browse::path_picks,
+            #[cfg(desktop)]
             list_picker_favorites,
             #[cfg(desktop)]
             set_picker_favorites,
@@ -2336,6 +2344,25 @@ pub fn run() {
             mobile::list_inbox,
             #[cfg(mobile)]
             mobile::delete_inbox_file,
+            // 「让应用在后台活着」所需的系统那一层（F-87）：读回电池优化白名单在不在、把用户送到
+            // ROM 的自启动页；外加通知这一层的自查与跳转（F-108 的横幅那一半）。
+            // 全是"读状态 + 跳系统页"，没有业务逻辑 —— 只有安卓有实体，见 `system_settings`。
+            #[cfg(mobile)]
+            system_settings::keepalive_state,
+            #[cfg(mobile)]
+            system_settings::request_ignore_battery_optimizations,
+            #[cfg(mobile)]
+            system_settings::open_autostart_settings,
+            #[cfg(mobile)]
+            system_settings::keepalive_guided,
+            #[cfg(mobile)]
+            system_settings::mark_keepalive_guided,
+            #[cfg(mobile)]
+            notify::notification_state,
+            #[cfg(mobile)]
+            notify::open_notification_settings,
+            #[cfg(mobile)]
+            notify::open_message_channel_settings,
             download_and_open,
             open_path,
             #[cfg(desktop)]

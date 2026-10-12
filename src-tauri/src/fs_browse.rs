@@ -193,6 +193,44 @@ pub async fn fs_list(path: String) -> Result<FsListing, FsError> {
         .map_err(|e| FsError::plain(format!("读取目录失败：{e}")))?
 }
 
+/// 一批本机路径的**展示元数据**（名字 / 是否目录 / 大小）：拖入会话浮层的那批文件要用它
+/// （`App` 的 `onDragDropEvent` → `sendDroppedToConvo`）。
+///
+/// 选择框那条路不需要它 —— 列目录时 `FsEntry` 本来就把这三样带下来了（`FilePicker` 直接
+/// 拼成 `LocalPick`）。而 **OS 拖放交给界面的只有路径**：会话里那条文件消息要显示"发的什么、
+/// 多大、是不是文件夹"，只能拿路径在这儿现问一次。
+///
+/// **只取元数据，不做判断**：能不能推（链接 / 系统目录 / 自家数据目录 / 镜像）由
+/// `push_paths` 那条路当场说清 —— 判据复制一份到这里，就又多了一处要跟着改的地方，而用户
+/// 该看到的是推送那套原话（"「x」是一个链接，不能作为推送源"）。取不到的项也照样返回一条
+/// （名字退回路径本身、按文件算）：批里有一条坏的，不该让界面在"问元数据"这一步就整批哑掉。
+#[tauri::command]
+pub async fn path_picks(paths: Vec<String>) -> Result<Vec<FsEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || pick_metas(&paths))
+        .await
+        .map_err(|e| format!("读取文件信息失败：{e}"))
+}
+
+/// `path_picks` 的全部动作（同步；命令层只负责放到阻塞线程上）。
+fn pick_metas(paths: &[String]) -> Vec<FsEntry> {
+    paths
+        .iter()
+        .map(|raw| {
+            let p = Path::new(raw);
+            // 名字与清单里那个顶层名同一份规则（`transfer::file_name_of`）：会话里显示的就是
+            // 对端将要落盘的那个名字，两处不能各猜各的。
+            let name = crate::transfer::file_name_of(p);
+            let (is_dir, size) = match std::fs::symlink_metadata(p) {
+                // 目录不报大小（与 `FsEntry` 同一约定：列一层不读它的子项）。
+                Ok(meta) if meta.is_dir() => (true, 0),
+                Ok(meta) => (false, meta.len()),
+                Err(_) => (false, 0),
+            };
+            FsEntry { name, path: raw.clone(), is_dir, size }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // 盘符枚举
 // ---------------------------------------------------------------------------
@@ -529,6 +567,35 @@ mod tests {
             "{} 不该出现在选择框里",
             own.display()
         );
+    }
+
+    /// 拖入会话浮层那批文件：界面手上只有路径，名字/是否目录/大小按路径现问一次。
+    /// 与清单里那个顶层名必须同一份规则（`transfer::file_name_of`）—— 会话气泡上显示的名字
+    /// 就是对端将要落盘的那个名字。
+    #[test]
+    fn pick_metas_names_dir_and_size_by_path() {
+        let dir = temp_dir("picks");
+        std::fs::write(dir.join("报告 v2.txt"), b"0123456789").unwrap();
+        let folder = dir.join("素材");
+        std::fs::create_dir_all(&folder).unwrap();
+
+        let picks = pick_metas(&[
+            dir.join("报告 v2.txt").to_string_lossy().to_string(),
+            folder.to_string_lossy().to_string(),
+            // 取不到的项照样返回一条（名字退回路径末段），让 `push_paths` 去报那句原话
+            dir.join("不在了.txt").to_string_lossy().to_string(),
+        ]);
+
+        assert_eq!(picks.len(), 3);
+        assert_eq!(picks[0].name, "报告 v2.txt");
+        assert!(!picks[0].is_dir);
+        assert_eq!(picks[0].size, 10);
+
+        assert_eq!(picks[1].name, "素材");
+        assert!(picks[1].is_dir);
+        assert_eq!(picks[1].size, 0, "文件夹不报大小");
+
+        assert_eq!(picks[2].name, "不在了.txt", "取不到也要有名字，不能整批哑掉");
     }
 
     #[test]

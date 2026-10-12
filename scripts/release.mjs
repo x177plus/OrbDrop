@@ -65,10 +65,14 @@ const USAGE = `用法：node scripts/release.mjs [选项]
   --local              本机演练：不联网、不 push、不调 API，mirrors 指向本机镜像台
   --verify-only        只回读校验某个已发布的版本（两个清单地址 + 每个资产 URL），不构建、不 push、不调 API
   --skip-build         不构建，直接发布现有产物（本机演练、或刚手动构建过）
+  --republish          同版本重发：复用已发布的 tag/Release，只把清单与四个附件换成这次构建的
+                       （给"版本号没变、但产物必须换掉"的补发用，比如发布后才发现的客户端缺陷）。
+                       仓库里 tag 不动，所以 tag 指向的提交与 Release 附件会不一致 —— 见 docs/update.md
 
 示例：
   node scripts/release.mjs --local --skip-build --version 0.0.1
   node scripts/release.mjs --version 0.0.2 --notes "新增 xxx"
+  node scripts/release.mjs --version 0.0.1 --republish --notes "修 xxx（同版本重发）"
   node scripts/release.mjs --verify-only --version 0.0.1`;
 
 /** Release 阶段失败时，git 侧（代码 + 清单）已经推上去了：说清这一点，别让人以为什么都没发生。 */
@@ -88,7 +92,7 @@ if (flag("--help") || flag("-h")) {
   log(USAGE);
   process.exit(0);
 }
-const KNOWN_FLAGS = ["--local", "--skip-build", "--verify-only", "--help", "-h", "--version", "--notes"];
+const KNOWN_FLAGS = ["--local", "--skip-build", "--verify-only", "--republish", "--help", "-h", "--version", "--notes"];
 // 跳过 `--version` / `--notes` 后面的那个值：更新说明里以 `-` 开头也不该被当成未知参数
 // （只有这两个选项真的出现时才登记下标，否则 indexOf 返回 -1，+1 会误把 argv[0] 排除）
 const valueIdx = new Set();
@@ -105,6 +109,18 @@ const cfg = loadConfig();
 const LOCAL = flag("--local");
 const SKIP_BUILD = flag("--skip-build");
 const VERIFY_ONLY = flag("--verify-only");
+/**
+ * 同版本重发：版本号不动、**产物必须换掉**的那种补发（例如发布之后才发现客户端有缺陷）。
+ *
+ * 与普通远端发布的差别只有两处，都跟"这一版已经存在"有关：
+ *  - **tag 不新建、也不移动**（它已经指向那一版最初那次提交）：只往发布仓的分支上追加一个
+ *    提交（清单与 CHANGELOG 变了）。所以远端 Release 的附件与 tag 指向的提交会不一致 ——
+ *    客户端读的是清单（GitHub 走 Release 附件、Gitee 走分支上的仓库文件），两边都是新的。
+ *  - **Release 是复用的**：GitHub 先删掉旧附件再传（同名附件会 422）；Gitee 直接删掉整个
+ *    Release 再建一个同 tag 的（它没有"删单个附件"这一步，而且这样也顺带释放配额）。
+ */
+const REPUBLISH = flag("--republish");
+if (REPUBLISH && LOCAL) die("--republish 只在远端模式有意义", "本机演练直接覆盖发布仓即可，不用它。");
 // --verify-only 只读远端（清单 + 资产 URL），不需要 token，也不碰构建与 git。
 const tokens = LOCAL || VERIFY_ONLY ? null : requireRemoteConfig(cfg);
 const keyPath = requireSigningKey(cfg);
@@ -116,7 +132,7 @@ const drifted = Object.entries(versions).filter(([, v]) => v !== ver.raw);
 
 step(`发布 OrbDrop ${ver.raw}（versionCode ${ver.code}）· ${LOCAL ? "本机演练（--local）" : "远端发布"}`);
 note(`配置 ${rel(cfg.__source)} · 发布仓 ${cfg.repoPath} · 私钥 ${keyPath}`);
-note(`模式 ${VERIFY_ONLY ? "只回读校验（不构建 / 不 push / 不调 API）" : LOCAL ? "不联网 / 不 push / mirrors 指向本机镜像台" : "构建 + push 两个远端 + 调 API + 回读校验"}${SKIP_BUILD ? " · --skip-build（用现有产物）" : ""}`);
+note(`模式 ${VERIFY_ONLY ? "只回读校验（不构建 / 不 push / 不调 API）" : LOCAL ? "不联网 / 不 push / mirrors 指向本机镜像台" : "构建 + push 两个远端 + 调 API + 回读校验"}${SKIP_BUILD ? " · --skip-build（用现有产物）" : ""}${REPUBLISH ? " · --republish（同版本重发：复用已发布的 tag 与 Release）" : ""}`);
 
 if (drifted.length) {
   const detail = drifted.map(([f, v]) => `${f}=${v}`).join("、");
@@ -369,20 +385,34 @@ async function publishRemote(cfg, tokens, ver, tag, notes, branch, files) {
     );
   }
   if (git(["tag", "-l", tag]).stdout.trim()) {
-    die(`tag ${tag} 已存在（本地）`, `同版本重发：git -C "${cfg.repoPath}" tag -d ${tag}，远端 tag 也要一起删。`);
+    if (!REPUBLISH) {
+      die(
+        `tag ${tag} 已存在（本地）`,
+        `同版本重发：加 --republish（复用已发布的 tag 与 Release，只换清单与附件）；或换个版本号。`,
+      );
+    }
+  } else if (REPUBLISH) {
+    die(`--republish 要复用的 tag ${tag} 不存在`, "这一版还没发过 —— 去掉 --republish 走普通发布。");
   }
   git(["add", "-A"]);
   if (!git(["status", "--porcelain"]).stdout.trim()) {
     die("发布仓没有任何变更（要发的内容跟已提交的一模一样）", "换个版本号，或确认产物/清单确实更新了。");
   }
   git(["commit", "-m", `Released ${tag}（产物与更新清单）`], { inherit: true, label: "git commit" });
-  git(["tag", "-a", tag, "-m", `OrbDrop ${tag}`], { inherit: true, label: "git tag" });
-  ok(`已提交并打 tag ${tag}`);
+  // 重发不碰 tag：它已经指向这一版最初那次提交，"移动已发布的 tag"会把两条历史打乱。
+  if (!REPUBLISH) {
+    git(["tag", "-a", tag, "-m", `OrbDrop ${tag}`], { inherit: true, label: "git tag" });
+    ok(`已提交并打 tag ${tag}`);
+  } else {
+    ok(`已提交（--republish：tag ${tag} 保持不动）`);
+  }
   for (const remote of [cfg.github.remote, cfg.gitee.remote]) {
     const url = git(["remote", "get-url", remote], { allowFail: true });
     if (url.status !== 0) die(`发布仓没有配置远端 ${remote}`, `git -C "${cfg.repoPath}" remote add ${remote} <仓库地址>`);
     git(["push", remote, branch], { inherit: true, label: `git push ${remote} ${branch}（推送失败：代理/权限/仓库不存在，别忽略）` });
-    git(["push", remote, `refs/tags/${tag}`], { inherit: true, label: `git push ${remote} ${tag}` });
+    if (!REPUBLISH) {
+      git(["push", remote, `refs/tags/${tag}`], { inherit: true, label: `git push ${remote} ${tag}` });
+    }
     ok(`已推送 ${remote} → ${url.stdout.trim()}`);
   }
 
@@ -395,20 +425,56 @@ async function publishRemote(cfg, tokens, ver, tag, notes, branch, files) {
 
 async function publishGithub(cfg, token, tag, notes, files) {
   const gh = cfg.github;
-  step("GitHub：建 Release 并上传附件");
-  const res = await fetchOrDie(
-    `https://api.github.com/repos/${gh.owner}/${gh.repo}/releases`,
-    {
-      method: "POST",
-      headers: { ...githubHeaders(token), "Content-Type": "application/json" },
-      body: JSON.stringify({ tag_name: tag, name: tag, body: notes, draft: false, prerelease: false }),
-      timeoutMs: 120_000,
-    },
-    "GitHub 建 Release",
-  );
-  if (res.status !== 201) die(`GitHub 建 Release 失败（HTTP ${res.status}）`, [await bodySnippet(res), PUSHED_HINT].join("\n"));
-  const release = await res.json();
-  ok(`Release #${release.id} · ${release.html_url ?? ""}`);
+  step(`GitHub：${REPUBLISH ? `复用 Release ${tag}（先删旧附件再传新的）` : "建 Release 并上传附件"}`);
+  let release;
+  if (REPUBLISH) {
+    const got = await fetchOrDie(
+      `https://api.github.com/repos/${gh.owner}/${gh.repo}/releases/tags/${tag}`,
+      { headers: githubHeaders(token), timeoutMs: 120_000 },
+      `GitHub 取 Release ${tag}`,
+    );
+    if (got.status !== 200) die(`GitHub 上没有 tag ${tag} 的 Release（HTTP ${got.status}）`, [await bodySnippet(got), PUSHED_HINT].join("\n"));
+    release = await got.json();
+    ok(`Release #${release.id}（复用） · ${release.html_url ?? ""}`);
+    // 说明也跟着刷新一次：清单里的 notes 变了，Release 页面上那句不该还是旧的。
+    const patched = await fetchOrDie(
+      `https://api.github.com/repos/${gh.owner}/${gh.repo}/releases/${release.id}`,
+      {
+        method: "PATCH",
+        headers: { ...githubHeaders(token), "Content-Type": "application/json" },
+        body: JSON.stringify({ name: tag, body: notes, draft: false, prerelease: false }),
+        timeoutMs: 120_000,
+      },
+      "GitHub 更新 Release 说明",
+    );
+    if (patched.status !== 200) warn(`更新 Release 说明失败（HTTP ${patched.status}），附件照旧上传`);
+    for (const asset of release.assets ?? []) {
+      const del = await fetchOrDie(
+        `https://api.github.com/repos/${gh.owner}/${gh.repo}/releases/assets/${asset.id}`,
+        { method: "DELETE", headers: githubHeaders(token), timeoutMs: 120_000 },
+        `GitHub 删附件 ${asset.name}`,
+      );
+      // 404 = 已经不在了（重跑发布时正常）；其余非 2xx 要拦住 —— 留着旧附件的话，同名上传会 422。
+      if (del.status !== 204 && del.status !== 404) {
+        die(`GitHub 删旧附件失败（HTTP ${del.status}）：${asset.name}`, [await bodySnippet(del), PUSHED_HINT].join("\n"));
+      }
+      ok(`删掉旧附件 ${asset.name}`);
+    }
+  } else {
+    const res = await fetchOrDie(
+      `https://api.github.com/repos/${gh.owner}/${gh.repo}/releases`,
+      {
+        method: "POST",
+        headers: { ...githubHeaders(token), "Content-Type": "application/json" },
+        body: JSON.stringify({ tag_name: tag, name: tag, body: notes, draft: false, prerelease: false }),
+        timeoutMs: 120_000,
+      },
+      "GitHub 建 Release",
+    );
+    if (res.status !== 201) die(`GitHub 建 Release 失败（HTTP ${res.status}）`, [await bodySnippet(res), PUSHED_HINT].join("\n"));
+    release = await res.json();
+    ok(`Release #${release.id} · ${release.html_url ?? ""}`);
+  }
   // upload_url 形如 https://uploads.github.com/.../assets{?name,label}，模板段要去掉
   const uploadBase = String(release.upload_url).replace(/\{\?.*\}$/, "");
   for (const file of files) {
@@ -456,7 +522,21 @@ function githubHeaders(token) {
 
 async function publishGitee(cfg, token, tag, notes, branch, files) {
   const gt = cfg.gitee;
-  step("Gitee：建 Release 并上传附件");
+  step(`Gitee：${REPUBLISH ? `重建 Release ${tag}（旧的那个连同附件一起删掉）` : "建 Release 并上传附件"}`);
+
+  // 重发先删旧的：Gitee 没有"删单个附件"，而且建同 tag 的 Release 要先让位；
+  // 先删也顺带把配额释放掉（下面的 checkGiteeQuota 才数得准）。
+  if (REPUBLISH) {
+    const old = await findGiteeRelease(gt, token, tag);
+    if (!old) die(`Gitee 上找不到 tag ${tag} 的 Release`, "这一版在 Gitee 上还没发过？去掉 --republish 走普通发布。");
+    const del = await fetchOrDie(giteeApiUrl(gt, token, `releases/${old.id}`), { method: "DELETE", timeoutMs: 120_000 }, `Gitee 删 Release ${tag}`);
+    // 404 = 已经不在了（重跑发布时正常）
+    if (del.status !== 204 && del.status !== 200 && del.status !== 404) {
+      die(`Gitee 删旧 Release 失败（HTTP ${del.status}）`, [await bodySnippet(del), PUSHED_HINT].join("\n"));
+    }
+    ok(`已删旧 Release #${old.id}（${tag}，连同它的附件）`);
+  }
+
   await checkGiteeQuota(gt, token, files);
 
   // 官方 spec：POST /repos/{o}/{r}/releases 是 x-www-form-urlencoded，
@@ -503,6 +583,40 @@ async function publishGitee(cfg, token, tag, notes, branch, files) {
   }
 }
 
+/** Gitee API 的带 token 地址（v5 的多数接口认查询串里的 `access_token`，不认 Authorization 头）。 */
+function giteeApiUrl(gt, token, rest) {
+  return `https://gitee.com/api/v5/repos/${gt.owner}/${gt.repo}/${rest}${rest.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(token)}`;
+}
+
+/**
+ * 按 tag 找 Gitee 上已经发过的 Release（没有就返回 null）。
+ *
+ * 先试官方的按 tag 取（`releases/tags/<tag>`）；它拿不到时翻列表兜底 —— 这个接口在
+ * "tag 名里带 `v` 前缀"这类情况下偶尔认不出来，而重发时必须准确定位到要删的那一个。
+ */
+async function findGiteeRelease(gt, token, tag) {
+  const byTag = await fetchOrDie(giteeApiUrl(gt, token, `releases/tags/${encodeURIComponent(tag)}`), { timeoutMs: 120_000 }, `Gitee 取 Release ${tag}`);
+  if (byTag.status === 200) {
+    const rel = await byTag.json();
+    if (rel?.id) return rel;
+  } else if (byTag.status !== 404) {
+    warn(`按 tag 取 Release 返回 HTTP ${byTag.status}，改用列表兜底`);
+  }
+  for (let page = 1; page <= 20; page++) {
+    const listRes = await fetchOrDie(giteeApiUrl(gt, token, `releases?per_page=100&page=${page}`), { timeoutMs: 120_000 }, "Gitee 列 Release");
+    if (!listRes.ok) {
+      warn(`拿不到 Release 列表（HTTP ${listRes.status}）`);
+      break;
+    }
+    const list = await listRes.json();
+    if (!Array.isArray(list) || list.length === 0) break;
+    const hit = list.find((r) => r.tag_name === tag);
+    if (hit) return hit;
+    if (list.length < 100) break;
+  }
+  return null;
+}
+
 /** Gitee 的硬限制：单附件 ≤100 MB、仓库附件总量 ≤1 GB。超了要在上传前就报清楚。 */
 async function checkGiteeQuota(gt, token, files) {
   const LIMIT_FILE = 100 * 1024 * 1024;
@@ -514,7 +628,7 @@ async function checkGiteeQuota(gt, token, files) {
     }
     incoming += f.size;
   }
-  const api = (u) => `https://gitee.com/api/v5/repos/${gt.owner}/${gt.repo}/${u}${u.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(token)}`;
+  const api = (u) => giteeApiUrl(gt, token, u);
   let used = 0;
   let releases = 0;
   let truncated = false;

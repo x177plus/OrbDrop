@@ -33,6 +33,13 @@
 //!
 //! 本机演练（还没有远端仓库时）用环境变量 `ORBDROP_UPDATE_MANIFEST` 覆盖上面那份常量，
 //! 指向本机镜像台 —— 见 `scripts/dev-mirror.mjs`。
+//!
+//! **这两条地址连的是公网域名，靠的是 reqwest 内置的公共 CA 列表**（`Cargo.toml` 里的
+//! `rustls-tls-webpki-roots-no-provider`）：到对端那一跳用指纹判身份、不需要信任库，而这里没有
+//! pinning 可用，只能走普通证书校验。所以那份 feature 一被改回"只装 provider、不带 roots"
+//! （`rustls-tls-no-provider` = manual-roots = 空信任库），这里每条 https 都会
+//! `invalid peer certificate: UnknownIssuer` —— 而本机演练走的是**明文**回环 http，
+//! 整条链路照样绿。真机上出事的那种"所有清单地址都拿不到更新信息"就是这么来的。
 
 pub mod apply;
 
@@ -447,11 +454,11 @@ async fn fetch_manifest(app: &AppHandle) -> Result<Manifest, String> {
 async fn fetch_manifest_at(url: &str) -> Result<Manifest, String> {
     let client = http_client()?;
     let fut = async {
-        let res = client.get(url).send().await.map_err(|e| e.to_string())?;
+        let res = client.get(url).send().await.map_err(|e| err_chain(&e))?;
         if !res.status().is_success() {
             return Err(format!("HTTP {}", res.status()));
         }
-        let body = res.bytes().await.map_err(|e| e.to_string())?;
+        let body = res.bytes().await.map_err(|e| err_chain(&e))?;
         serde_json::from_slice::<Manifest>(&body).map_err(|e| format!("清单格式不对：{e}"))
     };
     match tokio::time::timeout(MANIFEST_TIMEOUT, fut).await {
@@ -530,7 +537,7 @@ async fn download_one(app: &AppHandle, url: &str, dest: &Path) -> Result<(), Str
                 FIRST_BYTE_TIMEOUT.as_secs()
             ))
         }
-        Ok(Err(e)) => return Err(e.to_string()),
+        Ok(Err(e)) => return Err(err_chain(&e)),
         Ok(Ok(r)) => r,
     };
     if !res.status().is_success() {
@@ -570,7 +577,7 @@ async fn download_one(app: &AppHandle, url: &str, dest: &Path) -> Result<(), Str
                 ))
             }
             Ok(None) => break,
-            Ok(Some(Err(e))) => return Err(format!("传输中断：{e}")),
+            Ok(Some(Err(e))) => return Err(format!("传输中断：{}", err_chain(&e))),
             Ok(Some(Ok(c))) => c,
         };
 
@@ -868,6 +875,28 @@ fn http_client() -> Result<reqwest::Client, String> {
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .map_err(|e| format!("建 HTTP 客户端失败：{e}"))
+}
+
+/// 拼出 reqwest 错误的**完整**原因链。
+///
+/// `reqwest::Error` 的 `Display` 只有一句 `error sending request for url (...)` —— 真正的原因
+/// （证书不受信、连接超时、DNS 失败）全挂在 `source()` 链上，不走一遍就看不见。而这行字是用户
+/// 排障时**唯一**的线索：真机上出过一次"两条清单地址都拿不到更新信息"，链上写的是
+/// `invalid peer certificate: UnknownIssuer`（信任库是空的，见 `Cargo.toml` 里 reqwest 那段），
+/// 只看 `Display` 的话根本无从下手。
+fn err_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(s) = cur {
+        let text = s.to_string();
+        // reqwest 偶尔把同一句话套两层，重复的不再写第二遍。
+        if !out.contains(&text) {
+            out.push_str("：");
+            out.push_str(&text);
+        }
+        cur = s.source();
+    }
+    out
 }
 
 fn host_of(url: &str) -> String {

@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import * as api from "$lib/api";
   import { formatFileSize, updateStatusText } from "$lib/types";
-  import type { AppSettings } from "$lib/types";
+  import type { AppSettings, KeepAliveState, RelayTraffic } from "$lib/types";
   import * as devices from "$lib/stores/devices.svelte";
   import * as upd from "$lib/stores/update.svelte";
   import Icon from "../Icon.svelte";
@@ -27,9 +27,38 @@
   let transferWorkers = $state("4");
   let transferBlockMb = $state("4");
 
+  /**
+   * 「允许中转」（后端 `AppSettings.allowRelay` + `groupRelay`，默认关）：与桌面端**同一颗开关
+   * 管两条路** —— ① 替够不着彼此的其它设备**盲转字节**（F-106 / S-09）：有些 AP 把同网段客户端
+   * 之间的单播隔开，本机与 A、B 都连得上就替它们搬这一趟，两端 TLS 端到端、本机只看得到字节；
+   * ② 替够不着的同群成员**转一份群消息**（F-100 / S-08，最多 3 跳）。两者都占本机上行带宽
+   * （手机上是流量），所以默认关，保存时两颗一起写。
+   *
+   * 手机当锚点与桌面端是**同一份实现**（`server::start_server` 两端都跑、`POST /relay/open` 的
+   * 认人规则也同一条，见 `server/routes_relay.rs`），唯一的差别是"得先活着等到别人来借"——
+   * 后台被系统冻结就没人借得到，见下面「后台与通知」那一格。
+   */
+  let relay = $state(false);
+
+  /**
+   * 本机替别人中转的**累计流量**（S-11，后端 `relay_traffic` 命令）：只读的用量记录 —— 它是
+   * "当中转方的代价"在界面上唯一的那笔账（上行带宽 + 手机上是流量），不是设置项、不参与保存。
+   *
+   * 桌面端那份面板常驻 DOM、按 `open` 轮询；移动端这一页只在「设置」tab 活跃时挂着，所以进页
+   * 读一次 + 5s 轮询，离开即停（`onMount` 的清理）。
+   */
+  let traffic = $state<RelayTraffic | null>(null);
+
 // 「本机在线」用本地镜像而不是那份拉取结果：改它的唯一入口就是下面那颗开关，
   // 失败要能弹回来，而拉取结果从拿到那一刻起就可能过期。
   let online = $state(true);
+
+  /**
+   * 「后台与通知」那一行要显示的状态：**只有电池优化白名单能读到**（Google 官方 API），
+   * ROM 的「应用启动管理」那三个开关读不到 —— 所以这一行只报这一样，其余交给引导底板去说
+   * （见 `sheets/KeepAliveSheet.svelte` 与 `docs/p1-implementation.md` §22）。
+   */
+  let keepAlive = $state<KeepAliveState | null>(null);
 
   /**
    * 自更新那份状态（后端 `update::UpdateState`，事件 `update://state` 推过来）。
@@ -78,6 +107,8 @@
       autoBroadcast = s.autoBroadcastNew;
       transferWorkers = String(s.transferWorkers);
       transferBlockMb = String(s.transferBlockMb);
+      // 一颗开关两条后端位：任一条开着就显示成开（与桌面端读法一致）。
+      relay = s.allowRelay || s.groupRelay;
       store.resetForm({ deviceName: s.deviceName, port: s.port });
     } catch (e) {
       loadError = e instanceof Error ? e.message : String(e);
@@ -92,11 +123,34 @@
     // 自更新状态：订阅一次（重复调用没有副作用）。
     void upd.watchUpdate();
     void load();
+    // 电池优化白名单：读不到（命令没注册 / 平台没有）就保持"读取中…"，不弹错误 —— 那一行是提示，不是功能。
+    void api
+      .keepAliveState()
+      .then((s) => {
+        keepAlive = s;
+      })
+      .catch(() => {});
+
+    // 中转流量（S-11）是**实时视图**：本机替别人搬的字节随时在涨，读一次只是进页那一刻的快照。
+    // 它没有可订阅的事件，所以这一页开着时按 5s 轮询（与桌面端同一个节拍），离开即停。
+    void refreshTraffic();
+    const trafficTimer = setInterval(() => void refreshTraffic(), 5000);
+    return () => clearInterval(trafficTimer);
   });
 
+  /** 读一次"本机替别人中转了多少"（只读的用量记录：不是设置项、不参与保存，失败只进控制台）。 */
+  async function refreshTraffic(): Promise<void> {
+    try {
+      traffic = await api.relayTraffic();
+    } catch (e) {
+      console.error("Relay traffic load failed:", e);
+    }
+  }
+
   /**
-   * 开关一 = 本机在线 / 隐身。**不是**原型那个「后台保活」：Android 上的常驻靠前台服务
-   * （F-81，本阶段不做），而这里这颗开关是后端真实存在的 `set_online`。
+   * 开关一 = 本机在线 / 隐身。**不是**原型那个「后台保活」：这一颗是后端真实存在的
+   * `set_online`（离线 = 隐身）。**后台保活**是另一回事、另有一个入口：常驻靠前台服务
+   * （F-81），而"系统会不会允许它在后台活着"只能引导用户去开 —— 见下面「后台与通知」那一格。
    */
   async function setOnline(next: boolean): Promise<boolean> {
     try {
@@ -140,6 +194,9 @@
         downloadMode,
         autoBroadcastNew: autoBroadcast,
         online,
+        // 一颗开关管两条路（与桌面端同一个口径）：替其它设备盲转字节 + 替群聊转消息。
+        groupRelay: relay,
+        allowRelay: relay,
         transferWorkers: clampNum(transferWorkers, 1, 8, saved.transferWorkers),
         transferBlockMb: clampNum(transferBlockMb, 1, 32, saved.transferBlockMb),
       });
@@ -147,6 +204,7 @@
       saved = next;
       downloadMode = next.downloadMode;
       autoBroadcast = next.autoBroadcastNew;
+      relay = next.allowRelay || next.groupRelay;
       transferWorkers = String(next.transferWorkers);
       transferBlockMb = String(next.transferBlockMb);
       store.resetForm({ deviceName: next.deviceName, port: next.port });
@@ -268,6 +326,38 @@
     </div>
 
     <div class="sec">
+      <div class="sec-label"><span>中转</span></div>
+      <div class="card gcard">
+        <div class="srow">
+          <div class="srow-top">
+            <span class="slabel">允许中转</span>
+            <label class="switch">
+              <input type="checkbox" bind:checked={relay} aria-label="允许中转" />
+              <span class="track"></span>
+            </label>
+          </div>
+          <p class="shelp">
+            替够不着彼此的其它设备搬字节（有些 Wi‑Fi 把同网段客户端之间的单播隔开），也替够不着的
+            同群成员转消息；不限已配对设备。会占用本机上行带宽（手机上是流量），关掉立刻收掉正在
+            替别人转的每一条。
+          </p>
+        </div>
+        <div class="srow">
+          <span class="slabel">中转流量</span>
+          {#if traffic && (traffic.bytes > 0 || traffic.connections > 0)}
+            <p class="shelp">
+              本机替别人中转累计 {formatFileSize(traffic.bytes)}{traffic.connections > 0
+                ? ` · ${traffic.connections} 条连接`
+                : ""}（只算本机当中转方替别人搬的那部分，重启接着算）。
+            </p>
+          {:else}
+            <p class="shelp">还没有替别人中转 —— 有设备借本机中转之后才会有这个数。</p>
+          {/if}
+        </div>
+      </div>
+    </div>
+
+    <div class="sec">
       <div class="sec-label"><span>运行</span></div>
       <div class="card gcard">
         <div class="srow">
@@ -299,7 +389,37 @@
     </div>
 
     <div class="sec">
+      <div class="sec-label"><span>后台与通知</span></div>
+      <div class="card gcard">
+        <div class="srow">
+          <div class="srow-top" style="justify-content:space-between;">
+            <span class="slabel">保活与通知</span>
+            <button
+              class="btn btn-secondary btn-sm"
+              type="button"
+              onclick={() => store.openSheet({ kind: "keepAlive" })}
+            >
+              检查
+            </button>
+          </div>
+          <p class="shelp">
+            电池优化：{keepAlive === null
+              ? "读取中…"
+              : keepAlive.batteryOptimizationIgnored
+                ? "已允许"
+                : "未允许"}。系统那一层（自启动 / 后台活动）与通知横幅都在这里检查 ——
+            留在默认档时，应用在后台会被系统冻结：通知栏那条「OrbDrop 正在运行」还挂着，
+            对端却已经看不到你了。
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="sec">
       <div class="sec-label"><span>版本与更新</span></div>
+      <!-- 这一格是设置页的最后一格。原型末尾还有一张「OrbDrop 移动端 / 需求 v0.5…」的卡片，
+           而且这一行底下压着一句"更新包先试 GitHub…"的小字 —— 两张都**不搬**：版本号这里本来
+           就有，卡片只是把同一件事说第二遍，小字则在出错时和真正的报错抢视线。 -->
       <div class="card gcard">
         <div class="srow">
           <div class="srow-top" style="justify-content:space-between;">
@@ -313,9 +433,6 @@
               {checking ? "检查中…" : "检查更新"}
             </button>
           </div>
-          <p class="shelp">
-            更新包先试 GitHub、连不上或太慢自动切 Gitee；装之前校验 sha256 与开发者签名。
-          </p>
         </div>
         {#if update?.phase === "available"}
           <div class="srow">
@@ -351,15 +468,6 @@
             </p>
           </div>
         {/if}
-      </div>
-    </div>
-
-    <div class="sec">
-      <div class="card gcard">
-        <div class="about">
-          <span class="an">OrbDrop 移动端</span>
-          <span class="av2">需求 v0.5 · 局域网文件中转工具 · 仅局域网内使用</span>
-        </div>
       </div>
     </div>
 
