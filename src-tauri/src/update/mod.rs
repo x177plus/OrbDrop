@@ -214,6 +214,12 @@ pub struct UpdateState {
     /// `desktop` / `mobile`：界面据此决定文案（"更新并重启" / "下载并安装"）。
     pub platform: &'static str,
     pub phase: Phase,
+    /// 这份结论是不是**启动时那次静默检查**得的（[`check`] 的 `force = false`）。
+    ///
+    /// 界面据此决定要不要**主动弹一格**：静默检查是后台自己跑的，用户没问过这件事，所以
+    /// 查到新版得有地方说出来；而用户自己点的那次（`force = true`）本来就在设置面板里显示着，
+    /// 再弹一遍就是把同一件事说两次。
+    pub silent: bool,
     /// 远端版本（检查到之后才有）。
     pub version: Option<String>,
     pub notes: Option<String>,
@@ -233,6 +239,8 @@ impl Default for UpdateState {
             current: String::new(),
             platform: platform_name(),
             phase: Phase::Idle,
+            // 默认不是静默检查（构建期还没有任何一次检查，界面也就没得弹）。
+            silent: false,
             version: None,
             notes: None,
             pub_date: None,
@@ -311,6 +319,8 @@ pub fn init(app: &AppHandle) {
 
     // 静默检查：**延迟 8 秒**。启动瞬间是应用自己最忙的时候（起服务器、注册 mDNS、
     // 前端首帧），没必要再挤一条 HTTPS 进去；而用户真要点"检查更新"也是一分钟后的事。
+    // 查到新版本时界面会**主动弹一格**（桌面是通知组里的一条气泡，手机是一张底板）——
+    // 这一趟的全部意义就在这儿，`state.silent` 就是给界面认这一档用的。
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(8)).await;
@@ -329,6 +339,8 @@ pub fn init(app: &AppHandle) {
 /// 检查更新。
 ///
 /// `force = true`（用户手动点）忽略静默检查的 30 分钟缓存与镜像记忆；`false` 是启动那次。
+/// 这一位同时决定了快照里的 [`UpdateState::silent`] —— 界面据它区分"后台自己查到的"与
+/// "用户要看的结果"，前者要主动弹一格。
 /// 已经有检查/下载在跑时**不排队、不报错**，直接把当前快照还回去 —— 界面跟着事件走就行。
 pub async fn check(app: AppHandle, force: bool) -> Result<UpdateState, String> {
     {
@@ -350,6 +362,10 @@ pub async fn check(app: AppHandle, force: bool) -> Result<UpdateState, String> {
         c.state.phase = Phase::Checking;
         c.state.error = None;
         c.state.received = 0;
+        // **整个检查过程都带着这个标记**（后面几步只改阶段，不动它）：它说的是"这份结论
+        // 是谁要的"，不是一个阶段的属性 —— 下载/校验那几步下面接着跑，界面靠它认得这一格
+        // 是不是自己弹出来的。
+        c.state.silent = !force;
     });
 
     let manifest = match fetch_manifest(&app).await {

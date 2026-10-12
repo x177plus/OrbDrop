@@ -419,7 +419,8 @@ export type Sheet =
   | { kind: "chatActions"; key: string }
   | { kind: "convo" }
   | { kind: "editRecipients"; key: string }
-  | { kind: "keepAlive" };
+  | { kind: "keepAlive" }
+  | { kind: "update" };
 
 let sheet = $state<Sheet | null>(null);
 
