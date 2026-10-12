@@ -81,8 +81,9 @@ fn verify_file_checks_hash_size_and_signature() {
 
 /// **发布脚本与客户端之间的接缝**：`scripts/release.mjs` 写出来的清单必须能被客户端解析。
 ///
-/// 这两半是分别写的（脚本在 Node 侧、解析在 Rust 侧），夹具是发布脚本在
-/// `--local --skip-build --version 0.0.1` 下**真实产出**的那一份，拷进来没改过。
+/// 这两半是分别写的（脚本在 Node 侧、解析在 Rust 侧），夹具是从发布仓 `update.json` **原样拷来**的
+/// 那一份（0.0.2 远端发布真实产出）—— 也就是**发出去的那份清单**（GitHub Release 附件与 Gitee 仓库根
+/// 是同一份文件）必须能被客户端解析、地址策略必须放行。
 /// 谁把字段名写歪了（`pubDate` ↔ `pub_date`、`windows-x86_64` ↔ `windows-x86_64-nsis`），
 /// 这里先红；不然要等到用户点「检查更新」才知道，而那时的报错只会说"清单格式不对"。
 #[test]
