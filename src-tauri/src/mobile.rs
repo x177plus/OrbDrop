@@ -21,7 +21,6 @@ use tracing::info;
 #[cfg(mobile)]
 use tracing::warn;
 
-use crate::config::PeerDevice;
 use crate::state::AppState;
 
 /// 列表最多列这么多条：手机屏幕上滚不完的东西没有价值，"最近 200 个"覆盖了真实用法。
@@ -97,6 +96,8 @@ fn list_inbox_at(root: &Path) -> Vec<InboxEntryDto> {
         };
         if meta.is_dir() {
             // 一级子目录 = 一台发送方（或用户自己放进去的文件夹）。列它里面的直接项。
+            // S-12 关掉那层时推送直接落在根里 —— 那时顶部这一层就是它们本身（显示上没有
+            // "发送方"，`from` 空），这里的画法一个字都不用改。
             let sender = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -203,26 +204,6 @@ pub fn repair_device_name(state: &AppState) {
     tracing::info!(%old, %fixed, "已把自动取的设备名换成设备型号/厂商名");
 }
 
-/// 改一台设备在本机显示的名字（F-71）。
-///
-/// 直接复用地址簿的 upsert（`AppState::add_peer_book`）：它本来就是"只改传进来的非空字段、
-/// 落盘、通知界面刷新"这套语义，正是重命名需要的 —— 不必再开一条写入路径。
-#[tauri::command]
-pub fn rename_peer(peer_id: String, name: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let name = name.trim().to_string();
-    if name.is_empty() {
-        return Err("设备名不能为空".into());
-    }
-    state.add_peer_book(PeerDevice {
-        id: peer_id,
-        name,
-        ip: String::new(),
-        port: 0,
-        ..Default::default()
-    });
-    Ok(())
-}
-
 // ── 「用系统应用打开一个文件」（`open_path`）─────────────────────────────────────
 
 /// 文件打开插件的句柄。与 `notify` 那边同款：注册在插件 `setup` 那一刻，用在使用那一刻。
@@ -265,4 +246,121 @@ pub async fn open_file(path: String) -> Result<(), String> {
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+// ── 「把输入法剪贴板里的那张图拷成暂存文件」（`resolve_image_uri`）─────────────────
+
+/// 粘贴图片插件的句柄（与文件打开那条路同一个形状：`setup` 那一刻注册，用的时候取）。
+#[cfg(mobile)]
+static PASTE_HANDLE: OnceLock<PluginHandle<tauri::Wry>> = OnceLock::new();
+
+/// 「粘贴图片」插件（只在安卓构建里挂，见 `lib.rs`）。
+#[cfg(mobile)]
+pub fn paste_plugin() -> TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("orbdrop-paste-image")
+        .setup(|_app, api| {
+            // 类名与 Kotlin 那边的 `@TauriPlugin class PasteImagePlugin` 对应。
+            let handle = api.register_android_plugin("com.x177plus.orbdrop", "PasteImagePlugin")?;
+            if PASTE_HANDLE.set(handle).is_err() {
+                warn!("粘贴图片插件重复注册：沿用第一份句柄");
+            }
+            Ok(())
+        })
+        .build()
+}
+
+/// 安卓：把一个**别的应用给的图片 URI**（输入法剪贴板往输入框里插图时给的就是 `content://`）
+/// 拷成一份暂存文件，返回它的路径。
+///
+/// 为什么非要过原生这一跳：`content://` 那串 URL 在 WebView 的 JS 里**读不出来**（它属于
+/// ContentResolver，不是网页能取的地址），而会话里"发图片"走的是推送 —— 推送只认本机真实
+/// 路径。拷到应用自己的缓存目录之后，那条路与桌面端粘贴的字节完全一致（同一个
+/// `paste::paste_dir`... 不，桌面端落系统临时目录、这里落缓存目录，但**对推送而言都只是
+/// 一个本机路径**，见 `transfer::manifest_for_paths`）。
+#[cfg(mobile)]
+pub async fn resolve_image_uri(uri: String) -> Result<PickedImage, String> {
+    let Some(handle) = PASTE_HANDLE.get() else {
+        return Err("粘贴图片插件没注册上（内部错误）".into());
+    };
+    let value = handle
+        .run_mobile_plugin_async::<serde_json::Value>("resolveImage", serde_json::json!({ "uri": uri }))
+        .await
+        .map_err(|e| e.to_string())?;
+    // Kotlin 那边回的是 `{path, size}`（`Plugin.resolve` 收 `JSObject?`，塞不了裸字符串）。
+    let path = value["path"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "原生那一跳没给出暂存路径".to_string())?;
+    Ok(PickedImage { path, size: value["size"].as_u64().unwrap_or(0) })
+}
+
+/// 原生那一跳拷回来的东西：暂存路径 + 字节数（会话里那条气泡要显示"多大"，而这一层是唯一
+/// 知道的地方 —— 少了它那条气泡会写「0 B」）。
+#[cfg(mobile)]
+#[derive(serde::Serialize)]
+pub struct PickedImage {
+    pub path: String,
+    pub size: u64,
+}
+
+// ── 「引擎太旧时，一键去应用商店更新 WebView」────────────────────────────────────
+
+/// 商店打开插件的句柄（与文件打开、粘贴图片同款：插件 `setup` 那一刻注册，用的时候取）。
+#[cfg(mobile)]
+static STORE_HANDLE: OnceLock<PluginHandle<tauri::Wry>> = OnceLock::new();
+
+/// 「打开应用商店」插件。
+///
+/// 与前面两个插件不同，它的入口是**导航钩子**而不是一条命令 —— 需要它的那一刻，前端恰好是死的：
+/// 引擎低于下限时入口 module 连解析都过不去（产物里带 `??=`，Chrome 85 起），界面里那套 IPC 根本
+/// 不存在。页面上唯一还能点的东西是 `static/engine-floor.js`（ES5）画的浮层，它只能发出一次
+/// **导航**（`market://details?id=com.google.android.webview`）。wry 的 Android `WebViewClient`
+/// 把每一次导航都交给 Rust（`shouldOverride` → 插件的 `on_navigation`），于是这里把那次导航截住，
+/// 换成系统 Intent（Kotlin 侧的 `StoreOpenPlugin.openStore`）。
+///
+/// **拦下而不是放行**：`market://` 这个 scheme WebView 自己加载不了（unknown scheme），放行只会得到一个
+/// 空白页加一行错误。`https://play.google.com/...` 一并接住：浮层上的链接是 `market://`，但用户也可能
+/// 直接点到 Play 的网页版，而那个地址在 WebView 里只会换掉界面（这个界面没有后退按钮可退）。
+#[cfg(mobile)]
+pub fn store_plugin() -> TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("orbdrop-store-open")
+        .on_navigation(|_webview, url| {
+            if !is_store_url(url) {
+                return true; // 别的导航照旧，我们只认这一种
+            }
+            let Some(handle) = STORE_HANDLE.get().cloned() else {
+                warn!("商店插件没注册上：导航被拦下了，但没人接手");
+                return false;
+            };
+            let target = url.as_str().to_string();
+            // 同步那条 `run_mobile_plugin` 会阻塞调用线程等 Kotlin 回话，而这里正是 WebView 的主线程
+            // 回调（Kotlin 那边发 Intent 也要主线程）—— 只能用异步那条，否则当场死锁。
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = handle
+                    .run_mobile_plugin_async::<serde_json::Value>(
+                        "openStore",
+                        serde_json::json!({ "url": target }),
+                    )
+                    .await
+                {
+                    warn!("打开应用商店失败：{e}");
+                }
+            });
+            false
+        })
+        .setup(|_app, api| {
+            // 类名与 Kotlin 那边的 `@TauriPlugin class StoreOpenPlugin` 对应。
+            let handle = api.register_android_plugin("com.x177plus.orbdrop", "StoreOpenPlugin")?;
+            if STORE_HANDLE.set(handle).is_err() {
+                warn!("商店插件重复注册：沿用第一份句柄");
+            }
+            Ok(())
+        })
+        .build()
+}
+
+/// 这条导航该不该交给系统去开：应用商店的 scheme，以及 Play 的网页版。
+#[cfg(mobile)]
+fn is_store_url(url: &tauri::Url) -> bool {
+    url.scheme() == "market" || (url.scheme() == "https" && url.host_str() == Some("play.google.com"))
 }

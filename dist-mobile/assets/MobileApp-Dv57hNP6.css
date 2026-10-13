@@ -302,9 +302,30 @@ a { color: inherit; text-decoration: none; }
 }
 .sub.open { transform: none; opacity: 1; visibility: visible; pointer-events: auto; }
 .chatbar { flex: none; display: flex; align-items: center; gap: calc(8 * var(--u)); padding: calc(11 * var(--u)) calc(12 * var(--u)); background: var(--bg); border-bottom: 1px solid var(--border); }
-.cb-main { flex: 1; min-width: 0; display: grid; gap: 2px; }
+/* 会话名与状态行**居中**（槽留出来的空位因此看不出来：名字在中间，左边那段空白就只是"返回键旁边
+   的空白"，而不是"名字前面多出来的一截"）。居中必须靠 `text-align` 而不是 `justify-items: center`：
+   后者会让名字按内容宽度摆（`max-content`），长名字就不再省略、直接盖到右边那颗 ⋮ 上。 */
+.cb-main { flex: 1; min-width: 0; display: grid; gap: 2px; text-align: center; }
 .cb-title { font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 620; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.cb-sub { display: flex; align-items: center; gap: calc(6 * var(--u)); font-size: calc(11 * var(--u)); color: var(--muted); }
+.cb-sub { display: flex; align-items: center; justify-content: center; gap: calc(6 * var(--u)); font-size: calc(11 * var(--u)); color: var(--muted); }
+/* 会话子屏头顶那颗「别处还等着几条」（返回箭头右边，见 ChatScreen 里那段说明）：
+   配色与 `.cv-unread`、底栏「会话」角标同一档（蓝 = 有人在跟你说话 / 有东西等你）——
+   同一件事在本机各处长一样。
+   它不是返回键的替身：一颗胶囊 + 一个数字，看着就不是"退回去"，点它才回列表。
+   **槽常驻、宽度按最大值钉死**（`99+` 那颗胶囊 34u）：数从无到有时标题不许横移 ——
+   `.cb-title` 是这一屏唯一说"这是谁的会话"的东西，每来一条消息就跳一截比留一格空位难看得多。
+   右边还有一格**同样宽**的空槽（`aria-hidden`）：名字是在两格之间的剩余空间里居中的，
+   少那一格的话名的中心会比屏幕中心偏右 21u（左簇 102u vs 右簇 48u，393 宽下实测）。 */
+.cb-navslot {
+  flex: none; width: calc(34 * var(--u)); display: flex; align-items: center;
+}
+.cb-elsewhere {
+  min-width: calc(22 * var(--u)); height: calc(22 * var(--u)); padding: 0 calc(7 * var(--u));
+  border-radius: 99px; background: var(--accent); color: #fff;
+  font-family: var(--font-mono); font-size: calc(11 * var(--u)); font-weight: 700; line-height: 1;
+  display: grid; place-items: center;
+}
+.cb-elsewhere:active { transform: scale(.95); }
 .chat-banner { flex: none; display: flex; align-items: flex-start; gap: calc(8 * var(--u)); padding: calc(9 * var(--u)) calc(14 * var(--u)); font-size: var(--fs-xs); line-height: 1.5; }
 .chat-banner .ic { width: calc(15 * var(--u)); height: calc(15 * var(--u)); flex: none; margin-top: 1px; }
 .chat-banner.bc { background: var(--bc-soft); color: var(--bc-deep); }
@@ -345,6 +366,10 @@ a { color: inherit; text-decoration: none; }
 .who.sp-3 .who-nm { color: var(--sp-3-deep); }
 
 .fbub { display: flex; align-items: center; gap: calc(10 * var(--u)); min-width: calc(168 * var(--u)); }
+/* 收完的那条文件气泡是一颗按钮（点它交给系统打开，见 `ChatScreen.openFile`）：UA 给按钮的那套
+   （底色、边框、居中、字体）得清掉，排版仍旧由 `.fbub` 自己给。`width: 100%` 是补回按钮的收缩
+   行为 —— `min-width` 那一条本来就撑着它，这里只是别让按钮比内容还窄。 */
+button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: left; font: inherit; color: inherit; }
 /* 老引擎算不出 `color-mix(… currentColor …)`（它取决于继承来的文字色，无法预计算）：这一处与下面
    `.fbar` 各给一条**中性**回退。数值刻意取成与新引擎同值 —— 浅底气泡里 currentColor 就是 `--fg`，
    所以老引擎得到的颜色与新的逐位相同；蓝气泡（文字是白）另由下面的 `.msg.me` 两条兜住。 */
@@ -359,6 +384,17 @@ a { color: inherit; text-decoration: none; }
 /* 自己发的气泡（含群发那条）背景是深蓝，currentColor = 白：老引擎用白色浅底，与新引擎同值。 */
 .msg.me .fbub .fio { background: rgba(255, 255, 255, 0.15); }
 .msg.me .fbar { background: rgba(255, 255, 255, 0.24); }
+
+/* 「正在接收」那一行右端的停止（图标就够：手机这一行本来就窄，写"停止"会把进度条挤没）。 */
+.fbub .fstop {
+  flex: none; margin-left: calc(4 * var(--u));
+  width: calc(28 * var(--u)); height: calc(28 * var(--u)); padding: 0;
+  display: grid; place-items: center;
+  border: 0; border-radius: calc(8 * var(--u)); background: none;
+  color: var(--muted); cursor: pointer;
+}
+.fbub .fstop:hover { color: var(--danger); background: var(--fg-soft); }
+.fbub .fstop .ic { width: calc(16 * var(--u)); height: calc(16 * var(--u)); }
 
 .invite {
   align-self: flex-start; max-width: 88%;
@@ -389,7 +425,7 @@ a { color: inherit; text-decoration: none; }
 .rc-dev.off { opacity: .62; }
 .rc-dev.off .rc-ic { color: var(--muted); }
 
-.compose { flex: none; display: flex; align-items: center; gap: calc(8 * var(--u)); padding: calc(10 * var(--u)) calc(12 * var(--u)); background: var(--bg); border-top: 1px solid var(--border); }
+.compose { flex: none; display: flex; align-items: flex-end; gap: calc(8 * var(--u)); padding: calc(10 * var(--u)) calc(12 * var(--u)); background: var(--bg); border-top: 1px solid var(--border); }
 .cbtn { flex: none; width: calc(40 * var(--u)); height: calc(40 * var(--u)); border-radius: 50%; display: grid; place-items: center; transition: background .15s ease, transform .08s ease; }
 .cbtn .ic { width: calc(19 * var(--u)); height: calc(19 * var(--u)); }
 .cplus { background: var(--fg-soft); color: var(--muted); }
@@ -400,11 +436,35 @@ a { color: inherit; text-decoration: none; }
 .cbtn:active { transform: scale(.94); }
 .cinput {
   flex: 1; min-width: 0; height: calc(40 * var(--u)); padding: 0 calc(14 * var(--u));
-  border: 1px solid var(--border); border-radius: calc(20 * var(--u));
+  border: 1px solid var(--border);
+  /* 圆角**是钉死的**（= 折叠态那 40u 高的一半）：撑大之后一直是同一副圆角矩形。
+     别写 `999px` —— 那会被高度钳到"半个高"，输入区长高时左右两端会跟着变成半圆。 */
+  border-radius: calc(20 * var(--u));
   background: var(--surface); color: var(--fg); font-size: var(--fs-lg);
 }
 .cinput::placeholder { color: var(--muted); }
 .cinput:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+/* 富输入区（`.cx`）：里面除了文字还可能有图，所以高度自适应。上下留白取 7u —— 一行文字的
+   行盒（约 25.6u）加上它正好落回 40u（`min-height`）：**空着的时候与原来的单行输入一模一样
+   （一颗 20u 圆角的胶囊，与两颗圆按钮同高）**，长高之后圆角仍是 20u，于是成了一张圆角矩形。
+   `pre-wrap` 让文本里那个换行（Shift+回车）真的换行。 */
+.cinput.cx {
+  height: auto;
+  min-height: calc(40 * var(--u));
+  max-height: calc(132 * var(--u));
+  padding: calc(7 * var(--u)) calc(14 * var(--u));
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+/* 空的时候写占位文案：`:empty` 只认"一个子节点都没有"，而被编辑过的框里往往留着一个空文本节点
+   （甚至一个 `<br>`），所以真正的判据是组件挂的那个 `data-empty`。 */
+.cinput.cx[data-empty="1"]::before { content: attr(data-placeholder); color: var(--muted); pointer-events: none; }
+/* 框里那张图：既要是"能看见的一张小图"，又要是**一个原子**（一次退格删掉一整张、光标跳得过去）
+   —— 原子性由 `contenteditable="false"` 给（见 `lib/composer.ts`），这里只管长相。
+   与桌面端 `main.css` 里那条同名规则是同一份东西（两份产物各带一份，见那个文件的注释）。 */
+.cx-img { display: inline-block; vertical-align: middle; max-width: calc(120 * var(--u)); max-height: calc(96 * var(--u)); margin: 2px 3px; border-radius: calc(8 * var(--u)); border: 1px solid var(--border); object-fit: contain; background: var(--fg-soft); }
 /* ─────────────────────────── segmented control ─────────────────────────── */
 .seg { display: flex; gap: calc(4 * var(--u)); padding: 2px calc(18 * var(--u)) 0; background: var(--bg); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 3; }
 .seg-item { position: relative; padding: calc(11 * var(--u)) calc(4 * var(--u)) calc(12 * var(--u)); margin-right: calc(18 * var(--u)); color: var(--muted); font-size: var(--fs-md); font-weight: 560; display: inline-flex; align-items: center; gap: calc(6 * var(--u)); }
@@ -484,12 +544,23 @@ a { color: inherit; text-decoration: none; }
    名字长到装不下时**胶囊不被挤掉**：`.dname` 可缩可省略，胶囊 `flex: none`（在它自己的规则里）。 */
 .dnrow { display: flex; align-items: center; gap: calc(6 * var(--u)); min-width: 0; }
 .dname { flex: 0 1 auto; min-width: 0; font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 620; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 行上的待处理角标（F-112）：设备行没有头像（§21），所以它落在名字那一排、胶囊的右边。
+   取会话未读那套配色（`.cv-unread`、底栏「会话」角标都是 `--accent`）——"蓝 = 有人在跟你
+   说话/有东西等你"在本机各处长一样。`flex: none`：名字再长也是名字那格省略，数字不许被挤掉。 */
+.dn-pending {
+  flex: none; min-width: calc(18 * var(--u)); height: calc(18 * var(--u)); padding: 0 calc(5 * var(--u));
+  border-radius: 99px; background: var(--accent); color: #fff;
+  font-size: calc(10 * var(--u)); font-weight: 700; line-height: 1;
+  display: grid; place-items: center;
+}
 .dip { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* 「经 X 中转」：与地址**同一行、同一档小字**（两行恒定的第二行就靠它替地址那一位），
    取强调色 —— 它说的是"这条路不是直连"。 */
 .drelay { font-size: var(--fs-xs); color: var(--accent-deep); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* 设备行：**头像与「⋯」都不做了**（见 docs/p1-implementation.md §21）——名字与地址因此拿回
-   98px（393 宽下 98 → 197）。长按整行 = 设备操作，所以这一行要挡住 WebView 自己的长按：
+   98px（393 宽下 98 → 197）。名字那一排因此只剩三样：名字、状态胶囊、**待处理角标**
+   （F-112，见上面的 `.dn-pending` —— 头像没了，角标就落在这一排）。长按整行 = 设备操作，
+   所以这一行要挡住 WebView 自己的长按：
    `user-select` 挡文本选择、`-webkit-touch-callout` 挡长按弹窗（不挡的话长按只会选中文字，
    我们那条手势永远轮不上）。`is-pressing` 是按住 500ms 期间的浅底 —— 这条手势唯一的可见提示。 */
 .drow { width: 100%; display: flex; align-items: center; gap: calc(12 * var(--u)); padding: calc(11 * var(--u)) calc(12 * var(--u)); text-align: left; user-select: none; -webkit-touch-callout: none; }
@@ -747,3 +818,102 @@ body {
   .dot.offline { border-color: color-mix(in oklab, var(--fg) 32%, transparent); }
 }
 /* ↑↑↑ 生成区结束 ↑↑↑ */
+
+  /* 只用基础色板里的变量（不写 `color-mix()` / `oklch()`）：这份样式会进产物那份 CSS，
+     而移动端产物要过 Chrome 90 的兼容门禁，见 `scripts/check-compat.mjs`。 */
+  .ip-thumb.svelte-1th6cal {
+    display: block;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--fg-soft);
+    overflow: hidden;
+    cursor: zoom-in;
+    line-height: 0;
+    max-width: 168px;
+  }
+  .ip-thumb.static.svelte-1th6cal { cursor: default; }
+  .ip-thumb.svelte-1th6cal img:where(.svelte-1th6cal) {
+    display: block;
+    width: auto;
+    height: auto;
+    max-width: 168px;
+    max-height: 168px;
+    object-fit: contain;
+  }
+
+  /* 只用基础色板里的变量与 rgba（不写 `color-mix()` / `oklch()`）：这份样式进产物那份 CSS，
+     移动端产物要过 Chrome 90 的兼容门禁，见 `scripts/check-compat.mjs`。 */
+  .iv-layer.svelte-1cabxtb {
+    position: absolute;
+    inset: 0;
+    z-index: 95;
+    display: grid;
+    place-items: center;
+    padding: 14px;
+    background: rgba(0, 0, 0, 0.62);
+  }
+  /* 铺满整层的关闭按钮（在 `.iv-body` 底下）：点哪儿都算关，但它是真的可聚焦元素。 */
+  .iv-scrim.svelte-1cabxtb {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: zoom-out;
+  }
+  .iv-body.svelte-1cabxtb {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: 100%;
+    max-height: 100%;
+  }
+  .iv-img.svelte-1cabxtb {
+    display: block;
+    max-width: 100%;
+    max-height: 72vh;
+    object-fit: contain;
+    border-radius: 10px;
+    background: var(--surface);
+  }
+  .iv-err.svelte-1cabxtb {
+    margin: 0;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: var(--surface);
+    color: var(--muted);
+    font-size: var(--fs-xs);
+    line-height: 1.6;
+  }
+  .iv-bar.svelte-1cabxtb {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    border-radius: 10px;
+    background: var(--surface);
+  }
+  .iv-name.svelte-1cabxtb {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--font-display);
+    font-size: var(--fs-xs);
+    color: var(--fg);
+  }
+  .iv-btn.svelte-1cabxtb {
+    flex: none;
+    padding: 4px 9px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--fg);
+    font-size: var(--fs-xs);
+    cursor: pointer;
+  }

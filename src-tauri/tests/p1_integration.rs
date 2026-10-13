@@ -138,8 +138,8 @@ async fn pairing_then_push_transfers_file_to_receiver() {
     state_a.config.lock().shares.push(ShareItem::new(root.clone()));
 
     // Start both servers.
-    let port_a = orbdrop_lib::server::start_server(state_a.clone(), 3990).await.expect("A server");
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), 3991).await.expect("B server");
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), 3990).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), 3991).await.expect("B server");
     assert_eq!(port_a, 3990);
     assert_eq!(port_b, 3991);
 
@@ -306,8 +306,8 @@ async fn push_to_unpaired_peer_rides_http() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-ua", "PC-UA", save_dir.clone());
     let state_b = make_state(port_b, "device-ub", "PC-UB", save_dir.clone());
-    let port_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
     assert_eq!(state_a.server_port.load(std::sync::atomic::Ordering::SeqCst), port_a);
 
     // A 只是"看得见" B（mDNS/手动添加给到地址）：没配对、没有 token、没有长连接。
@@ -328,8 +328,15 @@ async fn push_to_unpaired_peer_rides_http() {
         .expect("推送应该直接发出去（HTTP 邀请）")
         .targets[0].invite_id.clone();
 
-    // B 的界面上收到了邀请卡片，请求还挂在那儿等它决定。
+    // B 的界面上收到了邀请卡片。**投递即回**（请求不再挂在"等它决定"上）：B 的响应只是
+    // 一句"已送达、等着呢"，发送方那一台照旧停在「等待对方同意」，决定稍后从
+    // `POST /push/report` 回来。
     wait_until("B 收到推送邀请", || state_b.push.inbound.lock().contains_key(&invite_id)).await;
+    assert_eq!(
+        state_a.push.target_of_invite(&invite_id).map(|t| t.state),
+        Some(transfer::push_job::TargetState::Invited),
+        "没人点之前发送方一直停在「等待对方同意」——投递成功不等于对方同意"
+    );
 
     // 未绑定设备的推送**必须**等人点同意：邀请到了、没人点，一个字节都不该落盘。
     // （`<下载目录>/<发送方名>` 这层目录是下载循环建的 —— 它存在 = 下载已经开始了。）
@@ -339,15 +346,35 @@ async fn push_to_unpaired_peer_rides_http() {
         "未绑定设备：没点同意就不该开始传"
     );
 
-    // ---- 发送方撤销：HTTP 这条路上也要到得了对端（回执走 POST /push/report）----
-    // 此时 B 还没点同意，撤销必须让那张邀请卡消失，而不是等它自己 60s 超时。
+    // ---- 拒绝：决定也要到得了发送方（HTTP 这条路上走 `POST /push/report`）----
+    // 未绑定设备**没有长连接**，这条 HTTP 回执是它唯一的路：少了它，发送方那边会一直
+    // 停在「等待对方同意」，而对面早就点了拒绝。
+    transfer::reject_invite(&state_b, &invite_id);
+    wait_until("拒绝后发送方那一台落「已拒绝」", || {
+        state_a.push.target_of_invite(&invite_id).map(|t| t.state)
+            == Some(transfer::push_job::TargetState::Rejected)
+    })
+    .await;
+    assert_eq!(
+        state_a.push.target_of_invite(&invite_id).unwrap().error.as_deref(),
+        Some("对方拒绝"),
+        "拒绝的原因原话带回来，别写死一句"
+    );
+
+    // ---- 发送方撤销：HTTP 这条路上也要到得了对端（同样是 POST /push/report）----
+    // 此时 B 还没点同意，撤销必须让那张邀请卡消失，而不是等它自己过期。
+    let invite_id = push_invite(state_a.clone(), vec![src.to_string_lossy().to_string()], "device-ub")
+        .await
+        .expect("再推一次（这次撤销）")
+        .targets[0].invite_id.clone();
+    wait_until("B 收到第二次邀请", || state_b.push.inbound.lock().contains_key(&invite_id)).await;
     transfer::cancel_push(&state_a, &invite_id).expect("cancel");
     wait_until("撤销后 B 的邀请被撤掉", || {
         !state_b.push.inbound.lock().contains_key(&invite_id)
     })
     .await;
 
-    // ---- 重新推一次（这次真传）----
+    // ---- 再推一次（这次真传）----
     let big = src.join("big.bin");
     std::fs::write(&big, vec![0x5Au8; 32 * 1024 * 1024]).unwrap();
     let invite_id = push_invite(state_a.clone(), vec![src.to_string_lossy().to_string()], "device-ub")
@@ -406,6 +433,69 @@ async fn push_to_unpaired_peer_rides_http() {
     let _ = std::fs::remove_dir_all(&save_dir);
 }
 
+/// **等对方点头的邀请没有时钟**：没人处理时它不会自己作废，发送方那边也不会被
+/// 判成「未响应」（老行为是接收侧 60s 自动拒绝 + 发送侧长连接 5 分钟两档）。
+///
+/// `#[ignore]`：它必须真的等过那 60 秒（老行为的自动拒绝点就在这个位置），一分钟的用例
+/// 不该进默认那一轮。改推送邀请的等待语义时手动跑：
+/// `cargo test --test p1_integration a_waiting_invite_never_expires_on_its_own -- --ignored --exact --nocapture`
+#[tokio::test]
+#[ignore = "要等过 60 秒（老行为的自动拒绝点），只在真的验证这条语义时跑"]
+async fn a_waiting_invite_never_expires_on_its_own() {
+    let src_dir = std::env::temp_dir().join(format!("orbdrop_it_nx_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let file = src_dir.join("wait.txt");
+    std::fs::write(&file, b"waited long enough").unwrap();
+
+    let save_dir = std::env::temp_dir().join(format!("orbdrop_it_nxsave_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&save_dir).unwrap();
+    let (port_a, port_b) = two_free_ports();
+    let state_a = make_state(port_a, "device-nxa", "PC-NXA", save_dir.clone());
+    let state_b = make_state(port_b, "device-nxb", "PC-NXB", save_dir.clone());
+    let _port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
+    state_a.add_peer_book(PeerDevice {
+        id: "device-nxb".into(),
+        name: "PC-NXB".into(),
+        ip: "127.0.0.1".into(),
+        port: port_b,
+        online: true,
+        paired: false,
+        auto_connect: false, paused: false, relay: None,
+    });
+
+    let invite_id = push_invite(state_a.clone(), vec![file.to_string_lossy().to_string()], "device-nxb")
+        .await
+        .expect("邀请发出去")
+        .targets[0].invite_id.clone();
+    wait_until("B 收到邀请", || state_b.push.inbound.lock().contains_key(&invite_id)).await;
+
+    // 等过老行为那条 60 秒自动拒绝（接收侧）与 5 分钟那一档（发送侧）的前一段。
+    tokio::time::sleep(Duration::from_secs(70)).await;
+    assert!(
+        state_b.push.inbound.lock().contains_key(&invite_id),
+        "没人点，那张邀请卡就得一直在（不能自己作废）"
+    );
+    assert_eq!(
+        state_a.push.target_of_invite(&invite_id).map(|t| t.state),
+        Some(transfer::push_job::TargetState::Invited),
+        "发送方一直停在「等待对方同意」，既不是拒绝也不是未响应"
+    );
+
+    // 等了 70 秒这条邀请还是好好的：这会儿点同意照样能收完（等待没有把它等坏）。
+    transfer::accept_invite(state_b.clone(), &invite_id, None).expect("70 秒之后点同意也要能收");
+    let landed = save_dir.join("PC-NXA").join("wait.txt");
+    wait_until("等过 70 秒之后仍然收得下来", || {
+        std::fs::read(&landed).map(|c| c == b"waited long enough").unwrap_or(false)
+    })
+    .await;
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&save_dir);
+}
+
 /// 已绑定（已配对）但**没建长连接**的设备：推送走 HTTP 直达，同样不需要接收方同意 ——
 /// token 就是那份信任。"自动收下"在长连接那条路和 HTTP 这条路上是两段代码
 /// （`ws::session` 的 `push_invite` 分支 / `routes_push::push_invite_handler`），两条都得测。
@@ -417,8 +507,8 @@ async fn paired_push_without_a_long_connection_skips_consent_http() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-pha", "PC-PHA", save_dir.clone());
     let state_b = make_state(port_b, "device-phb", "PC-PHB", save_dir.clone());
-    let port_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
 
     // 两侧互相已配对：地址簿标 paired，凭据里存着**同一枚** token（真实配对换来的就是
     // 这一枚 —— 谁给对方发邀请就用它做 Bearer）。凭据文件是进程内共用的一份，所以这里
@@ -490,8 +580,8 @@ async fn consent_push_lands_in_the_chosen_root() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-ra", "PC-RA", save_dir.clone());
     let state_b = make_state(port_b, "device-rb", "PC-RB", save_dir.clone());
-    let _port_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    let _port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
 
     // A 只是"看得见" B：没配对、没有 token、没有长连接（与未绑定那条用例同一档）。
     state_a.add_peer_book(PeerDevice {
@@ -577,9 +667,9 @@ async fn multi_device_push_isolates_targets_and_shares_one_manifest() {
     let state_a = make_state(port_a, "device-mda", "PC-MDA", save_b.clone());
     let state_b = make_state(port_b, "device-mdb", "PC-MDB", save_b.clone());
     let state_c = make_state(port_c, "device-mdc", "PC-MDC", save_c.clone());
-    let port_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
-    let port_c = orbdrop_lib::server::start_server(state_c.clone(), port_c).await.expect("C server");
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
+    let port_c = orbdrop_lib::server::start_server_loopback(state_c.clone(), port_c).await.expect("C server");
 
     // B 已配对（收到就收，不问人）、C 未绑定（要它自己点头）、D 已配对但离线。
     const SHARED_TOKEN: &str = "fedcba9876543210fedcba9876543210";
@@ -607,6 +697,7 @@ async fn multi_device_push_isolates_targets_and_shares_one_manifest() {
         state_a.clone(),
         paths,
         vec!["device-mdb".into(), "device-mdb".into(), "device-mdc".into(), "device-mdd".into()],
+        None,
     )
     .await
     .expect("两台在线：整批该发出去");
@@ -720,6 +811,7 @@ async fn multi_device_push_isolates_targets_and_shares_one_manifest() {
         state_a.clone(),
         vec![src.to_string_lossy().to_string()],
         vec!["device-mdd".into(), "device-missing".into()],
+        None,
     )
     .await
     .expect_err("都收不了就不该建卡片");
@@ -758,8 +850,8 @@ async fn multi_select_push_is_one_job_with_one_consent() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-ua", "PC-UM", save_dir.clone());
     let state_b = make_state(port_b, "device-ub", "PC-UN", save_dir.clone());
-    let _port_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    let _port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
     state_a.add_peer_book(PeerDevice {
         id: "device-ub".into(),
         name: "PC-UN".into(),
@@ -843,7 +935,7 @@ async fn push_invite(
     paths: Vec<String>,
     peer_id: &str,
 ) -> Result<transfer::push_job::BatchView, String> {
-    transfer::push_paths(state, paths, vec![peer_id.to_string()]).await
+    transfer::push_paths(state, paths, vec![peer_id.to_string()], None).await
 }
 
 /// 「同意 → 等这批文件全部落地 → 等发送方收到完成回执」——多选用例的两批都走这一套。
@@ -913,13 +1005,13 @@ async fn a_hostile_sender_name_still_lands_inside_the_download_dir() {
         save_dir.clone(),
     );
     let state_b = make_state(port_b, "device-evil-b", "PC-EVB", save_dir.clone());
-    let _a1 = orbdrop_lib::server::start_server(state_a1.clone(), port_a1)
+    let _a1 = orbdrop_lib::server::start_server_loopback(state_a1.clone(), port_a1)
         .await
         .expect("A1 server");
-    let _a2 = orbdrop_lib::server::start_server(state_a2.clone(), port_a2)
+    let _a2 = orbdrop_lib::server::start_server_loopback(state_a2.clone(), port_a2)
         .await
         .expect("A2 server");
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), port_b)
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b)
         .await
         .expect("B server");
     for (id, port) in [("device-evil-1", port_a1), ("device-evil-2", port_a2)] {
@@ -1029,8 +1121,8 @@ async fn a_single_pushed_file_lands_as_a_file() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-ua", "PC-UO", save_dir.clone());
     let state_b = make_state(port_b, "device-ub", "PC-UP", save_dir.clone());
-    let _port_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    let _port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
     state_a.add_peer_book(PeerDevice {
         id: "device-ub".into(),
         name: "PC-UP".into(),
@@ -1074,8 +1166,8 @@ async fn accepting_a_push_from_a_sync_context_still_downloads() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-ua", "PC-US", save_dir.clone());
     let state_b = make_state(port_b, "device-ub", "PC-UT", save_dir.clone());
-    let _port_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    let _port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
     state_a.add_peer_book(PeerDevice {
         id: "device-ub".into(),
         name: "PC-UT".into(),
@@ -1118,9 +1210,12 @@ async fn accepting_a_push_from_a_sync_context_still_downloads() {
 /// 报的端口存下来当拨号地址，报错就等于让它去连别的进程（或连不上）。
 #[tokio::test]
 async fn pair_info_reports_the_port_actually_serving() {
-    let squatter = std::net::TcpListener::bind(("0.0.0.0", 3995)).unwrap();
+    // 占位的那条监听要**和被测服务器绑同一个地址**：服务器现在绑回环（`start_server_loopback`），
+    // 而 Windows 允许"通配地址已占用"时再绑一个具体地址 —— 拿 `0.0.0.0:3995` 占位，
+    // 回环那一个照样能绑上，这条用例就成了假绿/假红。
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", 3995)).unwrap();
     let state = make_state(3995, "device-pa", "PC-PA", std::env::temp_dir());
-    let port = orbdrop_lib::server::start_server(state.clone(), 3995).await.expect("server");
+    let port = orbdrop_lib::server::start_server_loopback(state.clone(), 3995).await.expect("server");
     assert_eq!(port, 3996, "3995 被占 → 顺延");
 
     let info: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{port}/pair/info"))
@@ -1285,7 +1380,10 @@ async fn unpair_does_not_wait_for_an_unresponsive_peer() {
 
     let dir = std::env::temp_dir().join(format!("orbdrop_unpair_fast_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let state = make_state(3996, "device-um", "PC-UM", dir.clone());
+    // 端口取**没人用的 4xxx 段**：`pair_info_reports_the_port_actually_serving` 拿 3995 当"被占"
+    // 的例子、顺延正好落在 3996 上（`long_connection_is_restored_after_a_restart` 也占着 3996）
+    // —— 这个二进制默认多线程跑，挤在 399x 那一段里就会随调度飘（实测：多线程跑必挂那条断言）。
+    let state = make_state(4150, "device-um", "PC-UM", dir.clone());
 
     // 只收不回的死对端：连接收下就一直攥着，TLS 握手永远等不到 ServerHello。
     // 计数用来看住"那条通知确实发出去了"（否则本用例可能只证明了"什么都没发"）。
@@ -1354,7 +1452,7 @@ async fn nat_peer_keeps_no_address_and_its_liveness_follows_the_link() {
     let save_dir = temp_share_dir("nat_save");
     let port = free_port();
     let state = make_state(port, "device-pc", "PC-NAT", save_dir.clone());
-    let serving = orbdrop_lib::server::start_server(state.clone(), port)
+    let serving = orbdrop_lib::server::start_server_loopback(state.clone(), port)
         .await
         .expect("server");
 
@@ -1510,8 +1608,8 @@ async fn pairing_stops_at_paired_until_the_user_clicks_connect() {
 
     let state_a = make_state(3992, "device-aa", "PC-AA", save_dir.clone());
     let state_b = make_state(3993, "device-ab", "PC-AB", save_dir.clone());
-    let port_a = orbdrop_lib::server::start_server(state_a.clone(), 3992).await.expect("A server");
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), 3993).await.expect("B server");
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), 3992).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), 3993).await.expect("B server");
 
     // A 显示自己的配对码；A 此前对 B 一无所知（无 mDNS、无手动添加、无地址）。
     let code = state_a.pair.create_code();
@@ -1686,10 +1784,12 @@ async fn long_connection_is_restored_after_a_restart() {
     let save_dir = std::env::temp_dir().join(format!("orbdrop_restore_save_dir_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&save_dir).unwrap();
 
-    let state_a = make_state(3995, "device-ra", "PC-RA", save_dir.clone());
-    let state_b = make_state(3996, "device-rb", "PC-RB", save_dir.clone());
+    // 端口挪到没人用的 4xxx 段：3995/3996 与 `pair_info_reports_the_port_actually_serving` 那条
+    // （它拿 3995 当"被占"、顺延落在 3996）撞在一起，多线程跑时那条断言会随调度飘。
+    let state_a = make_state(4170, "device-ra", "PC-RA", save_dir.clone());
+    let state_b = make_state(4171, "device-rb", "PC-RB", save_dir.clone());
     let config_path = state_a.config_path.clone();
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), 3996).await.expect("B server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), 4171).await.expect("B server");
 
     // 配对结果：一张 token，两侧各按对端 id 存一份（`PairResponse` 就是这个流向）。
     // token 用短值：Windows 单条凭据只有 2.5KB，测试条目别把上限顶掉。
@@ -1817,8 +1917,8 @@ async fn a_disconnect_also_survives_a_restart_against_the_peers_memory() {
 
     // 两边都得起服务：重启后要验的正是**入站闸门**（对端拨过来时被 403 挡掉），
     // 没有服务就没有那个闸门可验。
-    let port_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
     state_a.mark_paired(&PeerDevice {
         id: id_b.clone(), name: "PC-HBB".into(), ip: "127.0.0.1".into(), port: port_b,
         online: true, paired: true, auto_connect: false, paused: false, relay: None,
@@ -1862,7 +1962,7 @@ async fn a_disconnect_also_survives_a_restart_against_the_peers_memory() {
         state_a2.ws.is_paused(&id_b),
         "暂停标记要从地址簿读回来 —— 它要是只活在内存里，重启就等于把「断开」撤了"
     );
-    let port_a2 = orbdrop_lib::server::start_server(state_a2.clone(), port_a).await.expect("A server (restarted)");
+    let port_a2 = orbdrop_lib::server::start_server_loopback(state_a2.clone(), port_a).await.expect("A server (restarted)");
     assert_eq!(port_a2, port_a, "重启后端口不变，对端存的地址才还能用");
     orbdrop_lib::ws::restore_links_on_startup(&state_a2);
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -1969,7 +2069,7 @@ async fn auto_restore_connects_once_the_peer_shows_up() {
     );
 
     // 对端上线：起它的服务，并把地址修正 + 标记在线（真机上由 mDNS/探活完成）。
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), base_port)
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), base_port)
         .await
         .expect("B server");
     state_a2.upsert_peer(&orbdrop_lib::config::PeerDevice {
@@ -2021,7 +2121,7 @@ async fn a_peer_that_said_disconnect_stops_the_retry_loop() {
     credential::set_peer(&id_b, &token).unwrap();
     credential::set_peer(&id_a, &token).unwrap();
     let (base_port, _spare) = two_free_ports();
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), base_port)
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), base_port)
         .await
         .expect("B server");
     state_a.mark_paired(&orbdrop_lib::config::PeerDevice {
@@ -2105,7 +2205,7 @@ async fn a_peer_that_rejects_our_token_stops_the_retry_loop() {
     let token = format!("t-tk-{tag}");
     credential::set_peer(&id_b, &token).unwrap();
     let (base_port, _spare) = two_free_ports();
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), base_port)
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), base_port)
         .await
         .expect("B server");
     state_a.mark_paired(&orbdrop_lib::config::PeerDevice {
@@ -2152,7 +2252,7 @@ async fn pair_info_answers_who_it_recognises_the_caller_as() {
     let save_dir = std::env::temp_dir().join(format!("orbdrop_info_save_dir_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&save_dir).unwrap();
     let state = make_state(3993, "device-info", "PC-INFO", save_dir.clone());
-    let port = orbdrop_lib::server::start_server(state.clone(), 3993).await.expect("server");
+    let port = orbdrop_lib::server::start_server_loopback(state.clone(), 3993).await.expect("server");
 
     // 对端替我们存的那一条（键 = 我们 id，值 = 这张 token）。
     let caller = format!("device-caller-{}", uuid::Uuid::new_v4());
@@ -2202,7 +2302,7 @@ async fn probe_hides_a_row_whose_address_answers_with_another_device_id() {
     let save_dir = std::env::temp_dir().join(format!("orbdrop_probe_save_dir_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&save_dir).unwrap();
     let state_b = make_state(3999, "device-b-new", "PC-B", save_dir.clone());
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), 3999).await.expect("B server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), 3999).await.expect("B server");
 
     let state_a = make_state(3994, "device-own-a", "PC-A", save_dir.clone());
     let token = format!("tok-{}", uuid::Uuid::new_v4());
@@ -2250,7 +2350,7 @@ async fn probe_fills_a_placeholder_name_from_the_pair_info_answer() {
     let uniq = uuid::Uuid::new_v4().to_string();
     let peer_id = format!("device-name-{}", &uniq[..8]);
     let state_b = make_state(4321, &peer_id, "华为 Mate60", save_dir.clone());
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), 4321).await.expect("B server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), 4321).await.expect("B server");
 
     let state_a = make_state(4322, "device-own-name", "PC-A", save_dir.clone());
     // 本机从没看见过它，只是"这个地址被核实过"（中转控制面 / 路由记录那条路）：行里拿
@@ -2506,8 +2606,8 @@ async fn pair_invite_swaps_tokens_without_typing_a_code() {
     let (pa, pb) = two_free_ports();
     let state_a = make_state(pa, "device-inv-a", "PC-A", save_dir.clone());
     let state_b = make_state(pb, "device-inv-b", "PC-B", save_dir.clone());
-    let port_a = orbdrop_lib::server::start_server(state_a.clone(), pa).await.expect("A server");
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), pb).await.expect("B server");
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), pa).await.expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), pb).await.expect("B server");
 
     // A 知道 B 的地址（mDNS 发现 / 手动添加），但两边**都还没配对** —— 这正是邀请要解决的场合。
     state_a.upsert_peer(&PeerDevice {
@@ -2627,7 +2727,7 @@ async fn offline_refuses_every_inbound_request() {
     let save_dir = std::env::temp_dir().join(format!("orbdrop_it_off_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&save_dir).unwrap();
     let state = make_state(4190, "device-off", "PC-Off", save_dir.clone());
-    let port = orbdrop_lib::server::start_server(state.clone(), 4190)
+    let port = orbdrop_lib::server::start_server_loopback(state.clone(), 4190)
         .await
         .expect("server");
     let client = orbdrop_lib::net::client();
@@ -3083,7 +3183,7 @@ async fn an_unreachable_send_tries_a_relay_immediately() {
     state.set_relay_capable(&via_id, true);
     credential::set_peer(&via_id, "tok-via").ok();
 
-    let _ = orbdrop_lib::chat::send_text(&state, &[goal_id.clone()], "够不着的一句", None);
+    let _ = orbdrop_lib::chat::send_text(&state, &[goal_id.clone()], "够不着的一句", None, None);
 
     wait_until("发送那一跳去试了中转", || {
         state.relay_attempts.lock().contains_key(&goal_id)
@@ -3360,8 +3460,8 @@ async fn chat_messages_and_read_receipts_travel_over_the_long_connection() {
     let (state_a, dir_a) = chat_state(port_a, "device-chat-a", "PC-CA", &root);
     let (state_b, dir_b) = chat_state(port_b, "device-chat-b", "PC-CB", &root);
 
-    let server_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
-    let server_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    let server_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
+    let server_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
 
     // ---- 配对结果（两侧各存一枚 token）+ 用户点「连接」 ----
     credential::remove_peer("device-chat-a").ok();
@@ -3385,7 +3485,7 @@ async fn chat_messages_and_read_receipts_travel_over_the_long_connection() {
 
     // ---- A 发一条文本 ----
     let text = "在吗？帮我传一下「Q3 排期表」。";
-    let res = chat::send_text(&state_a, &["device-chat-b".to_string()], text, None);
+    let res = chat::send_text(&state_a, &["device-chat-b".to_string()], text, None, None);
     assert!(!res.id.is_empty(), "发出去的消息带回它的 id（界面据此逐台读状态）");
     assert_eq!(res.batch_id, None, "一对一发的：不挂群发名单");
     let snap = res.snapshot;
@@ -3428,7 +3528,7 @@ async fn chat_messages_and_read_receipts_travel_over_the_long_connection() {
     state_b.ws.pause("device-chat-a");
     wait_until("B 侧链路断开", || !state_a.ws.has_connection("device-chat-b")).await;
     let before = state_b.chat.inbound_watermark("device-chat-a");
-    let snap = chat::send_text(&state_a, &["device-chat-b".to_string()], "没有长连接也要到", None).snapshot;
+    let snap = chat::send_text(&state_a, &["device-chat-b".to_string()], "没有长连接也要到", None, None).snapshot;
     let convo = snap.convos.iter().find(|c| c.peer_id == "device-chat-b").unwrap();
     assert_eq!(
         convo.messages.last().unwrap().delivery,
@@ -3476,6 +3576,7 @@ async fn chat_messages_and_read_receipts_travel_over_the_long_connection() {
         &state_a,
         &["device-chat-b".to_string(), "device-chat-ghost".to_string()],
         "群发一句",
+        None,
         None,
     );
     let fan_id = fan.id.clone();
@@ -3560,8 +3661,8 @@ async fn messages_sent_while_the_peer_is_offline_arrive_when_it_comes_back() {
     let (state_a, _dir_a) = chat_state(port_a, "device-off-a", "PC-OFF-A", &root);
     let (state_b, _dir_b) = chat_state(port_b, "device-off-b", "PC-OFF-B", &root);
 
-    let server_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
-    let server_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    let server_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
+    let server_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
 
     credential::remove_peer("device-off-a").ok();
     credential::remove_peer("device-off-b").ok();
@@ -3576,7 +3677,7 @@ async fn messages_sent_while_the_peer_is_offline_arrive_when_it_comes_back() {
     state_b.mark_paired(&addr("device-off-a", "PC-OFF-A", "127.0.0.1", port_a));
 
     // 先正常说一句：这一步把对端证书按 TOFU 认下来（之后 B 换了进程也还是同一份身份文件）。
-    chat::send_text(&state_a, &["device-off-b".to_string()], "在线时说的", None);
+    chat::send_text(&state_a, &["device-off-b".to_string()], "在线时说的", None, None);
     wait_until("在线时那句到了", || state_b.chat.inbound_watermark("device-off-a") > 0).await;
     let convo = |state: &Arc<AppState>, peer: &str| {
         state.chat.snapshot().convos.into_iter().find(|c| c.peer_id == peer)
@@ -3597,9 +3698,9 @@ async fn messages_sent_while_the_peer_is_offline_arrive_when_it_comes_back() {
     state_a.set_peer_online("device-off-b", false);
 
     // ---- 这个窗口里 A 说了三句 ----
-    let first = chat::send_text(&state_a, &["device-off-b".to_string()], "你不在的时候说的", None);
+    let first = chat::send_text(&state_a, &["device-off-b".to_string()], "你不在的时候说的", None, None);
     let first_at = convo(&state_a, "device-off-b").unwrap().messages.last().unwrap().at;
-    chat::send_text(&state_a, &["device-off-b".to_string()], "还有这一句", None);
+    chat::send_text(&state_a, &["device-off-b".to_string()], "还有这一句", None, None);
     wait_until("前两句都排上队（HTTP 那一跳没打通）", || {
         // 会话里第一条是"在线时说的"（已送达），后面两条才是这一个窗口里的。
         convo(&state_a, "device-off-b").is_some_and(|c| {
@@ -3608,7 +3709,7 @@ async fn messages_sent_while_the_peer_is_offline_arrive_when_it_comes_back() {
     })
     .await;
     // 欠着消息的时候新消息**跟着排**（不许后发先至：对端那边顺序乱了，已读水位就跟着错）。
-    let third = chat::send_text(&state_a, &["device-off-b".to_string()], "第三句", None);
+    let third = chat::send_text(&state_a, &["device-off-b".to_string()], "第三句", None, None);
     let third_copy = third
         .snapshot
         .convos
@@ -3707,9 +3808,9 @@ async fn group_roster_confirmation_and_messages_reach_every_member() {
     let (state_a, _) = chat_state(port_a, "device-grp-a", "PC-GA", &root);
     let (state_b, _) = chat_state(port_b, "device-grp-b", "PC-GB", &root);
     let (state_c, _) = chat_state(port_c, "device-grp-c", "PC-GC", &root);
-    let server_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
-    let server_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
-    let server_c = orbdrop_lib::server::start_server(state_c.clone(), port_c).await.expect("C server");
+    let server_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
+    let server_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
+    let server_c = orbdrop_lib::server::start_server_loopback(state_c.clone(), port_c).await.expect("C server");
 
     address_book(&state_a, "device-grp-b", "PC-GB", port_b);
     address_book(&state_a, "device-grp-c", "PC-GC", port_c);
@@ -3751,7 +3852,7 @@ async fn group_roster_confirmation_and_messages_reach_every_member() {
 
     // ---- A 发一句：B、C 都要收到（未配对 → 只能走 HTTP 兜底那一跳） ----
     let text = "周三十点开个短会";
-    let msg_id = group::send_text(&state_a, &gid, text).expect("本机在群里，发得出去");
+    let msg_id = group::send_text(&state_a, &gid, text, None).expect("本机在群里，发得出去");
     wait_until("B 收到群消息", || {
         state_b.groups.view(&gid, "device-grp-b").is_some_and(|v| v.messages.len() == 1)
     })
@@ -3770,7 +3871,7 @@ async fn group_roster_confirmation_and_messages_reach_every_member() {
     assert!(state_a.groups.view(&gid, "device-grp-a").unwrap().messages[0].from_me, "自己的那条");
 
     // ---- B 回一句：**A 与 C 都该看到**（成员互见 —— 群发做不到这件事） ----
-    group::send_text(&state_b, &gid, "收到，我把参会人拉齐").expect("B 发得出去");
+    group::send_text(&state_b, &gid, "收到，我把参会人拉齐", None).expect("B 发得出去");
     wait_until("A 看到 B 的那句", || {
         state_a.groups.view(&gid, "device-grp-a").is_some_and(|v| v.messages.len() == 2)
     })
@@ -3826,6 +3927,86 @@ async fn group_roster_confirmation_and_messages_reach_every_member() {
     let _ = (server_a, server_b, server_c);
 }
 
+/// 群里有人**明确拒绝加入**（「不加入」）时，发送方必须看得见这件事。
+///
+/// 这一条钉着的是那条"看不出来"的旧账：拒绝是本机动作、一个包都不回，发送方那边那条消息
+/// 走着 HTTP 兜底（甚至长连接"写成功"就落「已送达」）—— 收件人那一排看着一切正常，其实
+/// 那台设备一个字都收不到。现在收方收不下时明确回话（HTTP 409 + 反向一条 `group_text_rejected`），
+/// 发送方据此把那一份落「未送达」，并把那位成员记进 `declined`（界面那枚胶囊就是靠它变红）。
+#[tokio::test]
+async fn a_declining_member_is_reported_back_to_the_sender() {
+    use orbdrop_lib::chat::Delivery;
+    use orbdrop_lib::group;
+
+    let root = std::env::temp_dir().join(format!("orbdrop_it_groupdecl_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+
+    let (port_a, port_b) = two_free_ports();
+    let port_c = free_port();
+    let (state_a, _) = chat_state(port_a, "device-gd-a", "PC-GDA", &root);
+    let (state_b, _) = chat_state(port_b, "device-gd-b", "PC-GDB", &root);
+    let (state_c, _) = chat_state(port_c, "device-gd-c", "PC-GDC", &root);
+    let server_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
+    let server_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
+    let server_c = orbdrop_lib::server::start_server_loopback(state_c.clone(), port_c).await.expect("C server");
+
+    address_book(&state_a, "device-gd-b", "PC-GDB", port_b);
+    address_book(&state_a, "device-gd-c", "PC-GDC", port_c);
+    address_book(&state_b, "device-gd-a", "PC-GDA", port_a);
+    address_book(&state_c, "device-gd-a", "PC-GDA", port_a);
+
+    let gid = group::create(&state_a, &["device-gd-b".into(), "device-gd-c".into()], "复盘组").expect("建群");
+    wait_until("B 收到邀请卡", || !state_b.groups.pending_views("device-gd-b").is_empty()).await;
+    wait_until("C 收到邀请卡", || !state_c.groups.pending_views("device-gd-c").is_empty()).await;
+
+    // ---- B 点「不加入」；C 点「加入」 ----
+    assert!(group::dismiss(&state_b, &gid), "拒绝那张卡");
+    assert!(state_b.groups.is_dismissed(&gid));
+    assert!(state_b.groups.pending_views("device-gd-b").is_empty(), "卡跟着决定走");
+    assert!(group::accept(&state_c, &gid));
+
+    // ---- A 发一句：C 收到；B 那边明确拒收 → A 这边**看得见** ----
+    group::send_text(&state_a, &gid, "这周的复盘", None).expect("发得出去");
+    wait_until("C 收到群消息", || {
+        state_c.groups.view(&gid, "device-gd-c").is_some_and(|v| v.messages.len() == 1)
+    })
+    .await;
+    wait_until("A 看到 B 拒绝了", || {
+        state_a
+            .groups
+            .view(&gid, "device-gd-a")
+            .is_some_and(|v| v.declined.contains(&"device-gd-b".to_string()))
+    })
+    .await;
+
+    let a_view = state_a.groups.view(&gid, "device-gd-a").unwrap();
+    assert_eq!(
+        a_view.messages[0].delivery.get("device-gd-b"),
+        Some(&Delivery::Failed),
+        "拒收的那一份落「未送达」（长连接那条路原来会显示「已送达」）"
+    );
+    assert_eq!(a_view.declined, vec!["device-gd-b".to_string()], "界面要能看见是哪一台");
+    assert!(
+        a_view.members.iter().any(|m| m.id == "device-gd-b"),
+        "名册一个字不动：拒绝是本机的观察"
+    );
+    // 给别人那份照旧到位 —— 一台拒绝不该影响别的成员。
+    assert_eq!(a_view.messages[0].delivery.get("device-gd-c"), Some(&Delivery::Sent));
+    // 界面拿到的快照里也带着它（那枚胶囊就是读这个字段）。
+    let snap = group::snapshot(&state_a);
+    assert_eq!(snap.groups[0].declined, vec!["device-gd-b".to_string()]);
+
+    // B 那边一个字的记录都没有（拒绝过就是不收，不落账、也不攒）。
+    assert!(state_b.groups.view(&gid, "device-gd-b").is_none());
+    assert_eq!(state_b.groups.buffered_count(&gid), 0, "拒绝过的不该攒着");
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    orbdrop_lib::server::stop_server(&state_c).await;
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = (server_a, server_b, server_c);
+}
+
 /// 群消息的离线补发：对端**没开机**时那一份落「排队」，等它上线由补发那一跳按原顺序送出去。
 ///
 /// 顺带覆盖"名册先于消息"：名册当初广播时 C 不在网上，所以补发那一步必须先补名册、
@@ -3841,14 +4022,14 @@ async fn group_messages_wait_for_an_offline_member_and_the_roster_goes_first() {
     let (port_a, port_b) = two_free_ports();
     let (state_a, _) = chat_state(port_a, "device-gq-a", "PC-QA", &root);
     let (state_b, _) = chat_state(port_b, "device-gq-b", "PC-QB", &root);
-    let server_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
+    let server_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
 
     address_book(&state_a, "device-gq-b", "PC-QB", port_b);
 
     let gid = group::create(&state_a, &["device-gq-b".into()], "临时群").expect("建群");
     // B 还没开机：名册投不出去（`told` 停在"没说过"）。
     assert!(state_a.groups.needs_roster(&gid, "device-gq-b"));
-    let msg_id = group::send_text(&state_a, &gid, "你上线再看这句").expect("发得出去");
+    let msg_id = group::send_text(&state_a, &gid, "你上线再看这句", None).expect("发得出去");
     let view = state_a.groups.view(&gid, "device-gq-a").unwrap();
     assert_eq!(
         view.messages[0].delivery.get("device-gq-b"),
@@ -3859,7 +4040,7 @@ async fn group_messages_wait_for_an_offline_member_and_the_roster_goes_first() {
     assert!(state_a.groups.has_backlog_for("device-gq-b"));
 
     // ---- B 上线（起服务器 + 判在线）→ 补发那一跳：先名册、再消息 ----
-    let server_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
+    let server_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
     chat::flush_queued(&state_a, "device-gq-b");
     // 名册先到：B 那边先挂一张邀请卡（它还没点「加入」）。
     wait_until("B 收到邀请卡", || state_b.groups.has_pending(&gid)).await;
@@ -3883,7 +4064,7 @@ async fn group_messages_wait_for_an_offline_member_and_the_roster_goes_first() {
     .await;
 
     // ---- 再发一条：B 现在可达，直接就送到（不用再排队） ----
-    group::send_text(&state_a, &gid, "这句是它上线之后发的").expect("发得出去");
+    group::send_text(&state_a, &gid, "这句是它上线之后发的", None).expect("发得出去");
     wait_until("B 收到第二条", || {
         state_b.groups.view(&gid, "device-gq-b").is_some_and(|v| v.messages.len() == 2)
     })
@@ -3914,9 +4095,9 @@ async fn a_chain_group_catches_up_by_pull_and_by_relay() {
     let (state_a, _) = chat_state(port_a, "device-ch-a", "PC-CHA", &root);
     let (state_b, _) = chat_state(port_b, "device-ch-b", "PC-CHB", &root);
     let (state_c, _) = chat_state(port_c, "device-ch-c", "PC-CHC", &root);
-    let server_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.expect("A server");
-    let server_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.expect("B server");
-    let server_c = orbdrop_lib::server::start_server(state_c.clone(), port_c).await.expect("C server");
+    let server_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
+    let server_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
+    let server_c = orbdrop_lib::server::start_server_loopback(state_c.clone(), port_c).await.expect("C server");
 
     // A ↔ B、B ↔ C 有地址；A ↔ C **没有**（两个网段之间没有路径）。
     address_book(&state_a, "device-ch-b", "PC-CHB", port_b);
@@ -3935,7 +4116,7 @@ async fn a_chain_group_catches_up_by_pull_and_by_relay() {
     assert!(group::accept(&state_c, &gid));
 
     // ---- ① 补拉：A 发一句（只能到 B），C 向 B 要来 ----
-    group::send_text(&state_a, &gid, "排期表我放共享里了").expect("A 发得出去");
+    group::send_text(&state_a, &gid, "排期表我放共享里了", None).expect("A 发得出去");
     wait_until("B 收到", || {
         state_b.groups.view(&gid, "device-ch-b").is_some_and(|v| v.messages.len() == 1)
     })
@@ -3965,7 +4146,7 @@ async fn a_chain_group_catches_up_by_pull_and_by_relay() {
 
     // ---- ② 中转：B 打开开关后，A 新发的那句由 B 转给 C（不必等补拉） ----
     state_b.config.lock().group_relay = true;
-    group::send_text(&state_a, &gid, "十点开会").expect("A 发得出去");
+    group::send_text(&state_a, &gid, "十点开会", None).expect("A 发得出去");
     wait_until("C 从中转那条路收到", || {
         state_c
             .groups

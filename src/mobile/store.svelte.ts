@@ -8,9 +8,8 @@
  *   这类"移动端才有的视图"，后者的数据来自后端命令。
  */
 import * as api from "$lib/api";
-import type { InboxEntry, PeerShareItem, TreeEntry } from "$lib/types";
+import type { ChatFileMsg, InboxEntry, PeerShareItem, TreeEntry } from "$lib/types";
 import * as chat from "$lib/stores/chat.svelte";
-import type { ChatFileMsg } from "$lib/stores/chat.svelte";
 import * as devices from "$lib/stores/devices.svelte";
 import type { IconName } from "./icons";
 
@@ -180,7 +179,11 @@ export interface TransferRow {
   isDir: boolean;
   /** `out` = 本机发出去的，`in` = 本机在接收。 */
   dir: "in" | "out";
-  peerId: string;
+  /**
+   * 这一行"跟谁有关"：**发出去的**是收件方（一台就写名字、多台写「N 台设备」—— 一条文件消息
+   * 的 `peerId` 是空的，那是"每台各存一份"留下的，不是"没有收件人"）；**收进来的**是发送方。
+   */
+  who: string;
   /** 0–100。 */
   pct: number;
   /** 已收/已发字节与总量（接收侧才准）。 */
@@ -198,12 +201,18 @@ export function activeTransfers(): TransferRow[] {
       const sending = item.sending;
       const receiving = item.inviteState === "accepted";
       if (!sending && !receiving) continue;
+      // 发出去那条的收件方要看**这次推送的目标**（`perTargets`）：文件消息是按对端存的，
+      // 单条记录上的 `peerId` 因此是空串（那是"每台各存一份"留下的空位，不是"没有收件人"）。
+      const targets = item.perTargets ?? [];
       rows.push({
         id: item.id,
         name: item.name,
         isDir: item.isDir,
         dir: sending ? "out" : "in",
-        peerId: item.peerId,
+        who:
+          sending && targets.length > 1
+            ? `${targets.length} 台设备`
+            : chat.deviceNameOf((sending ? targets[0]?.peerId : item.peerId) ?? ""),
         pct: item.pct,
         received: item.received,
         total: item.bytes,
@@ -329,12 +338,27 @@ export async function downloadEntry(shareId: string, path: string, name: string)
 
 /** 连接/断开、解除配对、手动添加：全部转发到后端，再由设备 store 的事件刷新列表。 */
 export async function toggleConnection(peerId: string, connected: boolean): Promise<void> {
+  const peer = devices.getDevices().find((d) => d.id === peerId);
+  const name = peer ? devices.deviceShortName(peer) : "设备";
   // 这一台此刻"看得见却直连不通"时，那句解释在这里说（连接是一个动作，不是一个常驻状态）。
-  const tip = connected ? null : devices.unicastBlockedTip(devices.getDevices().find((d) => d.id === peerId));
+  const tip = connected ? null : devices.unicastBlockedTip(peer);
   try {
-    if (connected) await api.disconnectPeer(peerId);
-    else await api.connectPeer(peerId);
-    if (tip) toast(tip);
+    if (connected) {
+      await api.disconnectPeer(peerId);
+      if (tip) toast(tip);
+      return;
+    }
+    // 「连接」= 先向对端发一条**请求**（F-16 的同意制），不是直接拨号。
+    const outcome = await api.connectPeer(peerId);
+    if (outcome.kind === "asked") {
+      // 真 requestId 由 `link://request_sent` 补上（后端不从这个返回里给 id，见 `connect_peer`）；
+      // 这里只在事件还没到时先占一档，好让"在等谁同意"当场可见、可取消。
+      if (!pendingLinkRequest()) setPendingLinkRequest("", peer ? devices.deviceShortName(peer) : "设备");
+      toast(`已把连接请求发给「${name}」：等它在自己的通知里点「接受」`);
+      return;
+    }
+    // 对端不在网上 / 链路本就在：后端直接拨号，与旧行为同一句（那儿还有"看得见却连不上"的解释）。
+    toast(tip ?? `正在与「${name}」建立长连接`);
   } catch (e) {
     failed(connected ? "断开" : "连接", e);
   }
@@ -359,13 +383,23 @@ export async function unpair(peerId: string, name: string): Promise<boolean> {
   }
 }
 
-export async function renamePeer(peerId: string, name: string): Promise<void> {
-  try {
-    await api.renamePeer(peerId, name);
-    toast(`已重命名为「${name}」`);
-  } catch (e) {
-    failed("重命名", e);
-  }
+/**
+ * 写一台设备的备注（F-101）：`''` = 清除，返回后端真正存下去的值（`null` = 已清除）。
+ *
+ * 与桌面端**同一条路**（后端同一命令 `set_device_remark`、同一个落盘位置 `config.toml` 的
+ * `deviceRemarks`）：备注只写本机，不发给对端、也不改对方自己的设备名。提示里报的是这台设备
+ * **自己的设备名**（对端自报的 `name`，不含备注）与真正存下去的值 —— 用户得看得出改的是哪台。
+ *
+ * 失败不在这里吞：由调用方（备注底板）报错并把底板留着，用户改完能再试。
+ */
+export async function saveRemark(
+  peerId: string,
+  rawName: string,
+  remark: string,
+): Promise<string | null> {
+  const stored = await devices.saveDeviceRemark(peerId, remark);
+  toast(stored ? `已把「${rawName}」的备注设为「${stored}」` : `已清除「${rawName}」的备注`);
+  return stored;
 }
 
 export async function addManualPeer(host: string, port: number): Promise<void> {
@@ -412,9 +446,10 @@ export function editForm(patch: Partial<SettingsForm>): void {
 export type Sheet =
   | { kind: "pair" }
   | { kind: "pairInvite" }
+  | { kind: "linkRequest" }
   | { kind: "addDevice" }
   | { kind: "deviceActions"; peerId: string }
-  | { kind: "renameDevice"; peerId: string }
+  | { kind: "remarkDevice"; peerId: string }
   | { kind: "fileActions"; entry: InboxEntry }
   | { kind: "chatActions"; key: string }
   | { kind: "convo" }
@@ -541,6 +576,90 @@ export async function cancelPendingPairInvite(): Promise<void> {
     toast(`已取消对「${pending.peerName}」的配对邀请`, "x");
   } catch (e) {
     failed("取消配对邀请", e);
+  }
+}
+
+// ── 连接请求（两端）──────────────────────────────────────────────────────────
+//
+// F-16 的同意制：点「连接」不直接拨号，先给对方发一条**请求**，对方在自己的通知里点「接受」
+// 才建链。形状与「配对邀请（两端）」那一段一致 —— 同样是"别人发来的挂一张底板接住、本机
+// 发出去的停在等待那一档、结果/作废由事件回来"，所以放在一起读。
+//
+// **别人发来的**（`link://request`）：只有 60s 有效期，比推送邀请更等不了，当场开底板。
+// **本机发出去的**（`link://request_sent`）：请求 id 由事件带来（`connect_peer` 的返回不带
+// id，后端明说"界面不该同时从两个地方拼同一件事"），设备页上因此显示「在等谁同意」并能取消。
+
+export type IncomingLinkRequest = {
+  requestId: string;
+  peerId: string;
+  peerName: string;
+};
+
+let linkRequest = $state<IncomingLinkRequest | null>(null);
+let linkWait = $state<{ requestId: string; peerName: string } | null>(null);
+
+export function incomingLinkRequest(): IncomingLinkRequest | null {
+  return linkRequest;
+}
+
+/** 收到一条连接请求：挂上并当场开那张表（`link://request`）。 */
+export function noteLinkRequest(req: IncomingLinkRequest): void {
+  linkRequest = req;
+  openSheet({ kind: "linkRequest" });
+}
+
+/** 请求作废了（超时 / 对方撤回）：把表和状态一起收掉。 */
+export function dropLinkRequest(requestId: string): void {
+  if (linkRequest?.requestId !== requestId) return;
+  linkRequest = null;
+  if (sheet?.kind === "linkRequest") closeSheet();
+}
+
+/** 用户在表上点了「接受 / 拒绝」。接受走 `accept_link_request`，返回对方设备名。 */
+export async function answerLinkRequest(accept: boolean): Promise<void> {
+  const req = linkRequest;
+  if (!req) return;
+  linkRequest = null;
+  try {
+    if (accept) {
+      const peerName = await api.acceptLinkRequest(req.requestId);
+      toast(`已同意「${peerName}」建立长连接`);
+    } else {
+      await api.rejectLinkRequest(req.requestId);
+      toast(`已拒绝「${req.peerName}」的连接请求`, "x");
+    }
+  } catch (e) {
+    failed(accept ? "接受连接请求" : "拒绝连接请求", e);
+  }
+}
+
+/** 本机发出去、还在等对方同意的请求（空 = 没有）。 */
+export function pendingLinkRequest(): { requestId: string; peerName: string } | null {
+  return linkWait;
+}
+
+export function setPendingLinkRequest(requestId: string, peerName: string): void {
+  linkWait = { requestId, peerName };
+}
+
+export function clearPendingLinkRequest(requestId?: string): void {
+  if (!linkWait) return;
+  if (requestId && linkWait.requestId !== requestId) return;
+  linkWait = null;
+}
+
+/** 用户点了「取消」：撤回对方界面上那条请求，然后收掉这一档。 */
+export async function cancelPendingLinkRequest(): Promise<void> {
+  const pending = linkWait;
+  if (!pending) return;
+  linkWait = null;
+  try {
+    // 真 id 来自 `link://request_sent`；万一还没到（极短的一瞬），就只收掉本机这一档，
+    // 不拿空 id 去撞后端。
+    if (pending.requestId) await api.cancelLinkRequest(pending.requestId);
+    toast(`已取消对「${pending.peerName}」的连接请求`, "x");
+  } catch (e) {
+    failed("取消连接请求", e);
   }
 }
 

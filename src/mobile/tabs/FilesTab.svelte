@@ -238,7 +238,7 @@
               </div>
               <div class="t-bar"><i style="width:{pctOf(t.pct)}%"></i></div>
               <div class="t-meta">
-                <span>{t.dir === "out" ? "发送至 " : "接收自 "}{chat.deviceNameOf(t.peerId)}</span>
+                <span>{t.dir === "out" ? "发送至 " : "接收自 "}{t.who}</span>
                 <!-- 原型这里按状态给「取消」按钮或「已完成」；取消整批要 batchId（这条路上拿不到，
                      本阶段不做），而 activeTransfers 只给还在动的行，所以右边换 store 写好的状态文案。 -->
                 <span class="num">{t.status}</span>
@@ -274,7 +274,7 @@
           type="button"
           onclick={() => void store.selectBrowsePeer(d.id)}
         >
-          <Icon name="devices" />{d.name}
+          <Icon name="devices" />{devices.deviceShortName(d)}
         </button>
       {/each}
     </div>

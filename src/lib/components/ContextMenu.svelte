@@ -53,6 +53,11 @@
     shareId?: string;
     path?: string;
     isDir?: boolean;
+    /**
+     * 设备/会话菜单：这台设备的状态档（`connected` / `paired` / `unbound`）。
+     * **一对一会话菜单也填它**（那两项「修改备注 / 配对」的判据就在这里，见 `App.openConvoCtx`）：
+     * 留空 = 这台设备已经不在设备表里，会话菜单不摆那两项。
+     */
     deviceState?: string;
     /** 右击的设备此刻是否在线：离线时只剩「解除配对」是本机动作。 */
     deviceOnline?: boolean;
@@ -115,7 +120,7 @@
     onDisconnect: () => void;
     onPair: () => void;
     onUnpair: () => void;
-    /** 设备菜单：改本机给这台设备起的备注（F-101）—— 纯本机动作，任何状态的行都给。 */
+    /** 设备 / 一对一会话菜单：改本机给这台设备起的备注（F-101）—— 纯本机动作，任何状态的行都给。 */
     onRemark: () => void;
     onPeerDownload: () => void;
     onBcCompare: () => void;
@@ -231,6 +236,26 @@
       复制整条消息
     </button>
   {:else if kind === 'convo'}
+    <!-- 一对一那条会话也摆着**设备那两项**（修改备注 / 配对·重新配对），与设备右键菜单
+         同一份处理函数（`onRemark` / `onPair` 读的是 `ctxState.deviceId`，见 `App.openConvoCtx`）：
+         会话正是"看着这台设备"的地方，要改对它的叫法或重新配对，不该先退回设备页去右键那一行。
+         分档与设备菜单逐条同规 —— 备注与在线状态无关（纯本机数据，离线会话照样能改）；
+         配对项只给「未绑定」与「凭据失效」两档（已配对的一对一会话没有配对可言）。
+         `deviceState` 为空 = 这台设备已经不在设备表里（会话还留着，但那两项都没有主语）：不摆。 -->
+    {#if !convoThread && deviceState}
+      <button class="ctx-item" title={deviceRemark ?? undefined} onclick={() => handleItem(onRemark)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M4 10h10M4 15h16M4 20h7"/></svg>
+        修改备注
+        {#if deviceRemark}<span class="ctx-current">{deviceRemark}</span>{/if}
+      </button>
+      {#if deviceState === 'unbound' || deviceNeedsPair}
+        <button class="ctx-item" onclick={() => handleItem(onPair)}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+          {deviceState === 'unbound' ? '配对' : '重新配对'}
+        </button>
+      {/if}
+      <div class="ctx-sep"></div>
+    {/if}
     {#if !convoThread && convoBrowse}
       <button class="ctx-item" onclick={() => handleItem(onConvoFiles)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>

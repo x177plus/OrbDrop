@@ -5,12 +5,34 @@
   import * as store from "../store.svelte";
   import * as devices from "$lib/stores/devices.svelte";
   import * as settings from "$lib/stores/settings.svelte";
+  import * as chat from "$lib/stores/chat.svelte";
   import type { PeerDevice } from "$lib/types";
 
   // 哪些行该列、按什么序，交给 `visibleDevices`（离线且未绑定的不列：它没有任何可做的动作；
   // 在线在前、同级按名字）。后端给的是"发现的先后"，不是给人看的顺序，界面自己不排。
   const rows = $derived(devices.visibleDevices(devices.getDevices()));
   const addr = $derived(store.getLocalAddr());
+  // 本机刚发出去、还在等对方点头的连接请求（F-16 同意制）：有它就在页面上停一档可取消的等待态。
+  const linkWait = $derived(store.pendingLinkRequest());
+  // 还没处理的推送邀请（会话 store 里那些 `pending` 的文件消息，见 `store.pendingInvites`）：
+  // 行上那颗待处理角标（F-112）的一半，另一半是未读消息。
+  const invites = $derived(store.pendingInvites());
+
+  /** 这台设备发来的、等本机接收/拒绝的推送有几条。 */
+  function invitesOf(peerId: string): number {
+    return invites.filter((p) => p.peerId === peerId).length;
+  }
+
+  /**
+   * 角标的悬停 / 读屏文案：未读消息与待接收邀请是两个数，合成一个就说不清是哪一类
+   * （与桌面端 `DeviceTab` 那颗角标同一套说法）。
+   */
+  function pendingLabel(unread: number, pending: number): string {
+    return [
+      unread ? `${unread} 条未读消息` : '',
+      pending ? `${pending} 条待接收推送` : '',
+    ].filter(Boolean).join(" · ");
+  }
 
   // 本机名字与桌面那份「本机名称」是同一份设置。设备页可能是开机后第一个进的页，
   // 那时还没人拉过设置，缺了就补一次；已经拉到就沿用，不重复请求。
@@ -99,6 +121,24 @@
     </button>
   </div>
 
+  <!-- 本机发出的连接请求还在等对方点头（F-16 同意制）：停在"等谁同意"那一档，可当场取消 ——
+       写法与配对表里的「取消邀请」同款（`.opt` + 一颗次级整宽按钮），不另造一套视觉。
+       `link://request_result` / `link://request_closed` 回来时这一档自己会收掉。 -->
+  {#if linkWait}
+    <div class="sec">
+      <div class="opt">
+        <span class="oi"><Icon name="link" /></span>
+        <span class="om">
+          <span class="on">等待「{linkWait.peerName}」同意</span>
+          <span class="od">连接请求已发出，等它在自己的通知里点「接受」。</span>
+        </span>
+      </div>
+      <button class="btn btn-secondary btn-block" type="button" onclick={() => void store.cancelPendingLinkRequest()}>
+        <Icon name="x" />取消请求
+      </button>
+    </div>
+  {/if}
+
   <div class="sec">
     <div class="sec-label"><span>已发现设备</span><span class="num">{rows.length} 台</span></div>
     {#if rows.length === 0}
@@ -118,6 +158,12 @@
                这几个 pointer 处理器不是"这个 div 是颗按钮"：它只在**按住不放**时才做事，
                给不了 `role="button"`（短按什么都不发生，加了就是骗读屏），键盘也没有等价操作 ——
                设备操作的键盘/读屏入口因此**没有**（已知取舍，见 §21 那条记录）。 -->
+          <!-- 行上的待处理角标（F-112）：这台设备还有几件等你处理 —— 未读消息（会话 store
+               算好的）＋ 还没接收/拒绝的推送邀请。移动端的设备行**没有头像**（§21 把那一格
+               还给了名字与地址），所以角标落在名字那一排、状态胶囊的右边：数字紧挨着
+               "这台现在怎么样"，读作"它那边还有几件等你"。两行高度不变。 -->
+          {@const unread = chat.unreadForPeer(d.id)}
+          {@const pending = invitesOf(d.id)}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
             class="drow"
@@ -134,8 +180,19 @@
                    整列宽 —— 列一宽就是一条空壳。同排之后行少一行（无中转的行 92 → 71），
                    胶囊也回到自适应宽度；名字长到装不下时先省略号，胶囊**不**被挤掉。 -->
               <span class="dnrow">
-                <span class="dname">{d.name}</span>
+                <!-- 名字走**显示名**（F-101：有备注就是「备注(设备名)」）—— 设备列表是"挑哪一台机器"
+                     的地方，只写备注认不出是哪台（桌面端 `deviceDisplayName` 只给这一处用）。
+                     名字长了这一行省略号截断，`title` 给全（桌面端同款）。 -->
+                <span class="dname" title={devices.deviceDisplayName(d)}>{devices.deviceDisplayName(d)}</span>
                 <StateChip state={devices.deviceState(d)} />
+                {#if unread + pending > 0}
+                  <span
+                    class="dn-pending num"
+                    role="img"
+                    aria-label="等你处理 {unread + pending} 件：{pendingLabel(unread, pending)}"
+                    title={pendingLabel(unread, pending)}
+                  >{unread + pending}</span>
+                {/if}
               </span>
               <!-- 第二行 = "这台现在**怎么到的**"：直连写地址；经中转就写「经 X 中转」。
                    中转那一档原来显示的是对方**自报、而这跳已经不通**的地址（写在那一行反而误导 ——

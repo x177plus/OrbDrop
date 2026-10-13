@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use axum::extract::{Query, State, WebSocketUpgrade};
@@ -19,6 +19,7 @@ pub mod proxy;
 mod routes_chat;
 mod routes_dav;
 mod routes_discover;
+mod routes_link;
 mod routes_relay;
 mod routes_file;
 mod routes_pair;
@@ -84,6 +85,11 @@ fn ip_rank(ip: &std::net::Ipv4Addr) -> u8 {
 /// 这里与它对齐，两条通道的能力才一致。
 const MANIFEST_BODY_LIMIT: usize = 64 << 20;
 
+/// 图片消息那条路由的体积上限：`blobs::MAX_IMAGE_BYTES` 的 base64（4/3）再加一点信封余量
+/// （`id`/`name`/`sender`/JSON 那几格）。
+const IMAGE_BODY_LIMIT: usize =
+    (crate::blobs::MAX_IMAGE_BYTES as usize / 3 + 1) * 4 + (64 << 10);
+
 /// Build the axum Router with all routes, including the WS /events
 /// endpoint (outside the auth layer).
 fn build_router(state: Arc<AppState>) -> Router {
@@ -116,6 +122,16 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/pair/invite/withdraw",
             axum::routing::post(routes_pair::pair_invite_withdraw_handler),
+        )
+        // 长连接请求（F-16 的同意制）：对端点「连接」时来问本机一句，随它挂在本机通知里
+        // 等用户点头（见 `crate::link`）。同样是公开面：请求的送达本来就不该要求先有链路。
+        .route(
+            "/link/request",
+            axum::routing::post(routes_link::link_request_handler),
+        )
+        .route(
+            "/link/request/withdraw",
+            axum::routing::post(routes_link::link_withdraw_handler),
         )
         .route("/events", axum::routing::get(events_ws_handler))
         .route(
@@ -164,15 +180,26 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/chat/message",
             axum::routing::post(routes_chat::chat_message_handler),
         )
+        // 图片消息：体里装着那张图的字节（base64），所以只有这一条会话路由要把体积上限
+        // 抬高一档 —— axum 默认的 2MB 会把一张两兆的截图直接 413 掉（发送方那边只看到
+        // "没打通"）。与 `blobs::MAX_IMAGE_BYTES` 对齐（base64 后 4/3，另留一点信封余量）。
+        .route(
+            "/chat/image",
+            axum::routing::post(routes_chat::chat_image_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(IMAGE_BODY_LIMIT)),
+        )
         .route(
             "/chat/read",
             axum::routing::post(routes_chat::chat_read_handler),
         )
         // 群聊三条同样走公开路由 + 自己认人：群成员**不需要配对**（D6=b），所以不能挪到
         // `auth_routes` 里（那条路要求 token 反解出身份）。
+        // `/chat/group` 的体积上限与 `/chat/image` 同一档：群里发图片时，体里也装着那张图
+        // 的字节（见 `routes_chat::GroupTextBody`）。
         .route(
             "/chat/group",
-            axum::routing::post(routes_chat::group_text_handler),
+            axum::routing::post(routes_chat::group_text_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(IMAGE_BODY_LIMIT)),
         )
         .route(
             "/chat/group-read",
@@ -193,6 +220,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/chat/group-ack",
             axum::routing::post(routes_chat::group_ack_handler),
+        )
+        // 群消息的**拒收回执**（收方 → 发送方）：没有长连接时它只能反拨回来，
+        // 理由（`declined` 那一档）就靠这一跳带回去。
+        .route(
+            "/chat/group-reject",
+            axum::routing::post(routes_chat::group_text_reject_handler),
         );
 
     // Beyond Compare 的 WebDAV 入口：让 BC 连**本机**（回环），由这里加密转发到对端。
@@ -381,7 +414,28 @@ async fn events_ws_handler(
 // Server lifecycle (unchanged from P0)
 // ---------------------------------------------------------------------------
 
+/// 起监听。**真实用法**：绑 `0.0.0.0` —— 对端要能拨进来。
 pub async fn start_server(state: Arc<AppState>, base_port: u16) -> Result<u16, String> {
+    start_server_at(state, base_port, IpAddr::V4(Ipv4Addr::UNSPECIFIED)).await
+}
+
+/// **测试**用的监听入口：只绑回环。
+///
+/// 为什么要有它：测试实例的配置来自 `Config::default()`（设备名 = `%COMPUTERNAME%`、设备
+/// id 每次新取，见 `config::test_config`）。绑 `0.0.0.0` 时，一套 `cargo test` 下来局域网
+/// 上会短时间冒出一串**与本机同名、id 各不同**的设备；对端每轮探活问到这些地址，判据是
+/// "这个地址上换了设备"，于是它地址簿里那一行被作废、界面写「地址未知」（真机反馈：一台
+/// 设备上冒出一屏同名设备）。测试从来只拨 `127.0.0.1`，绑回环就够 —— 顺带把测试实例从
+/// 局域网上摘干净。
+///
+/// 例外只有一类：需要模拟"**来自另一台设备**"的请求的用例（它们拨本机的内网地址，绕开
+/// "回环 = 本机 UI"的免鉴权分支，见 `local_lan_ip`）—— 那些服务器必须绑 `0.0.0.0`，
+/// 仍用 `start_server`；它们的身份同样走 `config::test_config`，不会与真机撞名。
+pub async fn start_server_loopback(state: Arc<AppState>, base_port: u16) -> Result<u16, String> {
+    start_server_at(state, base_port, IpAddr::V4(Ipv4Addr::LOCALHOST)).await
+}
+
+async fn start_server_at(state: Arc<AppState>, base_port: u16, ip: IpAddr) -> Result<u16, String> {
     let app = build_router(state.clone());
     // 监听方向要一份 TLS 配置：没有身份就没有加密，宁可就起不来。
     let identity = crate::net::load_or_create_identity()?;
@@ -391,7 +445,7 @@ pub async fn start_server(state: Arc<AppState>, base_port: u16) -> Result<u16, S
     // —— 而这条路径是"启动监听"，panic 等于应用起不来。溢出时退化成"只试到 65535"。
     let last = base_port.saturating_add(10);
     for port in base_port..=last {
-        let addr: SocketAddr = ([0, 0, 0, 0], port).into();
+        let addr = SocketAddr::new(ip, port);
         match TcpListener::bind(addr).await {
             Ok(listener) => {
                 let (tx, rx) = oneshot::channel::<()>();
@@ -457,7 +511,7 @@ pub async fn ensure_server(state: Arc<AppState>) -> Result<u16, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, ShareItem};
+    use crate::config::{test_config, ShareItem};
     use crate::state::AppState;
     use reqwest::StatusCode;
 
@@ -470,7 +524,8 @@ mod tests {
     }
 
     fn make_state(root: std::path::PathBuf) -> Arc<AppState> {
-        let mut config = Config::default();
+        // 身份走 `test_config`：`Config::default()` 的设备名就是本机名（见那一份说明）。
+        let mut config = test_config();
         let share = ShareItem::new(root);
         config.shares.push(share);
         let config_path = std::env::temp_dir().join(format!("orbdrop_test_config_{}.toml", uuid::Uuid::new_v4()));
@@ -480,7 +535,7 @@ mod tests {
     async fn start_test_server() -> (Arc<AppState>, u16, std::path::PathBuf) {
         let root = temp_share_dir();
         let state = make_state(root.clone());
-        let port = start_server(state.clone(), 3990).await.expect("server start");
+        let port = start_server_loopback(state.clone(), 3990).await.expect("server start");
         (state, port, root)
     }
 
@@ -610,7 +665,7 @@ mod tests {
         let state = make_state(root.clone());
 
         let occupied = std::net::TcpListener::bind("127.0.0.1:3995").unwrap();
-        let port = start_server(state.clone(), 3990).await.expect("server start");
+        let port = start_server_loopback(state.clone(), 3990).await.expect("server start");
         assert!(
             port >= 3990 && port <= 3995,
             "should probe within range, got {port}"

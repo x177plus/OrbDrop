@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, ChatSnapshot, InboxEntry, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState } from './types';
+import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, ChatFileMsg, ChatSnapshot, InboxEntry, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState } from './types';
 import type { ScreenMetrics, ScreenRect } from './orbLayout';
 
 // Share management
@@ -30,7 +30,7 @@ export function getSettings(): Promise<AppSettings> {
   return invoke('get_settings');
 }
 
-export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; downloadMode: string; deviceName: string; autoStart: boolean; bcExePath: string; autoBroadcastNew: boolean; groupRelay: boolean; allowRelay: boolean; relayMemory: boolean; transferWorkers: number; transferBlockMb: number }): Promise<AppSettings> {
+export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; deviceSubdir: boolean; downloadMode: string; deviceName: string; autoStart: boolean; bcExePath: string; autoBroadcastNew: boolean; groupRelay: boolean; allowRelay: boolean; relayMemory: boolean; transferWorkers: number; transferBlockMb: number }): Promise<AppSettings> {
   return invoke('update_settings', { req: s });
 }
 
@@ -105,11 +105,6 @@ export function setDeviceRemark(peerId: string, remark: string): Promise<string 
   return invoke('set_device_remark', { peerId, remark });
 }
 
-/** 改设备在本机显示的名字（后端只在移动端构建里注册 `rename_peer`）。 */
-export function renamePeer(peerId: string, name: string): Promise<void> {
-  return invoke('rename_peer', { peerId, name });
-}
-
 export function getPeerToken(peerId: string): Promise<string | null> {
   return invoke('get_peer_token', { peerId });
 }
@@ -121,12 +116,35 @@ export function wipeCredentials(): Promise<number> {
 
 // Long connection (F-16). Only the user opens it — pairing just establishes the
 // 「已配对」 relationship — these two are the manual 断开 / 连接 buttons.
-export function connectPeer(peerId: string): Promise<void> {
+
+/**
+ * 点「连接」：**先问对端一句**（F-16 的同意制）。
+ *
+ * - `{kind:'asked'}`：请求挂在对方通知里等它点头 —— 成败走 `link://request_result`，
+ *   等待中的卡片走 `link://request_sent`；
+ * - `{kind:'dialing'}`：本机直接拨号（对端不在网上 / 老版本 / 链路本来就在）。
+ */
+export function connectPeer(peerId: string): Promise<{ kind: 'asked' | 'dialing' }> {
   return invoke('connect_peer', { peerId });
 }
 
 export function disconnectPeer(peerId: string): Promise<void> {
   return invoke('disconnect_peer', { peerId });
+}
+
+/** 接收方：接受一条连接请求（通知里的「接受」），返回对方设备名。 */
+export function acceptLinkRequest(requestId: string): Promise<string> {
+  return invoke('accept_link_request', { requestId });
+}
+
+/** 接收方：拒绝一条连接请求。 */
+export function rejectLinkRequest(requestId: string): Promise<void> {
+  return invoke('reject_link_request', { requestId });
+}
+
+/** 发起方：取消自己刚发出去、还没被处理的连接请求（对端那条通知跟着撤掉）。 */
+export function cancelLinkRequest(requestId: string): Promise<void> {
+  return invoke('cancel_link_request', { requestId });
 }
 
 // Pairing (F-12)
@@ -200,8 +218,34 @@ export function pathPicks(paths: string[]): Promise<LocalPick[]> {
  * 一次操作只开一次文件选择框：多选的文件合并成**每台一条**推送（对端只弹一张卡、只同意一次），
  * 各台独立推进 —— 谁成谁败、还差几台，看 `push://batch` 事件推进的那张卡片。
  */
-export function pushPaths(paths: string[], peerIds: string[]): Promise<PushBatch> {
-  return invoke('push_paths', { paths, peerIds });
+export function pushPaths(paths: string[], peerIds: string[], at?: number): Promise<PushBatch> {
+  return invoke('push_paths', { paths, peerIds, at: at ?? null });
+}
+
+/**
+ * 把剪贴板里的图片字节落成一个**暂存文件**（系统临时目录），返回它的绝对路径。
+ *
+ * `data` 是 base64（`invoke` 的载荷是 JSON，一张 5 MB 的截图摊成数字数组就是 20 MB 文本）。
+ * 会话里发图片走的是推送，而推送只认本机真实路径 —— 这一步就是那中间的一跳。
+ */
+export function savePastedImage(data: string, ext: string): Promise<string> {
+  return invoke('save_pasted_image', { data, ext });
+}
+
+/** 一张落盘的图片 → `data:` URL（会话里的缩略图与「看大图」都用它）。 */
+export function readImageDataUrl(path: string): Promise<string> {
+  return invoke('read_image_data_url', { path });
+}
+
+/**
+ * 把一个**别的应用给的图片 URI**（安卓 `content://` / `file://`）交给原生那一跳拷成暂存文件，
+ * 返回拷好的路径与字节数（见 `src-tauri/src/mobile.rs` 与 `PasteImagePlugin.kt`）。
+ *
+ * 这条路只在与输入法的剪贴板打交道时用得上：它把图插进输入框时给的是 URI，不是字节。
+ * `size` 由原生那一趟量出来 —— 界面那条文件气泡要显示"多大"。
+ */
+export function resolveImageUri(uri: string): Promise<{ path: string; size: number }> {
+  return invoke('resolve_image_uri', { uri });
 }
 
 /** 发送方取消一整批推送（各台各撤一条）。 */
@@ -248,8 +292,9 @@ export function chatSend(
   peerIds: string[],
   text: string,
   batchId?: string | null,
+  at?: number,
 ): Promise<{ id: string; batchId: string | null; snapshot: ChatSnapshot }> {
-  return invoke('chat_send', { peerIds, text, batchId: batchId ?? null });
+  return invoke('chat_send', { peerIds, text, batchId: batchId ?? null, at: at ?? null });
 }
 
 /**
@@ -283,6 +328,35 @@ export function chatClear(peerId: string): Promise<ChatSnapshot> {
   return invoke('chat_clear', { peerId });
 }
 
+/**
+ * 把一台设备的**文件消息记录**整份落盘（会话里那条文件气泡的唯一持久物）。
+ *
+ * **不是每条进度都写**：传输中的进度每 200ms 一跳，那是内存里的事；界面只在"能定下来"的
+ * 时刻（刚发出 / 刚收到 / 接受或拒绝 / 收完或失败 / 整批走完）写一次 —— 见 `stores/chat`。
+ */
+export function chatFilesSet(peerId: string, files: ChatFileMsg[]): Promise<ChatSnapshot> {
+  return invoke('chat_files_set', { peerId, files });
+}
+
+/**
+ * 发一张**图片消息**给一台或多台设备（输入框里粘一张图就是走这一条）。
+ *
+ * `path` 是本机那份**暂存**图片（粘贴那一刻就落下的）；后端把字节读进来、落成会话内容
+ * （`<数据目录>/chat-blobs/`）再发出去。**图片是消息内容，不是推送文件**：对端直接就能看，
+ * 没有"接收 / 同意"那一步 —— 所以它不走 `pushPaths`。
+ *
+ * 超过上限（`blobs::MAX_IMAGE_BYTES`，8 MB）会当场 reject，**不会**偷偷改走推送。
+ */
+export function chatSendImage(
+  peerIds: string[],
+  path: string,
+  name: string,
+  at?: number,
+  batchId?: string | null,
+): Promise<{ id: string; batchId: string | null; snapshot: ChatSnapshot }> {
+  return invoke('chat_send_image', { peerIds, path, name, at: at ?? null, batchId: batchId ?? null });
+}
+
 // 共享群聊：一份"所有人的同一个"消息流（与群发相反 —— 群消息不镜像进各台的 1:1）。
 // 与上面几条同一个路数：命令一律返回**整份会话状态**，界面拿来就换。
 /**
@@ -299,8 +373,8 @@ export function groupEdit(id: string, members: string[], name: string): Promise<
 }
 
 /** 往群里发一条文本；返回的 `id` 是**这条消息**的 id（不是群的）。 */
-export function groupSend(id: string, text: string): Promise<{ id: string; snapshot: ChatSnapshot }> {
-  return invoke('group_send', { id, text });
+export function groupSend(id: string, text: string, at?: number): Promise<{ id: string; snapshot: ChatSnapshot }> {
+  return invoke('group_send', { id, text, at: at ?? null });
 }
 
 /** 本机读到哪儿了：推进群里的已读水位（未读清零）。 */
@@ -317,6 +391,21 @@ export function groupMarkRead(id: string): Promise<ChatSnapshot> {
  */
 export function groupSync(id: string): Promise<ChatSnapshot> {
   return invoke('group_sync', { id });
+}
+
+/**
+ * 在群里发一张**图片消息**（与 `groupSend` 同一个口径，内容换成那张图）。
+ *
+ * **图片是消息内容，不是文件**：群里的成员直接就能看，没有"接收 / 同意"那一步。
+ * 超过上限（`blobs::MAX_IMAGE_BYTES`，8 MB）会当场 reject。
+ */
+export function groupSendImage(
+  id: string,
+  path: string,
+  name: string,
+  at?: number,
+): Promise<{ id: string; snapshot: ChatSnapshot }> {
+  return invoke('group_send_image', { id, path, name, at: at ?? null });
 }
 
 /** 接受一条群邀请 —— 从这一刻起它才算群（进会话列表，不再只是那张邀请卡）。 */
@@ -486,6 +575,19 @@ export function orbMouseDown(): Promise<boolean> {
 /** 记录悬浮体本体中心（球心 / 卡片白底中心；物理像素）：下次启动复原到同一位置 */
 export function orbSaveCenter(x: number, y: number): Promise<void> {
   return invoke('orb_save_center', { x, y });
+}
+
+/**
+ * 告诉托盘：此刻**有没有事等处理**（未读消息 / 群邀请 / 待确认通知 / 在途推送 / 发现新版本）。
+ *
+ * 有事那一档托盘图标会挂一颗红点并闪动，左键单击则落到"该看的那一件事"上
+ * （`orb://tray_alert` 事件，见 `App.svelte`）。这里传的布尔与悬浮球左上角那颗角标是**同一个
+ * 数**（`App` 里的 `orbNotifCount`）：球上有数 ⇔ 托盘上有红点，两处显示一起动。
+ *
+ * 只有桌面端有托盘，这条命令也只在桌面构建里注册。
+ */
+export function traySetAlert(active: boolean): Promise<void> {
+  return invoke('tray_set_alert', { active });
 }
 
 // 对端浏览：**走后端命令**，不在 WebView 里直接 fetch 对端。

@@ -1,11 +1,22 @@
 <script lang="ts">
   import * as chat from '$lib/stores/chat.svelte';
   import type { ChatItem } from '$lib/stores/chat.svelte';
-  import { getDevices, deviceDotState, threadDotState } from '$lib/stores/devices.svelte';
+  import { getDevices, deviceDotState, threadDotState, deviceShortName } from '$lib/stores/devices.svelte';
   import { getSettings } from '$lib/stores/settings.svelte';
   import { undeliverableText, type PendingGroup, type Undeliverable } from '$lib/types';
+  import {
+    adoptDomImages,
+    applyComposer,
+    imageFiles,
+    insertImages,
+    isImageName,
+    serializeComposer,
+    setCaretEnd,
+  } from '$lib/composer';
+  import ImagePreview from '$lib/components/ImagePreview.svelte';
+  import ImageViewer from '$lib/components/ImageViewer.svelte';
   import { listen } from '@tauri-apps/api/event';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
 
   /**
    * 会话浮层（原型 `.convo-pop`）：两块视图共用一层 —— **会话列表 / 某个会话**。
@@ -25,8 +36,10 @@
     onSendFiles,
     onAcceptInvite,
     onRejectInvite,
+    onStopReceive,
     onConvoCtx,
     onMessageCtx,
+    onOpenFile,
   }: {
     /** 右键菜单正指着的那条消息（高亮它，菜单收掉就清空）。 */
     pickedId: string | null;
@@ -37,10 +50,14 @@
     onSendFiles: () => void;
     onAcceptInvite: (inviteId: string) => void;
     onRejectInvite: (inviteId: string) => void;
+    /** 正在接收的那颗停止：撤掉这条接收（保留续传记录，但**不再自动接着收** —— 用户喊停就是喊停）。 */
+    onStopReceive: (inviteId: string) => void;
     /** 「⋮」：把会话菜单的锚点与**是哪个会话**交出去（菜单由 App 画，项按模式分）。 */
     onConvoCtx: (x: number, y: number, key: string) => void;
     /** 消息右键：坐标 + 这一条要复制的内容（整条 / 选中的那段）。 */
     onMessageCtx: (x: number, y: number, id: string, full: string, sel: string) => void;
+    /** 点了一条**文件**消息（自己发的 / 对端推来且已收完的）：App 拿系统默认程序打开它。 */
+    onOpenFile: (item: ChatItem) => void;
   } = $props();
 
   const open = $derived(chat.isChatOpen());
@@ -50,10 +67,16 @@
   const rows = $derived(chat.convoRows());
   const devices = $derived(getDevices());
   const items = $derived<ChatItem[]>(thread ? chat.itemsOf(thread.key) : []);
-  const draft = $derived(thread ? chat.draftOf(thread.key) : '');
+  /** 输入区里有没有值得发的东西（文字或图，见 `lib/composer.ts`）。 */
+  const canSend = $derived(thread ? chat.draftHasContent(thread.key) : false);
   /** 最后一条的 id：新消息进来就跳到底（按 id 而不是长度，编辑/替换也算变化）。 */
   const tail = $derived(items.length ? items[items.length - 1].id : '');
   const openDev = $derived(thread?.mode === 'direct' ? devices.find((d) => d.id === thread.participants[0]) : undefined);
+  /**
+   * 这个群里**明确拒绝加入**的那些成员（后端 `Group::declined`）：收件人那一排把它们染红，
+   * 消息那行小字也改口说「已拒绝加入」。不是群 = 空表。
+   */
+  const declinedIds = $derived(thread?.mode === 'group' ? chat.groupDeclinedIds(thread.id) : []);
   /**
    * 一对一那条会话对着哪台设备（群发/群聊是空串）。
    *
@@ -68,8 +91,24 @@
    */
   const missing = $derived(thread?.mode === 'group' ? (chat.groupOf(thread.id)?.missing ?? 0) : 0);
 
+  /**
+   * 别的会话上还等着几条（当前这条不算，见 `chat.unreadElsewhere`）。
+   *
+   * 会话详情里**别处来消息原本没有任何提示**：底栏那颗角标在这一屏底下盖着、会话列表那条行
+   * 也在浮层的另一屏里 —— 得退回去才知道。返回箭头右边这颗数就是它。
+   */
+  const elsewhere = $derived(chat.unreadElsewhere());
+
   let logEl = $state<HTMLDivElement | null>(null);
-  let inputEl = $state<HTMLInputElement | null>(null);
+  let inputEl = $state<HTMLDivElement | null>(null);
+  /** 正开着大图的那条（点缩略图进去，见 `ImageViewer`；`null` = 没开）。 */
+  let viewing = $state<ChatItem | null>(null);
+
+  /**
+   * 正在认领浏览器塞进输入区的图（见 `composer.adoptDomImages`）：认领会改 DOM、而改 DOM 又会
+   * 走进来的那次 `input`，用这个闸门挡住重入。
+   */
+  let adopting = false;
 
   /** 新消息进来、换会话、浮层重新展开 —— 都落到最底下（原型 `renderChatLog` 结尾那次滚动）。 */
   $effect(() => {
@@ -80,12 +119,71 @@
     logEl.scrollTop = logEl.scrollHeight;
   });
 
-  /** 打开某个会话就把光标放进输入框（点「发消息」进来的人下一步一定是打字）。 */
+  /**
+   * 打开某个会话：把这条会话的草稿**重画**进输入区，光标放到末尾。
+   *
+   * `untrack` 不能省：输入区在编辑时**不归 Svelte 管**（DOM 就是编辑时的真相，否则每敲一个字
+   * 都被重画一遍、光标丢到最前）。这个 effect 因此只认"哪条会话 / 哪个节点"，
+   * 而**不能**跟着草稿的每一次变化跑 —— 读草稿那一下包在 `untrack` 里。
+   */
   $effect(() => {
-    void thread?.key;
-    if (!open || !thread) return;
-    inputEl?.focus();
+    const el = inputEl;
+    const key = thread?.key ?? '';
+    if (!el || !key) return;
+    untrack(() => {
+      applyComposer(el, chat.draftSegsOf(key));
+      markEmpty();
+    });
+    // 换会话 / 关掉浮层：大图跟着收掉（它不是"第二个窗口"，只是这一条会话里的一次摊开）。
+    viewing = null;
+    el.focus();
+    if (open) setCaretEnd(el);
   });
+
+  /** 输入区那句占位文案的判据（`:empty` 认不出"只剩一个空文本节点"的框，见 `main.css`）。 */
+  function markEmpty() {
+    const el = inputEl;
+    const t = thread;
+    if (el && t) el.dataset.empty = chat.draftHasContent(t.key) ? '0' : '1';
+  }
+
+  /** 把输入区里此刻的样子存成草稿（每次 `input` 之后、认领完图之后都要叫一次）。 */
+  function syncDraft() {
+    const el = inputEl;
+    const t = thread;
+    if (!el || !t) return;
+    chat.setDraftSegs(t.key, serializeComposer(el));
+    markEmpty();
+  }
+
+  /**
+   * `input` 事件：输入法剪贴板那条路（安卓那半靠的就是它）会把图**直接插进框里**，
+   * 插进来的多半是一个 `<img>`（`data:` / `blob:` / `content://`）—— 先认领（落成暂存文件、
+   * 换成我们自己那张有路径的图），再同步草稿。桌面端 `paste` 事件那条路见 `onPaste`。
+   */
+  async function onInput() {
+    const el = inputEl;
+    if (!el || adopting) return;
+    adopting = true;
+    try {
+      await adoptDomImages(el, onToast);
+    } finally {
+      adopting = false;
+    }
+    syncDraft();
+  }
+
+  /** `Ctrl+V` 里带图：那几张图落盘后插到**光标处**（见 `composer.insertImages`）。 */
+  function onPaste(e: ClipboardEvent) {
+    const el = inputEl;
+    if (!el) return;
+    const files = imageFiles(e.clipboardData);
+    if (!files.length) return; // 纯文字：交给默认粘贴，`input` 事件会把草稿同步过去
+    e.preventDefault();
+    void insertImages(el, files, onToast).then((ok) => {
+      if (ok) syncDraft();
+    });
+  }
 
   /**
    * 一条消息暂时送不出去时那句解释（F-106，`chat://undeliverable`）：一行小字，可关闭、
@@ -173,13 +271,28 @@
       return state ? `${when} · ${state}` : when;
     }
     if (thread?.mode !== 'group') return when;
-    const receipt = chat.groupReceiptText(item);
+    const receipt = chat.groupReceiptText(item, declinedIds);
     return receipt ? `${when} · ${receipt}` : when;
   }
 
-  /** 消息右键要复制的那串（文件消息 = `名字（大小）`，与原型 `data-copy` 同一套）。 */
+  /** 消息右键要复制的那串（文件消息 = `名字（大小）`，图片消息 = `[图片] 名字`，与原型同一套）。 */
   function copyTextOf(item: ChatItem): string {
-    return item.kind === 'file' ? `${item.name}（${item.size}）` : item.text;
+    if (item.kind === 'file') return `${item.name}（${item.size}）`;
+    if (item.image) return `[图片] ${item.name ?? ''}`.trim();
+    return item.text;
+  }
+
+  /**
+   * 这条文件消息是不是一张**能在会话里摊开看的图**：按扩展名判（与后端 `paste::mime_of`
+   * 同一份名单）。文件夹当然不是；认不出来的扩展名也不是（那样的气泡还是老样式）。
+   */
+  function isImageMsg(item: ChatItem): boolean {
+    return item.kind === 'file' && !item.isDir && isImageName(item.name);
+  }
+
+  /** 一条消息的显示名：文件消息与图片消息都有 `name`，都没有时写「图片」。 */
+  function msgName(item: ChatItem): string {
+    return item.kind === 'file' ? item.name : item.name ?? '图片';
   }
 
   function onLogContext(e: MouseEvent) {
@@ -198,38 +311,50 @@
   }
 
   /**
-   * 发出去这条。三种身份都走 `chat.sendText`（群发 = "每台各存一份副本"，群聊 = 群里那一条
-   * 共用的消息流）。
+   * 发出去这一整条。**顺序与分段都在 store 里**（`chat.sendComposer`）：输入区里可能是
+   * "一段文字 / 一张图 / 又一段文字"，它按框里的顺序一条条落成消息，两端都排得对。
    *
+   * 这里只管两件界面上的事：把输入区**重画**成 store 里剩下的那几段（发出去的不留、没发出去
+   * 的原地留着），以及报结果 ——
    * 群发的提示当场给出逐台战果（刚发那条读出来的，不猜）：全到位只说台数；没到位的把
    * "几台送达 / 几台在等对端上线 / 几台没送到 / 几台发送中"一次说清 —— 随后
    * `chat://changed` 还会更新回执（对端上线后，等待发送的那几台会自己变成已送达）。
    */
-  function send() {
+  async function send() {
     const t = thread;
-    const text = draft.trim();
-    if (!t || !text) return;
-    void chat
-      .sendText(t.key, text)
-      .then((res) => {
-        if (!res) return;
-        chat.setDraftOf(t.key, '');
-        if (t.mode !== 'broadcast') return;
-        const item = chat.itemById(t.key, res.id);
-        const receipt = item ? chat.receiptOf(item) : null;
-        if (!item || !receipt) return;
-        if (receipt.delivered === receipt.total) {
-          onToast(`已群发至 ${receipt.total} 台设备`);
-          return;
-        }
-        const tail = [`${receipt.delivered}/${receipt.total} 台送达`];
-        if (receipt.waiting) tail.push(`${receipt.waiting} 台等对端上线`);
-        if (receipt.offline) tail.push(`${receipt.offline} 台未送达`);
-        const pending = chat.perDeviceOf(item).filter((p) => p.state === 'pending').length;
-        if (pending) tail.push(`${pending} 台发送中`);
-        onToast(`已群发 · ${tail.join('，')}`);
-      })
-      .catch((e) => onToast(String(e)));
+    if (!t) return;
+    const res = await chat.sendComposer(t.key).catch((e) => {
+      onToast(String(e));
+      return null;
+    });
+    const el = inputEl;
+    if (el) {
+      applyComposer(el, chat.draftSegsOf(t.key));
+      markEmpty();
+      el.focus();
+      setCaretEnd(el);
+    }
+    if (!res || res.failed) {
+      if (res?.failed) onToast(`有 ${res.failed} 项没发出去：${res.error ?? '原因不明'}（还留在输入框里）`);
+      return;
+    }
+    if (t.mode !== 'broadcast' || !res.textId) {
+      if (res.images && !res.texts) onToast(`已发送 ${res.images} 张图片`);
+      return;
+    }
+    const item = chat.itemById(t.key, res.textId);
+    const receipt = item ? chat.receiptOf(item) : null;
+    if (!item || !receipt) return;
+    if (receipt.delivered === receipt.total) {
+      onToast(`已群发至 ${receipt.total} 台设备`);
+      return;
+    }
+    const tail = [`${receipt.delivered}/${receipt.total} 台送达`];
+    if (receipt.waiting) tail.push(`${receipt.waiting} 台等对端上线`);
+    if (receipt.offline) tail.push(`${receipt.offline} 台未送达`);
+    const pending = chat.perDeviceOf(item).filter((p) => p.state === 'pending').length;
+    if (pending) tail.push(`${pending} 台发送中`);
+    onToast(`已群发 · ${tail.join('，')}`);
   }
 
   /** 收件人上那颗 ✕（原型 `removeRecipient`）：去掉一台；只剩一台就退回一对一会话。 */
@@ -281,9 +406,33 @@
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5 2.6 20h18.8L12 3.5Z" /><path d="M12 10v4" /><path d="M12 17.4h.01" /></svg>
 {/snippet}
 
+<!-- 推送卡头部那一行（图标 + 名字 + 大小）：待接收、收下的、以及它外面套的那颗「打开」按钮
+     共用同一份 —— 三种状态的行长得必须一样，差别只在能不能点。 -->
+{#snippet fileRow(item: ChatItem & { kind: 'file' })}
+  <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d={icPath(item)} /></svg></span>
+  <span class="ic-main">
+    <span class="ic-name">{item.name}</span>
+    <span class="ic-size">{item.size}</span>
+  </span>
+{/snippet}
+
+<!-- 自己发出去那条气泡里的内容（名字 / 大小 / 状态行 / 进度条）：那颗「打开」按钮套在外面，
+     没有路径时就裸着画（一个字都不差）。`status` 由调用处现算 —— 一对一那条只写这一台自己的
+     状态，群发那条写整批（见 `fileStatusText`）。 -->
+{#snippet fileBubbleBody(item: ChatItem & { kind: 'file' }, status: string)}
+  <span class="cf-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d={icPath(item)} /></svg></span>
+  <span class="cf-main">
+    <span class="cf-name">{item.name}</span>
+    <span class="cf-size">{item.size}</span>
+    {#if status}<span class="cf-status">{status}</span>{/if}
+    {#if item.sending}<span class="cf-bar"><i style="width:{item.pct}%"></i></span>{/if}
+  </span>
+{/snippet}
+
 <!-- 群邀请卡：**只画在会话侧**（列表头顶 + 会话详情顶部），不进右下角那组通知气泡 ——
-     那组东西是"没有落点、有期限"的（推送/配对邀请 60s 自动作废），而这张卡没有期限、处理完
-     的落点就是它将要成为的那条会话。两处都渲染同一份（snippet），一处滚走另一处还在。 -->
+     那组东西是"没有落点、有期限"的（配对邀请 60s 自动作废；推送邀请在对方点头前
+     一直留着），而这张卡没有期限、处理完的落点就是它将要成为的那条会话。两处都渲染同一份
+     （snippet），一处滚走另一处还在。 -->
 {#snippet inviteStrip(inhead: boolean)}
   <div class="invite-strip" class:inhead={inhead} aria-label="群聊邀请">
     {#each chat.pendingGroups() as pg (pg.id)}
@@ -359,7 +508,7 @@
             </span>
             <span class="convo-main">
               <span class="convo-top">
-                <span class="convo-name">{row.label}</span>
+                <span class="convo-name" title={row.label}>{row.label}</span>
                 {#if row.mode === 'broadcast'}
                   <span class="convo-mode-chip bc">{@render icBc()}群发</span>
                 {:else if row.mode === 'group'}
@@ -384,15 +533,37 @@
           <button class="conv-back" type="button" aria-label="返回会话列表" onclick={() => chat.backToList()}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 6-6 6 6 6" /></svg>
           </button>
-          <span class="conv-title">{thread.title}</span>
-          <!-- 标题旁**只有一枚状态点**（`docs/orb-functional-design.md` §12.2「状态栏」：header
-               除设备名外就带该设备的状态点）。未绑定的设备照样能收发（消息走"长连接优先 +
-               HTTP 兜底"），但它不需要再挂一枚「未绑定」章 —— 那会在标题旁并排摆出两颗点
-               （一枚裸的、一枚在胶囊里），看着就像画重了。 -->
-          <span class="conv-status {directPeer ? deviceDotState(openDev) : threadDotState(thread.participants)}"></span>
-          {#if thread.participants.length > 1}
-            <span class="conv-count num">{thread.participants.length} 台</span>
-          {/if}
+          <!-- 返回箭头**右边**：别的会话还等着几条（数与减掉当前这条的算法见 `chat.unreadElsewhere`）。
+               不把返回键本身改成这颗数：让唯一那颗"退回去"要悬停才变得回来，是把主操作藏进指针里
+               （键盘 Tab 到的还是同一个位置，屏幕上却写着 3）；点它是回列表，与返回键同一个落点。
+
+               外面那层 `.conv-navslot` **一直在**（哪怕没有数）：数从无到有的时候不许把会话名顶走。
+               槽宽按**最大值**（`99+` 那颗胶囊）钉死，1 位数与 3 位数都不动标题。 -->
+          <span class="conv-navslot">
+            {#if elsewhere}
+              <button
+                class="conv-elsewhere"
+                type="button"
+                title="还有 {elsewhere} 条来自其他会话的消息"
+                aria-label="还有 {elsewhere} 条来自其他会话的消息，回会话列表"
+                onclick={() => chat.backToList()}
+              >{elsewhere > 99 ? '99+' : elsewhere}</button>
+            {/if}
+          </span>
+          <!-- 名字 + 状态点 + 台数这一组**居中**（`.conv-headline`）：槽留出来的那格空位因此看不出
+               来 —— 名字在中间，左边那段空白就只是"返回键旁边的空白"，而不是"名字前面多出来的一截"。
+               分组里那颗点与台数跟着名字走（原型那三样本来就是一组）。 -->
+          <div class="conv-headline">
+            <span class="conv-title" title={thread.title}>{thread.title}</span>
+            <!-- 标题旁**只有一枚状态点**（`docs/orb-functional-design.md` §12.2「状态栏」：header
+                 除设备名外就带该设备的状态点）。未绑定的设备照样能收发（消息走"长连接优先 +
+                 HTTP 兜底"），但它不需要再挂一枚「未绑定」章 —— 那会在标题旁并排摆出两颗点
+                 （一枚裸的、一枚在胶囊里），看着就像画重了。 -->
+            <span class="conv-status {directPeer ? deviceDotState(openDev) : threadDotState(thread.participants)}"></span>
+            {#if thread.participants.length > 1}
+              <span class="conv-count num">{thread.participants.length} 台</span>
+            {/if}
+          </div>
           <div class="conv-acts">
             <button class="icon-btn" type="button" aria-label="会话操作" onclick={convoMenu}>
               <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="19" cy="12" r="1.6" /></svg>
@@ -441,10 +612,24 @@
           {#each thread.participants as peerId (peerId)}
             {@const dev = devices.find((d) => d.id === peerId)}
             <!-- 群成员不一定还在本机设备表里（被解除了配对、或只是没再加回来）：那时用名册上
-                 随群带来的名字，别把一串设备 id 摆给用户看。 -->
+                 随群带来的名字，别把一串设备 id 摆给用户看。一对一那台的设备行也可能已经不在
+                 表里了（解绑又离线、会话还留着）：名字退回记录里那个（`deviceNameOf`）。 -->
             {@const rosterName = thread.mode === 'group' ? chat.groupOf(thread.id)?.members.find((m) => m.id === peerId)?.name.trim() : ''}
-            {@const label = dev?.name ?? rosterName ?? peerId}
-            <span class="recip-chip">
+            <!-- 这一栏用的是**短名**（F-101）：有备注就只写备注，**不挂设备名** —— 一排胶囊
+                 （群发/群聊常常好几台）里装不下「备注(设备名)」，用户起备注本来就是为了少看那
+                 串机器名。头像字跟着同一个 label 走；名字长了悬停看全（`title`）。
+                 本机只有**局域网设备列表**那一行是「备注(设备名)」（`deviceDisplayName`）。 -->
+            {@const label = dev ? deviceShortName(dev) : rosterName || chat.deviceNameOf(peerId)}
+            <!-- 明确拒绝加入这个群的那几台：整枚胶囊染红 + 悬停说明**为什么** —— 它们看着一切
+                 正常（链路是通的、点名也在名册里），不说出来用户根本不知道这条消息它收不到。
+                 旁边那颗状态点照旧画**链路**（绿 = 长连接…）：那是"拨得动它吗"，与"它收不收
+                 本群的消息"是两件事（红的点在这个配色里已经被「要重新配对」占用）。 -->
+            {@const refused = declinedIds.includes(peerId)}
+            <span
+              class="recip-chip"
+              class:refused
+              title={refused ? `${label} · 已拒绝加入这个群，收不到群消息` : label}
+            >
               <span class="rc-av">{(label.trim().charAt(0) || '?').toUpperCase()}</span>
               <span class="rc-name">{label}</span>
               <span class="rc-st {deviceDotState(dev)}"></span>
@@ -525,17 +710,26 @@
                 </div>
               {/if}
               {#if item.kind === 'text'}
-                <div class="chat-bubble"><span class="chat-text">{item.text}</span></div>
+                {#if item.image}
+                  <!-- **图片消息**：图片是消息内容，不是文件 —— 对端直接就能看（没有"接收 /
+                       同意"那一步），气泡里就是那张图，点开看大图。内容不在盘上（老版本留下的
+                       记录、或文件被人删了）就退回一行名字，那一行点得动（用系统程序打开）。 -->
+                  <div class="chat-bubble chat-bubble-file">
+                    {#if item.path}
+                      <ImagePreview path={item.path} label={item.name ?? '图片'} onopen={() => (viewing = item)}>
+                        <span class="cf-main"><span class="cf-name">{item.name ?? '图片'}</span></span>
+                      </ImagePreview>
+                    {:else}
+                      <span class="cf-main"><span class="cf-name">{item.name ?? '图片'}（读不出来）</span></span>
+                    {/if}
+                  </div>
+                {:else}
+                  <div class="chat-bubble"><span class="chat-text">{item.text}</span></div>
+                {/if}
               {:else if !item.fromMe && item.inviteState === 'pending'}
                 <!-- 对端推过来的那条：接收 / 拒绝（原型 `invite-card`） -->
                 <div class="invite-card">
-                  <div class="ic-row">
-                    <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d={icPath(item)} /></svg></span>
-                    <span class="ic-main">
-                      <span class="ic-name">{item.name}</span>
-                      <span class="ic-size">{item.size}</span>
-                    </span>
-                  </div>
+                  <div class="ic-row">{@render fileRow(item)}</div>
                   <div class="ic-sub">来自 {chat.deviceNameOf(item.peerId)} · {askEachTime ? '接收时选保存位置' : '接收后保存到下载目录'}</div>
                   <div class="ic-acts">
                     <button class="btn btn-secondary btn-sm" type="button" onclick={() => onRejectInvite(item.inviteId)}>拒绝</button>
@@ -543,17 +737,44 @@
                   </div>
                 </div>
               {:else if !item.fromMe}
-                <!-- 收下的那条：进度 / 结果（原型里这一档走 `.cf-*` 那套零件） -->
+                <!-- 收下的那条：进度 / 结果（原型里这一档走 `.cf-*` 那套零件）。
+                     收完之后（`item.path` 有值了）那一行变成一颗按钮：点它用系统默认程序打开落盘
+                     的那一份 —— 与文件标签页里双击一格同一个落点。还没收完就没有路径，那行照旧
+                     是死的。 -->
                 <div class="invite-card">
-                  <div class="ic-row">
-                    <span class="f-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d={icPath(item)} /></svg></span>
-                    <span class="ic-main">
-                      <span class="ic-name">{item.name}</span>
-                      <span class="ic-size">{item.size}</span>
-                    </span>
-                  </div>
+                  {#if item.path && isImageMsg(item)}
+                    <!-- 收到的是一张图：气泡里摊开看它一眼（点开是大图）。读不出来就退回文件行。 -->
+                    <ImagePreview path={item.path} label={item.name} onopen={() => (viewing = item)}>
+                      <div class="ic-row">{@render fileRow(item)}</div>
+                    </ImagePreview>
+                  {:else if item.path}
+                    <button
+                      class="ic-row ic-open"
+                      type="button"
+                      title="打开「{item.name}」"
+                      onclick={() => onOpenFile(item)}
+                    >{@render fileRow(item)}</button>
+                  {:else}
+                    <div class="ic-row">{@render fileRow(item)}</div>
+                  {/if}
                   <div class="ic-done">
                     <span>{chat.fileStatusText(item)}</span>
+                    {#if item.inviteState === 'accepted'}
+                      <!-- 正在接收：一颗停止（图标就够 —— 这一行本来就窄，写"停止"会把状态顶走）。
+                           点了就撤掉这条接收，且**不再自动接着收**（见后端 `cancel_receive`）。 -->
+                      <button
+                        class="ic-stop"
+                        type="button"
+                        title="停止接收「{item.name}」"
+                        aria-label="停止接收「{item.name}」"
+                        onclick={() => onStopReceive(item.inviteId)}
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                          <circle cx="12" cy="12" r="9" />
+                          <path d="M9 9h6v6H9z" />
+                        </svg>
+                      </button>
+                    {/if}
                   </div>
                   {#if item.inviteState === 'accepted'}
                     <span class="cf-bar"><i style="width:{item.bytes > 0 ? Math.min(100, Math.round((item.received / item.bytes) * 100)) : 0}%"></i></span>
@@ -561,16 +782,32 @@
                 </div>
               {:else}
                 <!-- 自己发出去的文件：传输状态行（一对一 = 这台自己的状态；群发 = 整批的进度，
-                     逐台状态另有一排回执。进度来自右下角那张推送卡）。 -->
+                     逐台状态另有一排回执。进度来自右下角那张推送卡）。
+                     整块是一颗按钮：源文件就在这台机器上，点它直接开那一份（零拷贝）；
+                     路径是选文件那一刻记下的，所以传着的时候也点得开。 -->
                 {@const fState = chat.fileStatusText(item, directPeer)}
                 <div class="chat-bubble chat-bubble-file">
-                  <span class="cf-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d={icPath(item)} /></svg></span>
-                  <span class="cf-main">
-                    <span class="cf-name">{item.name}</span>
-                    <span class="cf-size">{item.size}</span>
-                    {#if fState}<span class="cf-status">{fState}</span>{/if}
-                    {#if item.sending}<span class="cf-bar"><i style="width:{item.pct}%"></i></span>{/if}
-                  </span>
+                  {#if item.path && isImageMsg(item)}
+                    <!-- 自己发出去的一张图：同样在气泡里摊开（点开是大图）。源文件就在这台机器上，
+                         读不出来时退回"点一下用系统程序打开"那颗按钮。 -->
+                    <ImagePreview path={item.path} label={item.name} onopen={() => (viewing = item)}>
+                      <button
+                        class="cf-open"
+                        type="button"
+                        title="打开本机的「{item.name}」"
+                        onclick={() => onOpenFile(item)}
+                      >{@render fileBubbleBody(item, fState)}</button>
+                    </ImagePreview>
+                  {:else if item.path}
+                    <button
+                      class="cf-open"
+                      type="button"
+                      title="打开本机的「{item.name}」"
+                      onclick={() => onOpenFile(item)}
+                    >{@render fileBubbleBody(item, fState)}</button>
+                  {:else}
+                    {@render fileBubbleBody(item, fState)}
+                  {/if}
                 </div>
               {/if}
               <div class="chat-meta">{metaOf(item)}</div>
@@ -609,30 +846,39 @@
         class:bc={thread.mode === 'broadcast'}
         onsubmit={(e) => {
           e.preventDefault();
-          send();
+          void send();
         }}
       >
-        <input
-          class="chat-input"
+        <!-- 富输入区（`contenteditable`）：文字与图片**在同一行流里**，图可以夹在前后两段文字
+             中间（需求要的就是这个顺序）。交给 Svelte 管的只有"哪个会话 / 哪个节点"，
+             里面的内容由 `lib/composer.ts` 直接读写 DOM —— 受控的话每敲一个字光标都会被拽回最前。
+             图片那一份（`.cx-img`）由那段代码用 `document.createElement` 造，样式在 `main.css`。 -->
+        <div
+          class="chat-input cx"
           bind:this={inputEl}
-          type="text"
-          placeholder={thread.mode === 'broadcast'
+          contenteditable="true"
+          role="textbox"
+          tabindex="0"
+          aria-multiline="true"
+          spellcheck="false"
+          data-empty="1"
+          data-placeholder={thread.mode === 'broadcast'
             ? `群发给 ${thread.participants.length} 台设备…`
             : thread.mode === 'group'
               ? '在群里说一句…'
               : '输入消息…'}
-          autocomplete="off"
           aria-label={thread.mode === 'broadcast' ? '输入要群发的消息' : thread.mode === 'group' ? '输入群消息' : '发送消息'}
-          title={thread.mode === 'group' ? '群里说的话，名册上的成员都会看到' : ''}
-          value={draft}
-          oninput={(e) => chat.setDraftOf(thread.key, e.currentTarget.value)}
+          title={thread.mode === 'group' ? '群里说的话，名册上的成员都会看到；图片也可以直接粘进来' : '图片可以直接粘进来（Ctrl+V），前后还能继续写文字'}
+          oninput={() => void onInput()}
+          onpaste={onPaste}
           onkeydown={(e) => {
+            // Shift+回车留给换行（这一版输入区支持多行），回车是发送。
             if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
               e.preventDefault();
-              send();
+              void send();
             }
           }}
-        />
+        ></div>
         <button
           class="chat-plus"
           class:bc={thread.mode === 'broadcast'}
@@ -649,7 +895,7 @@
           type="submit"
           aria-label={thread.mode === 'broadcast' ? '群发消息' : '发送消息'}
           title={thread.mode === 'group' ? '发送到群里' : ''}
-          disabled={draft.trim() === ''}
+          disabled={!canSend}
         >
           {#if thread.mode === 'broadcast'}
             {@render icBc()}
@@ -667,6 +913,19 @@
        且已经进了某条会话时才为真，见 `App.dropInConvo`）。 -->
   {#if dropHot}
     <div class="drop-hint"><b>松手即发送到这条会话</b></div>
+  {/if}
+
+  <!-- 「看大图」：会话里点一张图的缩略图就在这一层上摊开它（`viewing` 跟着会话走 ——
+       换会话时上面那个 effect 会把它清掉，一张已经不属于这条会话的图不该还挂在屏幕上）。 -->
+  {#if viewing && viewing.path !== undefined && viewing.path !== ''}
+    <ImageViewer
+      path={viewing.path}
+      name={msgName(viewing)}
+      onclose={() => (viewing = null)}
+      onopenfile={() => {
+        if (viewing) onOpenFile(viewing);
+      }}
+    />
   {/if}
 </section>
 

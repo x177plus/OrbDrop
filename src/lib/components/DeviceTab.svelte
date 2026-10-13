@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { PeerDevice } from '$lib/types';
-  import { getDevices, loadDevices, deviceState, needsRepair, deviceDisplayName, unicastBlockedTip, transitHint } from '$lib/stores/devices.svelte';
+  import { getDevices, loadDevices, deviceState, needsRepair, deviceDisplayName, deviceShortName, unicastBlockedTip, transitHint } from '$lib/stores/devices.svelte';
   import { connectPeer, disconnectPeer } from '$lib/api';
   import * as chat from '$lib/stores/chat.svelte';
   import Hint from '$lib/components/Hint.svelte';
@@ -11,12 +11,15 @@
     onMessage,
     onOpenPair,
     onUnpair,
+    noticeCount,
   }: {
     onToast: (msg: string) => void;
     /** 行上那颗「发消息」：打开与这台设备的会话。 */
     onMessage?: (device: PeerDevice) => void;
     onOpenPair?: (device: PeerDevice | null) => void;
     onUnpair?: (device: PeerDevice) => void;
+    /** 这台设备此刻还挂着几件待处理的通知（F-112）：由 `App` 从右下角那组气泡里数出来。 */
+    noticeCount?: (peerId: string) => number;
   } = $props();
 
   onMount(() => {
@@ -50,6 +53,17 @@
 
   function deviceInitial(name: string): string {
     return name.charAt(0).toUpperCase();
+  }
+
+  /**
+   * 头像上那颗角标的悬停 / 读屏文案（数字是两件事加起来的，只说一个数说不清是哪一类：
+   * 与底栏「会话」那颗角标同一条规矩）。两半都为空时不会走到这里（角标那时根本不画）。
+   */
+  function pendingLabel(unread: number, notice: number): string {
+    return [
+      unread ? `${unread} 条未读消息` : '',
+      notice ? `${notice} 条待处理通知` : '',
+    ].filter(Boolean).join(' · ');
   }
 
   let listEl = $state<HTMLUListElement | undefined>();
@@ -118,6 +132,7 @@
           case 'tokenRejected': return withTransit('对端不认本机的凭据（它清过数据或已解除配对）：需要重新配对');
           case 'identityChanged': return withTransit('对端证书与本机记住的不一致（对方重装过 / 换过机器？）：需要重新配对才连得上');
           case 'localDisconnected': return withTransit('本机点过「断开」：重启后也不会自动连，点「连接」即可恢复');
+          case 'peerRejected': return withTransit('对方拒绝了本机的连接请求：想再试一次就再点一次「连接」（那会重新发一次请求）');
         }
     }
     return withTransit('');
@@ -127,13 +142,20 @@
   async function setLink(d: PeerDevice, connect: boolean) {
     try {
       if (connect) {
-        await connectPeer(d.id);
-        // 这一台此刻"看得见却直连不通"时，那句解释在这里说 —— 它是"这一次为什么连不上"，
-        // 不该做成设备行上的一个常驻状态（见 `unicastBlocked`）。
-        onToast(unicastBlockedTip(d) ?? `正在与「${deviceDisplayName(d)}」建立长连接`);
+        // 「连接」= 先向对端发一条**请求**（F-16 的同意制）：对方在它自己的通知里点
+        // 「接受」才建链。等待那张卡片由 `link://request_sent` 事件挂上（App 那边），
+        // 这里只说清"球踢给对方了"。
+        const outcome = await connectPeer(d.id);
+        if (outcome.kind === 'asked') {
+          onToast(`已把连接请求发给「${deviceShortName(d)}」：等它在自己的通知里点「接受」`);
+        } else {
+          // 这一台此刻"看得见却直连不通"时，那句解释在这里说 —— 它是"这一次为什么连不上"，
+          // 不该做成设备行上的一个常驻状态（见 `unicastBlocked`）。
+          onToast(unicastBlockedTip(d) ?? `正在与「${deviceShortName(d)}」建立长连接`);
+        }
       } else {
         await disconnectPeer(d.id);
-        onToast(`已与「${deviceDisplayName(d)}」断开长连接（临时暂停，不是解除配对）：本机不再自动接回，对方点「连接」可立刻恢复`);
+        onToast(`已与「${deviceShortName(d)}」断开长连接（临时暂停，不是解除配对）：本机不再自动接回，对方点「连接」可立刻恢复`);
       }
     } catch (e) {
       onToast(`${connect ? '建立长连接' : '断开'}失败：${e}`);
@@ -230,7 +252,8 @@
       「＋」，按名册逐台推过去。
       <span class="hl">搜索框</span>只在这里筛显示（显示名或 IP），不影响长连接与消息。
       <span class="hl">右键设备行</span>可以「修改备注」：备注只存在本机（对端看不到），
-      设好之后这台设备在本机到处都显示成「备注(设备名)」。
+      设好之后<b>这一行</b>显示成「备注(设备名)」—— 其余地方（会话、标签栏、收件人选择框…）
+      只写备注本身；名字太长时悬停能看到完整的。
     </p>
   </Hint></span>
   {#if devices.length > 0}
@@ -274,6 +297,12 @@
     {#each filtered as d (d.id)}
       <!-- 状态点与状态章同一处判据（`stores/devices` 的 `deviceState`）：颜色=能不能送到、形状=有没有长连接。 -->
       {@const st = deviceState(d)}
+      <!-- 这台设备"还有几件等你处理"（F-112）：未读消息（会话 store 算好的）＋ 它那边挂着的
+           通知（右下角那组气泡里属于它的几条）。两处都有角标了，头像上再来一颗 —— 设备列表
+           一眼扫过去就知道该点哪一台，不必先想"它是不是跟我说过话"。 -->
+      {@const unread = chat.unreadForPeer(d.id)}
+      {@const notice = noticeCount?.(d.id) ?? 0}
+      {@const pending = unread + notice}
       <li
         class="device-row"
         class:online={d.online}
@@ -282,10 +311,23 @@
         data-ip={`${d.ip}:${d.port}`}
         oncontextmenu={(e) => openCtx(e, d)}
       >
-        <span class="d-avatar">{deviceInitial(deviceDisplayName(d))}</span>
+        <span class="d-avatar">
+          {deviceInitial(deviceDisplayName(d))}
+          {#if pending > 0}
+            <!-- 一颗数字角标（不是一颗点）：设备多起来时"哪台最要紧"要靠数字读，点在扫视时
+                 都一样大。文案把两半分开报（见 `pendingLabel`）。 -->
+            <span
+              class="d-av-badge num"
+              role="img"
+              aria-label="等你处理 {pending} 件：{pendingLabel(unread, notice)}"
+              title={pendingLabel(unread, notice)}
+            >{pending}</span>
+          {/if}
+        </span>
         <div class="d-main">
           <div class="d-name">
-            <span class="d-name-txt">{deviceDisplayName(d)}</span>
+            <!-- 名字长了这一行只淡不截断（右端渐隐）：悬停给全名（这一栏的全名就是「备注(设备名)」）。 -->
+            <span class="d-name-txt" title={deviceDisplayName(d)}>{deviceDisplayName(d)}</span>
             <span class="state-chip {st.chip}" title={linkHint(d)}>
               <span class="dot {st.dot}"></span>{st.label}
             </span>

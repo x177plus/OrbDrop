@@ -17,8 +17,12 @@ export default defineConfig(({ mode }) => ({
   // 另一个分支连同它的动态 import 会被摇掉。
   build: {
     outDir: mode === "mobile" ? "dist-mobile" : "dist",
-    // JS 语法也钉到下限：默认目标是 Chrome 107+，不改的话新语法会被原样留在产物里。
-    target: mode === "mobile" ? "chrome90" : undefined,
+    // JS 语法也钉到下限：默认目标是 Chrome 107+，不改的话新语法（Svelte 5 运行时里的 `??=`）会被
+    // 原样留在产物里，而低于 Chrome 85 的引擎**解析期就 SyntaxError** → 整块脚本作废 → 纯白屏
+    // （实测：三星 SM-G8750 + 系统 WebView 81，见 `docs/p1-implementation.md` §35）。
+    // 81 是移动端的实际下限：降完语法之后，剩下门槛由 `static/engine-floor.js` 兜（replaceAll 打补丁、
+    // 缺 flex gap/inset 才按需加载 `legacy-gap.css`/`legacy-misc.css`）—— 现代引擎一个字节都不多花。
+    target: mode === "mobile" ? "chrome81" : undefined,
     // CSS 不压缩：压缩器（lightningcss 或 esbuild）会去重同属性的重复声明，而回退正是靠它们承载的。
     // 样式表要随包走、由本地读，几十 KB 的体积无关紧要；换来的是回退声明 1:1 原样出货。
     cssMinify: mode === "mobile" ? false : undefined,

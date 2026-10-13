@@ -3,6 +3,8 @@ pub mod autostart;
 // bc 不能门控：pair.rs / server::proxy / routes_pair.rs 这些共享协议路径也用它的
 // DAV_USER 常量与 profile 预写（后者在非 Win/mac 上因 locate_exe 返回 None 而自然空转）。
 pub mod bc;
+/// 会话里图片消息的**内容**（`<数据目录>/chat-blobs/`）：消息本体只留元数据，字节单独一份文件。
+pub mod blobs;
 pub mod chat;
 pub mod config;
 pub mod credential;
@@ -13,9 +15,10 @@ pub mod fs_browse;
 pub mod group;
 #[cfg(desktop)]
 pub mod hit_region;
+pub mod link;
 pub mod log;
 pub mod mirror;
-// 移动端专属命令（收件目录列举/删除、设备重命名）：只在 Android 构建里登记。
+// 移动端专属命令（收件目录列举/删除）：只在 Android 构建里登记。
 #[cfg(mobile)]
 pub mod mobile;
 pub mod net;
@@ -25,6 +28,8 @@ pub mod notify;
 #[cfg(desktop)]
 pub mod orb_window;
 pub mod pair;
+/// 粘贴进来的图片：字节 → 暂存文件（会话里"发图片"走推送那条路，只认本机真实路径）。
+pub mod paste;
 pub mod peer_fs;
 pub mod relay;
 pub mod server;
@@ -41,6 +46,8 @@ pub mod unsendable;
 pub mod update;
 pub mod ws;
 
+#[cfg(test)]
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -149,6 +156,11 @@ pub struct UpdateSettingsRequest {
     pub download_mode: DownloadMode,
     pub device_name: String,
     pub auto_start: bool,
+    /// 推送接收是否再放一层 `<发送方名>/`（设置里的「推送按发送方分目录」，默认开，S-12）。
+    /// 缺省用配置的缺省（**开**）而不是 `bool::default()`（关）：老界面不带这个字段时，
+    /// 不该把用户的落盘形状悄悄改掉。
+    #[serde(default = "config::default_device_subdir")]
+    pub device_subdir: bool,
     /// BeyondCompare 可执行文件路径；空串 = 自动探测。
     #[serde(default)]
     pub bc_exe_path: String,
@@ -366,6 +378,7 @@ async fn update_settings(
         config.port = req.port;
         config.download_dir = PathBuf::from(&req.download_dir);
         config.download_mode = req.download_mode;
+        config.device_subdir = req.device_subdir;
         config.device_name = req.device_name.clone();
         config.auto_start = req.auto_start;
         config.bc_exe_path = Some(PathBuf::from(req.bc_exe_path.trim()))
@@ -719,29 +732,38 @@ pub fn apply_offline(arc: &Arc<AppState>) {
 ///
 /// 注册的记录里带着端口与设备名，所以每次都是"丢掉旧 daemon、按新参数再注册一个"。
 fn register_mdns(state: &Arc<AppState>, port: u16) {
-    *state.mdns_daemon.lock() = None;
+    // 旧的那一份**先撤下来**：改名/换端口都是"替换"，不是"再加一条"。而且必须
+    // 注销 + 关掉 daemon（`discover::release`），只丢句柄的话旧记录会一直挂在网上 ——
+    // 对端每次解析到它，就把旧名字写回设备行一次。
+    release_mdns(state);
     let (device_name, device_id, allow_relay) = {
         let cfg = state.config.lock();
         (cfg.device_name.clone(), cfg.device_id.clone(), cfg.allow_relay)
     };
-    if let Some(daemon) = discover::register(port, &device_name, &device_id, allow_relay) {
-        *state.mdns_daemon.lock() = Some(daemon);
-    }
+    // 注册失败时保持"没有注册"（`None`）：留着一个空的注册等于以为自己在网上。
+    *state.mdns_reg.lock() = discover::register(port, &device_name, &device_id, allow_relay);
+}
+
+/// 撤下当前 mDNS 注册（换注册、切「离线」共用）。
+///
+/// 注销必须按**注册那一刻的全名**点名（存在 `mdns_reg` 里）：按当前配置拼出来的全名在
+/// 改过名之后已经不是线上那一条了。注销会立刻发一条 TTL=0 的告别包，而不是等对端缓存
+/// 自然过期（TXT 的 TTL 有 75 分钟）。
+fn release_mdns(state: &Arc<AppState>) {
+    let Some(reg) = state.mdns_reg.lock().take() else {
+        return;
+    };
+    info!(fullname = %reg.fullname, "mDNS service released");
+    discover::release(reg);
 }
 
 /// 注销 mDNS 广播（离线 = 隐身）。
 ///
-/// 必须按**服务全名**精确注销：只把 daemon 丢掉，对端缓存里那条记录要等 TTL（约 2 分钟）
-/// 自然过期才消失 —— 那两分钟里它照旧看得见本机。`unregister` 会立刻发一条 TTL=0 的告别包。
+/// 与"换注册"共用 `release_mdns`：注销要点名到注册那一刻的全名，并且**关掉** daemon
+/// （`ServiceDaemon` 没有 `Drop`，只丢句柄等于没注销 —— 对端缓存里那条记录要等到 TTL
+/// 过期才消失，而且旧记录会一直答 query）。
 fn unregister_mdns(state: &Arc<AppState>) {
-    let Some(daemon) = state.mdns_daemon.lock().take() else {
-        return;
-    };
-    let fullname = discover::service_fullname(&state.config.lock().device_name);
-    match daemon.unregister(&fullname) {
-        Ok(_) => info!(%fullname, "mDNS service unregistered (offline)"),
-        Err(e) => warn!("mDNS unregister failed: {e}"),
-    }
+    release_mdns(state);
 }
 
 /// 切本机「在线 / 离线」（面板右上角状态框、托盘右键菜单两个入口共用这一份实现）。
@@ -794,27 +816,83 @@ fn get_peer_token(peer_id: String) -> Result<Option<String>, String> {
     credential::get_peer_token(&peer_id).map_err(|e| e.to_string())
 }
 
-/// Arm the long connection by hand（F-16）: 拨号只由用户点「连接」（或启动时的恢复）
-/// 发起，点它就无视"必须已配对"以外的任何规则直接拨号，并结束本机之前的「断开」暂停。
+/// 用户点「连接」（F-16）：**先问对端一句**（同意制，见 `crate::link`），得到同意才拨号。
 ///
-/// 与启动恢复的区别在 `manual=1`：这里是**有人按了按钮**，对端收到后连它自己的暂停
-/// 一起结束；启动恢复（`ws::restore_links_on_startup`）不带这个标记，对端点过「断开」
-/// 时照旧被拒。
+/// 返回 `ConnectOutcome`（前端按它决定要不要挂"等待对方同意"的卡片）：
+/// - `asked`：请求已挂在对方通知里等它点头，本机不等在这儿 —— 结果走
+///   `link://request_result` 事件回来（那边同意后本机自己拨号）。
+/// - `dialing`：**已经没有可问的人**（对端不在网上 / 是老版本）或链路本来就在：直接拨号，
+///   与旧行为一致。
 ///
-/// **保持 async**：拨号任务要在运行时上跑。异步命令天然满足；写成同步的话就得靠
-/// `task::spawn` 退到 Tauri 的全局运行时（能跑，但多绕一层）。
+/// 无论哪一条，本机「断开」的暂停都当场结束：按钮已经按了，这一台不该再拿"本机暂停"
+/// 挡着自己（`link::request` 在同意后会写 `Wanted`；`dialing` 这一支在这里写）。
+///
+/// **保持 async**：请求与拨号任务都要在运行时上跑。
 #[tauri::command]
-async fn connect_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+async fn connect_peer(
+    peer_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ConnectOutcome, String> {
     ensure_online(&state)?;
-    if state.get_peer(&peer_id).is_none() {
+    let Some(peer) = state.get_peer(&peer_id) else {
         return Err("设备不存在".to_string());
+    };
+    // 长连接只与**已配对**的设备建立（`dial_now` 里同一道关）：未绑定的设备得先配对。
+    if !peer.paired {
+        return Err(format!("还没有与「{}」配对", peer.name));
     }
+    if state.ws.has_connection(&peer_id) {
+        return Ok(ConnectOutcome::Dialing);
+    }
+    // 本机的暂停先结束（内存 + 地址簿），再问对端。
     state.ws.resume(&peer_id);
-    // 暂停在**地址簿**里也要清：只清内存那份的话，重启后本机又会拒绝这条链
-    // （用户明明点过「连接」）。`Wanted` 同时把"要这条链"记下 —— 拨号失败/强杀也不丢。
-    state.set_link_intent(&peer_id, LinkIntent::Wanted);
-    ws::ensure_link_now(state.inner(), &peer_id);
-    Ok(())
+
+    // 对端不在网上（探活就判"离线"）、或**手上没有任何能拨的地址**（直连地址与借来的中转
+    // 端点都没有）→ 没人能点头：退回直接拨号，让拨号循环去等它上线。
+    if !peer.online || !peer.dialable() {
+        state.set_link_intent(&peer_id, LinkIntent::Wanted);
+        ws::ensure_link_now(state.inner(), &peer_id);
+        return Ok(ConnectOutcome::Dialing);
+    }
+
+    link::request(state.inner(), &peer_id)?;
+    Ok(ConnectOutcome::Asked)
+}
+
+/// 「连接」这件动作的两种开局（前端只认这两种：挂卡片 / 直接等链路）。
+///
+/// 卡片由 `link://request_sent` / `link://request_result` 两条事件驱动（与配对邀请同一套），
+/// 所以这里不带 requestId —— 界面不该同时从两个地方拼同一件事。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+enum ConnectOutcome {
+    /// 请求已经发出去、挂在对方通知里等它点头（结果走 `link://request_result`）。
+    Asked,
+    /// 本机正在拨号（对端不在网上 / 老版本 / 链路本来就在）：与旧行为一致。
+    Dialing,
+}
+
+/// 接收方：用户点了「接受」——放行对方的这一次拨号（并结束本机对它的「断开」暂停）。
+#[tauri::command]
+fn accept_link_request(
+    request_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
+    let peer = link::accept(state.inner(), &request_id)?;
+    info!(peer = %peer, "link request accepted, waiting for the peer to dial");
+    Ok(peer)
+}
+
+/// 接收方：用户点了「拒绝」——给发起方一个明确的"不"。
+#[tauri::command]
+fn reject_link_request(request_id: String, state: State<'_, Arc<AppState>>) {
+    link::reject(state.inner(), &request_id);
+}
+
+/// 发起方：用户点了「取消」——不再等这一次结果，并（尽力）把对方那条通知撤掉。
+#[tauri::command]
+fn cancel_link_request(request_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    link::cancel(state.inner(), &request_id)
 }
 
 /// Drop the long connection and keep it down (auto-connect stays off) until the
@@ -839,21 +917,102 @@ fn disconnect_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(
 // Device management commands (F-11, F-14, F-71)
 // ---------------------------------------------------------------------------
 
+/// 手动添加设备（F-11）时，留空端口要探的端口个数：与 S-06 的端口段一致
+/// （`3890` 起 10 个 —— 对端启动时默认端口被占会顺延到 `+1..+9`，只探 3890 会在那种
+/// 机器上"添加不上"）。
+const MANUAL_PORT_SCAN: u16 = 10;
+
 /// Add a device manually by IP:port. Probes /pair/info to get identity.
+///
+/// `port == 0` = 用户没填端口：从默认端口起探 `MANUAL_PORT_SCAN` 个（见 `manual_peer`）。
 #[tauri::command]
 async fn add_peer(ip: String, port: u16, state: State<'_, Arc<AppState>>) -> Result<PeerDevice, String> {
-    let url = format!("{}/pair/info", net::peer_base(&ip, port));
-    let resp = net::client()
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("无法连接 {ip}:{port}: {e}"))?;
-    let info: serde_json::Value = resp.json().await.map_err(|e| format!("响应异常: {e}"))?;
+    let own_id = state.config.lock().device_id.clone();
+    let (port, info) = manual_peer(&ip, port, &own_id).await?;
     let id = info["id"].as_str().unwrap_or("").to_string();
     let name = info["name"].as_str().unwrap_or(&ip).to_string();
     let peer = PeerDevice { id, name, ip, port, online: true, paired: false, ..Default::default() };
     state.add_peer_book(peer.clone());
     Ok(peer)
+}
+
+/// 在 `ip` 上找到那台设备：返回**它答话的端口**与 `/pair/info` 的回话。
+///
+/// - 给了端口（≠ 0）：只问那一个，问不到就报错（错在端口上，说清楚是哪一个）。
+/// - 留空（0）：从 `config::default_port()` 起探 `MANUAL_PORT_SCAN` 个端口段。
+///
+/// 十个端口**并发**探：串行最坏情况是十次连接超时（用户只能看到"点了没反应"），并发后
+/// 一轮就是一次超时的时间。答话的端口里取**最小的那个** —— S-06 是"从默认端口往上找第一个
+/// 空闲的"，所以对端真实监听的端口就是这一段里最小的那个活着的（上面的顺延规则）。
+///
+/// **本机自己那一台要跳过**（`own_id`）：跨网段手动添加时用户完全可能把自己那台的 IP 粘进来
+/// （从 footer 复制 `IP:端口` 那条路就是这么用的），而扫描时本机在默认端口上一定答话 ——
+/// 不跳过就会"添加了自己"，设备列表里多一行自己，后面所有关系判定都跟着乱。
+async fn manual_peer(ip: &str, port: u16, own_id: &str) -> Result<(u16, serde_json::Value), String> {
+    manual_peer_from(ip, port, crate::config::default_port(), own_id).await
+}
+
+/// [`manual_peer`] 的实体：扫描起点单独给（测试要在一个自己的端口段上跑，不然会撞上开发者
+/// 正在跑的那份实例 —— 那台设备也答 `/pair/info`）。
+async fn manual_peer_from(
+    ip: &str,
+    port: u16,
+    base: u16,
+    own_id: &str,
+) -> Result<(u16, serde_json::Value), String> {
+    let ports = manual_scan_ports(port, base);
+    let client = net::client_builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build()
+        .map_err(|e| format!("HTTP 客户端建不起来: {e}"))?;
+    let answers = futures_util::future::join_all(
+        ports.iter().map(|p| probe_pair_info(&client, ip, *p)),
+    )
+    .await;
+    let mut self_only = false;
+    for (p, answer) in ports.iter().zip(answers) {
+        let Some(info) = answer else { continue };
+        if info["id"].as_str() == Some(own_id) {
+            self_only = true;
+            continue;
+        }
+        return Ok((*p, info));
+    }
+    if self_only {
+        return Err(format!("{ip} 上是本机自己：手动添加填的是本机自己的地址"));
+    }
+    Err(match ports.as_slice() {
+        [only] => format!("无法连接 {ip}:{only}（对方没启动 / 端口不对 / 被防火墙挡住）"),
+        _ => format!(
+            "无法连接 {ip}（已试 {}~{} 这 {} 个端口：对方没启动 / 端口不对 / 被防火墙挡住）",
+            ports[0],
+            ports[ports.len() - 1],
+            ports.len()
+        ),
+    })
+}
+
+/// 手动添加要探的端口表：`port != 0` 就是那一个，`0` 就是 `base` 起 `MANUAL_PORT_SCAN` 个
+/// （升序，答话时取最小的那个）。
+fn manual_scan_ports(port: u16, base: u16) -> Vec<u16> {
+    if port != 0 {
+        return vec![port];
+    }
+    (0..MANUAL_PORT_SCAN).map(|i| base.saturating_add(i)).collect()
+}
+
+/// 问一次 `ip:port` 的 `/pair/info`：**HTTP 200 + 合法 JSON** 才算"有人答话"。
+///
+/// 中间那道 `error_for_status` 不能省：一段里开着别的 HTTP 服务时，它可能回 404/500/一坨
+/// 别的东西 —— 那都不算"这里有一台 OrbDrop"。
+async fn probe_pair_info(
+    client: &reqwest::Client,
+    ip: &str,
+    port: u16,
+) -> Option<serde_json::Value> {
+    let url = format!("{}/pair/info", net::peer_base(ip, port));
+    let resp = client.get(&url).send().await.ok()?.error_for_status().ok()?;
+    resp.json::<serde_json::Value>().await.ok()
 }
 
 /// 解除配对（F-14）：**先清本机**（这是本机动作，对端在不在网上都不该挡在这里），
@@ -1105,14 +1264,38 @@ fn reject_pair_invite(invite_id: String, state: State<'_, Arc<AppState>>) {
 /// （界面弹一条提示，不建卡片 —— 与原来单台那条路一模一样）。
 ///
 /// 返回整批快照；界面的卡片由 `push://batch` 事件推进（同一个 `batchId`，按它合并）。
+///
+/// `at` = 这批文件在**会话时间线**上的位置（发送方的墙上时间，epoch 毫秒）。只有"输入框里
+/// 文字与图片交错着一次发出去"那条路会点名给它：一条消息里图片夹在前后两段文字中间，两端
+/// 都要按这个顺序排（见 `stores/chat.svelte.ts` 的 `sendComposer`）。**没人点名时（普通推送）
+/// 由后端当场取现在** —— 与文本消息同一个口径。
 #[tauri::command]
 async fn push_paths(
     paths: Vec<String>,
     peer_ids: Vec<String>,
+    at: Option<u64>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<transfer::push_job::BatchView, String> {
     ensure_online(&state)?;
-    transfer::push_paths(state.inner().clone(), paths, peer_ids).await
+    transfer::push_paths(state.inner().clone(), paths, peer_ids, at).await
+}
+
+/// 把剪贴板里的图片字节落成一个**暂存文件**，返回它的绝对路径（见 `paste`）。
+///
+/// 字节走 **base64 字符串**而不是 `Vec<u8>`：`invoke` 的载荷是 JSON，`Vec<u8>` 得摊成一串
+/// 数字（一张 5 MB 的截图就是 20 MB 的 JSON 文本），base64 只多三分之一且是一个字符串。
+///
+/// 会话里发图片走的是推送，而推送只认本机真实路径 —— 这一步就是那中间的一跳。暂存落在系统
+/// 临时目录（不是自家数据目录：那棵子树会被 `push_paths` 当成本机凭据拒掉）。
+#[tauri::command]
+fn save_pasted_image(data: String, ext: String) -> Result<String, String> {
+    paste::save_base64(&data, &ext)
+}
+
+/// 一张落盘的图片 → `data:` URL：会话里画缩略图、点开看大图都用它。
+#[tauri::command]
+fn read_image_data_url(path: String) -> Result<String, String> {
+    paste::preview_data_url(&path)
 }
 
 /// 发送方取消一整批推送：逐台走 `cancel_push`（两个阶段为什么都要通知对端，见那里）。
@@ -1188,11 +1371,16 @@ pub struct ChatSendView {
 ///
 /// `batch_id` = 从哪个群发里发的（空 = 一次新的群发：按成员集合复用已有名单，没有就新建）。
 /// 落账与逐台投递都在 `chat::send_text`（集成测试与这里共用同一条路）。
+///
+/// `at` = 这条消息在会话时间线上的位置（发送方的墙上时间，epoch 毫秒）。只有"输入框里文字与
+/// 图片交错着一次发出去"那条路会点名给它（见 `stores/chat.svelte.ts` 的 `sendComposer`）：
+/// 那时前后两段文字的先后是被图片隔开的，得由界面统一编号；不点名就当场取现在。
 #[tauri::command]
 fn chat_send(
     peer_ids: Vec<String>,
     text: String,
     batch_id: Option<String>,
+    at: Option<u64>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<ChatSendView, String> {
     ensure_online(&state)?;
@@ -1211,7 +1399,50 @@ fn chat_send(
     if targets.is_empty() {
         return Err("收件人不存在".to_string());
     }
-    let result = chat::send_text(&state, &targets, &text, batch_id.as_deref());
+    let result = chat::send_text(&state, &targets, &text, batch_id.as_deref(), at);
+    group::emit(&state);
+    Ok(ChatSendView {
+        id: result.id,
+        batch_id: result.batch_id,
+        snapshot: group::snapshot(&state),
+    })
+}
+
+/// 发一张**图片消息**给一台或多台设备（输入框里粘一张图就是走这一条）。
+///
+/// 与 `chat_send`（文字）同一个口径：每台各存一份副本、逐台记送达状态、够不着的排队等它上线，
+/// 区别只在内容换成那张图 —— **图片是消息内容，不是推送文件**：对端直接就能看，没有
+/// "接收 / 同意"那一步，也不进"传输中"那本账。
+///
+/// `path` 是本机那份**暂存**图片（粘贴那一刻就落下的，见 `paste`）；这一条命令把字节读进来，
+/// 落成会话内容（`blobs`）再发出去。`name` 是显示名（只用来取扩展名），`size` 由后端按读到的
+/// 字节算。超过上限（`blobs::MAX_IMAGE_BYTES`）当场拒绝，**不改走推送** —— 那会弹出
+/// "对方要不要接收"，正是这个需求要去掉的东西。
+///
+/// `at` 同 `chat_send`：输入区"图文混排"一次发三条时由界面统一编号。
+#[tauri::command]
+fn chat_send_image(
+    peer_ids: Vec<String>,
+    path: String,
+    name: String,
+    at: Option<u64>,
+    batch_id: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ChatSendView, String> {
+    ensure_online(&state)?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("读不到那张图（{path}）：{e}"))?;
+    // 去重 + 只认本机设备表里有的 id（与 `chat_send` 同一套）。
+    let mut targets: Vec<String> = Vec::new();
+    for id in peer_ids {
+        if state.get_peer(&id).is_none() || targets.contains(&id) {
+            continue;
+        }
+        targets.push(id);
+    }
+    if targets.is_empty() {
+        return Err("收件人不存在".to_string());
+    }
+    let result = chat::send_image(&state, &targets, &name, &bytes, at, batch_id.as_deref())?;
     group::emit(&state);
     Ok(ChatSendView {
         id: result.id,
@@ -1272,6 +1503,21 @@ fn chat_clear(peer_id: String, state: State<'_, Arc<AppState>>) -> group::Snapsh
     group::snapshot(&state)
 }
 
+/// 把一台设备的**文件消息记录**整份落盘（`chat::ChatFileMsg`）。
+///
+/// 界面是这些记录的实时作者（进度、邀请状态都在它手上），只在"能定下来的时刻"（刚发出 /
+/// 刚收到 / 接受或拒绝 / 收完或失败 / 整批走完）把该设备那份整列表交回来 —— 所以这条命令
+/// **不推 `chat://changed`**：界面手上已经有这份数据，推一份回去没有任何人要读。
+#[tauri::command]
+fn chat_files_set(
+    peer_id: String,
+    files: Vec<chat::ChatFileMsg>,
+    state: State<'_, Arc<AppState>>,
+) -> group::Snapshot {
+    state.chat.set_files(&peer_id, files);
+    group::snapshot(&state)
+}
+
 // ---------------------------------------------------------------------------
 // 群聊（共享群）
 // ---------------------------------------------------------------------------
@@ -1309,14 +1555,38 @@ fn group_edit(id: String, members: Vec<String>, name: String, state: State<'_, A
 }
 
 /// 在群里发一条文本（每台各一份；够不着的排队等它上线）。
+///
+/// `at` = 点名这条消息在时间线上的位置（输入区"图文混排"的每一段会点名，见 `chat_send`）。
 #[tauri::command]
-fn group_send(id: String, text: String, state: State<'_, Arc<AppState>>) -> Result<GroupRef, String> {
+fn group_send(id: String, text: String, at: Option<u64>, state: State<'_, Arc<AppState>>) -> Result<GroupRef, String> {
     ensure_online(&state)?;
     let text = text.trim().to_string();
     if text.is_empty() {
         return Err("消息为空".to_string());
     }
-    let msg_id = group::send_text(&state, &id, &text).ok_or_else(|| "本机不在这个群里".to_string())?;
+    let msg_id = group::send_text(&state, &id, &text, at).ok_or_else(|| "本机不在这个群里".to_string())?;
+    Ok(GroupRef { id: msg_id, snapshot: group::snapshot(&state) })
+}
+
+/// 在群里发一张**图片消息**（输入框里粘一张图就是走这一条）。
+///
+/// 与 `group_send` 同一个口径（每台各投一份、够不着的排队等它上线），区别只在内容换成那张图：
+/// **图片是消息内容，不是文件** —— 群里的每个成员直接就能看，没有"接收 / 同意"那一步。
+///
+/// `path` 是本机那份**暂存**图片；后端把字节读进来、落成会话内容（`blobs`）再发出去。
+/// 超过上限（`blobs::MAX_IMAGE_BYTES`）当场拒绝，不改走推送。
+#[tauri::command]
+fn group_send_image(
+    id: String,
+    path: String,
+    name: String,
+    at: Option<u64>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<GroupRef, String> {
+    ensure_online(&state)?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("读不到那张图（{path}）：{e}"))?;
+    let msg_id = group::send_image(&state, &id, &name, &bytes, at)?
+        .ok_or_else(|| "本机不在这个群里".to_string())?;
     Ok(GroupRef { id: msg_id, snapshot: group::snapshot(&state) })
 }
 
@@ -1712,6 +1982,17 @@ async fn open_path(path: String) -> Result<(), String> {
     mobile::open_file(path).await
 }
 
+/// 安卓：把输入法剪贴板塞进输入框的那个图片 URI（`content://`）拷成一份暂存文件，
+/// 返回它的路径与字节数。
+///
+/// `content://` 在 WebView 的 JS 里读不出来（它属于 ContentResolver），而会话里发图片走的是
+/// 推送 —— 推送只认本机真实路径。所以这一跳必须回原生，见 `mobile::resolve_image_uri`。
+#[cfg(mobile)]
+#[tauri::command]
+async fn resolve_image_uri(uri: String) -> Result<mobile::PickedImage, String> {
+    mobile::resolve_image_uri(uri).await
+}
+
 // ---------------------------------------------------------------------------
 // 拖拽下载（把树里的任意文件/目录拖到资源管理器里落盘）
 // ---------------------------------------------------------------------------
@@ -2049,6 +2330,10 @@ fn setup_server_task(app: &AppHandle) {
                     chat::requeue_inflight(&arc_state);
                     chat::flush_all_queued(&arc_state);
 
+                    // 上次关机/强杀时**没收完的那几条推送**：对端还持有那条推送的话，
+                    // 自己接着收（块位图与 `.part` 都还在盘上，见 `transfer::resume_pending`）。
+                    transfer::resume_pending(&arc_state);
+
                     // Liveness backstop: mDNS only reports a departure when the peer
                     // sends goodbye or its records expire (up to ~2 min), and a
                     // re-registration under the same instance name may not be
@@ -2070,6 +2355,9 @@ fn setup_server_task(app: &AppHandle) {
                                 continue;
                             }
                             state::probe_peers_once(&probe_state).await;
+                            // 没传完的那些接收任务：这一拍顺手看一眼（退避台阶在
+                            // `resume::attempt_due` 里把关，"够不着"就只是跳过）。
+                            transfer::resume_pending(&probe_state);
                         }
                     });
 
@@ -2245,6 +2533,16 @@ pub fn run() {
     #[cfg(mobile)]
     let builder = builder.plugin(mobile::open_plugin());
 
+    // 「粘贴进来的那张图」：输入法剪贴板往输入框里插的是一个 `content://`，JS 读不出来，
+    // 得请原生那一跳拷成暂存文件（会话里发图片走推送，只认本机路径）—— 见 `mobile::resolve_image_uri`。
+    #[cfg(mobile)]
+    let builder = builder.plugin(mobile::paste_plugin());
+
+    // 引擎太低（WebView 低于下限）时兜底页上那个「去应用商店更新 WebView」按钮：那种状态下前端是死的，
+    // 浮层只能发一次 `market://` 导航，由这个插件的导航钩子接住换成系统 Intent —— 见 `mobile::store_plugin`。
+    #[cfg(mobile)]
+    let builder = builder.plugin(mobile::store_plugin());
+
     // 「让应用在后台活着」所需的系统那一层（F-87）：电池优化白名单、ROM 的自启动/后台活动页。
     // 那一层是 ROM 私有的，应用改不了只能引导 —— 见 `system_settings` 的模块注释。
     #[cfg(mobile)]
@@ -2293,8 +2591,6 @@ pub fn run() {
             relay_traffic,
             add_peer,
             remove_peer,
-            #[cfg(mobile)]
-            mobile::rename_peer,
             pair_start,
             pair_confirm,
             pair_invite,
@@ -2306,6 +2602,9 @@ pub fn run() {
             peer_tree,
             connect_peer,
             disconnect_peer,
+            accept_link_request,
+            reject_link_request,
+            cancel_link_request,
             wipe_credentials,
             #[cfg(desktop)]
             fs_browse::fs_drives,
@@ -2318,6 +2617,8 @@ pub fn run() {
             #[cfg(desktop)]
             set_picker_favorites,
             push_paths,
+            save_pasted_image,
+            read_image_data_url,
             cancel_push_batch,
             accept_push,
             reject_push,
@@ -2325,14 +2626,17 @@ pub fn run() {
             cancel_receive,
             chat_snapshot,
             chat_send,
+            chat_send_image,
             chat_mark_read,
             chat_batch_ensure,
             chat_batch_rename,
             chat_batch_delete,
             chat_clear,
+            chat_files_set,
             group_create,
             group_edit,
             group_send,
+            group_send_image,
             group_mark_read,
             group_sync,
             group_join,
@@ -2344,6 +2648,8 @@ pub fn run() {
             mobile::list_inbox,
             #[cfg(mobile)]
             mobile::delete_inbox_file,
+            #[cfg(mobile)]
+            resolve_image_uri,
             // 「让应用在后台活着」所需的系统那一层（F-87）：读回电池优化白名单在不在、把用户送到
             // ROM 的自启动页；外加通知这一层的自查与跳转（F-108 的横幅那一半）。
             // 全是"读状态 + 跳系统页"，没有业务逻辑 —— 只有安卓有实体，见 `system_settings`。
@@ -2384,6 +2690,9 @@ pub fn run() {
             orb_set_hit_region,
             #[cfg(desktop)]
             orb_save_center,
+            // 托盘上有事等处理吗（未读消息 / 通知 / 群邀请）：界面说一声，托盘据此挂红点 + 闪动。
+            #[cfg(desktop)]
+            tray::tray_set_alert,
             // 自更新（桌面端 + 安卓端同一套，见 `src/update/`）。
             update::update_state,
             update::update_check,
@@ -2445,6 +2754,15 @@ pub fn run() {
             // 悬浮球回到上次的位置；没有记录（首启）就放到默认落位（右上 1/3）
             #[cfg(desktop)]
             place_orb_on_startup(app.handle());
+
+            // 粘贴图片的暂存目录：清掉上次留下的过期文件（草稿只活在内存里，进程一退，
+            // 那些还没发出去的图就只剩这一个回收时机了，见 `paste::MAX_AGE`）。
+            paste::sweep();
+            // 会话里图片消息的**内容**：清掉没人引用的（消息被裁剪、写了一半进程没了、
+            // 旧版本留下的，见 `blobs`）。这一条要排在状态建好之后 —— 它要读两份账本。
+            if let Some(state) = app.try_state::<Arc<AppState>>() {
+                chat::sweep_blobs(&state);
+            }
 
             // 镜像（拖对端项走这条路）：先按龄回收上次留下的项，再把 provider 接上
             // （注册 + 连接）。失败只记日志 —— 拖放那条路会当场把原因报给用户。
@@ -2533,6 +2851,197 @@ mod tests {
         assert_eq!(json["itemCount"], 2);
         assert!(json["size"].is_null(), "目录的大小是 null，不是 0");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 手动添加（F-11）：**留空端口**时要在端口段里找到真正答话的那一台，且**跳过本机自己**。
+    ///
+    /// 搭法照着真实场景：本机先占住起点（`BASE`），对端随后起来、按 S-06 顺延到 `BASE+1`。
+    /// 于是"留空端口的添加"必须**跳过 BASE 上那个自己**、找到 `+1` 上的对端 —— 只探起点、
+    /// 或者把本机自己也当成对端，都会在这里失败。
+    ///
+    /// ⚠️ 拨的地址用**本机的内网地址**，不用 `127.0.0.1`：指纹表的键是**地址**（`net::Trust`
+    /// 的 `pinned: HashMap<IpAddr, _>`），而同一进程里别的用例早就在 `127.0.0.1` 上钉过别的
+    /// 证书（它们用的身份文件与这里不是同一份）—— 用回环就会在 TLS 那一跳被判"指纹不一致"，
+    /// 假红。内网地址没有这个污染面。拿不到内网地址（纯离线）就跳过：这条路需要真的握手。
+    #[tokio::test]
+    async fn manual_add_without_a_port_finds_the_peer_and_skips_itself() {
+        const BASE: u16 = 4890;
+        let Some(lan) = local_lan_ip() else {
+            eprintln!("这台机器没有内网地址（纯离线）：跳过");
+            return;
+        };
+        let lan = lan.to_string();
+        let own_dir = std::env::temp_dir().join(format!("orbdrop_add_own_{}", uuid::Uuid::new_v4()));
+        let peer_dir = std::env::temp_dir().join(format!("orbdrop_add_peer_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&own_dir).unwrap();
+        std::fs::create_dir_all(&peer_dir).unwrap();
+        // 身份用 `test_config`：这一条**故意绑 0.0.0.0**（它要拨本机的内网地址，见上面那段
+        // 说明），所以它是测试里唯一会把监听放到局域网上的地方 —— 名字中立、id 各取各的，
+        // 对端看到的只是一台 `orbdrop-test`，不会与真机撞名。
+        let own = Arc::new(AppState::new(
+            crate::config::test_config(),
+            own_dir.join("config.toml"),
+        ));
+        let peer = Arc::new(AppState::new(
+            crate::config::test_config(),
+            peer_dir.join("config.toml"),
+        ));
+        let own_id = own.config.lock().device_id.clone();
+        let peer_id = peer.config.lock().device_id.clone();
+
+        let own_port = crate::server::start_server(own.clone(), BASE).await.unwrap();
+        assert_eq!(own_port, BASE, "本机占住起点");
+        let peer_port = crate::server::start_server(peer.clone(), BASE).await.unwrap();
+        assert_eq!(peer_port, BASE + 1, "对端起在起点上：按 S-06 顺延到 +1");
+
+        // 两个服务器都要**真的答话**了再扫：扫描每一步只等 1.5s（真机上够，满载的测试进程里
+        // 不够），先等它起来，这条用例才不会在并行跑时假红。
+        let client = crate::net::client();
+        for port in [own_port, peer_port] {
+            let url = format!("{}/pair/info", crate::net::peer_base(&lan, port));
+            let ok = wait_until_async(|| {
+                let (client, url) = (client.clone(), url.clone());
+                async move {
+                    client
+                        .get(&url)
+                        .send()
+                        .await
+                        .map(|r| r.status().is_success())
+                        .unwrap_or(false)
+                }
+            })
+            .await;
+            assert!(ok, "服务器还没起在 {lan}:{port} 上");
+        }
+
+        let (found, info) = manual_peer_from(&lan, 0, BASE, &own_id).await.unwrap();
+        assert_eq!(found, BASE + 1, "留空端口要扫到真正答话的那一台（自己的那一个跳过）");
+        assert_eq!(info["id"].as_str(), Some(peer_id.as_str()), "找到的是对端，不是本机");
+        assert_eq!(info["port"].as_u64(), Some(u64::from(BASE + 1)), "回话里是它实际的端口");
+
+        // 明确指到自己头上：报错要说清"是本机自己"，而不是"连不上"（用户才知道错在哪）。
+        let self_err = manual_peer_from(&lan, BASE, BASE, &own_id).await.unwrap_err();
+        assert!(self_err.contains("本机自己"), "是把本机自己填进来的：{self_err}");
+
+        // 明确给了对端端口就只问那一个。
+        assert_eq!(manual_peer_from(&lan, BASE + 1, BASE, &own_id).await.unwrap().0, BASE + 1);
+
+        crate::server::stop_server(&own).await;
+        crate::server::stop_server(&peer).await;
+        let _ = std::fs::remove_dir_all(&own_dir);
+        let _ = std::fs::remove_dir_all(&peer_dir);
+    }
+
+    /// 本机在局域网上的出口地址（拿不到 = 这台机器没有可用网卡，用它拨号的那几条用例跳过）。
+    fn local_lan_ip() -> Option<std::net::IpAddr> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("192.0.2.1:9").ok()?;
+        let ip = socket.local_addr().ok()?.ip();
+        (!ip.is_loopback()).then_some(ip)
+    }
+
+    /// 等一个**异步**条件成立（最多 20 秒）。返回是否等到了。
+    async fn wait_until_async<F, Fut>(mut f: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            if f().await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    /// 浏览 `_orbdrop._tcp` 若干秒，返回解析到的**服务全名**。
+    ///
+    /// 每一轮都新建一个 daemon（空缓存）：看到的只能是**此刻真在应答**的那些记录，
+    /// 不带任何历史缓存 —— 这是"旧的还在不在网上"唯一诚实的问法。
+    async fn browse_fullnames(secs: u64) -> Vec<String> {
+        let daemon = match mdns_sd::ServiceDaemon::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("mDNS 用不了（跳过）: {e}");
+                return Vec::new();
+            }
+        };
+        let rx = match daemon.browse("_orbdrop._tcp.local.") {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("mDNS 浏览起不来（跳过）: {e}");
+                return Vec::new();
+            }
+        };
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(left, rx.recv_async()).await {
+                Ok(Ok(mdns_sd::ServiceEvent::ServiceResolved(info))) => {
+                    seen.push(info.get_fullname().to_string());
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        let _ = daemon.shutdown();
+        seen
+    }
+
+    /// **改设备名之后，旧的那条 mDNS 记录必须从网上消失**。
+    ///
+    /// 这条用例只能是真组播：`ServiceDaemon` **没有 `Drop`**，只把句柄丢掉的话线程还活着、
+    /// 注册还在，对端每次解析到它就把旧名字写回设备行一次 —— 表现正是"我改了名字，别人看到
+    /// 的还是旧名"。同理 `Registration` 也必须是"注册那一刻的全名"（改过名之后按配置拼出来
+    /// 的串已经指不到线上那一条了）。
+    #[tokio::test]
+    async fn renaming_releases_the_previous_mdns_registration() {
+        let dir = std::env::temp_dir()
+            .join(format!("orbdrop_mdns_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        let tag = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let old = format!("mdns-old-{tag}");
+        let new = format!("mdns-new-{tag}");
+
+        state.config.lock().device_name = old.clone();
+        register_mdns(&state, 3611);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let before = browse_fullnames(5).await;
+        if !before.iter().any(|f| f.contains(&old)) {
+            // 这台机器播不出去（没有可用的非回环网卡之类的）：组播这条路验不了，不硬断言。
+            eprintln!("mDNS 广播在这台机器上没成（旧名没被解析到），跳过：{before:?}");
+            release_mdns(&state);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        // 改名 → 重注册（`update_settings` 走的就是这两句）。
+        state.config.lock().device_name = new.clone();
+        register_mdns(&state, 3611);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let after = browse_fullnames(5).await;
+        assert!(
+            after.iter().any(|f| f.contains(&new)),
+            "新名字要在网上：{after:?}"
+        );
+        assert!(
+            !after.iter().any(|f| f.contains(&old)),
+            "旧名字必须已经被撤下（注销 + 关掉 daemon）：{after:?}"
+        );
+
+        release_mdns(&state);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

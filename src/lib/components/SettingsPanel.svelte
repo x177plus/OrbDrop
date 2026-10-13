@@ -52,6 +52,14 @@
   // Local form state
   let port = $state(3890);
   let downloadDir = $state('');
+  /**
+   * 推送接收是否再放一层 `<发送方名>/`（后端 `AppSettings.deviceSubdir`，**默认开**，S-12）。
+   *
+   * 开着 = 对端推来的东西落在 `<下载目录>/<发送方名>/…` 下：两台设备推同名文件不会互相
+   * 顶掉、一批东西能按来源整体看/整体清、接收未配对设备的推送时那颗目录框只把"根的里面
+   * 一个自己的目录"授权出去。关掉 = 和手动下载的文件落到同一层。
+   */
+  let deviceSubdir = $state(true);
   let downloadMode = $state<'Direct' | 'AskEachTime'>('Direct');
   let deviceName = $state('');
   let autoStart = $state(true);
@@ -179,6 +187,7 @@
       if (s) {
         port = s.port;
         downloadDir = s.downloadDir;
+        deviceSubdir = s.deviceSubdir;
         downloadMode = s.downloadMode;
         deviceName = s.deviceName;
         autoStart = s.autoStart;
@@ -220,6 +229,7 @@
       await updateSettings({
         port,
         downloadDir,
+        deviceSubdir,
         downloadMode,
         deviceName,
         autoStart,
@@ -250,6 +260,7 @@
     if (s) {
       port = s.port;
       downloadDir = s.downloadDir;
+      deviceSubdir = s.deviceSubdir;
       downloadMode = s.downloadMode;
       deviceName = s.deviceName;
       autoStart = s.autoStart;
@@ -283,12 +294,32 @@
     <div class="field">
       <label for="downloadDir">下载目录<Hint>
         手动「下载到本地」和对端「推送」接收都默认存这里（选了「每次询问」时，接收推送那条
-        会先让你挑一个目录，挑的那个就是这次接收的根）；推送一律落在 <strong>发送方名</strong>
-        目录下，按你选中的那些项各自的名字展开（不会和下载的文件混在一层）。
+        会先让你挑一个目录，挑的那个就是这次接收的根）；推送默认落在 <strong>发送方名</strong>
+        目录下（可由下面那颗开关关掉），按你选中的那些项各自的名字展开（不会和下载的文件混在一层）。
       </Hint></label>
       <div class="path-input">
         <input class="input" id="downloadDir" value={downloadDir} readonly />
         <button class="btn btn-secondary btn-sm" onclick={pickDownloadDir}>选择</button>
+      </div>
+    </div>
+    <!-- svelte-ignore a11y_label_has_associated_control -->
+    <div class="field">
+      <label>推送按发送方分目录<Hint>
+        <strong>打开（默认）</strong>：对端推来的东西落在 <strong>发送方名</strong> 那一层下面
+        —— <code>下载目录\某某的电脑\…</code>。三件事跟着来：两台设备推同名文件不会互相顶掉；
+        一批东西能按来源整体看、整体清；接收未配对设备的推送时，那颗目录框只授权对方在根里
+        <strong>新建一个自己的目录</strong>，碰不到根里已经有的东西。<br />
+        <strong>关掉</strong>：推送和手动下载的文件落在<strong>同一层</strong>。同名的照旧自动改名
+        <code>xxx (1).ext</code>；代价是别人推来的 <code>D\…</code> 会并进你本来就有的
+        <code>下载目录\D</code>（已配对设备的推送对同名文件是<strong>校验通过后原子替换</strong>），
+        「每次询问」下挑的那个目录也就等于直接让对方往那一层写文件名。
+      </Hint></label>
+      <div style="display:flex; align-items:center; justify-content:space-between;">
+        <span style="font-size:var(--fs-sm); color:var(--muted);">接收推送时放进以发送方命名的子目录</span>
+        <label class="switch">
+          <input type="checkbox" bind:checked={deviceSubdir} data-device-subdir />
+          <span class="track"></span>
+        </label>
       </div>
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->

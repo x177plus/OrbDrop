@@ -1,7 +1,7 @@
 <script lang="ts">
   import * as api from "$lib/api";
   import * as chat from "$lib/stores/chat.svelte";
-  import { deviceState, getDevices } from "$lib/stores/devices.svelte";
+  import { deviceState, deviceShortName, getDevices } from "$lib/stores/devices.svelte";
   import Icon from "../Icon.svelte";
   import Sheet from "../components/Sheet.svelte";
   import StateChip from "../components/StateChip.svelte";
@@ -97,7 +97,7 @@
           />
           <span class="pav">{chat.peerInitial(d.id)}</span>
           <span class="fmain">
-            <span class="fname2">{d.name}</span>
+            <span class="fname2" title={deviceShortName(d)}>{deviceShortName(d)}</span>
             <span class="fmeta num">{d.ip}</span>
           </span>
           <StateChip state={deviceState(d)} />

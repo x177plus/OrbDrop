@@ -95,8 +95,8 @@
       // **表不关**（P1-13⑤）：发出去的邀请只有 60s，而撤回的唯一入口就是这一张表 ——
       // 收起它等于把"取消"这颗按钮藏起来（对端界面上那条通知只能等它超时）。
       const inviteId = await api.pairInvite(peer.id);
-      store.setPendingPairInvite(inviteId, peer.name);
-      store.toast(`已向「${peer.name}」发起配对邀请`);
+      store.setPendingPairInvite(inviteId, devices.deviceShortName(peer));
+      store.toast(`已向「${devices.deviceShortName(peer)}」发起配对邀请`);
     } catch (e) {
       store.failed("发起配对邀请", e);
       // 邀请是一次到对端的 POST：投不出去、而那台"看得见却直连不通"时，说清这条路为什么不通。
@@ -130,7 +130,8 @@
       <p class="es">确保两台设备在同一局域网，或手动添加 IP:端口。</p>
     </div>
   {:else}
-    <!-- 原型那两颗「选设备」的表用的是 `.sec-label` + `.stack` + `.pick`，这里照抄结构。 -->
+    <!-- 目标设备这一份就是**设备列表**（候选取自 `visibleDevices`）：名字与头像字都走
+         **显示名**（F-101：有备注就是「备注(设备名)」），与设备页那一行同规。 -->
     <div class="sec-label" style="padding-bottom:0">
       <span>目标设备</span><span class="num">{candidates.length} 台</span>
     </div>
@@ -138,9 +139,9 @@
       {#each candidates as d (d.id)}
         <label class="pick" class:is-checked={target.id === d.id}>
           <input type="radio" name="pairTarget" checked={target.id === d.id} onchange={() => (picked = d.id)} />
-          <span class="pav">{d.name.charAt(0)}</span>
+          <span class="pav">{devices.deviceDisplayName(d).charAt(0)}</span>
           <span class="fmain">
-            <span class="fname2">{d.name}</span>
+            <span class="fname2" title={devices.deviceDisplayName(d)}>{devices.deviceDisplayName(d)}</span>
             <span class="fmeta num">{d.ip}:{d.port}</span>
           </span>
           <StateChip state={devices.deviceState(d)} />

@@ -26,21 +26,24 @@
     "release:local": "node scripts/release.mjs --local --skip-build",
     "mirror": "node scripts/dev-mirror.mjs",
     "commit": "omp commit -c \"摘要首词用英文过去式动词（Added、Fixed、Updated），其余摘要与全部明细用简体中文\"",
-    "commit:dry": "npm run commit -- --dry-run"
+    "commit:dry": "npm run commit -- --dry-run",
+    "legacy:gen": "node scripts/gen-legacy-gap.mjs",
+    "legacy:check": "node scripts/gen-legacy-gap.mjs --check"
   },
   "license": "GPL-3.0-or-later",
   "dependencies": {
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2",
     "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-opener": "^2",
     "@tauri-apps/plugin-shell": "^2"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
+    "@tauri-apps/cli": "^2",
+    "acorn": "^8.18.0",
     "svelte": "^5.56.3",
     "svelte-check": "^4.6.0",
     "typescript": "~6.0.3",
-    "vite": "^8.0.16",
-    "@tauri-apps/cli": "^2"
+    "vite": "^8.0.16"
   }
 }

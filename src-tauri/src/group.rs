@@ -125,11 +125,27 @@ pub struct Group {
     /// 本机视角的标记，**不跟着名册走**。
     #[serde(default)]
     pub left: bool,
+    /// 名册里那些**明确拒绝收这个群的消息**的成员 id（本机看到的：`group_text_rejected`
+    /// 那一条回来时记下，见 `on_group_text_rejected`）。
+    ///
+    /// **为什么不改名册**：名册是 LWW 共享物，"那台设备拒绝了"是**本机的观察** —— 写进名册
+    /// 就等于替所有成员改了名单，还会跟着 LWW 跟别人的版本打架（而且拒绝它的那台设备自己
+    /// 未必知道别人怎么看）。所以它只活在本机这一份里：界面上把那枚胶囊标出来，要不要把它
+    /// 移出名单由用户按那颗 ✕ 决定。
+    ///
+    /// 老文件没有这一栏 → 空表（那时也没人记过这件事）。
+    #[serde(default)]
+    pub declined: Vec<String>,
 }
 
 impl Group {
     fn is_member(&self, peer_id: &str) -> bool {
         self.members.iter().any(|m| m.id == peer_id)
+    }
+
+    /// 这个成员是不是**拒绝收本群消息**的（本机看到的）。
+    fn has_declined(&self, peer_id: &str) -> bool {
+        self.declined.iter().any(|d| d == peer_id)
     }
 
     /// 除了 `except` 之外的成员 id（投递目标）。
@@ -173,6 +189,16 @@ pub struct GroupMsg {
     /// **仅本机发出的消息有意义**：成员 id → 这一份的投递状态。收来的消息是空的。
     #[serde(default)]
     pub delivery: HashMap<String, Delivery>,
+    /// 这条是不是**图片消息**（图片是消息内容，不是文件 —— 与一对一那条路同一套语义，
+    /// 见 `crate::blobs`）。老文件里没有这个键 = 文字消息。
+    #[serde(default)]
+    pub image: bool,
+    /// 图片消息的内容文件名（"图片-20261013-153012.png"）：扩展名由它决定。
+    #[serde(default)]
+    pub name: String,
+    /// 图片消息的字节数（界面上写"多大"）。
+    #[serde(default)]
+    pub size: u64,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -312,6 +338,20 @@ pub struct GroupMsgWire {
     pub at: u64,
     #[serde(default)]
     pub seq: u64,
+    /// 图片消息那几格（与 `GroupMsg` 同一套语义）：`image` / `name` / `size` 是元数据，
+    /// `data` 是**内容本身**（base64）。
+    ///
+    /// 补拉是"把手上有的发回去"，所以内容得跟着走（不然补回来的那条只有一个标题）；
+    /// 服务方手上那份内容要是不在盘上了（被裁剪过），`data` 就是空串 —— 收方拿到一条
+    /// **没有内容的图片消息**（气泡上如实写"读不出来"，见 `group::on_sync_post`）。
+    #[serde(default)]
+    pub image: bool,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub data: String,
 }
 
 /// 名册吃进来之后发生了什么（命令与测试都看它）。
@@ -350,6 +390,10 @@ struct GroupFile {
 
 pub struct GroupStore {
     path: PathBuf,
+    /// 图片消息的**内容**目录（见 `crate::blobs`）：与一对一那份**同一个目录**
+    /// （`<数据目录>/chat-blobs`）—— 两边的消息 id 都是 uuid，内容文件按 id 认人，
+    /// 分开放只会让"谁引用着它"多一份账（启动扫孤儿要把两边合起来看）。
+    blobs_root: PathBuf,
     inner: Mutex<GroupFile>,
     /// `(群, 设备)` → 本机**已经告诉过它**的名册版本（内存即可：重启后多发一次名册无害）。
     ///
@@ -371,12 +415,31 @@ impl GroupStore {
             .ok()
             .and_then(|s| serde_json::from_str::<GroupFile>(&s).ok())
             .unwrap_or_default();
+        let blobs_root = crate::blobs::root_of(&path);
         Self {
             path,
+            blobs_root,
             inner: Mutex::new(inner),
             told: Mutex::new(HashMap::new()),
             sync: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 图片消息的内容目录（与 `ChatStore` 那个是同一个：见上面那段说明）。
+    pub fn blobs_root(&self) -> &std::path::Path {
+        &self.blobs_root
+    }
+
+    /// 手上还引用着的**图片消息 id**（启动时扫孤儿用，见 `blobs::sweep_in`）。
+    pub fn image_ids(&self) -> std::collections::HashSet<String> {
+        let guard = self.inner.lock();
+        let convo = guard.convos.values().flat_map(|c| c.messages.iter());
+        let orphan = guard.orphans.values().flatten();
+        convo
+            .chain(orphan)
+            .filter(|m| m.image)
+            .map(|m| m.id.clone())
+            .collect()
     }
 
     // ── 读 ────────────────────────────────────────────────────────────────
@@ -388,7 +451,7 @@ impl GroupStore {
             .groups
             .iter()
             .filter(|g| !g.left)
-            .map(|g| view_of(g, guard.convos.get(&g.id), own_id))
+            .map(|g| view_of(g, guard.convos.get(&g.id), own_id, &self.blobs_root))
             .collect()
     }
 
@@ -446,7 +509,7 @@ impl GroupStore {
         if g.left {
             return None;
         }
-        Some(view_of(g, guard.convos.get(group_id), own_id))
+        Some(view_of(g, guard.convos.get(group_id), own_id, &self.blobs_root))
     }
 
     /// 本机在这个群里下一条要用的 `seq`（1 起，只增）。
@@ -602,6 +665,7 @@ impl GroupStore {
             updated_at: now,
             members,
             left: false,
+            declined: Vec::new(),
         });
         guard.convos.entry(id.clone()).or_default();
         guard.my_seq.entry(id.clone()).or_insert(1);
@@ -628,6 +692,9 @@ impl GroupStore {
             group.updated_by = own_id.to_string();
             group.updated_at = now;
             group.members = members;
+            // "拒绝过"只对**还在名册里**的人有意义：名单里没有它了，那一格就跟着作废
+            //（重新加回来 = 一次新的邀请，得重新看它答不答）。
+            group.declined.retain(|id| group.members.iter().any(|m| &m.id == id));
             // 名册里又有本机了 → 之前"被移出"的标记作废（被重新拉回来了）。
             group.left = false;
             group.clone()
@@ -654,10 +721,13 @@ impl GroupStore {
         };
         // 本地删干净：用户按下的是「退出会话（本地删除并广播离开）」—— 会话该没了。
         guard.groups.retain(|g| g.id != group_id);
-        guard.convos.remove(group_id);
+        let gone = guard.convos.remove(group_id).unwrap_or_default();
         guard.my_seq.remove(group_id);
         guard.pending.retain(|p| p.group_id != group_id);
-        guard.orphans.remove(group_id);
+        let discarded = guard.orphans.remove(group_id).unwrap_or_default();
+        // 会话记录（含攒着的那几条）连同里面的图片内容一起走。
+        drop_content(&gone.messages, &self.blobs_root);
+        drop_content(&discarded, &self.blobs_root);
         persist(&self.path, &mut guard);
         Some(out)
     }
@@ -718,6 +788,8 @@ impl GroupStore {
                 g.members = unique;
                 // 名册里还有本机 → 之前的"被移出"作废；没有了 → 停发（历史留着）。
                 g.left = !g.is_member(own_id);
+                // "拒绝过"的人被移出名单了 → 那一格作废（与 `edit_local` 同一条规矩）。
+                g.declined.retain(|id| g.members.iter().any(|m| &m.id == id));
                 left = g.left;
             }
             guard.convos.entry(roster.id.clone()).or_default();
@@ -787,6 +859,8 @@ impl GroupStore {
             updated_at: invite.updated_at,
             members,
             left: false,
+            // 本机这一刻才成为成员：在此之前没人对本机说过"拒绝"，这一栏从空起步。
+            declined: Vec::new(),
         });
         guard.my_seq.entry(group_id.to_string()).or_insert(1);
         // 邀请挂着的那段时间里到的消息：这一刻并进会话（按 `(from, id)` 去重、按展示顺序排）。
@@ -799,7 +873,8 @@ impl GroupStore {
             convo.messages.push(m);
         }
         convo.messages.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
-        prune(convo);
+        let dropped = prune(convo);
+        drop_content(&dropped, &self.blobs_root);
         persist(&self.path, &mut guard);
         true
     }
@@ -809,8 +884,9 @@ impl GroupStore {
         let mut guard = self.inner.lock();
         let had = guard.pending.iter().any(|p| p.group_id == group_id);
         guard.pending.retain(|p| p.group_id != group_id);
-        // 攒着的那几条跟着这个决定一起丢掉（用户说了不进这个群）。
-        guard.orphans.remove(group_id);
+        // 攒着的那几条跟着这个决定一起丢掉（用户说了不进这个群）—— 内容一起走。
+        let discarded = guard.orphans.remove(group_id).unwrap_or_default();
+        drop_content(&discarded, &self.blobs_root);
         if !guard.dismissed.iter().any(|d| d == group_id) {
             guard.dismissed.push(group_id.to_string());
         }
@@ -827,10 +903,11 @@ impl GroupStore {
         group_id: &str,
         msg_id: &str,
         from: &str,
-        text: &str,
+        content: impl Into<crate::blobs::Content>,
         at: u64,
         deliveries: &[(String, Delivery)],
     ) -> GroupMsg {
+        let content = content.into();
         let mut guard = self.inner.lock();
         let seq = {
             let next = guard.my_seq.entry(group_id.to_string()).or_insert(1);
@@ -838,25 +915,29 @@ impl GroupStore {
             *next += 1;
             used
         };
-        let msg = GroupMsg {
-            id: msg_id.to_string(),
-            from: from.to_string(),
-            from_name: String::new(),
-            text: text.to_string(),
-            at,
-            seq,
-            delivery: deliveries.iter().cloned().collect(),
-        };
+        let msg = msg_with(content, msg_id, from, "", at, seq, deliveries.iter().cloned().collect());
         let convo = guard.convos.entry(group_id.to_string()).or_default();
         convo.messages.push(msg.clone());
-        prune(convo);
+        let dropped = prune(convo);
+        drop_content(&dropped, &self.blobs_root);
         persist(&self.path, &mut guard);
         msg
     }
 
     /// 收到对端一条群消息。`true` = 是新的一条（`false` = 重复投递）。
-    pub fn record_inbound(&self, group_id: &str, from: &str, from_name: &str, id: &str, text: &str, at: u64, seq: u64) -> bool {
+    pub fn record_inbound(
+        &self,
+        group_id: &str,
+        from: &str,
+        from_name: &str,
+        id: &str,
+        content: impl Into<crate::blobs::Content>,
+        at: u64,
+        seq: u64,
+    ) -> bool {
+        let content = content.into();
         let mut guard = self.inner.lock();
+        let dropped;
         {
             let convo = guard.convos.entry(group_id.to_string()).or_default();
             // 幂等键 `(from, id)`：补发/重连重投是常态，同一句不能变成两句。
@@ -864,17 +945,10 @@ impl GroupStore {
                 debug!(%id, %from, group_id, "群消息重复投递，丢弃");
                 return false;
             }
-            convo.messages.push(GroupMsg {
-                id: id.to_string(),
-                from: from.to_string(),
-                from_name: from_name.to_string(),
-                text: text.to_string(),
-                at,
-                seq,
-                delivery: HashMap::new(),
-            });
-            prune(convo);
+            convo.messages.push(msg_with(content, id, from, from_name, at, seq, HashMap::new()));
+            dropped = prune(convo);
         }
+        drop_content(&dropped, &self.blobs_root);
         persist(&self.path, &mut guard);
         true
     }
@@ -882,6 +956,14 @@ impl GroupStore {
     /// 这个群此刻正挂着邀请卡（等用户点「加入」）。
     pub fn has_pending(&self, group_id: &str) -> bool {
         self.inner.lock().pending.iter().any(|p| p.group_id == group_id)
+    }
+
+    /// 本机**明确拒绝过**这个群（用户点过那张卡上的「不加入」）—— 之后它的事件一律忽略。
+    ///
+    /// 与 `has_pending` 互斥：拒绝的那一刻邀请卡就被撤了。收不下去的群消息按这两种分开回话
+    /// （理由不同，发送方那边「已拒绝加入」只在第一种亮）。
+    pub fn is_dismissed(&self, group_id: &str) -> bool {
+        self.inner.lock().dismissed.iter().any(|d| d == group_id)
     }
 
     /// 这台设备是不是"挂着的那张群邀请卡"里的成员之一（含发起人）。
@@ -905,7 +987,17 @@ impl GroupStore {
     /// 邀请还没确认、但群里已经有消息进来了：先攒着（见 `MAX_ORPHANS`）。`true` = 攒下了。
     ///
     /// 名册都还没到（连邀请卡都没有）时返回 `false` —— 那种消息无处可放，调用方记一行日志。
-    pub fn buffer_pending_message(&self, group_id: &str, from: &str, from_name: &str, id: &str, text: &str, at: u64, seq: u64) -> bool {
+    pub fn buffer_pending_message(
+        &self,
+        group_id: &str,
+        from: &str,
+        from_name: &str,
+        id: &str,
+        content: impl Into<crate::blobs::Content>,
+        at: u64,
+        seq: u64,
+    ) -> bool {
+        let content = content.into();
         let mut guard = self.inner.lock();
         if !guard.pending.iter().any(|p| p.group_id == group_id) {
             return false;
@@ -917,18 +1009,12 @@ impl GroupStore {
         if list.iter().any(|m| m.from == from && m.id == id) {
             return false;
         }
-        list.push(GroupMsg {
-            id: id.to_string(),
-            from: from.to_string(),
-            from_name: from_name.to_string(),
-            text: text.to_string(),
-            at,
-            seq,
-            delivery: HashMap::new(),
-        });
+        list.push(msg_with(content, id, from, from_name, at, seq, HashMap::new()));
         if list.len() > MAX_ORPHANS {
             let drop = list.len() - MAX_ORPHANS;
-            list.drain(..drop);
+            // 挤出去的那几条如果是图片，内容也跟着走（不然它会一直躺在那儿没人引用）。
+            let evicted: Vec<GroupMsg> = list.drain(..drop).collect();
+            drop_content(&evicted, &self.blobs_root);
         }
         persist(&self.path, &mut guard);
         true
@@ -947,6 +1033,43 @@ impl GroupStore {
                     changed = true;
                 }
                 _ => {}
+            }
+        }
+        if changed {
+            persist(&self.path, &mut guard);
+        }
+        changed
+    }
+
+    /// 那台设备**明确拒绝了这一条**（`group_text_rejected`）：这一份从"已送达/在途/排队"改判成
+    /// 「未送达」，并且把 `declined` 记进名册视图（理由 = 本机拒绝过这个群时）。
+    ///
+    /// 为什么不走 `set_deliveries`：那个闸门只许 `Sending/Queued → 终态`（防一条迟到的失败
+    /// 把已经写进长连接的那份降级）。而这条拒收是**对端自己说的**，它比任何推测都硬 ——
+    /// 长连接那条路"写成功 = 已送达"正好是它要纠正的那种情形。
+    pub fn mark_rejected(&self, group_id: &str, msg_id: &str, peer_id: &str, declined: bool) -> bool {
+        let mut guard = self.inner.lock();
+        let mut changed = false;
+        if let Some(convo) = guard.convos.get_mut(group_id) {
+            if let Some(m) = convo.messages.iter_mut().find(|m| m.id == msg_id) {
+                match m.delivery.get(peer_id).copied() {
+                    // 已经读过 = 那一条确实到过它手上（拒收的是**这条**，不改历史）。
+                    Some(Delivery::Read) | Some(Delivery::Failed) => {}
+                    Some(_) => {
+                        m.delivery.insert(peer_id.to_string(), Delivery::Failed);
+                        changed = true;
+                    }
+                    None => {}
+                }
+            }
+        }
+        if declined {
+            if let Some(g) = guard.groups.iter_mut().find(|g| g.id == group_id) {
+                // 只记名册里的人：不在名单里的（早被移出）没有可标的那一格。
+                if g.is_member(peer_id) && !g.has_declined(peer_id) {
+                    g.declined.push(peer_id.to_string());
+                    changed = true;
+                }
             }
         }
         if changed {
@@ -1131,7 +1254,9 @@ impl GroupStore {
         list.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
         let more = list.len() > cap;
         list.truncate(cap);
-        (list.into_iter().map(wire_of).collect(), more)
+        // **带上内容**：图片消息那几条要把盘上那份读出来（`wire_of`）。读不到就只带元数据
+        // 过去（收方那台如实显示"读不出来"）—— 补拉是尽力而为。
+        (list.into_iter().map(|m| wire_of(&self.blobs_root, m)).collect(), more)
     }
 
     /// 对方点名要的那几条（按 `(from, seq)` 精确找）。
@@ -1145,7 +1270,7 @@ impl GroupStore {
                     return out;
                 }
                 if let Some(m) = convo.messages.iter().find(|m| m.from == hole.from && m.seq == *seq) {
-                    out.push(wire_of(m));
+                    out.push(wire_of(&self.blobs_root, m));
                 }
             }
         }
@@ -1159,11 +1284,22 @@ impl GroupStore {
     pub fn apply_sync(&self, group_id: &str, own_id: &str, messages: &[GroupMsgWire]) -> Vec<(String, u64)> {
         let mut guard = self.inner.lock();
         let mut acked: HashMap<String, u64> = HashMap::new();
+        let dropped;
         {
             let convo = guard.convos.entry(group_id.to_string()).or_default();
             for m in messages {
                 if m.from == own_id || m.from.is_empty() {
                     continue;
+                }
+                // 图片消息的内容先落下来（补拉那一路内容跟着走）。落不下（id/名字不可用、
+                // 字节坏了）就把这一条当**没有内容的图片消息**收下 —— 界面那条气泡会写
+                // "读不出来"，比整条丢掉诚实。
+                if m.image && !m.data.is_empty() {
+                    if let Err(reason) =
+                        crate::blobs::save_base64(&self.blobs_root, &m.id, &m.name, &m.data)
+                    {
+                        warn!(id = %m.id, %reason, "补拉回来的图片内容没能落下来");
+                    }
                 }
                 if convo.messages.iter().any(|x| x.from == m.from && x.id == m.id) {
                     continue;
@@ -1176,14 +1312,18 @@ impl GroupStore {
                     at: m.at,
                     seq: m.seq,
                     delivery: HashMap::new(),
+                    image: m.image,
+                    name: m.name.clone(),
+                    size: m.size,
                 });
                 let entry = acked.entry(m.from.clone()).or_insert(0);
                 *entry = (*entry).max(m.at);
             }
             convo.bootstrapped = true;
             convo.messages.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
-            prune(convo);
+            dropped = prune(convo);
         }
+        drop_content(&dropped, &self.blobs_root);
         persist(&self.path, &mut guard);
         acked.into_iter().collect()
     }
@@ -1238,26 +1378,59 @@ fn normalize_members(members: &mut Vec<Member>, add: Vec<Member>) {
     }
 }
 
-fn prune(convo: &mut GroupConvo) {
+fn prune(convo: &mut GroupConvo) -> Vec<GroupMsg> {
     let excess = convo.messages.len().saturating_sub(MAX_PER_GROUP);
-    if excess > 0 {
-        // 砍之前先记下"这些号是本机主动丢的"（每个发送方各记一个下界）：补拉找洞要从
-        // 下界之上开始，否则被裁掉的老号会被永远当成缺口（见 `pruned_below`）。
-        for m in convo.messages.iter().take(excess) {
-            if m.seq == 0 {
-                continue;
-            }
-            let slot = convo.pruned_below.entry(m.from.clone()).or_insert(0);
-            *slot = (*slot).max(m.seq);
+    if excess == 0 {
+        return Vec::new();
+    }
+    // 砍之前先记下"这些号是本机主动丢的"（每个发送方各记一个下界）：补拉找洞要从
+    // 下界之上开始，否则被裁掉的老号会被永远当成缺口（见 `pruned_below`）。
+    for m in convo.messages.iter().take(excess) {
+        if m.seq == 0 {
+            continue;
         }
-        convo.messages.drain(..excess);
-        // 读位指的那条可能正好被砍掉了：清掉，别让未读算出一个不存在的位置。
-        if let Some(pos) = convo.read_pos.clone() {
-            if !convo.messages.iter().any(|m| m.id == pos) {
-                convo.read_pos = None;
-            }
+        let slot = convo.pruned_below.entry(m.from.clone()).or_insert(0);
+        *slot = (*slot).max(m.seq);
+    }
+    let dropped: Vec<GroupMsg> = convo.messages.drain(..excess).collect();
+    // 读位指的那条可能正好被砍掉了：清掉，别让未读算出一个不存在的位置。
+    if let Some(pos) = convo.read_pos.clone() {
+        if !convo.messages.iter().any(|m| m.id == pos) {
+            convo.read_pos = None;
         }
     }
+    dropped
+}
+
+/// 这几条群消息的**内容文件**一起删掉（裁剪 / 丢攒着的那几条 / 退群时）。
+///
+/// 与 `chat::drop_blobs` 是同一件事（都走 `blobs::remove_many`）：内容目录是**同一个**，
+/// 两边各按自己的消息类型挑出"谁是图片消息"。
+fn drop_content(messages: &[GroupMsg], root: &std::path::Path) {
+    crate::blobs::remove_many(root, messages.iter().filter(|m| m.image).map(|m| (m.id.as_str(), m.name.as_str())));
+}
+
+/// 一条消息的**内容文件**此刻在哪（文字消息、或那份文件不在盘上 = 空串）。
+///
+/// 界面上那条气泡按它读图；空串就是"这一条没有内容可看"（老版本留下的记录、被裁剪过、
+/// 或补拉回来的那条没有内容）—— 界面如实写"读不出来"。
+fn content_path(root: &std::path::Path, m: &GroupMsg) -> String {
+    if !m.image {
+        return String::new();
+    }
+    crate::blobs::path_in(root, &m.id, &m.name)
+        .filter(|p| p.is_file())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// 一条图片消息的内容（base64）；文字消息、或内容不在盘上 = `None`。
+///
+/// 两条路都要它：补发那一刻重建事件（`flush_one`）、补拉把手上那几条发回去（`on_sync_ask`）。
+fn image_data(root: &std::path::Path, m: &GroupMsg) -> Option<String> {
+    use base64::Engine;
+    let bytes = crate::blobs::read_in(root, &m.id, &m.name)?;
+    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 /// 展示顺序的键：`(at, from, seq)`（跨发送方按墙钟，同一个人按自己的序号）。
@@ -1301,7 +1474,8 @@ fn holes_in(convo: &GroupConvo) -> Vec<SyncHole> {
     out
 }
 
-fn wire_of(m: &GroupMsg) -> GroupMsgWire {
+/// 一条消息的**补拉/报名册**形状（`messages_after` / `on_sync_ask` 用）：内容跟着走。
+fn wire_of(root: &std::path::Path, m: &GroupMsg) -> GroupMsgWire {
     GroupMsgWire {
         id: m.id.clone(),
         from: m.from.clone(),
@@ -1309,6 +1483,12 @@ fn wire_of(m: &GroupMsg) -> GroupMsgWire {
         text: m.text.clone(),
         at: m.at,
         seq: m.seq,
+        image: m.image,
+        name: m.name.clone(),
+        size: m.size,
+        // 内容不在盘上（被裁剪过、或写了一半）：这一条就**没有内容**地过去 —— 收方那台会
+        // 如实显示"读不出来"。补拉本来就是尽力而为，扣下整条不发反而让人以为丢了。
+        data: if m.image { image_data(root, m).unwrap_or_default() } else { String::new() },
     }
 }
 
@@ -1326,6 +1506,12 @@ pub struct GroupMsgView {
     pub delivery: HashMap<String, Delivery>,
     /// 仅 `from_me` 有意义：读过这条的成员数（`read_by` 的水位 ≥ 这条的 `at`）。
     pub read_count: u32,
+    /// 图片消息那几格（与一对一那条路同一套语义，见 `crate::blobs`）：`path` 是**本机此刻**
+    /// 那份内容文件（后端现算，不进 `groups.json`），内容不在盘上时是空串。
+    pub image: bool,
+    pub name: String,
+    pub size: u64,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1337,6 +1523,9 @@ pub struct GroupView {
     pub created_by: String,
     /// **不含本机**（名册的存储里含本机）。
     pub members: Vec<Member>,
+    /// 名册里**明确拒绝收本群消息**的那些成员 id（本机的观察，见 `Group::declined`）：
+    /// 界面据此把那枚收件人胶囊标成「已拒绝加入」。
+    pub declined: Vec<String>,
     pub messages: Vec<GroupMsgView>,
     pub read_pos: Option<String>,
     pub unread: u32,
@@ -1344,7 +1533,7 @@ pub struct GroupView {
     pub missing: u32,
 }
 
-fn view_of(group: &Group, convo: Option<&GroupConvo>, own_id: &str) -> GroupView {
+fn view_of(group: &Group, convo: Option<&GroupConvo>, own_id: &str, blobs_root: &std::path::Path) -> GroupView {
     let empty = GroupConvo::default();
     let convo = convo.unwrap_or(&empty);
     let others: Vec<Member> = group.members.iter().filter(|m| m.id != own_id).cloned().collect();
@@ -1372,6 +1561,11 @@ fn view_of(group: &Group, convo: Option<&GroupConvo>, own_id: &str) -> GroupView
                 from_me,
                 delivery: if from_me { m.delivery.clone() } else { HashMap::new() },
                 read_count,
+                image: m.image,
+                name: m.name.clone(),
+                size: m.size,
+                // 图片内容文件**本机此刻**在哪（不进 `groups.json`：换台机器就错了）。
+                path: content_path(blobs_root, m),
             }
         })
         .collect();
@@ -1381,6 +1575,7 @@ fn view_of(group: &Group, convo: Option<&GroupConvo>, own_id: &str) -> GroupView
         rev: group.rev,
         created_by: group.created_by.clone(),
         members: others,
+        declined: group.declined.clone(),
         messages,
         read_pos: convo.read_pos.clone(),
         unread: unread_in(convo, own_id),
@@ -1529,17 +1724,102 @@ pub fn dismiss(state: &Arc<AppState>, group_id: &str) -> bool {
 ///
 /// 每台各投一份（无组播）：有长连接就写它；够不着的**排队等它上线**（与一对一同一套，由
 /// `chat::flush_queued` 按原顺序发出去）；对端明确拒绝的落「未送达」，不发第二次。
-pub fn send_text(state: &Arc<AppState>, group_id: &str, text: &str) -> Option<String> {
-    let own_id = state.config.lock().device_id.clone();
-    let own_name = state.config.lock().device_name.clone();
+///
+/// `at` = 点名这条消息在时间线上的位置（只有输入区"图文混排"的每一段会点名，见
+/// `chat::send_text` 的同名参数）。**`seq` 仍然由这里按序发**（同一个发送方说话的先后），
+/// 所以点名 `at` 之后排序键（`at`，`seq`）照样是稳的。
+pub fn send_text(state: &Arc<AppState>, group_id: &str, text: &str, at: Option<u64>) -> Option<String> {
+    let (own_id, own_name) = own_ids(state);
+    let group = sendable_group(state, group_id, &own_id)?;
+    let at = at.unwrap_or_else(now_ms);
+    let msg = send_group_msg(
+        state,
+        &group,
+        &own_id,
+        text,
+        at,
+        |msg| group_event_with(&group, &own_id, &own_name, msg, vec![own_id.clone()], String::new()),
+        None,
+    );
+    Some(msg.id)
+}
+
+/// 在群里发一张**图片消息**（输入框里粘一张图就是走这一条）。
+///
+/// 与 `send_text` 同一个口径（每台各投一份、够不着的排队、对端明确拒绝的落「未送达」），
+/// 区别只在内容换成那张图：**图片是消息内容，不是文件** —— 对端直接就能看，没有"接收 /
+/// 同意"那一步（与一对一那条路同一套语义，见 `crate::blobs`）。
+///
+/// 发送方自己那份内容先落下来（补发、重启、给别人补拉都要用它）。`Err` 只有两种：
+/// 内容超过上限、或落盘失败 —— `Ok(None)` = 本机不在这个群里。
+pub fn send_image(
+    state: &Arc<AppState>,
+    group_id: &str,
+    name: &str,
+    bytes: &[u8],
+    at: Option<u64>,
+) -> Result<Option<String>, String> {
+    if bytes.len() as u64 > crate::blobs::MAX_IMAGE_BYTES {
+        return Err(format!(
+            "这张图 {}，超过了会话里能发的上限（{} MB）—— 用「＋」当文件发过去",
+            crate::chat::human_size(bytes.len() as u64),
+            crate::blobs::MAX_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    let (own_id, own_name) = own_ids(state);
+    let Some(group) = sendable_group(state, group_id, &own_id) else {
+        return Ok(None);
+    };
+    let at = at.unwrap_or_else(now_ms);
+    let id = uuid::Uuid::new_v4().to_string();
+    crate::blobs::save_in(state.groups.blobs_root(), &id, name, bytes)?;
+    // 内容编一次，各台共用（`send_group_msg` 里那个闭包只叫一次）。
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let msg = send_group_msg(
+        state,
+        &group,
+        &own_id,
+        crate::blobs::Content::image(name, bytes.len() as u64),
+        at,
+        |msg| group_event_with(&group, &own_id, &own_name, msg, vec![own_id.clone()], data.clone()),
+        Some(&id),
+    );
+    Ok(Some(msg.id))
+}
+
+/// 本机的身份（id 与设备名）。
+fn own_ids(state: &AppState) -> (String, String) {
+    let c = state.config.lock();
+    (c.device_id.clone(), c.device_name.clone())
+}
+
+/// 这个群此刻能不能发消息（本机在名册里、且没退出）。
+fn sendable_group(state: &AppState, group_id: &str, own_id: &str) -> Option<Group> {
     let group = state.groups.group(group_id)?;
-    if group.left || !group.is_member(&own_id) {
+    if group.left || !group.is_member(own_id) {
         return None;
     }
-    let at = now_ms();
-    let id = uuid::Uuid::new_v4().to_string();
+    Some(group)
+}
+
+/// 群消息的公共那一半：规划每台的初态 → 落账（拿 `seq`）→ 长连接当场发、写不进去的交给
+/// 后台那一跳、要排队的那几台叫一次补发。
+///
+/// `event_of` 按**落账后**的那条消息造事件（图片那一档要用到内容字节，所以由调用方给）；
+/// `pre_id` 非空时用它当消息 id（图片那一档要提前把内容落到那个 id 上）。
+fn send_group_msg(
+    state: &Arc<AppState>,
+    group: &Group,
+    own_id: &str,
+    content: impl Into<crate::blobs::Content>,
+    at: u64,
+    event_of: impl FnOnce(&GroupMsg) -> WsEvent,
+    pre_id: Option<&str>,
+) -> GroupMsg {
+    let group_id = group.id.as_str();
     let queued_group = state.groups.has_queued(group_id);
-    let targets = group.others(&own_id);
+    let targets = group.others(own_id);
     let mut deliveries: Vec<(String, Delivery)> = Vec::new();
     let mut inflight: Vec<String> = Vec::new();
     let mut needs_flush: Vec<String> = Vec::new();
@@ -1554,15 +1834,17 @@ pub fn send_text(state: &Arc<AppState>, group_id: &str, text: &str) -> Option<St
         deliveries.push((peer.clone(), Delivery::Sending));
         inflight.push(peer.clone());
     }
-    let msg = state.groups.record_outbound(group_id, &id, &own_id, text, at, &deliveries);
-    // 落账之后才有 seq：长连接那条路当场发（写成功 = 已送达），写不进去的交给后台那一跳。
+    let id = pre_id.map(str::to_string).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let msg = state.groups.record_outbound(group_id, &id, own_id, content, at, &deliveries);
+    // 落账之后才有 seq：事件在这之后造（内容也只编一次）。
+    let event = event_of(&msg);
+    // 长连接那条路当场发（写成功 = 已送达），写不进去的交给后台那一跳。
     let mut settled: Vec<(String, Delivery)> = Vec::new();
     for peer in &targets {
         if !inflight.contains(peer) {
             continue;
         }
-        let event = group_text_event(&group, &own_id, &own_name, &msg.id, text, at, msg.seq, vec![own_id.clone()]);
-        if state.ws.send(peer, event) {
+        if state.ws.has_connection(peer) && state.ws.send(peer, event.clone()) {
             settled.push((peer.clone(), Delivery::Sent));
             state.groups.mark_told(group_id, peer);
         }
@@ -1574,15 +1856,14 @@ pub fn send_text(state: &Arc<AppState>, group_id: &str, text: &str) -> Option<St
         if settled.iter().any(|(p, _)| p == &peer) {
             continue;
         }
-        let event = group_text_event(&group, &own_id, &own_name, &msg.id, text, at, msg.seq, vec![own_id.clone()]);
-        spawn_group_event(state, &peer, event, Some((group_id.to_string(), msg.id.clone())));
+        spawn_group_event(state, &peer, event.clone(), Some((group_id.to_string(), msg.id.clone())));
     }
     for peer in needs_flush {
         crate::chat::flush_queued(state, &peer);
     }
     emit(state);
     debug!(group = %group_id, msg = %msg.id, seq = msg.seq, targets = targets.len(), "group outbound recorded");
-    Some(msg.id)
+    msg
 }
 
 /// 本机读过这个群：读位推进到最新那条，并给每个成员回一条**逐发送者水位**的已读回执。
@@ -1729,7 +2010,22 @@ pub async fn flush_one(state: &Arc<AppState>, peer_id: &str, group_id: &str, msg
         }
     }
     let own = own_info(state);
-    let event = group_text_event(group, &own.id, &own.name, &msg.id, &msg.text, msg.at, msg.seq, vec![msg.from.clone()]);
+    // 图片那一档要回盘上取内容：取不到（被裁剪过 / 写了一半）就别发 —— 这一份落「未送达」
+    // 并往下走（与一对一 `flush_queued` 同一档处理），别把一条只有标题的图片塞给对端，
+    // 也别让它卡在「排队」里带着后面的消息一起等。
+    let data = if msg.image {
+        match image_data(state.groups.blobs_root(), msg) {
+            Some(data) => data,
+            None => {
+                warn!(group = %group_id, msg = %msg.id, "这一份的内容不在了，落未送达");
+                settle_group(state, group_id, &msg.id, peer_id, Outcome::Rejected);
+                return FlushStep::Advanced;
+            }
+        }
+    } else {
+        String::new()
+    };
+    let event = group_event_with(group, &own.id, &own.name, msg, vec![msg.from.clone()], data);
     let outcome = crate::chat::deliver(state, peer_id, &event).await;
     if outcome == Outcome::Unreachable {
         return FlushStep::Blocked;
@@ -1744,30 +2040,34 @@ pub async fn flush_one(state: &Arc<AppState>, peer_id: &str, group_id: &str, msg
     }
 }
 
-/// 群消息的线上事件。
+/// 造一条群消息的线上事件（文字与图片同一份：图片多带内容那几个字段）。
 ///
-/// `reached` 从**作者自己**起算：收到的人据此跳过"已经有人送过"的成员（作者自己当然也在
-/// 里面 —— 谁都不该把它转回给作者）。
-fn group_text_event(
+/// **每次都从这里造**（不是把消息原样发出去）：`reached` 从**作者自己**起算（收到的人据此
+/// 跳过"已经有人送过"的成员）、`hops` 是这一跳的。`data` 是图片的内容（base64；文字消息给
+/// 空串）—— 由调用方给：发送那一刻内容在手里，补发那一刻得回 `blobs` 取（取不到就别发，
+/// 见 `flush_one`）。
+fn group_event_with(
     group: &Group,
     own_id: &str,
     own_name: &str,
-    id: &str,
-    text: &str,
-    at: u64,
-    seq: u64,
+    msg: &GroupMsg,
     reached: Vec<String>,
+    data: String,
 ) -> WsEvent {
     WsEvent::GroupText {
         group_id: group.id.clone(),
-        id: id.to_string(),
-        text: text.to_string(),
-        at,
-        seq,
+        id: msg.id.clone(),
+        text: msg.text.clone(),
+        at: msg.at,
+        seq: msg.seq,
         rev: group.rev,
         author: PeerInfo { id: own_id.to_string(), name: own_name.to_string() },
         hops: 0,
         reached,
+        image: msg.image,
+        name: msg.name.clone(),
+        size: msg.size,
+        data,
     }
 }
 
@@ -1800,24 +2100,114 @@ fn resolve_members(state: &AppState, ids: &[String], own_id: &str) -> Vec<Member
 // 入站（`ws::session::handle_inbound` 与 HTTP 兜底两条路共用）
 // ---------------------------------------------------------------------------
 
+/// 收方**明确拒收**这条群消息的理由（线上代码，界面自己翻成人话）。
+///
+/// 为什么要有理由而不只是一个"没收到"：长连接那条路是"写成功 = 已送达"，收方丢弃时若只
+/// 闷着，发送方会一直显示**已送达**（比"没提示"更糟）。反过来还得让发送方分得清"它明确
+/// 拒绝了加入"与"它压根不知道这个群" —— 前一种要在那枚收件人胶囊上标出来（用户要的就是
+/// 这个），后一种只是这一次没送成。
+pub const REASON_DECLINED: &str = "declined";
+/// 本机从没见过这个群的名册（对方以为告诉过本机，本机这边没有）。
+pub const REASON_UNKNOWN: &str = "unknown";
+/// 这一帧的发送方不在名册里（P1-7 防冒名）。
+pub const REASON_NOT_MEMBER: &str = "not_member";
+
+/// 收到一条群消息之后，本机到底把它放哪儿了。
+///
+/// **只有这一档需要回话**（其余入站事件没有回执）：`accepted()` 为假时，调用方要把理由
+/// 反向告诉发送方（长连接那侧由 `reject_text` 回一条 `group_text_rejected`，HTTP 那侧另有
+/// 409 兜底）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupTextOutcome {
+    /// 落进群里了（`false` 那一支见 `record_inbound` 的去重）。
+    Recorded,
+    /// 名册挂着（邀请卡还没点）：**先攒着**，消息没丢 —— 对发送方算送达。
+    Buffered,
+    /// 本机明确拒绝过这个群（用户点过「不加入」）。
+    Dismissed,
+    /// 本机压根不认识这个群（名册没到 / 早删了）。
+    Unknown,
+    /// 这一帧的发送方不在名册里：丢掉（P1-7）。
+    NotMember,
+}
+
+impl GroupTextOutcome {
+    /// 这条收下了吗（收下了就别回头去reject）。
+    pub fn accepted(self) -> bool {
+        matches!(self, Self::Recorded | Self::Buffered)
+    }
+
+    /// 拒收的理由代码（`accepted()` 为真时没有意义）。
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Dismissed => REASON_DECLINED,
+            Self::Unknown => REASON_UNKNOWN,
+            _ => REASON_NOT_MEMBER,
+        }
+    }
+}
+
 /// 收到一条群消息。
-pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -> bool {
+pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -> GroupTextOutcome {
     let own_id = state.config.lock().device_id.clone();
-    // **本帧的对端必须是这个群的成员**（P1-7）：群消息允许未配对设备发（成员不必配对），
-    // 于是"谁都能往群里塞字"这件事只能靠这一条挡 —— 原来只校验自称的作者在名册里，
-    // 任何局域网主机都能拿一个真实成员的 id 冒名发言（信封上写自己）。
-    // 中转（F-100）那一跳的发送者也是成员，所以正常路径不受影响；被移出的人同样进不来。
+    // 本机**拒绝过**这个群：这一条不管谁发来的都收不下 —— 理由如实说（`declined`），发送方
+    // 才知道该把那台设备标出来（"一直显示已送达"就是这么来的）。
     //
-    // 两种"成员"都算：名册已经落库的，以及**挂着还没加入**那张邀请卡上的（后者也要能收消息，
-    // 否则 F-97 的"挂着期间先攒着"就没了）。
-    if !state.groups.is_member(&event.group_id, peer_id)
-        && !state.groups.pending_has_member(&event.group_id, peer_id)
-    {
+    // **要放在下面那道成员闸门之前**：点「不加入」的那一刻邀请卡就撤了，本机手上没有这个群
+    // 的任何名册可查 —— 落进成员闸门只会回一句没有信息量的"你不是成员"，发送方那边既不知道
+    // 是拒绝、也不知道该标谁。代价是：知道群 id 的局域网主机能问出"这台拒绝过这个群"这一个
+    // 布尔值（群 id 是 UUID，且这条路一个字都不落库）—— 权衡下来"发送方看得见是哪台拒绝"更重要。
+    if state.groups.is_dismissed(&event.group_id) {
+        debug!(group = %event.group_id, %peer_id, "群消息被拒收：本机拒绝过这个群");
+        return GroupTextOutcome::Dismissed;
+    }
+    // 本机不在这个群里：**先分档**，再看这一帧值不值得收 ——
+    // 拒绝过 / 名册没到 / 已被移出，对发送方是三种不同的理由（只有第一种要在界面上标红）。
+    if !state.groups.is_member(&event.group_id, &own_id) {
+        // 攒之前照样要认人：只有**名册里**（或挂着那张邀请卡上）的人**直发**的才攒 ——
+        // 否则谁都能往别人的邀请卡里塞满 50 条垃圾，把真消息挤出去。
+        //（中转（F-100）来的那一条这里收不了：作者是不是成员要拿手上的名册验，而本机手上
+        //  连这个群的名册都没有 —— 与改动前的行为一致。）
+        let sender_ok = (event.sender_id.is_empty() || event.sender_id == peer_id)
+            && (state.groups.pending_has_member(&event.group_id, peer_id)
+                || state.groups.members(&event.group_id).iter().any(|m| m == peer_id));
+        if !sender_ok {
+            warn!(
+                group = %event.group_id, %peer_id,
+                "群消息被丢弃：这帧的发送者不在名册（也不在挂着的邀请卡）里"
+            );
+            return GroupTextOutcome::NotMember;
+        }
+        // 名册已经到、只是**用户还没点「加入」**：先攒着（点了加入并进会话，点了不加入跟着丢）。
+        // 攒下 = 对发送方算送达（它会在本机点「加入」那一刻出现），所以这一档不回拒收。
+        let name = display_name(state, peer_id, &event.sender_name);
+        stage_group_content(state, &event);
+        if state.groups.buffer_pending_message(
+            &event.group_id,
+            peer_id,
+            &name,
+            &event.id,
+            event_content(&event),
+            event.at,
+            event.seq,
+        ) {
+            debug!(group = %event.group_id, %peer_id, "邀请还没确认：先把这条群消息攒着");
+            return GroupTextOutcome::Buffered;
+        }
+        // 连邀请卡都没有（名册没到、或本机早被移出）：这条无处可放 —— **要明说**，别让发送方
+        // 那边显示「已送达」（长连接那条路"写成功"就是这个假象的来源）。
+        debug!(group = %event.group_id, %peer_id, "群消息被拒收：本机不在这个群里（名册没到或已被移出）");
+        return GroupTextOutcome::Unknown;
+    }
+    // 本机是成员：这一帧的**发送方必须是成员**（P1-7）—— 群消息允许未配对设备发
+    // （成员不必配对），于是"谁都能往群里塞字"这件事只能靠这一条挡。
+    // 中转（F-100）那一跳的发送者也是成员，所以正常路径不受影响；被移出的人同样进不来。
+    if !state.groups.is_member(&event.group_id, peer_id) {
         warn!(
             group = %event.group_id, %peer_id,
-            "群消息被丢弃：这帧的发送者不在名册（也不在挂着的邀请卡）里"
+            "群消息被丢弃：这帧的发送者不在名册里"
         );
-        return false;
+        return GroupTextOutcome::NotMember;
     }
     // 作者是谁：直发时就是本帧的对端；**中转来的**那一条作者是别人（搬运工才是本帧对端）——
     // 载荷里自称的那个 id 只在它确实是名册成员时才采信，否则谁都能借一台成员设备往群里冒名塞字。
@@ -1832,38 +2222,26 @@ pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -
             %peer_id,
             "群消息被丢弃：自称的作者既不是本帧对端、也不在名册里"
         );
-        return false;
+        return GroupTextOutcome::NotMember;
     };
     let name = display_name(state, &author, &event.sender_name);
-    if !state.groups.is_member(&event.group_id, &own_id) {
-        // 名册已经到、只是**用户还没点「加入」**：先攒着（点了加入并进会话，点了不加入跟着丢）。
-        if state.groups.buffer_pending_message(
-            &event.group_id,
-            &author,
-            &name,
-            &event.id,
-            &event.text,
-            event.at,
-            event.seq,
-        ) {
-            debug!(group = %event.group_id, %author, "邀请还没确认：先把这条群消息攒着");
-        } else {
-            // 连邀请卡都没有（名册没到）或本机拒绝过：这条无处可放。
-            debug!(group = %event.group_id, %author, "群消息被丢弃：本机不在这个群里（名册没到或已拒绝）");
-        }
-        return false;
-    }
+    // 图片消息：**先把内容落下来**（攒着的那一档上面那条路也落过一次；重投是幂等的）。
+    // 落不下（解码失败 / id 不可用 / 超上限）就把这一条当**没有内容的图片消息**收下：
+    // 界面那条气泡会写"读不出来"，比整条丢掉诚实，也比闷着不说强。
+    stage_group_content(state, &event);
+    let content = event_content(&event);
     let inserted = state.groups.record_inbound(
         &event.group_id,
         &author,
         &name,
         &event.id,
-        &event.text,
+        content.clone(),
         event.at,
         event.seq,
     );
     if !inserted {
-        return false;
+        // 重复投递（补发/重连重投）：这条早就在群里了，对发送方**算收下** —— 别拿它回一条拒收。
+        return GroupTextOutcome::Recorded;
     }
     emit(state);
     // 这位发送方身上**还缺着号**（中间那条没到手）：唯一能当场看见的缺口信号 —— 直接问作者。
@@ -1872,7 +2250,42 @@ pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -
         sync_with(state, &event.group_id, &author);
     }
     maybe_relay(state, &own_id, &author, &name, &event);
-    true
+    GroupTextOutcome::Recorded
+}
+
+/// 把"这一条我收不下"反向告诉发送方（长连接优先、HTTP 兜底）。
+///
+/// 只由拒收那一档调用（`GroupTextOutcome::accepted()` 为假）。**必须真的发出去**：
+/// 发送方那边那条消息的状态就靠它从「已送达」改判成「未送达」，`declined` 那一种还要在
+/// 收件人胶囊上标红 —— 收方闷着不说的后果是"看起来送到了，其实一个字没进去"。
+///
+/// 长连接那条路上，这条回执走的就是**同一条链路**（对端刚用它把消息送过来），所以
+/// "写成功"在这里是可信的；HTTP 兜底那一跳要反拨发送方（地址是它这一次连接时留下的，
+/// 经中转来的那些对端不会留下地址 —— 那种情形这条回执会发不出去，此时发送方至少还有
+/// 409 那个状态码兜底，只是拿不到理由）。
+pub fn reject_text(state: &Arc<AppState>, peer_id: &str, group_id: &str, msg_id: &str, reason: &str) {
+    let event = WsEvent::GroupTextRejected {
+        group_id: group_id.to_string(),
+        id: msg_id.to_string(),
+        reason: reason.to_string(),
+    };
+    let (state, peer) = (state.clone(), peer_id.to_string());
+    crate::task::spawn("group reject", async move {
+        let outcome = crate::chat::deliver(&state, &peer, &event).await;
+        if outcome != Outcome::Delivered {
+            debug!(%peer, ?outcome, "群消息的拒收回执没送出去");
+        }
+    });
+}
+
+/// 收到"这一条我收不下"（`GroupTextRejected`）：那一份落「未送达」；理由是"本机拒绝过"时，
+/// 还要把这位成员记进 `declined`（界面上那枚胶囊就是靠它变红）。
+pub fn on_group_text_rejected(state: &Arc<AppState>, peer_id: &str, group_id: &str, msg_id: &str, reason: &str) {
+    let declined = reason == REASON_DECLINED;
+    if state.groups.mark_rejected(group_id, msg_id, peer_id, declined) {
+        debug!(group = %group_id, msg = %msg_id, %peer_id, %reason, "对端拒收了这条群消息");
+        emit(state);
+    }
 }
 
 /// 跨网段那一档：把这条消息转给"本机够得着、而这一路上还没经手过"的成员。
@@ -1914,6 +2327,12 @@ fn maybe_relay(state: &Arc<AppState>, own_id: &str, author: &str, author_name: &
             author: PeerInfo { id: author.to_string(), name: author_name.to_string() },
             hops: event.hops + 1,
             reached: reached.clone(),
+            // 图片消息那几格**原样搬**（内容也在 `event.data` 里）—— 中转就是"替别人再送一遍"，
+            // 少带一格就等于替别人丢了一部分消息。
+            image: event.image,
+            name: event.name.clone(),
+            size: event.size,
+            data: event.data.clone(),
         };
         if let Ok(body) = serde_json::to_vec(&ev) {
             relayed_bytes += body.len() as u64;
@@ -2067,6 +2486,8 @@ pub fn on_sync_ask(
         }
     }
     messages.sort_by(|a, b| (a.at, a.from.as_str(), a.seq).cmp(&(b.at, b.from.as_str(), b.seq)));
+    // 这两条来路（`messages_after` / `messages_by_holes`）给的**已经是线上形状**，
+    // 图片消息的内容也在里面了（见 `wire_of`）。
     let roster = state.groups.group(group_id).map(|g| g.payload());
     debug!(group = %group_id, %peer_id, count = messages.len(), has_more, "补拉：把手上有的发回去");
     let event = WsEvent::GroupSyncPost {
@@ -2155,6 +2576,63 @@ pub struct GroupTextIn {
     /// 已被中转了几跳、以及这一路上经手过的成员（见 `MAX_HOPS`）。
     pub hops: u8,
     pub reached: Vec<String>,
+    /// 图片消息那几格（与 `GroupMsg` / `GroupMsgWire` 同一套语义）：内容在 `data` 里。
+    /// 文字消息这一档全是缺省值。
+    pub image: bool,
+    pub name: String,
+    pub size: u64,
+    pub data: String,
+}
+
+/// 造一条落盘的群消息（三处都走它：本机发出的、收到的、以及邀请卡挂着时攒下的）。
+///
+/// 一份 `Content` 挪进消息里之后就读不出它那几格了，所以"拆"这件事只有这一处做。
+fn msg_with(
+    content: crate::blobs::Content,
+    id: &str,
+    from: &str,
+    from_name: &str,
+    at: u64,
+    seq: u64,
+    delivery: HashMap<String, Delivery>,
+) -> GroupMsg {
+    let name = content.image.as_ref().map(|(n, _)| n.clone()).unwrap_or_default();
+    let size = content.image.as_ref().map(|(_, s)| *s).unwrap_or(0);
+    GroupMsg {
+        id: id.to_string(),
+        from: from.to_string(),
+        from_name: from_name.to_string(),
+        text: content.text,
+        at,
+        seq,
+        delivery,
+        image: content.image.is_some(),
+        name,
+        size,
+    }
+}
+
+/// 一条入站群消息的**内容**（图片那一档带名字与字节数，文字的就是那段字）。
+fn event_content(event: &GroupTextIn) -> crate::blobs::Content {
+    if event.image {
+        crate::blobs::Content::image(event.name.clone(), event.size)
+    } else {
+        crate::blobs::Content::text(event.text.clone())
+    }
+}
+
+/// 图片消息：把内容落下来（两条存储路都先叫它：攒着的那一档与直接记账那一档）。
+///
+/// 落不下就**只记一行日志**、照样把这条消息收下（当"没有内容的图片消息"）：收方这边没有
+/// 回话通道（群消息的拒收回执说的是"这个群我收不下"，不是"这张图解不开"），而丢整条会让
+/// 用户以为消息没了 —— 一条写"读不出来"的气泡更诚实。
+fn stage_group_content(state: &AppState, event: &GroupTextIn) {
+    if !event.image || event.data.is_empty() {
+        return;
+    }
+    if let Err(reason) = crate::blobs::save_base64(state.groups.blobs_root(), &event.id, &event.name, &event.data) {
+        warn!(group = %event.group_id, id = %event.id, %reason, "群里的图片内容没能落下来");
+    }
 }
 
 /// 显示名：**本机设备表优先**（长连接是 token 换来的身份；载荷里自称的名字只在没见过时用）——
@@ -2175,10 +2653,11 @@ mod tests {
     use super::*;
 
     fn store(name: &str) -> GroupStore {
-        let path = std::env::temp_dir().join(format!("orbdrop_group_{name}_{}", uuid::Uuid::new_v4()));
-        let store = GroupStore::with_path(path.clone());
-        let _ = std::fs::remove_file(path);
-        store
+        // 每个用例自己**一个目录**：图片消息的内容目录是从 `groups.json` 的位置推出来的
+        // （见 `with_path`），共用一个临时目录的话，并行跑的几条会互相删对方的内容。
+        let dir = std::env::temp_dir().join(format!("orbdrop_group_{name}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        GroupStore::with_path(dir.join("groups.json"))
     }
 
     fn roster(id: &str, rev: u64, by: &str, members: &[&str]) -> RosterPayload {
@@ -2201,6 +2680,102 @@ mod tests {
 
     fn member(id: &str) -> Member {
         Member { id: id.to_string(), name: id.to_uppercase() }
+    }
+
+    /// 建一个"本机已加入"的群（本机 + a + b）。
+    fn joined(s: &GroupStore, group_id: &str) -> Group {
+        s.apply_roster("me", &roster(group_id, 1, "a", &["a", "me", "b"]), &inviter());
+        s.accept_pending(group_id, "me");
+        s.group(group_id).unwrap()
+    }
+
+    /// 群里的图片消息：内容落在**自己的**目录里、视图里带本机那份路径、收到的按 `(from,id)` 幂等。
+    #[test]
+    fn a_group_image_keeps_its_content_and_its_path() {
+        let s = store("image_round_trip");
+        joined(&s, "g1");
+        let written = crate::blobs::save_in(s.blobs_root(), "img-1", "图片-1.png", b"PNGDATA").unwrap();
+        let msg = s.record_outbound(
+            "g1",
+            "img-1",
+            "me",
+            crate::blobs::Content::image("图片-1.png", 7),
+            100,
+            &[(String::from("a"), Delivery::Sent)],
+        );
+        assert_eq!(msg.seq, 1);
+        assert!(msg.image);
+        let view = s.view("g1", "me").unwrap();
+        let m = &view.messages[0];
+        assert!(m.image && m.name == "图片-1.png" && m.size == 7);
+        assert_eq!(m.path, written.to_string_lossy(), "视图里给的是本机那份内容文件");
+
+        // 收到的同一条（重投第二次不写第二条）。
+        assert!(s.record_inbound("g1", "a", "PC-A", "img-2", crate::blobs::Content::image("图片-2.png", 3), 200, 1));
+        assert!(!s.record_inbound("g1", "a", "PC-A", "img-2", crate::blobs::Content::image("图片-2.png", 3), 200, 1));
+        assert_eq!(s.view("g1", "me").unwrap().messages.len(), 2);
+    }
+
+    /// 补拉：发回去的那几条**带上内容**；收方按 `(from,id)` 并进来，内容也落下来。
+    #[test]
+    fn a_sync_answer_carries_the_content_both_ways() {
+        let mine = store("sync_serve");
+        joined(&mine, "g1");
+        crate::blobs::save_in(mine.blobs_root(), "img-1", "图片.png", b"DATA").unwrap();
+        mine.record_inbound("g1", "a", "PC-A", "img-1", crate::blobs::Content::image("图片.png", 4), 100, 1);
+
+        let (wire, _) = mine.messages_after("g1", 0, 10);
+        assert_eq!(wire.len(), 1);
+        assert!(wire[0].image);
+        assert_eq!(wire[0].name, "图片.png");
+        assert_eq!(wire[0].data, "REFUQQ==", "base64(DATA)");
+
+        // 收方：内容落下来、那条消息也进来了（`path` 指得到那份文件）。
+        let theirs = store("sync_take");
+        joined(&theirs, "g1");
+        let acked = theirs.apply_sync("g1", "me", &wire);
+        assert_eq!(acked.len(), 1, "确实新增了一条");
+        let view = theirs.view("g1", "me").unwrap();
+        let m = &view.messages[0];
+        assert!(m.image, "补回来的这条也是图片消息");
+        assert!(m.path.ends_with("img-1.png"), "内容落到了本机：{}", m.path);
+        assert!(std::path::Path::new(&m.path).is_file());
+    }
+
+    /// 退群 / 不加入：那条会话（或攒着的那几条）连同里面的图片内容一起走 —— 别把盘留脏。
+    #[test]
+    fn leaving_or_dismissing_drops_the_content() {
+        let s = store("image_gc");
+        joined(&s, "g1");
+        let kept = crate::blobs::save_in(s.blobs_root(), "img-1", "图片.png", b"DATA").unwrap();
+        s.record_outbound("g1", "img-1", "me", crate::blobs::Content::image("图片.png", 4), 100, &[]);
+        assert!(kept.exists());
+
+        // 攒着的那几条（邀请卡还挂着）也要能被清掉。
+        s.apply_roster("me", &roster("g2", 1, "a", &["a", "me"]), &inviter());
+        let buffered = crate::blobs::save_in(s.blobs_root(), "img-2", "图片.png", b"DATA").unwrap();
+        assert!(s.buffer_pending_message("g2", "a", "PC-A", "img-2", crate::blobs::Content::image("图片.png", 4), 100, 1));
+        assert!(buffered.exists());
+
+        // 「不加入」→ 攒着的那条跟着丢。
+        s.dismiss_pending("g2");
+        assert!(!buffered.exists(), "不加入：攒着的那条内容也要删");
+        // 退群 → 那条会话的内容跟着丢。
+        s.leave("g1", "me");
+        assert!(!kept.exists(), "退群：会话里的内容也要删");
+        assert!(s.image_ids().is_empty(), "引用表空了");
+    }
+
+    /// 启动扫孤儿看的引用表要**两份账本合起来**（这里只看群这一半：会话里 + 还攒着的）。
+    #[test]
+    fn image_ids_cover_the_convo_and_the_buffered_ones() {
+        let s = store("image_ids");
+        joined(&s, "g1");
+        s.record_outbound("g1", "img-1", "me", crate::blobs::Content::image("图片.png", 4), 100, &[]);
+        s.apply_roster("me", &roster("g2", 1, "a", &["a", "me"]), &inviter());
+        s.buffer_pending_message("g2", "a", "PC-A", "img-2", crate::blobs::Content::image("图片.png", 4), 100, 1);
+        let ids = s.image_ids();
+        assert!(ids.contains("img-1") && ids.contains("img-2"), "{ids:?}");
     }
 
     /// 没见过的群 → 一张邀请卡（不是正式的群）；用户点了「加入」才成为群。
@@ -2544,9 +3119,14 @@ mod tests {
             sender_name: "PC-A".into(),
             hops: 0,
             reached: Vec::new(),
+            image: false,
+            name: String::new(),
+            size: 0,
+            data: String::new(),
         };
-        assert!(
-            !on_group_text(&state, "c", forged),
+        assert_eq!(
+            on_group_text(&state, "c", forged),
+            GroupTextOutcome::NotMember,
             "冒充成员发言要丢掉"
         );
         assert!(
@@ -2566,8 +3146,12 @@ mod tests {
             sender_name: "PC-A".into(),
             hops: 0,
             reached: Vec::new(),
+            image: false,
+            name: String::new(),
+            size: 0,
+            data: String::new(),
         };
-        assert!(on_group_text(&state, "a", real), "成员发言照旧收下");
+        assert_eq!(on_group_text(&state, "a", real), GroupTextOutcome::Recorded, "成员发言照旧收下");
 
     }
 
@@ -2610,8 +3194,12 @@ mod tests {
             sender_name: "PC-A".into(),
             hops: 0,
             reached: Vec::new(),
+            image: false,
+            name: String::new(),
+            size: 0,
+            data: String::new(),
         };
-        assert!(on_group_text(&state, "a", inbound), "成员发的这条要收下");
+        assert_eq!(on_group_text(&state, "a", inbound), GroupTextOutcome::Recorded, "成员发的这条要收下");
 
         let traffic = state.relay_traffic_json();
         let bytes = traffic["bytes"].as_u64().expect("字节数是数");
@@ -2786,6 +3374,10 @@ mod tests {
                 text: "二".into(),
                 at: 200,
                 seq: 2,
+                image: false,
+                name: String::new(),
+                size: 0,
+                data: String::new(),
             }],
         );
         assert_eq!(acked, vec![("a".to_string(), 200)], "新增的那条要回执给作者");
@@ -2813,6 +3405,10 @@ mod tests {
                 text: "早先说的".into(),
                 at: 100,
                 seq: 1,
+                image: false,
+                name: String::new(),
+                size: 0,
+                data: String::new(),
             }],
         );
         assert_eq!(s.ask_payload(&gid, "me"), Some((100, Vec::new())), "之后按锚点问");
@@ -3008,5 +3604,184 @@ mod tests {
         assert!(s.leave(&first, &me.id).is_some());
         let rebuilt = s.create(me.clone(), vec![member("b"), member("c")], "重建");
         assert_ne!(rebuilt, first, "退过的群不复用");
+    }
+
+    // ── 拒收（F-98 那一档）────────────────────────────────────────────────
+
+    /// 收方说"这一条我收不下"（`declined`）：那一份从「已送达」改判成「未送达」，并记进
+    /// `declined` —— 收件人那一排就是靠它变红的。**名册一个字都不动**。
+    #[test]
+    fn a_declined_member_is_marked_but_stays_on_the_roster() {
+        let s = store("declined");
+        let gid = s.create(member("me"), vec![member("a"), member("b")], "");
+        // 长连接那条路：写成功就落「已送达」（这正是要被拒收纠正的那种状态）。
+        s.record_outbound(&gid, "m1", "me", "在吗", 100, &[
+            (String::from("a"), Delivery::Sent),
+            (String::from("b"), Delivery::Sent),
+        ]);
+        assert!(s.mark_rejected(&gid, "m1", "a", true));
+        let view = s.view(&gid, "me").unwrap();
+        assert_eq!(view.messages[0].delivery.get("a"), Some(&Delivery::Failed), "被拒的那份改判未送达");
+        assert_eq!(view.messages[0].delivery.get("b"), Some(&Delivery::Sent), "别人不受影响");
+        assert_eq!(view.declined, vec!["a".to_string()], "界面要能看见是哪一台");
+        assert!(
+            view.members.iter().any(|m| m.id == "a"),
+            "名册不动：拒绝是本机的观察，替所有人改名单要跟 LWW 打架"
+        );
+        // 同一条又来一次（重复投递）：不重复记、也不重复报改动。
+        assert!(!s.mark_rejected(&gid, "m1", "a", true), "第二次没有新东西可改");
+
+        // 落盘要带着它（重启后那枚胶囊还是红的）。
+        let reloaded = GroupStore::with_path(s.path.clone());
+        assert_eq!(reloaded.view(&gid, "me").unwrap().declined, vec!["a".to_string()]);
+
+        // 把这台移出名单 → 那一格作废（重新加回来 = 一次新的邀请，得重新看它答不答）。
+        assert!(s.edit_local(&gid, "me", "", vec![member("b")]).is_some());
+        assert!(s.view(&gid, "me").unwrap().declined.is_empty(), "名单里没有它了就不该再标红");
+    }
+
+    /// 老文件（没有 `declined` 那一栏）要照样读得进来：那一栏为空，界面不画红。
+    #[test]
+    fn a_legacy_file_without_the_declined_key_still_loads() {
+        let path = std::env::temp_dir().join(format!("orbdrop_group_legacy_{}", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            r#"{"version":1,"groups":[{"id":"g1","name":"老群","rev":1,"createdBy":"a","updatedBy":"a",
+                "members":[{"id":"a","name":"A"},{"id":"me","name":"ME"}]}],
+                "convos":{"g1":{"messages":[]}}}"#,
+        )
+        .unwrap();
+        let s = GroupStore::with_path(path.clone());
+        let view = s.view("g1", "me").expect("老文件里的群读得出来");
+        assert!(view.declined.is_empty(), "老文件里没人记过拒绝这件事");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 收方点了「不加入」的那个群：下一条群消息**明确拒收**（理由 = `declined`）。
+    ///
+    /// 这条正是"发送方一直显示已送达"的解药 —— 收方闷着不说，长连接那条路写成功就等于
+    /// 送达，界面上看它一切正常。
+    #[tokio::test]
+    async fn a_dismissed_invitee_refuses_the_next_group_message() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_group_refuse_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(crate::config::Config::default(), dir.join("config.toml")));
+        let own = state.config.lock().device_id.clone();
+
+        // 收到一份不认识的名册（邀请卡）→ 用户点「不加入」。
+        assert_eq!(
+            state.groups.apply_roster(&own, &roster("g1", 1, "a", &["a", &own]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.dismiss_pending("g1"));
+        assert!(state.groups.is_dismissed("g1"), "拒绝过就记着（同一份邀请不会再弹）");
+
+        let inbound = |gid: &str, id: &str, text: &str| GroupTextIn {
+            group_id: gid.into(),
+            id: id.into(),
+            text: text.into(),
+            at: 100,
+            seq: 1,
+            rev: 1,
+            sender_id: String::new(),
+            sender_name: "PC-A".into(),
+            hops: 0,
+            reached: Vec::new(),
+            image: false,
+            name: String::new(),
+            size: 0,
+            data: String::new(),
+        };
+        assert_eq!(
+            on_group_text(&state, "a", inbound("g1", "m1", "进来聊聊")),
+            GroupTextOutcome::Dismissed,
+            "拒绝过的群：要明确回话（理由 = 已拒绝加入），不能闷着"
+        );
+        assert_eq!(GroupTextOutcome::Dismissed.reason(), REASON_DECLINED);
+        assert!(!GroupTextOutcome::Dismissed.accepted());
+        assert!(
+            state.groups.messages_after("g1", 0, 50).0.is_empty(),
+            "拒绝过的群不落任何消息"
+        );
+
+        // 邀请还挂着（没点加入）时是另一档：**先攒着**，对发送方算送达（它会在点「加入」那一刻出现）。
+        assert_eq!(
+            state.groups.apply_roster(&own, &roster("g2", 1, "a", &["a", &own]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert_eq!(on_group_text(&state, "a", inbound("g2", "m2", "先攒着")), GroupTextOutcome::Buffered);
+        assert!(GroupTextOutcome::Buffered.accepted());
+        assert_eq!(state.groups.buffered_count("g2"), 1);
+    }
+
+    /// 被移出名单之后：本机不认识这个群里的消息（理由 = `unknown`，**不是**"我拒绝过"）。
+    /// 两档分开才不会把那台设备误标成"已拒绝加入"。
+    #[tokio::test]
+    async fn a_removed_member_refuses_as_unknown_not_as_declined() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_group_removed_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(crate::config::Config::default(), dir.join("config.toml")));
+        let own = state.config.lock().device_id.clone();
+        assert_eq!(
+            state.groups.apply_roster(&own, &roster("g1", 1, "a", &["a", &own, "b"]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.accept_pending("g1", &own));
+        // 名册换了一份**没有本机**的（rev 更大）→ 本机被移出。
+        assert_eq!(
+            state.groups.apply_roster(&own, &roster("g1", 2, "a", &["a", "b"]), &inviter()),
+            RosterOutcome::Updated
+        );
+        let inbound = GroupTextIn {
+            group_id: "g1".into(),
+            id: "m1".into(),
+            text: "还在吗".into(),
+            at: 100,
+            seq: 1,
+            rev: 2,
+            sender_id: String::new(),
+            sender_name: "PC-A".into(),
+            hops: 0,
+            reached: Vec::new(),
+            image: false,
+            name: String::new(),
+            size: 0,
+            data: String::new(),
+        };
+        assert_eq!(on_group_text(&state, "a", inbound), GroupTextOutcome::Unknown);
+        assert_eq!(GroupTextOutcome::Unknown.reason(), REASON_UNKNOWN);
+        assert_ne!(
+            GroupTextOutcome::Unknown.reason(),
+            GroupTextOutcome::Dismissed.reason(),
+            "两档的理由不能混：`declined` 才会在发送方那边把那枚胶囊标红"
+        );
+    }
+
+    /// 收到拒收回执：那一份落「未送达」，`declined` 记进视图（界面那枚胶囊变红的那条路）。
+    #[tokio::test]
+    async fn a_rejection_receipt_settles_the_copy_and_marks_the_member() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_group_reject_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(crate::config::Config::default(), dir.join("config.toml")));
+        let own = state.config.lock().device_id.clone();
+        assert_eq!(
+            state.groups.apply_roster(&own, &roster("g1", 1, "a", &["a", &own]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.accept_pending("g1", &own));
+        state.groups.record_outbound("g1", "m1", &own, "在吗", 100, &[(String::from("a"), Delivery::Sent)]);
+
+        on_group_text_rejected(&state, "a", "g1", "m1", REASON_DECLINED);
+        let view = state.groups.view("g1", &own).unwrap();
+        assert_eq!(view.messages[0].delivery.get("a"), Some(&Delivery::Failed));
+        assert_eq!(view.declined, vec!["a".to_string()]);
+
+        // 别的理由（名册没到那种）只落「未送达」，**不许**把对方标成"已拒绝加入"。
+        state.groups.record_outbound("g1", "m2", &own, "再问一句", 200, &[(String::from("a"), Delivery::Sent)]);
+        on_group_text_rejected(&state, "a", "g1", "m2", REASON_UNKNOWN);
+        let view = state.groups.view("g1", &own).unwrap();
+        let m2 = view.messages.iter().find(|m| m.id == "m2").unwrap();
+        assert_eq!(m2.delivery.get("a"), Some(&Delivery::Failed));
+        assert_eq!(view.declined, vec!["a".to_string()], "理由不是 declined 就不该多记一个");
     }
 }

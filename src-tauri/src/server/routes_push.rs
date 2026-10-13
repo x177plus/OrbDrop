@@ -46,6 +46,10 @@ pub struct InviteBody {
     /// 发送方支持的能力位（见 `WsEvent::PushInvite::caps`）。老对端不带 → 空 → 走老循环。
     #[serde(default)]
     caps: Vec<String>,
+    /// 这批文件在会话时间线上的位置（发送方的墙上时间；见 `WsEvent::PushInvite::at`）。
+    /// 老对端不带 → 0 → 接收侧退回"收到的那一刻"。
+    #[serde(default)]
+    at: u64,
 }
 
 fn one_item() -> usize {
@@ -55,6 +59,15 @@ fn one_item() -> usize {
 #[derive(serde::Serialize)]
 pub struct InviteResponse {
     accepted: bool,
+    /// **邀请已送达、本机等用户点头**（对端带 `await1` 时才有这一档，见
+    /// `push_job::CAP_AWAIT`）：发送方据此继续等，别当拒绝 —— 决定稍后从回执通道
+    /// （`POST /push/report` 或长连接 `push_response`）过去。
+    ///
+    /// 老对端不认识这个字段（也永远不会收到 true）：它那条请求照旧挂着等用户决定。
+    pending: bool,
+    /// 拒绝 / 收不下的原因（原话），发送方卡片上就写这句。老对端忽略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 /// POST /push/invite —— 接收方收到一条推送邀请（F-50 / F-51）。
@@ -63,9 +76,12 @@ pub struct InviteResponse {
 /// ① 同意制 —— 用户点了才会开始传；② 若 sender 自称的是本机**已配对**的设备，
 /// 就必须出示那枚 token，否则等于谁都能冒充你的老搭档给你塞文件。
 ///
-/// 这是个**同步**接口：**未绑定**设备的推送在用户做决定之前，请求一直挂着，决定一下来
-/// 就作为响应回给发送方（长连接那条路走 WS `push_response`）；**已绑定**（已配对）设备
-/// 不问同意，当场开收并立刻回 `accepted: true`。
+/// 决定什么时候回来，看对端是哪一版（邀请体里的 `caps`，见 `push_job::CAP_AWAIT`）：
+/// - 带 `await1`（新版本）→ **投递即回**：这张邀请挂在本机通知列表里等用户点，响应只是
+///   一句"送到了"（`pending`），用户点完的结果从回执通道过去。**没有超时**；
+/// - 老对端 → 这条请求一直挂着等用户决定，到点自动作废，响应就是回执。
+///
+/// **已绑定**（已配对）设备不问同意：当场开收并立刻回 `accepted: true`（两条路一样）。
 pub async fn push_invite_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -85,7 +101,13 @@ pub async fn push_invite_handler(
     }
 
     let invite_id = body.invite_id;
-    info!(%invite_id, sender = %body.sender.name, name = %body.name, paired, "inbound push invite (http)");
+    // `await1` = 发送方是"投递即回"那一版（见 `push_job::CAP_AWAIT`）。哪一端老，看这一行
+    // 最快：**没有**这个位就是对面老 —— 那这条邀请只能按老规矩（60 秒没人处理就作废）办。
+    let await_capable = body.caps.iter().any(|c| c == crate::transfer::push_job::CAP_AWAIT);
+    info!(
+        %invite_id, sender = %body.sender.name, name = %body.name, paired, await1 = await_capable,
+        "inbound push invite (http)"
+    );
 
     crate::ws::emit_ui(&state, crate::ws::events::ui::PUSH_INVITE, &serde_json::json!({
         "inviteId": invite_id,
@@ -95,6 +117,8 @@ pub async fn push_invite_handler(
         "isDir": body.is_dir,
         "count": body.count,
         "auto": paired,
+        // 这条文件消息在会话时间线上的位置（发送方点的）。
+        "at": body.at,
     }));
 
     let mut invite = InboundInvite {
@@ -130,9 +154,21 @@ pub async fn push_invite_handler(
             reject_invite_with(&state, &invite_id, &reason);
             return Err((StatusCode::BAD_REQUEST, reason));
         }
-        return Ok(Json(InviteResponse { accepted: true }));
+        return Ok(Json(InviteResponse { accepted: true, pending: false, reason: None }));
     }
 
+    // 带 `await1` 的对端（新版本）：**投递即算送达**，不在这儿等用户 ——
+    // 它那边一直挂着等回执的话，用户一直不点就等于把一条 HTTP 请求吊死在那儿，
+    // 而"等多久"这件事本来就该由人来定。用户点完，那道决定从回执通道过去
+    // （`/push/report` 或长连接 `push_response`，见 `transfer::reject_shared`）。
+    if invite.supports_await() {
+        state.push.insert_invite(invite);
+        return Ok(Json(InviteResponse { accepted: false, pending: true, reason: None }));
+    }
+
+    // 老对端：那条邀请请求挂着等本机用户的决定，同步响应就是回执（到点自动作废，
+    // 两边必须同时收手 —— 见 `transfer::schedule_invite_timeout`）。
+    info!(%invite_id, "对端没带 await1（老版本）：这条邀请按老规矩办 —— 60 秒没人处理就自动作废");
     let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
     invite.responder = Some(tx);
     state.push.insert_invite(invite);
@@ -143,7 +179,7 @@ pub async fn push_invite_handler(
         Ok(Ok(v)) => v,
         _ => false,
     };
-    Ok(Json(InviteResponse { accepted }))
+    Ok(Json(InviteResponse { accepted, pending: false, reason: None }))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -159,19 +195,28 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 // Sender side: reports from the receiver
 // ---------------------------------------------------------------------------
 
-/// POST /push/report —— 接收方回报进度/完成/失败。
+/// POST /push/report —— 接收方回报**决定**（接收/拒绝）与进度/完成/失败。
 ///
 /// 没有长连接时（已配对未连、未绑定）走这条路：请求体就是 WS 那条路上的
-/// `push_progress` / `push_done` 事件，发送方用同一个 dispatcher 处理。
+/// `push_response` / `push_progress` / `push_done` 事件，发送方用同一个 dispatcher 处理。
+///
+/// `push_response` 是**等报告那一版对端的主要出口**（见 `push_job::CAP_AWAIT`）：邀请投递
+/// 时那条同步响应只说"送到了"，用户点完的结果从这里回来。
 pub async fn push_report_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(event): Json<WsEvent>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let (invite_id, kind) = match &event {
+        WsEvent::PushResponse { invite_id, .. } => (invite_id.clone(), "push_response"),
         WsEvent::PushProgress { invite_id, .. } => (invite_id.clone(), "push_progress"),
         WsEvent::PushDone { invite_id, .. } => (invite_id.clone(), "push_done"),
-        _ => return Err((StatusCode::BAD_REQUEST, "只接受 push_progress / push_done".into())),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "只接受 push_response / push_progress / push_done".into(),
+            ))
+        }
     };
     // 本机可能按两种身份收到这条消息：
     // - 发送方：这条推送是我发出去的（job 在）—— 进度/完成；
@@ -199,7 +244,7 @@ pub async fn push_report_handler(
     let peer_paired = state.get_peer(&sender_id).is_some_and(|p| p.paired);
     authorize(&state, &headers, peer_paired, &sender_id)?;
     info!(%invite_id, kind, "push report (http)");
-    crate::ws::session::handle_inbound(&state, &sender_id, event).await;
+    let _ = crate::ws::session::handle_inbound(&state, &sender_id, event).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -408,7 +453,7 @@ mod tests {
     fn state() -> Arc<AppState> {
         let dir = std::env::temp_dir().join(format!("orbdrop_push_rep_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        Arc::new(AppState::new(crate::config::Config::default(), dir.join("config.toml")))
+        Arc::new(AppState::new(crate::config::test_config(), dir.join("config.toml")))
     }
 
     fn inbound_invite(id: &str, sender: &str) -> crate::transfer::push_job::InboundInvite {
@@ -434,7 +479,7 @@ mod tests {
     #[tokio::test]
     async fn push_report_needs_the_token_of_a_paired_peer() {
         let st = state();
-        let port = crate::server::start_server(st.clone(), 4320)
+        let port = crate::server::start_server_loopback(st.clone(), 4320)
             .await
             .expect("server start");
         crate::credential::set_peer_credential("peer-paired", "tok-paired", &"c".repeat(64))

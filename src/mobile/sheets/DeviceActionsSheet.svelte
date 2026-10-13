@@ -24,20 +24,22 @@
   /** 解除配对：问那一句在 `store.unpair` 里（设备行那颗按钮共用同一个判据），这里只负责收表。 */
   async function unpair(): Promise<void> {
     if (!d) return;
-    if (await store.unpair(d.id, d.name)) onClose();
+    if (await store.unpair(d.id, devices.deviceShortName(d))) onClose();
   }
 </script>
 
 <!-- 这一张表就是移动端的**设备右键菜单**（桌面端那份见 `ContextMenu.svelte` 的 `kind === 'device'`）：
      同一套动作、同一套档位规则，改一处就要对着另一处核一遍 —— 两边分叉过的事已经发生过一次
      （这里曾经给未配对 / 离线的行也摆着「建立长连接」，点了只会被拒；桌面端那两档压根不给）。 -->
-<Sheet title={d?.name ?? ""} desc={d ? `${d.ip}:${d.port}` : ""} label="设备操作" onClose={onClose}>
+<Sheet title={d ? devices.deviceShortName(d) : ""} desc={d ? `${d.ip}:${d.port}` : ""} label="设备操作" onClose={onClose}>
   {#if d}
-    <button class="opt" type="button" onclick={() => store.openSheet({ kind: "renameDevice", peerId: d.id })}>
+    <!-- 备注（F-101）与桌面端右键菜单那一项（`ContextMenu.svelte`「修改备注」）同规：
+         **与在线状态无关**（纯本机数据，离线/未绑定的行照样能改），当前备注就摆在标题里。 -->
+    <button class="opt" type="button" onclick={() => store.openSheet({ kind: "remarkDevice", peerId: d.id })}>
       <span class="oi"><Icon name="settings" /></span>
       <span class="om">
-        <span class="on">重命名</span>
-        <span class="od">修改设备在本机显示的名称。</span>
+        <span class="on">修改备注{d.remark ? ` · ${d.remark}` : ""}</span>
+        <span class="od">给这台设备起一个只存在本机的名字（不发给对端）：设好后这一行显示「备注(设备名)」，会话与标题只写备注本身。</span>
       </span>
     </button>
 
@@ -86,7 +88,7 @@
         <span class="oi"><Icon name="send" /></span>
         <span class="om">
           <span class="on">发消息</span>
-          <span class="od">打开与「{d.name}」的会话：长连接优先、HTTP 兜底，对端不在网上就排着队等它上线。</span>
+          <span class="od">打开与「{devices.deviceShortName(d)}」的会话：长连接优先、HTTP 兜底，对端不在网上就排着队等它上线。</span>
         </span>
       </button>
     {/if}

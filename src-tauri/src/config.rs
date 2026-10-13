@@ -308,6 +308,8 @@ pub struct PickerFavorite {
 pub struct AppSettings {
     pub port: u16,
     pub download_dir: PathBuf,
+    /// 推送接收是否再放一层 `<发送方名>/`（设置里的「推送按发送方分目录」，默认开）。见 `Config::device_subdir`。
+    pub device_subdir: bool,
     pub download_mode: DownloadMode,
     pub device_name: String,
     pub auto_start: bool,
@@ -336,6 +338,7 @@ impl Default for AppSettings {
         Self {
             port: 3890,
             download_dir: default_download_dir(),
+            device_subdir: default_device_subdir(),
             download_mode: DownloadMode::Direct,
             device_name: default_device_name(),
             auto_start: true,
@@ -415,15 +418,28 @@ pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
     /// **默认**的落盘位置：手动「下载到本地」（S-01，受 `download_mode` 影响）和对端
-    /// 「推送」接收（F-52）都写这里。推送一律落在 `<发送方名>/` 下，路径由发送方给的
-    /// 清单决定（选中项各自的名字，见 `transfer::manifest_for_paths`）—— 没有"推送名
-    /// 子目录"那一层。不再单设「收件目录」——两个预设位置对用户是同一种操作。
+    /// 「推送」接收（F-52）都写这里。推送默认落在 `<发送方名>/` 下（S-12 可关掉那层），
+    /// 路径由发送方给的清单决定（选中项各自的名字，见 `transfer::manifest_for_paths`）
+    /// —— 没有"推送名子目录"那一层。不再单设「收件目录」——两个预设位置对用户是同一种操作。
     ///
     /// **例外**：`download_mode = AskEachTime` 时，接收**未绑定设备**的推送会先让用户挑一个
-    /// 目录，挑的那个只是这次接收的**根**（`InboundInvite::root`，`<根>/<发送方名>/…` 那层
-    /// 照旧）—— 已配对设备免同意自动收，永远用这里。
+    /// 目录，挑的那个只是这次接收的**根**（`InboundInvite::root`；S-12 开着时
+    /// `<根>/<发送方名>/…` 那层照旧）—— 已配对设备免同意自动收，永远用这里。
     #[serde(default = "default_download_dir")]
     pub download_dir: PathBuf,
+    /// 推送接收时是否**再放一层 `<发送方名>/`**（S-12，默认**开**）。
+    ///
+    /// 开着（默认）= 现在这套：落盘根 = `<落盘根>/<净化过的发送方名>`，对端清单里的相对路径
+    /// 在它下面展开（`resume::landing_dir`）。它买来三件事：两台设备推同名文件不会互相顶掉、
+    /// 一批东西能按来源整体看/整体清、以及「每次询问」那次点击只授权对方在根里**新建一个自己
+    /// 的目录**（碰不到根里已有的东西）。
+    ///
+    /// 关掉 = 推送直接落在落盘根里（和手动下载的文件同一层）。代价如实写在这里：别人的
+    /// `报告.docx` 会和你的同名文件在同一层比 `unique_path` 改名；推一个目录 `D/` 会并进
+    /// 你可能本来就有的 `<落盘根>/D`（已配对设备的推送对同名文件是**校验通过后原子替换**）；
+    /// 「每次询问」下挑的根就等于直接授权对方往那一层写文件名。
+    #[serde(default = "default_device_subdir")]
+    pub device_subdir: bool,
     /// 下载模式（S-02）：手动下载弹出保存框；`AskEachTime` 时，接收**需要同意的**推送
     /// （未绑定设备那条）也会先弹一次目录选择框，取消即拒绝这次接收。已配对设备的推送
     /// 免同意、到了就收，与它无关。
@@ -594,7 +610,9 @@ pub fn default_transfer_block_mb() -> u32 {
     4
 }
 
-fn default_port() -> u16 {
+/// S-06 的默认监听端口（同时是"手动添加、没填端口时"探测端口的**起点**：对端的监听端口
+/// 就在这一段里，见 `lib.rs` 的 `MANUAL_PORT_SCAN`）。
+pub(crate) fn default_port() -> u16 {
     3890
 }
 
@@ -621,6 +639,7 @@ impl Config {
         AppSettings {
             port: self.port,
             download_dir: self.download_dir.clone(),
+            device_subdir: self.device_subdir,
             download_mode: self.download_mode,
             device_name: self.device_name.clone(),
             auto_start: self.auto_start,
@@ -759,6 +778,7 @@ impl Default for Config {
         Self {
             port: 3890,
             download_dir: default_download_dir(),
+            device_subdir: default_device_subdir(),
             download_mode: DownloadMode::Direct,
             device_name: default_device_name(),
             auto_start: true,
@@ -861,6 +881,12 @@ pub(crate) fn default_download_dir() -> PathBuf {
     dirs::desktop_dir().unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\Desktop"))
 }
 
+/// S-12 的缺省：**开**。旧配置里没有这一项（升级上来的）也按"开"读 —— 那正是它们一直
+/// 以来的落盘形状（`<落盘根>/<发送方名>/…`），升级不该把用户的东西挪个地方。
+pub fn default_device_subdir() -> bool {
+    true
+}
+
 pub(crate) fn default_device_name() -> String {
     #[cfg(target_os = "android")]
     {
@@ -880,6 +906,25 @@ pub(crate) fn default_device_name() -> String {
         std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("HOST"))
             .unwrap_or_else(|_| "OrbDrop-Mac".into())
+    }
+}
+
+/// **测试实例**用的配置：只把身份换掉，其余照 `Config::default()`。
+///
+/// 为什么非要它：`Config::default()` 的设备名是 `%COMPUTERNAME%`、设备 id 每次新取 ——
+/// 一个"跑测试的实例"于是跟**本机同名**。它一旦暴露在局域网上（测试服务器原本绑
+/// `0.0.0.0`），对端那边看到的就成了一屏"同名、id 各不相同"的设备，而它的探活会把那些
+/// 地址判成"这个地址上换了设备"、把地址簿里那一行的地址作废（界面写「地址未知」）——
+/// 真机反馈的那一屏「D1159 · 地址未知」就是这么来的。测试实例一律叫这个中立名字、
+/// id 各取各的，就不可能与真机撞上。
+///
+/// `pub` 而不是 `#[cfg(test)]`：集成测试（`tests/`）也要用它。名字与 `apply_offline`
+/// 同一档 —— 那个也是"只给测试、但集成测试要用"才放出来的。
+pub fn test_config() -> Config {
+    Config {
+        device_name: "orbdrop-test".to_string(),
+        device_id: format!("orbdrop-test-{}", Uuid::new_v4()),
+        ..Config::default()
     }
 }
 
@@ -1362,6 +1407,7 @@ mod tests {
         let config = Config {
             port: 3895,
             download_dir: PathBuf::from("C:/test/downloads"),
+            device_subdir: false,
             download_mode: DownloadMode::AskEachTime,
             device_name: "TestPC".into(),
             auto_start: false,
@@ -1444,6 +1490,7 @@ mod tests {
 
         assert_eq!(loaded.port, 3895);
         assert_eq!(loaded.download_dir, PathBuf::from("C:/test/downloads"));
+        assert_eq!(loaded.device_subdir, false, "S-12 的开关也要跨重启保留");
         assert_eq!(loaded.download_mode, DownloadMode::AskEachTime);
         assert_eq!(loaded.device_name, "TestPC");
         assert_eq!(loaded.auto_start, false);
@@ -1561,6 +1608,19 @@ mod tests {
 
         let current: Config = toml::from_str("downloadMode = \"AskEachTime\"\n").unwrap();
         assert_eq!(current.download_mode, DownloadMode::AskEachTime);
+    }
+
+    /// S-12 的开关在旧配置里没有：读出来必须是**开** —— 那正是这些配置一直以来的落盘形状
+    /// （`<落盘根>/<发送方名>/…`），升级不能把用户的东西挪个地方。
+    #[test]
+    fn device_subdir_defaults_on_for_configs_that_never_had_it() {
+        let cfg: Config = toml::from_str("downloadDir = 'C:/dl'\n").unwrap();
+        assert!(cfg.device_subdir);
+        // 显式写下"关"的配置照读，不被缺省翻回来。
+        let cfg: Config = toml::from_str("deviceSubdir = false\n").unwrap();
+        assert!(!cfg.device_subdir);
+        // 设置整份给界面时也带着它（界面按它画开关）。
+        assert!(Config::default().settings().device_subdir);
     }
 
     /// 旧配置里的 `inboxDir`（收件目录已并入 `downloadDir`）不能把配置文件判成损坏：

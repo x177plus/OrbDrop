@@ -122,7 +122,8 @@ pub struct InboundInvite {
     /// 只有"需要用户同意"那条路（未绑定设备）才可能带它 —— 已配对设备免同意自动收，
     /// "到了就收"没有让人先挑目录的时机（见 `transfer::accept_invite` 的 `root` 参数）。
     ///
-    /// 它只是**根**：`<根>/<发送方名>/…` 这一层照样由 `resume::landing_root` 拼、照样净化。
+    /// 它只是**根**：`<根>/<发送方名>/…` 这一层由 `resume::landing_dir` 按设置（S-12）拼、
+    /// 名字照样净化；关掉那层时根就是落点（`safe_join` 逐段校验仍是围栏）。
     pub root: Option<std::path::PathBuf>,
     /// 发送方的地址（ip, 服务端口）：没有长连接时，进度/完成/取消这些回执要 POST 回去。
     ///
@@ -140,10 +141,24 @@ pub struct InboundInvite {
 /// 新数据面（分帧并发）的能力位。
 pub const CAP_STREAM: &str = "stream1";
 
+/// 「决定走报告」的能力位：邀请**投递即算送达**，用户点完「接收 / 拒绝」之后，那道决定
+/// 才通过回执通道（WS `push_response` 或 `POST /push/report`）走回来。
+///
+/// 不带这个位的对端（老版本）走的是另一套：那条 HTTP 邀请**挂着等同步响应**，本机 60 秒
+/// 没人处理就自动拒绝（见 `transfer::schedule_invite_timeout`）。带了这个位，本机与对端
+/// 两边都**没有时钟** —— 邀请一直有效，等用户点、或发送方撤销（见 `transfer::cancel_push`；
+/// 发送方还会在源文件/目录变化时自己取消）。
+pub const CAP_AWAIT: &str = "await1";
+
 impl InboundInvite {
     /// 走新协议还是老循环。判据只有一个：**对端说自己支持**（老对端不带这个位）。
     pub fn supports_stream(&self) -> bool {
         self.caps.iter().any(|c| c == CAP_STREAM)
+    }
+
+    /// 对端是不是"等报告"那一版（见 [`CAP_AWAIT`]）：是就不要排那个 60 秒作废。
+    pub fn supports_await(&self) -> bool {
+        self.caps.iter().any(|c| c == CAP_AWAIT)
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -151,6 +166,68 @@ impl InboundInvite {
             self.files.iter().map(|f| f.size).sum()
         } else {
             self.size
+        }
+    }
+
+    /// 落成一条**待续传任务**（`transfer::accept_invite` 放行那一刻）。
+    ///
+    /// 邀请本体（`InboundInvite`）带 `oneshot` 与响应口，落不了盘也不该落盘；能落的就是
+    /// "重新发一次这条接收请求"要的那几样（见 `PendingInbound` 那段说明）。
+    pub fn to_pending(&self) -> super::resume::PendingInbound {
+        super::resume::PendingInbound {
+            invite_id: self.invite_id.clone(),
+            sender_id: self.sender.id.clone(),
+            sender_name: self.sender.name.clone(),
+            name: self.name.clone(),
+            size: self.size,
+            is_dir: self.is_dir,
+            count: self.count as u32,
+            files: self
+                .files
+                .iter()
+                .map(|f| super::resume::PendingFile {
+                    path: f.path.clone(),
+                    size: f.size,
+                    mtime: f.mtime,
+                })
+                .collect(),
+            caps: self.caps.clone(),
+            root: self.root.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            callback: self.callback.clone(),
+            updated_at: super::resume::now_secs(),
+        }
+    }
+}
+
+impl super::resume::PendingInbound {
+    /// 从落盘那条任务重建一份邀请（发起续传那一跳用它）。
+    ///
+    /// `responder: None`：那条同步回执口只属于"邀请刚到、等用户点头"那一刻 —— 续传时用户
+    /// 早就点过头了（我们只记已经放行的邀请）。
+    pub fn to_invite(&self) -> InboundInvite {
+        InboundInvite {
+            invite_id: self.invite_id.clone(),
+            sender: PeerInfo {
+                id: self.sender_id.clone(),
+                name: self.sender_name.clone(),
+            },
+            name: self.name.clone(),
+            size: self.size,
+            is_dir: self.is_dir,
+            count: self.count as usize,
+            files: self
+                .files
+                .iter()
+                .map(|f| FileEntry {
+                    path: f.path.clone(),
+                    size: f.size,
+                    mtime: f.mtime,
+                })
+                .collect(),
+            caps: self.caps.clone(),
+            root: self.root.as_ref().map(PathBuf::from),
+            callback: self.callback.clone(),
+            responder: None,
         }
     }
 }
@@ -347,7 +424,7 @@ pub struct PushStore {
     ///
     /// 为什么要留一份：传完/失败之后 `inbound` 与 `jobs` 里那条都已经清了，而"回执丢了"
     /// 的对账（`WsEvent::PushAsk`）得答得出"这条我当时收没收到、结果如何" —— 没有这份记录，
-    /// 发送方就只能等它那 5 分钟超时，然后把一条已经成功的传输记成失败。
+    /// 发送方就只能一直停在「等待」，然后把一条已经成功的传输记成失败。
     recent: Mutex<HashMap<String, RecentOutcome>>,
     /// 对账的节流：peer_id → 上次问的时刻（一台设备别每 5 秒问一遍）。
     asked_at: Mutex<HashMap<String, Instant>>,
@@ -574,6 +651,26 @@ impl PushStore {
         }
     }
 
+    /// 这条邀请的对端是不是"等报告"那一版（`await1`，见 [`CAP_AWAIT`]）——
+    /// `schedule_invite_timeout` 靠它决定要不要排那个 60 秒作废。
+    pub fn invite_supports_await(&self, id: &str) -> bool {
+        self.inbound
+            .lock()
+            .get(id)
+            .is_some_and(|inv| inv.supports_await())
+    }
+
+    /// 这批里还有没有"等对方点头"的台（`Invited`）。
+    ///
+    /// 源变化监视（`transfer::watch`）只在等待期间有意义：**都点头了（或都落了终态）就卸掉**，
+    /// 正在传的时候不再盯 —— 那时改源是"传的东西变了"，由接收端按清单 `size`/`mtime` 对账。
+    pub fn batch_has_invited(&self, batch_id: &str) -> bool {
+        self.batches
+            .lock()
+            .get(batch_id)
+            .is_some_and(|b| b.targets.iter().any(|t| t.state == TargetState::Invited))
+    }
+
     /// 对账的闸门：这台设备现在可以问了吗（可以 = 顺带把"上次问的时刻"推到现在）。
     /// 回执丢了就靠下一拍再问，所以这里是**节流**而不是"只问一次"。
     pub fn ask_due(&self, peer_id: &str) -> bool {
@@ -712,6 +809,10 @@ pub fn batch_set(
         // 到点由 `sweep_settled_batches` 收掉。
         state.push.settle_batch(&batch_id);
     }
+    // 源变化监视只在"还有台在等对方点头"时有意义：没人等了就卸掉（见 `transfer::watch`）。
+    if !state.push.batch_has_invited(&batch_id) {
+        crate::transfer::watch::unwatch(state, &batch_id);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -722,7 +823,7 @@ pub fn batch_set(
 ///
 /// 长连接在就**先试它**；"塞进队列"不等于"送出去了"（`ws::send` 只写进当前会话的 mpsc，
 /// socket 写失败它并不知道），所以塞失败要**退回 HTTP**，而不是把这条回执丢掉 ——
-/// 丢了这一条，发送方那台就会在 5 分钟后把一条已经成功的传输记成失败（假账）。
+/// 丢了这一条，发送方那台就会一直停在「等待」，而对面其实已经点头了 / 已经收完了。
 /// HTTP 那一跳是最后一道兜底：**退避重试几次**，够覆盖对端重启/瞬时抖动。
 /// 两条通道说的是同一个 `WsEvent`，发送方只有一份处理代码。
 pub fn report_to_sender(
@@ -741,8 +842,8 @@ pub fn report_to_sender(
     let url = format!("{}/push/report", crate::net::peer_base(&ip, port));
     // 认人：对端那边**已配对**时，这条回执必须带上它那枚 token（与它认我们的规则对称，
     // 见 `routes_push::authorize`）。手里有就带 —— 拿不到（未配对的推送）就照旧只靠邀请 id，
-    // 那是"未绑定也能推"的前提。丢下这一枚的后果是回执被 401 掉，发送方 5 分钟后把一次
-    // 成功的传输记成失败（假账）。
+    // 那是"未绑定也能推"的前提。丢下这一枚的后果是回执被 401 掉，发送方一直把一次
+    // 成功的传输写成「等待」（假账）。
     let token = crate::credential::get_peer_token(peer_id)
         .ok()
         .flatten()
@@ -790,12 +891,18 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
     let invite_id = invite.invite_id.clone();
     let callback = state.dial_endpoint(&peer_id, invite.callback.clone());
 
-    // 长连接那条路上的"同意"回执（HTTP 那条路走邀请请求的同步响应）。
-    if state.ws.has_connection(&peer_id) {
-        ws::send_to_peer(&state, &peer_id, WsEvent::PushResponse {
-            invite_id: invite_id.clone(),
-            accepted: true,
-        });
+    // "同意"这一条回执：带 `await1` 的对端要它（它的邀请投递时只回了"送到了、等着呢"，
+    // 用户点的结果得有这么一条过去），长连接在就先走长连接，否则 POST 它的 `/push/report`。
+    // 老对端照旧只走长连接 —— HTTP 那条路的决定是它自己那条同步响应（oneshot）。
+    let accepted = WsEvent::PushResponse {
+        invite_id: invite_id.clone(),
+        accepted: true,
+        reason: None,
+    };
+    if invite.supports_await() {
+        report_to_sender(&state, &peer_id, &callback, accepted);
+    } else if state.ws.has_connection(&peer_id) {
+        ws::send_to_peer(&state, &peer_id, accepted);
     }
 
     // 下载要认人：已配对的对端必须带自己那枚 token；未绑定的推送没有 token 可带，
@@ -842,19 +949,20 @@ fn spawn_download_legacy(
     crate::task::spawn("push download", async move {
         let client = crate::net::client();
         let config = state.config.lock().clone();
-        // 落盘根 = `<落盘目录>/<发送方名>`。落盘目录默认是用户设的下载目录（S-01）；只有在
+        // 落盘根 = `<落盘目录>/<发送方名>`（S-12 那颗开关关掉时就是落盘根本身；两条引擎共用
+        // `resume::landing_dir`）。落盘目录默认是用户设的下载目录（S-01）；只有在
         // 「每次询问」下由用户亲自挑过的那些邀请才带自己的根（`invite.root`）—— 已配对设备
         // 免同意自动收，不会有这个根。推送接收不再单独有「收件目录」。
         //
-        // 对端只往 <发送方名>/ 下面写 —— **没有"推送名子目录"**：清单里的相对路径就是落盘后
+        // 对端只往落盘根下面写 —— **没有"推送名子目录"**：清单里的相对路径就是落盘后
         // 的样子（单文件 `A.txt`、单目录 `D/…`、多选 `甲目录/…` + `散文件.txt`），
         // 发送方在 `manifest_for_paths` 里已经把每个源的名字放进路径了。
         //
         // 名字必须先净化：它是报文里的自由字符串，`C:\Windows\Temp`、`..\..\..\Users\Public`
         // 之类会把基址顶掉（`PathBuf::push` 遇到带前缀的段会清空已累积的部分）。净化 +
-        // `safe_join` 两道闸都在 `landing_root` 里。
+        // `safe_join` 两道闸都在 `landing_root` 里（关掉那层时 `safe_join` 仍是唯一的围栏）。
         let base = invite.root.as_deref().unwrap_or(config.download_dir.as_path());
-        let sender_dir = super::resume::landing_root(base, &invite.sender.name);
+        let sender_dir = super::resume::landing_dir(base, &invite.sender.name, config.device_subdir);
         let _ = tokio::fs::create_dir_all(&sender_dir).await;
 
         let mut total_received: u64 = 0;
@@ -946,7 +1054,13 @@ fn spawn_download_legacy(
                 let resp = match req.send().await {
                     Ok(r) if r.status().as_u16() == 410 => {
                         info!(%invite_id, %file.path, "cancelled by sender");
-                        fail_download(&state, &peer_id, &callback, &invite_id, "发送方已取消".into());
+                        fail_download(
+                            &state,
+                            &peer_id,
+                            &callback,
+                            &invite_id,
+                            super::SENDER_GONE.into(),
+                        );
                         state.push.resume.clear(&invite_id);
                         return;
                     }
@@ -989,7 +1103,8 @@ fn spawn_download_legacy(
                         Ok(c) => c,
                         Err(e) => {
                             // 发送方中途取消时，流会就地断掉：退回外层重试，
-                            // 下一次请求就会拿到 410，按"发送方已取消"收尾。
+                            // 下一次请求就会拿到 410，按"对端不再提供这条推送"收尾
+                            // （`SENDER_GONE`：撤销与"它那台重启过"在线上分不出来）。
                             //
                             // **先把缓冲交出去再退**：`offset` 已经把缓冲里的字节算进去了，
                             // 丢掉它们就等于"以为收过、其实没写"（后续续传直接从洞后面接着写）。
@@ -1073,6 +1188,8 @@ fn spawn_download_legacy(
 
         state.push.resume.flush();
         state.push.resume.clear(&invite_id);
+        // 传完了：这条不用再接手了（重启后不该再来一遍）。
+        state.push.resume.drop_pending(&invite_id);
         // 结局**先**落地、再摘邀请：对账可能正好撞在这一瞬（邀请已摘、记录还没写），
         // 那种窗口里答出去的是 `unknown`（"没送到"）——事实是"收到了"。
         state
@@ -1097,6 +1214,10 @@ fn spawn_download_legacy(
 
 /// 接收失败：告诉发送方，并让本机的接收卡片变成失败态。
 ///
+/// **终态**（这条推送到此为止）：对端撤了（410）、源文件与清单对不上、用户取消/拒绝、
+/// 待续传任务过期。落到这里就会把待续传任务删掉 —— 重启之后不会再自己接着收。
+/// 中间态那次失败走 `fail_attempt`（保留邀请与任务，退避重试）。
+///
 /// `pub(super)`：新协议那条路（`transfer::download`）的会话级失败也走它 ——
 /// 两条路对发送方说的话必须一模一样，不能各写一套。
 pub(super) fn fail_download(
@@ -1107,6 +1228,8 @@ pub(super) fn fail_download(
     reason: String,
 ) {
     error!(%invite_id, %reason, "push download failed");
+    // 终态 = 不再接手这条：把待续传任务删掉（文件级位图**留着**，用户手动重推一次仍然省得下）。
+    state.push.resume.drop_pending(invite_id);
     // 同"完成"那条：先落结局再摘邀请（对账撞在中间那一瞬不该答 `unknown`）。
     //
     // 顺带把续传记录落盘：失败之后**留下**的记录就是"下次接着传"的全部依据，
@@ -1127,6 +1250,28 @@ pub(super) fn fail_download(
         "reason": reason,
     }));
 }
+
+/// **这一轮没成，但这条推送还能再试**：保留邀请与待续传任务，**不报终态**。
+///
+/// 为什么不报：报了 `PushDone{failed}`，接收端那张卡变成「接收失败」、发送端那张卡也被落成
+/// 失败 —— 而失败是"只落一次"的终态（`late_success` 只认对端权威的 `Done`/`Rejected`），
+/// 下一轮重试把字节接上时它回不来了。所以这里只留一行日志：
+/// - 发送方对账问到时，本机答 `waiting`（邀请还在 `inbound` 里，见 `answer_invite_state`）；
+/// - 两端界面都停在最后的进度上，等重试真的接上，或者由 `fail_download` 给个说法。
+///
+/// 邀请要从 `inbound` 里摘掉：它是"这一轮正在跑"的标志（`transfer::resume_pending` 拿它当
+/// 闸门），留着下一轮就起不来了 —— 而重试的资格在**待续传任务**那一份里，不在邀请里。
+///
+/// 摘了邀请还得替它回答对账：**这条推送本机还拿着、正准备接着收**（`waiting`）。不写这一条，
+/// `answer_invite_state` 会答 `unknown`（"没送到"），发送方那边就会把一条还在重试的推送
+/// 记成失败 —— 而失败是它那份记录里的终态，重试成功也纠正不回来（见 `late_success`）。
+pub(super) fn fail_attempt(state: &AppState, peer_id: &str, invite_id: &str, reason: String) {
+    warn!(%invite_id, %reason, "这次接收没成，推送还在，等下一轮重试");
+    state.push.remove_invite(invite_id);
+    state.push.record_outcome(invite_id, peer_id, "waiting", 0, None);
+    state.push.resume.flush();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

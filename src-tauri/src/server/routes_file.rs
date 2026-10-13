@@ -96,7 +96,7 @@ pub async fn file_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, ShareItem};
+    use crate::config::ShareItem;
 
     /// 共享项根**就是一个文件**时，空 `path` 必须当"根自身"。
     ///
@@ -111,14 +111,14 @@ mod tests {
         let file = dir.join("single.txt");
         std::fs::write(&file, b"hello from a file share").unwrap();
 
-        let mut config = Config::default();
+        let mut config = crate::config::test_config();
         let share = ShareItem::new(file.clone()); // 共享项根指向一个文件
         let share_id = share.id.clone();
         config.shares.push(share);
         let config_path =
             std::env::temp_dir().join(format!("orbdrop_file_cfg_{}.toml", uuid::Uuid::new_v4()));
         let state = Arc::new(AppState::new(config, config_path));
-        let port = crate::server::start_server(state.clone(), 4070).await.expect("起服务");
+        let port = crate::server::start_server_loopback(state.clone(), 4070).await.expect("起服务");
 
         let resp = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{port}/file"))

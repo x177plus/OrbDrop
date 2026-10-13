@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
-use mdns_sd::ServiceDaemon;
 use parking_lot::Mutex;
 use serde::Serialize;
 use tauri::AppHandle;
@@ -52,8 +51,10 @@ pub struct AppState {
     pub server_port: AtomicU16,
     pub server_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     pub server_task: Mutex<Option<JoinHandle<()>>>,
-    /// Kept alive for the app's lifetime to keep the mDNS registration live.
-    pub mdns_daemon: Mutex<Option<ServiceDaemon>>,
+    /// 当前挂着的 mDNS 注册（daemon 句柄 + 它报的服务全名）。换名字/端口/在线状态时
+    /// **必须整体换掉并释放旧的那一份**（见 `discover::release`）：只丢句柄不注销，对端会
+    /// 一直解析到旧记录 —— 用户改了设备名，别人的设备行还是旧名。
+    pub mdns_reg: Mutex<Option<crate::discover::Registration>>,
     /// WebSocket manager (peer links).
     pub ws: WsManager,
     /// Push jobs (sender + receiver) and resume store.
@@ -62,6 +63,8 @@ pub struct AppState {
     pub drag: crate::drag::DragStore,
     /// Pairing code store.
     pub pair: PairStore,
+    /// 长连接请求（F-16 的同意制）：进来的等本机用户点头，出去的等对端。
+    pub link: crate::link::LinkStore,
     /// 会话（聊天）记录：文本消息的落盘 + 界面快照（`chat.json`）。
     pub chat: crate::chat::ChatStore,
     /// 群聊（共享群）：名册 + 群消息（`groups.json`）。
@@ -71,7 +74,8 @@ pub struct AppState {
     pub groups: crate::group::GroupStore,
     /// Tauri handle for emitting UI events.
     pub app_handle: Mutex<Option<AppHandle>>,
-    /// File watchers keyed by share id.
+    /// File watchers keyed by share id（推送批次的源变化监视用 `push:<batch_id>`，见
+    /// `transfer::watch` —— 两类键不会撞：共享项那个是 UUID）。
     pub watchers: Mutex<std::collections::HashMap<String, notify::RecommendedWatcher>>,
     /// 「学来的」设备（F-10 跨网段）：对端 `/discover` 表里带过来、而本机自己从没发现过的
     /// 设备 id → 最近一次被提到的时刻。
@@ -370,11 +374,12 @@ impl AppState {
             server_port: AtomicU16::new(0),
             server_shutdown: Mutex::new(None),
             server_task: Mutex::new(None),
-            mdns_daemon: Mutex::new(None),
+            mdns_reg: Mutex::new(None),
             ws,
             push: PushStore::new(),
             drag: crate::drag::DragStore::new(),
             pair: PairStore::new(),
+            link: crate::link::LinkStore::new(),
             chat: crate::chat::ChatStore::with_path(chat_path),
             groups: crate::group::GroupStore::with_path(group_path),
             app_handle: Mutex::new(None),

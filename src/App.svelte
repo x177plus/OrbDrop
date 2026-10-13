@@ -9,15 +9,15 @@
   import { cubicOut } from 'svelte/easing';
   import { listen } from '@tauri-apps/api/event';
   import { open as openDialog } from '@tauri-apps/plugin-dialog';
-  import { getDevices, loadDevices, isLocalOnline, noteLocalOnline, deviceDisplayName, peerDisplayName, saveDeviceRemark, unicastBlockedTip } from '$lib/stores/devices.svelte';
+  import { getDevices, loadDevices, isLocalOnline, noteLocalOnline, deviceShortName, peerShortName, saveDeviceRemark, unicastBlockedTip, needsRepair } from '$lib/stores/devices.svelte';
   import { getServerPort, setServerPort, loadShares, addShare, removeShare, getShares } from '$lib/stores/shares.svelte';
   import { loadSettings, getSettings } from '$lib/stores/settings.svelte';
   import { getPeerSharesState, loadPeerShares } from '$lib/stores/peers.svelte';
   import { getBcStatus, loadBcStatus, setBcSide, clearSide, compare } from '$lib/stores/bc.svelte';
   import * as chat from '$lib/stores/chat.svelte';
-  import type { ConvoThread } from '$lib/stores/chat.svelte';
+  import type { ConvoThread, ChatItem } from '$lib/stores/chat.svelte';
   import * as upd from '$lib/stores/update.svelte';
-  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree } from '$lib/api';
+  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
   import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem } from '$lib/types';
   import { shareMeta, updateStatusText, updateTitleText } from '$lib/types';
   import { planExpansion, planCollapse, planDock, planRectDock, spinForDock, type BadgeSpin, type DockAxis, type DockPlan, type ScreenRect } from '$lib/orbLayout';
@@ -188,8 +188,10 @@
      * failed    失败，同样等用户确认（右下角气泡）
      * pair      对端发来的**配对邀请**：点「接收」即配对（免输入配对码，F-12）
      * pairWait  本机**发出去**、还在等对端在它的通知里处理的配对邀请（带「取消」）
+     * link      对端发来的**长连接请求**（F-16 的同意制）：点「接受」才建链
+     * linkWait  本机发出去、还在等对端点头的长连接请求（带「取消」）
      */
-    kind: 'invite' | 'receiving' | 'done' | 'failed' | 'pair' | 'pairWait';
+    kind: 'invite' | 'receiving' | 'done' | 'failed' | 'pair' | 'pairWait' | 'link' | 'linkWait';
     from: string;        // 对方设备名
     name: string;        // 文件/目录名（多选时是容器名）
     size: number;
@@ -200,7 +202,13 @@
     error?: string;
     /** 落盘位置（`<下载目录>/<发送方名>`），只有 done 有。 */
     dest?: string;
-    /** 配对邀请的发起方 id（kind = 'pair'）。 */
+    /**
+     * 这条通知是**哪台设备**的事（设备 id）。
+     *
+     * 配对邀请与长连接请求本来就有它，推送那几条补上 `inv.sender.id` —— 设备行头像上那颗
+     * 角标（F-112）靠它把"是谁的事"对上号（见下面的 `pendingNoticeCount`）。本机发出去的
+     * 两档（`pairWait` / `linkWait`）也带着它，但计数那边把它们排掉：那是**本机在等对端**。
+     */
     peerId?: string;
     /**
      * 配对邀请（kind = 'pair'）来自"本机记录里已配对、但没带上本机发给它的凭据"的设备
@@ -326,6 +334,34 @@
   // 不进那一组，所以铃铛角标跟着涨就会「说 3 件、点开只有 2 件」）。打开那个会话即已读、
   // 群邀请点了「加入/不加入」即消失，数自己就掉。
   let orbNotifCount = $derived(notifCount + convoBadgeCount);
+  // 托盘图标上的红点与闪动 = **悬浮球左上角那颗角标同一个数**（`orbNotifCount`）：球上有数
+  // ⇔ 托盘上有红点，两处显示一起动。后端只收一个布尔（有没有事），"是哪一件事"留在这一层
+  // —— 左键单击落点时按下面那份判断决定开哪儿（见 `openTrayAlert`）。
+  //
+  // `trayAlertOn` 刻意是普通变量而不是 `$state`：这个 `$effect` 里**读**它，`$state` 的话
+  // 一次写入就会把自己再触发一遍（角标来回动时 ping-pong）。
+  let trayAlertOn = false;
+  $effect(() => {
+    const on = orbNotifCount > 0;
+    if (on === trayAlertOn) return;
+    trayAlertOn = on;
+    traySetAlert(on).catch((e) => console.error('托盘提示状态同步失败:', e));
+  });
+
+  /**
+   * 某台设备此刻还挂着几件**等你处理**的通知（设备页头像上那颗角标要的数，见 F-112）。
+   *
+   * 只数**从它那儿来的**：`pairWait` / `linkWait` 是本机发出去、等对端处理的，挂在对方头上
+   * 会读成"它欠本机一件"，实际是本机在等它 —— 排掉。剩下的（推送邀请 / 接收中 / 收完待确认 /
+   * 失败待确认 / 配对邀请 / 长连接请求）都是"它那边有事等你"，与右下角那组气泡逐条对应：
+   * 气泡撤掉（收下、拒绝、知道、打开目录、超时作废）数字就掉。
+   *
+   * 设备行上的总数 = 这个 + 会话 store 的 `unreadForPeer`（未读消息）—— 两半各归各自的真相源，
+   * 这里不把消息也数一遍。
+   */
+  function pendingNoticeCount(peerId: string): number {
+    return notices.filter((n) => n.peerId === peerId && n.kind !== 'pairWait' && n.kind !== 'linkWait').length;
+  }
   // 通知（面板右下角那组气泡）：未绑定的邀请、正在接收、已收到待确认、失败 —— **全都在
   // 这一组里**，形状统一（右对齐、2/3 面板宽，不占满）。要当场点的按钮（接收/拒绝/取消）
   // 就长在气泡里，所以它们不单独占一层。
@@ -412,7 +448,7 @@
     const path = c.path ?? '';
     if (c.kind === 'peer') {
       if (!c.peerId) return null;
-      const dev = peerDisplayName(c.peerId);
+      const dev = peerShortName(c.peerId);
       const item = path || c.name;                                  // 树内节点用累积相对路径，共享项根用共享项名
       return { kind: 'peer', peerId: c.peerId, shareId: c.shareId, path, label: item ? `${dev} · ${item}` : dev };
     }
@@ -572,9 +608,9 @@
         return {
           id: d.id,
           kind: 'peer',
-          // 卡片上的设备名用显示名（F-101：设了备注就是「备注(设备名)」）—— 与本机页写
-          // 「本机」同一个目的：一眼看出这是哪一台。
-          name: deviceDisplayName(d),
+          // 卡片上的设备名走**短名**（F-101：有备注就是备注本身）—— 与本机页写
+          // 「本机」同一个目的：一眼看出这是哪一台；地址就在下面一行。
+          name: deviceShortName(d),
           ip: `${d.ip}:${d.port}`,
           loading: drill.loading ?? st.loading,
           error: drill.error ?? st.error,
@@ -1436,11 +1472,11 @@
 
   /**
    * 一批推送里一台目标的**显示名**（F-101）：快照里的 `target` 是**发起那一刻**对端自报的
-   * 设备名，本机现在若给这台设备起了备注，就该按备注显示（`peerDisplayName` 找不到这台设备时
+   * 设备名，本机现在若给这台设备起了备注，就该按备注显示（`peerShortName` 找不到这台设备时
    * 才回落到快照里那个名字 —— 设备可能已经被移除了）。
    */
   function targetName(t: PushTarget): string {
-    return peerDisplayName(t.peerId, t.target);
+    return peerShortName(t.peerId, t.target);
   }
 
   /** 悬停里的完整名单（标题只放得下两个名字）。 */
@@ -1473,7 +1509,9 @@
       case 'sending': return `传输中 ${pushPercent(t.received, total)}%`;
       case 'done': return `已发送 ${fmtBytes(t.received)}`;
       case 'cancelled': return '已取消';
-      case 'rejected': return '对方拒绝';
+      // 对端给了原因就用它的：**「对方拒绝」与「本机收不下」是两件事**（后者是已配对设备
+      // 免同意自动收时的失败，对面根本没点过任何东西）。
+      case 'rejected': return t.error ?? '对方拒绝';
       default: return `失败：${t.error ?? '未知原因'}`;
     }
   }
@@ -1525,7 +1563,7 @@
    */
   function toastNoLiveTarget(devices: PeerDevice[]) {
     toast(devices.length === 1
-      ? `「${deviceDisplayName(devices[0])}」不在网上，推送未发送`
+      ? `「${deviceShortName(devices[0])}」不在网上，推送未发送`
       : '所选设备都不在网上，推送未发送');
   }
 
@@ -1555,7 +1593,7 @@
 
   /** 「A」「B」等 3 台设备 —— 与卡片标题同一个规则（设备名一律用「」框住）。 */
   function pushTargetsLabel(devices: PeerDevice[]): string {
-    const names = devices.map((d) => `「${deviceDisplayName(d)}」`);
+    const names = devices.map((d) => `「${deviceShortName(d)}」`);
     if (names.length === 1) return names[0];
     if (names.length === 2) return names.join('');
     return `${names[0]}${names[1]}等 ${names.length} 台设备`;
@@ -1674,6 +1712,38 @@
   }
 
   /**
+   * 托盘左键**单击**（后端 `orb://tray_alert`，只在"有事等处理"时才发）：落到"该看的那一件事"上。
+   *
+   * 按"人最想先看到什么"排三档：
+   * 1. **未读消息** → 直接开那条会话（打开即已读，托盘那颗红点跟着掉）；
+   * 2. **只有群邀请** → 开会话浮层的列表 —— 邀请卡只画在那儿，点「加入」才算数；
+   * 3. **其余**（推送邀请 / 配对邀请 / 长连接请求 / 新版本）→ 展开面板右下角那组通知气泡。
+   *
+   * 三档之外没有第四档：后端**只在有事时才发**这条事件（它只知道有没有事，不知道是哪一件），
+   * 所以这里不必再兜一个"其实没事"的分支。
+   */
+  function openTrayAlert() {
+    // `convoRows` 已按"最近一条"倒序排好、每行带着自己的未读（一对一 + 群聊都在里面），
+    // 所以"最近动过的那条未读"就是第一条 `unread > 0` —— 不另算一份"哪条最新"。
+    const key = chat.convoRows().find((r) => r.unread > 0)?.key;
+    if (key) {
+      setOpen(true);
+      chat.openConversation(key);
+      return;
+    }
+    if (chat.pendingGroups().length > 0) {
+      setOpen(true);
+      void chat.refresh();       // 与点底栏「会话」那颗按钮同一套：开浮层就把记录重拉一次
+      chat.setChatOpen(true);
+      chat.backToList();         // 停到列表那一层，邀请卡才在视野里
+      return;
+    }
+    setOpen(true);
+    // 铃铛可以把那组气泡收起来，而"收起 ≠ 已读"：既然人是冲着它来的，就替他把闸门打开。
+    notifOpen = true;
+  }
+
+  /**
    * 这条会话该发给谁、那批记录归到哪里 —— 「＋」选文件与拖入浮层（F-111）两条路共用这一份。
    *
    * `chatBatchId` = 群发那份名单的 id（这批文件记进那份群发的记录），`groupId` = 群聊的 id
@@ -1763,23 +1833,38 @@
 
   /**
    * 会话菜单（详情右上那颗「⋮」）：锚点 + **是哪个会话**交出去，菜单由 `ContextMenu`
-   * 按模式分（一对一：查看该设备文件 / 清空聊天记录；群发与群聊：编辑那份名单 / 删掉它）。
+   * 按模式分（一对一：修改备注 / 配对·重新配对（未绑定或凭据失效时）/ 查看该设备文件 /
+   * 清空聊天记录；群发与群聊：编辑那份名单 / 删掉它）。
+   *
+   * 一对一的「修改备注」与「配对」**复用设备右键菜单那两项的同一份处理函数**
+   * （`ctxRemark` / `ctxPair` 读的是 `ctxState.deviceId`）—— 所以这里把设备那一档字段一并
+   * 填上，菜单项本身不用各写一套。理由：会话正是"看着这台设备"的地方，要改它的备注或
+   * 重新配对，不该先退回设备页去右键那一行。
    */
   function openConvoCtx(x: number, y: number, key: string) {
     const t = chat.activeThread();
     if (!t || t.key !== key) return;
+    const directId = t.mode === 'direct' ? t.participants[0] : '';
+    const dev = directId ? getDevices().find((d) => d.id === directId) : undefined;
     // 「查看该设备文件」要有对方的**浏览标签**才成立（那个标签只给长连接设备开）：
     // 没长连接时挂上去只是个点了没反应的项。
-    const browse = getDevices().find((d) => d.id === t.participants[0])?.connected === true;
+    const browse = dev?.connected === true;
     ctxState = {
       x,
       y,
       kind: 'convo',
       convoKey: t.key,
-      convoPeerId: t.mode === 'direct' ? t.participants[0] : undefined,
+      convoPeerId: directId || undefined,
       convoThread: t.mode !== 'direct',
       convoBc: t.mode === 'broadcast',
       convoBrowse: t.mode === 'direct' && browse,
+      // 设备那一档（与 `DeviceTab` 交给右键菜单的字段同一套取法）：一对一才填。
+      // 这台设备已经不在设备表里（会话还留着，但备注/配对都没有主语）时留空 ——
+      // `ContextMenu` 靠 `deviceState` 有值来决定摆不摆那两项。
+      deviceId: dev?.id,
+      deviceState: dev ? (dev.connected ? 'connected' : dev.paired ? 'paired' : 'unbound') : undefined,
+      deviceOnline: dev?.online,
+      deviceNeedsPair: dev ? needsRepair(dev) : undefined,
     };
   }
 
@@ -1964,6 +2049,26 @@
     chat.noteInviteDone(inviteId, 'rejected');
   }
 
+  /**
+   * 会话里点了一条文件消息（或一张图片消息）= 用系统默认程序打开它。
+   *
+   * 路径都在 `chat` 里：文件消息自己发的记着**本机那个源文件**（选文件时就有的 `LocalPick.path`），
+   * 对端推来的在收完时拿到落盘位置（`push://done` 的 `dest`）；**图片消息**记的是会话内容
+   * （`<数据目录>/chat-blobs/` 那一份，见 `blobs`）。所以这里只管开 —— 与文件标签页里双击一格
+   * 是同一个落点（`openRectFile`），失败时报原话而不是装成功。
+   *
+   * 点得早（还在传输、或那一条本来就没路径）就什么都不做：路径还没有，开不了。
+   */
+  async function openChatFile(item: ChatItem) {
+    // 文件消息与**图片消息**（图片是消息内容那一档）都有 `path`：交给系统默认程序打开本机这一份。
+    if (!item.path) return;
+    try {
+      await openPath(item.path);
+    } catch (e) {
+      toast(`打开失败：${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   function dropNotice(inviteId: string) {
     notices = notices.filter((n) => n.inviteId !== inviteId);
   }
@@ -1997,6 +2102,9 @@
     if (n.kind === 'pair') return `「${n.from}」请求与你配对`;
     // 本机发出去的那条：说清"在等谁" —— 卡片挂着就代表对面还没处理。
     if (n.kind === 'pairWait') return `等待「${n.from}」确认配对`;
+    // 长连接请求（F-16 的同意制）：两边的卡片都说清"这个动作在等谁"。
+    if (n.kind === 'link') return `「${n.from}」请求建立长连接`;
+    if (n.kind === 'linkWait') return `等待「${n.from}」同意连接`;
     if (n.count > 1) {
       const what = `（${n.count} 项）`;
       if (n.kind === 'invite') return `收到「${n.from}」的推送${what}`;
@@ -2022,6 +2130,13 @@
     if (n.kind === 'pairWait') {
       return `已把邀请推到「${n.from}」：它在自己的通知里点「接收」即配对成功。60 秒内没人处理自动作废。`;
     }
+    // 长连接请求：说清"点了会怎样"，两边同一套措辞，用户才知道对面在等什么。
+    if (n.kind === 'link') {
+      return `接受后「${n.from}」会与本机建立长连接（实时通道：共享项变更自动广播、消息即时送达）。60 秒内没人处理自动作废。`;
+    }
+    if (n.kind === 'linkWait') {
+      return `已把连接请求发给「${n.from}」：它在自己的通知里点「接受」即建立长连接。60 秒内没人处理自动作废。`;
+    }
     if (n.kind === 'done') {
       const what = n.count > 1 ? `${n.count} 项` : n.name;
       return n.dest ? `${what} 已保存到 ${n.dest}` : `${what} 已保存到下载目录`;
@@ -2033,8 +2148,9 @@
    * 接收一条**需要同意**的推送（未绑定设备那条）：设置了「每次询问」就先问落盘目录。
    *
    * - 目录选择框打开即设置里的下载目录（`defaultPath`），省掉一层层点；
-   * - 框里取消 = **拒绝**这次接收（返回 false）—— 发送方那边正挂着等回执，不能让它干等到
-   *   60 秒超时；调用方接着走 `rejectNotice` / `chatRejectInvite` 把话带回去；
+   * - 框里取消 = **拒绝**这次接收（返回 false）—— 发送方那边一直挂着等一个决定，不能让它
+   *   干等（邀请没有时钟：对方不点、我也不点，两边就都停在那儿）；调用方接着走
+   *   `rejectNotice` / `chatRejectInvite` 把话带回去；
    * - 「直接下载」那一档照旧不问，`root` 不带 → 后端落在设置里的下载目录。
    *
    * **已配对设备那条路根本不会走到这里**：它免同意自动收，界面上连「接收」按钮都没有。
@@ -2086,6 +2202,27 @@
   }
 
   /**
+   * 会话里那张**正在接收**的卡上那颗停止：撤掉这条接收（`cancel_receive`）。
+   *
+   * 与通知里那颗「取消」同一个落点（右下角那条通知还在时连它一起收掉）—— 后端把那条邀请取走、
+   * 告诉发送方、并把"待续传任务"一并删掉：**用户喊停就是喊停**，重启之后不会再自己接着收
+   * （只有"关掉应用"才有那一条）。界面不用自己改那条文件消息：随后那条
+   * `push://done{cancelled}` 会把它落成「已停止接收」。
+   */
+  async function stopReceive(inviteId: string) {
+    const notice = notices.find((n) => n.inviteId === inviteId);
+    if (notice) {
+      await cancelNotice(notice);
+      return;
+    }
+    try {
+      await cancelReceive(inviteId);
+    } catch (e) {
+      toast(String(e));
+    }
+  }
+
+  /**
    * 接受一条配对邀请：凭据在后端交换（本机铸一枚 token 放在那条挂着 HTTP 请求的响应里
    * 交给对方，同时把对方那枚存下来）——回到这里的已经是"配对完成"。
    */
@@ -2113,6 +2250,37 @@
     dropNotice(n.inviteId);
     try { await cancelPairInvite(n.inviteId); } catch (e) { toast(String(e)); }
     toast('已取消配对邀请');
+  }
+
+  /**
+   * 接受一条长连接请求（F-16 的同意制）：本机结束对它的「断开」暂停，放行它这一次拨号。
+   *
+   * 链路是**对方**建起来的（请求就是它发来的），所以这里只说"等它拨进来" —— 不假装
+   * 本机在连它。
+   */
+  async function acceptLinkNotice(n: PushNotice) {
+    dropNotice(n.inviteId);
+    try {
+      const name = await acceptLinkRequest(n.inviteId);
+      toast(`已同意「${name}」建立长连接`);
+    } catch (e) {
+      toast(`同意连接失败：${e}`);
+    }
+  }
+
+  /** 拒绝一条长连接请求：对端收到明确的"对方拒绝"，本机什么都不写。 */
+  async function rejectLinkNotice(n: PushNotice) {
+    dropNotice(n.inviteId);
+    try { await rejectLinkRequest(n.inviteId); } catch (e) { toast(String(e)); }
+  }
+
+  /**
+   * 取消本机发出去、还没被处理的长连接请求：撤回对端界面上那条通知，本机这张卡收掉。
+   * 撤回失败（对面已经处理/不在网上）不是错误 —— 它那条通知的 TTL 会兜底。
+   */
+  async function cancelLinkWaitNotice(n: PushNotice) {
+    dropNotice(n.inviteId);
+    try { await cancelLinkRequest(n.inviteId); } catch (e) { toast(String(e)); }
   }
 
   /** 配对码有效期（秒），与后端 PairStore::CODE_TTL 一致。 */
@@ -2173,14 +2341,16 @@
       // （配对码由本机持有、对方拨进来，拨不动这张网就是白等）。设备行本身不带这个状态。
       const tip = unicastBlockedTip(device);
       if (tip) toast(tip);
-      void issuePairCode(device.id, deviceDisplayName(device));
+      void issuePairCode(device.id, deviceShortName(device));
       return;
     }
-    // 还没选中设备：先手动添加（F-11），探测到身份后直接进入配对
+    // 还没选中设备：先手动添加（F-11），探测到身份后直接进入配对。
+    // 端口**默认留空**：对方的监听端口可能因为占用顺延到 3891-3899，留空由后端探
+    // 这一段（`manual_peer`）；预填本机自己那个端口反而更像在替用户猜。
     stopPairTimer();
     pairState = {
       peerId: null, peerName: null, code: '', remaining: 0, input: '', busy: false, error: null,
-      ip: '', port: serverPortVal ? String(serverPortVal) : '',
+      ip: '', port: '',
     };
   }
 
@@ -2196,17 +2366,25 @@
     let port = ps.port.trim();
     const colon = ip.lastIndexOf(':');
     if (colon > 0) { port = ip.slice(colon + 1); ip = ip.slice(0, colon); }
-    const portNum = Number(port);
-    if (!ip || !Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
-      pairState = { ...ps, error: '请填写对方 IP 与端口（1-65535）' };
+    // 端口留空 = 让对方那一侧自己认领：后端从 3890 起探 10 个（S-06 的端口段）
+    if (!ip) {
+      pairState = { ...ps, error: '请填写对方 IP' };
       return;
+    }
+    let portNum = 0;
+    if (port) {
+      portNum = Number(port);
+      if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+        pairState = { ...ps, error: '端口要在 1-65535 之间（留空则自动扫描 3890-3899）' };
+        return;
+      }
     }
     pairState = { ...ps, busy: true, error: null };
     try {
       const device = await addPeer(ip, portNum);
       await loadDevices();
-      toast(`已添加设备「${peerDisplayName(device.id, device.name)}」`);
-      await issuePairCode(device.id, peerDisplayName(device.id, device.name));
+      toast(`已添加设备「${peerShortName(device.id, device.name)}」`);
+      await issuePairCode(device.id, peerShortName(device.id, device.name));
     } catch (e) {
       if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
     }
@@ -2406,10 +2584,16 @@
     hideCtx();
     if (!deviceId) return;
     try {
-      await connectPeer(deviceId);
-      // 与行内那颗「长连接」同一句话（`DeviceTab.setLink`）：拨之前先看这一台此刻通不通。
+      const outcome = await connectPeer(deviceId);
+      // 与行内那颗「连接」同一句话（`DeviceTab.setLink`）：先看这一台此刻通不通，再看
+      // 这一次是"在等对方同意"还是"本机直接拨号"。
       const tip = unicastBlockedTip(getDevices().find((d) => d.id === deviceId));
-      toast(tip ?? '正在建立长连接，拖入文件将自动广播');
+      const name = peerShortName(deviceId);
+      if (outcome.kind === 'asked') {
+        toast(`已把连接请求发给「${name}」：等它在自己的通知里点「接受」`);
+      } else {
+        toast(tip ?? '正在建立长连接，拖入文件将自动广播');
+      }
     } catch (e) {
       toast(`建立长连接失败：${e}`);
     }
@@ -2599,7 +2783,8 @@
       notices = [...notices, {
         inviteId: inv.inviteId,
         kind: inv.auto ? 'receiving' : 'invite',
-        from: peerDisplayName(inv.sender.id, inv.sender.name),
+        peerId: inv.sender.id,
+        from: peerShortName(inv.sender.id, inv.sender.name),
         name: inv.name,
         size: inv.size,
         isDir: inv.isDir,
@@ -2656,7 +2841,7 @@
         }
         return;
       }
-      // 对方拒绝 / 60s 没人处理而作废 / 已绑定设备**自动收下时本机放行失败**：本机挂着
+      // 对方拒绝 / 已绑定设备**自动收下时本机放行失败**：本机挂着
       // 的那条通知必须撤掉，否则它会一直留在那儿，点「接收」才发现邀请早就没了（后面那种
       // 情况下 kind 已经是 'receiving' —— 后端这时补一条 accepted:false 回来）。
       // 发送方那张进度卡由随后的 push://done 收尾（两条通道都会跟一条）。
@@ -2682,7 +2867,13 @@
 
     const unPushDone = listen<{ inviteId: string; status: string; reason?: string | null; dest?: string }>('push://done', (ev) => {
       const { inviteId, status, reason, dest } = ev.payload;
-      chat.noteInviteDone(inviteId, status === 'completed' ? 'received' : 'failed');
+      // `dest` 一并带给会话 store：收完那条气泡上的「打开」按它去开（见 `ChatFileMsg.path`）。
+      // `cancelled` 单列一档：那是有人按了停止（本机那颗，或发送方撤销），不是"接收失败"。
+      chat.noteInviteDone(
+        inviteId,
+        status === 'completed' ? 'received' : status === 'cancelled' ? 'cancelled' : 'failed',
+        dest,
+      );
       const notice = notices.find((n) => n.inviteId === inviteId);
       if (notice) {
         if (status === 'completed') {
@@ -2754,6 +2945,13 @@
       setOpen(true);
     });
 
+    // 托盘左键单击（**只在有事等处理时才发**）：落到"该看的那一件事"上。
+    // 与上面那条分开：`orb://show` 是"打开主界面"（双击 / 第二份进程），这条是"打开该看的那件"，
+    // 落到的视图不一样（见 `openTrayAlert`）。
+    const unTrayAlert = listen('orb://tray_alert', () => {
+      openTrayAlert();
+    });
+
     // 对方输入了本机显示的配对码 → 本机验证通过、给出 token（list 由 devices://changed 刷新）
     const unPairDone = listen<{ peerId: string; peerName?: string | null; inviteId?: string | null }>('pair://completed', (ev) => {
       if (pairConfirming) return;   // 本机自己发起的确认，toast 由 confirmPair 给出
@@ -2766,7 +2964,7 @@
       }
       const ps = pairState;
       if (ps?.peerId === ev.payload.peerId) {
-        const name = peerDisplayName(ev.payload.peerId, ps.peerName ?? ev.payload.peerName ?? '设备');
+        const name = peerShortName(ev.payload.peerId, ps.peerName ?? ev.payload.peerName ?? '设备');
         closePair();
         toast(`已与「${name}」配对成功（点「连接」建立长连接）`);
       }
@@ -2780,7 +2978,7 @@
         inviteId: p.inviteId,
         kind: 'pair',
         peerId: p.peerId,
-        from: peerDisplayName(p.peerId, p.peerName),
+        from: peerShortName(p.peerId, p.peerName),
         name: '',
         size: 0,
         isDir: false,
@@ -2806,6 +3004,65 @@
       // 用户自己点「取消」时那张卡已经收掉了（撤回来的 403 落到这里时什么都不用说）。
       const why = reason ?? '对方未接受';
       toast(why.includes('取消') ? '配对邀请已取消' : `配对邀请未完成：${why}`);
+    });
+
+    // 收到一条**长连接请求**（F-16 的同意制）→ 挂一条通知（带「接受/拒绝」）。
+    // 与配对邀请同一套约定：**不主动弹面板**，悬浮球左上角的数字就是信号。
+    const unLinkRequest = listen<{ requestId: string; peerId: string; peerName: string }>('link://request', (ev) => {
+      const p = ev.payload;
+      notices = [...notices, {
+        inviteId: p.requestId,
+        kind: 'link',
+        peerId: p.peerId,
+        from: peerShortName(p.peerId, p.peerName),
+        name: '',
+        size: 0,
+        isDir: false,
+        count: 1,
+        received: 0,
+      }];
+    });
+
+    // 本机刚把一条连接请求发出去 → 挂"等待对方同意"那张卡（对方处理完由下面那条收掉）。
+    const unLinkSent = listen<{ requestId: string; peerId: string; peerName: string }>('link://request_sent', (ev) => {
+      const p = ev.payload;
+      // 同一台设备重复点「连接」：旧的那张卡先收掉（后一次请求作数），别在角标里堆两张。
+      notices = notices.filter((n) => !(n.kind === 'linkWait' && n.peerId === p.peerId));
+      notices = [...notices, {
+        inviteId: p.requestId,
+        kind: 'linkWait',
+        peerId: p.peerId,
+        from: peerShortName(p.peerId, p.peerName),
+        name: '',
+        size: 0,
+        isDir: false,
+        count: 1,
+        received: 0,
+      }];
+    });
+
+    // 一条进来的连接请求作废了（本机 60s 没处理 / 对方撤回）：撤掉通知并说明原因。
+    const unLinkClosed = listen<{ requestId: string; reason?: string | null }>('link://request_closed', (ev) => {
+      const { requestId, reason } = ev.payload;
+      if (!notices.some((n) => n.kind === 'link' && n.inviteId === requestId)) return;
+      dropNotice(requestId);
+      toast(`连接请求已作废：${reason ?? '超时未处理'}`);
+    });
+
+    // 本机发出去的那条有结果了：`granted`（在建链）/ `denied`（对方拒绝或没处理）/
+    // `fallback`（请求送不到，退回直接拨号 —— 与旧行为一致，不用提示什么大事）。
+    const unLinkResult = listen<{ requestId: string; peerId: string; outcome: string; reason?: string | null }>('link://request_result', (ev) => {
+      const { requestId, peerId, outcome, reason } = ev.payload;
+      if (!notices.some((n) => n.kind === 'linkWait' && n.inviteId === requestId)) return;
+      const from = notices.find((n) => n.inviteId === requestId)?.from ?? peerShortName(peerId);
+      dropNotice(requestId);
+      if (outcome === 'granted') {
+        toast(`「${from}」已同意：正在建立长连接`);
+      } else if (outcome === 'fallback') {
+        toast(`正在与「${from}」建立长连接`);
+      } else {
+        toast(`「${from}」没有接受连接请求：${reason ?? '对方未处理'}`);
+      }
     });
 
     // Context menu from child components
@@ -2848,10 +3105,15 @@
       document.removeEventListener('keydown', escStatus);
       document.removeEventListener('keydown', escChat);
       unOrbShow.then(fn => fn());
+      unTrayAlert.then(fn => fn());
       unPairDone.then(fn => fn());
       unPairInvite.then(fn => fn());
       unPairInviteClosed.then(fn => fn());
       unPairInviteFailed.then(fn => fn());
+      unLinkRequest.then(fn => fn());
+      unLinkSent.then(fn => fn());
+      unLinkClosed.then(fn => fn());
+      unLinkResult.then(fn => fn());
       document.removeEventListener('od:ctx', handleCtx);
       document.removeEventListener('contextmenu', killDefaultCtx, true);
       document.removeEventListener('od:toast', handleToast);
@@ -2977,7 +3239,7 @@
     />
 
     <div class="panel-body" bind:this={bodyEl}>
-      <TabContent tab={activeTab} devices={getDevices()} onToast={toast} onMessage={(d) => openDeviceChat(d.id)} onAddShare={requestAddShare} onOpenPair={openPair} onUnpair={(d) => void unpairDevice(d.id)} />
+      <TabContent tab={activeTab} devices={getDevices()} onToast={toast} onMessage={(d) => openDeviceChat(d.id)} onAddShare={requestAddShare} onOpenPair={openPair} onUnpair={(d) => void unpairDevice(d.id)} noticeCount={pendingNoticeCount} />
     </div>
 
     <footer class="panel-foot" bind:this={footEl}>
@@ -3101,7 +3363,7 @@
               <div class="p-top">
                 <span class="nb-title">{noticeTitle(n)}</span>
                 <span class="nb-size num">
-                  {#if n.kind === 'pair'}{:else if n.kind === 'receiving'}{pushPercent(n.received, n.size)}%{:else}{fmtBytes(n.size)}{/if}
+                  {#if n.kind === 'pair' || n.kind === 'link' || n.kind === 'linkWait'}{:else if n.kind === 'receiving'}{pushPercent(n.received, n.size)}%{:else}{fmtBytes(n.size)}{/if}
                 </span>
               </div>
 
@@ -3130,6 +3392,23 @@
                 <p class="nb-body">{noticeBody(n)}</p>
                 <div class="nb-acts">
                   <button class="btn btn-secondary btn-sm" onclick={() => void cancelPairWaitNotice(n)}>取消</button>
+                </div>
+              {:else if n.kind === 'link'}
+                <div class="consent-info">
+                  <span class="f-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/></svg>
+                  </span>
+                  <span class="c-name">{n.from}</span>
+                </div>
+                <p class="nb-body">{noticeBody(n)}</p>
+                <div class="nb-acts">
+                  <button class="btn btn-secondary btn-sm" onclick={() => void rejectLinkNotice(n)}>拒绝</button>
+                  <button class="btn btn-primary btn-sm" onclick={() => void acceptLinkNotice(n)}>接受</button>
+                </div>
+              {:else if n.kind === 'linkWait'}
+                <p class="nb-body">{noticeBody(n)}</p>
+                <div class="nb-acts">
+                  <button class="btn btn-secondary btn-sm" onclick={() => void cancelLinkWaitNotice(n)}>取消</button>
                 </div>
               {:else if n.kind === 'invite'}
                 <div class="consent-info">
@@ -3289,14 +3568,14 @@
             </div>
           {:else}
             <h3>添加设备</h3>
-            <p class="d-desc">输入对方设备的 IP 与端口，添加后即可与它配对（跨网段场景）。</p>
+            <p class="d-desc">输入对方设备的 IP，添加后即可与它配对（跨网段场景）。端口留空会自动扫 3890-3899。</p>
             <div class="field">
               <label for="pairIp">对方 IP / IP:端口</label>
-              <input id="pairIp" class="input num" bind:value={pairState.ip} placeholder="192.168.1.4:3890" />
+              <input id="pairIp" class="input num" bind:value={pairState.ip} placeholder="192.168.1.4" />
             </div>
             <div class="field pair-port">
-              <label for="pairPort">端口</label>
-              <input id="pairPort" class="input num" bind:value={pairState.port} inputmode="numeric" placeholder="3890" />
+              <label for="pairPort">端口（留空自动扫描）</label>
+              <input id="pairPort" class="input num" bind:value={pairState.port} inputmode="numeric" placeholder="3890-3899" />
             </div>
             {#if pairState.error}<p class="d-err">{pairState.error}</p>{/if}
             <div class="d-acts">
@@ -3310,7 +3589,7 @@
 
     <!-- 设备备注（F-101）：右键设备行 →「修改备注」。备注**只写本机**
          （`config.toml` 的 `deviceRemarks`），对端看不到、也不改对方的设备名；
-         设了备注之后，本机界面上这台设备的名字显示成「备注(设备名)」。
+         设了备注之后，到处显示成备注本身，只有**局域网设备列表**那一行写「备注(设备名)」。
          留空保存 = 清除这一条（与「清除备注」同一件事）。 -->
     {#if remarkState}
       <div class="overlay open" id="remarkDialog">
@@ -3318,8 +3597,9 @@
           <h3 class="d-head">设备备注<Hint>
             备注是<b>你</b>给这台设备起的名字，只保存在本机（`config.toml`），
             <span class="hl">不会发给对端</span>，也不改对方自己的设备名。
-            设好之后本机到处都用「<b>备注(设备名)</b>」显示这台设备（设备行、标签栏、会话标题、
-            收件人选择框、推送卡都算）。备注跟着<b>设备</b>走，不跟地址走 ——
+            设好之后<b>局域网设备列表</b>那一行显示成「<b>备注(设备名)</b>」，
+            其余地方（会话列表与标题、标签栏、收件人选择框、推送卡与通知）只写<b>备注本身</b>；
+            名字太长时把鼠标放上去能看全。备注跟着<b>设备</b>走，不跟地址走 ——
             换网段、重新配对之后它还在；留空保存即清除。
           </Hint></h3>
           <p class="d-desc">当前设备名：{remarkState.rawName}</p>
@@ -3359,8 +3639,10 @@
       onSendFiles={chatSendFiles}
       onAcceptInvite={chatAcceptInvite}
       onRejectInvite={chatRejectInvite}
+      onStopReceive={(id) => void stopReceive(id)}
       onConvoCtx={openConvoCtx}
       onMessageCtx={openMessageCtx}
+      onOpenFile={(item) => void openChatFile(item)}
     />
     {#if chat.getRecipientReq()}
       <RecipientDialog />
@@ -3398,7 +3680,7 @@
     deviceOnline={ctxState.deviceOnline}
     deviceNeedsPair={ctxState.deviceNeedsPair}
     deviceRemark={ctxState.deviceId ? getDevices().find((d) => d.id === ctxState?.deviceId)?.remark ?? null : null}
-    peerName={ctxState.peerId ? peerDisplayName(ctxState.peerId) : undefined}
+    peerName={ctxState.peerId ? peerShortName(ctxState.peerId) : undefined}
     bcAvailable={bcMenu.available}
     bcLeftLabel={bcMenu.leftLabel}
     bcRightLabel={bcMenu.rightLabel}

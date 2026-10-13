@@ -51,7 +51,8 @@ pub async fn serve(
 
     for task in &req.tasks {
         // 用户取消 / 这条推送已经收尾：整条停下来（接收端会看到断流并重试，下一次请求
-        // 拿到 410 就知道是"发送方已取消"）。
+        // 拿到 410 就知道"对端不再提供这条推送了" —— 撤销与"它那台重启过"在线上分不出来，
+        // 见 `transfer::SENDER_GONE`）。
         let (abs, cancelled) = match state.push.download_target(&req.id, &task.path) {
             DownloadTarget::Missing => {
                 debug!(id = %req.id, path = %task.path, "推送已不在，停止发流");

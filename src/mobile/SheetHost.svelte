@@ -2,9 +2,10 @@
   import type { Sheet } from "./store.svelte";
   import PairSheet from "./sheets/PairSheet.svelte";
   import PairInviteSheet from "./sheets/PairInviteSheet.svelte";
+  import LinkRequestSheet from "./sheets/LinkRequestSheet.svelte";
   import AddDeviceSheet from "./sheets/AddDeviceSheet.svelte";
   import DeviceActionsSheet from "./sheets/DeviceActionsSheet.svelte";
-  import RenameDeviceSheet from "./sheets/RenameDeviceSheet.svelte";
+  import RemarkDeviceSheet from "./sheets/RemarkDeviceSheet.svelte";
   import FileActionsSheet from "./sheets/FileActionsSheet.svelte";
   import ChatActionsSheet from "./sheets/ChatActionsSheet.svelte";
   import ConvoSheet from "./sheets/ConvoSheet.svelte";
@@ -21,12 +22,14 @@
   <PairSheet {onClose} />
 {:else if sheet.kind === "pairInvite"}
   <PairInviteSheet {onClose} />
+{:else if sheet.kind === "linkRequest"}
+  <LinkRequestSheet {onClose} />
 {:else if sheet.kind === "addDevice"}
   <AddDeviceSheet {onClose} />
 {:else if sheet.kind === "deviceActions"}
   <DeviceActionsSheet peerId={sheet.peerId} {onClose} />
-{:else if sheet.kind === "renameDevice"}
-  <RenameDeviceSheet peerId={sheet.peerId} {onClose} />
+{:else if sheet.kind === "remarkDevice"}
+  <RemarkDeviceSheet peerId={sheet.peerId} {onClose} />
 {:else if sheet.kind === "fileActions"}
   <FileActionsSheet entry={sheet.entry} {onClose} />
 {:else if sheet.kind === "chatActions"}

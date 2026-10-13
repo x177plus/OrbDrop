@@ -3,6 +3,7 @@ pub mod push_job;
 pub mod resume;
 pub mod stream;
 pub mod stream_send;
+pub mod watch;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,16 +21,25 @@ use push_job::{InboundInvite, PushJob, PushStatus};
 
 /// 一条邀请在接收方屏幕上停留多久：到点自动拒绝。
 ///
-/// 发送方在等（HTTP 邀请是同步等回执的），接收方这边没人管的话，那条邀请会一直挂在
-/// 通知列表里，而发送方早就超时走人了 —— 两边状态必须同时作废。
+/// **只对老对端（不带 `await1`，见 `push_job::CAP_AWAIT`）有效**：它们那条 HTTP 邀请是
+/// **挂着等同步响应**的，本机这边没人管的话，发送方会一直挂在那条请求上 —— 两边状态必须
+/// 同时作废。带 `await1` 的对端走"投递即回 + 决定走报告"，这条邀请**没有时钟**：
+/// 卡片留到用户点、或发送方撤销为止（守卫在 [`schedule_invite_timeout`] 里）。
 pub const INVITE_TTL: Duration = Duration::from_secs(60);
 
-/// 发送方等 HTTP 邀请回执的时限：比 `INVITE_TTL` 多一点余量，让"对方没点、自动拒绝"
-/// 这条正常路径能走到回执，而不是本机先断在网上。
-const HTTP_INVITE_TIMEOUT: Duration = Duration::from_secs(75);
+/// 接收端撞上 `410` 时给用户的那句话（两条数据面共用一份，不许各写各的）。
+///
+/// **不能写「发送方已取消」**：`410` 只说明"对端这会儿没有这条 job 了"（`download_target` 答
+/// `Missing`），而撤销、收尾、**它那台重启过**、它自己把这条判失败 —— 这四件事在线上长得一模
+/// 一样。特别是"两端都重启过"那条路：接收端会自动来续传（见 `resume_pending`），撞上的正是
+/// 它，写成"已取消"就是一句假话（用户会以为对面点了取消，其实对面只是关了一次应用）。
+pub const SENDER_GONE: &str = "发送方已不再提供这份推送（它可能重启过，也可能已取消）";
 
-/// 长连接那条路上没有同步回执，等不到人处理就作废（P1 原有行为）。
-const WS_INVITE_TTL: Duration = Duration::from_secs(300);
+/// 老对端那条 HTTP 邀请请求的**网络**时限（不是"等用户"的时限）。
+///
+/// 比 `INVITE_TTL` 多一点余量，让"对方没点、自动作废"这条正常路径能走到回执，而不是本机
+/// 先断在网上。带 `await1` 的对端投递即回，这条线根本碰不到（它等的是回执通道那一条）。
+const HTTP_INVITE_TIMEOUT: Duration = Duration::from_secs(75);
 
 // ---------------------------------------------------------------------------
 // Source manifest
@@ -294,18 +304,26 @@ async fn collect_dir_manifest(dir: &Path) -> Result<(Vec<FileEntry>, u64, usize)
 /// 一次操作 = 一批，只多两件事，其余与单台推送完全一致：
 /// - **清单只建一次**（目录只走一遍，各台拿到的清单与同名去重编号一模一样）；
 /// - 每台各有一条独立的邀请/job —— 接收侧因此毫无差别（已配对不问同意、未绑定弹卡等点头、
-///   60s 超时、双向取消、断点续传全部照旧），批次只多一张聚合卡片 + **失败隔离**
+///   一直等（对方点头前不设时钟，见 `watch` 与 `push_job::CAP_AWAIT`）、双向取消、断点续传全部照旧），
+///   批次只多一张聚合卡片 + **失败隔离**
 ///   （一台送不到不影响其余几台；但一台都送不到时整批就地失败，等价于单台那条 F-53）。
 ///
 /// 通道按对端状态逐台选（`docs/p1-implementation.md` §7）：
 /// - 长连接 → WS 事件 `push_invite`；其余在线设备（已配对未连、未绑定）→ HTTP `POST /push/invite`。
 ///
 /// 返回整批快照；界面同时还会收到 `push://batch` —— 同一份数据，界面按 `batchId` 合并。
+///
+/// `at` = 这批文件在**会话时间线**上的位置（发送方的墙上时间）。只有"输入框里文字与图片
+/// 交错着一次发出去"那条路会点名给它（见 `chat::send_text` 的同名参数）：接收方那条文件消息
+/// 的 `at` 就是它 —— 不带过去的话，对端只能拿"邀请到达的那一刻"当位置，夹在前后两段文字
+/// 中间的那张图就会掉到后面去。不点名 = 当场取现在。
 pub async fn push_paths(
     state: Arc<AppState>,
     paths: Vec<String>,
     peer_ids: Vec<String>,
+    at: Option<u64>,
 ) -> Result<push_job::BatchView, String> {
+    let at = at.unwrap_or_else(crate::chat::now_ms);
     // 同一台设备勾两次只发一条（保持勾选顺序）。
     let mut ids: Vec<String> = Vec::new();
     for id in peer_ids {
@@ -418,9 +436,16 @@ pub async fn push_paths(
             is_dir: source.is_dir,
             count: source.count,
             files: source.files.clone(),
-            caps: vec![push_job::CAP_STREAM.to_string()],
+            caps: vec![push_job::CAP_STREAM.to_string(), push_job::CAP_AWAIT.to_string()],
+            at,
         };
         spawn_invite_delivery(state.clone(), peer, invite_id, event, server_port);
+    }
+
+    // 这批里有台在等对方点头（`Invited`）→ 盯住这次推的源：源一变，这批当场作废。
+    // 这是"我这边取消"的另一半（另一半是用户点「取消」）—— 见 `watch`。
+    if state.push.batch_has_invited(&batch_id) {
+        watch::watch_sources(&state, &batch_id, &roots);
     }
 
     Ok(view)
@@ -443,38 +468,51 @@ fn spawn_invite_delivery(
     crate::task::spawn("push invite", async move {
         if state.ws.has_connection(&peer_id) {
             if state.ws.send(&peer_id, event) {
-                schedule_ws_invite_timeout(state.clone(), invite_id.clone());
+                // 长连接那条路本来就是异步的（决定走 `push_response`）。**没有时钟**：
+                // 对端一直不点头就一直等着（它带 `await1` 时两边都没有时钟；老对端自己
+                // 那边会 60 秒作废，或者由它的回答/对账把话带回来）。
+                debug!(%invite_id, %peer_id, "invite sent over the long connection; waiting for the decision");
             } else {
                 fail_invite(&state, &invite_id, "对方离线");
             }
             return;
         }
         match deliver_invite_http(&peer, server_port, &event, paired).await {
-            Ok(true) => {
+            Ok(d) if d.pending => {
+                // `await1` 的对端：**投递即算送达**。它那边一条卡片挂着等用户点，
+                // 那道决定稍后从回执通道回来（`push_response`）。本机这张卡就一直写
+                // 「等待对方同意」—— 这正是要的：不点就一直等。
+                info!(%invite_id, %peer_id, "invite delivered; the peer is waiting for its user (await1)");
+            }
+            Ok(d) if d.accepted => {
+                info!(%invite_id, %peer_id, "invite auto-accepted by a paired peer");
                 state.push.update_status(&invite_id, PushStatus::Accepted);
                 ws::emit_ui(&state, ws::events::ui::PUSH_RESPONSE, &serde_json::json!({
                     "inviteId": invite_id,
                     "accepted": true,
                 }));
             }
-            Ok(false) => {
+            Ok(d) => {
+                let why = refusal_reason(&peer_name, &d);
+                info!(%invite_id, %peer_id, legacy = d.reason.is_none(), %why, "invite refused synchronously");
                 state.push.remove_job(&invite_id);
                 push_job::batch_set(
                     &state,
                     &invite_id,
                     push_job::TargetState::Rejected,
                     None,
-                    Some("对方拒绝了这次推送".into()),
+                    Some(why.clone()),
                     true,
                 );
                 ws::emit_ui(&state, ws::events::ui::PUSH_RESPONSE, &serde_json::json!({
                     "inviteId": invite_id,
                     "accepted": false,
+                    "reason": why,
                 }));
                 ws::emit_ui(&state, ws::events::ui::PUSH_DONE, &serde_json::json!({
                     "inviteId": invite_id,
                     "status": "failed",
-                    "reason": format!("「{peer_name}」拒绝了这次推送"),
+                    "reason": why,
                 }));
             }
             Err(reason) => fail_invite(&state, &invite_id, &reason),
@@ -500,41 +538,52 @@ fn fail_invite(state: &AppState, invite_id: &str, reason: &str) {
     }));
 }
 
-/// 长连接邀请没人处理就作废（发送方等 5 分钟）。
-fn schedule_ws_invite_timeout(state: Arc<AppState>, invite_id: String) {
-    crate::task::spawn("push invite timeout", async move {
-        tokio::time::sleep(WS_INVITE_TTL).await;
-        if state.push.job_status(&invite_id).as_deref() == Some("invited") {
-            info!(%invite_id, "invite timed out, cancelling");
-            state.push.remove_job(&invite_id);
-            push_job::batch_set(
-                &state,
-                &invite_id,
-                push_job::TargetState::Failed,
-                None,
-                Some("对方未响应（5 分钟超时）".into()),
-                true,
-            );
-            ws::emit_ui(&state, ws::events::ui::PUSH_DONE, &serde_json::json!({
-                "inviteId": invite_id,
-                "status": "failed",
-                "reason": "对方未响应（5 分钟超时）",
-            }));
-        }
-    });
+/// 一条邀请在远端是什么结局（`POST /push/invite` 的响应体）。
+///
+/// 三档要分得清：
+/// - `pending` —— 送到了、对方记下了，正在等它的用户点（`await1` 对端）。**发送方继续等**，
+///   不是拒绝；
+/// - `accepted` —— 对方**免同意**直接收（已配对设备）；
+/// - 其余 —— 对方明确拒绝 / 收不下，`reason` 是它给的原话。
+#[derive(serde::Deserialize)]
+struct InviteDecision {
+    accepted: bool,
+    /// 邀请已送达、等对方用户决定（见 `push_job::CAP_AWAIT`）。老对端不带 → false。
+    #[serde(default)]
+    pending: bool,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
-/// 把邀请 POST 到对端的 `/push/invite`。返回对方是否同意。
+/// 那条**同步**的 `accepted:false` 该怎么说。
+///
+/// **对端没回 `pending` 就说明它不认识 `await1`**（见 `push_job::CAP_AWAIT`）：带这个位
+/// 的对端永远不会在这条同步响应上拒绝（拒绝走回执通道），所以只要在这儿收到 `accepted:false`，
+/// 对面就是老版本。而老版本那句 `accepted:false` **分不出"用户点了拒绝"与"60 秒到点自动作废"**
+/// （它不带 `reason`）—— 所以别替它编一个"对方拒绝"，如实说清"对面是老版本、它按老规矩办"，
+/// 让人知道**升级对端**才是那条路（P1-13 的同一类毛病：说错原因比不说不清更坏）。
+fn refusal_reason(peer_name: &str, decision: &InviteDecision) -> String {
+    decision.reason.clone().unwrap_or_else(|| {
+        format!("「{peer_name}」是老版本：它不支持一直等，邀请 60 秒没人处理就会自动作废")
+    })
+}
+
+/// 把邀请 POST 到对端的 `/push/invite`。返回对端给的那道决定。
 ///
 /// 请求体就是 WS 那条路的 `push_invite` 事件（同一个序列化结构，多带一个 `port`）——
 /// 两条通道说的是同一套协议，接收方只有一份解析代码。`port` 是本机**服务端口**：
 /// 这个 HTTP 请求的源端口是一次性的，对端要回执（进度/完成）得发回真正的服务端口。
+///
+/// **响应不再是"最终决定"**：带 `await1` 的对端（新版本）只回一句"送到了、等着呢"
+/// （`pending`），它那边的用户点完才把决定通过 `/push/report` 发回来；老对端才会一直
+/// 挂着这条请求，把用户点的结果当同步响应当场回（那条路上 `HTTP_INVITE_TIMEOUT` 是
+/// 网络时限，不是"等用户"的时限）。
 async fn deliver_invite_http(
     peer: &crate::config::PeerDevice,
     server_port: u16,
     event: &WsEvent,
     paired: bool,
-) -> Result<bool, String> {
+) -> Result<InviteDecision, String> {
     let mut body = serde_json::to_value(event).map_err(|e| format!("邀请序列化失败: {e}"))?;
     body["port"] = serde_json::json!(server_port);
 
@@ -567,12 +616,7 @@ async fn deliver_invite_http(
         .json()
         .await
         .map_err(|e| format!("「{}」的回应无法解析：{e}", peer.name))?;
-    Ok(decision.accepted)
-}
-
-#[derive(serde::Deserialize)]
-struct InviteDecision {
-    accepted: bool,
+    Ok(decision)
 }
 
 /// 发送方：取消一条推送（F-54）。
@@ -582,6 +626,17 @@ struct InviteDecision {
 ///   点「接收」才发现早就没了；
 /// - 已经在传 → 下载端点会当场断流、下一次请求拿到 410，收手更快。
 pub fn cancel_push(state: &AppState, invite_id: &str) -> Result<(), String> {
+    cancel_push_with(state, invite_id, "已取消", "发送方已取消")
+}
+
+/// 同上，但两句原因各写各的：`card` 是本机卡片那一行，`wire` 是回给对端那句话
+/// （源变化那条路要用它说清"为什么"——见 `transfer::watch`）。
+fn cancel_push_with(
+    state: &AppState,
+    invite_id: &str,
+    card: &str,
+    wire: &str,
+) -> Result<(), String> {
     let job = state
         .push
         .job(invite_id)
@@ -592,13 +647,13 @@ pub fn cancel_push(state: &AppState, invite_id: &str) -> Result<(), String> {
         invite_id,
         push_job::TargetState::Cancelled,
         None,
-        Some("已取消".into()),
+        Some(card.to_string()),
         true,
     );
     notify_peer(state, &job.peer_id, WsEvent::PushDone {
         invite_id: invite_id.to_string(),
         status: "cancelled".into(),
-        reason: Some("发送方已取消".into()),
+        reason: Some(wire.to_string()),
     });
     ws::emit_ui(state, ws::events::ui::PUSH_DONE, &serde_json::json!({
         "inviteId": invite_id,
@@ -610,15 +665,25 @@ pub fn cancel_push(state: &AppState, invite_id: &str) -> Result<(), String> {
 /// 发送方：取消一整批推送 —— 每台各撤一条（两个阶段各自的理由见 `cancel_push`）。
 ///
 /// 单台的失败（对端已经不在网上、这条早就结束了）**不该挡住其余几台的取消**，
-/// 所以逐台各自尽力、结果不带出来（对端那条邀请照样会因为它自己的 60s 超时作废）。
+/// 所以逐台各自尽力、结果不带出来。
 pub fn cancel_push_batch(state: &AppState, batch_id: &str) -> Result<(), String> {
+    cancel_push_batch_with(state, batch_id, "已取消", "发送方已取消")
+}
+
+/// 同上，换成自己的那两句话（源文件/目录变了时用它，见 `transfer::watch`）。
+pub fn cancel_push_batch_with(
+    state: &AppState,
+    batch_id: &str,
+    card: &str,
+    wire: &str,
+) -> Result<(), String> {
     let targets = state
         .push
         .batch_targets(batch_id)
         .ok_or_else(|| "推送不存在".to_string())?;
     for target in targets {
         if target.state.is_waiting() {
-            let _ = cancel_push(state, &target.invite_id);
+            let _ = cancel_push_with(state, &target.invite_id, card, wire);
         }
     }
     Ok(())
@@ -638,11 +703,15 @@ pub fn notify_peer(state: &AppState, peer_id: &str, event: WsEvent) {
 // Receiver side
 // ---------------------------------------------------------------------------
 
-/// 接收方：邀请到点没被处理就自动拒绝（两条通道共用）。
+/// 接收方：邀请到点没被处理就自动拒绝（**只服务老对端**）。
 ///
-/// 发送方在等回执：HTTP 那条路上等的是这个 oneshot，长连接那条路上等的是
-/// `push_response` —— 所以这里两个出口都要走到。
+/// 老对端的 HTTP 邀请挂着等同步响应，本机这边没人管的话它会一直挂着 —— 两边状态必须同时
+/// 作废。带 `await1` 的对端（见 `push_job::CAP_AWAIT`）在等一条**报告**，两边都没有时钟：
+/// 这条函数对它直接返回，卡片留到用户点、或发送方撤销为止（这就是"一直等"）。
 pub fn schedule_invite_timeout(state: Arc<AppState>, invite_id: String) {
+    if state.push.invite_supports_await(&invite_id) {
+        return;
+    }
     crate::task::spawn("push invite decision timeout", async move {
         tokio::time::sleep(INVITE_TTL).await;
         let Some(invite) = state.push.take_invite(&invite_id) else {
@@ -664,6 +733,8 @@ pub fn accept_invite(
     invite_id: &str,
     root: Option<std::path::PathBuf>,
 ) -> Result<(), String> {
+    // 落盘那一层由设置决定（S-12）：在拿 inbound 锁**之前**读，锁序单一，不跟自己打结。
+    let device_subdir = state.config.lock().device_subdir;
     let (invite, sender_id) = {
         let mut inbound = state.push.inbound.lock();
         let inv = inbound
@@ -688,7 +759,7 @@ pub fn accept_invite(
             }
             // 就地验一次可写（不存在的建出来、拔掉的盘/只读目录当场报错）：失败时**什么都别动**，
             // 用户换一个目录重按「接收」即可 —— 比"收了一半才发现写不进去"强。
-            let dir = resume::landing_root(base, &inv.sender.name);
+            let dir = resume::landing_dir(base, &inv.sender.name, device_subdir);
             std::fs::create_dir_all(&dir).map_err(|e| format!("落盘目录不可用：{e}"))?;
         }
         if let Some(tx) = inv.responder.take() {
@@ -713,6 +784,10 @@ pub fn accept_invite(
         )
     };
 
+    // **从这一刻起这条接收该被接手**：落一份待续传任务 —— 进程之后被杀/关掉，下次启动
+    // 自己接着收（见 `resume_pending`）。写在放行之后、起下载之前：没点头的邀请不该在重启
+    // 之后自己开始收，那等于替用户点了一次同意。
+    state.push.resume.put_pending(invite.to_pending());
     push_job::spawn_download(state, invite, sender_id);
     Ok(())
 }
@@ -727,6 +802,9 @@ pub fn reject_invite(state: &AppState, invite_id: &str) {
 /// 自动放行（已绑定设备）失败时用它：那种场合**没有人"拒绝"**，是本机收不下
 /// （地址未知之类）—— 原因照实说，别让用户以为对面点了拒绝。
 pub fn reject_invite_with(state: &AppState, invite_id: &str, reason: &str) {
+    // 明确不要这条：待续传任务一并作废（预检那条路不会记任务，这里是兜底 —— 万一
+    // 放行之后又走到拒绝，重启后不该再自己开始收）。
+    state.push.resume.drop_pending(invite_id);
     let Some(mut invite) = state.push.take_invite(invite_id) else {
         return;
     };
@@ -738,20 +816,25 @@ pub fn reject_invite_with(state: &AppState, invite_id: &str, reason: &str) {
 
 /// 拒绝的共同出口：回执 + 本机通知列表撤掉这张卡。
 fn reject_shared(state: &AppState, invite: InboundInvite, reason: &str) {
-    if state.ws.has_connection(&invite.sender.id) {
-        ws::send_to_peer(
-            state,
-            &invite.sender.id,
-            WsEvent::PushResponse { invite_id: invite.invite_id.clone(), accepted: false },
-        );
+    let response = WsEvent::PushResponse {
+        invite_id: invite.invite_id.clone(),
+        accepted: false,
+        reason: Some(reason.to_string()),
+    };
+    if invite.supports_await() {
+        // 等报告那一版（`await1`）：这条决定只能从回执通道走 —— 长连接在就先走它，
+        // 否则 POST 对方的 `/push/report`。**未绑定设备没有长连接**，HTTP 这一跳是它唯一的路。
+        push_job::report_to_sender(state, &invite.sender.id, &invite.callback, response);
+    } else if state.ws.has_connection(&invite.sender.id) {
+        // 老对端：长连接上照旧回一条（HTTP 那条路的决定是它自己那条同步响应）。
+        ws::send_to_peer(state, &invite.sender.id, response);
     }
     ws::emit_ui(state, ws::events::ui::PUSH_RESPONSE, &serde_json::json!({
         "inviteId": invite.invite_id,
         "accepted": false,
         "reason": reason,
     }));
-    // 拒绝也是个结局：这条 `PushResponse` 现在只在有长连接时发得出去（没有 HTTP 兜底），
-    // 丢了的话发送方只能靠超时 —— 对账时把真话说出去。
+    // 拒绝也是个结局：发送方那边可能还是靠对账（`PushAsk`）补上的，这里把真话说出去。
     state.push.record_outcome(
         &invite.invite_id,
         &invite.sender.id,
@@ -762,7 +845,11 @@ fn reject_shared(state: &AppState, invite: InboundInvite, reason: &str) {
 }
 
 /// 接收方：取消正在进行的接收（保留续传记录，下次可接着拉）。
+///
+/// **但不再自动接着拉**（`resume_pending` 的名单里把它去掉）：自动续传的前提是"用户没喊停"，
+/// 而这里正是用户喊停的那一下 —— 关掉应用是"可能想停"，点这颗按钮是"就是要停"。
 pub fn cancel_receive(state: &AppState, invite_id: &str) {
+    state.push.resume.drop_pending(invite_id);
     let Some(invite) = state.push.take_invite(invite_id) else {
         return;
     };
@@ -796,6 +883,55 @@ pub fn cancel_receive(state: &AppState, invite_id: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// 自动续传：进程重启之后接着收
+// ---------------------------------------------------------------------------
+
+/// 每一拍（启动时 + 每 5s 一拍）看一遍还没传完的接收任务，按退避台阶接着收。
+///
+/// 判据与纪律：
+/// - **这一轮还在跑**（邀请还在 `inbound` 里）→ 跳过。它同时是 TTL 的豁免：真的在传的那条
+///   不该被 7 天窗口砍掉（"有进展"由 `touch_pending` 在文件收尾时刷新）。
+/// - **过期**（7 天没进展）→ 终态收尾并说清原因；文件级位图留着（用户手动重推仍接着传）。
+/// - **没到退避台阶** → 跳过（够不着对端时就是靠它"先放着不管"，见 `RETRY_BACKOFF`）。
+/// - 其余 → 重建邀请（`PendingInbound::to_invite`）、挂回 `inbound`、走同一条
+///   `spawn_download`：新数据面按**文件身份**接手块位图、老数据面按**同一个邀请 id**接手
+///   offset —— 两条路都不必重传已经落盘的那些字节。位图已经满了的那些文件连网都不用上
+///   （`run` 的收尾兜底直接把 `.part` 改名落位）。
+///
+/// 幂等、随时可叫：那一拍本来就只是"看一遍名单"（退避在 `attempt_due` 里把关）。
+pub fn resume_pending(state: &Arc<AppState>) {
+    let now = resume::now_secs();
+    // 任务删了但退避记账还在（内存里的一点点残留，顺手扫掉）。
+    state.push.resume.prune_attempts();
+    for rec in state.push.resume.pending_entries() {
+        if state.push.inbound.lock().contains_key(&rec.invite_id) {
+            continue;
+        }
+        if rec.expired(now) {
+            push_job::fail_download(
+                state,
+                &rec.sender_id,
+                &rec.callback,
+                &rec.invite_id,
+                format!(
+                    "等了 {} 天也没传完，已放弃（发送方一直没出现）",
+                    resume::PENDING_TTL_SECS / 86400
+                ),
+            );
+            continue;
+        }
+        if !state.push.resume.attempt_due(&rec.invite_id) {
+            continue;
+        }
+        state.push.resume.note_attempt(&rec.invite_id);
+        // 挂回 `inbound`：它同时是"这一轮在跑"的标志（`cancel_receive` 也靠它叫停）。
+        state.push.insert_invite(rec.to_invite());
+        debug!(invite = %rec.invite_id, sender = %rec.sender_id, "接着收这条没传完的推送");
+        push_job::spawn_download(state.clone(), rec.to_invite(), rec.sender_id.clone());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 对账：回执丢了怎么办（`PushAsk` / `PushState`）
 // ---------------------------------------------------------------------------
 
@@ -804,7 +940,8 @@ pub fn cancel_receive(state: &AppState, invite_id: &str) {
 /// 调用点与文本消息的"排队补发"（`chat::flush_queued`）是同一批，理由也一样：
 /// **链路在的时候不主动对账，回执丢了就永远对不上账**。回执（进度/完成/拒绝）是"一次、
 /// 尽力而为"的 —— 长连接断在"检查有没有会话"与"真的发出去"之间、或那一跳 HTTP 补发失败，
-/// 发送方那一台就会一直停在「等待」，5 分钟后被判成「对方未响应」，而对面其实早就收完了。
+/// 发送方那一台就会一直停在「等待」（带 `await1` 的对端没有时钟，见 `push_job::CAP_AWAIT`），
+/// 而对面其实早就拒了、或者早就收完了。
 ///
 /// 幂等 + 节流（`PushStore::ask_due`），所以每 5 秒一拍地叫它不会刷屏；没有待对账的邀请
 /// 就什么都不做（连闸门都不动）。只走长连接：对账的前提就是"链路在"。
@@ -911,7 +1048,8 @@ pub fn apply_push_states(
                 }
             }
             // 对端没有这条邀请（本机没见过 / 记录已过期）：它根本没送到 —— 当场收手，
-            // 不必再等满 5 分钟。发送方随后重试时对端会正常收到。
+            // 不必一直等着（带 `await1` 的对端没有时钟，凭证就在这条回答里）。
+            // 发送方随后重试时对端会正常收到。
             other => {
                 debug!(invite_id = %s.invite_id, state = %other, "对账：对端没有这条邀请");
                 state.push.remove_job(&s.invite_id);
@@ -1070,6 +1208,32 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    // ── 混版本：对面回的那句"拒绝"该怎么说 ────────────────────────────────────
+
+    /// `accepted:false` 而且**没有 `pending`** = 对端不认识 `await1`（老版本）。
+    ///
+    /// 老对端那句拒绝分不出"用户点了拒绝"与"60 秒到点自动作废"（它不带 `reason`）——
+    /// 所以卡片上不能写死"对方拒绝"，得如实说"对面是老版本、按老规矩办"，让人知道
+    /// 该往哪边走（升级对端）。对端**给了**原因就原话用它。
+    #[test]
+    fn a_synchronous_refusal_names_an_old_peer() {
+        let legacy = InviteDecision { accepted: false, pending: false, reason: None };
+        let why = refusal_reason("PC-UB", &legacy);
+        assert!(why.contains("老版本"), "老对端要说清是老版本，别写死「对方拒绝」：{why}");
+        assert!(why.contains("PC-UB"), "卡片上要认得出是哪一台：{why}");
+
+        let with_reason = InviteDecision {
+            accepted: false,
+            pending: false,
+            reason: Some("落盘目录不可用".into()),
+        };
+        assert_eq!(
+            refusal_reason("PC-UB", &with_reason),
+            "落盘目录不可用",
+            "对端给了原因就原话用它"
+        );
+    }
+
     // ── 对账：回执丢了怎么办（`PushAsk` / `PushState`）────────────────────────
 
     /// 一台临时状态：对账的落账要真的批次与真的 store。
@@ -1143,7 +1307,7 @@ mod tests {
     async fn reconcile_corrects_a_speculative_failure() {
         let state = reconcile_state();
         state.push.insert_batch(batch_with(vec![target_of("p1", "i1", push_job::TargetState::Invited)]));
-        // 5 分钟超时：本机先记成失败
+        // 本机先把这一台**推测**成失败（邀请送不出去 / 对账答 `unknown` 都落这一档）
         push_job::batch_set(&state, "i1", push_job::TargetState::Failed, None, Some("对方未响应".into()), true);
         assert_eq!(state.push.target_of_invite("i1").unwrap().state, push_job::TargetState::Failed);
 
@@ -1191,7 +1355,7 @@ mod tests {
         );
     }
 
-    /// 对端说"没见过这条邀请" = 那条邀请根本没送到：当场收手，不用等满 5 分钟。
+    /// 对端说"没见过这条邀请" = 那条邀请根本没送到：当场收手，不用一直等着。
     #[tokio::test]
     async fn reconcile_fails_an_invite_the_peer_never_saw() {
         let state = reconcile_state();

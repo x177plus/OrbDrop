@@ -195,7 +195,7 @@ fn pair_without_ws(
 }
 
 async fn push_one(state: &Arc<AppState>, src: &std::path::Path, peer: &str) -> String {
-    transfer::push_paths(state.clone(), vec![src.to_string_lossy().to_string()], vec![peer.into()])
+    transfer::push_paths(state.clone(), vec![src.to_string_lossy().to_string()], vec![peer.into()], None)
         .await
         .expect("邀请应该发得出去")
         .targets[0]
@@ -213,8 +213,8 @@ async fn stream_push_transfers_mixed_folder_intact() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-sa", "PC-SA", save.clone());
     let state_b = make_state(port_b, "device-sb", "PC-SB", save.clone());
-    let port_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.unwrap();
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.unwrap();
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
     pair_without_ws(&state_a, &state_b, "device-sa", "device-sb", port_a, port_b);
 
     let invite_id = push_one(&state_a, &src, "device-sb").await;
@@ -272,8 +272,8 @@ async fn interrupted_push_resumes_from_the_block_record() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-ra", "PC-RA", save.clone());
     let state_b = make_state(port_b, "device-rb", "PC-RB", save.clone());
-    let port_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.unwrap();
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.unwrap();
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
     pair_without_ws(&state_a, &state_b, "device-ra", "device-rb", port_a, port_b);
 
     let name = src.file_name().unwrap().to_string_lossy().to_string();
@@ -282,8 +282,16 @@ async fn interrupted_push_resumes_from_the_block_record() {
         let meta = std::fs::metadata(src.join("big.bin")).unwrap();
         orbdrop_lib::transfer::stream::mtime_secs(&meta)
     };
-    let key = orbdrop_lib::transfer::stream::resume_key("device-ra", &rel, big.len() as u64, mtime);
-    let dest = save.join("PC-RA").join(&name).join("big.bin");
+    let dest_dir = save.join("PC-RA").join(&name);
+    // 身份里含**落盘目录**（`stream::resume_key`）：这里要说的正是"这个文件收到哪儿"。
+    let key = orbdrop_lib::transfer::stream::resume_key(
+        "device-ra",
+        &dest_dir,
+        &rel,
+        big.len() as u64,
+        mtime,
+    );
+    let dest = dest_dir.join("big.bin");
 
     // ---- 第一趟：开传就取消 --------------------------------------------------------
     //
@@ -355,8 +363,196 @@ async fn interrupted_push_resumes_from_the_block_record() {
     let _ = std::fs::remove_dir_all(&save);
 }
 
+/// **接收端关掉应用之后自己接着收**（发送方什么都不用做，也不用重推）。
+///
+/// 与上一条（`interrupted_push_resumes_from_the_block_record`）的分工：
+/// - 那条是"用户点了取消、又让发送方重推一次" —— 靠的是文件级块位图跨邀请复用；
+/// - 这条是"这次没成、应用重启后自己接上" —— 靠的是 `resume.json` 里那份**待续传任务**
+///   （邀请 id + 清单 + 落盘根 + 对端地址）。判据是"发送方一次都没重推，接收端自己把那条
+///   请求重新发起并跑完"。
+///
+/// 第一趟怎么掐得**确定**：给接收端一个**写不进去的落盘根**（那个路径上躺着一个文件，
+/// `create_dir_all` 必失败）—— 下载建目录那一步当场失败，接收端按"这次没成、推送还在"收手
+/// （`fail_attempt`：摘邀请、**留任务**），正是"应用被杀/关掉"留在盘上的样子。
+/// 不调 `cancel_receive`：那是"用户喊停"，会正当地把任务删掉（那样就没得续了）。
+/// 也不靠"传一半再掐服务"：`stop_server` 是**优雅**停机（在飞的请求会跑完），掐不干净。
 #[tokio::test]
-async fn source_changed_before_consent_fails_only_that_file() {
+async fn a_restarted_receiver_resumes_on_its_own() {
+    let src = temp_dir("selfresume_src");
+    let save = temp_dir("selfresume_save");
+    // 24MB / 4MB 块 = 6 块：真有分块，重试那条路也真的走一遍。
+    let big: Vec<u8> = (0..24 * 1024 * 1024).map(|b| (b % 239) as u8).collect();
+    std::fs::write(src.join("big.bin"), &big).unwrap();
+    // 那个"写不进去的落盘根"：路径上先躺一个**文件**，`create_dir_all` 必失败。
+    let blocked = save.join("blocked");
+    std::fs::write(&blocked, b"x").unwrap();
+
+    let (port_a, port_b) = two_free_ports();
+    let state_a = make_state(port_a, "device-za", "PC-ZA", save.clone());
+    let state_b = make_state(port_b, "device-zb", "PC-ZB", blocked);
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    pair_without_ws(&state_a, &state_b, "device-za", "device-zb", port_a, port_b);
+
+    let name = src.file_name().unwrap().to_string_lossy().to_string();
+    let dest = save.join("PC-ZA").join(&name).join("big.bin");
+
+    // ---- 第一趟：接收端自动收下（已配对），建目录那一步当场失败 ----------------------------
+    let invite = push_one(&state_a, &src, "device-zb").await;
+    wait_until("待续传任务已落盘", 30, || {
+        state_b.push.resume.pending_ids().contains(&invite)
+    })
+    .await;
+    wait_until("这一趟收手（邀请摘掉）", 30, || {
+        !state_b.push.inbound.lock().contains_key(&invite)
+    })
+    .await;
+    assert!(
+        state_b.push.resume.pending_ids().contains(&invite),
+        "没传完的这条必须留在待续传名单里（重启后靠它接着收）"
+    );
+    assert!(!dest.exists(), "没传完就不该有最终文件");
+    assert!(
+        state_a.push.jobs.lock().get(&invite).is_some(),
+        "发送方那条 job 还该在（它什么都没做）"
+    );
+
+    // ---- "重启"接收端：同一份数据目录 / device id，全新一份 AppState（这次落盘根是好的）----
+    let state_b2 = make_state(port_b, "device-zb", "PC-ZB", save.clone());
+    let pending = state_b2.push.resume.pending_entries();
+    let kept = pending
+        .iter()
+        .find(|p| p.invite_id == invite)
+        .expect("重启之后要认得这条没传完的接收（任务在盘上）");
+    assert_eq!(kept.sender_id, "device-za");
+    assert_eq!(kept.files.len(), 1);
+    assert_eq!(kept.files[0].size, big.len() as u64);
+
+    // 启动那一拍（`lib.rs` 里跑的就是这一句）：自己接着收 —— 发送方一次都没重推。
+    transfer::resume_pending(&state_b2);
+
+    wait_until("自己接着收完（发送方那一台收到完成回执）", 120, || {
+        state_a.push.jobs.lock().get(&invite).is_none()
+    })
+    .await;
+    assert_eq!(std::fs::read(&dest).unwrap(), big, "接着收之后必须逐字节一致");
+    assert!(
+        !state_b2.push.resume.pending_ids().contains(&invite),
+        "传完要把待续传任务删掉（重启后不该再收一遍）"
+    );
+    let mut leftovers = Vec::new();
+    collect_parts(&save, &mut leftovers);
+    assert!(leftovers.is_empty(), "收完不该留 .part: {leftovers:?}");
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    credential::remove_peer("device-za").ok();
+    credential::remove_peer("device-zb").ok();
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&save);
+}
+
+/// **同一个文件收在两个目录下**：两份记录各算各的（`resume_key` 里含落盘目录）。
+///
+/// 这是"落盘目录并进身份"这条改动的回归闸：键里没有目录时，第二次推送会**共用**第一个目录
+/// 那份记录 —— 按着它的位图去新目录找 `.part`（找不到 → 从零，这个可以接受），顺手把那份记录
+/// **覆盖**成空位图、把旧目录里的 `.part` 变成没人认领的垃圾（`sweep_stale` 只清"还有记录
+/// 指着"的那些）。所以这条用例守的是"**旧的那份记录与半截文件一个字都没动**"。
+#[tokio::test]
+async fn the_same_file_into_two_dirs_keeps_both_records() {
+    let src = temp_dir("twodirs_src");
+    let save = temp_dir("twodirs_save");
+    let big: Vec<u8> = (0..24 * 1024 * 1024).map(|b| (b % 233) as u8).collect();
+    std::fs::write(src.join("big.bin"), &big).unwrap();
+    let dir1 = save.join("one");
+    let dir2 = save.join("two");
+    std::fs::create_dir_all(&dir1).unwrap();
+    std::fs::create_dir_all(&dir2).unwrap();
+
+    let (port_a, port_b) = two_free_ports();
+    let state_a = make_state(port_a, "device-2a", "PC-2A", save.clone());
+    let state_b = make_state(port_b, "device-2b", "PC-2B", dir1.clone());
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    pair_without_ws(&state_a, &state_b, "device-2a", "device-2b", port_a, port_b);
+
+    let name = src.file_name().unwrap().to_string_lossy().to_string();
+    let rel = format!("{name}/big.bin");
+    let mtime = {
+        let meta = std::fs::metadata(src.join("big.bin")).unwrap();
+        orbdrop_lib::transfer::stream::mtime_secs(&meta)
+    };
+    let land1 = dir1.join("PC-2A").join(&name);
+    let key1 = orbdrop_lib::transfer::stream::resume_key("device-2a", &land1, &rel, big.len() as u64, mtime);
+
+    // ---- 第一趟：收了一半就取消（留下记录 + 半截 `.part`）------------------------------
+    let invite_one = push_one(&state_a, &src, "device-2b").await;
+    wait_until("第一趟的续传记录已建立", 30, || {
+        state_b.push.resume.file_record(&key1).is_some()
+    })
+    .await;
+    transfer::cancel_receive(&state_b, &invite_one);
+    wait_until("接收端收手", 30, || {
+        !state_b.push.inbound.lock().contains_key(&invite_one)
+    })
+    .await;
+    let before = state_b
+        .push
+        .resume
+        .file_record(&key1)
+        .expect("取消之后记录要留着（下次接着传的全部依据）");
+    assert!(before.part.starts_with(&dir1.to_string_lossy().to_string()), "记录指着第一个目录: {}", before.part);
+
+    // ---- 换到第二个目录再推一次：它必须**另起一份**，别碰第一份 ------------------------
+    state_b.config.lock().download_dir = dir2.clone();
+    let invite_two = push_one(&state_a, &src, "device-2b").await;
+    wait_until("第二趟收完（发送方拿到完成回执）", 60, || {
+        state_a.push.jobs.lock().get(&invite_two).is_none()
+    })
+    .await;
+
+    let land2 = dir2.join("PC-2A").join(&name);
+    assert_eq!(std::fs::read(land2.join("big.bin")).unwrap(), big, "新目录那份必须逐字节一致");
+    assert!(
+        state_a
+            .push
+            .resume
+            .file_record(&orbdrop_lib::transfer::stream::resume_key(
+                "device-2a",
+                &land2,
+                &rel,
+                big.len() as u64,
+                mtime
+            ))
+            .is_none(),
+        "新目录那份收完就该丢掉（文件已在最终路径上）"
+    );
+    // **第一份一个字都没动**：记录还在、还指着第一个目录。
+    let after = state_b
+        .push
+        .resume
+        .file_record(&key1)
+        .expect("第二个目录那一趟不该覆盖第一份记录");
+    assert_eq!(after.part, before.part, "第一份记录的 .part 路径不该被改写");
+    assert_eq!(after.done_bytes(), before.done_bytes(), "第一份记录的进度也不该被改写");
+    if before.done_bytes() > 0 {
+        assert!(PathBuf::from(&before.part).exists(), "第一份的 .part 还要在（它是「接着传」的凭据）");
+    }
+    // 收完的那个目录里不留临时文件（另一个目录里的那份是"下次接着传"的凭据，不算残留）。
+    let mut leftovers = Vec::new();
+    collect_parts(&dir2, &mut leftovers);
+    assert!(leftovers.is_empty(), "收完的目录不该留 .part: {leftovers:?}");
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    credential::remove_peer("device-2a").ok();
+    credential::remove_peer("device-2b").ok();
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&save);
+}
+
+#[tokio::test]
+async fn a_changed_source_retracts_the_waiting_push() {
     let src = temp_dir("changed_src");
     let save = temp_dir("changed_save");
     std::fs::write(src.join("好的.txt"), vec![7u8; 4096]).unwrap();
@@ -365,11 +561,11 @@ async fn source_changed_before_consent_fails_only_that_file() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-ca", "PC-CA", save.clone());
     let state_b = make_state(port_b, "device-cb", "PC-CB", save.clone());
-    let _port_a = orbdrop_lib::server::start_server(state_a.clone(), port_a).await.unwrap();
-    let port_b = orbdrop_lib::server::start_server(state_b.clone(), port_b).await.unwrap();
+    let _port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
 
-    // **未绑定**：这条推送要等接收方点同意 —— 正好给了我们一个确定的窗口去改源文件
-    // （已配对设备会当场开收，窗口只有几毫秒，测不出确定性）。
+    // **未绑定**：这条推送要等接收方点同意 —— 正好给了我们一个确定的等待窗口
+    // （已配对设备当场开收，那个窗口只有几毫秒，测不出确定性）。
     state_a.add_peer_book(PeerDevice {
         id: "device-cb".into(),
         name: "PC-CB".into(),
@@ -381,64 +577,110 @@ async fn source_changed_before_consent_fails_only_that_file() {
         paused: false, relay: None,
     });
 
-    // **注意**：未绑定那条路上，`push_paths` 会一直等到"对方点同意"才返回（HTTP 邀请是
-    // 同步等回执的）。所以先把它挂起来后台跑，否则这里就在等一个我们还没给出的同意。
-    let pushing = {
-        let state = state_a.clone();
-        let src = src.clone();
-        tokio::spawn(async move { push_one(&state, &src, "device-cb").await })
-    };
-    let invite_id = wait_for_invite(&state_b, 10).await;
+    let invite_id = push_one(&state_a, &src, "device-cb").await;
+    wait_for_invite(&state_b, 10).await;
 
-    // 清单已经生成了，这时把其中一个源文件改掉（大小变了 → 块布局也不成立了）。
+    // 清单已经生成了，这时把其中一个源文件改掉 → **发送方收回这次推送**（源变 = 我这边
+    // 取消，见 `transfer::watch`）。不再有"只让那一条文件失败、其余照收"这一档：
+    // 邀请还挂在对方屏幕上、谁也没点头，这就是"我改主意了"。
     std::fs::write(src.join("改过的.bin"), vec![9u8; 2 * 1024 * 1024 + 5]).unwrap();
 
-    transfer::accept_invite(state_b.clone(), &invite_id, None).expect("同意接收");
-    let invite_id = pushing.await.expect("邀请任务不该 panic");
+    wait_until("发送方那一台落「已取消」", 10, || {
+        state_a.push.target_of_invite(&invite_id).map(|t| t.state)
+            == Some(TargetState::Cancelled)
+    })
+    .await;
+    assert_eq!(
+        state_a.push.target_of_invite(&invite_id).unwrap().error.as_deref(),
+        Some("源文件已变化，本机已取消"),
+        "卡片上要说清是**源变了**，不是用户点了取消"
+    );
+    assert!(
+        state_a.push.jobs.lock().get(&invite_id).is_none(),
+        "撤销之后这条 job 也要清掉（再没人会来取文件）"
+    );
+    // 对端那张邀请卡跟着收掉 —— 不然它点「接收」才发现早就没了。
+    wait_until("对端那张邀请卡被撤掉", 10, || {
+        !state_b.push.inbound.lock().contains_key(&invite_id)
+    })
+    .await;
 
+    // **一个字节都不落**：整批被收回，连没动过的那个文件也不给；`.part` 这类半截产物
+    // 更不该出现（下载压根没开始）。
+    tokio::time::sleep(Duration::from_millis(400)).await;
     let name = src.file_name().unwrap().to_string_lossy().to_string();
     let dest = save.join("PC-CA").join(&name);
-    wait_until("这批走完（没动的文件落盘）", 30, || {
-        std::fs::read(dest.join("好的.txt")).map(|c| c == vec![7u8; 4096]).unwrap_or(false)
-    })
-    .await;
-    wait_until("发送方拿到终态", 30, || {
-        state_a.push.jobs.lock().get(&invite_id).is_none()
-    })
-    .await;
-
-    // ① 没动过的文件照常落盘（失败隔离：一条坏文件不拖垮整批）。
-    assert_eq!(std::fs::read(dest.join("好的.txt")).unwrap(), vec![7u8; 4096]);
-    // ② 改过的那条**不许**出现在最终路径上：宁可不给，也不能给一份"半新半旧"的字节。
     assert!(
-        !dest.join("改过的.bin").exists(),
-        "源文件变过的这条不该落到最终路径"
+        !dest.join("好的.txt").exists(),
+        "整批撤回了，没动过的那个文件也不该落盘"
     );
-    // ③ 它一个字节都没落：`FILE` 记录一进门就被判"源与清单不符"，所以连 `.part` 都不会建
-    //    （`.part` 是"写了块"的产物）。这里要钉住的正是"没有半截字节被留在盘上"。
     let mut leftovers = Vec::new();
-    collect_parts(&dest, &mut leftovers);
+    collect_parts(&save, &mut leftovers);
     assert!(
         leftovers.is_empty(),
-        "源变了的那条不该写任何字节，也就不该有 .part: {leftovers:?}"
-    );
-
-    // ④ 发送方那边这张卡是**失败**，不是"已完成"。
-    let target = state_a
-        .push
-        .target_of_invite(&invite_id)
-        .expect("批次里应该还有这台目标");
-    assert_eq!(
-        target.state,
-        TargetState::Failed,
-        "源文件变过就必须如实报失败（错误原因: {:?})",
-        target.error
+        "被撤回的推送不该在盘上留下任何东西: {leftovers:?}"
     );
 
     orbdrop_lib::server::stop_server(&state_a).await;
     orbdrop_lib::server::stop_server(&state_b).await;
     credential::remove_peer("device-ca").ok();
     credential::remove_peer("device-cb").ok();
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&save);
+}
+
+/// S-12 关掉那层时：推送直接落在落盘根里（与手动下载同一层），**不建** `<发送方名>/`。
+///
+/// 跑的是真链路（HTTP 邀请 + 已配对免同意 + 新数据面），所以这条同时证明开关经
+/// `accept_invite` → `download::run` → `resume::landing_dir` 一路传到了落盘处，
+/// 而不只是那个纯函数自己算对了。开着的那一档由上面几条夹具钉着（`save.join("PC-SA")`）。
+#[tokio::test]
+async fn device_subdir_off_lands_directly_in_the_download_dir() {
+    let src = temp_dir("src-flat");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("a.txt"), b"flat landing").unwrap();
+    std::fs::write(src.join("sub").join("b.txt"), b"nested").unwrap();
+
+    let save = temp_dir("save-flat");
+    let (port_a, port_b) = two_free_ports();
+    let state_a = make_state(port_a, "device-fa", "PC-FA", save.clone());
+    let state_b = make_state(port_b, "device-fb", "PC-FB", save.clone());
+    // 接收方关掉 `<发送方名>/` 那一层（S-12，默认开）。
+    state_b.config.lock().device_subdir = false;
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    pair_without_ws(&state_a, &state_b, "device-fa", "device-fb", port_a, port_b);
+
+    let invite_id = push_one(&state_a, &src, "device-fb").await;
+    wait_until("整批收完（收尾完成回执）", 60, || {
+        state_a.push.jobs.lock().get(&invite_id).is_none()
+    })
+    .await;
+
+    // 落点 = `<下载目录>/<源目录名>/…`（相对路径照旧展开），而不是再套一层发送方名。
+    let name = src.file_name().unwrap().to_string_lossy().to_string();
+    assert_eq!(
+        std::fs::read(save.join(&name).join("a.txt"))
+            .expect("关掉那层后 a.txt 该直接落在下载目录里的源目录名下"),
+        b"flat landing"
+    );
+    assert_eq!(
+        std::fs::read(save.join(&name).join("sub").join("b.txt")).unwrap(),
+        b"nested",
+        "目录结构照旧完整保留"
+    );
+    assert!(
+        !save.join("PC-FA").exists(),
+        "关掉那层之后不该再多出 `<发送方名>/` 目录"
+    );
+    let mut leftovers = Vec::new();
+    collect_parts(&save, &mut leftovers);
+    assert!(leftovers.is_empty(), "收完还留着临时文件: {leftovers:?}");
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    credential::remove_peer("device-fa").ok();
+    credential::remove_peer("device-fb").ok();
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&save);
 }

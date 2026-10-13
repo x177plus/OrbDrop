@@ -712,7 +712,7 @@ async fn dispatch_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, ShareItem};
+    use crate::config::ShareItem;
     use reqwest::{Client, Method as HttpMethod, StatusCode as HttpStatus};
 
     fn fixture_root() -> PathBuf {
@@ -725,9 +725,12 @@ mod tests {
 
     /// 每个测试用自己的端口段：并行跑时若都从同一个基址往上探，会互相抢端口，
     /// 表现为偶发 `IncompleteMessage`（请求落在一个正在关停的监听上）。
+    ///
+    /// 绑 `0.0.0.0`（`start_server`）而不是回环：这一组里有三条用例要**拨本机的内网地址**，
+    /// 模拟"BC 从另一台设备过来"（见 `local_lan_ip`）—— 绑回环就拨不到了。
     async fn serve(base_port: u16) -> (Arc<AppState>, u16, PathBuf, String) {
         let root = fixture_root();
-        let mut config = Config::default();
+        let mut config = crate::config::test_config();
         let share = ShareItem::new(root.clone());
         let share_id = share.id.clone();
         config.shares.push(share);

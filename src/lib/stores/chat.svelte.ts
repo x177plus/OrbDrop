@@ -1,8 +1,9 @@
 import { listen } from '@tauri-apps/api/event';
 import { formatFileSize } from '$lib/types';
-import type { ChatDelivery, ChatGroup, ChatGroupMsg, ChatSnapshot, ChatMessage, ChatPeerConvo, ConvoMode, LocalPick, PendingGroup, PushBatch, PushInvite, PushTargetState } from '$lib/types';
+import { hasContent, revokeSegs, type ComposerSeg } from '$lib/composer';
+import type { ChatDelivery, ChatFileMsg, ChatGroup, ChatGroupMsg, ChatSnapshot, ChatMessage, ChatPeerConvo, ConvoMode, LocalPick, PendingGroup, PushBatch, PushInvite, PushTargetState } from '$lib/types';
 import * as api from '$lib/api';
-import { getDevices, deviceDotState, threadDotState, peerDisplayName, type DeviceDotState } from './devices.svelte';
+import { getDevices, deviceDotState, threadDotState, peerShortName, type DeviceDotState } from './devices.svelte';
 
 /**
  * 会话（聊天）：后端那份记录在前端的影子 + 会话界面自己的状态。
@@ -25,10 +26,17 @@ import { getDevices, deviceDotState, threadDotState, peerDisplayName, type Devic
  * 这里：底栏那颗入口在 App、会话浮层在自己的组件、设备行右键的「发消息」在第三个地方 ——
  * 三处都要能开到同一个会话，状态必须有一个共同的家。
  *
- * **文件消息只活在本机内存里**（`files`）：文件本身有它自己的持久物（落盘的那份文件、
- * 右下角那张推送卡），会话里那条是**这次传输的状态行** —— 后端只存文本。群里发文件也没有
- * 新的后端命令：那就是"拿群成员当收件人跑一次多目标推送"，本机这条记录挂上 `groupId` 就能
- * 归到群那条视图里（见 `noteOutgoingFiles`）。
+ * **文件消息**（`files`，设备 id → 那几条）：会话里那条"发了 / 收到了一个文件"的气泡。
+ * 它与文本**同处落盘**（后端 `chat.json` 的 `ChatFileMsg`，`chatFilesSet` 是写入口）——以前
+ * 它只活在本机内存里，重启就丢：只发过文件、没说过话的会话整条从列表里消失（见 `convoRows`），
+ * 重发一条文本把它拉回来时文件那几条也回不来了。
+ *
+ * 但**进度不在落盘里**（每 200ms 一跳，不值得每拍写一次盘）：这一层是它的**实时作者**，
+ * 只在能定下来的时刻（刚发出 / 刚收到 / 接受或拒绝 / 收完或失败 / 整批走完）把该设备那份
+ * 列表写回后端（`persistFiles`）；启动时反过来，从快照里种下（`seedFiles`）。界面上
+ * 那些"传输中 62%"只在这份内存里 —— 进程断在中间时，后端重启扫尾会把那条落成终态。
+ * 群里发文件也没有新的后端命令：那就是"拿群成员当收件人跑一次多目标推送"，本机这条记录
+ * 挂上 `groupId` 就能归到群那条视图里（见 `noteOutgoingFiles`）。
  */
 
 /** 会话浮层没数据时的占位（只读，别改）。 */
@@ -39,55 +47,19 @@ let snapshot = $state<ChatSnapshot>(EMPTY_SNAPSHOT);
 let open = $state(false);
 /** 详情里开着哪个会话（`null` = 停在会话列表）。键见 `deviceKey` / `refOf`。 */
 let openKey = $state<string | null>(null);
-/** 还没发出去的草稿：**按会话**存，切来切去不丢字（原型 `chat.draft[key]`）。 */
-let draft = $state<Record<string, string>>({});
+/** 还没发出去的草稿：**按会话**存，切来切去不丢（分段表，见 `lib/composer.ts`）。 */
+let draft = $state<Record<string, ComposerSeg[]>>({});
 /** 收件人选择框（「新建会话」「编辑参与者」共用一份）。 */
 let recipientReq = $state<RecipientReq | null>(null);
-/** 文件消息：设备 id → 那几条（见文件头说明）。 */
+/** 文件消息：设备 id → 那几条（见文件头说明）。启动时由 `seedFiles` 从快照种下。 */
 let files = $state<Record<string, ChatFileMsg[]>>({});
+/** 已经种过了：快照里的文件消息只在启动那一刻取一次，之后这份内存就是实时的真相。 */
+let filesSeeded = false;
 /**
  * 正在补拉的群 id（见 `syncGroup`）：同一条会话被连着开两次（连点两下、或刚建完群紧接着
  * 打开）时，补拉只飞一次 —— 一次补拉回来的是整份快照，重复飞几遍只是白花几个来回。
  */
 let syncingGroup: string | null = null;
-
-/**
- * 会话里那条文件消息（**只在本机内存里**）。
- *
- * 发送侧：`batchId` 指向右下角那张推送卡（进度、成败都从它抄过来）；接收侧：`inviteState`
- * 是那条邀请走到哪一步了，`received`/`bytes` 是接收进度。
- */
-export interface ChatFileMsg {
-  id: string;
-  at: number;
-  fromMe: boolean;
-  name: string;
-  /** 文件夹还是文件（气泡/卡片上那颗图标）。 */
-  isDir: boolean;
-  /** 收到的那条是谁推过来的（`fromMe` 时为空）。 */
-  peerId: string;
-  /** 显示用的大小串。 */
-  size: string;
-  /** 发送侧：这批推到几台、几台没成、进度百分比、还在不在传。 */
-  targets: number;
-  failed: number;
-  pct: number;
-  sending: boolean;
-  /** 发送侧：`push://batch` 那张卡的 id（结算后清掉 —— 卡片 3 秒就没了）。 */
-  batchId: string;
-  /** 发送侧：这条文件消息属于哪份**群发名单**（空 = 不是群发那条发的）；群发那条视图按它筛。 */
-  chatBatchId: string;
-  /** 发送侧：这条文件消息属于哪个**群**（空 = 不是发到群里的）；群那条视图按它筛。 */
-  groupId: string;
-  /** 发送侧：逐台的推送状态（等待同意 / 传输中 / 已送达 / 未送达…），群发视图按它逐台写。 */
-  perTargets: { peerId: string; state: PushTargetState }[];
-  /** 接收侧：那条推送邀请。 */
-  inviteId: string;
-  inviteState: 'pending' | 'accepted' | 'received' | 'rejected' | 'failed' | '';
-  /** 接收侧：已收字节 / 总字节（进度条）。 */
-  received: number;
-  bytes: number;
-}
 
 /**
  * 时间线上的一项：后端存的文本消息、群里的一条消息，或本机内存里那条文件消息。
@@ -106,9 +78,21 @@ function convoOf(peerId: string): ChatPeerConvo | undefined {
   return snapshot.convos.find((c) => c.peerId === peerId);
 }
 
-/** 这台设备还在不在设备表里（设备被移除后，它的会话也就不列了）。 */
+/** 这台设备还在不在**设备表**里（设备页那一份，见 `devices.visibleDevices`）。 */
 function known(peerId: string): boolean {
   return getDevices().some((d) => d.id === peerId);
+}
+
+/**
+ * 这台设备**还有没有聊天记录**（一条文本或一条文件消息都算）。
+ *
+ * 会话与设备行是两件事：设备行说的是"这台现在能不能连上"（离线**且未绑定**的不列，见
+ * `visibleDevices`），而聊天记录是**用户数据** —— 一台聊过天的设备解除配对（关系没了、
+ * 地址簿里也删了）、又离线之后，记录还躺在 `chat.json` 里，会话列表那一行就没有跟着消失的
+ * 道理。所以"列不列、能不能打开、未读算不算"都认这一条，见 [`directPeerIds`] / [`threadOf`]。
+ */
+function hasHistory(peerId: string): boolean {
+  return (convoOf(peerId)?.messages.length ?? 0) > 0 || (files[peerId]?.length ?? 0) > 0;
 }
 
 // ── 会话键 ────────────────────────────────────────────────────────────────
@@ -177,7 +161,7 @@ function titleOf(mode: ConvoMode, name: string, participants: string[]): string 
  */
 function groupTitle(g: ChatGroup): string {
   if (g.name.trim()) return `群聊 · ${g.name.trim()}`;
-  return g.members.map((m) => peerDisplayName(m.id, m.name.trim() || m.id)).join('、') || '群聊';
+  return g.members.map((m) => peerShortName(m.id, m.name.trim() || m.id)).join('、') || '群聊';
 }
 
 /** 本机已知的那个群（找不到 = `undefined`：退出了、或这条键本来就过期了）。 */
@@ -193,7 +177,8 @@ export function pendingGroups(): PendingGroup[] {
 /**
  * 键 → 会话视图。三种模式各自的"还算不算数"：
  *
- * - 一对一：那台设备还在设备表里；
+ * - 一对一：那台设备还在设备表里，**或**跟它的记录还在（解绑又离线之后，会话不跟着消失 ——
+ *   见 `hasHistory`）；
  * - 群发：名单还在，且**有两台以上**成员还在设备表里（少于两台就不再是"多台记录"了）；
  * - 群聊：后端那份群还在（退出 / 被解散后它就从快照里消失了）。**名册就是唯一依据**：
  *   成员列出来就是成员，不看它在不在设备表里（群是后端的一份实体，不随本机的设备表缩水）。
@@ -205,7 +190,8 @@ function threadOf(key: string | null): ConvoThread | null {
   const ref = refOf(key);
   if (!ref) return null;
   if (ref.mode === 'direct') {
-    if (!known(ref.id)) return null;
+    // 设备页那一行可能已经不在了（解绑又离线）：记录还在就照旧开着这条会话。
+    if (!known(ref.id) && !hasHistory(ref.id)) return null;
     return { key: deviceKey(ref.id), mode: 'direct', id: '', name: '', participants: [ref.id], title: deviceNameOf(ref.id) };
   }
   if (ref.mode === 'broadcast') {
@@ -236,15 +222,38 @@ export function unreadForPeer(peerId: string): number {
 /**
  * 全部未读（底栏那颗角标 / 悬浮球左上角那颗）。
  *
- * **只算还在设备表里的会话**，不直接读后端那份总数：设备被解除配对又离线之后，那个会话
- * 在界面上已经列不出来（列不出来 = 打不开 = 标不了已读），它的未读要还计入，角标就成了
- * 一个永远清不掉的数。多台会话不产生未读（群发是单向的）。群聊的未读是**后端算好的**
- * （本机之外、排在已读水位之后的条数）—— 这里只把还在快照里的那些群加一遍，不重算。
+ * 与 [`convoRows`] 同一份名单（`directPeerIds`），不是"还有几台设备"：**会话列表里列得出的**，
+ * 未读就得算进来 —— 反向漏掉（列表里挂着未读、角标不认）会让那个数永远清不干净，反向多算
+ * （算了列不出来的）会让角标清不掉。设备解绑又离线但**记录还在**的那几台照样列得出来，
+ * 所以照样算（`unreadForPeer` 照着同一份记录读，不看它现在在不在网上）。
+ *
+ * 多台会话不产生未读（群发是单向的）。群聊的未读是**后端算好的**（本机之外、排在已读水位
+ * 之后的条数）—— 这里只把还在快照里的那些群加一遍，不重算。
  */
 export function unreadTotal(): number {
-  const peers = getDevices().reduce((n, d) => n + unreadForPeer(d.id), 0);
+  const peers = directPeerIds().reduce((n, peerId) => n + unreadForPeer(peerId), 0);
   const groups = snapshot.groups.reduce((n, g) => n + g.unread, 0);
   return peers + groups;
+}
+
+/**
+ * **别的会话**上等着看的未读（当前开着的那条不算）—— 会话详情头顶那颗角标记的就是它。
+ *
+ * 正停在 A 的会话里、B 来了话，用户要问的是"**别处**还等着几条"：把当前这条自己的未读算进去
+ * 是错的，那是屏幕上已经摊开的东西。而且当前这条一进来就被标已读（`markOpenRead`，回来还要
+ * 等一次 `chat_mark_read` 的往返），算进去的话数字要么恒为 0、要么在那一瞬间闪一下 —— 不是
+ * 一条能读的数。减掉的那一项必须是**当前这条自己的**：一对一按台（`unreadForPeer`）、群聊按群
+ * （`ChatGroup.unread`）、群发不产生未读（单向，没有要减的）。
+ *
+ * 顶掉的是"面板收起时看底栏角标、进了会话看不到"那一段：不显示的话，会话详情里**没有任何
+ * 像素**提示别处来消息了，得退回去才知道。
+ */
+export function unreadElsewhere(): number {
+  const t = activeThread();
+  if (!t) return unreadTotal();
+  if (t.mode === 'direct') return unreadTotal() - unreadForPeer(t.participants[0]);
+  if (t.mode === 'group') return unreadTotal() - (groupOf(t.id)?.unread ?? 0);
+  return unreadTotal();
 }
 
 /**
@@ -259,9 +268,26 @@ export function convoBadgeTotal(): number {
   return unreadTotal() + snapshot.pendingGroups.length;
 }
 
-/** 一台设备的显示名（F-101：设了备注就是「备注(设备名)」）：消息里存的是收到那一刻的名字，改过名/起过备注的设备以本机设备表为准。 */
+/**
+ * 一台设备在会话侧的**短名**（F-101：有备注就是备注本身，没备注才是设备名）：消息里存的是收到那一刻的名字，改过名/起过备注的设备以本机设备表为准。
+ *
+ * 设备表里**一台都找不到**时（解绑又离线，见 `hasHistory`）还有记录里那个名字可退：
+ * 对端自己发来的消息带着它当时的设备名（`ChatMessage.fromName`，后端落盘的那一份）——
+ * 会话还在，名字就不该只剩一串设备 id。记录里也没名字（比如只收过一条文件消息）才退回 id。
+ */
 export function deviceNameOf(peerId: string): string {
-  return peerDisplayName(peerId);
+  return peerShortName(peerId, nameFromHistory(peerId) ?? undefined);
+}
+
+/** 记录里认得的这台设备的**最后一个名字**（对端自己发的消息带着它当时的设备名）；记录里没有 = `null`。 */
+function nameFromHistory(peerId: string): string | null {
+  const msgs = convoOf(peerId)?.messages ?? [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    const name = m.fromMe ? '' : m.fromName.trim();
+    if (name) return name;
+  }
+  return null;
 }
 
 /** 头像上的那个字（设备名的首字符；与设备页 `.d-avatar` 同一套算法）。 */
@@ -355,7 +381,8 @@ function lastOf(peerId: string): ChatItem | null {
 function summaryOf(peerId: string): string {
   const last = lastOf(peerId);
   if (!last) return '还没有消息';
-  const body = last.kind === 'file' ? `[文件] ${last.name}` : last.text;
+  const body =
+    last.kind === 'file' ? `[文件] ${last.name}` : last.image ? '[图片]' : last.text;
   return (last.fromMe ? '你：' : '') + body;
 }
 
@@ -370,7 +397,7 @@ function threadSummary(items: ChatItem[]): string {
   const last = items.length ? items[items.length - 1] : null;
   if (!last) return '还没有消息';
   const r = receiptOf(last);
-  const body = last.kind === 'file' ? `[文件] ${last.name}` : last.text;
+  const body = last.kind === 'file' ? `[文件] ${last.name}` : last.image ? '[图片]' : last.text;
   return (r ? `已送达 ${r.delivered}/${r.total} 台 · ` : '') + body;
 }
 
@@ -381,6 +408,10 @@ function threadSummary(items: ChatItem[]): string {
  * 一句话都没说过"的设备不进会话列表 —— 互报一次能把对端视野里的设备全带进来，全列出来的话
  * 会话页就成了设备页的副本。要跟没说过话的设备开聊走「＋ 新建会话」（桌面端设备页那一行
  * 也还有「发消息」）。群发/群聊照旧列：它们本来就是用户自己建/加入的，还没说话也该看得见。
+ *
+ * **判据是"有没有记录"，不是"这台设备还在不在设备表里"**：有过消息的设备解除配对、又离线
+ * 之后，它那一行照旧留着（名单见 `directPeerIds`）—— 记录还在盘上，用户要能翻它。这也是
+ * 这一列表与设备页最大的不同：设备页是"这台现在能不能连上"，会话页是"跟谁说过话"。
  *
  * 动过的按最近一条倒序在前，没动过的排在后面（名单按各自的顺序），且不会每次刷新乱跳。
  */
@@ -401,22 +432,54 @@ export type ConvoRow = {
   initial: string;
 };
 
+/**
+ * 一对一那几条会话要看的设备 id：**设备表里的全部**（没说过话的那几台靠 `lastOf` 挡在外面），
+ * 加上**表里已经没有、但记录还在**的那些。
+ *
+ * 后半截就是这个列表存在的原因：跟一台设备聊过天之后，它（或本机）解除配对、又离线 ——
+ * 设备页那一行按 F-13 不列了（离线且未绑定的没有可做的动作），会话却还在盘上。记录是
+ * **用户数据**，不该跟着"这台现在能不能连上"走：会话列表那一行、能不能打开它、它的未读
+ * 都靠这份名单（名字见 `deviceNameOf`）。
+ *
+ * **顺序**：设备表里的在前（表里那些行的相对次序照旧），记录里多出来的那些跟在后面 ——
+ * 列表本身按"最近一条"倒序排（见 `convoRows` 末尾），这里的次序只影响同一时刻的并列。
+ */
+function directPeerIds(): string[] {
+  const ids = getDevices().map((d) => d.id);
+  const seen = new Set(ids);
+  for (const convo of snapshot.convos) {
+    if (seen.has(convo.peerId)) continue;
+    seen.add(convo.peerId);
+    ids.push(convo.peerId);
+  }
+  // 本机手上还没落盘的那份文件记录也算（收到一条推送邀请就有一条，见 `noteInboundInvite`）：
+  // 它可能比快照先到，或后端那份已经被清掉而本机这条还在。
+  for (const peerId of Object.keys(files)) {
+    if (seen.has(peerId)) continue;
+    seen.add(peerId);
+    ids.push(peerId);
+  }
+  return ids;
+}
+
 export function convoRows(): ConvoRow[] {
   // 一对一：**有过消息才算一条会话**（见上面那段说明）—— 没说过话的设备不进这个列表。
+  // 设备表里已经没有的那几台只要记录还在就照样列（见 `directPeerIds`）。
   const rows: ConvoRow[] = [];
-  for (const d of getDevices()) {
-    const last = lastOf(d.id);
+  for (const peerId of directPeerIds()) {
+    const last = lastOf(peerId);
     if (!last) continue;
+    const dev = getDevices().find((d) => d.id === peerId);
     rows.push({
-      key: deviceKey(d.id),
+      key: deviceKey(peerId),
       mode: 'direct' as const,
       at: last.at,
-      label: deviceNameOf(d.id),
-      sub: summaryOf(d.id),
-      time: timeOf(d.id),
-      unread: unreadForPeer(d.id),
-      dot: deviceDotState(d),
-      initial: peerInitial(d.id),
+      label: deviceNameOf(peerId),
+      sub: summaryOf(peerId),
+      time: timeOf(peerId),
+      unread: unreadForPeer(peerId),
+      dot: deviceDotState(dev),
+      initial: peerInitial(peerId),
     });
   }
   for (const b of snapshot.batches) {
@@ -524,23 +587,39 @@ export function perDeviceOf(item: ChatItem): PerDevice[] {
  * 群里没有"各台各一份副本"那套账（群是一条共享消息流），所以不摆逐台回执行，一行小字就够：
  * 读过这条的有几台（`readCount`，后端算的）配这条当时发给的台数（`delivery` 的键数），
  * 再补上还在路上的那几档 —— 没人读过时**不能只写「已读 0/4」**，得说清剩下 4 台在等什么。
+ *
+ * `declined` = 这个群里**明确拒绝加入**的那些成员（`ChatGroup.declined`，调用方从会话上取）：
+ * 它们那几份是 `failed`，但说成「未送达」就把"明确拒绝"和"这一跳没成"混成一件事了 ——
+ * 用户看到收件人胶囊上的红色，需要这行字给出同一个说法。
  */
-export function groupReceiptText(item: ChatItem): string {
+export function groupReceiptText(item: ChatItem, declined: readonly string[] = []): string {
   if (!item.fromMe || item.kind !== 'text' || 'targets' in item) return '';
-  const states = Object.values(item.delivery);
+  const states = Object.entries(item.delivery);
   if (!states.length) return '';
   const parts = [`已读 ${item.readCount}/${states.length}`];
-  const waiting = states.filter((s) => s === 'queued').length;
-  const sending = states.filter((s) => s === 'sending').length;
-  const failed = states.filter((s) => s === 'failed').length;
+  const waiting = states.filter(([, s]) => s === 'queued').length;
+  const sending = states.filter(([, s]) => s === 'sending').length;
+  const failedIds = states.filter(([, s]) => s === 'failed').map(([peerId]) => peerId);
+  const refused = failedIds.filter((peerId) => declined.includes(peerId)).length;
+  const failed = failedIds.length - refused;
   // 从别的成员那里补到的那些：也是到了，但走的不是本机这一跳 —— 单说一句，别混进"已读"
   // （它只是拿到了，不等于读过；后端也是等它真读了才把 `readCount` 加上去）。
-  const synced = states.filter((s) => s === 'synced').length;
+  const synced = states.filter(([, s]) => s === 'synced').length;
   if (waiting) parts.push(`${waiting} 台等待发送`);
   if (sending) parts.push(`${sending} 台发送中`);
   if (synced) parts.push(`${synced} 台已同步（经其他成员补到）`);
+  if (refused) parts.push(`${refused} 台已拒绝加入`);
   if (failed) parts.push(`${failed} 台未送达`);
   return parts.join(' · ');
+}
+
+/**
+ * 这个群里**明确拒绝加入**的那些成员 id（`ChatGroup.declined`；不是群 = 空）。
+ *
+ * 收件人胶囊与消息那行小字都用它：一处染红、一处改说法，两处取同一个来源。
+ */
+export function groupDeclinedIds(groupId: string): string[] {
+  return groupOf(groupId)?.declined ?? [];
 }
 
 /**
@@ -651,6 +730,7 @@ export function fileStatusText(f: ChatFileMsg, peerId = ''): string {
   }
   if (f.inviteState === 'received') return '已接收 · 已保存到下载目录';
   if (f.inviteState === 'rejected') return '已拒绝接收';
+  if (f.inviteState === 'cancelled') return '已停止接收';
   if (f.inviteState === 'failed') return '接收失败';
   if (f.inviteState === 'accepted') return '接收中';
   return '';
@@ -684,12 +764,25 @@ export function setChatOpen(next: boolean) {
   if (next) openKey = null;
 }
 
-export function draftOf(key: string): string {
-  return draft[key] ?? '';
+/**
+ * 一个会话的草稿：**有序的分段表**（一段文字 / 一张图），不是一坨字符串。
+ *
+ * 需求要的是"图夹在前后两段文字中间"，还要按框里的顺序发出去 —— 顺序本身就是数据，
+ * 见 `lib/composer.ts` 的文件头。图片那一段里放的是**本机暂存文件的路径**（粘贴那一刻就
+ * 落盘了），框里的 `url` 只是预览。
+ */
+export function draftSegsOf(key: string): ComposerSeg[] {
+  return draft[key] ?? [];
 }
 
-export function setDraftOf(key: string, text: string) {
-  draft = { ...draft, [key]: text };
+/** 整份换掉这个会话的草稿（输入区每次 `input` 之后叫一次）。 */
+export function setDraftSegs(key: string, segs: ComposerSeg[]) {
+  draft = { ...draft, [key]: segs };
+}
+
+/** 这条草稿里有没有值得发的东西（两段空白文字不算）。 */
+export function draftHasContent(key: string): boolean {
+  return hasContent(draftSegsOf(key));
 }
 
 /** 收件人选择框的那份请求：种子、锁定的模式、预填名字、确认回调。 */
@@ -745,7 +838,35 @@ export function askParticipants(key: string) {
 
 function replace(next: ChatSnapshot) {
   snapshot = next;
+  // 第一次拿到快照（启动时 `refresh` / 第一条 `chat://changed`）：把落盘的文件消息种进内存。
+  // 之后这份内存就是实时的真相 —— 每次 `replace` 再种一遍会把正在传的进度抹回上一次落盘的样子。
+  if (!filesSeeded) {
+    filesSeeded = true;
+    seedFiles();
+  }
   markOpenRead();
+}
+
+/**
+ * 把快照里落盘的文件消息种进内存（**只在启动那一次**，见 `replace`）。
+ *
+ * **按设备合并**：本机已经有的那几条（万一某条推送事件比首次快照先到 —— 两边都是异步的）
+ * 不该被后端那份旧的盖掉，后端那份里本机还没有的也要补上 —— 两边谁都不是"全的"。
+ * 后端的排在前面：它是更早的（启动之前）记录。
+ */
+function seedFiles() {
+  const seeded: Record<string, ChatFileMsg[]> = { ...files };
+  for (const convo of snapshot.convos) {
+    const persisted = convo.files ?? [];
+    const local = seeded[convo.peerId];
+    if (!local) {
+      seeded[convo.peerId] = persisted;
+      continue;
+    }
+    const have = new Set(local.map((f) => f.id));
+    seeded[convo.peerId] = [...persisted.filter((f) => !have.has(f.id)), ...local];
+  }
+  files = seeded;
 }
 
 /**
@@ -931,21 +1052,136 @@ export async function removeParticipant(
  *
  * 返回这条的 id 与它挂在哪份名单上（界面据此读逐台战果；`null` = 没发）。群消息没有"名单"
  * 那一层，`batchId` 一律是 `null`。
+ *
+ * `at` = 点名这条消息在时间线上的位置（只有输入区"图文混排"的每一段会点名，见 `sendComposer`）。
  */
-export async function sendText(key: string, text: string): Promise<{ id: string; batchId: string | null } | null> {
+export async function sendText(
+  key: string,
+  text: string,
+  at?: number,
+): Promise<{ id: string; batchId: string | null } | null> {
   const t = threadOf(key);
   const body = text.trim();
   if (!t || !body) return null;
   if (t.mode === 'group') {
-    const res = await api.groupSend(t.id, body);
+    const res = await api.groupSend(t.id, body, at);
     replace(res.snapshot);
     return { id: res.id, batchId: null };
   }
   const res = t.mode === 'direct'
-    ? await api.chatSend([t.participants[0]], body)
-    : await api.chatSend(t.participants, body, t.id);
+    ? await api.chatSend([t.participants[0]], body, null, at)
+    : await api.chatSend(t.participants, body, t.id, at);
   replace(res.snapshot);
   return { id: res.id, batchId: res.batchId };
+}
+
+/** `sendComposer` 的结果：界面据此报"发了几条 / 哪几条没发出去"。 */
+export interface ComposerSendResult {
+  /** 最后一条**文本**消息的 id（群发那条视图据此读逐台战果；没文本 = `null`）。 */
+  textId: string | null;
+  /** 那份群发名单的 id（一对一 / 群聊 = `null`）。 */
+  batchId: string | null;
+  texts: number;
+  images: number;
+  /** 没发出去的那几段（已放回草稿：失败不清空，用户不用重打一遍）。 */
+  failed: number;
+  /** 第一次失败的原因（后端原话；没有失败 = `null`）。 */
+  error: string | null;
+}
+
+/**
+ * 把输入区里那一整条**图文混排**发出去 —— 这段文字 / 这张图 / 后面那段文字，一条一条按
+ * 框里的顺序落成消息。
+ *
+ * 四件事必须一起做对，缺哪件用户都能看出来：
+ *
+ * 1. **顺序**：整条消息的每一段由**这里**统一编号（`at`），从"现在"起一段加一毫秒。为什么
+ *    不能让后端各取各的"现在"：一条里图片夹在两段文字中间时，那几次调用很可能落在同一
+ *    毫秒里，而两端的时间线都是按 `at` 排的（同一毫秒就跟着遍历顺序飘）——用户看到的"图在
+ *    中间"就散了。图片那一段的号跟着**消息本身**过去（`ChatImage.at`），对端拿它排位置。
+ * 2. **一条条发**：串行 `await`，不做并发 —— 并发发出去的三段在时间线上就没有先后可言了。
+ * 3. **失败不清空**：哪一段没发出去，那一段原样留在草稿里（发出去的段落不再留）；
+ *    一张图失败不影响后面那段文字照发。
+ * 4. **图片是消息内容，不是推送**：走 `chat_send_image`（对端直接就能看，没有"接收 / 同意"
+ *    那一步，也不进"传输中"那本账）。唯一例外是**群聊**（那一半的收发还没落地，见
+ *    docs/p1-implementation.md §33）：群里暂时仍旧按文件推送 —— 也就是说群里的图还要对端
+ *    点一次「接收」。
+ */
+export async function sendComposer(key: string): Promise<ComposerSendResult | null> {
+  const t = threadOf(key);
+  if (!t) return null;
+  const segs = draftSegsOf(key);
+  if (!hasContent(segs)) return null;
+
+  // 这一整条的时间戳：从"现在"起严格递增，且**排在已有消息之后**（同一毫秒里发第二条时，
+  // 不能让它落到上一条前面去）。
+  const lastAt = itemsOf(key).reduce((max, i) => Math.max(max, i.at), 0);
+  let stamp = Math.max(Date.now(), lastAt + 1);
+  const nextStamp = () => stamp++;
+
+  // 这条会话该发给谁（与 App.svelte 的 `convoSendTargets` 同一套：名册里那些已经不在本机
+  // 设备表里的成员寻不到址），以及这份记录挂在哪份群发名单上。
+  const peers = getDevices().filter((d) => t.participants.includes(d.id)).map((d) => d.id);
+  const chatBatchId = t.mode === 'broadcast' ? t.id : '';
+
+  const failedSegs: ComposerSeg[] = [];
+  const result: ComposerSendResult = {
+    textId: null,
+    batchId: null,
+    texts: 0,
+    images: 0,
+    failed: 0,
+    error: null,
+  };
+  for (const seg of segs) {
+    // 图片那一段要按设备寻址（一对一 / 群发），一台都找不到就把这张留在草稿里等下一次。
+    // **群聊不算这一档**：群里发图按名册寻址（成员不必在本机设备表里）。
+    if (seg.kind === 'image' && t.mode !== 'group' && !peers.length) {
+      result.failed += 1;
+      result.error ??= '这条会话里没有能送达的设备';
+      failedSegs.push(seg);
+      continue;
+    }
+    try {
+      if (seg.kind === 'text') {
+        // 空白的文字段（比如两张图之间用户多敲了个空格）不该落成一条空消息。
+        if (!seg.text.trim()) continue;
+        const res = await sendText(key, seg.text, nextStamp());
+        if (res) {
+          result.textId = res.id;
+          if (res.batchId) result.batchId = res.batchId;
+          result.texts += 1;
+        }
+        continue;
+      }
+      // 图片那一段：这里是"路径 + 名字"两条信息，后端把字节读进来、落成会话内容再发出去。
+      const at = nextStamp();
+      if (t.mode === 'group') {
+        // 群聊：与一对一同一套（图片走会话协议，对端直接就能看）。
+        const res = await api.groupSendImage(t.id, seg.path, seg.name, at);
+        replace(res.snapshot);
+      } else {
+        // 图片走**会话协议**（`chat_send_image`）：对端直接就能看，没有同意那一步。
+        const res = await api.chatSendImage(peers, seg.path, seg.name, at, chatBatchId || null);
+        replace(res.snapshot);
+        // 界面上那句"群发战果"读的是**最后一条文本**的消息 id；这一条是图，就不动它。
+        result.batchId ??= res.batchId;
+      }
+      result.images += 1;
+    } catch (e) {
+      result.failed += 1;
+      result.error ??= e instanceof Error ? e.message : String(e);
+      failedSegs.push(seg);
+    }
+  }
+
+  // 发出去的那几段连同它们的预览 URL 一起丢掉；没发出去的**原样留着**（图还在草稿里，
+  // 它的暂存文件也还在盘上，直接再点一次发送就能重发）。
+  for (const seg of segs) {
+    if (!failedSegs.includes(seg)) revokeSegs([seg]);
+  }
+  setDraftSegs(key, failedSegs);
+  return result;
 }
 
 /**
@@ -995,6 +1231,23 @@ function patchFiles(peerId: string, fn: (list: ChatFileMsg[]) => ChatFileMsg[]) 
 }
 
 /**
+ * 把这几台设备的文件消息记录写回后端（`chat_files_set`）。
+ *
+ * **只在能定下来的时刻叫**（刚发出 / 刚收到 / 接受或拒绝 / 收完或失败 / 整批走完）：
+ * 传输中的进度每 200ms 一跳，那是内存里的事，每拍都写一次盘（`chat.json` 整份重写）
+ * 纯属白花 —— 而断了的那一刻，后端重启扫尾会把还在传的那条落成终态。
+ *
+ * 失败只记一行：这是"记录"的持久化，把它变成用户可见的错误没有出口（下一次能定下来的
+ * 时刻会再写一遍）。命令不返回快照的更新（后端也不推 `chat://changed`）—— 界面手上这份
+ * 就是它的作者。
+ */
+function persistFiles(peerIds: Iterable<string>) {
+  for (const peerId of new Set(peerIds)) {
+    void api.chatFilesSet(peerId, files[peerId] ?? []).catch((e) => console.error('保存文件记录失败:', e));
+  }
+}
+
+/**
  * 本机选了文件发出去：**每台目标各一条气泡**（群发过去的那份在每台设备的会话里各算一条，
  * 与文本消息同一个道理），都挂在同一个 `batchId` 上。
  *
@@ -1002,19 +1255,22 @@ function patchFiles(peerId: string, fn: (list: ChatFileMsg[]) => ChatFileMsg[]) 
  * （空 = 不是群里发的）—— 群那条视图按 `groupId` 筛出记录，两个字段互斥（群聊不镜像进 1:1，
  * 群里发文件就是"拿群成员当收件人跑一次多目标推送"）。调用方（App）从**当前开着的那条会话**
  * 读它们。
+ *
+ * `at` = 这条气泡在时间线上的位置。0（默认）= 当场取现在；输入区那条"图文混排"的路会点名给它
+ * （见 `sendComposer`）—— 那时图片夹在前后两段文字中间，位置必须由界面统一排。
  */
-export function noteOutgoingFiles(peerIds: string[], items: LocalPick[], push: PushBatch, chatBatchId: string, groupId = '') {
+export function noteOutgoingFiles(peerIds: string[], items: LocalPick[], push: PushBatch, chatBatchId: string, groupId = '', at = 0) {
   const pushBatchId = push.batchId;
   // 逐台状态当场就有了（`push_paths` 回来的那份快照）——不等 `push://batch` 再回一条：
   // 未绑定的对端停在"等待同意"时不会有下一条事件，那条记录下面就会一直空着。
   const perTargets = push.targets.map((t) => ({ peerId: t.peerId, state: t.state }));
   const live = peerIds.filter(known);
   if (!live.length) return;
-  const at = Date.now();
+  const base = at || Date.now();
   for (const peerId of live) {
     const added: ChatFileMsg[] = items.map((it, i) => ({
       id: `file:${pushBatchId}:${i}`,
-      at: at + i,
+      at: base + i,
       fromMe: true,
       name: it.name,
       isDir: it.isDir,
@@ -1032,19 +1288,25 @@ export function noteOutgoingFiles(peerIds: string[], items: LocalPick[], push: P
       inviteState: '',
       received: 0,
       bytes: 0,
+      // 源文件本来就在这台机器上：点这条气泡开的就是它（零拷贝，与文件标签页双击一格同一落点）。
+      path: it.path,
+      count: 0,
     }));
     patchFiles(peerId, (list) => [...list, ...added]);
   }
+  persistFiles(live);
 }
 
 /** 推送批次快照 → 那一批文件消息的进度与成败（右下角那张卡是唯一的数据来源）。 */
 export function noteBatch(b: PushBatch) {
   let hit = false;
   const next: Record<string, ChatFileMsg[]> = {};
+  const touched: string[] = [];
   for (const [peerId, list] of Object.entries(files)) {
     next[peerId] = list.map((f) => {
       if (f.batchId !== b.batchId) return f;
       hit = true;
+      touched.push(peerId);
       const sending = b.waiting > 0;
       const pct = b.total > 0 ? Math.min(100, Math.round((b.received / b.total) * 100)) : 0;
       return {
@@ -1060,6 +1322,8 @@ export function noteBatch(b: PushBatch) {
     });
   }
   if (hit) files = next;
+  // 只有**整批走完**这一拍值得落盘（进度那几拍不写，见 `persistFiles`）。
+  if (hit && b.waiting === 0) persistFiles(touched);
 }
 
 /** 收到一条推送邀请：会话里落下那张「接收 / 拒绝」卡（落在与推送方的那条会话里）。 */
@@ -1067,7 +1331,10 @@ export function noteInboundInvite(inv: PushInvite) {
   const peerId = inv.sender.id;
   const msg: ChatFileMsg = {
     id: `invite:${inv.inviteId}`,
-    at: Date.now(),
+    // **发送方给的**位置（不是"收到的这一刻"）：一次发出去的一整条里，图片夹在前后两段文字
+    // 中间时，只有它能让对端排出同一个顺序（见 `sendComposer` / `WsEvent::PushInvite::at`）。
+    // 老对端不带（0）→ 退回收到的那一刻。
+    at: inv.at || Date.now(),
     fromMe: false,
     name: inv.name,
     isDir: inv.isDir,
@@ -1086,13 +1353,22 @@ export function noteInboundInvite(inv: PushInvite) {
     inviteState: inv.auto ? 'accepted' : 'pending',
     received: 0,
     bytes: inv.size,
+    // 落在哪只有后端知道：收完那一刻由 `push://done` 的 `dest` 补上（见 `noteInviteDone`）。
+    path: '',
+    count: inv.count,
   };
   patchFiles(peerId, (list) => (list.some((f) => f.inviteId === inv.inviteId) ? list : [...list, msg]));
+  persistFiles([peerId]);
 }
 
-/** 那条邀请被收下了（本机点「接收」，或后端自动收下）。 */
+/**
+ * 那条邀请被收下了（本机点「接收」，或后端自动收下）。
+ *
+ * 落盘的只是"这台设备此刻的记录"：`accepted` 不是终态，进程断在这儿时重启扫尾会把它落成
+ * 终态（接收失败）—— 这里写一次是为了让**已经走过的决定**（用户点过接收）不随崩溃消失。
+ */
 export function noteInviteAccepted(inviteId: string) {
-  patchInvite(inviteId, (f) => (f.inviteState === 'pending' ? { ...f, inviteState: 'accepted' } : f));
+  persistFiles(patchInvite(inviteId, (f) => (f.inviteState === 'pending' ? { ...f, inviteState: 'accepted' } : f)));
 }
 
 /** 接收进度（`push://progress`）。 */
@@ -1113,22 +1389,51 @@ export function noteInviteProgress(inviteId: string, received: number, total: nu
   });
 }
 
-/** 那条邀请的终局：已接收 / 已拒绝 / 接收失败。 */
-export function noteInviteDone(inviteId: string, outcome: 'received' | 'rejected' | 'failed') {
-  patchInvite(inviteId, (f) => ({ ...f, inviteState: outcome, sending: false }));
+/**
+ * 落盘那一层目录 + 这条消息 → 本机上这一项的绝对路径。
+ *
+ * **多选合并成的那一条只能开目录**：`name`（共同父目录名 /「N 项」）只是显示用的，落盘根下面
+ * 躺着的是**每个源自己的名字**（后端 `manifest_for_paths` 就是这么排的），拿显示名去拼会指到
+ * 一个不存在的地方。单项推送才拼得准 —— 清单里那个顶层路径就是它自己的名字。
+ * 分隔符跟 `dest` 走：Windows 给的是反斜杠，安卓给的是斜杠。
+ */
+function landingPath(dest: string, f: ChatFileMsg): string {
+  if (f.count > 1) return dest;
+  const sep = dest.includes('\\') && !dest.includes('/') ? '\\' : '/';
+  return dest.endsWith(sep) ? dest + f.name : dest + sep + f.name;
 }
 
-function patchInvite(inviteId: string, fn: (f: ChatFileMsg) => ChatFileMsg) {
-  let hit = false;
+/**
+ * 那条邀请的终局：已接收 / 已拒绝 / 接收失败。
+ *
+ * `dest` = 后端随 `push://done` 给的那一层**落盘目录**（`<落盘目录>/<发送方名>`；S-12 关掉那层
+ * 时就是落盘根本身），只有"已接收"才有。它是会话里那条气泡「打开」的**唯一路径来源**：
+ * 东西落在哪只有后端知道，界面不自己拼目录名（同名/改写与净化都在后端）。
+ */
+export function noteInviteDone(inviteId: string, outcome: 'received' | 'rejected' | 'failed' | 'cancelled', dest = '') {
+  persistFiles(
+    patchInvite(inviteId, (f) => ({
+      ...f,
+      inviteState: outcome,
+      sending: false,
+      path: outcome === 'received' && dest ? landingPath(dest, f) : f.path,
+    })),
+  );
+}
+
+/** 改这条邀请所在的那几条文件消息，返回**改到了哪几台设备**（调用方据此决定要不要落盘）。 */
+function patchInvite(inviteId: string, fn: (f: ChatFileMsg) => ChatFileMsg): string[] {
+  const hit: string[] = [];
   const next: Record<string, ChatFileMsg[]> = {};
   for (const [peerId, list] of Object.entries(files)) {
     next[peerId] = list.map((f) => {
       if (f.inviteId !== inviteId) return f;
-      hit = true;
+      hit.push(peerId);
       return fn(f);
     });
   }
-  if (hit) files = next;
+  if (hit.length) files = next;
+  return hit;
 }
 
 // 后端每改一次会话就推一份整快照过来（与推送卡片同一条路数）。

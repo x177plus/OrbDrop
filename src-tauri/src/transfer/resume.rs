@@ -34,7 +34,85 @@ pub struct ResumeFile {
     /// 新协议：文件身份（`stream::resume_key`）→ 记录（块位图 + 临时文件名）。
     #[serde(default)]
     pub files: HashMap<String, FileResume>,
+    /// 还没传完的接收任务（见 [`PendingInbound`]）：进程重启之后接着收的依据。
+    ///
+    /// 与上面两份**不是一回事**：那两份记的是"哪几个字节已经在盘上"（省流量），
+    /// 这份记的是"还有一次接收没走完"（要不要接着收）。所以它们各有各的寿命 ——
+    /// 任务走完/放弃就把这份删掉，位图留着（用户手动重推一次仍然省得下那些块）。
+    #[serde(default)]
+    pub pending: HashMap<String, PendingInbound>,
 }
+
+/// 接收端的一条**待续传任务**：进程重启之后还认得"有这么一次接收没走完"。
+///
+/// 为什么不复用文件级那套记录：那份的键是**文件身份**（`stream::resume_key`）、故意不带
+/// 邀请 id（跨邀请复用），它答得了"哪几块不用再要"，答不了"要不要接着收"。要重新发起一次
+/// 接收，这四样缺一不可：邀请 id（对端的凭据）、对端身份与地址、清单（要哪些、各自多大、
+/// 什么时候的）、落盘根（东西该落哪）。
+///
+/// **只在"已经放行、开始下载"之后才记**（`transfer::accept_invite`）：没点头的邀请不该在
+/// 重启之后自己开始收 —— 那等于替用户点了一次同意。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingInbound {
+    pub invite_id: String,
+    pub sender_id: String,
+    /// 对端自报的名字（落盘目录那一层按它拼，见 `landing_dir`）。
+    pub sender_name: String,
+    pub name: String,
+    pub size: u64,
+    pub is_dir: bool,
+    /// 发送方这次选了几项（>1 = 多选合并成的一条推送）。
+    #[serde(default = "one_item")]
+    pub count: u32,
+    pub files: Vec<PendingFile>,
+    /// 对端声明的能力位：重启后要按**同一套**协议续（`stream1` 走新数据面，否则老那一套）。
+    #[serde(default)]
+    pub caps: Vec<String>,
+    /// 落盘根：只有"每次询问下用户亲自挑过目录"的那条邀请才带（否则用设置里的下载目录）。
+    #[serde(default)]
+    pub root: Option<String>,
+    /// 对端地址（未配对时这是唯一的路；已配对的按地址簿拨，它只当兜底）。
+    #[serde(default)]
+    pub callback: Option<(String, u16)>,
+    /// 有进展的时刻（unix 秒）：接受那一刻，或最后一次**有文件收完**那一刻。
+    ///
+    /// TTL 按它算（见 [`PENDING_TTL_SECS`]）。**尝试不刷新它**（"对面一直不出现"熬不过窗口），
+    /// 块级进度也不刷新（那是每 200ms 一次的事，写盘会被拖垮）。
+    pub updated_at: i64,
+}
+
+/// 清单里的一项：只留重新发起一次接收要的那三样（`FileEntry` 的投影）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingFile {
+    pub path: String,
+    pub size: u64,
+    #[serde(default)]
+    pub mtime: i64,
+}
+
+fn one_item() -> u32 {
+    1
+}
+
+/// 一条待续传任务最多留多久：**从"最后一次有进展"算起 7 天**。
+///
+/// 到点就收尾（如实说一句"等了 7 天没传完"）—— 留着它没有意义：对端要么不在网上了，
+/// 要么那条推送早就没了。位图与 `.part` 不跟着删（用户手动重推一次仍然接着传）。
+pub const PENDING_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+
+impl PendingInbound {
+    /// 过了 TTL 没有？`now` = unix 秒。
+    pub fn expired(&self, now: i64) -> bool {
+        now.saturating_sub(self.updated_at) > PENDING_TTL_SECS
+    }
+}
+
+/// 重试的退避台阶（秒）：够不着就等下一拍，越等越久，封顶 2 小时。
+///
+/// 台阶都在 TTL（7 天）之内，所以"对面一直不出现"最终会由 TTL 收尾，而不是这一串无限重试。
+const RETRY_BACKOFF: [u64; 5] = [30, 120, 600, 1800, 7200];
 
 struct Inner {
     records: ResumeFile,
@@ -46,11 +124,20 @@ struct Inner {
 pub struct ResumeStore {
     path: PathBuf,
     inner: Mutex<Inner>,
+    /// 重试的**运行时**记账（不落盘）：invite_id → (已试几轮, 上一次尝试的时刻)。
+    ///
+    /// 为什么不落盘：重启一次就该立刻再试一遍（上一趟已经随进程没了），把"已经等了几轮"
+    /// 也带过去是最糟的 —— 用户重启往往就是为了让它再试一次。
+    attempts: Mutex<HashMap<String, (u32, Instant)>>,
 }
 
 impl ResumeStore {
     pub fn new() -> Self {
-        let path = data_dir().join("resume.json");
+        Self::with_path(data_dir().join("resume.json"))
+    }
+
+    /// 指定文件的构造（单测用：不碰真实数据目录）。
+    pub fn with_path(path: PathBuf) -> Self {
         let records = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<ResumeFile>(&s).ok())
@@ -62,6 +149,7 @@ impl ResumeStore {
                 dirty: false,
                 last_flush: Instant::now(),
             }),
+            attempts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -174,6 +262,88 @@ impl ResumeStore {
         guard.dirty = true;
         persist_locked(&self.path, &mut guard);
         stale.len()
+    }
+
+    // -- 待续传任务（进程重启后接着收）--------------------------------------------------
+
+    /// 记下一条待续传任务（`transfer::accept_invite` 放行那一刻）。**立刻落盘**：
+    /// 这是一次状态跃迁（"从这一刻起这条接收该被接手"），拖到下一拍就没有意义了 ——
+    /// 用户正是在这之后可能把应用关掉。
+    pub fn put_pending(&self, rec: PendingInbound) {
+        let mut guard = self.inner.lock();
+        guard.records.pending.insert(rec.invite_id.clone(), rec);
+        guard.dirty = true;
+        persist_locked(&self.path, &mut guard);
+    }
+
+    /// 这条不用再接着收了：传完 / 终态失败 / 用户取消 / 对端撤了 / 过期放弃。
+    ///
+    /// **不清**文件级位图：用户手动重推一次仍然省得下那些块（见 [`ResumeFile::pending`] 那段）。
+    pub fn drop_pending(&self, invite_id: &str) {
+        {
+            let mut guard = self.inner.lock();
+            if guard.records.pending.remove(invite_id).is_some() {
+                guard.dirty = true;
+                persist_locked(&self.path, &mut guard);
+            }
+        }
+        self.attempts.lock().remove(invite_id);
+    }
+
+    /// 有进展了（**一个文件收完了**）：把 TTL 的锚点往前挪。不是每块都叫 ——
+    /// 块级进度是每 200ms 一次的事，那样等于把整份 JSON 按 5 次/秒重写。
+    pub fn touch_pending(&self, invite_id: &str) {
+        let mut guard = self.inner.lock();
+        let Some(rec) = guard.records.pending.get_mut(invite_id) else {
+            return;
+        };
+        rec.updated_at = now_secs();
+        guard.dirty = true;
+        // 与 `save_file` 同一条节流纪律（一个几千文件的推送会一条一条地收尾）。
+        if guard.last_flush.elapsed() >= FLUSH_INTERVAL {
+            persist_locked(&self.path, &mut guard);
+        }
+    }
+
+    /// 全部待续传任务（启动时/每一拍由 `transfer::resume_pending` 逐条接着收）。
+    pub fn pending_entries(&self) -> Vec<PendingInbound> {
+        self.inner.lock().records.pending.values().cloned().collect()
+    }
+
+    /// 还在接手的邀请 id。
+    ///
+    /// `chat` 的启动扫尾用它：那条"接收中"的记录不能被落成「接收失败」—— 它马上就要接着收了
+    /// （见 `chat::requeue_inflight`）。
+    pub fn pending_ids(&self) -> std::collections::HashSet<String> {
+        self.inner.lock().records.pending.keys().cloned().collect()
+    }
+
+    /// 这会儿该不该再试一次这条（退避台阶见 [`RETRY_BACKOFF`]）。没有记账 = 头一次，立刻试。
+    pub fn attempt_due(&self, invite_id: &str) -> bool {
+        let attempts = self.attempts.lock();
+        match attempts.get(invite_id) {
+            None => true,
+            Some((round, at)) => {
+                // 已经试过 `round` 轮 → 等第 `round` 号台阶（第 1 轮试完等 30s，第 2 轮完等 2min…）。
+                let step = RETRY_BACKOFF[(*round).clamp(1, RETRY_BACKOFF.len() as u32) as usize - 1];
+                at.elapsed().as_secs() >= step
+            }
+        }
+    }
+
+    /// 记一次尝试（调用方刚从 `attempt_due` 拿到 `true`）。
+    pub fn note_attempt(&self, invite_id: &str) {
+        let mut attempts = self.attempts.lock();
+        let entry = attempts.entry(invite_id.to_string()).or_insert((0, Instant::now()));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = Instant::now();
+    }
+
+    /// 清掉已经不存在的任务的退避记账（任务删了但记账还在 = 内存里一点点泄漏，
+    /// 而且 approve 里那个 id 万一被复用会带着旧台阶）。
+    pub fn prune_attempts(&self) {
+        let live = self.inner.lock().records.pending.keys().cloned().collect::<Vec<_>>();
+        self.attempts.lock().retain(|k, _| live.contains(k));
     }
 }
 
@@ -288,6 +458,19 @@ pub fn landing_root(download_dir: &Path, sender_name: &str) -> PathBuf {
     safe_join(download_dir, &name).unwrap_or_else(|| download_dir.join("unknown-device"))
 }
 
+/// 这次接收实际写哪个目录：按设置（S-12，`Config::device_subdir`）决定要不要 `<发送方名>/` 那层。
+///
+/// 关掉时给它**根目录本身**。围栏不靠那一层：清单里的相对路径照旧逐段过 `safe_join`
+/// （每个文件都从 `dir` 往下拼、每段必须是普通名字），所以"关掉"只是把"能碰的范围"从
+/// `<根>/<发送方名>` 放大到 `<根>`，**没有**放大到根之外 —— 对端自报的名字这时压根不参与拼路径。
+pub fn landing_dir(base: &Path, sender_name: &str, device_subdir: bool) -> PathBuf {
+    if device_subdir {
+        landing_root(base, sender_name)
+    } else {
+        base.to_path_buf()
+    }
+}
+
 /// Sanitize a relative path so it cannot escape the save root (下载目录 / 推送落盘根).
 ///
 /// 清单里的相对路径也是对方给的，逐段校验：
@@ -326,9 +509,10 @@ pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
 
 /// 一个文件的续传记录（新协议 `POST /push/stream` 那条路）。
 ///
-/// 键是**文件身份**（`stream::resume_key`：对端 id + 路径 + 大小 + 时间戳），不是邀请 id ——
-/// 用户"传失败了再推一次"拿到的是新邀请，只有身份是稳定的。按邀请存的话，重推一次就是从零
-/// 重传一整遍（老实现正是如此）。
+/// 键是**文件身份**（`stream::resume_key`：对端 id + **落盘目录** + 路径 + 大小 + 时间戳），不是
+/// 邀请 id —— 用户"传失败了再推一次"拿到的是新邀请，只有身份是稳定的。按邀请存的话，重推一次
+/// 就是从零重传一整遍（老实现正是如此）。身份里带落盘目录，是为了"同一个文件收在两个目录下"
+/// 各算各的（见 `stream::resume_key` 那段）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileResume {
@@ -487,6 +671,23 @@ mod path_tests {
         }
     }
 
+    /// S-12：那颗开关只决定"要不要多一层发送方目录"，**不决定**能不能出根。
+    #[test]
+    fn device_subdir_toggle_only_decides_the_layer() {
+        let base = PathBuf::from("C:\\Users\\u\\Downloads");
+        // 开（默认）：`<根>/<净化过的发送方名>`
+        assert_eq!(landing_dir(&base, "PC-B", true), base.join("PC-B"));
+        // 关：就是根本身 —— 发送方自报的名字这时**不参与拼路径**，连净化都不需要
+        assert_eq!(landing_dir(&base, "PC-B", false), base);
+        assert_eq!(landing_dir(&base, "..\\..\\evil", false), base);
+        // 两种取值下，清单里的相对路径都钉在根里：围栏是 `safe_join`（逐段校验），不是这一层。
+        for subdir in [true, false] {
+            let dir = landing_dir(&base, "..\\..\\evil", subdir);
+            let target = safe_join(&dir, "a/b.txt").expect("普通相对路径该放行");
+            assert!(target.starts_with(&base), "逃出根了：{target:?}");
+        }
+    }
+
     #[test]
     fn safe_dir_name_keeps_device_names_readable() {
         assert_eq!(safe_dir_name("PC-B"), "PC-B", "正常名字一个字不动");
@@ -599,6 +800,111 @@ mod bitmap_tests {
             let (_, len) = block_range(size, DEFAULT_BLOCK_SIZE, i).unwrap();
             assert!(len > 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+
+    fn record(invite: &str, updated_at: i64) -> PendingInbound {
+        PendingInbound {
+            invite_id: invite.into(),
+            sender_id: "peer-a".into(),
+            sender_name: "PC-A".into(),
+            name: "报告".into(),
+            size: 24,
+            is_dir: true,
+            count: 2,
+            files: vec![
+                PendingFile { path: "a.bin".into(), size: 16, mtime: 7 },
+                PendingFile { path: "空.txt".into(), size: 0, mtime: 0 },
+            ],
+            caps: vec!["stream1".into()],
+            root: Some("D:/下载".into()),
+            callback: Some(("127.0.0.1".into(), 47800)),
+            updated_at,
+        }
+    }
+
+    fn store(name: &str) -> (ResumeStore, PathBuf) {
+        let path = std::env::temp_dir().join(format!("orbdrop_pending_{name}_{}", uuid::Uuid::new_v4()));
+        (ResumeStore::with_path(path.clone()), path)
+    }
+
+    /// 待续传任务**要能活过一次重启**：重开一份 store（同一个文件）之后，那几样
+    /// （邀请 id / 清单 / 落盘根 / 对端地址）一个不少 —— 这就是"重启后自己接着收"的全部依据。
+    #[test]
+    fn a_pending_task_survives_a_restart_field_for_field() {
+        let (s, path) = store("survive");
+        s.put_pending(record("inv-1", now_secs()));
+
+        let reopened = ResumeStore::with_path(path.clone());
+        let got = reopened.pending_entries();
+        assert_eq!(got.len(), 1);
+        let p = &got[0];
+        assert_eq!(p.invite_id, "inv-1");
+        assert_eq!(p.sender_id, "peer-a");
+        assert_eq!(p.files.len(), 2);
+        assert_eq!(p.files[1].path, "空.txt");
+        assert_eq!(p.root.as_deref(), Some("D:/下载"));
+        assert_eq!(p.callback.clone().unwrap().1, 47800);
+        assert_eq!(p.caps, vec!["stream1".to_string()], "按同一套协议续");
+        // 重建出来的邀请要能直接跑（清单与落盘根逐字段对上）。
+        let inv = p.to_invite();
+        assert_eq!(inv.name, "报告");
+        assert_eq!(inv.count, 2);
+        assert_eq!(inv.files[0].size, 16);
+        assert!(inv.root.is_some());
+        assert!(reopened.pending_ids().contains("inv-1"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 传完/终态之后任务要删掉（重启不该再自己收一遍）；文件级位图**不跟着删**
+    /// （用户手动重推一次仍然省得下那些块）。
+    #[test]
+    fn dropping_the_task_keeps_the_block_record() {
+        let (s, path) = store("drop");
+        s.put_pending(record("inv-1", now_secs()));
+        s.save_file("key-1", FileResume::new(16, 7, 4, "x.part".into()));
+
+        s.drop_pending("inv-1");
+        assert!(s.pending_entries().is_empty());
+        assert!(!s.pending_ids().contains("inv-1"));
+        assert!(s.file_record("key-1").is_some(), "位图留着");
+        // 删了之后，重建出来的那份里也不该再有它。
+        let reopened = ResumeStore::with_path(path.clone());
+        assert!(reopened.pending_entries().is_empty());
+        assert!(reopened.file_record("key-1").is_some());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 退避：第一次立刻试；试过一轮后要等台阶；**重启之后立刻再试**（记账不落盘）。
+    #[test]
+    fn retry_backoff_is_runtime_only() {
+        let (s, path) = store("backoff");
+        assert!(s.attempt_due("inv-1"), "没试过 = 立刻试");
+        s.note_attempt("inv-1");
+        assert!(!s.attempt_due("inv-1"), "刚试过，要等第一级台阶");
+
+        let reopened = ResumeStore::with_path(path.clone());
+        assert!(reopened.attempt_due("inv-1"), "重启就是为了让它再试一次");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// TTL 按**最后一次有进展**算（7 天）：这个窗口以内留着，过了一点就收尾。
+    #[test]
+    fn the_ttl_window_is_measured_from_the_last_progress() {
+        let now = now_secs();
+        assert!(!record("inv-1", now - 6 * 86400).expired(now));
+        assert!(record("inv-1", now - 8 * 86400).expired(now));
+        // 有进展就把锚点往前挪（`touch_pending` 在"一个文件收完"时叫）。
+        let (s, path) = store("touch");
+        s.put_pending(record("inv-1", now - 8 * 86400));
+        assert!(s.pending_entries()[0].expired(now));
+        s.touch_pending("inv-1");
+        assert!(!s.pending_entries()[0].expired(now), "刚有进展就不该过期");
+        let _ = std::fs::remove_file(path);
     }
 }
 

@@ -60,7 +60,8 @@ pub async fn run_inbound_session(state: Arc<AppState>, peer_id: String, ws: WebS
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(event) = serde_json::from_str::<WsEvent>(&text) {
-                            handle_inbound(&state, &peer_id, event).await;
+                            // 回执不在这里处理：拒收那条回话由 `group::reject_text` 当场发出去。
+                            let _ = handle_inbound(&state, &peer_id, event).await;
                         }
                     }
                     Some(Ok(Message::Ping(data))) => {
@@ -123,7 +124,25 @@ pub fn peer_id_from_token(state: &AppState, token: &str) -> Option<String> {
 // Inbound event dispatcher
 // ---------------------------------------------------------------------------
 
-pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent) {
+/// 一条入站事件落账之后要给对方的回执。**收不下**的有两条：群消息，与图片消息的内容：
+///
+/// - HTTP 兜底那一跳按它回状态码（`Accepted` = 204，`GroupRefused` = 409 + 理由，
+///   `ImageRefused` = 400）；
+/// - 长连接那一条路的回话已经由 `group::reject_text` 当场发了（`GroupTextRejected`）；
+///   图片那一条**没有回话通道**（长连接上的入站事件是单向的），只能记日志 —— 发送方
+///   那边那条消息照样显示"已送达"，而本机确实没记下它（见 `chat::accept_inbound_image`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum InboundResult {
+    /// 收下了（或这条事件本来就没有回执可言）。
+    Accepted,
+    /// 群消息收不下：理由代码见 `crate::group::REASON_*`。
+    GroupRefused(&'static str),
+    /// 图片消息的内容收不下（base64 坏了 / 超过上限 / 写盘失败）：本机**没有**记下这条消息。
+    ImageRefused,
+}
+
+pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent) -> InboundResult {
     match event {
         WsEvent::PeerOnline { peer } => {
             // mDNS-driven; accept as an upsert for completeness.
@@ -141,7 +160,7 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
         WsEvent::PeerOffline { peer_id: _ } => {
             // WS drop itself drives offline; nothing to do here.
         }
-        WsEvent::PushInvite { invite_id, sender, name, size, is_dir, count, files, caps } => {
+        WsEvent::PushInvite { invite_id, sender, name, size, is_dir, count, files, caps, at } => {
             // 身份以**这条会话**为准，不用载荷里自称的那个：长连接是 token 换来的，
             // 而载荷里的 sender.id 只是对端自己填的字符串。
             let known = state.get_peer(peer_id);
@@ -184,6 +203,8 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 "isDir": is_dir,
                 "count": count,
                 "auto": paired,
+                // 这条文件消息在会话时间线上的位置（发送方点的，见 `WsEvent::PushInvite::at`）。
+                "at": at,
             }));
             // 已配对的设备推送**不需要接收方同意**（token 就是那份信任）：直接开收 —
             // 界面那条通知是"正在接收"而不是"要不要收"。未绑定的才挂卡片等用户点。
@@ -193,30 +214,36 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                     // 本机那条"正在接收"的通知得收尾：这条邀请已经不可能变成完成了。
                     transfer::reject_invite_with(state, &invite_id, &reason);
                 }
-                return;
+                return InboundResult::Accepted;
             }
-            // 到点没处理就自动拒绝：发送方那边一直在等回执，不能只有一边作废。
+            // 到点没处理就自动拒绝：老对端那边一直挂着等回执，不能只有一边作废。
+            // **带 `await1` 的对端不排这个超时**（守卫在 `schedule_invite_timeout` 里）：
+            // 它等的是"报告"，两边都没有时钟。
             transfer::schedule_invite_timeout(state.clone(), invite_id);
         }
-        WsEvent::PushResponse { invite_id, accepted } => {
+        WsEvent::PushResponse { invite_id, accepted, reason } => {
             info!(%invite_id, accepted, "push response");
             use transfer::push_job::{batch_set, PushStatus, TargetState};
+            // 对端给了原因就用它的：「对方拒绝」与「本机收不下（地址未知之类）」是两件事，
+            // 卡片上那句话该说准（老对端不带 reason → 回到原来那句）。
+            let why = reason.unwrap_or_else(|| "对方拒绝了这次推送".into());
             if accepted {
                 state.push.update_status(&invite_id, PushStatus::Accepted);
             } else {
                 // 拒绝：发送方不能再等下去 —— 清掉 job，并让界面把"等待对方同意"那张卡收掉。
                 state.push.remove_job(&invite_id);
-                batch_set(state, &invite_id, TargetState::Rejected, None, Some("对方拒绝了这次推送".into()), true);
+                batch_set(state, &invite_id, TargetState::Rejected, None, Some(why.clone()), true);
             }
             emit_ui(state, ui::PUSH_RESPONSE, &serde_json::json!({
                 "inviteId": invite_id,
                 "accepted": accepted,
+                "reason": why,
             }));
             if !accepted {
                 emit_ui(state, ui::PUSH_DONE, &serde_json::json!({
                     "inviteId": invite_id,
                     "status": "failed",
-                    "reason": "对方拒绝了这次推送",
+                    "reason": why,
                 }));
             }
         }
@@ -237,6 +264,9 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             // 发送方撤销时这条邀请可能还挂在通知列表里（对方还没点同意）：
             // 一并撤掉 —— 界面收到下面这条 push://done 就会把卡片收走。
             state.push.remove_invite(&invite_id);
+            // 发送方说这条结束了 → 接收端那份"待续传任务"一并作废（重启后不该再自己开始收）。
+            // 发送方这边没有这一份，这行是个空操作。
+            state.push.resume.drop_pending(&invite_id);
             state.push.update_status(&invite_id, if status == "completed" {
                 PushStatus::Completed
             } else {
@@ -276,7 +306,7 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             // 去解掉第三方的配对（删凭据 + 断链 + 移出地址簿），那是越权，丢掉。
             if who != peer_id {
                 warn!(%peer_id, claimed = %who, "WS unpair 的自称 id 与连接身份不一致，忽略");
-                return;
+                return InboundResult::Accepted;
             }
             info!(%peer_id, "received unpair over WS");
             let _ = credential::remove_peer(peer_id);
@@ -302,6 +332,33 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             // 界面是不是**正开着**这个会话，只有界面知道（它自己会来 `chat_mark_read`）；
             // 这里不回已读回执 —— 收到 ≠ 读过。
         }
+        WsEvent::ChatImage { id, at, name, size: _, data } => {
+            let sender = crate::group::display_name(state, peer_id, "");
+            debug!(%id, %peer_id, name = %name, "inbound chat image");
+            // 内容先落盘再记账（见 `chat::accept_inbound_image`）：落不下来就不记。
+            match crate::chat::accept_inbound_image(state, peer_id, &sender, &id, &name, &data, at) {
+                Ok(fresh) => {
+                    crate::group::emit(state);
+                    if fresh {
+                        // 通知里写的是一句"发了张图"：图片本身不必进通知（手机上那条通知
+                        // 只有一行字的位置）。重复投递不再响一遍。
+                        crate::notify::message(
+                            &crate::notify::Convo::Direct(peer_id.to_string()),
+                            &sender,
+                            "[图片]",
+                        )
+                        .await;
+                    }
+                }
+                Err(reason) => {
+                    // 长连接这一跳没有回执通道可以说这件事：如实记一行，那条消息于是不在本机
+                    // 会话里出现（"至少一次"投递的固有缺口 —— 宁可漏一条，也不留一条打不开的空图。
+                    // HTTP 那一跳会把这个原因回给发送方，那边落「未送达」）。
+                    warn!(%id, %peer_id, %name, %reason, "收到一条图片消息但内容没能落下来");
+                    return InboundResult::ImageRefused;
+                }
+            }
+        }
         WsEvent::ChatRead { up_to } => {
             debug!(%peer_id, up_to, "inbound chat read receipt");
             state.chat.mark_read_by_peer(peer_id, up_to);
@@ -309,13 +366,15 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
         }
         // 群聊三条：落账那一段在 `group.rs`（WS 与 HTTP 兜底两条路共用同一个 dispatcher，
         // 所以这里只有转发）。
-        WsEvent::GroupText { group_id, id, text, at, seq, rev, author, hops, reached } => {
-            debug!(%group_id, %id, %peer_id, hops, "inbound group text");
+        WsEvent::GroupText { group_id, id, text, at, seq, rev, author, hops, reached, image, name, size, data } => {
+            debug!(%group_id, %id, %peer_id, hops, image, "inbound group text");
             // 通知里要"哪个群、谁说的"，这两样都得在 `author` 被搬进事件里之前留一份
             // （发言人那半截用 `group::display_name`：与落账写进消息里的**同一个名字**）。
             let notify_author = author.id.clone();
             let notify_claimed = author.name.clone();
-            let fresh = crate::group::on_group_text(
+            // 拒收回执要用的两样：`id` 与 `group_id` 马上会被搬进 `GroupTextIn`。
+            let (nack_group, nack_msg) = (group_id.clone(), id.clone());
+            let outcome = crate::group::on_group_text(
                 state,
                 peer_id,
                 crate::group::GroupTextIn {
@@ -329,24 +388,42 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                     sender_name: author.name,
                     hops,
                     reached,
+                    image,
+                    name,
+                    size,
+                    data,
                 },
             );
-            if fresh {
-                // 群名给标题（没起名的那一档界面也是回落到成员名，这里退回中性的一档）、
-                // 发言人给正文。
-                let title = state
-                    .groups
-                    .group(&group_id)
-                    .map(|g| g.name.trim().to_string())
-                    .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| "群聊".to_string());
-                let who = crate::group::display_name(state, &notify_author, &notify_claimed);
-                crate::notify::message(
-                    &crate::notify::Convo::Group(group_id),
-                    &title,
-                    &format!("{who}：{text}"),
-                )
-                .await;
+            match outcome {
+                crate::group::GroupTextOutcome::Recorded => {
+                    // 群名给标题（没起名的那一档界面也是回落到成员名，这里退回中性的一档）、
+                    // 发言人给正文。
+                    let title = state
+                        .groups
+                        .group(&group_id)
+                        .map(|g| g.name.trim().to_string())
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| "群聊".to_string());
+                    let who = crate::group::display_name(state, &notify_author, &notify_claimed);
+                    // 图片消息在通知里写「[图片]」（手机那条通知只有一行字的位置，
+                    // 而这里的 `text` 对图片来说是空串）。
+                    let body = if image { "[图片]".to_string() } else { text.clone() };
+                    crate::notify::message(
+                        &crate::notify::Convo::Group(group_id),
+                        &title,
+                        &format!("{who}：{body}"),
+                    )
+                    .await;
+                }
+                // 邀请卡还挂着（消息已经攒下了）：不响通知 —— 用户还没点「加入」，
+                // 此刻响一声就是"我没进这个群，却有人跟我说话"。
+                crate::group::GroupTextOutcome::Buffered => {}
+                // 收不下：**当场明说**（长连接这条路的"写成功"不能当真），并把理由交给
+                // HTTP 那一跳（见 `routes_chat`：同一件事回 409，发送方那边两条路都落得下）。
+                refused => {
+                    crate::group::reject_text(state, peer_id, &nack_group, &nack_msg, refused.reason());
+                    return InboundResult::GroupRefused(refused.reason());
+                }
             }
         }
         WsEvent::GroupRead { group_id, up_to } => {
@@ -369,6 +446,11 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             debug!(%group_id, %peer_id, up_to, "inbound group ack");
             crate::group::on_ack(state, peer_id, &group_id, up_to);
         }
+        // 群聊：对端说"这一条我收不下"（长连接那条路的"写成功 = 已送达"要由它来纠正）。
+        WsEvent::GroupTextRejected { group_id, id, reason } => {
+            debug!(%group_id, %id, %peer_id, %reason, "inbound group text rejected");
+            crate::group::on_group_text_rejected(state, peer_id, &group_id, &id, &reason);
+        }
         // 推送对账（回执丢了怎么办）：对端在问它发出去的那几条邀请现在什么状态 ——
         // 按本机记录如实答（还拿着的 `waiting`、处理过的报结局、没见过的 `unknown`）。
         WsEvent::PushAsk { ask_id, invite_ids } => {
@@ -382,6 +464,8 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             crate::transfer::apply_push_states(state, peer_id, &ask_id, &states);
         }
     }
+    // 走到这里 = 这一条收下了（群消息那一条收不下时在上面就返回了）。
+    InboundResult::Accepted
 }
 #[cfg(test)]
 mod tests {
@@ -405,7 +489,7 @@ mod tests {
         let victim_seen = st.get_peer("device-victim").is_some();
 
         // 攻击者拿自己的连接，声称要解掉"受害者"。
-        handle_inbound(
+        let _ = handle_inbound(
             &st,
             "device-attacker",
             WsEvent::Unpair { peer_id: "device-victim".into() },
@@ -422,7 +506,7 @@ mod tests {
         );
 
         // 自己的 id（旧对端的正常写法）照旧生效。
-        handle_inbound(
+        let _ = handle_inbound(
             &st,
             "device-attacker",
             WsEvent::Unpair { peer_id: "device-attacker".into() },

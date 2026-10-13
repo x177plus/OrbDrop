@@ -581,6 +581,25 @@ export const ICONS = {
         }
       }
     ]
+  },
+  "stop": {
+    "viewBox": "0 0 24 24",
+    "prims": [
+      {
+        "tag": "circle",
+        "attrs": {
+          "cx": "12",
+          "cy": "12",
+          "r": "9"
+        }
+      },
+      {
+        "tag": "path",
+        "attrs": {
+          "d": "M9 9h6v6H9z"
+        }
+      }
+    ]
   }
 } as const satisfies Record<string, IconDef>;
 
