@@ -149,6 +149,11 @@ struct Session {
     local_cancel: AtomicBool,
     /// 对端取消了（410）。
     sender_cancel: AtomicBool,
+    /// 对端的源文件与清单**对不上**（传输期间被改过）：这条文件判失败，整条任务也不再重试。
+    ///
+    /// 与"这次没传成"分开：那是网络/写盘的抖动，重试有意义；源变了再试一百次还是同一份
+    /// 清单对不上（见 `transfer::resume_pending` 的终态判据）。
+    source_changed: AtomicBool,
     /// 收尾完成（reporter 据此退出）。
     finished: AtomicBool,
     /// 失败的文件（路径 + 原因）。
@@ -159,6 +164,13 @@ struct Session {
 }
 
 impl Session {
+    /// 对端那份源文件与清单对不上（大小/时间戳变了）：这条文件判失败，并**记下"整条任务
+    /// 落终态"** —— 再试还是同一份清单对不上，重试没有意义。
+    fn mark_source_changed(&self, rel: &str, reason: String) {
+        self.source_changed.store(true, Ordering::SeqCst);
+        self.mark_failed(rel, reason);
+    }
+
     fn mark_failed(&self, rel: &str, reason: String) {
         let mut failed = self.failed.lock();
         if failed.iter().any(|(p, _)| p == rel) {
@@ -311,6 +323,9 @@ impl Session {
             .await
             .map_err(|e| format!("改名失败: {e}"))?;
         self.state.push.resume.drop_file(&fw.key);
+        // 一个文件真的落定了 = 这条接收**有进展**：把待续传任务的 TTL 锚点往前挪
+        // （够不着对端那种"没有进展"的等待就不该刷新它，见 `PendingInbound::updated_at`）。
+        self.state.push.resume.touch_pending(&self.invite_id);
         debug!(path = %fw.rel, "文件收尾完成（原子改名）");
         Ok(())
     }
@@ -413,10 +428,12 @@ impl Session {
         let resp = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
         let status = resp.status();
         if status.as_u16() == 410 {
-            // 对端把这条推送撤了（用户点了取消 / 已经收尾）。
+            // 对端**不再提供**这条推送了：它撤销了、收尾了、或者它那台已经没有这条 job
+            // （重启过 / 自己把这条判失败了）。这三件事在线上长得一模一样（都是 `Missing`），
+            // 所以下面那句话不许写成"已取消" —— 见 `SENDER_GONE`。
             self.sender_cancel.store(true, Ordering::SeqCst);
             self.cancel.store(true, Ordering::SeqCst);
-            return Err("发送方已取消".into());
+            return Err(super::SENDER_GONE.into());
         }
         if !status.is_success() {
             return Err(format!("HTTP {status}"));
@@ -464,7 +481,7 @@ impl Session {
                             sent_mtime = mtime, want_mtime = fw.mtime,
                             "对端的源文件与清单不符"
                         );
-                        self.mark_failed(
+                        self.mark_source_changed(
                             &path,
                             format!("源文件在传输期间被修改（大小 {} → {}）", fw.size, size),
                         );
@@ -571,7 +588,7 @@ impl Session {
                     self.mark_failed(&path, message);
                 }
                 Record::SourceChanged { path } => {
-                    self.mark_failed(&path, "源文件在传输期间被修改".into());
+                    self.mark_source_changed(&path, "源文件在传输期间被修改".into());
                 }
             }
         }
@@ -634,15 +651,15 @@ impl Session {
 
 /// 开始一次新协议的接收（由 `push_job::spawn_download` 按能力位分派）。
 pub fn spawn(state: Arc<AppState>, invite: InboundInvite, peer_id: String, token: Option<String>) {
-    // `InboundInvite` 里有一个 oneshot 发送端（不是 `Clone`），所以失败收尾要用的两样东西
+    // `InboundInvite` 里有一个 oneshot 发送端（不是 `Clone`），所以失败收尾要用的东西
     // 先取出来，再把邀请整体移进任务。
     let invite_id = invite.invite_id.clone();
-    let callback = invite.callback.clone();
     crate::task::spawn("push download (stream)", async move {
         if let Err(e) = run(state.clone(), invite, peer_id.clone(), token).await {
-            // 会话级失败（建目录、路径非法、读凭据……）：走与老循环同一个收尾函数，
-            // 两边对发送方说的话必须一模一样。
-            push_job::fail_download(&state, &peer_id, &callback, &invite_id, e);
+            // 会话级失败（建目录、清单非法、请求……）：**这一轮没成，但推送还在** ——
+            // 保留邀请与待续传记录，退避重试。真落终态的两条路是"对端撤了（410）"与
+            // "源文件与清单对不上"，它们自己走 `fail_download`。
+            push_job::fail_attempt(&state, &peer_id, &invite_id, e);
         }
     });
 }
@@ -660,12 +677,13 @@ async fn run(
     }
 
     let config = state.config.lock().clone();
-    // 落盘根 = `<落盘目录>/<对端名字>`。落盘目录默认是设置里的下载目录；只有在「每次询问」
+    // 落盘根 = `<落盘目录>/<对端名字>`（S-12 关掉这层时就是落盘根本身，见 `resume::landing_dir`）。
+    // 落盘目录默认是设置里的下载目录；只有在「每次询问」
     // 下由用户亲自挑过的邀请才带自己的根（`invite.root`，见 `accept_invite`）。
     // 名字先净化（对端自报的串不能直接当目录名用，
     // 否则 `C:\Windows\Temp` / `..\..\Users\Public` 会把基址那一层整个顶掉）。
     let base = invite.root.as_deref().unwrap_or(config.download_dir.as_path());
-    let dir = super::resume::landing_root(base, &invite.sender.name);
+    let dir = super::resume::landing_dir(base, &invite.sender.name, config.device_subdir);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| format!("建目录失败: {e}"))?;
@@ -700,7 +718,15 @@ async fn run(
                     .map_err(|e| format!("建目录失败: {e}"))?;
             }
         }
-        let key = stream::resume_key(&peer_id, &entry.path, entry.size, entry.mtime);
+        // 身份 = 对端 id + **落盘目录** + 相对路径 + 大小 + 时间戳（见 `stream::resume_key`）：
+        // 同一个文件收在两个目录下是两份记录，互不踩。
+        let key = stream::resume_key(
+            &peer_id,
+            target.parent().unwrap_or(&dir),
+            &entry.path,
+            entry.size,
+            entry.mtime,
+        );
         let part = target
             .parent()
             .unwrap_or(&dir)
@@ -838,6 +864,7 @@ async fn run(
         cancel: Arc::new(AtomicBool::new(false)),
         local_cancel: AtomicBool::new(false),
         sender_cancel: AtomicBool::new(false),
+        source_changed: AtomicBool::new(false),
         finished: AtomicBool::new(false),
         failed: Mutex::new(Vec::new()),
         bufs: Mutex::new(Vec::new()),
@@ -897,7 +924,7 @@ async fn run(
             &peer_id,
             &callback,
             &invite.invite_id,
-            "发送方已取消".into(),
+            super::SENDER_GONE.into(),
         );
         return Ok(());
     }
@@ -931,6 +958,7 @@ async fn run(
 
     let failed = session.failed.lock().clone();
     if failed.is_empty() {
+        state.push.resume.drop_pending(&invite.invite_id);
         state
             .push
             .record_outcome(&invite.invite_id, &peer_id, "done", total, None);
@@ -957,7 +985,14 @@ async fn run(
         info!(invite = %session.invite_id, files = session.files.len(), "并发接收完成");
     } else {
         let reason = session.summarize_failure();
-        push_job::fail_download(&state, &peer_id, &callback, &invite.invite_id, reason);
+        if session.source_changed.load(Ordering::Relaxed) {
+            // 对端的源文件与清单对不上：再试还是同一份清单，落终态。
+            push_job::fail_download(&state, &peer_id, &callback, &invite.invite_id, reason);
+        } else {
+            // 其余（网络断了、写不进去、有几块重试到底仍失败）→ **这次不成、推送还在**：
+            // 保留邀请与待续传任务，退避重试（见 `transfer::resume_pending`）。
+            push_job::fail_attempt(&state, &peer_id, &invite.invite_id, reason);
+        }
     }
     Ok(())
 }
@@ -1153,6 +1188,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             local_cancel: AtomicBool::new(false),
             sender_cancel: AtomicBool::new(false),
+            source_changed: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             failed: Mutex::new(Vec::new()),
             bufs: Mutex::new(Vec::new()),

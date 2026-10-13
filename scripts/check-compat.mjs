@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 /**
- * 兼容性门禁：保证移动端产物在 **Chrome 90+** 的 WebView 上不会"静默失色"。
+ * 兼容性门禁：保证移动端产物在 **Chrome 81+** 的 WebView 上不会"静默失色"，也不会因语法过新而白屏。
  *
- * 为什么必须有它：`oklch()` / `color-mix()`（Chrome 111 起）与 `:has()`（105 起）在不支持的引擎上
- * **不报错** —— 只是那条声明失效（背景透明、文字变默认黑、强调色全没）。开发机（新引擎）看不出来。
+ * 为什么必须有它：这几类失效都**不报错**，开发机（新引擎）看不出来 ——
+ *   · `oklch()` / `color-mix()`（Chrome 111 起）与 `:has()`（105 起）：那条声明只是失效（背景透明、
+ *     文字变默认黑、强调色全没）；
+ *   · flex `gap`（84 起）：子元素只是全贴在一起；
+ *   · `??=` / `||=` / `&&=`（85 起）：**整块脚本解析期作废** → 纯白屏（实测 SM-G8750 / WebView 81，
+ *     见 `docs/p1-implementation.md` §35）。
  *
- * 判据（对应 `scripts/gen-color-tokens.mjs` 的三套机制，都是实测出来的失效时机）：
+ * 判据（对应 `scripts/gen-color-tokens.mjs` 与 `scripts/gen-legacy-gap.mjs` 两套生成机制，都是实测出来的
+ * 失效时机）：
  *   1. **基础表里不允许出现 `color-mix()` 声明**：老引擎能解析它、失败在计算期 → 结果是 unset，
  *      成对声明救不了（实测 `.toast`/`.scrim` 因此仍透明）。它只能待在 `@supports` 生成区里。
  *   2. 基础表里的**纯 `oklch()` 声明**必须有紧邻其前的"老引擎读得懂"的同属性声明
@@ -13,15 +18,23 @@
  *   3. **生成区里的每条 `color-mix()` 声明，基础表里都要有同属性、老引擎读得懂的值**，
  *      否则老引擎那条属性会整个丢掉。
  *   4. 含 `:has()` 的选择器必须并联 `.is-checked`（组件按已有状态挂类）。
- *   5. 产物层：`dist-mobile/assets/*.css` 同 1–4；`*.js` 不得用超出下限的内建方法。
+ *   5. 产物层：`dist-mobile/assets/*.css` 同 1–4；`*.js` 不得用超出下限的内建方法，且**必须能被
+ *      ES2020 语法解析器读下来**（`vite.config.js` 的 `target: "chrome81"` 若被调高，这里当场红）。
+ *   6. `static/legacy-gap.css` 必须与 `src/mobile/mobile.css` 同步（跑 `npm run legacy:gen`）。
+ *
+ * 下限之外的门槛靠 `static/engine-floor.js` 兜（`replaceAll` 打补丁、缺 flex gap/`inset` 才按需加载
+ * 补丁表、连 ES2020 语法都没有才出兜底页）—— 所以下面的黑名单只列**没被兜住**的内建方法。
  *
  * 用法：`npm run check:compat`（退出码非零 = 有回归）
  */
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import * as acorn from "acorn";
 
-const FLOOR = "Chrome 90";
+import { collect as collectLegacyGap, render as renderLegacyGap } from "./gen-legacy-gap.mjs";
+
+const FLOOR = "Chrome 81";
 const MODERN = /color-mix\(|oklch\(|oklab\(|lab\(|lch\(|\bcolor\(/;
 const isLegacySafe = (v) => !MODERN.test(v);
 const BEGIN = "生成区：高保真颜色";
@@ -135,6 +148,7 @@ if (fs.existsSync(distDir)) {
     const text = fs.readFileSync(full, "utf8");
     if (file.endsWith(".css")) checkSheet(`dist-mobile/assets/${file}`, text);
     if (file.endsWith(".js")) {
+      // 没被 `static/engine-floor.js` 兜住的内建方法（`replaceAll` 不在此列：那一层给它打了补丁）。
       const denied = [
         ["structuredClone", 98],
         ["Object.hasOwn", 93],
@@ -142,14 +156,40 @@ if (fs.existsSync(distDir)) {
         ["crypto.randomUUID", 92],
         ["findLast", 97],
         ["Promise.withResolvers", 119],
+        ["Promise.any", 85],
+        ["AggregateError", 85],
+        ["WeakRef", 84],
+        ["FinalizationRegistry", 84],
       ];
       for (const [needle, since] of denied) {
         if (text.includes(needle)) problems.push(`dist-mobile/assets/${file} 用到 \`${needle}\`（Chrome ${since} 起），超出下限 ${FLOOR}`);
+      }
+      // 语法闸：`target: "chrome81"` 若被调高（或某天有人往产物里塞了新语法），这里当场红 ——
+      // 这一条正是能最早发现"整块脚本解析期作废 → 白屏"的闸门。
+      try {
+        acorn.parse(text, { ecmaVersion: 2020, sourceType: "module" });
+      } catch (e) {
+        problems.push(
+          `dist-mobile/assets/${file} 用了 ${FLOOR} 读不了的语法：${e.message}（vite.config.js 的 target 是不是被调高了？）`,
+        );
       }
     }
   }
 } else {
   notes.push("dist-mobile 不存在，跳过产物层检查（只查了源码）");
+}
+
+// 6：间距兜底表必须与 mobile.css 同步（生成器与门禁共用同一份实现，不靠人记得跑）
+{
+  const collected = collectLegacyGap(fs.readFileSync(CSS_PATH, "utf8"));
+  const want = renderLegacyGap(collected);
+  const legacyPath = path.resolve("static/legacy-gap.css");
+  const have = fs.existsSync(legacyPath) ? fs.readFileSync(legacyPath, "utf8") : "";
+  if (have !== want) {
+    problems.push("static/legacy-gap.css 与 src/mobile/mobile.css 不同步：跑 `npm run legacy:gen` 并提交结果");
+  } else {
+    notes.push(`间距兜底表已同步（${collected.rules.length} 条 flex 容器，${collected.notes.length} 条待人工核对）`);
+  }
 }
 
 for (const n of notes) console.log(`· ${n}`);

@@ -129,7 +129,7 @@ async fn shares_reports_is_dir_from_real_metadata() {
     let (file_id, dir_id) = (file_share.id.clone(), dir_share.id.clone());
     state.config.lock().shares.push(file_share);
     state.config.lock().shares.push(dir_share);
-    let port = orbdrop_lib::server::start_server(state.clone(), 3993).await.expect("起服务");
+    let port = orbdrop_lib::server::start_server_loopback(state.clone(), 3993).await.expect("起服务");
     credential::set_peer(&peer, "t").unwrap();
 
     let body: serde_json::Value = reqwest::Client::new()
@@ -169,7 +169,7 @@ async fn probe_entry_reports_what_the_peer_actually_has() {
     std::fs::write(root.join("一个文件"), b"file-content").unwrap();
 
     let (state, share_id, peer, cfg) = state_with_share(3994, &root, 3994).await;
-    let port = orbdrop_lib::server::start_server(state.clone(), 3994).await.expect("起服务");
+    let port = orbdrop_lib::server::start_server_loopback(state.clone(), 3994).await.expect("起服务");
     credential::set_peer(&peer, "t").unwrap();
 
     let client = peer_fs::client();
@@ -243,7 +243,7 @@ async fn peer_file_streams_to_disk_in_chunks_and_leaves_no_litter() {
     std::fs::write(root.join("big.bin"), &payload).unwrap();
 
     let (state, share_id, peer, _cfg) = state_with_share(3997, &root, 3997).await;
-    let port = orbdrop_lib::server::start_server(state.clone(), 3997)
+    let port = orbdrop_lib::server::start_server_loopback(state.clone(), 3997)
         .await
         .expect("起服务");
     credential::set_peer(&peer, "t").unwrap();

@@ -1,6 +1,6 @@
 <script lang="ts">
   import * as chat from '$lib/stores/chat.svelte';
-  import { getDevices, deviceState, deviceDisplayName, peerDisplayName } from '$lib/stores/devices.svelte';
+  import { getDevices, deviceState, deviceShortName, peerShortName } from '$lib/stores/devices.svelte';
   import Hint from '$lib/components/Hint.svelte';
   import type { ConvoMode, PeerDevice } from '$lib/types';
 
@@ -16,6 +16,10 @@
    *
    * **两张模式卡各自只写名字**：规则（单向 / 共享）收进名字旁边那颗「?」
    * —— 展开在卡片里的话，两张卡就把整个框撑满了（见 `Hint`）。
+   *
+   * **框高封顶在面板里**（`main.css` 的 `.recip-overlay` / `.recip-dialog`）：内容再多也只让
+   * 设备列表自己滚，整只框不会把 overlay 顶出一根滚动条、也不会把底下那颗按钮推到看得见的地方
+   * 之外（多台时这个框本来就贴着面板高）。
    */
   const req = chat.getRecipientReq();
   const devices = $derived(getDevices());
@@ -45,7 +49,7 @@
   const namePreview = $derived(
     isBc
       ? `群发 · ${name.trim() || '未命名群发'}`
-      : `群聊 · ${name.trim() || selected.map((id) => peerDisplayName(id)).join('、') || '设备名称'}`,
+      : `群聊 · ${name.trim() || selected.map((id) => peerShortName(id)).join('、') || '设备名称'}`,
   );
 
   function toggle(id: string, on: boolean) {
@@ -70,7 +74,7 @@
 
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div
-  class="overlay open"
+  class="overlay open recip-overlay"
   role="dialog"
   aria-modal="true"
   aria-label={title}
@@ -79,7 +83,7 @@
     if (e.target === e.currentTarget) chat.closeRecipients();
   }}
 >
-  <div class="dialog">
+  <div class="dialog recip-dialog">
     <h3>{title}</h3>
     <p class="d-desc">勾选一台设备时为单独会话；勾选两台以上才启用模式。</p>
 
@@ -156,9 +160,9 @@
         {@const st = deviceState(d)}
         <label class="recip-row">
           <input type="checkbox" checked={selected.includes(d.id)} onchange={(e) => toggle(d.id, e.currentTarget.checked)} />
-          <span class="d-avatar">{(deviceDisplayName(d).trim().charAt(0) || '?').toUpperCase()}</span>
+          <span class="d-avatar">{(deviceShortName(d).trim().charAt(0) || '?').toUpperCase()}</span>
           <span class="rr-main">
-            <span class="rr-name">{deviceDisplayName(d)}</span>
+            <span class="rr-name" title={deviceShortName(d)}>{deviceShortName(d)}</span>
             <span class="rr-ip num">{d.ip}:{d.port}</span>
           </span>
           <span class="state-chip {st.chip}"><span class="dot {st.dot}"></span>{st.label}</span>

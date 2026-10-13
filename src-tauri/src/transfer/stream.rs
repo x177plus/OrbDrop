@@ -38,6 +38,7 @@
 //! （`GET /push/download`），老端点一字未改。
 
 use std::io;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -134,9 +135,18 @@ pub fn missing_blocks(size: u64, block_size: u32, bits: &str) -> Vec<u32> {
 ///
 /// 含 `mtime`：源文件改过（时间戳变了）就不该复用旧记录，否则会拿着旧字节"续"出一个
 /// 新旧拼接的文件。
-pub fn resume_key(peer_id: &str, path: &str, size: u64, mtime: i64) -> String {
+///
+/// **含落盘目录**（`dir` = 这个文件真正要写进去的那一层目录）：身份是"**对端的哪个文件 ×
+/// 我把它收到哪个目录下**"。少了后半截，同一个文件先后落到两个目录时（用户改了下载目录、
+/// "每次询问"下换了保存位置）会共用一个键 —— 按着旧目录的位图去新目录找 `.part`（找不到 →
+/// 从零），顺手还把旧记录**覆盖**成空位图（那批已经在盘上的字节谁也认不出来了）、把旧目录
+/// 里的 `.part` 变成**没人认领**的垃圾（`sweep_stale` 只清"还有记录指着"的那些）。
+/// 并进来之后：两个目录就是两份互不干扰的记录，旧的照旧能接着用、过期了也能被清掉。
+pub fn resume_key(peer_id: &str, dir: &Path, path: &str, size: u64, mtime: i64) -> String {
     let mut h = Sha256::new();
     h.update(peer_id.as_bytes());
+    h.update([0]);
+    h.update(identity_dir(dir).as_bytes());
     h.update([0]);
     h.update(path.as_bytes());
     h.update([0]);
@@ -149,6 +159,22 @@ pub fn resume_key(peer_id: &str, path: &str, size: u64, mtime: i64) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+/// 落盘目录进身份时的写法：分隔符统一成 `/`、去掉尾部多余的 `/`；Windows 上再按小写。
+///
+/// 为什么不能原样拼：同一个目录会有好几种说法（用户在挑目录的框里重挑一次拿到的串、
+/// 手改过配置文件的串、Windows 上大小写不同的串）。说法一变键就变 —— 那些**已经落盘的字节**
+/// 就白传了。这是"把目录并进身份"这一改的代价，得在这儿兜住。
+fn identity_dir(dir: &Path) -> String {
+    let mut s = dir.to_string_lossy().replace('\\', "/");
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    if cfg!(windows) {
+        s = s.to_lowercase();
+    }
+    s
 }
 
 /// 由 `resume_key` 派生的临时文件名：同一个目标文件在同一目录下只有一个 `.part`。
@@ -463,11 +489,33 @@ mod tests {
 
     #[test]
     fn resume_key_is_stable_and_identity_sensitive() {
-        let a = resume_key("peer", "D/x.txt", 10, 5);
-        assert_eq!(a, resume_key("peer", "D/x.txt", 10, 5), "同一身份 → 同一个键");
-        assert_ne!(a, resume_key("peer", "D/x.txt", 11, 5), "大小变了 → 换键");
-        assert_ne!(a, resume_key("peer", "D/x.txt", 10, 6), "时间戳变了 → 换键");
-        assert_ne!(a, resume_key("other", "D/x.txt", 10, 5), "换了一台对端 → 换键");
+        let dir = Path::new("C:/Users/u/Downloads/PC-A");
+        let a = resume_key("peer", dir, "D/x.txt", 10, 5);
+        assert_eq!(a, resume_key("peer", dir, "D/x.txt", 10, 5), "同一身份 → 同一个键");
+        assert_ne!(a, resume_key("peer", dir, "D/x.txt", 11, 5), "大小变了 → 换键");
+        assert_ne!(a, resume_key("peer", dir, "D/x.txt", 10, 6), "时间戳变了 → 换键");
+        assert_ne!(a, resume_key("other", dir, "D/x.txt", 10, 5), "换了一台对端 → 换键");
+        // 落盘目录也是身份的一半：同一个文件收在两个目录下，两份记录各算各的
+        // （共用的话，按着 A 的位图去 B 找 `.part` 只会从零，还顺手砸掉 A 的记录）。
+        assert_ne!(
+            a,
+            resume_key("peer", Path::new("D:/另一块盘/PC-A"), "D/x.txt", 10, 5),
+            "落盘目录变了 → 换键"
+        );
+        // 同一个目录的几种说法必须认成同一个 —— 说法一变就白传（见 `identity_dir`）。
+        assert_eq!(a, resume_key("peer", Path::new("C:/Users/u/Downloads/PC-A/"), "D/x.txt", 10, 5));
+        assert_eq!(
+            a,
+            resume_key("peer", Path::new("C:\\Users\\u\\Downloads\\PC-A"), "D/x.txt", 10, 5),
+            "反斜杠/正斜杠是同一个目录"
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                a,
+                resume_key("peer", Path::new("c:/users/u/downloads/pc-a"), "D/x.txt", 10, 5),
+                "Windows 上大小写不同是同一个目录"
+            );
+        }
         assert_eq!(a.len(), 32, "16 字节的 hex");
         assert!(part_name(&a).ends_with(".orbdrop-part"));
     }

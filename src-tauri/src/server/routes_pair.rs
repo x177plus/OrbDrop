@@ -353,7 +353,7 @@ pub async fn pair_invite_withdraw_handler(
 #[cfg(test)]
 mod tests {
     use super::must_prove_identity;
-    use crate::config::{Config, PeerDevice};
+    use crate::config::PeerDevice;
     use crate::state::AppState;
     use axum::http::StatusCode;
     use std::sync::Arc;
@@ -383,8 +383,8 @@ mod tests {
     async fn a_repairing_peer_invite_reaches_the_user_instead_of_401() {
         let dir = std::env::temp_dir().join(format!("orbdrop_pair_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let state = Arc::new(AppState::new(Config::default(), dir.join("config.toml")));
-        let port = crate::server::start_server(state.clone(), 4318)
+        let state = Arc::new(AppState::new(crate::config::test_config(), dir.join("config.toml")));
+        let port = crate::server::start_server_loopback(state.clone(), 4318)
             .await
             .expect("server start");
 
@@ -442,8 +442,8 @@ mod tests {
     async fn pairing_code_attempts_are_throttled_per_source() {
         let dir = std::env::temp_dir().join(format!("orbdrop_pair_thr_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let state = Arc::new(AppState::new(Config::default(), dir.join("config.toml")));
-        let port = crate::server::start_server(state.clone(), 4319)
+        let state = Arc::new(AppState::new(crate::config::test_config(), dir.join("config.toml")));
+        let port = crate::server::start_server_loopback(state.clone(), 4319)
             .await
             .expect("server start");
         let url = format!("http://127.0.0.1:{port}/pair");

@@ -69,11 +69,30 @@ pub enum WsEvent {
         /// `GET /push/download` 的逐文件串行循环，两边都能跑，滚动升级不需要同步。
         #[serde(default)]
         caps: Vec<String>,
+        /// 发送方给这批文件点的时间线位置（发送方的墙上时间，epoch 毫秒；0 = 没点名）。
+        ///
+        /// 接收侧那条文件消息的 `at` 就是它：会话时间线按 `at` 排，而"输入框里一张图夹在
+        /// 前后两段文字中间"这种一次发三条的活儿，只有发送方的编号能让对端排出同一个顺序
+        /// （见 `chat::send_text` / `transfer::push_paths` 的 `at`）。老对端不带 → 0 →
+        /// 接收侧退回"收到的那一刻"。
+        #[serde(default)]
+        at: u64,
     },
     /// Receiver → Sender: accept / reject an invitation.
+    ///
+    /// 带 `await1`（见 `push_job::CAP_AWAIT`）的对端**只靠这一条**知道决定：邀请投递时那条
+    /// 同步响应早就以「已送达、等着呢」结束了。不带这个位的对端走老路（同步响应就是回执），
+    /// 这里多半只在长连接上出现。
     PushResponse {
         invite_id: String,
         accepted: bool,
+        /// 拒绝/收不下的原因，原话回给发送方（它那边卡片上就写这句）。
+        ///
+        /// **不能一律写「对方拒绝了这次推送」**：已配对设备免同意自动收，收不下时是
+        /// 本机自己的问题（地址未知之类），说成"对面点了拒绝"是在编一个没发生的事。
+        /// `default` 是为了容忍老对端（不带这个字段）。
+        #[serde(default)]
+        reason: Option<String>,
     },
     /// Receiver → Sender: download progress.
     PushProgress {
@@ -91,7 +110,8 @@ pub enum WsEvent {
     ///
     /// 回执（进度/完成/拒绝）是"一次、尽力而为"的：长连接在"检查有没有会话"和"真的发出去"
     /// 之间断掉、或那一跳 HTTP 补发失败，回执就没了 —— 发送方那一台会一直停在「等待」，
-    /// 5 分钟后被判成「对方未响应」，而对面其实早就收完了。链路回来（或探活发现链路在）时，
+    /// 而对面其实早就拒了、或者早就收完了（等待本身没有时钟，见 `push_job::CAP_AWAIT`）。
+    /// 链路回来（或探活发现链路在）时，
     /// 发送方把自己**还没落终态**的邀请号问一遍，由接收方按它的记录回答（`PushState`）。
     /// 一次一批，只走长连接（对账的前提就是"链路在"）。
     PushAsk {
@@ -103,7 +123,7 @@ pub enum WsEvent {
     /// Receiver → Sender: 对账的答案（`PushAsk` 的回执）。
     ///
     /// **只答"本机确实收到过、或此刻还拿着"的邀请**：没有记录的答 `unknown` ——
-    /// 那说明这条邀请根本没送到，发送方据此当场收手，不必再等满 5 分钟。
+    /// 那说明这条邀请根本没送到，发送方据此当场收手，不必一直等着。
     PushState {
         ask_id: String,
         states: Vec<crate::transfer::push_job::PushInviteStateWire>,
@@ -132,6 +152,24 @@ pub enum WsEvent {
         text: String,
         /// 发送方的墙上时间（epoch 毫秒）：接收方原样存，回执按它比水位。
         at: u64,
+    },
+    /// 会话：Sender → Receiver 的一条**图片消息**。
+    ///
+    /// 图片是**消息内容**，不是文件：收方直接就能看，没有"接收 / 同意"那一步，也不进
+    /// "传输中"那本账（与 `transfer` 那条推送路是两件事）。所以字节**跟着消息一起走**：
+    /// `data` 是 base64（上限见 `blobs::MAX_IMAGE_BYTES`，超了发送方当场拒绝）。
+    ///
+    /// - `id` = 消息 id，同时是内容文件的名字（`<数据目录>/chat-blobs/<id>.<扩展名>`）——
+    ///   两端**同一个 id**，重投幂等（同一条再来一次不重写内容）；
+    /// - `name` 只用来取扩展名与显示（"图片-20261013-153012.png"）；
+    /// - `size` 是发送方报的字节数（收方以自己解出来的长度为准）。
+    ChatImage {
+        id: String,
+        at: u64,
+        name: String,
+        size: u64,
+        /// 图片字节（base64；`data [<mediatype>][;base64],<data>` 里那后半段）。
+        data: String,
     },
     /// 会话：Receiver → Sender 的已读回执。`up_to` 是接收方**见到过的、你发来的最大 `at`**。
     ///
@@ -171,6 +209,20 @@ pub enum WsEvent {
         /// 注意它是**声明**、没有签名：谎报只会让别人少转发，不会伪造出消息本身。
         #[serde(default)]
         reached: Vec<String>,
+        /// 图片消息那几格（与一对一那条 `ChatImage` 同一套语义，见 `crate::blobs`）：
+        /// `image`/`name`/`size` 是元数据、`data` 是**内容本身**（base64）。
+        ///
+        /// **加在 `GroupText` 上而不是另起一条事件**：群消息的转发（F-100 中转）与补拉那两条路
+        /// 都是"把这一条原样再送一遍"，多一条事件就要在那两处各接一次；老对端读到不认识的字段
+        /// 会忽略（于是它在群里看到一条**空文字**的消息 —— 一幅图它看不到，但不影响别的）。
+        #[serde(default)]
+        image: bool,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        size: u64,
+        #[serde(default)]
+        data: String,
     },
     /// 群聊：Receiver → Sender 的已读回执。`up_to` = 读到的、**你在这个群里发的**最大 `at`。
     ///
@@ -224,6 +276,22 @@ pub enum WsEvent {
         /// 我手上你发的消息里最大的一条 `at`。
         up_to: u64,
     },
+    /// 群聊：Receiver → Sender 的**拒收**："这一条我收不下"。
+    ///
+    /// 为什么要有它：群消息是逐成员直投的，而**长连接那条路"写成功 = 已送达"** —— 收方
+    /// 丢弃时不回头说一句，发送方就会一直显示「已送达」（比"没提示"更糟：它看起来送到了，
+    /// 其实一个字没进去）。HTTP 兜底那一跳另有 409 兜底（状态码），但**理由**只有这一条带得回来。
+    ///
+    /// `reason` 是稳定代码（见 `crate::group::REASON_*`）：`declined` = 那台设备明确拒绝过
+    /// 这个群（用户点过「不加入」）—— 发送方要把这位成员标出来；`unknown` = 它压根不认识
+    /// 这个群（名册没到）；`not_member` = 这帧的发送方不在名册里（P1-7）。
+    GroupTextRejected {
+        group_id: String,
+        /// 被拒的那条消息 id（发送方据此把那一份落「未送达」）。
+        id: String,
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 impl WsEvent {
@@ -241,6 +309,7 @@ impl WsEvent {
             WsEvent::SharesChanged => "shares_changed",
             WsEvent::Unpair { .. } => "unpair",
             WsEvent::ChatText { .. } => "chat_text",
+            WsEvent::ChatImage { .. } => "chat_image",
             WsEvent::ChatRead { .. } => "chat_read",
             WsEvent::GroupText { .. } => "group_text",
             WsEvent::GroupRead { .. } => "group_read",
@@ -248,6 +317,7 @@ impl WsEvent {
             WsEvent::GroupSyncAsk { .. } => "group_sync_ask",
             WsEvent::GroupSyncPost { .. } => "group_sync_post",
             WsEvent::GroupAck { .. } => "group_ack",
+            WsEvent::GroupTextRejected { .. } => "group_text_rejected",
         }
     }
 }
@@ -264,6 +334,15 @@ pub mod ui {
     pub const PAIR_INVITE_CLOSED: &str = "pair://invite_closed";
     /// 本机发起的配对邀请没成（对端拒绝 / 不在网上 / 撤回）：只有发起方收这条。
     pub const PAIR_INVITE_FAILED: &str = "pair://invite_failed";
+    /// 收到一条**长连接请求**（F-16 的同意制）：界面挂一条带「接受/拒绝」的通知。
+    pub const LINK_REQUEST: &str = "link://request";
+    /// 本机刚把一条长连接请求发出去（同一套：界面挂一条"等待对方同意"的卡片）。
+    pub const LINK_REQUEST_SENT: &str = "link://request_sent";
+    /// 一条挂在界面上的长连接请求作废了（超时 / 对端撤回）：两边凭它收手。
+    pub const LINK_REQUEST_CLOSED: &str = "link://request_closed";
+    /// 本机发出的长连接请求有结果了：`outcome` = `granted`（对方同意，本机在拨号）/
+    /// `denied`（对方拒绝或没处理）/ `fallback`（请求送不到，退回直接拨号）。
+    pub const LINK_REQUEST_RESULT: &str = "link://request_result";
     /// 一批推送（= 界面上一张卡片）的快照：创建、进度、成功/失败/取消都走它。
     /// 它是**发送侧卡片唯一的数据来源** —— 单台推送也是一批（只有一条目标），
     /// 所以"等待对方同意 → 传输中 → 已发送"和"3 台里成了几台"共用同一条事件。
@@ -284,6 +363,13 @@ pub mod ui {
     pub const SERVER_ERROR: &str = "server://error";
     /// 第二份进程被启动 → 本实例被调到前台，悬浮球面板展开。
     pub const ORB_SHOW: &str = "orb://show";
+    /// 托盘左键**单击**、且此刻有事等处理 → 界面落到"该看的那一件事"上（未读会话 / 群邀请 /
+    /// 通知气泡）。载荷为空：**哪一件事由界面自己判**（未读、邀请、通知都活在它的 store 里，
+    /// 后端再存一份就是两处真相，见 `src-tauri/src/tray.rs` 的文件头）。
+    ///
+    /// 与 `ORB_SHOW` 分开：那条是"打开主界面"（双击 / 第二份进程），这条是"打开该看的那件事"，
+    /// 两者在界面上落到的视图不同，合成一条就得在界面里再猜一次"这次是哪种"。
+    pub const TRAY_ALERT: &str = "orb://tray_alert";
     /// 本机「在线 / 离线」变了（面板右上角状态框）：界面更新那个框。载荷 `{ online: bool }`。
     pub const LOCAL_ONLINE: &str = "local://online";
     /// 本机网卡地址变了（插网线、开/关热点、切 Wi-Fi、VPN 起来）：界面重新拉一次

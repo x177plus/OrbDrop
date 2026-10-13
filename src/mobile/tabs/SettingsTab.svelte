@@ -18,6 +18,12 @@
   // 不在 `store.form()` 里的两项：表单只装"用户正在改的那几个"（见 store 里 resetForm 的注释），
   // 下载模式与"添加后自动共享"是本页自己的编辑态，保存时一起写回。
   let downloadMode = $state<AppSettings["downloadMode"]>("Direct");
+  /**
+   * 推送接收是否再放一层 `<发送方名>/`（后端 `AppSettings.deviceSubdir`，默认开，S-12）。
+   * 与桌面端同一个后端位、同一套落盘形状：开着时「文件」页那两层铺平就是"根下的散文件 +
+   * 每台发送方一个目录"（见 `mobile::list_inbox`）；关掉时对端推来的东西直接落在根里。
+   */
+  let deviceSubdir = $state(true);
   let autoBroadcast = $state(false);
   /**
    * 「传输」两项（后端 `AppSettings.transferWorkers` / `transferBlockMb`）：与下载模式同一路数 ——
@@ -104,6 +110,7 @@
       const s = await api.getSettings();
       saved = s;
       downloadMode = s.downloadMode;
+      deviceSubdir = s.deviceSubdir;
       autoBroadcast = s.autoBroadcastNew;
       transferWorkers = String(s.transferWorkers);
       transferBlockMb = String(s.transferBlockMb);
@@ -192,6 +199,7 @@
         deviceName: f.deviceName.trim() || saved.deviceName,
         port: digits ? Number(digits) : saved.port,
         downloadMode,
+        deviceSubdir,
         autoBroadcastNew: autoBroadcast,
         online,
         // 一颗开关管两条路（与桌面端同一个口径）：替其它设备盲转字节 + 替群聊转消息。
@@ -203,6 +211,7 @@
       // 后端会规范化（端口被占时顺延、名字裁剪），保存后再读一次让表单跟着真值走。
       saved = next;
       downloadMode = next.downloadMode;
+      deviceSubdir = next.deviceSubdir;
       autoBroadcast = next.autoBroadcastNew;
       relay = next.allowRelay || next.groupRelay;
       transferWorkers = String(next.transferWorkers);
@@ -275,6 +284,20 @@
         <div class="srow">
           <span class="slabel">下载目录</span>
           <input class="input" value={saved.downloadDir} readonly aria-label="下载目录" />
+        </div>
+        <div class="srow">
+          <div class="srow-top">
+            <span class="slabel">推送按发送方分目录</span>
+            <label class="switch">
+              <input type="checkbox" bind:checked={deviceSubdir} aria-label="推送按发送方分目录" />
+              <span class="track"></span>
+            </label>
+          </div>
+          <p class="shelp">
+            打开（默认）时，接收到的推送放在以<strong>发送方名字</strong>命名的子目录里
+            （「文件」页按"发送方"分组就是它）；关掉则和手动下载的文件落在同一层 —— 同名的会自动改名，
+            但别人推来的目录会并进你本来就有的同名目录。
+          </p>
         </div>
         <div class="srow">
           <span class="slabel">下载模式</span>

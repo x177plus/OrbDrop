@@ -1,0 +1,83 @@
+/*
+ * 老引擎的间距兜底表 —— **由 `scripts/gen-legacy-gap.mjs` 从 `src/mobile/mobile.css` 生成，勿手改**。
+ * 重新生成：`npm run legacy:gen`；是否同步：`npm run legacy:check`（也挂在 `check:compat` 里）。
+ *
+ * 谁会用：只有**缺 flex gap**（Chrome 84 以下）的引擎 —— `static/engine-floor.js` 量到 gap 不生效
+ * 就把这张表按需 `<link>` 进去。现代引擎根本不加载它（加载了会与现代的 gap 叠加成双倍间距）。
+ *
+ * 手法：`父 > * + *` 给相邻兄弟补一份 margin，值原样沿用 `mobile.css` 里那条 `gap`。
+ *   · `justify-content: space-*` 的容器**不进这张表**：它本来就靠 space 把子项推开，再补 margin 只会推歪。
+ *   · 换行容器（`flex-wrap`）走「容器负外边距 + 子项外边距」：只补 margin-left 的话，换行后的行间距会丢。
+ *   · 每条都带 `html.lgap` 前缀：`父 > * + *` 的基数是 (0,1,0)，压不过应用里 `.empty p { margin: 0 }`
+ *     这类 (0,1,1) 的后代规则（真机上就是这么丢掉空态那 23px 间距的）。这个类由
+ *     `engine-floor.js` 在注入本表时挂到 `<html>` 上 —— 没挂上时本表一条都不生效，等于双保险。
+ */
+
+html.lgap .appbar > * + * { margin-left: calc(12 * var(--u)); }
+html.lgap .ab-acts > * + * { margin-left: calc(4 * var(--u)); }
+html.lgap .tab-item > * + * { margin-top: calc(3 * var(--u)); }
+html.lgap .btn > * + * { margin-left: calc(7 * var(--u)); }
+html.lgap .empty > * + * { margin-top: calc(8 * var(--u)); }
+html.lgap .chip > * + * { margin-left: calc(6 * var(--u)); }
+html.lgap .convo > * + * { margin-left: calc(12 * var(--u)); }
+html.lgap .cv-top > * + * { margin-left: calc(6 * var(--u)); }
+html.lgap .cv-mode > * + * { margin-left: calc(3 * var(--u)); }
+html.lgap .chatbar > * + * { margin-left: calc(8 * var(--u)); }
+html.lgap .cb-sub > * + * { margin-left: calc(6 * var(--u)); }
+html.lgap .chat-banner > * + * { margin-left: calc(8 * var(--u)); }
+html.lgap .chatlog > * + * { margin-top: calc(10 * var(--u)); }
+html.lgap .who > * + * { margin-left: calc(5 * var(--u)); }
+html.lgap .fbub > * + * { margin-left: calc(10 * var(--u)); }
+html.lgap .inv-head > * + * { margin-left: calc(10 * var(--u)); }
+html.lgap .inv-acts > * + * { margin-left: calc(8 * var(--u)); }
+html.lgap .rc-list { margin: calc(-1 * (calc(6 * var(--u)))) 0 0 calc(-1 * (calc(6 * var(--u)))); }
+html.lgap .rc-list > * { margin: calc(6 * var(--u)) 0 0 calc(6 * var(--u)); }
+html.lgap .rc-dev > * + * { margin-left: calc(5 * var(--u)); }
+html.lgap .compose > * + * { margin-left: calc(8 * var(--u)); }
+html.lgap .seg > * + * { margin-left: calc(4 * var(--u)); }
+html.lgap .seg-item > * + * { margin-left: calc(6 * var(--u)); }
+html.lgap .pend-top > * + * { margin-left: calc(8 * var(--u)); }
+html.lgap .pend-chip > * + * { margin-left: calc(4 * var(--u)); }
+html.lgap .pend-body > * + * { margin-left: calc(11 * var(--u)); }
+html.lgap .pend-acts > * + * { margin-left: calc(8 * var(--u)); }
+html.lgap .frow > * + * { margin-left: calc(12 * var(--u)); }
+html.lgap .t-top > * + * { margin-left: calc(10 * var(--u)); }
+html.lgap .chips > * + * { margin-left: calc(8 * var(--u)); }
+html.lgap .node > * + * { margin-left: calc(11 * var(--u)); }
+html.lgap .dcard > * + * { margin-left: calc(12 * var(--u)); }
+html.lgap .dnrow > * + * { margin-left: calc(6 * var(--u)); }
+html.lgap .drow > * + * { margin-left: calc(12 * var(--u)); }
+html.lgap .state-chip > * + * { margin-left: calc(5 * var(--u)); }
+html.lgap .dacts > * + * { margin-left: calc(4 * var(--u)); }
+html.lgap .srow-top > * + * { margin-left: calc(12 * var(--u)); }
+html.lgap .radio > * + * { margin-left: calc(11 * var(--u)); }
+html.lgap .sheet-head > * + * { margin-left: calc(12 * var(--u)); }
+html.lgap .sheet-foot > * + * { margin-left: calc(10 * var(--u)); }
+html.lgap .opt > * + * { margin-left: calc(11 * var(--u)); }
+html.lgap .mode > * + * { margin-left: calc(11 * var(--u)); }
+html.lgap .pick > * + * { margin-left: calc(11 * var(--u)); }
+html.lgap .toasts > * + * { margin-top: calc(8 * var(--u)); }
+html.lgap .toast > * + * { margin-left: calc(8 * var(--u)); }
+
+/*
+ * 应用里**故意写的**外边距：兜底表基数更高（(0,2,1)），会把 `mobile.css` 里 `.fbub .fstop { margin-left: … }`
+ * 这类设计值盖掉 —— 原样再声明一遍（基数 (0,3,1)）把它保回来。`margin: 0` 那种不算（那是重置 <p>/<input>
+ * 的默认外边距，得让兜底表的间距生效）。
+ */
+html.lgap .chatlog > .empty { margin: auto; }
+html.lgap .fbub .fstop { margin-left: calc(4 * var(--u)); }
+html.lgap .mode input { margin: calc(3 * var(--u)) 0 0; }
+
+
+/*
+ * 下面这些要人工核对（生成器只能照搬，判断得人来做）：
+ *   · 第 193 行 `.sec-label`：`justify-content: space-between` 已自带分离，**跳过**（不补 margin）
+ *   · 第 227 行 `.empty` 下的 `.empty p` 自带 `margin: 0`（重置，兜底表的间距照常生效）
+ *   · 第 332 行 `.chatlog` 下的 `.chatlog > .empty` 自带 `margin: auto`（设计值，下面会原样再声明一遍保住它）
+ *   · 第 366 行 `.fbub` 下的 `.fbub .fstop` 自带 `margin-left: calc(4 * var(--u))`（设计值，下面会原样再声明一遍保住它）
+ *   · 第 419 行 `.rc-list`：换行容器，走"容器负外边距 + 子项外边距"（行/列间距都有）
+ *   · 第 516 行 `.t-meta`：`justify-content: space-between` 已自带分离，**跳过**（不补 margin）
+ *   · 第 588 行 `.radio` 下的 `.radio input` 自带 `margin: 0`（重置，兜底表的间距照常生效）
+ *   · 第 646 行 `.mode` 下的 `.mode input` 自带 `margin: calc(3 * var(--u)) 0 0`（设计值，下面会原样再声明一遍保住它）
+ *   · 第 659 行 `.pick` 下的 `.pick input` 自带 `margin: 0`（重置，兜底表的间距照常生效）
+ */

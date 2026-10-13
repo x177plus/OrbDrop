@@ -30,7 +30,7 @@ export type LinkState =
   | { kind: 'retrying' }
   /** 对端此刻不在网上：等它出现（不再空发 TCP）。 */
   | { kind: 'waiting' }
-  | { kind: 'stopped'; reason: 'peerDisconnected' | 'tokenRejected' | 'identityChanged' | 'localDisconnected' };
+  | { kind: 'stopped'; reason: 'peerDisconnected' | 'tokenRejected' | 'identityChanged' | 'localDisconnected' | 'peerRejected' };
 
 export interface PeerDevice {
   id: string;
@@ -69,8 +69,12 @@ export interface PeerDevice {
    * 本机给这台设备起的备注（F-101）：`null`/缺省 = 没备注。
    *
    * **只存在本机**（`config.toml` 的 `deviceRemarks`，键是设备 id）：不随设备名广播出去，
-   * 对端看到的始终是它自己的名字。界面上设备名一律显示成「备注(设备名)」——
-   * 拼装只有一处（`stores/devices` 的 `deviceDisplayName`），别在组件里各拼一套。
+   * 对端看到的始终是它自己的名字。
+   *
+   * 界面上有两档名字（拼装都只有一处，别在组件里各拼一套）：
+   * `deviceShortName` = **备注优先**（有备注就是备注本身），本机绝大多数地方都用它；
+   * `deviceDisplayName` = 「备注(设备名)」，**只给局域网设备列表**那一行（连同它的头像字、
+   * 右键菜单、搜索匹配与排序）—— 那里是"挑哪一台机器"的地方。名字长了各处都有 `title` 兜底。
    */
   remark?: string | null;
 }
@@ -80,6 +84,14 @@ export interface AppSettings {
   /** 默认的落盘目录：手动下载（受 downloadMode 影响）与推送接收都默认写这里；
    *  「每次询问」时接收未配对设备的推送会先挑一个目录，那次就用挑的那个作根。 */
   downloadDir: string;
+  /**
+   * 推送接收是否再放一层 `<发送方名>/`（设置里的「推送按发送方分目录」，**默认开**，S-12）。
+   *
+   * 开着：对端推来的东西落在 `<下载目录>/<发送方名>/…`（「每次询问」挑的那个目录只是根，
+   * 这一层照旧）。关掉：推送与手动下载的文件落在同一层 —— 后端 `Config::device_subdir`，
+   * 落盘根由 `transfer::resume::landing_dir` 按它算（围栏是 `safe_join` 逐段校验，与这层无关）。
+   */
+  deviceSubdir: boolean;
   /** `AskEachTime` = 下载前弹保存框；接收未配对设备的推送前也弹一次目录框（取消即拒绝）。
    *  已配对设备的推送免同意自动收，与它无关。 */
   downloadMode: 'Direct' | 'AskEachTime';
@@ -333,6 +345,14 @@ export interface PushInvite {
    * 不再问用户一次）。界面据此直接显示"正在接收"，不放「接收/拒绝」。
    */
   auto?: boolean;
+  /**
+   * 发送方给这条文件消息点的时间线位置（发送方的墙上时钟，epoch 毫秒；老对端不带 = 0）。
+   *
+   * 会话时间线按 `at` 排 —— 一次发出去的一整条里图片夹在前后两段文字中间时，只有发送方
+   * 给的号能让对端排出同一个顺序（见 `stores/chat.svelte.ts::sendComposer`）。
+   * 0 = 退回"收到的那一刻"。
+   */
+  at?: number;
 }
 
 /** 一台目标设备在一批推送里的状态（后端 `TargetState`）。 */
@@ -400,6 +420,7 @@ export interface ChatMessage {
   fromMe: boolean;
   /** 对端消息的发送方名字；本机发出的为空串。 */
   fromName: string;
+  /** 文字消息的内容。**图片消息这里是空串**（内容在 `path` 那个文件里）。 */
   text: string;
   /** 发送方的墙上时间（epoch 毫秒）：排序与已读水位都按它。 */
   at: number;
@@ -407,6 +428,20 @@ export interface ChatMessage {
   targets: string[];
   /** 这条是走哪个群发发出去的（`null`/缺省 = 一对一发的）。 */
   batchId?: string | null;
+  /**
+   * 这条是不是**图片消息**：图片是**消息内容**，不是推送文件 —— 对端直接就能看，
+   * 没有"接收 / 同意"那一步，也不进"传输中"那本账（见 `src-tauri/src/blobs.rs`）。
+   */
+  image?: boolean;
+  /** 图片的显示名（"图片-20261013-153012.png"）：读不出来时那条气泡写它。 */
+  name?: string;
+  /** 图片的字节数（界面上写"多大"）。 */
+  size?: number;
+  /**
+   * 本机上这份图片内容的绝对路径（**后端在快照里现算**，不进 `chat.json`：那是"这台机器上
+   * 它在哪"，换台机器就错了）。内容不在盘上时是空串 —— 那条气泡退回"图片读不出来"那一档。
+   */
+  path?: string;
 }
 
 /**
@@ -427,9 +462,74 @@ export interface ChatBatch {
 export interface ChatPeerConvo {
   peerId: string;
   messages: ChatMessage[];
+  /**
+   * 这台设备会话里的**文件消息**（会话里那条文件气泡）。后端 `chat.json` 里存着，
+   * 重启后还在 —— 见 [`ChatFileMsg`]。
+   *
+   * 快照里这一份是**记录**，不是实时视图：传输中的进度由前端掌握（每 200ms 一跳，不值得
+   * 每拍都落盘），前端只在能定下来的时刻把整列表写回后端（`api.chatFilesSet`）。
+   * 界面渲染读的始终是本机那份实时列表（`stores/chat` 的 `files`，启动时从这里种下）。
+   */
+  files: ChatFileMsg[];
   /** 本机已读水位（epoch 毫秒）：`at <= readAt` 的对端消息算读过。 */
   readAt: number;
   unread: number;
+}
+
+/**
+ * 会话里那条**文件（推送）消息** —— 后端 `chat.json` 里的 `ChatFileMsg`（逐字段对应）。
+ *
+ * 发送侧：`batchId` 指向右下角那张推送卡（进度、成败都从它抄过来）；接收侧：`inviteState`
+ * 是那条邀请走到哪一步了，`received`/`bytes` 是接收进度。
+ *
+ * **落盘的只是"能定下来的时刻"**（见 `ChatPeerConvo.files`）：进程断在传输中间时，重启
+ * 会把还在传的那条落成终态（发送侧「未送达」、接收侧「接收失败」，后端 `chat::requeue_inflight`）。
+ */
+export interface ChatFileMsg {
+  id: string;
+  at: number;
+  fromMe: boolean;
+  name: string;
+  /** 文件夹还是文件（气泡/卡片上那颗图标）。 */
+  isDir: boolean;
+  /** 收到的那条是谁推过来的（`fromMe` 时为空）。 */
+  peerId: string;
+  /** 显示用的大小串。 */
+  size: string;
+  /** 发送侧：这批推到几台、几台没成、进度百分比、还在不在传。 */
+  targets: number;
+  failed: number;
+  pct: number;
+  sending: boolean;
+  /** 发送侧：`push://batch` 那张卡的 id（结算后清掉 —— 卡片 3 秒就没了）。 */
+  batchId: string;
+  /** 发送侧：这条文件消息属于哪份**群发名单**（空 = 不是群发那条发的）；群发那条视图按它筛。 */
+  chatBatchId: string;
+  /** 发送侧：这条文件消息属于哪个**群**（空 = 不是发到群里的）；群那条视图按它筛。 */
+  groupId: string;
+  /** 发送侧：逐台的推送状态（等待同意 / 传输中 / 已送达 / 未送达…），群发视图按它逐台写。 */
+  perTargets: { peerId: string; state: PushTargetState }[];
+  /** 接收侧：那条推送邀请。 */
+  inviteId: string;
+  /**
+   * 接收侧走到哪一步了：`pending` = 等用户点头；`accepted` = 接收中（含"断了、正在自己重试"）；
+   * `received` / `rejected` / `failed` / `cancelled` = 终态（`cancelled` = 有人按了停止：本机
+   * 那颗停止按钮，或发送方撤销 —— 都不是"出错"，所以不并进 `failed`）。
+   */
+  inviteState: 'pending' | 'accepted' | 'received' | 'rejected' | 'failed' | 'cancelled' | '';
+  /** 接收侧：已收字节 / 总字节（进度条）。 */
+  received: number;
+  bytes: number;
+  /**
+   * 本机上这一项的**绝对路径**（空 = 还没有 / 不知道，界面就别开它）。
+   *
+   * 自己发的：选文件那一刻就有的源路径（`LocalPick.path`）—— 拖进会话那条路同样带路径。
+   * 对端推来的：**收完那一刻**才有 —— 后端随 `push://done` 给的那一层落盘目录（`dest`）加
+   * 这一项自己的名字（拼法见 `stores/chat` 的 `landingPath`）。
+   */
+  path: string;
+  /** 接收侧：发送方这次选了几项（>1 = 多选合并成的一条推送）；落盘路径的判据，见 `landingPath`。 */
+  count: number;
 }
 
 /** 群成员（名册里的一行）。 */
@@ -460,6 +560,16 @@ export interface ChatGroup {
   createdBy: string;
   /** 名册（**不含本机**，后端已滤掉；顺序按名册）。 */
   members: ChatGroupMember[];
+  /**
+   * 名册里**明确拒绝收本群消息**的那些成员 id（**本机看到的**，后端 `Group::declined`）：
+   * 收方在收不下一条群消息时回头说了理由（`group_text_rejected` 的 `declined`），后端据此记下。
+   *
+   * 界面上就一件事：那枚收件人胶囊**染红**并说明「已拒绝加入」—— 否则它看着一切正常
+   * （链路是通的、点名也在名册里），用户根本不知道这条消息它一个字都收不到。
+   *
+   * **不是名册的一部分**：名字是共享的（LWW），"拒绝"是本机的观察，不会跟着名册传给别人。
+   */
+  declined: string[];
   /** 群消息，落盘顺序（追加序）。 */
   messages: ChatGroupMsg[];
   /** 本机读到哪条了（那条消息 id；`null` = 一条都没读过）。 */
@@ -495,6 +605,15 @@ export interface ChatGroupMsg {
   delivery: Record<string, ChatDelivery>;
   /** **仅 `fromMe` 有意义**：读过这条的成员数（配 `delivery` 的台数就是「已读 n/m」）。 */
   readCount: number;
+  /**
+   * 图片消息那几格，与 [`ChatMessage`] 同一套语义（图片是**消息内容**，不是推送文件）。
+   * **群聊那一半的收发还没落地**（见 `docs/p1-implementation.md` §33）：这里先让时间线那一层
+   * 认得这几个字段（界面代码是共用的）—— 后端发来的群消息里它们一直是缺省的。
+   */
+  image?: boolean;
+  name?: string;
+  size?: number;
+  path?: string;
 }
 
 /** 收到但还没确认的群邀请：用户没点「加入」之前它都不算群（只进会话列表那张邀请卡）。 */

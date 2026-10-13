@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 把 `src/mobile/mobile.css` 里的现代颜色写法**降级到 Chrome 90 也能读**，同时保住新引擎的高保真。
+ * 把 `src/mobile/mobile.css` 里的现代颜色写法**降级到 Chrome 81 也能读**，同时保住新引擎的高保真。
  *
  * 背景：`oklch()` / `color-mix()` 是 Chrome 111（2023-03）起才有的。老 WebView（MuMu 里是 110）
  * 上它们**不报错**，只是那条声明失效 —— 界面变成白底黑字没配色，开发机（新引擎）完全看不出来。

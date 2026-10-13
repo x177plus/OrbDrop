@@ -14,7 +14,7 @@ use std::sync::Arc;
 use axum::extract::{Extension, Query, State};
 use axum::response::Json;
 use orbdrop_lib::add_share_impl;
-use orbdrop_lib::config::{Config, ShareItem};
+use orbdrop_lib::config::ShareItem;
 use orbdrop_lib::credential;
 use orbdrop_lib::server::{file_handler, shares_handler, tree_handler, Caller};
 use orbdrop_lib::state::AppState;
@@ -37,7 +37,9 @@ fn hermetic_bc_exe() -> std::path::PathBuf {
 
 /// 一个共享项、开播开关关着；对端 `peer-a` 有一条（假的）长连接。
 fn make_state(root: std::path::PathBuf, peer_connected: bool) -> Arc<AppState> {
-    let mut config = Config::default();
+    // 身份走 `test_config`：这些用例里有两条要拨本机内网地址（服务器绑 0.0.0.0），
+    // 用 `Config::default()` 的话局域网对端看到的是一台**与本机同名**的"新设备"。
+    let mut config = orbdrop_lib::config::test_config();
     config.shares.push(ShareItem::new(root));
     config.bc_exe_path = Some(hermetic_bc_exe());
     let config_path = std::env::temp_dir().join(format!("orbdrop_vis_cfg_{}.toml", uuid::Uuid::new_v4()));
@@ -259,7 +261,7 @@ fn local_lan_ip() -> Option<std::net::IpAddr> {
 #[tokio::test]
 async fn new_share_inherits_auto_broadcast_setting() {
     let root = temp_share_dir(); // 目录里那条共享项还没登记，留给测试自己加
-    let mut config = Config::default();
+    let mut config = orbdrop_lib::config::test_config();
     config.bc_exe_path = Some(hermetic_bc_exe());
     let config_path =
         std::env::temp_dir().join(format!("orbdrop_vis_cfg_{}.toml", uuid::Uuid::new_v4()));

@@ -1,5 +1,6 @@
 <script lang="ts">
   import * as chat from "$lib/stores/chat.svelte";
+  import * as devices from "$lib/stores/devices.svelte";
   import Icon from "../Icon.svelte";
   import Sheet from "../components/Sheet.svelte";
   import * as store from "../store.svelte";
@@ -9,6 +10,15 @@
   const thread = $derived(chat.activeThread());
   const title = $derived(thread?.title ?? "会话");
   const isThread = $derived(!!thread && thread.mode !== "direct");
+  /**
+   * 一对一会话对着哪台设备（多台会话是空串）：「修改备注」与「配对」两项长在它身上。
+   *
+   * `dev` 取设备表里那一条 —— 会话列表只列**还在设备表里**的设备（`chat.svelte` 的 `known`），
+   * 所以正常都在；真被移除（解除配对后设备行也消失）时这两项什么都不摆：`remarkDevice` 与
+   * `pair` 两张表都没有主语。
+   */
+  const peerId = $derived(thread?.mode === "direct" ? thread.participants[0] : "");
+  const dev = $derived(devices.getDevices().find((d) => d.id === peerId));
 
   /**
    * 标记为已读：走"打开这条会话"那条路，而不是直接调 `chat_mark_read` / `group_mark_read` ——
@@ -92,6 +102,35 @@
         <span class="od">调整群发或群聊的参与设备。</span>
       </span>
     </button>
+  {/if}
+
+  <!-- 一对一那条也摆着**设备那两项**（与设备操作底板、桌面端右键菜单同一份动作与文案）：
+       会话正是"看着这台设备"的地方，要改对它的叫法或重新配对，不该先退回设备页长按那一行。
+       分档与设备底板逐条同规 —— 备注与在线状态无关（纯本机数据，离线/未绑定的会话照样能改）；
+       配对项只给「未绑定」与「凭据失效」两档（已配对的一对一会话没有配对可言）。
+       目标设备照旧在配对表里选（`pair_start` 要 peerId，那张表本来就是选目标的地方）。 -->
+  {#if dev}
+    <button class="opt" type="button" onclick={() => store.openSheet({ kind: "remarkDevice", peerId: dev.id })}>
+      <span class="oi"><Icon name="settings" /></span>
+      <span class="om">
+        <span class="on">修改备注{dev.remark ? ` · ${dev.remark}` : ""}</span>
+        <span class="od">给这台设备起一个只存在本机的名字（不发给对端）：会话与标题只写备注本身，设备页那一行显示「备注(设备名)」。</span>
+      </span>
+    </button>
+
+    {#if !dev.paired || devices.needsRepair(dev)}
+      <button class="opt" type="button" onclick={() => store.openSheet({ kind: "pair" })}>
+        <span class="oi"><Icon name="plus" /></span>
+        <span class="om">
+          <span class="on">{dev.paired ? "重新配对" : "配对"}</span>
+          <span class="od">
+            {dev.paired
+              ? "对端不认本机的凭据（它清过数据，或换了机器）：拨号必然被拒，重新配对换一枚新 token。"
+              : "到配对表里完成配对。未配对也能发消息（HTTP 兜底），但拨不动长连接、也读不到对方的共享项。"}
+          </span>
+        </span>
+      </button>
+    {/if}
   {/if}
 
   <!-- 清空聊天记录只给一对一：群发是"每台各存一份副本"，群里那份记录本机也只有一半的账

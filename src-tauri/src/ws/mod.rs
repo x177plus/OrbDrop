@@ -68,6 +68,9 @@ pub enum StopReason {
     IdentityChanged,
     /// 本机点过「断开」。
     LocalDisconnected,
+    /// 对方拒绝了本机的连接请求（F-16 的同意制）：不是网络问题，本机不再拨 ——
+    /// 用户想再试一次就再点一次「连接」（那会重新发一次请求）。
+    PeerRejected,
 }
 
 pub struct WsManager {
@@ -623,7 +626,7 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
                                 match msg {
                                     Some(Ok(Message::Text(text))) => {
                                         if let Ok(event) = serde_json::from_str::<WsEvent>(&text) {
-                                            session::handle_inbound(&state, &peer_id, event).await;
+                                            let _ = session::handle_inbound(&state, &peer_id, event).await;
                                         }
                                     }
                                     Some(Ok(Message::Pong(_))) => { missed = 0; }

@@ -1023,6 +1023,25 @@ input { font: inherit; }
   border: 1px solid var(--border);
 }
 .device-row.online .d-avatar { color: var(--fg); }
+/* 设备行的头像要当角标的包含块：角标压在右上角（`top/right: -5px`，一半探出头像），
+   所以这一格必须有定位。`relative` 只加在设备行这一档 —— 同一个 `.d-avatar` 还被会话头像
+   叠图（`.convo-avs`）、收件人行、对端标签头复用，那里没有角标可挂，不给它们凭空立一层。 */
+.device-row .d-avatar { position: relative; }
+/* 头像上的待处理角标（F-112）：这台设备还有几件等你处理（未读消息 + 待处理通知）。
+   **数字，不是一颗点**：设备多了以后"哪台最要紧"得按数读；取会话未读那套配色
+   （`.convo-unread` / 标签栏那颗点 / 底栏「会话」角标都是 `--accent`），
+   于是"蓝 = 有人在跟你说话"在本机各处长一样。`--surface` 那圈 2px 环是必要的：
+   角标一半压在头像的圆角与描边上，没有环就跟头像底色糊在一起（同 `.convo-avs .d-avatar`
+   那道 2px 白描边的办法）。 */
+.d-av-badge {
+  position: absolute; top: -5px; right: -5px;
+  min-width: 17px; height: 17px; padding: 0 4px;
+  border-radius: 999px;
+  background: var(--accent); color: var(--surface);
+  font-size: 10px; font-weight: 700; line-height: 1;
+  display: grid; place-items: center;
+  box-shadow: 0 0 0 2px var(--surface);
+}
 .d-main { flex: 1; min-width: 0; }
 /* 名字与状态章同在一行：**名字可以淡掉，胶囊不能** —— 容器上写 `overflow` + `text-overflow`
    会把胶囊一起裁掉（`text-overflow` 在 flex 容器上本来也不生效，长名字是被硬切在半截字上的）。
@@ -1623,7 +1642,25 @@ input { font: inherit; }
 .conv-back { flex: none; width: 28px; height: 28px; border-radius: 7px; display: grid; place-items: center; color: var(--muted); transition: background 0.15s ease, color 0.15s ease; }
 .conv-back:hover { background: var(--fg-soft); color: var(--fg); }
 .conv-back svg { width: 16px; height: 16px; }
+/* 名字 + 状态点 + 台数这一组居中（见 ConvoPanel 里那段说明）：槽留出来的空位因此看不出来。
+   `flex: 1` + `justify-content: center` —— 组按剩余空间居中，长名字照旧在组内省略
+   （组是唯一可伸缩的那一格，`.conv-title` 在组里 `flex: 0 1 auto` 缩）。 */
+.conv-headline { flex: 1; min-width: 0; display: flex; align-items: center; justify-content: center; gap: 6px; }
 .conv-title { flex: 0 1 auto; min-width: 0; font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 600; letter-spacing: -0.005em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 会话详情头顶、返回箭头**右边**那颗「别处还等着几条」（数与算法见 `chat.unreadElsewhere`）：
+   配色取会话未读那一档（`.convo-unread` / 底栏「会话」角标都是 `--accent` + `--surface` 字），
+   "蓝 = 有人在跟你说话"在本机各处长一样。与 `.conv-back` 同高一行、`flex: none` —— 标题再长
+   也是标题那格省略，数不许被挤掉。它不是返回键的替身：一颗胶囊 + 一个数，点它才回列表。
+   **槽常驻、宽度按最大值钉死**（`99+` 那颗胶囊 28px）：数从无到有时标题不许横移 ——
+   会话名每来一条消息就跳一截，比留一格空位难看得多。 */
+.conv-navslot { flex: none; width: 28px; display: flex; align-items: center; }
+.conv-elsewhere {
+  min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px;
+  background: var(--accent); color: var(--surface);
+  font-family: var(--font-mono); font-size: 10px; font-weight: 700; line-height: 1;
+  display: grid; place-items: center; transition: background 0.15s ease;
+}
+.conv-elsewhere:hover { background: var(--accent-deep); }
 .conv-status { flex: none; width: 7px; height: 7px; border-radius: 50%; }
 .conv-count { flex: none; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
 .conv-acts { margin-left: auto; flex: none; display: flex; align-items: center; gap: 2px; }
@@ -1635,6 +1672,14 @@ input { font: inherit; }
 .recip-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 168px; height: 24px; padding: 0 4px 0 5px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); font-size: var(--fs-xs); color: var(--fg); }
 .recip-chip .rc-av { flex: none; width: 15px; height: 15px; border-radius: 5px; display: grid; place-items: center; font-family: var(--font-display); font-weight: 650; font-size: 9px; color: var(--accent); background: var(--accent-soft); }
 .recip-chip .rc-name { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 明确拒绝加入这个群的成员：整枚胶囊红（名字 + 描边 + 淡底）。
+   为什么不是把那颗状态点染红：点画的是**链路**（绿 = 长连接、蓝 = 在线、灰 = 离线），红的点
+   在这一版里被「关系出问题（对端不认 token/换机 → 要重新配对）」占着 —— 那会让用户去重新配对
+   一台关系完全正常的设备。这里要说的其实是"这个**群**它不收"，是名单上的事，落在那枚胶囊上。
+   颜色取法与 `.state-chip.repair` 同一套（danger 72% 文字 / 32% 描边 / 8% 底）。 */
+.recip-chip.refused { border-color: color-mix(in oklch, var(--danger) 32%, transparent); background: color-mix(in oklch, var(--danger) 8%, transparent); }
+.recip-chip.refused .rc-name { color: color-mix(in oklch, var(--danger) 72%, black); }
+.recip-chip.refused .rc-av { color: color-mix(in oklch, var(--danger) 72%, black); background: color-mix(in oklch, var(--danger) 12%, transparent); }
 .recip-chip .rc-st { flex: none; width: 6px; height: 6px; border-radius: 50%; }
 
 /* ─── 设备状态点：一处判据，四处共用（颜色 = 链路与广播范围，形状 = 有没有实时链路）─────
@@ -1663,6 +1708,22 @@ input { font: inherit; }
 .recip-add svg { width: 12px; height: 12px; }
 
 /* ── 收件人选择对话框（挂在面板上的那份 overlay 里）── */
+/* 先把这一行**轨道**钉成面板高（`minmax(0, 1fr)`）：grid 项上的百分比 max-height 是按轨道
+   算的，而默认那条 auto 轨道会被内容撑到 660，于是框上的 `max-height: 100%` 变成一句恒等式、
+   照旧溢出。轨道定死之后下面那条才有参照物。只动收件人这一个 overlay，配对的框不受影响
+   （轨道 = 容器高，项照旧居中，短框渲染结果一字不变）。 */
+.recip-overlay { grid-template-rows: minmax(0, 1fr); }
+/* 框高封顶在面板里（overlay 就是面板那么大）：内容超了也只让**设备列表自己滚**。
+   不封顶的话整只框把 overlay 顶出一根滚动条 —— 那根条挂在面板右缘，看着像主界面在滚，
+   而且最下面那颗按钮被推到可视区外，得先滚才点得到。
+   上下各留 6px（`- 12px`）：既不贴着面板边，也留出亚像素取整的余量（正好等于面板高时会因
+   半像素取整再冒出一根条）。固定部分（标题/说明/模式卡/名称/工具行/按钮）本身就装得下，
+   列表 `flex: 1 1 auto` 吸掉差额，最矮也能收到 0。 */
+.recip-dialog { max-height: calc(100% - 12px); display: flex; flex-direction: column; }
+/* 只有列表吃差额：固定那几块一律不缩（默认 `flex-shrink: 1` 会把标题/说明也按比例压扁，
+   压出来的半像素重叠比"框高一点"难看多了）。 */
+.recip-dialog > :not(.recip-list) { flex: none; }
+.recip-dialog .recip-list { flex: 1 1 auto; min-height: 0; }
 .recip-tools { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 8px; }
 .recip-tools .num { font-size: var(--fs-xs); color: var(--muted); }
 .recip-list { display: flex; flex-direction: column; gap: 4px; max-height: 236px; overflow-y: auto; margin-bottom: 4px; }
@@ -1726,9 +1787,30 @@ input { font: inherit; }
 .ic-acts { display: flex; gap: 8px; }
 .ic-acts .btn { flex: 1; height: 30px; }
 .ic-done { display: flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--muted); }
+/* 正在接收时那一行右端那颗停止（只要图标：这一行本来就窄，写"停止"字数会把状态挤走）。
+   `margin-left: auto` 把它顶到右缘，与状态文字分开 —— 免得点"接收中"的旁边误触。 */
+.ic-stop {
+  margin-left: auto; flex: none; width: 20px; height: 20px; padding: 0;
+  display: grid; place-items: center;
+  border: none; border-radius: 6px; background: transparent;
+  color: var(--muted); cursor: pointer;
+}
+.ic-stop:hover { color: var(--danger); background: var(--fg-soft); }
+.ic-stop svg { width: 14px; height: 14px; }
+
+/* ── 会话里点得开的文件行（自己发出去的那条气泡 / 收完的那张卡）──
+   外面套一层按钮：落点与文件标签页里双击一格一样（交给系统默认程序）。按钮要把 UA 那套清掉
+   （底色、边框、居中、字体），排版仍旧由 `.ic-row` / 气泡那套给；`user-select: text` 是补回来的
+   —— 浏览器默认把按钮里的字设成不可选，而消息流（含这一块）一直可以选中复制。 */
+.ic-open, .cf-open { display: flex; align-items: center; gap: 9px; width: 100%; padding: 0; border: 0; background: none; text-align: left; font: inherit; color: inherit; cursor: pointer; user-select: text; -webkit-user-select: text; }
+.cf-open { gap: 8px; }
+.ic-open:hover .ic-name, .cf-open:hover .cf-name { text-decoration: underline; }
+.ic-open:hover .ic-name { color: var(--accent); }
 
 /* ── 输入行 ── */
-.chat-compose { flex: none; display: flex; align-items: center; gap: 6px; padding: 9px 12px; border-top: 1px solid var(--border); }
+/* `flex-end` 而不是居中：输入区长高（多行 / 里面夹了图）时，两颗圆按钮要贴着底边不动
+   —— 与它们在同一行里上下漂相比，贴着输入区的最后一行更像聊天软件。 */
+.chat-compose { flex: none; display: flex; align-items: flex-end; gap: 6px; padding: 9px 12px; border-top: 1px solid var(--border); }
 .chat-plus, .chat-send { flex: none; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; transition: background 0.15s ease, color 0.15s ease, transform 0.06s ease, opacity 0.15s ease; }
 .chat-plus { background: var(--fg-soft); color: var(--muted); }
 .chat-plus:hover { background: color-mix(in oklch, var(--accent) 14%, transparent); color: var(--accent); }
@@ -1738,9 +1820,30 @@ input { font: inherit; }
 .chat-plus:active, .chat-send:not(:disabled):active { transform: scale(0.94); }
 .chat-plus svg { width: 16px; height: 16px; }
 .chat-send svg { width: 15px; height: 15px; }
-.chat-input { flex: 1; min-width: 0; height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--fg); font-size: var(--fs-sm); user-select: text; -webkit-user-select: text; }
+/* 圆角**钉死 16px**（= 折叠态那 32px 高的一半）：单行时与原来的胶囊一模一样，撑大之后
+   一直是 16px 的圆角矩形。写成 `999px` 的话半径会被高度钳到"半个高"——输入区一长高，
+   左右两端就跟着变成半圆（胶囊），越拉越不像聊天软件的输入框。 */
+.chat-input { flex: 1; min-width: 0; height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); color: var(--fg); font-size: var(--fs-sm); user-select: text; -webkit-user-select: text; }
 .chat-input::placeholder { color: var(--muted); }
 .chat-input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+/* 富输入区（`.cx`）：里面除了文字还可能有图，所以高度自适应（`min-height` 与老的单行输入等高，
+   长到 5 行左右就不再长，改成自己滚）。`pre-wrap` 让文本里那个换行（Shift+回车）真的换行。 */
+.chat-input.cx {
+  height: auto;
+  min-height: 32px;
+  max-height: 104px;
+  padding: 6px 12px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+/* 空的时候写占位文案：`:empty` 只认"一个子节点都没有"，而被编辑过的框里往往留着一个空文本节点
+   （甚至一个 `<br>`），所以真正的判据是组件挂的那个 `data-empty`。 */
+.chat-input.cx[data-empty="1"]::before { content: attr(data-placeholder); color: var(--muted); pointer-events: none; }
+/* 框里那张图：既要是"能看见的一张小图"，又要是**一个原子**（一次退格删掉一整张、光标跳得过去）
+   —— 原子性由 `contenteditable="false"` 给（见 `lib/composer.ts`），这里只管长相。 */
+.cx-img { display: inline-block; vertical-align: middle; max-width: 96px; max-height: 72px; margin: 2px 3px; border-radius: 6px; border: 1px solid var(--border); object-fit: contain; background: var(--fg-soft); }
 
 /* ── 消息模式：单向群发 / 共享群聊（原型同名的两块）────────────────────────
    一对一没有模式条（`.conv-headgroup` 里那一行整个不画）；群发与群聊各说自己的规则，

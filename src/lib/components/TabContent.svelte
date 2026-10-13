@@ -12,6 +12,7 @@
     onAddShare,
     onOpenPair,
     onUnpair,
+    noticeCount,
   }: {
     tab: TabKey;
     /** 设备标签靠它取到 ip/port 与长连接状态。 */
@@ -23,6 +24,8 @@
     onAddShare: () => void;
     onOpenPair?: (device: PeerDevice | null) => void;
     onUnpair?: (device: PeerDevice) => void;
+    /** 一台设备此刻还挂着几件待处理的通知（F-112 头像角标的一半，另一半是未读消息）。 */
+    noticeCount?: (peerId: string) => number;
   } = $props();
 
   // 设备列表里**已配对但离线**的行也在（为了能解除配对），但对端离线时浏览标签没有
@@ -35,7 +38,7 @@
 {#if tab.kind === 'local'}
   <LocalTab {onToast} {onAddShare} />
 {:else if tab.kind === 'devices'}
-  <DeviceTab {onToast} {onMessage} {onOpenPair} {onUnpair} />
+  <DeviceTab {onToast} {onMessage} {onOpenPair} {onUnpair} {noticeCount} />
 {:else if peer}
   {#key peer.id}
     <PeerTab device={peer} {onToast} />

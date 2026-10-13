@@ -1,7 +1,7 @@
 <script lang="ts">
   import * as api from "$lib/api";
   import * as chat from "$lib/stores/chat.svelte";
-  import { deviceState, getDevices } from "$lib/stores/devices.svelte";
+  import { deviceState, deviceShortName, getDevices } from "$lib/stores/devices.svelte";
   import Icon from "../Icon.svelte";
   import Sheet from "../components/Sheet.svelte";
   import StateChip from "../components/StateChip.svelte";
@@ -22,8 +22,8 @@
   let name = $state("");
 
   const many = $derived(picked.length > 1);
-  /** 标题预览里那串设备名（原型 `ids.map(devName).join('、')`）。 */
-  const pickedNames = $derived(candidates.filter((d) => picked.includes(d.id)).map((d) => d.name));
+  /** 标题预览里那串设备名（原型 `ids.map(devName).join('、')`）——**短名**（F-101：有备注就是备注本身）。 */
+  const pickedNames = $derived(candidates.filter((d) => picked.includes(d.id)).map((d) => deviceShortName(d)));
   const preview = $derived(
     (mode === "broadcast" ? "群发 · " : "群聊 · ") +
       (name.trim() || (mode === "broadcast" ? "未命名群发" : pickedNames.join("、") || "设备名称")),
@@ -118,7 +118,7 @@
           />
           <span class="pav">{chat.peerInitial(d.id)}</span>
           <span class="fmain">
-            <span class="fname2">{d.name}</span>
+            <span class="fname2" title={deviceShortName(d)}>{deviceShortName(d)}</span>
             <span class="fmeta num">{d.ip}</span>
           </span>
           <StateChip state={deviceState(d)} />

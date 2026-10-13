@@ -59,6 +59,40 @@ pub async fn chat_message_handler(
     accept(&state, addr, &headers, &body.sender, body.port, event).await
 }
 
+/// POST /chat/image —— 收到对端一条**图片消息**（没有长连接时走这条路；带长连接那条路走
+/// `WsEvent::ChatImage`，见 `ws::session`）。
+///
+/// 体就是那条事件 + `port` / `sender`（`deliver_http` 就是这么拼的，见 `body_shapes`……那条
+/// 单测钉着这件事）。体里可能装着几 MB 的 base64 —— 这条路由的**体积上限**比别的会话路由高
+/// 一档（`server::IMAGE_BODY_LIMIT`），不然默认那 2MB 会把一张两兆的截图直接 413 掉。
+#[derive(Deserialize)]
+pub struct ChatImageBody {
+    id: String,
+    at: u64,
+    name: String,
+    #[serde(default)]
+    size: u64,
+    data: String,
+    port: u16,
+    sender: PeerInfo,
+}
+
+pub async fn chat_image_handler(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<ChatImageBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let event = WsEvent::ChatImage {
+        id: body.id,
+        at: body.at,
+        name: body.name,
+        size: body.size,
+        data: body.data,
+    };
+    accept(&state, addr, &headers, &body.sender, body.port, event).await
+}
+
 pub async fn chat_read_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -86,6 +120,16 @@ pub struct GroupTextBody {
     hops: u8,
     #[serde(default)]
     reached: Vec<String>,
+    /// 图片消息那几格（与线上那条 `WsEvent::GroupText` 逐字对应，见 `events.rs`）：
+    /// `data` 是内容本身（base64）—— 所以 `/chat/group` 这条路由的体积上限也抬了一档。
+    #[serde(default)]
+    image: bool,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    data: String,
     port: u16,
     /// 信封上的身份（本帧是谁发来的）：认人、`upsert_peer` 都用它，与 `author` 是两件事。
     sender: PeerInfo,
@@ -126,6 +170,10 @@ pub async fn group_text_handler(
         author: body.author,
         hops: body.hops,
         reached: body.reached,
+        image: body.image,
+        name: body.name,
+        size: body.size,
+        data: body.data,
     };
     accept(&state, addr, &headers, &body.sender, body.port, event).await
 }
@@ -227,6 +275,34 @@ pub async fn group_ack_handler(
     accept(&state, addr, &headers, &body.sender, body.port, event).await
 }
 
+/// POST /chat/group-reject —— 收到"这一条我收不下"（拒收回执）。
+///
+/// 没有长连接时，收方的这条回话只能反拨发送方；`reason` 是这个形状里**唯一有信息量**的字段
+/// （`declined` 让发送方把那位成员标成「已拒绝加入」）。
+#[derive(Deserialize)]
+pub struct GroupTextRejectBody {
+    group_id: String,
+    id: String,
+    #[serde(default)]
+    reason: String,
+    port: u16,
+    sender: PeerInfo,
+}
+
+pub async fn group_text_reject_handler(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<GroupTextRejectBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let event = WsEvent::GroupTextRejected {
+        group_id: body.group_id,
+        id: body.id,
+        reason: body.reason,
+    };
+    accept(&state, addr, &headers, &body.sender, body.port, event).await
+}
+
 /// 认人 + 落账。两条路（消息 / 回执）共用。
 async fn accept(
     state: &Arc<AppState>,
@@ -273,8 +349,22 @@ async fn accept(
     });
 
     info!(sender = %sender.id, name = %sender.name, paired, "inbound chat over http");
-    crate::ws::session::handle_inbound(state, &sender.id, event).await;
-    Ok(StatusCode::NO_CONTENT)
+    // **群消息这一条要看落账结果**：收不下（本机拒绝过这个群 / 名册没到）就回 409 ——
+    // 恒回 204 会让发送方把那一条记成「已送达」，而它实际被丢掉了（长连接那条路靠
+    // `group_text_rejected` 反向纠正，HTTP 这一跳就靠这个状态码）。理由代码同时带上：
+    // 日志里要能看出"是哪种收不下"。
+    match crate::ws::session::handle_inbound(state, &sender.id, event).await {
+        crate::ws::session::InboundResult::Accepted => Ok(StatusCode::NO_CONTENT),
+        crate::ws::session::InboundResult::GroupRefused(reason) => {
+            Err((StatusCode::CONFLICT, format!("group text refused: {reason}")))
+        }
+        // 图片内容收不下（坏了 / 太大 / 写不进去）：回 400 —— 发送方落「未送达」、不重试，
+        // 本机也**没有**记下这条消息（见 `chat::accept_inbound_image`）。回 204 会让发送方
+        // 以为这条到了，而它在本机根本不存在。
+        crate::ws::session::InboundResult::ImageRefused => {
+            Err((StatusCode::BAD_REQUEST, "image content refused".to_string()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -327,6 +417,10 @@ mod tests {
             author: PeerInfo { id: "p0".into(), name: "PC-A".into() },
             hops: 1,
             reached: vec!["p0".into()],
+            image: true,
+            name: "图片-1.png".into(),
+            size: 7,
+            data: "REFUQQ==".into(),
         })
         .unwrap();
         text["port"] = serde_json::json!(3890);
@@ -338,6 +432,11 @@ mod tests {
         assert_eq!(parsed.sender.id, "p1", "信封上是搬运工");
         assert_eq!(parsed.author.id, "p0", "作者另有其人，没被信封覆盖");
         assert_eq!(parsed.hops, 1, "中转的跳数要在体里带回来");
+        // 图片消息那几格也要逐字对上（体里装着那张图的字节）。
+        assert!(parsed.image);
+        assert_eq!(parsed.name, "图片-1.png");
+        assert_eq!(parsed.size, 7);
+        assert_eq!(parsed.data, "REFUQQ==");
         assert_eq!(parsed.reached, vec!["p0".to_string()]);
         assert_eq!(sender.name, "PC-B");
 
@@ -364,6 +463,20 @@ mod tests {
         let parsed: GroupRosterBody = serde_json::from_value(roster).expect("名册体的字段名必须对得上");
         assert_eq!(parsed.roster.rev, 2);
         assert_eq!(parsed.roster.members.len(), 1);
+
+        // 拒收回执（`/chat/group-reject`）：与线上事件逐字对应 —— `reason` 是**唯一有信息量**
+        // 的字段（`declined` 让发送方把那台设备标成「已拒绝加入」），键名错了就等于没带回来。
+        let mut reject = serde_json::to_value(WsEvent::GroupTextRejected {
+            group_id: "g1".into(),
+            id: "m1".into(),
+            reason: crate::group::REASON_DECLINED.into(),
+        })
+        .unwrap();
+        reject["port"] = serde_json::json!(3890);
+        reject["sender"] = serde_json::json!({ "id": "p1", "name": "PC-B" });
+        let parsed: GroupTextRejectBody = serde_json::from_value(reject).expect("拒收体的字段名必须对得上");
+        assert_eq!((parsed.group_id.as_str(), parsed.id.as_str()), ("g1", "m1"));
+        assert_eq!(parsed.reason, crate::group::REASON_DECLINED);
     }
 }
 

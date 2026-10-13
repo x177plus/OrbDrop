@@ -3,7 +3,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { peerTree } from '$lib/api';
   import { getPeerSharesState, loadPeerShares } from '$lib/stores/peers.svelte';
-  import { deviceDisplayName } from '$lib/stores/devices.svelte';
+  import { deviceShortName } from '$lib/stores/devices.svelte';
   import type { PeerDevice, PeerShareItem, TreeEntry } from '$lib/types';
   import { dragOut } from '$lib/dragOut';
   import TreeNode from './TreeNode.svelte';
@@ -24,8 +24,8 @@
   /** 每次收到对端目录变更就自增，驱动 TreeNode 重拉自己已加载的那一层（F-33）。 */
   let refreshSignal = $state(0);
 
-  /** 显示名（F-101）：设了备注就是「备注(设备名)」—— 标签页里到处都用它。 */
-  const deviceName = $derived(deviceDisplayName(device));
+  /** 短名（F-101）：有备注就只写备注（没备注才是设备名）—— 会话、标签栏、页头都用它。 */
+  const deviceName = $derived(deviceShortName(device));
 
   const shares = $derived(getPeerSharesState(device.id));
 
@@ -103,7 +103,7 @@
 <div class="peer-head">
   <span class="d-avatar">{deviceName.charAt(0).toUpperCase()}</span>
   <div class="d-main">
-    <div class="d-name">{deviceName}</div>
+    <div class="d-name" title={deviceName}>{deviceName}</div>
     <div class="d-ip num">{device.ip}:{device.port}</div>
   </div>
   <span class="state-chip live"><span class="dot live"></span>长连接</span>

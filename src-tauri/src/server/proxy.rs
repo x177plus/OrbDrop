@@ -322,7 +322,7 @@ mod tests {
     use axum::http::{HeaderValue, Method};
     use std::sync::Arc;
 
-    use crate::config::{Config, ShareItem};
+    use crate::config::ShareItem;
 
     #[test]
     fn base_url_is_loopback_and_trailing_slash_survives() {
@@ -421,7 +421,7 @@ mod tests {
         std::fs::write(peer_root.join("新建 文本文档.txt"), b"spaced").unwrap();
 
         // ---- B：对端 ----
-        let mut peer_config = Config::default();
+        let mut peer_config = crate::config::test_config();
         let share = ShareItem::new(peer_root.clone());
         let share_id = share.id.clone();
         peer_config.shares.push(share);
@@ -429,7 +429,7 @@ mod tests {
             std::env::temp_dir().join(format!("orbdrop_proxy_cfg_{}.toml", uuid::Uuid::new_v4()));
         let peer_state = Arc::new(AppState::new(peer_config, peer_config_path));
         peer_state.config.lock().shares[0].broadcast_enabled = true;
-        let peer_port = crate::server::start_server(peer_state.clone(), 4151)
+        let peer_port = crate::server::start_server_loopback(peer_state.clone(), 4151)
             .await
             .expect("peer server");
 
@@ -442,10 +442,10 @@ mod tests {
 
         // ---- A：本机（代理这一侧） ----
         let own_state = Arc::new(AppState::new(
-            Config::default(),
+            crate::config::test_config(),
             std::env::temp_dir().join(format!("orbdrop_proxy_own_{}.toml", uuid::Uuid::new_v4())),
         ));
-        let own_port = crate::server::start_server(own_state.clone(), 4150)
+        let own_port = crate::server::start_server_loopback(own_state.clone(), 4150)
             .await
             .expect("own server");
         own_state.add_peer_book(crate::config::PeerDevice {

@@ -12,13 +12,35 @@ use tracing::{info, warn};
 /// mDNS 服务类型（`register` 与注销共用一份字面量）。
 const SERVICE_TYPE: &str = "_orbdrop._tcp.local.";
 
-/// 本机在 mDNS 上的服务全名：`register` 注册用的就是它，「离线」时按它精确注销。
+/// 一次**挂着的** mDNS 注册：daemon 句柄 + 它自己报出来的服务全名。
 ///
-/// 注销必须点名到这一条记录：只把 `ServiceDaemon` 丢掉，对端缓存里的记录要等 TTL
-/// （约 2 分钟）自然过期才消失 —— 那段时间里它仍然看得见本机。`unregister` 会立刻
-/// 发一条 TTL=0 的告别包。
-pub fn service_fullname(device_name: &str) -> String {
-    format!("OrbDrop-{}.{}", device_name, SERVICE_TYPE)
+/// 两样必须一起存，缺一样就注销不掉：
+/// - 全名认的是**注册那一刻**的设备名。用户改了设备名之后，按当前配置拼出来的串已经不是
+///   线上那一条了（`unregister` 要点名到具体记录）；
+/// - 全名还必须取 mdns-sd 自己报的那一份（`ServiceInfo::get_fullname`）：实例名里可能有
+///   它转义过的字符，自己拼出来的串未必与线上一致。
+pub struct Registration {
+    pub daemon: ServiceDaemon,
+    pub fullname: String,
+}
+
+/// 摘掉一次注册：发一条 TTL=0 的告别包（对端立刻看不见），并**关掉**那个 daemon。
+///
+/// `shutdown` 这一步不能省。`ServiceDaemon` **没有 `Drop`**：只把句柄丢掉的话，daemon 线程
+/// 还活着、注册还在，对端照样能解析到那一条 —— 用户改了设备名，别人的设备行却还是旧名
+/// （旧实例每次答一次 query 就把旧名字写回去一次）。回归见 `lib.rs` 的
+/// `renaming_releases_the_previous_mdns_registration`（真组播）。
+///
+/// 注销失败不是错误（记录可能早已过期 / daemon 已经关了），关掉线程才是这一步的目的。
+pub fn release(reg: Registration) {
+    if let Err(e) = reg.daemon.unregister(&reg.fullname) {
+        warn!(fullname = %reg.fullname, "mDNS unregister failed: {e}");
+    }
+    // `shutdown` 是异步收尾（返回 DaemonStatus 的接收端），这里不等它 —— 句柄一丢，
+    // 线程自己会收尾退出。
+    if let Err(e) = reg.daemon.shutdown() {
+        warn!(fullname = %reg.fullname, "mDNS daemon shutdown failed: {e}");
+    }
 }
 
 /// Register the OrbDrop service via mDNS so same-subnet peers can discover us.
@@ -36,7 +58,7 @@ pub fn service_fullname(device_name: &str) -> String {
 ///
 /// `nets` 是**提示**不是权威：网卡换了（插网线/开热点）不会重播 TXT（`enable_addr_auto`
 /// 只管地址记录），所以活回话（`/pair/info` 与 `/discover` 的 `nets`）才是真值。
-pub fn register(port: u16, device_name: &str, device_id: &str, allow_relay: bool) -> Option<ServiceDaemon> {
+pub fn register(port: u16, device_name: &str, device_id: &str, allow_relay: bool) -> Option<Registration> {
     let daemon = match ServiceDaemon::new() {
         Ok(d) => d,
         Err(e) => {
@@ -78,10 +100,15 @@ pub fn register(port: u16, device_name: &str, device_id: &str, allow_relay: bool
         }
     };
 
+    // 全名**取 mdns-sd 自己报的那一份**，不按设备名自己拼：实例名里可能有它转义过的
+    // 字符，自己拼出来的串与线上那一条不一致时，注销会找不到目标（记录只能等 TTL 过期，
+    // 那段时间里对端还看得见旧名字）。
+    let fullname = service.get_fullname().to_string();
+
     match daemon.register(service) {
         Ok(_) => {
             info!(port, device_name, device_id, "mDNS service registered");
-            Some(daemon)
+            Some(Registration { daemon, fullname })
         }
         Err(e) => {
             warn!("mDNS registration failed: {e}");

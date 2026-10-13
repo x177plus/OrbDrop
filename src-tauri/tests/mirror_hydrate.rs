@@ -111,7 +111,7 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
     let share_id = share.id.clone();
     state.config.lock().shares.push(share);
     let base = state.config.lock().port;
-    let port = orbdrop_lib::server::start_server(state.clone(), base)
+    let port = orbdrop_lib::server::start_server_loopback(state.clone(), base)
         .await
         .expect("起服务");
 

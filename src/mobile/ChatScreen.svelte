@@ -4,6 +4,19 @@
   import * as devices from "$lib/stores/devices.svelte";
   import Icon from "./Icon.svelte";
   import * as store from "./store.svelte";
+  import * as api from "$lib/api";
+  import {
+    adoptDomImages,
+    applyComposer,
+    imageFiles,
+    insertImages,
+    isImageName,
+    serializeComposer,
+    setCaretEnd,
+  } from "$lib/composer";
+  import ImagePreview from "$lib/components/ImagePreview.svelte";
+  import ImageViewer from "$lib/components/ImageViewer.svelte";
+  import { untrack } from "svelte";
 
   let { convoKey }: { convoKey: string } = $props();
 
@@ -14,11 +27,23 @@
   const participants = $derived(thread?.participants ?? []);
   const title = $derived(thread?.title ?? "");
   const items = $derived(chat.itemsOf(convoKey));
+  /**
+   * 别的会话上还等着几条（当前这条不算，见 `chat.unreadElsewhere`）：正停在这条会话里、
+   * 别处来了消息时，返回箭头右边那颗角标记的就是它 —— 不开着这条会话时那个数是看不见的
+   * （底栏角标与「会话」页签都在这条会话底下盖着）。
+   */
+  const elsewhere = $derived(chat.unreadElsewhere());
 
   let logEl = $state<HTMLDivElement | null>(null);
-  let inputEl = $state<HTMLInputElement | null>(null);
+  let inputEl = $state<HTMLDivElement | null>(null);
+  /** 正开着大图的那条（点缩略图进去，见 `ImageViewer`；`null` = 没开）。 */
+  let viewing = $state<ChatItem | null>(null);
+  /** 正在认领输入法剪贴板塞进输入框的图（见 `composer.adoptDomImages`）—— 挡住重入。 */
+  let adopting = false;
 
-  const draft = $derived(chat.draftOf(convoKey));
+  /** 输入区里有没有值得发的东西（文字或图，见 `lib/composer.ts`）。 */
+  const canSend = $derived(chat.draftHasContent(convoKey));
+
   const dot = $derived(devices.threadDotState(participants));
   const peers = $derived(devices.getDevices().filter((d) => participants.includes(d.id)));
   /** 有长连接的那几台（"长连接"是这一档唯一的判据）。 */
@@ -68,7 +93,9 @@
       // 群发那条视图里只有"我发出去的"：没有"某台的送达状态"可言，逐台都在下面那张回执卡里。
       if (mode === "broadcast") return time;
       // 群聊是共享的一条消息流，没有"各台各一份副本"那套账 —— 逐台走群自己那行小字。
-      const status = mode === "group" ? chat.groupReceiptText(item) : chat.deliveryText(participants[0], item);
+      const status = mode === "group"
+        ? chat.groupReceiptText(item, chat.groupDeclinedIds(thread?.id ?? ""))
+        : chat.deliveryText(participants[0], item);
       return [time, status].filter(Boolean).join(" · ");
     }
     // 群聊里发言人已经写在上面的 `.who` 行了，这里只写时刻（原型同款）。
@@ -84,6 +111,19 @@
   }
 
   /**
+   * 这条文件消息是不是一张**能在会话里摊开看的图**：按扩展名判（与后端 `paste::mime_of`
+   * 同一份名单）。文件夹不是；认不出来的扩展名也不是（那种气泡还是老样式）。
+   */
+  function isImageMsg(item: ChatItem): boolean {
+    return item.kind === "file" && !item.isDir && isImageName(item.name);
+  }
+
+  /** 一条消息的显示名：文件消息与图片消息都有 `name`，都没有时写「图片」。 */
+  function msgName(item: ChatItem): string {
+    return item.kind === "file" ? item.name : item.name ?? "图片";
+  }
+
+  /**
    * 回执卡第一行：原型是 `已送达 n/m 台 · k 台离线`。
    * 真实的"排队等对端上线"（`waiting`）与"没成"（`offline`）是两档 —— 不单列一档就会漏报，
    * 让人以为剩下那几台都送到了。
@@ -95,26 +135,122 @@
     return parts.join(" · ");
   }
 
+  /**
+   * 发出去这一整条。**顺序与分段都在 store 里**（`chat.sendComposer`）：输入区里可能是
+   * "一段文字 / 一张图 / 又一段文字"，它按框里的顺序一条条落成消息 —— 图片夹在中间时，
+   * 发送方与接收方排出来的顺序是同一个（见那段说明里的"为什么不能让后端各取各的现在"）。
+   *
+   * 这里只管界面上的两件事：把输入区重画成 store 里剩下的那几段，以及报结果。
+   */
   async function send(): Promise<void> {
-    const text = chat.draftOf(convoKey).trim();
-    if (!text) return;
     try {
-      const res = await chat.sendText(convoKey, text);
+      const res = await chat.sendComposer(convoKey);
+      const el = inputEl;
+      if (el) {
+        applyComposer(el, chat.draftSegsOf(convoKey));
+        markEmpty();
+        el.focus();
+        setCaretEnd(el);
+      }
       if (!res) return;
+      if (res.failed) {
+        // **发失败不清草稿**：没发出去的那几段原样还在输入区里，用户不用重打一遍
+        // （原型是 mock 不会失败，真发不出去还把刚打的字抹掉，用户得重打一遍）。
+        store.toast(`有 ${res.failed} 项没发出去：${res.error ?? "原因不明"}`, "x");
+        return;
+      }
+      if (res.images && !res.texts) store.toast(`已发送 ${res.images} 张图片`, "file");
     } catch (e) {
-      // 发失败**不清草稿**：原型是 mock 不会失败，真发不出去还把刚打的字抹掉，用户得重打一遍。
       store.failed("发送消息", e);
-      return;
     }
-    chat.setDraftOf(convoKey, "");
-    inputEl?.focus();
   }
 
   function onKey(e: KeyboardEvent): void {
     // 中文/日文输入法里那下回车是"上屏"，不是"发送"（原型同款判断）。
-    if (e.key !== "Enter" || e.isComposing) return;
+    // Shift+回车留给换行（这一版输入区支持多行）。
+    if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
     e.preventDefault();
     void send();
+  }
+
+  /** 输入区那句占位文案的判据（`:empty` 认不出"只剩一个空文本节点"的框，见 `mobile.css`）。 */
+  function markEmpty(): void {
+    const el = inputEl;
+    if (el) el.dataset.empty = chat.draftHasContent(convoKey) ? "0" : "1";
+  }
+
+  /** 把输入区里此刻的样子存成草稿（每次 `input` 之后、认领完图之后都要叫一次）。 */
+  function syncDraft(): void {
+    const el = inputEl;
+    if (!el) return;
+    chat.setDraftSegs(convoKey, serializeComposer(el));
+    markEmpty();
+  }
+
+  /**
+   * `input`：**手机这条路上，图就是从这儿进来的** —— 输入法剪贴板往输入框里插图时不会走
+   * `paste` 事件，它是直接往 `contenteditable` 里插一个 `<img>`（`content://` / `data:` /
+   * `blob:` 都见过）。先认领（落成暂存文件、换成我们自己那张有路径的图），再同步草稿。
+   *
+   * 光标位置也在这里照看：认领会替换掉那个节点，替换完把光标放回它后面 —— 不然用户接着打的
+   * 字会跑到框首去（图前那一段文字就废了）。
+   */
+  async function onInput(): Promise<void> {
+    const el = inputEl;
+    if (!el || adopting) return;
+    adopting = true;
+    try {
+      if (await adoptDomImages(el, (msg) => store.toast(msg, "x"))) setCaretEnd(el);
+    } finally {
+      adopting = false;
+    }
+    syncDraft();
+  }
+
+  /** `Ctrl+V` / 长按粘贴里带图时（浏览器那条路给的是字节，安卓给的多半是 `<img>`）：两条都认。 */
+  function onPaste(e: ClipboardEvent): void {
+    const el = inputEl;
+    if (!el) return;
+    const files = imageFiles(e.clipboardData);
+    if (!files.length) return; // 纯文字：交给默认粘贴，`input` 会同步草稿
+    e.preventDefault();
+    void insertImages(el, files, (msg) => store.toast(msg, "x")).then((ok) => {
+      if (ok) syncDraft();
+    });
+  }
+
+  /**
+   * 点一条收完的文件气泡 = 交给系统打开它（`.apk` 落到系统安装器上 —— 后端按扩展名给 MIME，
+   * 见 `docs/p1-implementation.md` §20）。
+   *
+   * 与「文件」页收件行那张操作表里的「打开」是同一个落点（`api.openPath`），只是这里少走一层
+   * 表：在会话里点那一下就是想开它。还没有落盘路径的（在传、拒了、失败了）点不动 —— 气泡压根
+   * 不是按钮（见模板里那个 `{#if item.path}`）。
+   */
+  async function openFile(item: ChatItem): Promise<void> {
+    // 文件消息与**图片消息**（图片是消息内容那一档）都有 `path`：交给系统打开本机这一份。
+    if (!item.path) return;
+    try {
+      await api.openPath(item.path);
+    } catch (e) {
+      store.failed("打开", e);
+    }
+  }
+
+  /**
+   * 点那条**正在接收**的文件气泡右端那颗停止：撤掉这条接收（`cancel_receive`）。
+   *
+   * 后端把那条邀请取走、告诉发送方，并把"待续传任务"一并删掉 —— **用户喊停就是喊停**，
+   * 重启之后不会再自己接着收（只有"关掉应用"才有那一条，见 `transfer::resume_pending`）。
+   * 界面不用自己改这条消息：随后那条 `push://done{cancelled}` 会把它落成「已停止接收」。
+   */
+  async function stopReceive(item: ChatItem): Promise<void> {
+    if (item.kind !== "file" || !item.inviteId) return;
+    try {
+      await api.cancelReceive(item.inviteId);
+    } catch (e) {
+      store.failed("停止接收", e);
+    }
   }
 
   // 来了新消息就贴到底（读 `items.length` 而不是 `items`：那条文件消息的进度每秒都在变，
@@ -125,16 +261,73 @@
     void items.length;
     if (logEl) logEl.scrollTop = logEl.scrollHeight;
   });
+
+  /**
+   * 换会话：把这条会话的草稿**重画**进输入区（图片是 `blob:` 预览，重画就是重新挂上去）。
+   *
+   * `untrack` 不能省：输入区在编辑时**不归 Svelte 管**（DOM 就是编辑时的真相 —— 否则每敲一个
+   * 字都被重画一遍、光标丢到最前）。这个 effect 只认"哪条会话 / 哪个节点"，读草稿那一下包在
+   * `untrack` 里。`viewing` 一起收掉：一张已经不属于这条会话的图不该还挂在屏幕上。
+   */
+  $effect(() => {
+    const el = inputEl;
+    void convoKey;
+    if (!el) return;
+    untrack(() => {
+      applyComposer(el, chat.draftSegsOf(convoKey));
+      markEmpty();
+    });
+    viewing = null;
+  });
 </script>
+
+<!-- 一条文件气泡的内容（图标 / 名字 / 大小 / 状态行）：外面套不套那颗按钮由调用处定
+     （有落盘路径才点得开）。状态那一行在点得开时补一句"点一下打开" —— 手机上这是唯一的
+     提示，没有悬停可看。 -->
+{#snippet fileBub(item: ChatItem & { kind: "file" })}
+  <span class="fio"><Icon name="file" /></span>
+  <span class="fmain">
+    <span class="fname">{item.name}</span>
+    <span class="fsize num">{item.size || "文件"}</span>
+    {#if item.sending}
+      <span class="fstat">传输中 {Math.round(item.pct)}%</span>
+      <span class="fbar"><i style="width:{Math.round(item.pct)}%"></i></span>
+    {:else if fileStatus(item)}
+      <span class="fstat">{fileStatus(item)}{item.path ? " · 点一下打开" : ""}</span>
+    {/if}
+  </span>
+{/snippet}
 
 <header class="chatbar">
   <button class="icon-btn" type="button" aria-label="返回会话列表" onclick={() => store.navigateBackToList()}>
     <Icon name="back" />
   </button>
+  <!-- 返回箭头**右边**：别的会话还等着几条。不摆在返回键本身上 —— 那位置让给角标就得靠悬停
+       才能变回返回键，而这里没有悬停（手指没有 hover），唯一的"退回去"会变得不确定；也不并进
+       返回键画成一颗挂着数的按钮：那会让"返回"这个动作看起来像"去看那几条消息"。
+       点它 = 回会话列表（那几条就在列表里），与返回键同一个落点。
+
+       外面那层 `.cb-navslot` **一直在**（哪怕没有数）：数从无到有的时候不许把设备名顶走 ——
+       会话标题是这一屏上唯一告诉用户"这是谁的会话"的东西，每次来条消息就横移一截，比多留一格
+       空位难看得多。槽的宽度按**最大值**（`99+` 那颗胶囊）钉死，所以 1 位数、3 位数都不动。 -->
+  <span class="cb-navslot">
+    {#if elsewhere}
+      <button
+        class="cb-elsewhere"
+        type="button"
+        aria-label="还有 {elsewhere} 条来自其他会话的消息，回会话列表"
+        onclick={() => store.navigateBackToList()}
+      >{elsewhere > 99 ? "99+" : elsewhere}</button>
+    {/if}
+  </span>
   <div class="cb-main">
     <span class="cb-title">{title}</span>
     <span class="cb-sub"><i class="cv-dot {dot}"></i>{sub}</span>
   </div>
+  <!-- 左边那格槽的**镜像**：会话名是在「左右两格之间的剩余空间」里居中的，左边多出 34u 的话
+       名的中心就会比屏幕中心偏右 21u（393 宽下实测）。右边补上同样宽的空格，名的中心才落在
+       正中间。空的、也不给读屏看（`aria-hidden`）—— 它只是一格宽度。 -->
+  <span class="cb-navslot" aria-hidden="true"></span>
   <button
     class="icon-btn"
     type="button"
@@ -201,21 +394,50 @@
         {/if}
         <div class="bubble">
           {#if item.kind === "file"}
-            <span class="fbub">
-              <span class="fio"><Icon name="file" /></span>
-              <span class="fmain">
-                <span class="fname">{item.name}</span>
-                <span class="fsize num">{item.size || "文件"}</span>
-                {#if item.sending}
-                  <span class="fstat">传输中 {Math.round(item.pct)}%</span>
-                  <span class="fbar"><i style="width:{Math.round(item.pct)}%"></i></span>
-                {:else if fileStatus(item)}
-                  <span class="fstat">{fileStatus(item)}</span>
+            {#if item.path && isImageMsg(item)}
+              <!-- 一张图：气泡里摊开看它一眼（点开是大图）。读不出来退回原来那条文件行。 -->
+              <ImagePreview path={item.path} label={item.name} onopen={() => (viewing = item)}>
+                <button class="fbub is-open" type="button" onclick={() => void openFile(item)}>
+                  {@render fileBub(item)}
+                </button>
+              </ImagePreview>
+            {:else if item.path}
+              <!-- 收完的那条：整块是一颗按钮，点它交给系统打开（`openFile`）。状态那一行顺带
+                   说一句"点一下打开"（手机上只有这一处文字提示 —— 没有悬停可看）。 -->
+              <button class="fbub is-open" type="button" onclick={() => void openFile(item)}>
+                {@render fileBub(item)}
+              </button>
+            {:else}
+              <!-- 还没有落盘路径 = 还在传（或已经被拒/失败）。**正在接收**时这一行右端多一颗
+                   停止：撤掉这条接收，点了就不会再自动接着收（见 `stopReceive`）。 -->
+              <span class="fbub">
+                {@render fileBub(item)}
+                {#if item.inviteState === "accepted"}
+                  <button
+                    class="fstop"
+                    type="button"
+                    aria-label="停止接收「{item.name}」"
+                    onclick={() => void stopReceive(item)}
+                  >
+                    <Icon name="stop" />
+                  </button>
                 {/if}
               </span>
-            </span>
+            {/if}
           {:else}
-            <span class="ctext">{item.text}</span>
+            {#if item.image}
+              <!-- **图片消息**：图片是消息内容，不是文件 —— 对端直接就能看（没有"接收 / 同意"
+                   那一步），气泡里就是那张图，点开看大图。内容不在盘上就退回一行名字。 -->
+              {#if item.path}
+                <ImagePreview path={item.path} label={item.name ?? "图片"} onopen={() => (viewing = item)}>
+                  <span class="fbub"><span class="fname">{item.name ?? "图片"}</span></span>
+                </ImagePreview>
+              {:else}
+                <span class="ctext">{item.name ?? "图片"}（读不出来）</span>
+              {/if}
+            {:else}
+              <span class="ctext">{item.text}</span>
+            {/if}
           {/if}
         </div>
         <span class="meta num">{metaOf(item)}</span>
@@ -238,7 +460,11 @@
   {/each}
 </div>
 
-<!-- 底部那颗 `＋`（发送文件）本阶段不放：手机选文件要走 content URI 导入，还没做。 -->
+<!-- 输入区是**富文本**（`contenteditable`）：文字与图片在同一条流里，图能夹在前后两段文字中间。
+     手机这一端图片是**从输入法的剪贴板进来的**（长按/剪贴板里那张图 → 粘进框里），
+     进来的那个 `<img>` 由 `onInput` 认领成一份本机暂存文件（见 `lib/composer.ts`）。
+     交给 Svelte 管的只有"哪条会话 / 哪个节点"，框里的内容由 `lib/composer.ts` 直接读写 DOM
+     —— 受控的话每敲一个字光标都会被拽回最前。 -->
 <form
   class="compose"
   onsubmit={(e) => {
@@ -246,18 +472,34 @@
     void send();
   }}
 >
-  <input
-    class="cinput"
-    type="text"
-    placeholder="发送消息…"
-    autocomplete="off"
+  <div
+    class="cinput cx"
+    contenteditable="true"
+    role="textbox"
+    tabindex="0"
+    aria-multiline="true"
+    spellcheck="false"
+    data-empty="1"
+    data-placeholder="发送消息…"
     aria-label="消息内容"
     bind:this={inputEl}
-    value={draft}
-    oninput={(e) => chat.setDraftOf(convoKey, e.currentTarget.value)}
+    oninput={() => void onInput()}
+    onpaste={onPaste}
     onkeydown={onKey}
-  />
-  <button class="cbtn csend" type="submit" aria-label="发送消息" disabled={!draft.trim()}>
+  ></div>
+  <button class="cbtn csend" type="submit" aria-label="发送消息" disabled={!canSend}>
     <Icon name="send" />
   </button>
 </form>
+
+<!-- 「看大图」：会话里点一张图的缩略图就在这一层上摊开它（换会话时上面那个 effect 会清掉）。 -->
+{#if viewing && viewing.path !== undefined && viewing.path !== ""}
+  <ImageViewer
+    path={viewing.path}
+    name={msgName(viewing)}
+    onclose={() => (viewing = null)}
+    onopenfile={() => {
+      if (viewing) void openFile(viewing);
+    }}
+  />
+{/if}

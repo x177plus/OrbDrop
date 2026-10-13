@@ -225,7 +225,7 @@ WARN 把这次目录枚举判失败 {'why': '身份解不出来'}
 |---|---|---|
 | 端点 | `GET /file?share&path&offset&len` + `/tree` `/stat` | `POST /push/stream`（新）/ `GET /push/download`（老对端） |
 | 客户端 | `peer_fs::client()`（独立超时：5s 连接 / 30s 总） | `net::client()`（无总超时，长传输要它） |
-| 落盘根 | `<数据目录>/mirror`（占位符 + 水合字节） | `<下载目录>/<发送方名>/…`（真文件） |
+| 落盘根 | `<数据目录>/mirror`（占位符 + 水合字节） | `<下载目录>/<发送方名>/…`（真文件；S-12 关掉这层时 = `<下载目录>/…`） |
 | 状态 | `IDLE` 表、撤销登记表（`IN_FLIGHT`）、`identity` | `PushStore`（jobs/inbound/resume/batches） |
 | 并发 | 平台按需回调，一区一段串行拉（4MB 一段） | 每邀请 N 路并行（设置项，默认 4） |
 

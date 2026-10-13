@@ -15,15 +15,23 @@
  *   （`ChatScreen` 画好了卡、`store.answerInvite` 也落到了 `accept_push`/`reject_push`）、
  *   它的进度与终局，外加一条 toast：移动端没有桌面端右下角那叠通知气泡，"收到东西了"
  *   这件事只有 toast 与「文件」页两个出口。
+ * - `push://batch` —— **发送侧**那张快照（输入框里粘一张图发出去就是一次推送）：
+ *   会话里那条文件气泡的百分比与成败都抄它。
  * - `pair://completed` / `pair://invite_failed` —— 本机**发出去**的配对邀请的结果
  *   （`PairSheet` 只负责报"已发出"，结果由这两条回来）。
+ * - `link://request` / `link://request_sent` / `link://request_closed` / `link://request_result`
+ *   —— 长连接请求（F-16 的同意制），两端都接：别人发来的请求开一张底板当场接受/拒绝；
+ *   本机发出的请求在设备页上停在"等对方同意"那一档、可取消；结果三档（同意/拒绝/退回直拨）
+ *   都有 toast。
  * - `local://addresses` —— 本机网卡地址变了（手机上换 Wi-Fi / 开热点比桌面上常见得多）：
  *   「设备」页那行「本机 · ip:port」重拉一次。
  *
  * **不接的**（各有明确理由，别顺手加上）：
- * - `push://batch` / `push://response`：发送侧的事件，而移动端目前**没有发文件的入口**
- *   （`push_paths` 只在桌面端被调用）。将来手机上能发文件时，在这里接
- *   `push://batch` → `chat.noteBatch`，会话气泡里那个百分比才会动。
+ * - `push://response`：发送侧那一条"某台单独答复"的通知。移动端的发送侧出入口是会话里那条
+ *   文件气泡 + 「文件」页的"传输中"，两者读的都是 `push://batch` 那张快照（已经接了），
+ *   桌面端右下角那叠推送卡片与它的逐台通知是桌面端自己那套 UI 的事。
+ *   （`push://batch` 以前也在这一档里 —— "移动端没有发文件的入口，`push_paths` 只在桌面端被
+ *   调用"；现在输入框里粘一张图就能发，那一半已经接上了。）
  * - `pair://invite` / `pair://invite_closed` / `pair://completed` / `pair://invite_failed`：
  *   两端都接（P1-13⑤）—— 别人发来的邀请开一张「接收 / 拒绝」底板（桌面端是右下角那条通知），
  *   本机发出去的邀请在配对表里停在"等待对方确认"那一档、可取消。
@@ -35,7 +43,8 @@
  */
 import { listen } from "@tauri-apps/api/event";
 import * as chat from "$lib/stores/chat.svelte";
-import { undeliverableText, type PushInvite, type Undeliverable } from "$lib/types";
+import { peerShortName } from "$lib/stores/devices.svelte";
+import { undeliverableText, type PushBatch, type PushInvite, type Undeliverable } from "$lib/types";
 import * as store from "./store.svelte";
 
 /** 事件载荷里只有 `inviteId`，而 toast 要说"收到了哪个文件"，所以回会话里认一下。 */
@@ -56,7 +65,7 @@ export const ready: Promise<void> = (async () => {
     const inv = ev.payload;
     chat.noteInboundInvite(inv);
     store.toast(
-      inv.auto ? `正在接收「${inv.name}」` : `「${inv.sender.name}」发来「${inv.name}」`,
+      inv.auto ? `正在接收「${inv.name}」` : `「${peerShortName(inv.sender.id, inv.sender.name)}」发来「${inv.name}」`,
       "download",
     );
   });
@@ -69,16 +78,29 @@ export const ready: Promise<void> = (async () => {
     chat.noteInviteProgress(inviteId, received, total);
   });
 
+  // **发送侧**那张快照：输入框里粘一张图发出去，走的就是推送这条路
+  // （`stores/chat.svelte.ts::sendComposer` → `push_paths`）。会话里那条文件气泡的百分比与
+  // 成败都是这张快照抄来的（唯一的进度来源），没有它那条气泡会一直停在"传输中 0%"。
+  //
+  // 这是移动端**唯一**的发送侧事件：别的（`push://response` 那几条单独通知、右下角那叠
+  // 推送卡片）是桌面端自己那套 UI 的事，移动端出入口是「文件」页的"传输中"，读的是同一份
+  // 文件消息（见 `store.activeTransfers`）。
+  await listen<PushBatch>("push://batch", (ev) => {
+    chat.noteBatch(ev.payload);
+  });
+
   // 一条推送的终局：已接收 / 已拒绝或取消 / 失败。**三档要如实对应**（P1-13②）：
   // store 里本来就有 `rejected` 这个状态（气泡写「已拒绝接收」），旧写法把所有非 completed
   // 都塞进 `failed` —— 用户自己点「拒绝」、或任一端取消，界面上都显示成「接收失败」，
   // 看着像出错了，其实是有人主动做的决定。
-  await listen<{ inviteId: string; status: string; reason?: string | null }>("push://done", (ev) => {
-    const { inviteId, status, reason } = ev.payload;
+  await listen<{ inviteId: string; status: string; reason?: string | null; dest?: string }>("push://done", (ev) => {
+    const { inviteId, status, reason, dest } = ev.payload;
     const name = nameOfInvite(inviteId);
     const outcome =
-      status === "completed" ? "received" : status === "cancelled" ? "rejected" : "failed";
-    chat.noteInviteDone(inviteId, outcome);
+      status === "completed" ? "received" : status === "cancelled" ? "cancelled" : "failed";
+    // `dest`（落盘那一层目录）一并给会话 store：会话里那条气泡上的「打开」按它去开
+    // （见 `ChatFileMsg.path`）—— 东西落在哪只有后端知道。
+    chat.noteInviteDone(inviteId, outcome, dest);
     if (status === "completed") {
       store.toast(`已收到「${name}」`, "download");
       // 收件目录里刚多了一项，而「文件」页那份列表只在挂载/手动刷新/删除时才拉 ——
@@ -102,7 +124,7 @@ export const ready: Promise<void> = (async () => {
       // 等对方确认的那一档到此结束（表里那颗「取消邀请」跟着收掉）。
       store.clearPendingPairInvite(ev.payload.inviteId ?? undefined);
       if (!ev.payload.inviteId) return;
-      store.toast(`已与「${ev.payload.peerName ?? "设备"}」配对成功`);
+      store.toast(`已与「${peerShortName(ev.payload.peerId, ev.payload.peerName ?? "设备")}」配对成功`);
     },
   );
   await listen<{ inviteId: string; reason?: string | null }>("pair://invite_failed", (ev) => {
@@ -121,7 +143,7 @@ export const ready: Promise<void> = (async () => {
       store.notePairInvite({
         inviteId: p.inviteId,
         peerId: p.peerId,
-        peerName: p.peerName,
+        peerName: peerShortName(p.peerId, p.peerName),
         unproven: p.unproven === true,
       });
     },
@@ -131,6 +153,57 @@ export const ready: Promise<void> = (async () => {
     const wasOpen = store.incomingPairInvite()?.inviteId === inviteId;
     store.dropPairInvite(inviteId);
     if (wasOpen) store.toast(`配对邀请已作废：${reason ?? "超时未处理"}`, "x");
+  });
+
+  // **别人发来的**长连接请求（F-16 的同意制）：点「连接」不再直接拨号，先到对方这里问一声。
+  // 桌面端是右下角一条带「接受/拒绝」的通知；移动端用一张底板接住（`noteLinkRequest` 会打开
+  // 它）。和配对邀请同一取舍：有效期只有 60s（后端 `link::REQUEST_TTL`），等不起 —— 除了
+  // toast，还要**当场**把那张表开到脸上。
+  await listen<{ requestId: string; peerId: string; peerName: string }>("link://request", (ev) => {
+    const p = ev.payload;
+    store.noteLinkRequest({ requestId: p.requestId, peerId: p.peerId, peerName: peerShortName(p.peerId, p.peerName) });
+    store.toast(`「${peerShortName(p.peerId, p.peerName)}」请求与本机建立长连接`, "link");
+  });
+
+  // 本机刚把一条请求发出去（`connect_peer` 返回 `asked` 时后端发的）：挂上"在等谁同意"
+  // 那一档（设备页上可见、可取消）。**真 requestId 只从这条来** —— `connect_peer` 的返回
+  // 不带 id（后端明说"界面不该同时从两个地方拼同一件事"）。
+  await listen<{ requestId: string; peerId: string; peerName: string }>(
+    "link://request_sent",
+    (ev) => {
+      store.setPendingLinkRequest(ev.payload.requestId, peerShortName(ev.payload.peerId, ev.payload.peerName));
+    },
+  );
+
+  // 一条请求作废了（超时 / 对端撤回）：收掉底板与本机那一档等待态。发散处照
+  // `pair://invite_closed` 的写法：**只在底板正开着时才 toast**（没开表说明用户压根没看见，
+  // 再报一句"作废了"是噪音）。
+  await listen<{ requestId: string; reason?: string | null }>("link://request_closed", (ev) => {
+    const { requestId, reason } = ev.payload;
+    const wasOpen = store.incomingLinkRequest()?.requestId === requestId;
+    store.dropLinkRequest(requestId);
+    store.clearPendingLinkRequest(requestId);
+    if (wasOpen) store.toast(`连接请求已作废：${reason ?? "超时未处理"}`, "x");
+  });
+
+  // 本机发出的请求有结果了。三档要如实对应：同意 → 正在建链；拒绝（或对方没处理）→ 把
+  // 原因说出来并收等待态；退回直接拨号 → 与旧行为同一句"正在建立长连接"。
+  await listen<{
+    requestId: string;
+    peerId: string;
+    outcome: "granted" | "denied" | "fallback";
+    reason?: string | null;
+  }>("link://request_result", (ev) => {
+    const { requestId, outcome, reason } = ev.payload;
+    const name = store.pendingLinkRequest()?.peerName ?? "设备";
+    store.clearPendingLinkRequest(requestId);
+    if (outcome === "granted") {
+      store.toast(`「${name}」已同意：正在建立长连接`);
+    } else if (outcome === "denied") {
+      store.toast(`「${name}」没有接受连接请求：${reason ?? "对方未处理"}`, "x");
+    } else {
+      store.toast(`正在与「${name}」建立长连接`);
+    }
   });
 
   // 一条消息直连不通、也没有可用的中转（F-106）：**别静默** —— 消息照既有语义排队等它上线，

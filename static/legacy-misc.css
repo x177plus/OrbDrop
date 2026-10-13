@@ -1,0 +1,32 @@
+/*
+ * 老引擎的零星补丁 —— **手写**（只有 5 条，不值得生成），与 `legacy-gap.css` 同一机制：
+ * 由 `static/engine-floor.js`（ES5、最先执行）探到对应能力缺失时**按需 `<link>`**，现代引擎根本不加载。
+ *
+ * 这里只放"缺了会坏功能"的：
+ *
+ * 1. `inset: 0` 是 Chrome 87 起的简写，老引擎整条丢掉 —— 那 5 处都是绝对定位的铺满层
+ *    （`.sub` 全屏子页、`.switch input`/`.track`、`.scrim` 遮罩、`.sheet-layer` 弹层），
+ *    丢掉就等于"没有定位"，弹层位置与点击区域全错。退回四条 longhand 即可。
+ *
+ * 刻意不补的两项（都是观感/键盘专属，老引擎上原样缺着，不影响功能）：
+ *
+ * · `:focus-visible`（Chrome 86 起）：那两条是**键盘**聚焦环。手机没有键盘；退回 `:focus` 会让
+ *   每次点按都描一圈，反而更糟。
+ * · `accent-color`（Chrome 93 起）：原生 checkbox/radio 的强调色（`.radio/.mode/.pick input`）。
+ *   老引擎上显示系统默认蓝，而"选中"本身还有容器上的 `.is-checked` 样式兜着 —— 信息不丢。
+ *   （`.mode[data-mode="broadcast"] input` 的 `--bc` 强调色同样退成默认蓝。）
+ *
+ * 滚动条那 4 处**不用管**：`mobile.css` 每条 `scrollbar-width: none` 都配了
+ * `::-webkit-scrollbar { display: none }`，而 webkit 前缀那一条在 81 上就是生效的。
+ */
+
+/* 全屏子页（会话/设备等的次级页面，靠 transform 滑入） */
+.sub { top: 0; right: 0; bottom: 0; left: 0; }
+
+/* 开关：真实 input 铺满整块（点哪儿都算），轨道是它下面的那层 */
+.switch input { top: 0; right: 0; bottom: 0; left: 0; }
+.switch .track { top: 0; right: 0; bottom: 0; left: 0; }
+
+/* 遮罩与弹层：都要铺满整屏 */
+.scrim { top: 0; right: 0; bottom: 0; left: 0; }
+.sheet-layer { top: 0; right: 0; bottom: 0; left: 0; }

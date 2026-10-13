@@ -3,6 +3,15 @@ import type { PeerDevice } from '$lib/types';
 import * as api from '$lib/api';
 
 let devices = $state<PeerDevice[]>([]);
+/**
+ * 后端原样报上来的那一份（上面那份是 [`visibleDevices`] 过滤 + 排序之后的）。
+ *
+ * 留着它是给**会话侧取名字**用的：一台聊过天的设备解除配对又离线之后会掉出上面那份
+ * （F-13：离线且未绑定的不列），但它的会话还留着（记录是用户数据，见 `stores/chat` 的
+ * `convoRows`）—— 那一行的名字得从这儿找（`peerShortName` 会在这两份里各找一遍）。设备表
+ * 本身很小（一屏设备数），多留一份引用不值一提。
+ */
+let allDevices = $state<PeerDevice[]>([]);
 let loading = $state(false);
 
 export function getDevices() { return devices; }
@@ -19,8 +28,8 @@ export function isDevicesLoading() { return loading; }
  * 状态点照旧按 `offline` 画；"这张网把单播隔开了"只在**发起连接**时弹一句 tip（见 `unicastBlocked`）。
  *
  * 排序（用户要求）：**在线在前、离线在后**；在线组内 长连接 → 已配对 → 未绑定
- * （离线组内同理，只是没有长连接可言）。同级按名字排 —— 按**显示名**（设了备注就是
- * 「备注(设备名)」）：用户看到的是显示名，排序就该跟眼睛一致，否则备注会把行序弄乱。
+ * （离线组内同理，只是没有长连接可言）。同级按名字排 —— 按**设备列表上那个显示名**
+ * （设了备注就是「备注(设备名)」）：用户看到的是显示名，排序就该跟眼睛一致，否则备注会把行序弄乱。
  */
 export function visibleDevices(all: PeerDevice[]): PeerDevice[] {
   const group = (d: PeerDevice) => (d.online ? 0 : 1);
@@ -38,7 +47,9 @@ export function visibleDevices(all: PeerDevice[]): PeerDevice[] {
 export async function loadDevices() {
   loading = true;
   try {
-    devices = visibleDevices(await api.listDevices());
+    const all = await api.listDevices();
+    allDevices = all;
+    devices = visibleDevices(all);
   } catch (e) {
     console.error('Failed to load devices:', e);
   } finally {
@@ -49,12 +60,10 @@ export async function loadDevices() {
 /**
  * 一台设备的**显示名**（F-101）：设了备注就是「备注(设备名)」，否则就是设备名本身。
  *
- * 备注只存在本机（`config.toml` 的 `deviceRemarks`），对端看到的仍是它自己的名字 ——
- * 所以拼装只在这一处：设备行、标签栏、会话标题、收件人选择框、推送卡与 toast 全走它，
- * 谁也别自己拼一遍（那才是"设备名又分叉了"的老毛病）。
- *
- * 空字符串的备注按"没备注"处理：后端不会存空串（见 `Config::set_device_remark`），
- * 但手改过的 `config.toml` 里可能有。
+ * **只给局域网设备列表那一处用**：设备行（名字 + 头像字）、它的右键菜单、搜索匹配与排序 ——
+ * 那里是"挑哪一台机器"的地方，把设备名一起写着才认得出。别处一律 `deviceShortName`
+ * （有备注就只写备注）：会话列表/标题、标签栏、设备页头、收件人选择框、推送卡、toast 与通知。
+ * 名字长了照样能读全：这些地方都挂了 `title`（详见 `deviceShortName` 那段）。
  */
 export function deviceDisplayName(d: PeerDevice): string {
   const remark = d.remark?.trim();
@@ -62,14 +71,32 @@ export function deviceDisplayName(d: PeerDevice): string {
 }
 
 /**
- * 按设备 id 取显示名（拿不到这台设备时用 `fallback`，没给就退回 id 本身）。
+ * 一台设备的**短名**（F-101）：有备注就是备注本身（**不挂设备名**），没备注就是设备名。
+ *
+ * 这是本机界面上的**默认**名字。备注只存在本机（`config.toml` 的 `deviceRemarks`），
+ * 对端看到的仍是它自己的名字 —— 拼装只在这一处，谁也别自己拼一遍。
+ *
+ * 空字符串的备注按"没备注"处理：后端不会存空串（见 `Config::set_device_remark`），
+ * 但手改过的 `config.toml` 里可能有。名字被截断时全名在 `title` 里（悬停看全）。
+ */
+export function deviceShortName(d: PeerDevice): string {
+  const remark = d.remark?.trim();
+  return remark || d.name;
+}
+
+/**
+ * 按设备 id 取**短名**（拿不到这台设备时用 `fallback`，没给就退回 id 本身）。
  *
  * `fallback` 是给"名字来自别处"的场合用的：会话消息、推送卡与通知里的名字是**收到那一刻**
  * 存下来的字符串，设备表里可能已经没有这一台（移除过、或还没学到它），那时至少要有名字可显示。
+ *
+ * **设备页那份列表里没有的这台，再去后端原样那份里找一遍**（`allDevices`）：解绑又离线的设备
+ * 会被 `visibleDevices` 挡在设备页之外，可跟它的会话还在（记录是用户数据，见 `stores/chat`
+ * 的 `convoRows`）—— 会话列表与标题要拿它的名字，而不是一串设备 id。
  */
-export function peerDisplayName(peerId: string, fallback?: string): string {
-  const d = devices.find((x) => x.id === peerId);
-  return d ? deviceDisplayName(d) : fallback ?? peerId;
+export function peerShortName(peerId: string, fallback?: string): string {
+  const d = devices.find((x) => x.id === peerId) ?? allDevices.find((x) => x.id === peerId);
+  return d ? deviceShortName(d) : fallback ?? peerId;
 }
 
 /**
@@ -154,7 +181,7 @@ export function unicastBlocked(d: PeerDevice | undefined): boolean {
  */
 export function unicastBlockedTip(d: PeerDevice | undefined): string | null {
   if (!d || !unicastBlocked(d)) return null;
-  return `「${deviceDisplayName(d)}」直连不通：它在同一网段（能收到它的 mDNS 记录），但这张 Wi-Fi 可能把客户端之间的单播隔开了。要立刻连上它，得有一台两端都够得着的设备打开设置里的「允许为其它设备中转」——由它接管之后这一行会写「经 X 中转」。`;
+  return `「${deviceShortName(d)}」直连不通：它在同一网段（能收到它的 mDNS 记录），但这张 Wi-Fi 可能把客户端之间的单播隔开了。要立刻连上它，得有一台两端都够得着的设备打开设置里的「允许为其它设备中转」——由它接管之后这一行会写「经 X 中转」。`;
 }
 
 /**
