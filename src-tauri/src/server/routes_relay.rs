@@ -39,6 +39,15 @@ pub struct RelayRequester {
     /// 请求方**实际监听**的端口（本机去 `来源地址:这个端口` 问 `/pair/info` 核实）。
     #[serde(default)]
     pub port: u16,
+    /// 请求方自报的**设备名**。
+    ///
+    /// 只用来**补名字**：核实成功时以**问出来的那个名字**为准（那才是核实过的，直接更新
+    /// 设备行）；这一份只在"核实不过、却确实是经它自己点名的中转方送达"那一档用得上
+    /// （`carried_by_named_relay`），那一档没核实过，所以只填占位行（`fill_peer_name`）。
+    /// 以前这条报文只带 id + 端口，本机建出来的行名字就是那串 device id —— 表现就是
+    /// "设备列表/会话里先显示一串 deviceid"。
+    #[serde(default)]
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,19 +111,32 @@ pub async fn relay_open(
             // **来源地址**记（见 `relay::open`），端点来源白名单也只认来源地址（`trusted_caller`
             // = false）。失败细节只进日志，不回给调用方。
             let at = SocketAddr::new(addr.ip(), claim.port);
-            if let Err(why) = crate::relay::verify_identity_at(at, claim.id.trim()).await {
-                debug!(%at, claimed = %claim.id, "中转请求方身份核实不过: {why}");
-                return (
-                    StatusCode::FORBIDDEN,
-                    "请求方身份核实不过（自报的 id 与那个地址上问出来的不一致）",
-                )
-                    .into_response();
-            }
+            let observed = match crate::relay::verify_identity_at(at, claim.id.trim()).await {
+                Ok(observed) => observed,
+                Err(why) => {
+                    debug!(%at, claimed = %claim.id, "中转请求方身份核实不过: {why}");
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "请求方身份核实不过（自报的 id 与那个地址上问出来的不一致）",
+                    )
+                        .into_response();
+                }
+            };
             // 刚才这一问**证明了这个地址上答得出这个 id**：记下来（只补空行）。
             // 为什么重要：请求方往往正是"本机从别处只知其名、没有地址"的那一台 ——
             // 记下来之后，它下一次来请中转时就不必再靠 hint（真机上"本机不认识设备 X"
             // 就是这条缺失造成的）。
             state.observe_verified_addr(claim.id.trim(), &addr.ip().to_string(), claim.port);
+            // 同一问还证明了两件事，一并收下：
+            // ① **它此刻活着**（与 5s 探活同一级的证据，见 `AppState::heard`）；
+            // ② 它叫什么 —— **问出来的那份是核实过的**（这个地址上答得出这个 id）→ 直接更新
+            //    （`note_peer_name`：对端改名跟着走）；它没报名字时才退回自报的那份，那一份
+            //    没核实过，只填占位行（`fill_peer_name`）。
+            state.note_heard_online(claim.id.trim());
+            match observed {
+                Some(name) => state.note_peer_name(claim.id.trim(), &name),
+                None => state.fill_peer_name(claim.id.trim(), claim.name.trim()),
+            }
             (claim.id.trim().to_string(), false)
         }
     };
@@ -193,37 +215,60 @@ pub async fn relay_route(
                     .into_response();
             }
             let at = SocketAddr::new(addr.ip(), claim.port);
-            if let Err(why) = crate::relay::verify_identity_at(at, claim.id.trim()).await {
-                // **经中转过来的那一侧**：它自己够不着本机（AP 隔离那类），上面这一问必然
-                // 问不出它的身份 —— 来源地址是**中转方**，不是它。判据换成"这条连接是从
-                // **记录自己点名的中转方**那里转发来的"：TCP 来源地址伪造不了，而记录只是
-                // 提示（目标身份在借中转那一跳由中转方到地址上核实，见 `relay::open`）。
-                //
-                // 少了这一条，F-107 §10 的反向记录**恰恰在它唯一有用的场合**送不到：A 经
-                // C 到 B，A 想把自己那一段的路由告诉 B，而这一推只能经 C（A 够不着 B）——
-                // 被这一关 403 掉，B 于是永远不知道该经谁回去。"单向通、反向不通"就是这么来的。
-                if !carried_by_named_relay(addr.ip(), &req.routes) {
-                    debug!(%at, claimed = %claim.id, "路由记录：调用方身份核实不过: {why}");
-                    return (
-                        StatusCode::FORBIDDEN,
-                        "调用方身份核实不过（自报的 id 与那个地址上问出来的不一致）",
-                    )
-                        .into_response();
+            let verified = match crate::relay::verify_identity_at(at, claim.id.trim()).await {
+                Ok(observed) => Some(observed),
+                Err(why) => {
+                    // **经中转过来的那一侧**：它自己够不着本机（AP 隔离那类），上面这一问必然
+                    // 问不出它的身份 —— 来源地址是**中转方**，不是它。判据换成"这条连接是从
+                    // **记录自己点名的中转方**那里转发来的"：TCP 来源地址伪造不了，而记录只是
+                    // 提示（目标身份在借中转那一跳由中转方到地址上核实，见 `relay::open`）。
+                    //
+                    // 少了这一条，F-107 §10 的反向记录**恰恰在它唯一有用的场合**送不到：A 经
+                    // C 到 B，A 想把自己那一段的路由告诉 B，而这一推只能经 C（A 够不着 B）——
+                    // 被这一关 403 掉，B 于是永远不知道该经谁回去。"单向通、反向不通"就是这么来的。
+                    if !carried_by_named_relay(addr.ip(), &req.routes) {
+                        debug!(%at, claimed = %claim.id, "路由记录：调用方身份核实不过: {why}");
+                        return (
+                            StatusCode::FORBIDDEN,
+                            "调用方身份核实不过（自报的 id 与那个地址上问出来的不一致）",
+                        )
+                            .into_response();
+                    }
+                    info!(
+                        claimed = %claim.id,
+                        from = %addr.ip(),
+                        "路由记录经它自己点名的中转方送达（自报那一关问不到中转方背后的那一台）"
+                    );
+                    None
                 }
-                info!(
-                    claimed = %claim.id,
-                    from = %addr.ip(),
-                    "路由记录经它自己点名的中转方送达（自报那一关问不到中转方背后的那一台）"
-                );
-            } else {
-                // 直接送达的那一档：这一问**证明了来源地址上答得出这个 id**，记下来（只补空行）。
+            };
+            // 名字这一格与"它在不在网上"分开看：
+            // - **核实成功**：问出来的那份名字是核实过的 → 直接更新（`note_peer_name`）；
+            //   它没报名字才退回自报那份（那一份没核实，只填占位行）；并且这一问本身
+            //   就证明它活着 → 记进"刚听到过"（见 `AppState::heard`）。
+            // - **核实不过**（经中转方送达那一档）：只能采信自报的名字，与未配对会话信封上的
+            //   名字同一档信任（**只填占位行**）；**不声明在线** —— 这条 TCP 来源是**中转方**，
+            //   证明不了它活着。
+            if let Some(observed) = verified {
                 state.observe_verified_addr(claim.id.trim(), &addr.ip().to_string(), claim.port);
+                state.note_heard_online(claim.id.trim());
+                match observed {
+                    Some(name) => state.note_peer_name(claim.id.trim(), &name),
+                    None => state.fill_peer_name(claim.id.trim(), claim.name.trim()),
+                }
+            } else {
+                state.fill_peer_name(claim.id.trim(), claim.name.trim());
             }
             claim.id.trim().to_string()
         }
     };
     let (accepted, ignored) = state.apply_relay_routes(&caller_id, &req.routes);
-    info!(
+    // `debug` 而不是 `info`：这条路由是**事件驱动**的（每次路由记忆有变化就推一拍，最短 30s
+    // 一次），而绝大多数请求什么都没被采纳（`accepted: 0`，本机不是那个目标段）。按 `info`
+    // 记就是每半分钟一条"什么都没发生"，实测一天 1.4 兆。**真正被采纳的那一刻**由
+    // `AppState::apply_relay_routes` 记一条 INFO（那条只在 `accepted` 非空时才走），
+    // 事件本身一个字都没漏，只是不再复述。
+    debug!(
         caller = %caller_id,
         from = %addr.ip(),
         accepted = accepted.len(),

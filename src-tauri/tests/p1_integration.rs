@@ -698,6 +698,7 @@ async fn multi_device_push_isolates_targets_and_shares_one_manifest() {
         paths,
         vec!["device-mdb".into(), "device-mdb".into(), "device-mdc".into(), "device-mdd".into()],
         None,
+        None,
     )
     .await
     .expect("两台在线：整批该发出去");
@@ -811,6 +812,7 @@ async fn multi_device_push_isolates_targets_and_shares_one_manifest() {
         state_a.clone(),
         vec![src.to_string_lossy().to_string()],
         vec!["device-mdd".into(), "device-missing".into()],
+        None,
         None,
     )
     .await
@@ -935,7 +937,7 @@ async fn push_invite(
     paths: Vec<String>,
     peer_id: &str,
 ) -> Result<transfer::push_job::BatchView, String> {
-    transfer::push_paths(state, paths, vec![peer_id.to_string()], None).await
+    transfer::push_paths(state, paths, vec![peer_id.to_string()], None, None).await
 }
 
 /// 「同意 → 等这批文件全部落地 → 等发送方收到完成回执」——多选用例的两批都走这一套。
@@ -3332,7 +3334,9 @@ async fn the_view_exchange_survives_a_live_link() {
     });
 
     // 造一条"活着"的长连接：探活那一趟必须仍然去要表。
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    // 容量给个字面量：这里只造"链路活着"这个前提，没人往队列里发东西（`EVENT_QUEUE_CAPACITY`
+    // 是 `pub(crate)`，集成测试是独立 crate，看不见它）。
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
     state_a.ws.register(&b_id, tx);
     assert!(state_a.ws.has_connection(&b_id), "前提：链路活着");
 
@@ -3758,7 +3762,13 @@ async fn messages_sent_while_the_peer_is_offline_arrive_when_it_comes_back() {
     assert_eq!(on_b.unread, 4, "四条都没打开过 —— 补发进来的照样是未读（收到 ≠ 读过）");
 
     // ---- 重复投递由接收方按 id 幂等吸收（补发是"至少一次"：HTTP 到了、回话丢了） ----
-    let dup = WsEvent::ChatText { id: first.id.clone(), text: "你不在的时候说的".into(), at: first_at };
+    let dup = WsEvent::ChatText {
+        id: first.id.clone(),
+        text: "你不在的时候说的".into(),
+        at: first_at,
+        // 这条用例只管"按 id 幂等"，名字走老对端那一档（不带 = 空串）。
+        from_name: String::new(),
+    };
     assert_eq!(chat::deliver(&state_a, "device-off-b", &dup).await, chat::Outcome::Delivered, "这一跳是通的");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
@@ -4105,6 +4115,12 @@ async fn a_chain_group_catches_up_by_pull_and_by_relay() {
     address_book(&state_b, "device-ch-c", "PC-CHC", port_c);
     address_book(&state_c, "device-ch-b", "PC-CHB", port_b);
 
+    // 中转开关的缺省是**开**（`Config::default`）；这条用例要分开验"补拉"与"中转"两条路，
+    // 所以先把三台都关掉 —— ② 那一步再把中间那台打开。
+    for st in [&state_a, &state_b, &state_c] {
+        st.config.lock().group_relay = false;
+    }
+
     // 群由**中间那台**建：能同时看见两端的人建群，两端才都收得到名册（真事也是这样 ——
     // A 那边连 C 都列不出来，选不中它）。
     let gid = group::create(&state_b, &["device-ch-a".into(), "device-ch-c".into()], "跨段组").expect("建群");
@@ -4270,11 +4286,13 @@ async fn relay_open_obeys_the_rules_and_blind_forwards_bytes() {
             .json(&serde_json::json!({ "target": target }))
     };
 
-    // 1) 开关默认关：本机不替任何人搬字节。
+    // 1) 开关关着：本机不替任何人搬字节（缺省是开，见 `Config::default`；这一档验的是
+    //    "用户关掉之后真的不开门"，所以先显式关一次）。
+    state.config.lock().allow_relay = false;
     assert_eq!(
         ask(&target_id).send().await.unwrap().status(),
         reqwest::StatusCode::FORBIDDEN,
-        "「允许为其它设备中转」默认关"
+        "「允许中转」关掉之后不再替别人搬字节"
     );
     // 2) 没凭据的连接在 auth 中间件就被拦（连门都进不去）。
     assert_eq!(

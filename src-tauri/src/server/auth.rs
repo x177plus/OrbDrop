@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use parking_lot::Mutex;
 use tracing::{debug, info};
 
@@ -166,6 +166,19 @@ fn base64_decode_basic(input: &str) -> Result<String, String> {
 fn split_basic(decoded: &str) -> Option<(&str, &str)> {
     let (user, token) = decoded.split_once(':')?;
     (!token.is_empty()).then_some((user, token))
+}
+
+/// `Authorization: Bearer <token>` 里那枚 token（没有这个头 / 不是 Bearer / 非 UTF-8 → `None`）。
+///
+/// 公开面上那几条"自称是本机已配对设备就必须出示凭据"的路都要它：`/chat/*`、`/push/*`
+/// 与 `/pair/hello`。原来这条小工具在 `routes_chat` 与 `routes_push` 各抄了一份。
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("Authorization")?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(|t| t.to_string())
 }
 
 #[cfg(test)]

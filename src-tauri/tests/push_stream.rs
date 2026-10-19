@@ -169,9 +169,31 @@ fn pair_without_ws(
     port_a: u16,
     port_b: u16,
 ) {
-    const SHARED_TOKEN: &str = "00112233445566778899aabbccddeeff";
-    credential::set_peer(id_b, SHARED_TOKEN).unwrap();
-    credential::set_peer(id_a, SHARED_TOKEN).unwrap();
+    pair_without_ws_with_token(state_a, state_b, id_a, id_b, port_a, port_b, &pairing_token());
+}
+
+/// 一次配对用哪枚 token。
+///
+/// **每次新铸一枚**（而不是全文件共用一个常量）：凭据库是**整个测试进程共用**的（数据目录按
+/// pid 分，不按用例分），而"token → 设备 id"的解析在库里是**同一枚 token 对上多台设备**时
+/// 谁先命中谁说话 —— 用一个常量的话，任何一条用例先失败（没走到清理那一步）就会把它的设备
+/// 留在库里，后面每条用例的邀请都可能解析到**别人**身上，于是 `POST /push/invite` 一片 401。
+/// 每对设备各自一枚，这条污染链就断了（产品里每枚 token 本来就是配对时随机铸的）。
+fn pairing_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+fn pair_without_ws_with_token(
+    state_a: &Arc<AppState>,
+    state_b: &Arc<AppState>,
+    id_a: &str,
+    id_b: &str,
+    port_a: u16,
+    port_b: u16,
+    token: &str,
+) {
+    credential::set_peer(id_b, token).unwrap();
+    credential::set_peer(id_a, token).unwrap();
     state_a.add_peer_book(PeerDevice {
         id: id_b.into(),
         name: "PC-B".into(),
@@ -195,7 +217,7 @@ fn pair_without_ws(
 }
 
 async fn push_one(state: &Arc<AppState>, src: &std::path::Path, peer: &str) -> String {
-    transfer::push_paths(state.clone(), vec![src.to_string_lossy().to_string()], vec![peer.into()], None)
+    transfer::push_paths(state.clone(), vec![src.to_string_lossy().to_string()], vec![peer.into()], None, None)
         .await
         .expect("邀请应该发得出去")
         .targets[0]
@@ -551,6 +573,215 @@ async fn the_same_file_into_two_dirs_keeps_both_records() {
     let _ = std::fs::remove_dir_all(&save);
 }
 
+/// **两端都重启过**：发送端那一半也要能接上（`push_out.json`）。
+///
+/// 与 `a_restarted_receiver_resumes_on_its_own` 的分工：那条只换接收端，发送端那条 job 一直在
+/// 内存里；这条**两边都换一身 AppState** —— 发送端必须从盘上把自己那条 job 捡回来，否则对面
+/// 来要块时只会拿到 410。
+///
+/// 第一趟照旧用"写不进去的落盘根"确定性掐断（`stop_server` 是优雅停机，掐不干净）。
+#[tokio::test]
+async fn both_sides_restarted_resume() {
+    let src = temp_dir("both_src");
+    let save = temp_dir("both_save");
+    let big: Vec<u8> = (0..24 * 1024 * 1024).map(|b| (b % 227) as u8).collect();
+    std::fs::write(src.join("big.bin"), &big).unwrap();
+    let blocked = save.join("blocked");
+    std::fs::write(&blocked, b"x").unwrap();
+
+    let (port_a, port_b) = two_free_ports();
+    let state_a = make_state(port_a, "device-ba", "PC-BA", save.clone());
+    let state_b = make_state(port_b, "device-bb", "PC-BB", blocked);
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    pair_without_ws(&state_a, &state_b, "device-ba", "device-bb", port_a, port_b);
+
+    let name = src.file_name().unwrap().to_string_lossy().to_string();
+    let dest = save.join("PC-BA").join(&name).join("big.bin");
+
+    // ---- 第一趟：B 自动收下（并把"开始拉了"回报给 A），然后因落盘根写不进去而收手 ---------
+    let invite = push_one(&state_a, &src, "device-bb").await;
+    wait_until("接收端接住这条（待续传任务落盘）", 30, || {
+        state_b.push.resume.pending_ids().contains(&invite)
+    })
+    .await;
+    // 发送端要知道"对面真的开始拉了" —— 这一刻它才会把这条落盘（`accepted = true`）。
+    wait_until("发送端记下「对面开始拉了」", 30, || {
+        state_a.push.job_status(&invite).as_deref().is_some_and(|s| s != "invited")
+    })
+    .await;
+    wait_until("这一趟收手（邀请摘掉）", 30, || {
+        !state_b.push.inbound.lock().contains_key(&invite)
+    })
+    .await;
+    assert!(!dest.exists(), "这一趟一个字节都没落地（目录建不出来）");
+    // 断言**只认自己这一条**：`push_out.json` 是**整个测试进程共用**的（数据目录按 pid 分），
+    // 兄弟用例留下的记录（例如刚走完、还在 `SETTLED_GRACE` 里的批次）也在里面 —— 数总量必挂。
+    let (jobs_on_disk, batches_on_disk) = state_a.push.out.snapshot();
+    assert_eq!(
+        jobs_on_disk.iter().filter(|j| j.id == invite).count(),
+        1,
+        "发送端那条 job 应该已经落盘"
+    );
+    assert!(jobs_on_disk.iter().any(|j| j.id == invite && j.accepted), "而且记着「对面开始拉了」");
+    assert!(
+        batches_on_disk
+            .iter()
+            .any(|b| b.targets.iter().any(|t| t.invite_id == invite)),
+        "那张卡也落盘了"
+    );
+
+    // ---- 两边都"重启"：同一份数据目录 / device id / 端口，全新一身 AppState ----------------
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    let state_a2 = make_state(port_a, "device-ba", "PC-BA", save.clone());
+    let state_b2 = make_state(port_b, "device-bb", "PC-BB", save.clone());
+    let port_a2 = orbdrop_lib::server::start_server_loopback(state_a2.clone(), port_a).await.unwrap();
+    let port_b2 = orbdrop_lib::server::start_server_loopback(state_b2.clone(), port_b).await.unwrap();
+    assert_eq!((port_a, port_b), (port_a2, port_b2));
+
+    // A2 启动那一拍：把没走完的发送任务捡回来（`lib.rs` 的启动块调的就是这一句）。
+    assert_eq!(orbdrop_lib::transfer::push_job::restore_outbound(&state_a2), 1);
+    assert!(state_a2.push.jobs.lock().contains_key(&invite), "取文件的凭据回来了");
+    let cards = state_a2.push.all_batch_views();
+    assert!(
+        cards
+            .iter()
+            .any(|c| c.targets.iter().any(|t| t.invite_id == invite && t.state == "sending")),
+        "卡也回来了，而且那一行写着「传输中」: {:?}",
+        cards
+    );
+
+    // B2 启动那一拍：自己接着收（发送端一次都没重推）。
+    // **按运行时的节拍反复叫**（`lib.rs` 的 5s 探活循环就是这么调的）：一次没成（够不着、
+    // 恰好撞上握手的边）下一拍会再试 —— 单叫一次与真实行为不符，而且会把"本会自愈的那一次"
+    // 记成失败。真的落终态（例如 410）时，下一拍就找不到待续传任务了，下面的断言照样会失败。
+    wait_until("接收端拿到这一趟的判决（续传收完或收手）", 120, || {
+        if !state_b2.push.resume.pending_ids().contains(&invite) {
+            return true;
+        }
+        transfer::resume_pending(&state_b2);
+        false
+    })
+    .await;
+    // ---- 本机能定下来的事实（与任何回执通道无关）------------------------------------------
+    assert_eq!(std::fs::read(&dest).unwrap(), big, "接着收之后必须逐字节一致");
+    assert_eq!(
+        state_b2.push.answer_invite_state(&invite, "device-ba").state,
+        "done",
+        "接收端那边的结局必须是「完成」"
+    );
+
+    // ---- 发送端那半边的收尾：走的是**尽力而为**的回执（三次尝试，见 `report_to_sender`）----
+    // 它**不是本功能承诺的东西**（承诺的是"取文件的凭据还在、对面来要块要得到" —— 上面断言过了）：
+    // 没有长连接的场合回执丢了不会有人来纠正（`PushAsk` 对账要求长连接），卡片会停在 100%，直到
+    // 7 天窗口按"最后报满了 → 已送达"收尾（`sweep_outbound`）。所以两种结局都接受，但"不许变成
+    // 假话"要断言：它绝不能被判成失败。
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut converged = false;
+    while std::time::Instant::now() < deadline {
+        if state_a2.push.jobs.lock().get(&invite).is_none() {
+            converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    if converged {
+        let (jobs_left, batches_left) = state_a2.push.out.snapshot();
+        assert!(
+            !jobs_left.iter().any(|j| j.id == invite),
+            "收到回执就该把发送侧那份凭据删掉: {jobs_left:?}"
+        );
+        // 卡片那份不要求"此刻盘上为空"：整批走完还留一段宽限期（`SETTLED_GRACE`，见 `batch_set`），
+        // 到点由 `sweep_settled_batches` 收掉；即使这期间重启，"全是终态的批次"在恢复时也会被丢掉。
+        // 所以这里断言的是**这一条再也恢复不出一张卡**（照样只看自己那条：文件是整个进程共用的）。
+        assert!(
+            !batches_left.iter().any(|b| {
+                b.targets
+                    .iter()
+                    .any(|t| t.invite_id == invite && (t.state == "sending" || t.state == "invited"))
+            }),
+            "盘上不该再有这一条「还在等 / 在传」的行: {batches_left:?}"
+        );
+    } else {
+        let status = state_a2.push.job_status(&invite).unwrap_or_default();
+        assert!(
+            status.starts_with("downloading"),
+            "回执丢了可以（对面已经收完，本机只是还不知道），但**绝不许被判成失败**：{status}"
+        );
+        eprintln!(
+            "[note] 发送端没在 30s 内收到完成回执（尽力而为那条路），卡片停在 100%；\
+             7 天窗口到期会按「最后报满了 → 已送达」收尾（`sweep_outbound`）"
+        );
+    }
+
+    orbdrop_lib::server::stop_server(&state_a2).await;
+    orbdrop_lib::server::stop_server(&state_b2).await;
+    credential::remove_peer("device-ba").ok();
+    credential::remove_peer("device-bb").ok();
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&save);
+}
+
+/// 发送端**没**把那条记录捡回来（老版本、降级回来、盘上那份被删了）：对面来要块只能拿到 410。
+///
+/// 这条守的是"说不出来的话"那一半：收尾要发生，而且理由是 `SENDER_GONE` ——
+/// **不能再写成「发送方已取消」**（`Missing` 分不出"它撤了"和"它那台没有这条 job 了"）。
+#[tokio::test]
+async fn without_the_sender_record_the_receiver_is_told_so() {
+    let src = temp_dir("nosrc_src");
+    let save = temp_dir("nosrc_save");
+    std::fs::write(src.join("big.bin"), vec![3u8; 8 * 1024 * 1024]).unwrap();
+    let blocked = save.join("blocked");
+    std::fs::write(&blocked, b"x").unwrap();
+
+    let (port_a, port_b) = two_free_ports();
+    let state_a = make_state(port_a, "device-na", "PC-NA", save.clone());
+    let state_b = make_state(port_b, "device-nb", "PC-NB", blocked);
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    pair_without_ws(&state_a, &state_b, "device-na", "device-nb", port_a, port_b);
+
+    let invite = push_one(&state_a, &src, "device-nb").await;
+    wait_until("接收端接住这条", 30, || {
+        state_b.push.resume.pending_ids().contains(&invite)
+    })
+    .await;
+    wait_until("这一趟收手", 30, || {
+        !state_b.push.inbound.lock().contains_key(&invite)
+    })
+    .await;
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    // A2：**故意不调用 `restore_outbound`** —— 就是"发送端那台没有这条 job 了"。
+    let state_a2 = make_state(port_a, "device-na", "PC-NA", save.clone());
+    let state_b2 = make_state(port_b, "device-nb", "PC-NB", save.clone());
+    let _port_a2 = orbdrop_lib::server::start_server_loopback(state_a2.clone(), port_a).await.unwrap();
+    let port_b2 = orbdrop_lib::server::start_server_loopback(state_b2.clone(), port_b).await.unwrap();
+    assert_eq!(port_b, port_b2);
+
+    transfer::resume_pending(&state_b2);
+    wait_until("接收端收手（410 → 不再重试）", 60, || {
+        !state_b2.push.resume.pending_ids().contains(&invite)
+    })
+    .await;
+    let answer = state_b2.push.answer_invite_state(&invite, "device-na");
+    assert_eq!(answer.state, "failed", "这条要如实落终态");
+    assert_eq!(
+        answer.reason.as_deref(),
+        Some(orbdrop_lib::transfer::SENDER_GONE),
+        "理由要说「不再提供」，而不是「发送方已取消」"
+    );
+
+    orbdrop_lib::server::stop_server(&state_a2).await;
+    orbdrop_lib::server::stop_server(&state_b2).await;
+    credential::remove_peer("device-na").ok();
+    credential::remove_peer("device-nb").ok();
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&save);
+}
+
 #[tokio::test]
 async fn a_changed_source_retracts_the_waiting_push() {
     let src = temp_dir("changed_src");
@@ -681,6 +912,70 @@ async fn device_subdir_off_lands_directly_in_the_download_dir() {
     orbdrop_lib::server::stop_server(&state_b).await;
     credential::remove_peer("device-fa").ok();
     credential::remove_peer("device-fb").ok();
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&save);
+}
+/// 覆盖名（F-119）：**发送应用**那条路走到对端落盘的名字。
+///
+/// 源是"某台设备上的 `base.apk`"——测试里就是一份只读的普通文件（真实那条路的区别只在
+/// 路径长什么样：`/data/app/~~…/base.apk`，本机不拷、不能改名）。发送时给一个覆盖名，
+/// 对端落盘的**文件名**必须就是它、字节必须逐字节一致。
+///
+/// 这条守的是两件容易走散的事：① 覆盖名要一路活到落盘处（单文件推送那条路上对端只认邀请里的
+/// `name` —— 少了它，对端收到的会是一条叫 `base.apk` 的文件）；② 本机那份翻译表仍按**源路径**
+/// 开文件（覆盖名只改"对端看到的样子"，不该把本机读字节那一路也换掉）。
+#[tokio::test]
+async fn a_renamed_source_lands_under_the_override_name() {
+    let src = temp_dir("rename_src");
+    let save = temp_dir("rename_save");
+    // 假的"安装包"：内容无所谓，要的是"路径与名字完全无关"这件事。
+    let body: Vec<u8> = (0..512 * 1024).map(|b| (b % 251) as u8).collect();
+    let apk = src.join("base.apk");
+    std::fs::write(&apk, &body).unwrap();
+    let shown = "微信_8.0.50(2600)_com.tencent.mm.apk";
+
+    let (port_a, port_b) = two_free_ports();
+    let state_a = make_state(port_a, "device-na", "PC-NA", save.clone());
+    let state_b = make_state(port_b, "device-nb", "PC-NB", save.clone());
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    pair_without_ws(&state_a, &state_b, "device-na", "device-nb", port_a, port_b);
+
+    let view = transfer::push_paths(
+        state_a.clone(),
+        vec![apk.to_string_lossy().to_string()],
+        vec!["device-nb".into()],
+        Some(vec![shown.to_string()]),
+        None,
+    )
+    .await
+    .expect("邀请应该发得出去");
+    // 邀请上那条名字也要是覆盖名：单文件那条路上对端只有它，没有清单可看。
+    assert_eq!(view.name, shown, "卡片/邀请上该写覆盖名");
+    let invite_id = view.targets[0].invite_id.clone();
+
+    wait_until("整批收完（收尾完成回执）", 60, || {
+        state_a.push.jobs.lock().get(&invite_id).is_none()
+    })
+    .await;
+
+    // 落盘名就是覆盖名（`<下载目录>/<发送方名>/<覆盖名>`），字节一个不差。
+    let landed = save.join("PC-NA").join(shown);
+    let got = std::fs::read(&landed).unwrap_or_else(|e| panic!("{landed:?} 没落盘: {e}"));
+    assert_eq!(got.len(), body.len());
+    assert!(got == body, "内容不一致");
+    assert!(
+        !save.join("PC-NA").join("base.apk").exists(),
+        "源名不该出现在对端那份里（覆盖名取代了它）"
+    );
+    let mut leftovers = Vec::new();
+    collect_parts(&save, &mut leftovers);
+    assert!(leftovers.is_empty(), "收完还留着临时文件: {leftovers:?}");
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    credential::remove_peer("device-na").ok();
+    credential::remove_peer("device-nb").ok();
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&save);
 }

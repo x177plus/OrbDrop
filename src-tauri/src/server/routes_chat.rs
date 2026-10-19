@@ -21,6 +21,7 @@ use tracing::info;
 
 use crate::config::PeerDevice;
 use crate::net;
+use crate::server::auth::bearer_token;
 use crate::state::AppState;
 use crate::ws::events::{PeerInfo, WsEvent};
 use crate::ws::session::peer_id_from_token;
@@ -55,7 +56,15 @@ pub async fn chat_message_handler(
     headers: HeaderMap,
     Json(body): Json<ChatMessageBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let event = WsEvent::ChatText { id: body.id, text: body.text, at: body.at };
+    // 信封上的名字一并装进事件（长连接那条路只能从载荷里带名字，见 `ChatText::from_name`）：
+    // 于是"填占位名"只有一处实现（`handle_inbound` 的 `ChatText` 臂），HTTP 与长连接两条
+    // 路的收尾完全一致。
+    let event = WsEvent::ChatText {
+        id: body.id,
+        text: body.text,
+        at: body.at,
+        from_name: body.sender.name.clone(),
+    };
     accept(&state, addr, &headers, &body.sender, body.port, event).await
 }
 
@@ -89,6 +98,7 @@ pub async fn chat_image_handler(
         name: body.name,
         size: body.size,
         data: body.data,
+        from_name: body.sender.name.clone(),
     };
     accept(&state, addr, &headers, &body.sender, body.port, event).await
 }
@@ -379,6 +389,7 @@ mod tests {
             id: "m1".into(),
             text: "在吗".into(),
             at: 42,
+            from_name: "PC-B".into(),
         })
         .unwrap();
         text["port"] = serde_json::json!(3890);
@@ -478,13 +489,4 @@ mod tests {
         assert_eq!((parsed.group_id.as_str(), parsed.id.as_str()), ("g1", "m1"));
         assert_eq!(parsed.reason, crate::group::REASON_DECLINED);
     }
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("Authorization")?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(|t| t.to_string())
 }

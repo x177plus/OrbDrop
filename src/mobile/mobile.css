@@ -503,6 +503,15 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .fgo { flex: none; width: calc(36 * var(--u)); height: calc(36 * var(--u)); border-radius: calc(10 * var(--u)); display: grid; place-items: center; color: var(--muted); }
 .fgo:hover { background: var(--fg-soft); color: var(--fg); }
 .fgo .ic { width: calc(18 * var(--u)); height: calc(18 * var(--u)); }
+/* 应用表（F-119，会话里「＋」→「应用」）那一行的字母头像。
+   行骨架沿用 `.frow`（与文件列表同一套内边距与分割线），这里只补一颗"看着像图标"的方块 ——
+   应用图标要在原生那一侧 Bitmap→PNG 落一份缓存才拿得到，为了一张表不值得；首字母与
+   「新建会话」那份 `.pick .pav` 同一个形状、同一个尺寸，两处一眼看得出是同一类东西。 */
+.aav { flex: none; width: calc(34 * var(--u)); height: calc(34 * var(--u)); border-radius: calc(11 * var(--u)); display: grid; place-items: center; background: var(--fg-soft); color: var(--fg); font-family: var(--font-display); font-size: calc(14 * var(--u)); font-weight: 650; }
+/* 真图标（F-119）：拿到之前那一行显示首字母（`.aav`），拿到之后换成这张图 —— 尺寸与圆角
+   与首字母那块**逐字一致**，换的那一下不会跳一下。`object-fit: cover` 是给"图标不是正方形"
+   的极少数应用兜底（多数是方图，cover 与 contain 看不出差别）。 */
+.aav-img { object-fit: cover; background: none; }
 
 /* ─────────────────────────── files · transfers ─────────────────────────── */
 .trow { display: grid; gap: calc(8 * var(--u)); padding: calc(13 * var(--u)) calc(14 * var(--u)); }
@@ -554,9 +563,6 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
   display: grid; place-items: center;
 }
 .dip { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* 「经 X 中转」：与地址**同一行、同一档小字**（两行恒定的第二行就靠它替地址那一位），
-   取强调色 —— 它说的是"这条路不是直连"。 */
-.drelay { font-size: var(--fs-xs); color: var(--accent-deep); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* 设备行：**头像与「⋯」都不做了**（见 docs/p1-implementation.md §21）——名字与地址因此拿回
    98px（393 宽下 98 → 197）。名字那一排因此只剩三样：名字、状态胶囊、**待处理角标**
    （F-112，见上面的 `.dn-pending` —— 头像没了，角标就落在这一排）。长按整行 = 设备操作，
@@ -631,6 +637,15 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .sheet-desc { margin: 0; font-size: var(--fs-xs); color: var(--muted); line-height: 1.55; }
 .sheet-body { flex: 1; min-height: 0; overflow-y: auto; padding: calc(12 * var(--u)) calc(20 * var(--u)) calc(22 * var(--u)); display: grid; gap: calc(12 * var(--u)); align-content: start; scrollbar-width: none; }
 .sheet-body::-webkit-scrollbar { display: none; }
+/* 卡片（`overflow: hidden` —— 行底色要贴着圆角裁）在 `.sheet-body` 这个 grid 里**不贡献内容高度**：
+   实测（Chromium，与安卓 WebView 同一套布局）`.card.list` 里 150 行一共 19501px，卡片自己塌成
+   26.9px，于是 `.sheet-body` 的 `scrollHeight == clientHeight` —— **整段列表既看不见也滚不动**。
+   给它一个显式的内容高度就恢复：卡片照旧按内容长，`.sheet-body` 也就有得滚了
+   （`max-content` 是 Chrome 46 起的关键字，在本端 Chrome 81 的下限之上）。
+
+   为什么"别的底板没碰上"：它们的长列表直接摆在 `.sheet-body` 里（`.stack` / `.pick`），
+   用 `.card.list` 包的都只有空状态那两三行。 */
+.sheet-body > .card { height: max-content; }
 .sheet-foot { display: flex; gap: calc(10 * var(--u)); }
 .sheet-foot .btn { flex: 1; }
 

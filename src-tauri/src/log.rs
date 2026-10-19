@@ -50,6 +50,18 @@ fn install_panic_recorder() {
     }));
 }
 
+/// 日志文件**保留几天**。
+///
+/// 为什么必须有这个数：`rolling::daily` 是两参数便捷函数，它**不带保留策略** ——
+/// `tracing_appender` 的 builder 默认 `max_files: None`，而 prune 只在 `Some` 时才跑，
+/// 于是每过一天就多一个 `orbdrop.log.<日期>` 且**谁也不删**：一个天天开着的机器就是
+/// 一条只涨不落的曲线（实测本机 30 天 72 MB、单日峰值 19 MB）。日志是给人看故障的，
+/// 不是给机器攒历史 —— 14 天足够回溯"上周那台设备为什么连不上"。
+///
+/// 注意 prune 也只在**跨天轮转那一刻**发生（`tracing_appender` 自己的行为）：一个进程
+/// 连开 30 天不会中途清文件，但它一天最多留一份新文件，所以上限仍然是 14 份。
+const LOG_KEEP_FILES: usize = 14;
+
 /// Initialize tracing with daily rolling file appender in the data dir /logs.
 pub fn init_log() {
     install_panic_recorder();
@@ -60,7 +72,20 @@ pub fn init_log() {
         return;
     }
 
-    let file_appender = rolling::daily(log_dir, "orbdrop.log");
+    let file_appender = match rolling::RollingFileAppender::builder()
+        .rotation(rolling::Rotation::DAILY)
+        .filename_prefix("orbdrop.log")
+        .max_log_files(LOG_KEEP_FILES)
+        .build(&log_dir)
+    {
+        Ok(appender) => appender,
+        Err(e) => {
+            // 建不出带保留策略的 appender（目录权限之类）时**不降级成无保留策略的那个**
+            // ——那正是这次要修的东西。退成只有 stdout：功能照旧，只是没有文件日志。
+            eprintln!("Failed to open log file in {log_dir:?}: {e}");
+            return;
+        }
+    };
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
     if let Ok(mut slot) = LOG_GUARD.lock() {
         *slot = Some(guard);

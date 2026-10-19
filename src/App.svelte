@@ -9,15 +9,15 @@
   import { cubicOut } from 'svelte/easing';
   import { listen } from '@tauri-apps/api/event';
   import { open as openDialog } from '@tauri-apps/plugin-dialog';
-  import { getDevices, loadDevices, isLocalOnline, noteLocalOnline, deviceShortName, peerShortName, saveDeviceRemark, unicastBlockedTip, needsRepair } from '$lib/stores/devices.svelte';
+  import { getDevices, loadDevices, isLocalOnline, noteLocalOnline, deviceById, deviceShortName, peerShortName, saveDeviceRemark, unicastBlockedTip, needsRepair } from '$lib/stores/devices.svelte';
   import { getServerPort, setServerPort, loadShares, addShare, removeShare, getShares } from '$lib/stores/shares.svelte';
   import { loadSettings, getSettings } from '$lib/stores/settings.svelte';
-  import { getPeerSharesState, loadPeerShares } from '$lib/stores/peers.svelte';
-  import { getBcStatus, loadBcStatus, setBcSide, clearSide, compare } from '$lib/stores/bc.svelte';
+  import { getPeerSharesState, loadPeerShares, forgetPeerShares } from '$lib/stores/peers.svelte';
+  import { getBcStatus, loadBcStatus, setLeft, compareWithLeft } from '$lib/stores/bc.svelte';
   import * as chat from '$lib/stores/chat.svelte';
   import type { ConvoThread, ChatItem } from '$lib/stores/chat.svelte';
   import * as upd from '$lib/stores/update.svelte';
-  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
+  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
   import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem } from '$lib/types';
   import { shareMeta, updateStatusText, updateTitleText } from '$lib/types';
   import { planExpansion, planCollapse, planDock, planRectDock, spinForDock, type BadgeSpin, type DockAxis, type DockPlan, type ScreenRect } from '$lib/orbLayout';
@@ -52,6 +52,30 @@
   // 通知气泡甩入/甩出的时长。`prefers-reduced-motion` 下归零：动效可以省，功能不能省
   // （收/展、确认都照旧）。
   const MOTION = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 200;
+  /**
+   * 视口追赶窗口的**总预算**（ms）：正常一帧内就到，所以这个数是"明显不对了"的界线而不是等待时间。
+   *
+   * 为什么必须是时间预算：原来数的是帧数（6 帧），而**帧不是时间的函数** —— 页面被判为隐藏时
+   * （窗口被别的窗口整个盖住、被最小化、远控切换会话）rAF 会被节流甚至整个不跑，那时 6 帧
+   * 可能是 6 秒，也可能是永远。而这段等待正好落在"球已经藏起来、面板还没显形"那段**空窗**里
+   * （见 main.css 的 `.orb-stage.hold` / `.panel`），窗口是透明无边框的 —— 空窗和"窗口不见了"
+   * 在用户眼里是同一件事。
+   */
+  const VIEWPORT_WAIT_MS = 240;
+  /** 单帧等待的上限（ms）：rAF 不来就用定时器把循环推下去（定时器在后台只是被限到 1s，不会停）。 */
+  const FRAME_FALLBACK_MS = 60;
+  /**
+   * 一趟转换的兜底时限（ms）：正常展开/收起最多 ~250ms 落地，超过这个数就按"卡住了"处理
+   * （见 `releaseStuckOrb`）。
+   */
+  const STUCK_MS = 1200;
+  /** rAF 或定时器，谁先到算谁：rAF 停摆时循环仍然能往前走。 */
+  function nextFrameOr(ms: number): Promise<void> {
+    return Promise.race([
+      new Promise<void>((r) => requestAnimationFrame(() => r())),
+      new Promise<void>((r) => setTimeout(r, ms)),
+    ]);
+  }
 
   /**
    * 等 WebView2 的 CSS 视口跟上 OS 窗口尺寸。
@@ -59,11 +83,14 @@
    * 面板若在这期间开始淡入，就会先以窄条出现再跳宽（右边缘闪一下）。
    */
   async function waitForViewport(width: number, height: number) {
-    for (let i = 0; i < 6; i++) {
+    const deadline = Date.now() + VIEWPORT_WAIT_MS;
+    let frames = 0;
+    while (Date.now() < deadline) {
       if (Math.abs(window.innerWidth - width) <= 1 && Math.abs(window.innerHeight - height) <= 1) return;
-      await new Promise(requestAnimationFrame);
+      frames += 1;
+      await nextFrameOr(FRAME_FALLBACK_MS);
     }
-    console.warn('展开：视口尺寸未在预期帧数内跟上窗口，按当前尺寸继续');
+    console.warn(`展开：视口尺寸未在 ${VIEWPORT_WAIT_MS}ms 内跟上窗口（等了 ${frames} 帧），按当前尺寸继续`);
   }
 
   let expanded = $state(false);
@@ -164,6 +191,14 @@
   let foldTimer: ReturnType<typeof setTimeout> | null = null;
   let opening = false;
   let settling = false;   // 落位判定进行中（含「等松手」轮询）：防止 move 事件重复起一轮
+  // 三处转换的兜底定时器（见 `releaseStuckOrb`）：展开那一趟、收起那一趟、折叠态菜单撑窗那一趟。
+  // 它们各自卡住的方式不同（`expand` 卡在 IPC/视口等待、`collapse` 卡在 settleCollapse、
+  // `placeOrbMenu` 卡在 orbSetRect），但后果一样：**整窗空白**。
+  let stuckTimer: ReturnType<typeof setTimeout> | null = null;
+  let foldFailsafe: ReturnType<typeof setTimeout> | null = null;
+  let menuFailsafe: ReturnType<typeof setTimeout> | null = null;
+  let settleFailsafe: ReturnType<typeof setTimeout> | null = null;
+  let recovering = false; // 看门狗要求的那次几何重排进行中（防重入）
 
   // 发送侧：一次推送操作（可能覆盖多台设备）= 一张卡。是个列表而不是单张：同时在推两批
   // （或一边推一边还在等上一批）时，两张卡各自走完，不会被后来者顶掉 —— 顶掉等于把前一条
@@ -298,9 +333,11 @@
   let toastId = $state(0);
 
   let connectedCount = $derived(getDevices().filter(d => d.connected).length);
-  // 铃铛的角标：面板右下角那组气泡里还有几件事（通知 + 在途推送）。
-  // 铃铛收起的不只是"通知"—— 发送方的进度卡也在同一组里，所以角标得一起算，
-  // 否则会出现"收起后角标还在、但组里明明有东西"的错位。
+  // 铃铛的角标：面板右下角那组气泡里还有几件"等你处理"的事（通知，加发送侧那张
+  // "有台没成"的卡 —— 见下面的 `pushPendingCount`）。
+  // 铃铛收起的不只是"通知"—— 发送方的进度卡也在同一组里，但**在途的那几张不进角标**：
+  // 那是"本机在做事"，不是"有事等你"。所以"收起后角标是 0、组里却还挂着一张进度卡"
+  // 是刻意的一档，不是错位。
   // 「更新这件事」此刻该不该占一格（提示 → 点过「立即更新」之后的进度/失败）：后端那份
   // 状态归 store，这里只读。`silent` 那道门在 store 里 —— 用户自己检查来的结论不进这一格。
   let updateTask = $derived(upd.updateTask());
@@ -308,10 +345,23 @@
   let updatePct = $derived(
     updateTask?.size ? Math.min(100, Math.round((updateTask.received / updateTask.size) * 100)) : 0,
   );
-  // **一批多设备推送算一件**：用户点一次就得到一张卡，角标自然跟着"几次操作"走。
+  /**
+   * 发送侧那几张卡里**还该进角标**的件数。
+   *
+   * 本机自己推出去的一律不算：等对方同意、正在传、已发完（那 3 秒待收窗口）—— 这些都是
+   * "本机在做事"，不是"有事等你"。卡片照旧挂在右下角那组气泡里（面板展开就见得到），但
+   * 铃铛角标与悬浮球左上角那颗**不为它涨**：自己传个文件却让球上顶着一个数、托盘跟着闪，
+   * 等于拿"有事等你"的提示去报"我正忙着"。**一批多设备推送算一件**（点一次得到一张卡）。
+   *
+   * 唯一例外是**有台没成、卡片粘着等「知道了」**那一档（`batchSticky`：多台、已落定、
+   * 有失败）—— 那确实有一件事等着人看，而面板收着时球上那颗数是唯一还看得见的提示，
+   * 与接收侧那条 `failed` 通知进角标是同一个道理（单台失败走 toast + 当场收卡，不留卡，
+   * 所以这里也不会把它数进去）。
+   */
+  let pushPendingCount = $derived(pushBatches.filter(batchSticky).length);
   // 「更新这件事」也算一件：启动时的静默检查发现新版（或已经点过「立即更新」）时，
   // 它就和那些"等你确认"的通知一样占着右下角一格（见上面的 `upd.updateTask`）。
-  let notifCount = $derived(notices.length + pushBatches.length + (updateTask ? 1 : 0));
+  let notifCount = $derived(notices.length + pushPendingCount + (updateTask ? 1 : 0));
   // 底栏右下角那格版本号：**与设置里「当前版本」同一个源**（后端 `UpdateState.current`，
   // 也就是 `tauri.conf.json` 的 version）。写死字面量的话，`npm run bump` 之后底栏就停在
   // 上一版上，跟设置里那格对不上 —— 版本号只该有一处真源。
@@ -459,25 +509,31 @@
 
   /** 同一个比较对象（label 只是显示名，不参与比较）。 */
   function sameBcTarget(a: BcTarget, b: BcTarget): boolean {
-    if (a.kind !== b.kind || a.shareId !== b.shareId || a.path !== b.path) return false;
-    return a.kind === 'peer' && b.kind === 'peer' ? a.peerId === b.peerId : true;
+    if (a.kind !== b.kind) return false;
+    if (a.kind === 'share' && b.kind === 'share') return a.shareId === b.shareId && a.path === b.path;
+    if (a.kind === 'peer' && b.kind === 'peer') {
+      return a.shareId === b.shareId && a.path === b.path && a.peerId === b.peerId;
+    }
+    // `raw`（槽里那条原文，来自资源管理器）：认不出"是不是同一项"就当不是 ——
+    // 菜单因此同时给出「添加到左侧比较位」和「与左侧比对」，两条点了都不会错。
+    return false;
   }
 
-  // BC 菜单的显示条件：本机没装 BC（exePath 为空）时整区隐藏；装了则由右键项与比较位的组合决定文案与可用性
+  // BC 菜单的显示条件：没装 BC（exePath 为空）、或本机没有可写的槽（slotWritable=false，
+  // 即没装过 BC5）时整区隐藏。装了则由「槽里那一项」与「右键这一项」的关系决定文案与可用性。
   let bcMenu = $derived.by(() => {
     const st = getBcStatus();
     const target = ctxState ? ctxBcTarget(ctxState) : null;
-    const thisLeft = !!(target && st.left && sameBcTarget(st.left.target, target));
-    const thisRight = !!(target && st.right && sameBcTarget(st.right.target, target));
-    const otherLeft = !!(target && st.left && !thisLeft);           // 对手方在左侧
-    const otherRight = !!(target && st.right && !thisRight);
+    const slot = st.left;
+    const thisLeft = !!(target && slot && sameBcTarget(slot.target, target));
+    // 对手方 = 槽里那一项（还没人放过左侧、或右键的正是它自己时没有对手方）
+    const other = target && slot && !thisLeft ? slot : null;
     return {
-      available: st.exePath !== null,
-      leftLabel: st.left?.label ?? null,
-      rightLabel: st.right?.label ?? null,
-      compareLabel: otherLeft && otherRight ? '左右比较位' : otherLeft ? '与左侧' : otherRight ? '与右侧' : '',
-      compareEnabled: otherLeft || otherRight,
-      thisStaged: thisLeft || thisRight,
+      available: st.exePath !== null && st.slotWritable,
+      leftLabel: slot?.label ?? null,
+      leftExists: slot?.exists ?? true,
+      compareLabel: other?.label ?? '',
+      compareEnabled: other !== null,
     };
   });
 
@@ -505,6 +561,50 @@
     return `${pageId}|${loc.shareId}|${loc.rel}`;
   }
 
+  /** 子目录缓存的访问顺序（最近用过的在末尾）：非响应式 —— 它只决定淘汰谁，模板不读它。 */
+  let rectKidsOrder: string[] = [];
+  /**
+   * 子目录缓存的条数上限。键里带 `rel`，每钻一层就是一个新键；不封顶的话，反复进出不同共享项
+   * /不同设备页会让这张表一直涨（每条约一整层 `TreeEntry[]`）。32 条足够覆盖"钻进去再退回来"
+   * 的常用路径（回上一级命中缓存、不闪加载态这件事不受影响：命中的键都还在表里）。
+   */
+  const RECT_KIDS_MAX = 32;
+
+  /** 当前正被某一页显示的那几个键（`rectDirs` 指向的层）：它们**不许**被淘汰 —— 淘汰掉的话
+   *  下面那个加载 effect 会立刻重新拉一次，正在看的那层目录会闪一下加载态。 */
+  function activeRectKidsKeys(): Set<string> {
+    const s = new Set<string>();
+    for (const [pageId, loc] of Object.entries(rectDirs)) {
+      if (loc) s.add(rectKidsKey(pageId, loc));
+    }
+    return s;
+  }
+
+  /** 记一次访问：把键挪到队尾；超上限时从头淘汰最旧的（跳过正在显示的那些）。 */
+  function touchRectKids(key: string) {
+    const i = rectKidsOrder.indexOf(key);
+    if (i >= 0) rectKidsOrder.splice(i, 1);
+    rectKidsOrder.push(key);
+    if (rectKidsOrder.length <= RECT_KIDS_MAX) return;
+    const protect = activeRectKidsKeys();
+    let j = 0;
+    while (rectKidsOrder.length > RECT_KIDS_MAX && j < rectKidsOrder.length) {
+      const old = rectKidsOrder[j];
+      if (protect.has(old)) { j += 1; continue; }
+      delete rectKids[old];
+      rectKidsOrder.splice(j, 1);
+    }
+  }
+
+  /** 丢掉一页（`pageId`）钻过的全部层缓存。键是 `pageId|shareId|rel`，前缀匹配即可。 */
+  function dropRectKids(pageId: string) {
+    const prefix = `${pageId}|`;
+    for (const key of Object.keys(rectKids)) {
+      if (key.startsWith(prefix)) delete rectKids[key];
+    }
+    rectKidsOrder = rectKidsOrder.filter((k) => !k.startsWith(prefix));
+  }
+
   /**
    * 拉一层目录的内容：本机走自己的 HTTP（`fetchTree`）、对端走后端命令（`peerTree`），
    * 与面板里展开那棵树走的是同一条路（同一份后端、同一套越界防护）。
@@ -512,6 +612,7 @@
   async function loadRectKids(pageId: string, loc: RectDir) {
     const key = rectKidsKey(pageId, loc);
     rectKids[key] = { loading: true, error: null, entries: [] };
+    touchRectKids(key);
     try {
       const entries = loc.kind === 'local'
         ? await fetchTree(serverPortVal || 3890, loc.shareId, loc.rel)
@@ -623,7 +724,9 @@
   // 钻进去的目录要拉内容：缓存里没有就拉一次（进去/返回上一级都是改 `rectDirs`，这里只负责补数据）。
   $effect(() => {
     for (const [pageId, loc] of Object.entries(rectDirs)) {
-      if (!loc || rectKids[rectKidsKey(pageId, loc)]) continue;
+      if (!loc) continue;
+      const key = rectKidsKey(pageId, loc);
+      if (rectKids[key]) { touchRectKids(key); continue; }
       void loadRectKids(pageId, loc);
     }
   });
@@ -799,7 +902,12 @@
     const loc = rectDirs[pageId];
     if (!loc) return;
     const i = loc.rel.lastIndexOf('/');
-    rectDirs[pageId] = loc.rel === '' ? null : { ...loc, rel: i < 0 ? '' : loc.rel.slice(0, i) };
+    const next = loc.rel === '' ? null : { ...loc, rel: i < 0 ? '' : loc.rel.slice(0, i) };
+    rectDirs[pageId] = next;
+    // 回到共享项清单（`rectDirs` 变回 `null`）：这一页钻过的那些层再也不会被读
+    // （`rectView` 只在 `rectDirs` 非空时才查缓存），留着只会一直占内存 —— 顺手全丢掉，
+    // 下次再进去重新拉一次即可。
+    if (!next) dropRectKids(pageId);
   }
 
   /**
@@ -819,6 +927,9 @@
     const page = rectPages[pageIdx];
     const slot = page?.items[slotIdx];
     if (!page || page.kind !== 'local' || page.dir || !slot) return;
+    // 卡片这一份也要现读槽（与 `handleCtx` 同一理由：资源管理器那边可能刚改过）。
+    // 卡片上列的只有本机共享项入口（都是目录）→ 按文件夹那一档读。
+    void loadBcStatus('folder');
     ctxState = { x, y, kind: 'share', shareId: slot.id, name: slot.name, orb: true, placed: false };
   }
 
@@ -876,6 +987,10 @@
       const dx = (rect.x - pos.x) / sf, dy = (rect.y - pos.y) / sf;   // 原点挪了多少（往左/上是负）
       if (rect.x !== pos.x || rect.y !== pos.y || rect.w !== cw || rect.h !== ch) {
         orbMenuBusy = dx !== 0 || dy !== 0;    // 只往右下长时画面上本来就看不出来，不必藏
+        // 兜底：`orbMenuBusy` 期间卡片与球都是 `opacity:0`（main.css 的 `.menu-busy`），
+        // 撑窗那一步 invoke 不回就一直是"整窗空的"（见 `releaseStuckOrb`）。
+        if (menuFailsafe) clearTimeout(menuFailsafe);
+        menuFailsafe = setTimeout(() => { menuFailsafe = null; orbMenuBusy = false; }, STUCK_MS);
         await orbSetRect(rect);
         // **累加**：右键点另一格时窗口多半已经撑过一次（原点也挪过），这次挪的是相对**当前**原点的
         // 增量 —— 把它加到已有的那一段上，不然 stage 的平移会被清零，卡片当场横跳一段。
@@ -897,6 +1012,7 @@
       if (ctxState?.orb) ctxState.placed = true;   // 撑不动就按现状显形（夹在窗口里，总比不显示强）
     } finally {
       orbMenuBusy = false;
+      if (menuFailsafe) { clearTimeout(menuFailsafe); menuFailsafe = null; }
     }
   }
 
@@ -970,6 +1086,9 @@
     if (opening || expanded) return;
     opening = true;
     holdOrb = true;
+    // 兜底（见 `releaseStuckOrb`）：这一趟中间是"故意的空窗"，卡在任一步 await 上都得让球回来
+    if (stuckTimer) clearTimeout(stuckTimer);
+    stuckTimer = setTimeout(() => { stuckTimer = null; releaseStuckOrb('展开'); }, STUCK_MS);
     // 面板要长出来了，折叠态那份菜单（如果开着）当场作废：窗口马上从 236×162 变成面板，
     // 菜单还按旧坐标飘在卡片原位就成了面板上的一块残影。菜单那一档的撑窗账也当场结清
     // （下面算参考点要用它，算完就得清零 —— 平移留在 stage 上会把面板也画歪；卡片此刻已被
@@ -1020,6 +1139,7 @@
       toast('展开失败，请重试');
     } finally {
       opening = false;
+      if (stuckTimer) { clearTimeout(stuckTimer); stuckTimer = null; }
     }
   }
 
@@ -1033,6 +1153,30 @@
     badgeSpin = { left: 0, right: 0 };
     rectDock = 0;
     dockAxis = { x: 0, y: 0 };
+  }
+
+  /**
+   * 转换卡死的兜底：**先把悬浮体放出来**。
+   *
+   * 为什么非要有它：`expand` / `collapse` / 折叠态菜单撑窗这三趟中间都有一段**故意的空窗** ——
+   * 球被 `.hold` 藏起来（`main.css`）、面板要等 `expanded` 才显形（`.orb-stage.open .panel`），
+   * 菜单撑窗那一两帧连卡片都不出镜（`.menu-busy`）。而每一段都要走出好几步 await
+   * （`orb_set_rect` 这些命令 + 视口追赶窗口的等待）。窗口是**透明无边框**的 —— 空窗和
+   * "窗口不见了"在用户眼里是同一件事，而且这个状态**不可恢复**：展开一进门就
+   * `if (opening || expanded) return`，托盘那条 `orb://show` 也是空操作。
+   *
+   * 所以这里定个上限：超时就当它卡住了，把球放出来（"看得见"优先于"位置好看"）。
+   * 不做"整趟回滚"：那一趟若只是慢（不是死），它自己会接着走完并盖掉这里的临时状态。
+   */
+  function releaseStuckOrb(why: string) {
+    if (!holdOrb && !opening && !orbMenuBusy) return;
+    console.error(`${why}未在 ${STUCK_MS}ms 内落地：先把悬浮体放出来，避免整窗空白`);
+    opening = false;
+    orbMenuBusy = false;
+    holdOrb = false;
+    // 面板没展开（卡在展开前半程）：球按"未贴边"折叠态露面 —— 窗口哪怕已经放大，球也在窗内。
+    // 面板已经展开（卡在收起那半程）时球由 `.open` 藏着，这里只要把 `hold` 摘掉即可。
+    if (!expanded) resetOrbDom();
   }
 
   /** 悬浮体（球 / 卡片）在窗口内的偏移 + 热区（热区尺寸跟着形态走：圆球 62、悬浮框 卡片+点列） */
@@ -1254,40 +1398,109 @@
         await new Promise((r) => setTimeout(r, DRAG_POLL_MS));
         if (holdOrb || opening || expanded !== from) return;   // 期间展开/收起/切窗口：这轮作废
       }
+      // 兜底：**从这里往后**那几步都是 await（`orbSetRect` / `rememberOrbCenter` / 读几何），
+      // 其中任意一步不落地，`finally` 里的 `settling = false` 就永远不执行 —— 而 `settling`
+      // 正是"落位判定进行中"的守卫，卡住之后**后面每一次 move 都会被它挡掉**：窗口被搬走、
+      // 拓扑变了都不会再重排（可点区域也停在旧几何上）。上面那个等松手的循环不挂兜底：
+      // 用户拖多久都是合法的，"进行中"在那一段本来就是真的。
+      if (settleFailsafe) clearTimeout(settleFailsafe);
+      settleFailsafe = setTimeout(() => {
+        settleFailsafe = null;
+        if (!settling) return;
+        console.error(`落位判定未在 ${STUCK_MS}ms 内落地：放开守卫，让后续的 move 还能重判`);
+        settling = false;
+      }, STUCK_MS);
       if (from) {
         await rememberBallUnderPanel();
         return;
       }
-      const pos = await appWindow.outerPosition();
-      const size = await appWindow.outerSize();
-      const metrics = await orbScreenMetrics();
-      // 折叠态窗口的尺寸永远由**当前形态**定（不是此刻 OS 窗口测出来的那个）：形态刚换过时
-      // OS 那边还是旧尺寸，照它判吸附会把窗口的宽高带错（圆球的贴边偏移是按球径与内缩算的）。
-      const free: ScreenRect = {
-        x: pos.x,
-        y: pos.y,
-        w: Math.round(layout.size.w * metrics.scaleFactor),
-        h: Math.round(layout.size.h * metrics.scaleFactor),
-      };
-      sizedShape = orbShape;   // 这一趟落位之后窗口就是当前形态的尺寸了（见改尺寸那个 `$effect`）
-      if (orbShape === 'rect') {
-        // 悬浮框：离左右工作区边缘够近就贴边收起成一条竖条（上下两条边只夹进工作区）
-        const plan = rectDockPlan(free, metrics.scaleFactor, metrics.workArea);
-        if (plan.window.x !== pos.x || plan.window.y !== pos.y || plan.window.w !== size.width || plan.window.h !== size.height) {
-          await orbSetRect(plan.window);
-        }
-        setDockDom(plan, metrics.scaleFactor);
-        await rememberOrbCenter(centerOf(plan, metrics.scaleFactor));
-        return;
-      }
-      const plan = dockPlan(free, metrics.scaleFactor, metrics.workArea);
+      await replanDock();
+    } finally {
+      settling = false;
+      if (settleFailsafe) { clearTimeout(settleFailsafe); settleFailsafe = null; }
+    }
+  }
+
+  /**
+   * 折叠态窗口按**当前位置**重判一次尺寸与吸附落位。
+   *
+   * 两个调用点等的都是同一件事 ——"窗口的位置该重算一遍了"：
+   * - 拖动松手（`settleDrag`）：用户刚把球挪走；
+   * - 看门狗要求（`recoverGeometry`）：窗口被系统搬过、显示器拓扑/缩放变了（拔显示器、
+   *   改分辨率、远控工具临时插进来的虚拟屏），而界面手上那份几何（贴边偏移、角标转角、
+   *   命中区域）都是照旧拓扑算的。
+   *
+   * 折叠态窗口的尺寸永远由**当前形态**定（不是此刻 OS 窗口测出来的那个）：形态刚换过时
+   * OS 那边还是旧尺寸，照它判吸附会把窗口的宽高带错（圆球的贴边偏移是按球径与内缩算的）。
+   */
+  async function replanDock() {
+    const pos = await appWindow.outerPosition();
+    const size = await appWindow.outerSize();
+    const metrics = await orbScreenMetrics();
+    const free: ScreenRect = {
+      x: pos.x,
+      y: pos.y,
+      w: Math.round(layout.size.w * metrics.scaleFactor),
+      h: Math.round(layout.size.h * metrics.scaleFactor),
+    };
+    sizedShape = orbShape;   // 这一趟落位之后窗口就是当前形态的尺寸了（见改尺寸那个 `$effect`）
+    if (orbShape === 'rect') {
+      // 悬浮框：离左右工作区边缘够近就贴边收起成一条竖条（上下两条边只夹进工作区）
+      const plan = rectDockPlan(free, metrics.scaleFactor, metrics.workArea);
       if (plan.window.x !== pos.x || plan.window.y !== pos.y || plan.window.w !== size.width || plan.window.h !== size.height) {
         await orbSetRect(plan.window);
       }
       setDockDom(plan, metrics.scaleFactor);
       await rememberOrbCenter(centerOf(plan, metrics.scaleFactor));
+      return;
+    }
+    const plan = dockPlan(free, metrics.scaleFactor, metrics.workArea);
+    if (plan.window.x !== pos.x || plan.window.y !== pos.y || plan.window.w !== size.width || plan.window.h !== size.height) {
+      await orbSetRect(plan.window);
+    }
+    setDockDom(plan, metrics.scaleFactor);
+    await rememberOrbCenter(centerOf(plan, metrics.scaleFactor));
+  }
+
+  /**
+   * 看门狗（Rust 侧，`orb://recover`）说窗口那边出过事：窗口它已经叫回来了，界面这份几何得跟着重排。
+   *
+   * 它救的是三类事：窗口被系统藏起来 / 被最小化 / 落在所有显示器之外（显示器拓扑变了），以及
+   * "拓扑或缩放变了"这一条。前两类窗口已经被叫到台面上，但**界面不知道** —— 手上的吸附偏移、
+   * 展开方向、命中区域全是照旧拓扑算的；后一类连窗口位置都得重算（DPI 变化时 tao 会按系统建议
+   * 矩形自己搬窗口，而前端只在自己动手那一刻现读 `scaleFactor`）。
+   *
+   * 面板开着时**不重排**（那会跟用户正看着的界面打架），只把它夹回工作区（尺寸不动）——
+   * 面板要的只是"别跑到屏幕外"；收起那一趟的账由 `planCollapse` 的窗口位移自己吸收。
+   */
+  async function recoverGeometry() {
+    if (recovering) return;
+    recovering = true;
+    try {
+      if (holdOrb || opening) {
+        // 转换还在飞：不抢它的几何。但也别让它无限期飞下去 —— 把兜底往前拨一格，
+        // 真卡住了最迟 `STUCK_MS` 之后由 `releaseStuckOrb` 收掉（正常那趟自己会清掉它）。
+        if (stuckTimer) clearTimeout(stuckTimer);
+        stuckTimer = setTimeout(() => { stuckTimer = null; releaseStuckOrb('看门狗救回窗口时的那趟转换'); }, STUCK_MS);
+        return;
+      }
+      const metrics = await orbScreenMetrics();
+      if (expanded) {
+        const pos = await appWindow.outerPosition();
+        const size = await appWindow.outerSize();
+        const work = metrics.workArea;
+        // 工作区比窗口还小（极小屏/极端缩放）时 max < min：取 min，宁可朝外溢一截，
+        // 也别把面板推到工作区另一侧去（`planRectDock` 里同一条取舍）。
+        const x = Math.min(Math.max(pos.x, work.x), Math.max(work.x, work.x + work.w - size.width));
+        const y = Math.min(Math.max(pos.y, work.y), Math.max(work.y, work.y + work.h - size.height));
+        if (x !== pos.x || y !== pos.y) await orbSetRect({ x, y, w: size.width, h: size.height });
+        return;
+      }
+      await replanDock();
+    } catch (e) {
+      console.error('看门狗要求的几何重排失败:', e);
     } finally {
-      settling = false;
+      recovering = false;
     }
   }
 
@@ -1367,6 +1580,10 @@
     toasts = [];          // 提示是面板上的浮层：收起即作废，别等下次展开又冒出来
     holdOrb = true;
     if (foldTimer) clearTimeout(foldTimer);
+    // 收起这一趟的兜底：`settleCollapse` 那几步 invoke 若一直不回，`finally` 里的
+    // `holdOrb = false` 就永远不执行 —— 整窗空白（见 `releaseStuckOrb`）。
+    if (foldFailsafe) clearTimeout(foldFailsafe);
+    foldFailsafe = setTimeout(() => { foldFailsafe = null; releaseStuckOrb('收起'); }, FOLD_MS + STUCK_MS);
     foldTimer = setTimeout(() => {
       foldTimer = null;
       const anchor = orbAnchor;
@@ -1382,6 +1599,7 @@
           console.error('收起悬浮球失败:', e);
         } finally {
           holdOrb = false;      // 几何已 settle，球可以露面了
+          if (foldFailsafe) { clearTimeout(foldFailsafe); foldFailsafe = null; }
         }
         // 露面之后才滑出去 / 收进去 + 转角标（两档形态都有贴边这一档，`plan` 为 null 时才是异常路径）
         if (settled?.plan) await revealDock(settled.plan, settled.sf);
@@ -1439,6 +1657,9 @@
    *
    * 一条 toast 说不清"是 3 台里的哪一台失败了"，而单台推送那条路的收尾方式（toast +
    * 自动收掉）已经够用且是用户熟悉的 —— 所以只有多设备这一档需要留一张能逐行看的卡。
+   *
+   * 也正因为"粘住 ≠ 在途"，它成了发送侧**唯一**进角标的那一档（`pushPendingCount`）：
+   * 在途的卡是"本机在做事"，粘住的卡是"有一件事等你点掉"。
    */
   function batchSticky(b: PushBatch): boolean {
     return b.targets.length > 1 && !batchLive(b) && !batchAllDone(b);
@@ -1555,6 +1776,12 @@
     // （后端在这一批没有在路上之后就不再发事件了，所以清掉不会让谁重新收一次尾）。
     settledBatches.delete(batchId);
     pushBatches = pushBatches.filter((b) => b.batchId !== batchId);
+    // 「展开」标记也一起清：一个 batchId 只属于一批、卡片走了就不会再来，留着只增不减。
+    if (batchId in expandedBatches) {
+      const next = { ...expandedBatches };
+      delete next[batchId];
+      expandedBatches = next;
+    }
   }
 
   /**
@@ -1845,7 +2072,9 @@
     const t = chat.activeThread();
     if (!t || t.key !== key) return;
     const directId = t.mode === 'direct' ? t.participants[0] : '';
-    const dev = directId ? getDevices().find((d) => d.id === directId) : undefined;
+    // 查两份表（`deviceById`）：设备页列不出来的那几台（解绑又离线、会话还留着）也在
+    // 会话这一侧要算状态 —— 只查可见那份会把"查看该设备文件"这类项判错。
+    const dev = directId ? deviceById(directId) : undefined;
     // 「查看该设备文件」要有对方的**浏览标签**才成立（那个标签只给长连接设备开）：
     // 没长连接时挂上去只是个点了没反应的项。
     const browse = dev?.connected === true;
@@ -1897,7 +2126,7 @@
     const id = ctxState?.deviceId;
     hideCtx();
     if (!id) return;
-    const device = getDevices().find((d) => d.id === id);
+    const device = deviceById(id);
     if (!device) {
       toast('该设备已被移除');
       return;
@@ -2409,7 +2638,7 @@
       if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
       // 拨过去就没通的：那一台此刻"看得见却直连不通"时，这句解释比"请核对配对码"有用
       // （码很可能是对的，是这张网不让两个客户端互相说话）。
-      const tip = unicastBlockedTip(getDevices().find((d) => d.id === ps.peerId));
+      const tip = unicastBlockedTip(deviceById(ps.peerId));
       toast(tip ?? '配对失败，请核对配对码');
     } finally {
       pairConfirming = false;
@@ -2439,7 +2668,7 @@
     } catch (e) {
       if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
       // 邀请就是一次到对端的 POST：投不出去时，这一台是不是"看得见却直连不通"要说清楚。
-      const tip = unicastBlockedTip(getDevices().find((d) => d.id === ps.peerId));
+      const tip = unicastBlockedTip(deviceById(ps.peerId));
       if (tip) toast(tip);
       return;
     }
@@ -2587,8 +2816,10 @@
       const outcome = await connectPeer(deviceId);
       // 与行内那颗「连接」同一句话（`DeviceTab.setLink`）：先看这一台此刻通不通，再看
       // 这一次是"在等对方同意"还是"本机直接拨号"。
-      const tip = unicastBlockedTip(getDevices().find((d) => d.id === deviceId));
-      const name = peerShortName(deviceId);
+      const tip = unicastBlockedTip(deviceById(deviceId));
+      // 名字走 `deviceNameOf`（设备行 → 会话记录 → id）：设备行还顶着占位名（= 设备 id）时
+      // 用它记录里那个真名，别把一串 deviceid 塞进 toast。
+      const name = chat.deviceNameOf(deviceId);
       if (outcome.kind === 'asked') {
         toast(`已把连接请求发给「${name}」：等它在自己的通知里点「接受」`);
       } else {
@@ -2616,6 +2847,9 @@
   async function unpairDevice(deviceId: string) {
     try {
       await removePeer(deviceId);
+      // 关系没了：这台对本机可见的共享项缓存一起清 —— 留着的话，`states` 会随配对记录一直累积
+      // （按 peer id 存），且它下次上线/重新配对时界面会先显示一份已经不成立的清单。
+      forgetPeerShares(deviceId);
       toast('已解除配对（对方在线时会继续显示为「未绑定」）');
     } catch (e) {
       toast(`解除配对失败：${e}`);
@@ -2633,12 +2867,12 @@
   function ctxPair() {
     const deviceId = ctxState?.deviceId;
     hideCtx();
-    const device = deviceId ? getDevices().find((d) => d.id === deviceId) : undefined;
+    const device = deviceId ? deviceById(deviceId) : undefined;
     if (device) openPair(device);
   }
 
-  /** 放入比较位：side 是 'left' | 'right'，文案沿用同一套。 */
-  async function ctxBcPlace(side: 'left' | 'right') {
+  /** 放入左侧比较位（槽只有一个：放进去就是覆盖原有的那一项）。 */
+  async function ctxBcPlaceLeft() {
     const c = ctxState;
     hideCtx();
     const target = c ? ctxBcTarget(c) : null;
@@ -2647,31 +2881,14 @@
       return;
     }
     try {
-      const s = await setBcSide(side, target);
-      toast(`已放入${side === 'left' ? '左' : '右'}侧比较位：${s?.label ?? target.label ?? ''}`);
+      const s = await setLeft(target);
+      toast(`已放入左侧比较位：${s?.label ?? target.label ?? ''}`);
     } catch (e) {
-      toast(`设置比较位失败：${e}`);
+      toast(`设置左侧比较位失败：${e}`);
     }
   }
 
-  async function ctxBcClear() {
-    const c = ctxState;
-    hideCtx();
-    const target = c ? ctxBcTarget(c) : null;
-    if (!target) return;
-    const st = getBcStatus();
-    try {
-      // 同一项可能同时占着左右两侧，两边都要清
-      for (const side of ['left', 'right'] as const) {
-        const s = st[side];
-        if (s && sameBcTarget(s.target, target)) await clearSide(side);
-      }
-      toast('已清除比较位');
-    } catch (e) {
-      toast(`清除比较位失败：${e}`);
-    }
-  }
-
+  /** 与左侧比对：左边是槽里那一项（可能是资源管理器里放的），右边是这一项。 */
   async function ctxBcCompare() {
     const c = ctxState;
     hideCtx();
@@ -2680,23 +2897,14 @@
       toast('这项没有可比较的共享路径');
       return;
     }
-    const st = getBcStatus();
-    const { left, right } = st;
-    const thisLeft = !!left && sameBcTarget(left.target, target);
-    const thisRight = !!right && sameBcTarget(right.target, target);
-    // 当前项占位时与另一侧比；没占位时用它补空位（只有一侧占位）；两侧都占位就直接比两侧
-    const pair: { a: BcTarget; b: BcTarget; la: string; lb: string } | null =
-      left && right ? { a: left.target, b: right.target, la: left.label, lb: right.label }
-      : left && !thisLeft ? { a: left.target, b: target, la: left.label, lb: target.label ?? '' }
-      : right && !thisRight ? { a: target, b: right.target, la: target.label ?? '', lb: right.label }
-      : null;
-    if (!pair) {
-      toast('请先把要比较的另一项「添加到左侧/右侧比较位」');
+    const slot = getBcStatus().left;
+    if (!slot) {
+      toast('左侧比较位是空的：先「添加到左侧比较位」');
       return;
     }
     try {
-      await compare(pair.a, pair.b);
-      toast(`已在 BeyondCompare 中打开比较：${pair.la} ↔ ${pair.lb}`);
+      await compareWithLeft(target);
+      toast(`已在 BeyondCompare 中打开比较：${slot.label} ↔ ${target.label ?? ''}`);
     } catch (e) {
       toast(`BeyondCompare 启动失败：${e}`);
     }
@@ -2729,6 +2937,13 @@
     void (async () => {
       try {
         await Promise.all([settingsReady, loadDevices(), loadBcStatus()]);
+        // 发送侧那张卡的**初值**：重启后恢复出来的批次只会躺在后端，`push://batch` 是"变化"
+        // 不是初值 —— 不拉这一次，用户会看到"没传完的推送不见了"（见 `push_batches`）。
+        try {
+          pushBatches = await pushBatchesApi();
+        } catch (e) {
+          console.error('读取推送批次失败:', e);
+        }
         // 状态框的初始值跟着落盘的设置走（上次退出时是「离线」就还是「离线」）。
         noteLocalOnline(getSettings()?.online ?? true);
         const port = await getActualPort();
@@ -2773,6 +2988,11 @@
       if (moveTimer) clearTimeout(moveTimer);
       moveTimer = setTimeout(() => { moveTimer = null; void settleDrag(); }, DOCK_SETTLE_MS);
     });
+
+    // 看门狗（Rust）救回窗口之后要界面跟着重排几何：它管的是"窗口被系统藏起来 / 被最小化 /
+    // 落在所有显示器之外 / 显示器拓扑或缩放变了"—— 这几件事前端一件都收不到通知
+    // （它只在动手那一刻现读 `scaleFactor`），见 `recoverGeometry`。
+    const unRecover = listen('orb://recover', () => { void recoverGeometry(); });
 
     // ── 推送事件：发送侧一张进度卡，接收侧一串通知（面板右下角的气泡组）──────
     // 邀请：接收方收到别人的推送 → 挂一条通知（悬浮球左上角的数字 +1）。
@@ -3069,6 +3289,14 @@
     const handleCtx = (e: Event) => {
       const detail = (e as CustomEvent).detail as any;
       if (detail && detail.kind) {
+        // 左侧槽可能在资源管理器里刚被改过（那边右键「选择左侧」写的就是它）：开菜单前现读一次。
+        // 按右键项的类型读（BC 的右键菜单就是这条规矩：文件看文件槽、文件夹看文件夹槽）。
+        // 不等它落地 —— 点下去时后端还会再读一遍，菜单晚几毫秒刷新那一行无所谓。
+        if (detail.kind === 'share' || detail.kind === 'peer') {
+          // 对端共享项在 BC 眼里是 WebDAV 位置（文件夹那一档）；本机项按 isDir。
+          const slotFor = detail.kind === 'peer' || detail.isDir !== false ? 'folder' : 'file';
+          void loadBcStatus(slotFor);
+        }
         ctxState = { x: detail.x, y: detail.y, el: detail.el, kind: detail.kind, shareId: detail.shareId, path: detail.path, isDir: detail.isDir, deviceState: detail.deviceState, deviceOnline: detail.online, deviceNeedsPair: detail.needsPair, deviceId: detail.deviceId, peerId: detail.peerId, name: detail.name };
       }
     };
@@ -3093,6 +3321,7 @@
       unlisten.then(fn => fn());
       unMoved.then(fn => fn());
       if (moveTimer) clearTimeout(moveTimer);
+      unRecover.then(fn => fn());
       unPushInvite.then(fn => fn());
       unPushBatch.then(fn => fn());
       unPushResponse.then(fn => fn());
@@ -3269,7 +3498,8 @@
       <span class="foot-right">
         <span>OrbDrop v{appVersion}</span>
         <!-- 通知铃铛（最右下角、版本号右边）：点一下收起/展开右下角那组通知气泡。
-             角标 = 未处理的通知数，与悬浮球左上角黄标是同一个数 —— **收起 ≠ 已读**。 -->
+             角标 = 未处理的通知数（在途的发送进度卡不算，见 `pushPendingCount`），
+             与悬浮球左上角黄标是同一个数 —— **收起 ≠ 已读**。 -->
         <button
           class="icon-btn bell"
           class:active={notifOpen}
@@ -3293,7 +3523,9 @@
            已收到待确认、接收失败，外加**发送侧的进度卡**与**「更新这件事」**（启动时的静默
            检查发现新版）—— 全都同一形状：右对齐、2/3 面板宽（不占满）。
            来一条甩入一条、收起时整组甩回右侧（`fly`）；footer 最右侧的铃铛整体收起/展开它，
-           **收起 ≠ 已读**（角标照旧挂着，与悬浮球左上角黄标同一个数）。 -->
+           **收起 ≠ 已读**（角标照旧挂着，与悬浮球左上角黄标同一个数）。
+           发送侧那几张卡**挂在组里但不进角标**：`pushBatches` 里只有 `batchSticky`
+           那一档（有台没成、等你点「知道了」）算数，见 `pushPendingCount`。 -->
       {#if notifOpen && (notices.length > 0 || pushBatches.length > 0 || updateTask)}
         <div class="notif-group" bind:this={notifEl}>
           <!-- 「更新这件事」（F-110）：启动时的静默检查发现新版时它就在这儿等用户决定，
@@ -3435,7 +3667,9 @@
 
           <!-- 发送侧：一次推送操作（可能覆盖多台设备）一张卡 —— 和通知同一个形状、同一组、
                同一个铃铛管，因为它也是"右下角的一件事"（"等待对方同意"可以等很久；已绑定
-               目标那一档只是一瞬）。它排在通知前面：通知贴最下缘（要你看一眼的事优先）。
+               目标那一档只是一瞬）。**但它不进角标**：本机自己在做的事不算"有事等你"，
+               只有有台没成、卡片粘着等「知道了」那一档才进（见 `pushPendingCount`）。
+               它排在通知前面：通知贴最下缘（要你看一眼的事优先）。
 
                多台时多两样东西：**每台一行**（谁成了、谁还在等、谁没成，都逐行写清楚），
                以及那行计数 —— 数字全部来自后端快照（见 `push://batch`），界面不算账。 -->
@@ -3679,14 +3913,13 @@
     deviceState={ctxState.deviceState}
     deviceOnline={ctxState.deviceOnline}
     deviceNeedsPair={ctxState.deviceNeedsPair}
-    deviceRemark={ctxState.deviceId ? getDevices().find((d) => d.id === ctxState?.deviceId)?.remark ?? null : null}
-    peerName={ctxState.peerId ? peerShortName(ctxState.peerId) : undefined}
+    deviceRemark={ctxState.deviceId ? deviceById(ctxState.deviceId)?.remark ?? null : null}
+    peerName={ctxState.peerId ? chat.deviceNameOf(ctxState.peerId) : undefined}
     bcAvailable={bcMenu.available}
     bcLeftLabel={bcMenu.leftLabel}
-    bcRightLabel={bcMenu.rightLabel}
+    bcLeftExists={bcMenu.leftExists}
     bcCompareLabel={bcMenu.compareLabel}
     bcCompareEnabled={bcMenu.compareEnabled}
-    bcThisStaged={bcMenu.thisStaged}
     chatSel={!!ctxState.chatSel}
     convoBrowse={ctxState.convoBrowse === true}
     convoThread={ctxState.convoThread === true}
@@ -3713,8 +3946,6 @@
     onConvoExit={() => void ctxConvoExit()}
     onPeerDownload={ctxPeerDownload}
     onBcCompare={ctxBcCompare}
-    onBcAddLeft={() => ctxBcPlace('left')}
-    onBcAddRight={() => ctxBcPlace('right')}
-    onBcClear={ctxBcClear}
+    onBcAddLeft={() => void ctxBcPlaceLeft()}
   />
 {/if}

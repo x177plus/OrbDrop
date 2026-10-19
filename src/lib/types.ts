@@ -51,18 +51,12 @@ export interface PeerDevice {
    */
   seen: boolean;
   /**
-   * 非空 = 此刻**经这台设备中转**（值是中转方的名字，后端 `relay_via`）：
-   * 行上加一句小字「经 <名字> 中转」，用户才知道这条路不是直连。
+   * 非空 = 此刻**经这台设备中转**（值是中转方的名字，后端 `relay_via`）。
+   *
+   * **不上界面**（用户要求：两端都不写「经 X 中转」）：它只剩一个用处的判据 ——
+   * `unicastBlocked` 拿它区分"拨的是借来的中转端点"与"直连那一跳不通"。
    */
   relayVia: string | null;
-  /**
-   * F-107：**这一段设备的中转记忆**（有的话）——`viaCidr` = 中转网段，`poolSize` = 池里有几台。
-   *
-   * 与本行的 `relayVia`（此刻经谁中转）是两件事：这一位是"这段装不通时该走哪一段"的
-   * 持久策略（`config.toml` 的 `relayRoutes`），所以它在这一行**即使当前直连通着**也会在。
-   * 行上只说一句小字（`transitHint`），别把它做成状态档。
-   */
-  transit?: { viaCidr: string; poolSize: number } | null;
   /** 自动重连的现状；缺省 = 没有拨号意图（已配对但没人点过「连接」）。 */
   linkState?: LinkState | null;
   /**
@@ -117,19 +111,20 @@ export interface AppSettings {
    */
   autoBroadcastNew: boolean;
   /**
-   * 本机是否替群聊**中转**消息（设置里的「允许为群聊中转消息」，默认 `false`）。
+   * 本机是否替群聊**中转**消息（设置里的「允许中转」那颗开关管的第二条路，默认 `true`）。
    *
    * 群里两个成员互相够不着时（跨网段 / 只有本机跟它们都连得上），本机把消息替它们转一份，
-   * 最多 3 跳（后端 `hops <= 3` + `reached` 抑制重复）。**默认关**：代价落在本机 ——
-   * 每转一份就占一份上行带宽，而"转不转"是用户自己的取舍，不该由程序替他决定。
+   * 最多 3 跳（后端 `hops <= 3` + `reached` 抑制重复）。**默认开**（首次启动就是开的，
+   * 装上就能当锚点）；代价落在本机 —— 每转一份就占一份上行带宽，不想出这笔开销在设置里关掉。
    */
   groupRelay: boolean;
   /**
-   * 本机是否为其它设备**盲转字节**（设置里的「允许为其它设备中转」，默认 `false`）。
+   * 本机是否为其它设备**盲转字节**（设置里的「允许中转」，默认 `true`）。
    *
    * 某些 AP 把客户端之间的流量隔开，两台设备单播不通但都连得上本机 —— 本机替它们搬字节
    * （两端 TLS 端到端不变，本机看不到内容）；请求方也只在直连不通时才回退走中转。
-   * **默认关**：代价落在本机 —— 每转一份就占一份上行带宽，该不该出由用户自己定。
+   * **默认开**（首次启动就是开的）：代价落在本机 —— 每转一份就占一份上行带宽，
+   * 不想出这笔开销在设置里关掉（关掉写成落盘的 `false`，此后一直按关读）。
    */
   allowRelay: boolean;
   /**
@@ -141,7 +136,7 @@ export interface AppSettings {
    *
    * 关着 = **完全退回 F-106**：端点每次现开、用完即收，不落盘、不泛化、不传播。
    *
-   * **默认开**（与上面几条"默认关"不同）：这一条不替别人做事、也不向对端暴露本机的新能力
+   * **默认开**：这一条不替别人做事、也不向对端暴露本机的新能力
    * （花带宽、暴露能力的那一侧由中转方的 `allowRelay` 把关），只影响本机自己的选路效率。
    */
   relayMemory: boolean;
@@ -193,19 +188,30 @@ export type ConvoMode = 'direct' | 'broadcast' | 'group';
  */
 export type BcTarget =
   | { kind: 'share'; shareId: string; path: string; label?: string }
-  | { kind: 'peer'; peerId: string; shareId: string; path: string; label?: string };
+  | { kind: 'peer'; peerId: string; shareId: string; path: string; label?: string }
+  /**
+   * 左侧槽里那条**不属于我们任何一项**的原文（资源管理器在共享项之外放的路径，或掩码）。
+   * `arg` 是喂给 BC 的原文 —— 反解只为显示与"是不是同一项"，解不出来也照样能比。
+   */
+  | { kind: 'raw'; arg: string; label: string; dir: boolean };
 
-/** 比较位上的项。 */
-export interface BcSide {
+/**
+ * 左侧槽里那一项。**槽只有一处存储**：BC 自己的 `Saved*Left` 注册表值（资源管理器右键
+ * 那套「选择左侧 / 对比」用的就是它）—— 所以这不是本机配置，是现读的。
+ */
+export interface BcSlot {
   target: BcTarget;
   label: string;
+  /** 它此刻还在不在（本机路径被删/改就是 false；掩码不查）。 */
+  exists: boolean;
 }
 
-/** 后端返回的 BeyondCompare 状态：左/右比较位为空时对应字段为 null。 */
+/** 后端返回的 BeyondCompare 状态：`left` 为空 = 还没人放过左侧。 */
 export interface BcStatus {
   exePath: string | null;
-  left: BcSide | null;
-  right: BcSide | null;
+  /** 槽可写吗（= 本机装过 BC5）。false 时整个 BC 菜单区不显示。 */
+  slotWritable: boolean;
+  left: BcSlot | null;
 }
 
 /**
@@ -310,6 +316,45 @@ export interface LocalPick {
   path: string;
   isDir: boolean;
   size: number;
+}
+
+/**
+ * 安卓系统选择器交回来的一项（F-118，见 `mobile::pick_files` 与 `PickFilePlugin.kt`）。
+ *
+ * `path` **不是**选择器给的那串 `content://`，而是原生已经拷进应用缓存的那份暂存文件的路径
+ * —— 推送与会话图片都只认本机真实路径，所以这一跳必须发生在原生那一侧。`name` 是系统给的
+ * 真实名字（对话里那条气泡、对端落盘的那份都写它），`size` 以拷好的那份文件为准。
+ */
+export interface PickedFile {
+  path: string;
+  name: string;
+  size: number;
+  /** 系统声明的那一项是什么类型（空串 = 它没说）。界面据此判"这是不是一张图"。 */
+  mime: string;
+}
+
+/**
+ * 设备上已安装的一个应用（F-119，见 `mobile::list_installed_apps` 与 `InstalledAppsPlugin.kt`）。
+ *
+ * `path` 是**它自己的 `base.apk`**（`/data/app/…/base.apk`；不需要 root 就读得到 —— 那是
+ * SELinux 给所有 app 域的读权限，不是我们做了什么）。**这一项不拷文件**：发送时把
+ * `fileName` 当**覆盖名**交给 `pushPaths`，本机照旧从 `path` 读字节 —— 清单里"对端看到的
+ * 名字"与本机"从哪读"本来就是两件事（见 `transfer::manifest_for_named_paths`）。
+ *
+ * `fileName` 由后端拼好并**净化过**（`应用名_versionName(versionCode)_包名.apk`），界面只显示
+ * 与交回，不再自己拼一次 —— 净化判据（哪些字符会让对端整次接收判失败）在后端。
+ */
+export interface InstalledApp {
+  label: string;
+  packageName: string;
+  versionName: string;
+  versionCode: number;
+  path: string;
+  size: number;
+  /** 落盘名（后端拼好）：会话里那条气泡、对端落盘的那份都写它。 */
+  fileName: string;
+  /** 拆包安装（AAB）：单发 `base.apk` 对端多半装不上，界面上要说出来。 */
+  hasSplits: boolean;
 }
 
 /**

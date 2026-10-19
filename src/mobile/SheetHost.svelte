@@ -8,6 +8,8 @@
   import RemarkDeviceSheet from "./sheets/RemarkDeviceSheet.svelte";
   import FileActionsSheet from "./sheets/FileActionsSheet.svelte";
   import ChatActionsSheet from "./sheets/ChatActionsSheet.svelte";
+  import AttachSheet from "./sheets/AttachSheet.svelte";
+  import AppPickerSheet from "./sheets/AppPickerSheet.svelte";
   import ConvoSheet from "./sheets/ConvoSheet.svelte";
   import EditRecipientsSheet from "./sheets/EditRecipientsSheet.svelte";
   import KeepAliveSheet from "./sheets/KeepAliveSheet.svelte";
@@ -34,6 +36,10 @@
   <FileActionsSheet entry={sheet.entry} {onClose} />
 {:else if sheet.kind === "chatActions"}
   <ChatActionsSheet convoKey={sheet.key} {onClose} />
+{:else if sheet.kind === "attach"}
+  <AttachSheet {onClose} />
+{:else if sheet.kind === "appPicker"}
+  <AppPickerSheet {onClose} />
 {:else if sheet.kind === "convo"}
   <ConvoSheet {onClose} />
 {:else if sheet.kind === "editRecipients"}

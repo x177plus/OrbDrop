@@ -18,7 +18,7 @@
    * `pair` 两张表都没有主语。
    */
   const peerId = $derived(thread?.mode === "direct" ? thread.participants[0] : "");
-  const dev = $derived(devices.getDevices().find((d) => d.id === peerId));
+  const dev = $derived(devices.deviceById(peerId));
 
   /**
    * 标记为已读：走"打开这条会话"那条路，而不是直接调 `chat_mark_read` / `group_mark_read` ——

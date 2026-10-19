@@ -2294,7 +2294,8 @@ pub fn on_group_text_rejected(state: &Arc<AppState>, peer_id: &str, group_id: &s
 /// 最多转一次，环路由 `(from, id)` 与跳数（`MAX_HOPS`）一起收住。够不着的成员这里不管 ——
 /// 补拉那一档会兜住（对方自己来要）。
 ///
-/// **替别人搬消息要用户点头**（`Config::group_relay`，默认关）：它占用本机上行带宽 ——
+/// **替别人搬消息要用户点头**（`Config::group_relay`，缺省**开**，用户可在设置里关掉）：
+/// 它占用本机上行带宽 ——
 /// 搬出去的字节按序列化后的消息体大小计入「中转流量」（S-11，`AppState::note_relay_message`）。
 fn maybe_relay(state: &Arc<AppState>, own_id: &str, author: &str, author_name: &str, event: &GroupTextIn) {
     if !state.config.lock().group_relay || event.hops >= MAX_HOPS {

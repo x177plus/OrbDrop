@@ -264,12 +264,12 @@ pub async fn open(
             .filter(|p| !p.ip.is_empty() && p.port != 0)
             .map(|p| (p.ip.clone(), p.port))
     });
-    let (target_name, target_addr, target_in_book) = match known {
+    let (target_name, target_addr, target_in_book, verified_name) = match known {
         Some(peer) if peer.online && !peer.ip.is_empty() && peer.port != 0 => {
             let Some(addr) = socket_addr(&peer.ip, peer.port) else {
                 return Err(OpenError::NotEligible(format!("设备 {} 的地址不可用", peer.name)));
             };
-            (peer.name.clone(), addr, true)
+            (peer.name.clone(), addr, true, None)
         }
         _ => {
             let Some((host, port)) = &hint else {
@@ -280,17 +280,20 @@ pub async fn open(
             let Some(addr) = socket_addr(host, *port) else {
                 return Err(OpenError::NotEligible(format!("地址 {host}:{port} 不合法")));
             };
-            if let Err(why) = verify_identity_at(addr, target).await {
-                // **细节只进日志，不回给调用方**：回话里带着"那个地址上是谁 / 通不通"，
-                // 而调用方可能只是个自报身份、我们并不认识它。把 id 回给它，等于把"绕过
-                // 核实那一关所需的 id"亲手交出去 —— 它下一句就能点名那个 id，让本机去连
-                // 一个它自己够不着的地址（那正是核实这一关要防的"给任意地址开隧道"）。
-                debug!(addr = %addr, target = %target, "目标身份核实不过: {why}");
-                return Err(OpenError::NotEligible(
-                    "核实不了目标身份（本机不认识这台设备，给的地址上也没问出它）".into(),
-                ));
-            }
-            (target.to_string(), addr, false)
+            let observed = match verify_identity_at(addr, target).await {
+                Ok(observed) => observed,
+                Err(why) => {
+                    // **细节只进日志，不回给调用方**：回话里带着"那个地址上是谁 / 通不通"，
+                    // 而调用方可能只是个自报身份、我们并不认识它。把 id 回给它，等于把"绕过
+                    // 核实那一关所需的 id"亲手交出去 —— 它下一句就能点名那个 id，让本机去连
+                    // 一个它自己够不着的地址（那正是核实这一关要防的"给任意地址开隧道"）。
+                    debug!(addr = %addr, target = %target, "目标身份核实不过: {why}");
+                    return Err(OpenError::NotEligible(
+                        "核实不了目标身份（本机不认识这台设备，给的地址上也没问出它）".into(),
+                    ));
+                }
+            };
+            (target.to_string(), addr, false, Some(observed))
         }
     };
 
@@ -298,6 +301,16 @@ pub async fn open(
     // 身份）：记下来（只补空行）—— 中转方认识的设备越多，"请求方手里没地址"这件事就越少
     // 成为死路（真机上就是它让反方向的第一次借中转卡在"本机不认识设备 X"）。
     state.observe_verified_addr(target, &target_addr.ip().to_string(), target_addr.port());
+    // 刚才那一问（只在第二档发生）**证明了两件事**：那个地址上答得出这个 id，而且它此刻
+    // 活着 —— 与 5s 探活同一级的证据，记进"刚听到过"那一档（见 `AppState::heard`）；
+    // 顺手把问到的名字填进占位行（本机记着的真名一个字都不动）。
+    if let Some(observed) = verified_name {
+        state.note_heard_online(target);
+        if let Some(name) = observed {
+            // 核实过的名字（在那个地址上问出来的）→ 直接更新（对端改名跟着走）。
+            state.note_peer_name(target, &name);
+        }
+    }
 
     // 限流放在**所有资格判定之后**：一次说不清的请求（目标不认识、自己当目标）不该
     // 把这位请求方接下来几秒的额度吃掉 —— 那就成了"报错一次，三秒内连正经请求也开不了"。
@@ -401,7 +414,14 @@ fn socket_addr(host: &str, port: u16) -> Option<SocketAddr> {
 /// 两处用它：① 核实**目标**（请求方捎来的 `addr`）；② 核实**请求方自己**（F-107 §12.1
 /// 放宽之后，非配对设备也能借中转，那时它必须自报 `id`，这里到「它的 TCP 来源地址 + 自报
 /// 端口」上问一次，自报 id 对不上就拒）。
-pub(crate) async fn verify_identity_at(addr: SocketAddr, expected: &str) -> Result<(), String> {
+///
+/// 成功时把回话里的**名字**一起带回去（`None` = 它没报名字）：那是一份**核实过的**观察值，
+/// 调用方拿它更新名字（`AppState::note_peer_name`：对端改名跟着走）。核实成功同时还意味着
+/// "它此刻活着" —— 与 5s 探活同一级的证据（见 `AppState::heard`）。
+pub(crate) async fn verify_identity_at(
+    addr: SocketAddr,
+    expected: &str,
+) -> Result<Option<String>, String> {
     let url = format!(
         "{}/pair/info",
         crate::net::peer_base(&addr.ip().to_string(), addr.port())
@@ -414,7 +434,10 @@ pub(crate) async fn verify_identity_at(addr: SocketAddr, expected: &str) -> Resu
         return Err(format!("地址 {addr} 回的是 {}（不是 OrbDrop 对端？）", response.status()));
     }
     match response.json::<serde_json::Value>().await {
-        Ok(body) if body["id"].as_str() == Some(expected) => Ok(()),
+        Ok(body) if body["id"].as_str() == Some(expected) => Ok(body["name"]
+            .as_str()
+            .map(str::to_string)
+            .filter(|n| !n.trim().is_empty())),
         Ok(body) => Err(format!(
             "地址 {addr} 上是另一台设备（{}）",
             body["id"].as_str().unwrap_or("问不出身份")
@@ -880,9 +903,9 @@ pub async fn ensure_for(state: &Arc<AppState>, target: &str) -> Option<RelayAddr
             (Some(format!("{}:{}", peer.ip, peer.port)), peer.ip.clone())
         }
     };
-    let (memory_on, own_id) = {
+    let (memory_on, own_id, own_name) = {
         let config = state.config.lock();
-        (config.relay_memory, config.device_id.clone())
+        (config.relay_memory, config.device_id.clone(), config.device_name.clone())
     };
     // 池的键是**目标段**。地址未知时退回"含本机地址的那几条策略段"：`apply_relay_routes`
     // 只收这种段，而"要够着与本机同段的一台设备"正是那几条策略要说的事（同段的对端地址
@@ -922,7 +945,9 @@ pub async fn ensure_for(state: &Arc<AppState>, target: &str) -> Option<RelayAddr
             "addr": target_addr_hint,
             // F-107：请求方自报身份。中转方拿它当"来源白名单的键"与"限流的键"，
             // 并且会用「TCP 来源地址 + 这个端口」去核实（有 Bearer 时以 token 为准）。
-            "requester": { "id": own_id, "port": own_port },
+            // 名字是捎给对面填**占位行**用的（本机 mDNS 到不了它那边时，那是它唯一能
+            // 拿到真名的地方 —— 以前这条只带 id，对面于是显示一串 deviceid）。
+            "requester": { "id": own_id, "port": own_port, "name": own_name },
         });
         let mut request = OPEN_CLIENT.post(&url).json(&body);
         if let Some(t) = &token {
@@ -1122,9 +1147,9 @@ pub fn maybe_send_route(state: &Arc<AppState>, peer_id: &str) {
         return;
     }
     let token = crate::credential::get_peer_token(peer_id).ok().flatten();
-    let (own_id, own_port) = {
+    let (own_id, own_name, own_port) = {
         let config = state.config.lock();
-        (config.device_id.clone(), state.listening_port())
+        (config.device_id.clone(), config.device_name.clone(), state.listening_port())
     };
     let Some((host, port)) = state.dial_endpoint(peer_id, None) else {
         return;
@@ -1138,7 +1163,7 @@ pub fn maybe_send_route(state: &Arc<AppState>, peer_id: &str) {
         // 什么都学不到，只能等用户手动把它也加到锚点旁边去。
         let body = serde_json::json!({
             "routes": routes,
-            "requester": { "id": own_id, "port": own_port },
+            "requester": { "id": own_id, "port": own_port, "name": own_name },
         });
         let mut request = OPEN_CLIENT.post(&url).json(&body);
         if let Some(t) = &token {

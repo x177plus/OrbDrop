@@ -60,8 +60,9 @@ src-tauri/src/
 │ ├── ...
 │ ├── mod.rs                  # 路由装配 + 启动/停止 + local_ipv4_addresses（本机内网地址，F-09）
 │ ├── routes_push.rs          # POST /push/invite, POST /push/report, GET /push/download
-│ └── routes_pair.rs          # POST /pair（配对码换 token）、POST /pair/invite（配对邀请，免输码）、
-│                             # POST /pair/invite/withdraw（发起方撤回）、POST /unpair（解除配对的另一半）
+│ └── routes_pair.rs          # POST /pair（配对码换 token）、POST /pair/hello（手动添加的另一半：对方也建一行，F-11）、
+│                             # POST /pair/invite（配对邀请，免输码）、POST /pair/invite/withdraw（发起方撤回）、
+│                             # POST /unpair（解除配对的另一半）
 ├─┬ discover/
 │ ├── mod.rs                  # mDNS 注册 _orbdrop._tcp + 后台扫描服务
 │ └── peer.rs                 # PeerDevice 模型 + 在线状态管理
@@ -194,13 +195,24 @@ mDNS 只在对方主动告别或记录过期（约 2 分钟）时报告离开，
 
 | 信号 | 触发 | 语义 |
 |---|---|---|
-| mDNS `ServiceResolved` | 对方注册/更新 | 立即标在线（并补全 ip/port），并收拾同一地址上的旧身份（见下） |
+| mDNS `ServiceResolved` | 对方注册/更新 | 只补 ip/port 与「看得见」（`seen`，F-106），**不标在线** —— mDNS 记录只说"看得见"，不说"够得着"（同段被 AP 隔离时组播过得去、单播全灭）；同一地址上的旧身份照样收拾（见下） |
 | WS 长连接建立/断开 | 已配对设备 | 权威信号：连上即在线；断开时**只在没有可拨地址时**才标离线（见"没有地址的对端"） |
-| `/pair/info` 探测（每 5s，1.5s 超时） | 上面两条之外的兜底 | **回话里的 id 是这台设备**才算在线；地址上换了别的 id 则按"旧身份"处置 |
+| `/pair/info` 探测（**启动即拍**，之后每 5s；单台 1.5s 超时；**各台并发**，上限 `PROBE_CONCURRENCY`） | 上面两条之外的兜底 | **回话里的 id 是这台设备**才算在线；地址上换了别的 id 则按"旧身份"处置 |
 | `/discover`（同一趟 5s 循环，**只在手里有该对端的 token 时**替代上一条；**长连接活着的那几台也照走这一问** —— 链路只证明"跟这一台的关系"，不证明"它的视野已经同步过"） | 已配对设备 | 除了身份，还带回「对端此刻看得见的设备」**整份视野**（F-11a 跨网段发现：多网卡时每一段都在里面，别台设备转述来的不在）。对端 401/404 时退回 `/pair/info`；连不上则直接判离线，不再打第二遍 |
 
-前端只渲染 `online` 设备，因此在对方退出后数秒内该行从列表消失；地址簿与凭据保留，
-对方再上线会自动重新出现（不产生重复行）。
+前端只把**在线 / 已配对 / 看得见（`seen`）**的行画出来（`visibleDevices`），因此在对方退出后
+数秒内该行从列表消失；地址簿与凭据保留，对方再上线会自动重新出现（不产生重复行）。
+
+**启动第一帧不拿地址簿里的 `online` 当真相**（`AppState::new` 一律把它降级成离线）：本机这一趟
+还一台都没探过，那个值只是"那一行被创建时的那一刻"的残留（`set_peer_online` 从不回写它）。
+全信它会同时得到两种假象 —— 真不在网的设备顶着「在线」、真在网的设备先画成离线。真相只由
+**启动即跑的第一拍探活**（`lib.rs` 的循环把 `sleep(5)` 挪到探活之后）与链路建立
+（`restore_links_on_startup` / 入站会话）给出，两者都在毫秒到几百毫秒这一档。
+
+真机报的"启动后 A 与 B 明明同网段，A 却先写离线、过几秒才转在线"就是这三件事叠出来的：
+A 那一行落盘时是 `online = false`（配对时没有可拨地址，或地址被作废过 —— 而 B 那行落盘是
+`true`，或 B 有 `autoConnect` 记忆、链路在毫秒内接回来了），而第一拍探活要等满 5 秒才跑，
+列表里排在 A 前面的死行还会再按 1.5s 一台往后拖。
 
 **对端报好几个地址时挑哪一个当拨号目标**（`discover::pick_address`）：mDNS 的地址记录是
 **一块网卡一条**，对端的有线/无线/热点/VPN/WSL 各有各的地址，而对端这一侧把它们合成一个
@@ -739,7 +751,7 @@ POST /push/stream   { id, blockSize, tasks:[{path, index}] }
 唯一入口：会话里输入框左边那颗 [＋]（推给这个会话的收件人：1:1 即单台、群会话即多台）
         └► 文件选择框：推送到「PC-C」 / 推送到「A」「B」等 3 台设备
                [常用]  默认空（右键目录加入/移出，随配置持久化）
-               面包屑：此电脑 / C: / Users / 王磊 / Desktop
+               面包屑：此电脑 / C: / Users / 小明 / Desktop
                列表：文件与文件夹混排（目录在前）；点行 = 勾选，双击 / 点行尾箭头 = 进去
                购物车：底 [3] 报告.txt 等 2 项 ▲ ── 点开向上展开，逐项 ✕ 或「全部取消」
                [取消]  [推送到 3 台设备]      ← 确认后**一次** push_paths(paths, peerIds)
@@ -913,8 +925,9 @@ D/报告.txt                            → C:\…\D\报告.txt           单目
   这几台上，某台传到一半会显示成 15%（实际 30%）—— 这个 bug 是 UI 冒烟验证时抓到的。
 - 超过 5 台时先只列 4 行 + 「还有 N 台 ▾」就地展开（卡片自己不滚：滚动归 `.notif-group`，
   两条滚动条会打架）。
-- 角标：**一次多目标推送算一件事**（`notifCount = notices + batches`）—— 点了 8 台也不该让
-  悬浮球上的数字变成 8。
+- 角标：**一次多目标推送算一件事**（`notifCount = notices + 粘住的那几张发送卡`）—— 点了 8 台
+  也不该让悬浮球上的数字变成 8；整批还在途时**一张都不算**（`pushPendingCount` 只数
+  `batchSticky` 那一档）。
 
 > **滚动区域夹在两条横线之间**：`.notif-group` 的盒子（= 滚动容器的剪裁边界）**上下边就是**
 > 标签栏下缘与 footer 上缘 —— 底边靠 `bottom: var(--foot-h)` 贴住 footer 上缘那条线，
@@ -937,7 +950,8 @@ D/报告.txt                            → C:\…\D\报告.txt           单目
   - **不主动弹面板**：不抢屏幕 —— 悬浮球左上角的橙色数字就是要不要点开的信号。
     未绑定 → 右下角一条气泡（带接收/拒绝）；已绑定（`auto: true`）→ 后端已经开收，
     气泡直接是"正在接收"
-  - 悬浮球**左上角**的橙色数字 = 组里还剩几件事（通知 + 在途推送；与右上角的
+  - 悬浮球**左上角**的橙色数字 = 组里还剩几件**"等你处理"**的事（通知；**发送侧在途的推送卡
+    不算** —— 那是本机自己在做事，只有"有台没成、卡片粘着等「知道了」"那一档算；与右上角的
     「长连接设备数」对称，同一个数也挂在 footer 上的铃铛角标里）：
       接收中 → 原地推进度（进度条 + 「取消」）
       完成   → 变成**待确认**的气泡，直到点「知道了」（或按「打开目录」）：
@@ -1115,6 +1129,7 @@ pub fn disable_autostart() -> Result<()> { /* 清除注册表/删除 plist */ }
 | 任务 | 间隔 | 行为 |
 |---|---|---|
 | mDNS 扫描 | 持续监听 | `mdns.browse("_orbdrop._tcp")` 事件驱动 |
+| 探活 / 视野交换（F-11a / F-13） | **启动即拍**，之后每 5s | `/pair/info`（手里有 token 时用 `/discover`，顺带换视野）核对身份与在线；各台**并发**（上限 `PROBE_CONCURRENCY`）—— 一台够不着的设备不再挡着后面每一台，见 §5 |
 | WS ping | 30s | 每 session 独立定时器 |
 | 离线判定 | 90s (3×30s) | 3 次无 pong → 标记 offline |
 | 重连尝试 | 指数退避 5-60s | 用户点过「连接」的链路断开后重连；对端处于「断开」暂停时被拒 |
@@ -1278,7 +1293,7 @@ autostart.rs
 ☐ 收完的通知（长通知）：B 收完 → 那条"正在接收"的气泡就地变成**待确认**（写明几项、落在哪个目录），点「知道了」才消失；多条垂直堆叠、新的贴最下缘
 ☐ 收完的通知·「打开目录」：「知道了」左边还有一颗（只有带落盘位置的那条才有）→ 按它用系统默认方式打开落盘目录（资源管理器里打开 `<下载目录>/<发送方名>`，不是"在父目录里高亮它"）**并且这条通知也一并撤掉**（悬浮球/铃铛上的数字一起减）；目录已被移走/删掉 → 通知**留住** + 一条说明原因的提示（"没打开却把话说完"= 收在哪又没人知道了）
 ☐ 通知面板的形状：气泡右对齐、宽约面板 2/3（不占满）；**滚动区域正好夹在标签栏下缘与 footer 上缘两条横线之间**（左右 12px；放不下时才在组内滚且**看不到滚动条**；滚到时内容也越不过线）；展开/收起、来新的一条都有甩入/甩出动效；动画期间**没有横向滚动条**；铃铛在 footer 最右侧（版本号右边），角标 = 未处理的通知数（收起 ≠ 已读）
-☐ 发送侧进度：推送时那张「等待对方同意 → 正在发送」的卡也在**同一组**里（同一形状、同一个铃铛管、同一个角标）
+☐ 发送侧进度：推送时那张「等待对方同意 → 正在发送」的卡也在**同一组**里（同一形状、同一个铃铛管），但**角标不涨** —— 本机在途的推送卡是"自己在做事"，不是"有事等你"（`pushPendingCount` 只数 `batchSticky`）；球上/铃铛上的数在整段传输期间保持不动，卡片照旧挂在组里
 ☐ 多目标推送：会话里那颗「＋」（1:1 即单台、群会话收件人即多台）→ **只开一次**文件选择框 → 一次 `push_paths(paths, peerIds)`（`peerIds` 取自该会话的收件人，重复项已去重）
 ☐ 多目标推送·每台独立：已配对的那台**不问同意**直接收（行文案「等待开始（对方自动接收）」）、未绑定的那台各自弹卡等点头、离线的那台**当场**落「失败：…不在网上，推送未发送」—— **一台送不到不影响其余几台**（对比：一台都送不到时整体报错、不建卡片）
 ☐ 多目标推送·一份清单：两台收到的邀请内容一字不差（名字/条数/总字节），落盘内容与目录结构完全一致（清单只建一次，不是各建一份）
@@ -1298,7 +1313,7 @@ autostart.rs
 ☐ 退群入口（F-97）：桌面端 = 会话右键菜单「退出群聊」、安卓端 = 会话子屏右上角 ⋮ 的底板里那一项 —— 两端同一套语义。点进去先问一句（移动端 `confirm`，写明本机这份记录也会删）→ 退出后：会话列表里那一行消失、**移动端要退回会话列表**（路由是 hash，不退就是一屏没有标题的空壳）、`groups.json` 里这个群与本机的 `mySeq`/`convos` 都没了、对端收到"没有本机了"的名册（对端那一份仍留在它自己盘上）；提示写「已退出「群名」」。**群发**走同一条路（`chatBatchDelete`）但只删名单、消息留在各台 1:1 会话里
 ☐ 群聊·对端版本过旧（F-98 那条纪律的边界）：给一台**没有群聊路由**的对端（老版本）发群消息 → 名册那一跳拿 4xx（日志 `会话 HTTP 那一跳被拒 … /chat/group-roster`）→ 那条消息**落「未送达」、不再排队重放**；不能每 5 秒重试一次、也不能永远停在「等待发送」（这一档以前被当成"够不着"，实测会一直重放：同一个 404 每 5 秒一行）
 ☐ 工具条光学对齐（像素级）：24px 行里「局域网设备」与台数的墨迹**上下各 7px**（= 行中线）、hint 圆上下各 5px、圈里的「?」上下各 3px、输入框内光标 5/4（奇偶性使然，见实现指南）；缩放 125% 下前四项仍居中、光标 4.8/4（截屏放大核对，别只靠肉眼）
-☐ 角标语义：一次多目标推送在悬浮球左上角与铃铛角标上只算 **1** 件（`notices.length + pushBatches.length`）
+☐ 角标语义：一次多目标推送**在途时不算**（悬浮球左上角与铃铛角标整段传输期间都不动）、真出现"有台没成"的粘住卡时只算 **1** 件（`notices.length + pushPendingCount`）
 ☐ 气泡阴影：收在盒子内部的留白里（`padding 5/10/10` —— 实测可见半径 上 4 / 下 9.6 / 左右 7），四条边都过渡到透明、没有被裁出硬边；阴影**点击穿透**（footer 上的铃铛、气泡之间的空隙都点得穿）
 ☐ 层叠与点击：对话框/设置面板打开时**盖住**通知（点对话框按钮不会被气泡接走）；关掉模态后，面板右下角那条"阴影留白带"不吃点击（空白处点得穿）
 ☐ 窗口余量不吃点击（F-05 那一档的默认行为，见 `orb-functional-design.md` §14）：悬浮球/悬浮框四周那圈**阴影余量**（悬浮框左 14 / 上 10 / 右 16 / 下 18，面板四周 20）里点一下 → **压在下面的窗口收得到**、本机窗口不会被带到前台；悬浮体自己、贴边那一档的悬停热区、面板内部照旧吃点击（点卡片头部能展开、点面板按钮有反应）；贴边收起时悬停热区仍能把卡片滑出来且**不抖帧**
@@ -1490,9 +1505,9 @@ Windows 只把菜单项的**文字**画灰，位图不跟着灰（muda 走原生
 
 ### 有事那一档：图标闪动 + 右上角一颗红点
 
-那个布尔与**悬浮球左上角那颗角标是同一个数**（界面 `orbNotifCount` = 通知气泡 + 在途推送 +
-新版本 + 未读消息 + 群邀请）：球上有数 ⇔ 托盘上有红点。事情处理完（读过消息、点掉通知）角标
-掉回 0，红点与闪动自己就停了 —— 与"状态由真值现读"是同一条规矩。
+那个布尔与**悬浮球左上角那颗角标是同一个数**（界面 `orbNotifCount` = 通知气泡 + **发送侧那张
+"有台没成"的卡**（在途的推送卡不算）+ 新版本 + 未读消息 + 群邀请）：球上有数 ⇔ 托盘上有红点。
+事情处理完（读过消息、点掉通知）角标掉回 0，红点与闪动自己就停了 —— 与"状态由真值现读"是同一条规矩。
 
 - **闪动**：500ms 一拍，**整帧交替** —— 亮拍是"底图 + 红点"，灭拍是**一张看不见的空白**
   （`TrayFrame::Blank` / `blank_rgba`）。不是"红点自己一明一灭"：那样在任务栏上只是一颗点在抖，
@@ -1741,7 +1756,7 @@ A/B 时把 `dist-mobile/assets/MobileApp-*.css` 的文本原样 `appendChild` �
 
 ### 怎么做
 
-- **能力位**：`/pair/info` 与 `/discover` 各带一个 `relay`（= `Config::allow_relay`，S-09，默认关）。
+- **能力位**：`/pair/info` 与 `/discover` 各带一个 `relay`（= `Config::allow_relay`，S-09，**默认开**，用户可在设置里关掉）。
   请求方从 5s 探活的那一次问答里就学到了（`state::probe_addr`）。
 - **控制面**：`POST /relay/open`（鉴权路由，要凭据；`server::routes_relay` → `relay::open`）：
   开关关着 403、目标不合格 404、限流 429、本机开不出来 503。**资格判定在前、限流在后** ——
@@ -1762,7 +1777,7 @@ A/B 时把 `dist-mobile/assets/MobileApp-*.css` 的文本原样 `appendChild` �
   BC 代理、WS 拨号…）全部经它，不许各自读 `ip`/`port`。**广播/上报类**（`/discover` 的表）仍用
   `ip`/`port`：那是"这台设备自己长什么样"，不是"本机怎么走到它"。
 - **指纹**：中转端点上站的是**目标设备**，而指纹表（`net::Trust`）按地址索引 —— 端点字面量因此
-  写成 **IPv4 映射的 IPv6**（`net::relay_host`，如 `[::ffff:10.198.71.106]`）：同一个地址、另一个
+  写成 **IPv4 映射的 IPv6**（`net::relay_host`，如 `[::ffff:198.51.100.106]`）：同一个地址、另一个
   键位，免得与中转方自己的服务撞成"同地址两枚指纹 → 不钉 → 退 TOFU"。`refresh_trust` 把端点键位
   一起钉上，`remember_peer_fingerprint` 记的也是**刚拨的那个主机**。
 - **别把中转方的地址记成对端地址**：经中转过来的配对握手 / 聊天兜底，其 TCP 来源是**中转方**；
@@ -1774,7 +1789,8 @@ A/B 时把 `dist-mobile/assets/MobileApp-*.css` 的文本原样 `appendChild` �
   （否则"闪一下就没"），但**不带任何特殊状态** —— 关系没建立就是「未绑定」、点照旧按 `offline` 画；
   那句"这张 Wi-Fi 可能把客户端之间的单播隔开了"只在**发起连接**时弹（2026-09-30 改：配对 /
   长连接 / 立即连接 / 配对邀请的动作里，判据是前端 `unicastBlocked`：`seen && !online && !relayVia`，
-  见 `stores/devices` 的 `unicastBlockedTip`）。中转接管后自动回到在线行并标「经 X 中转」。
+  见 `stores/devices` 的 `unicastBlockedTip`）。中转接管后自动回到在线行，**不标中转**（2026-10-15 起
+  两端一律不写「经 X 中转」：`relayVia` 留在 DTO 里只为 `unicastBlocked` 那条判据）。
   ② 消息够不着时**先当场试一次中转**（`ensure_for`，它自带限流），成了就立刻重发；仍不通就落
   「排队」（既有语义 F-95）并 `notify_undeliverable` 发 `chat://undeliverable` 给界面 —— 用户看到的
   是一句解释，而不是"发了没反应"。
@@ -1987,7 +2003,7 @@ value ('/storage/emulated/0/Download/app.apk')
 - `invoke.parseArgs` 的字段名就是 Rust 那侧 JSON 的键（这里是 `path`），少一个就抛在 Kotlin 里、
   Rust 只看到一句 reject。
 
-### 校验（真机实测：Meizu 17 / Android 13，界面那条路）
+### 校验（真机实测：手机乙 / Android 13，界面那条路）
 
 构建与静态检查：`npm run build:mobile` 与 `npm run check`（svelte-check，138 文件 0 错）干净；
 `cargo check`（桌面）干净；`npx tauri android build --apk --debug --target aarch64` 与发行包
@@ -2067,8 +2083,8 @@ value ('/storage/emulated/0/Download/app.apk')
 
 ### 起因：挤
 
-用户真机上反馈"排版布局有点挤"。量出来的原因是**文字列被三颗控件挤到 98px**（393 宽 / Meizu 17），
-而这一列里要塞三样东西：设备名（`HUAWEI JAD-AL80` 要 151px）、地址（`172.20.21.198:3890` 要
+用户真机上反馈"排版布局有点挤"。量出来的原因是**文字列被三颗控件挤到 98px**（393 宽 / 手机乙），
+而这一列里要塞三样东西：设备名（`HUAWEI ABC-AL00` 要 151px）、地址（`203.0.113.198:3890` 要
 122px）、状态胶囊 —— 三条全在断字（真机上那台的地址与名字各只显示约 65%）。
 
 ### 量过的候选（同一套桩数据、`vite preview --mode mobile` 里量的"文字列"）
@@ -2093,10 +2109,10 @@ value ('/storage/emulated/0/Download/app.apk')
   跟着进长按菜单）—— 这是**刻意**偏离 F-14 的"离线行只提供解除配对"：贴屏上"行内只有这一刻能做的事"，
   离线那行没有任何链路动作可做，多摆一颗危险按钮不如和其它设备操作同路（要改回去只是一行）。
 - **左侧恒定两行**（第三轮，用户提的）：第二行 = "这台现在**怎么到的**" —— 直连写地址
-  （`172.20.21.198:3890`），经中转就写「经 X 中转」，**中转不再自己占一行**。
+  （`203.0.113.198:3890`），经中转就写「经 X 中转」，**中转不再自己占一行**。
   中转那一档原来那一行显示的是对方**自报、而这跳已经不通**的地址（写在那儿反而误导：用户会以为
   这就是路）；真实地址在 ⋯ 菜单标题与会话页标题旁都有。
-  为什么不是"两段并进一行"：真字号量下来要 216px（`172.20.21.198:3890` = 127.5 + ` · ` = 7 +
+  为什么不是"两段并进一行"：真字号量下来要 216px（`203.0.113.198:3890` = 127.5 + ` · ` = 7 +
   `经 D0622 中转` = 81），而文字列只有 197（@393）/ 165（@360）—— 从 393 起尾字就会被省略号切掉，
   切掉的正好是"这条路不是直连"那半句。代价：**经中转的那一行看不到地址**（在 ⋯ 菜单标题里）。
   收益：**行高 68 / 90 → 恒定 68**（两视口实测 67–69），一屏又多摆一台。
@@ -2105,7 +2121,7 @@ value ('/storage/emulated/0/Download/app.apk')
   胶囊 `flex: none` 回到自适应宽度 58px、名字可缩可省略）：**每行再少一行**
   （无中转 92 → 68/69、有中转 114 → 90；第三轮那条"第二行按优先只显示一处"之后**恒定 68**），
   一屏又多摆一台。
-  代价：名字那一行要分 64px 给胶囊 —— 393 宽下 `HUAWEI JAD-AL80`（要 151）只剩 132（省略号）、
+  代价：名字那一行要分 64px 给胶囊 —— 393 宽下 `HUAWEI ABC-AL00`（要 151）只剩 132（省略号）、
   360 下只剩 101。想再挤出 12px 可以把胶囊里那颗 `dot` 拿掉（胶囊底色本身已经说明五档，
   但会丢掉"实心 = 长连接 / 空心环"那层形状语义）；也可以让胶囊靠列右端（`space-between`，
   宽度不变、只是短名字时不贴着名字）。
@@ -2150,7 +2166,7 @@ value ('/storage/emulated/0/Download/app.apk')
   「经 D0622 中转」/「经 DESKTOP-ABC 中转」，**五种设备 × 两个视口都不截断**（`放得下: true`）；
   经中转那行第二行的颜色是 `--accent-deep`、直连是 `--muted`（一眼分得出"这不是直连"）；
 - 状态胶囊回到自适应宽度（**58px**：3 个字的文案 + 16 内边距 + 7 点 + 5 间隙），与名字同一排
-  （`sameLine`）；代价是名字那一行要分 64px 给胶囊 —— 桌面 Chromium 量到 `HUAWEI JAD-AL80`
+  （`sameLine`）；代价是名字那一行要分 64px 给胶囊 —— 桌面 Chromium 量到 `HUAWEI ABC-AL00`
   只剩 132px（要 151），而**真机上只差 2px**（`clientWidth 134 / scrollWidth 136` —— 同一个名字
   在手机上的字体度量更紧），也就是省略号只切掉一点点；
 - **长按整行**（按下 700ms）→ 打开那台设备的操作底板（标题 = 设备名，项 = 修改备注 / 断开连接 /
@@ -2159,7 +2175,7 @@ value ('/storage/emulated/0/Download/app.apk')
 - **按住「发消息」700ms** → **不**弹底板，松手照常进会话（`#/chat/dev%3Adev-b`）；
 - 行内不再有 `[aria-label="设备操作"]` 的「⋯」按钮（选择器查为空）。
 
-**第二轮的真机实测**（Meizu 17 / Android 13、WebView 120 —— debug 包重签成发行密钥装上，
+**第二轮的真机实测**（手机乙 / Android 13、WebView 120 —— debug 包重签成发行密钥装上，
 CDP 那份方法见下；验完已换回 release 包）：
 
 - 视口 393×783、dpr 2.75：文字列 **198**，行内只有 `配对 / 发消息`（那台是未绑定）、`⋯` 查为空；
@@ -2174,13 +2190,13 @@ CDP 那份方法见下；验完已换回 release 包）：
   （`user-select: none` + `-webkit-touch-callout: none` 在真机上确实算得出来），剩下那一步
   得靠真手指复核。
 
-**真机**（Meizu 17 / Android 13 = 本机，HUAWEI JAD-AL80 = 对端，两台都装了这一版）：
+**真机**（手机乙 / Android 13 = 本机，HUAWEI ABC-AL00 = 对端，两台都装了这一版）：
 
-- 设备页那一行是**未绑定的对端**（`HUAWEI JAD-AL80 · 经 D0622 中转 · 在线`，F-106 那张把单播隔开的网），
+- 设备页那一行是**未绑定的对端**（`HUAWEI ABC-AL00 · 经 D0622 中转 · 在线`，F-106 那张把单播隔开的网），
   行内三颗正好是 `[配对][发消息][设备操作]` —— 改之前这一档只有一颗「配对」，会话根本开不出来。
 - 点「发消息」→ `location.hash` = `#/chat/dev%3Ab67c4103-…`、会话子屏打开、输入框写着「发送消息…」；
   发出去的两条都收「已送达」，对端**在后台**时那条的系统通知标题/正文就是设备名与原文
-  （`dumpsys notification --noredact`：`channel=orbdrop.messages` / `android.title=meizu 17` /
+  （`dumpsys notification --noredact`：`channel=orbdrop.messages` / `android.title=手机乙` /
   `android.text=第二条：验证对方在后台时收得到（可忽略）`）。
 - **真机怎么取证的**（release 包没有 DOM 可读）：`npx tauri android build --apk --debug --target aarch64`
   出带 devtools 的 debug 包 → **用发行密钥重签**（`zipalign -f -p 4` +
@@ -2225,22 +2241,22 @@ CDP 那份方法见下；验完已换回 release 包）：
 冒烟：`vite preview --mode mobile` 服务产物 + 真 Chromium（CDP 直连，`init_scripts` 注入假 IPC 桩，
 393 宽；同一套办法见 §21 上面那几段）：
 
-- 会话列表那行只写**备注本身**（`客厅台式机`）—— 与设备列表那行「`客厅台式机(HUAWEI JAD-AL80)`」
+- 会话列表那行只写**备注本身**（`客厅台式机`）—— 与设备列表那行「`客厅台式机(HUAWEI ABC-AL00)`」
   明显不同，一眼看出两处规则确实分开了；`title` 给的是显示名（悬停能看全）。
 - 长按设备行 500ms → 「设备操作」底板（标题 = 短名 `客厅台式机`，项 = `修改备注 · 客厅台式机` /
   断开连接 / 发消息 / 解除配对）；点「修改备注」→「设备备注」底板（标题 `设备备注`、
-  `当前设备名：HUAWEI JAD-AL80`、输入框预填 `客厅台式机`、底部 = 清除备注 / 取消 / 保存）。
-- 改成「书房笔记本」→ 保存：toast = `已把「HUAWEI JAD-AL80」的备注设为「书房笔记本」`，
-  设备行变 `书房笔记本(HUAWEI JAD-AL80)`、会话列表那行变 `书房笔记本`（两处一起换，都是后端
+  `当前设备名：HUAWEI ABC-AL00`、输入框预填 `客厅台式机`、底部 = 清除备注 / 取消 / 保存）。
+- 改成「书房笔记本」→ 保存：toast = `已把「HUAWEI ABC-AL00」的备注设为「书房笔记本」`，
+  设备行变 `书房笔记本(HUAWEI ABC-AL00)`、会话列表那行变 `书房笔记本`（两处一起换，都是后端
   那条 `devices://changed` 之外本地当场也改了一份）。
-- 「清除备注」→ toast = `已清除「HUAWEI JAD-AL80」的备注`、设备行回到 `HUAWEI JAD-AL80`；
+- 「清除备注」→ toast = `已清除「HUAWEI ABC-AL00」的备注`、设备行回到 `HUAWEI ABC-AL00`；
   那颗按钮只在**打开时本来就有备注**时才画（与桌面端同一个判据）。整段页面 0 错误。
 
 ---
 
 ## 22. 安卓：让应用在后台活着（F-87）
 
-### 现象（真机，华为 JAD-AL80）
+### 现象（真机，华为 ABC-AL00）
 
 装完即用，什么都没动：对端把它看成**离线**（mDNS 发现不到、5s 探活也不通），别人推过来的
 东西收不到 —— 而**手机这一侧看不出任何毛病**：通知栏那条「OrbDrop 正在运行」还挂着，
@@ -2971,12 +2987,12 @@ daemon 线程的 `run()` 在通道断开后只是不再收命令、**照旧活�
   - 桌面端（挂真 `App`）：会话浮层 → 点会话行 → 点右上「⋮」。`unbound` 档 =
     「修改备注 / 配对 / 清空聊天记录」；`paired`（长连接）档 =「修改备注 / 查看该设备文件 /
     清空聊天记录」（**无**配对项）；`repair`（`tokenRejected`）+ 备注档 =「修改备注 · 客厅台式机 /
-    重新配对 / 清空聊天记录」。点「修改备注」开出的对话框写「当前设备名：HUAWEI JAD-AL80」
+    重新配对 / 清空聊天记录」。点「修改备注」开出的对话框写「当前设备名：HUAWEI ABC-AL00」
     （有备注时预填「客厅台式机」并多一颗「清除备注」）；点「配对」开出的配对框标题是
-    「与「HUAWEI JAD-AL80」配对」（码、刷新、邀请、确认配对都在）。
+    「与「HUAWEI ABC-AL00」配对」（码、刷新、邀请、确认配对都在）。
   - 移动端（同桩，393×795）：会话子屏 → 右上「⋯」→「会话操作」底板里依次是
     「标记为已读 / 修改备注 / 配对 / 清空聊天记录」（已配对档无「配对」，需重配档是「重新配对」
-    且那一行带当前备注）；点「修改备注」开「设备备注」底板（「当前设备名：HUAWEI JAD-AL80」、
+    且那一行带当前备注）；点「修改备注」开「设备备注」底板（「当前设备名：HUAWEI ABC-AL00」、
     有备注时输入框预填 + 「清除备注」）；点「配对」开「配对设备」底板并列出那台（未绑定）。
 - **没跑到的一层**：真后端 + 真两台设备（`set_device_remark` / `pair_start` 的实际落地）。这两条
   命令本身一行没改 —— 两端走的还是设备行 / 长按菜单那一条路。
@@ -3367,7 +3383,7 @@ callback, updatedAt }`
 - `dumpsys webviewupdate`：当前 WebView = `com.google.android.webview` **81.0.4044.138**，且是**唯一**
   provider（没有 beta/canary/`com.android.webview` 可切）；logcat 里
   `cr_LibraryLoader: Loaded native library version number "81.0.4044.138"` 对得上。
-- 启动之后**后端一切正常**：`HTTP server started port=3890`、mDNS 注册、TOFU 认得 `172.20.21.27`，
+- 启动之后**后端一切正常**：`HTTP server started port=3890`、mDNS 注册、TOFU 认得 `203.0.113.27`，
   `MainActivity` 是前台 —— 不是崩溃，也不是打包漏文件（前端确实编进了 `liborbdrop_lib.so`：
   里面有 `/assets/index-*.js`、`/assets/MobileApp-*.js`/`.css`）。
 - 截图（1080×2220）逐像素统计：**99.47% 是 `(251,252,253)`**，其余只有状态栏与导航栏 —— WebView
@@ -3567,3 +3583,754 @@ Google WebView（实测可行：`119.0.6045.53` 那份装上去界面就起来�
     弹层里共有元素的相对间距也一致（标题→副标题 2px vs 5px，属 a11y 盒边界的噪声）。
   · 结论：降级表给的 `margin-top: 8.45519px` 与现代引擎的 `gap: 8.45519px` **是同一个数**，空态高度
     193 vs 194（1px 取整）—— 两条路的版式等价，而现代引擎什么都没多下载。
+
+## 33. 两端都重启过也能续：发送端把没走完的推送落盘（2026-10-13）
+
+### 目标
+
+§32 解决了"只关掉接收端"（接收端 `pending` + 启动自己接着收）。剩下那一档：**发送端也重启过**
+（重启电脑、两边都关了应用）—— 此前只能 410 收尾。这一节把它补上。
+
+### 关键发现：这一档比看起来小
+
+原本以为要"落盘整份清单 + 重建时复核源 + 挂回源监视 + 重发邀请"。读代码后发现前三条**都不需要**：
+
+- **数据面是接收端主动来要块**（`POST /push/stream`）→ 发送端**不用重发邀请**，只要那条
+  **取文件的凭据（job）**还在，对面一来就发。
+- **`stream_send::serve` 每次现场 `stat` 源文件**（`size`/块布局都按现场算），`FILE` 记录每条任务
+  都发一次，接收端拿它跟自己清单对账 → 变了就 `SOURCE_CHANGED`。
+  ⇒ 清单的**身份**不用落盘，也不用"重建时复核源"：变的文件由既有机制逐条判失败。
+- `authorize()` 只认"调用方 token → peer_id"，token 在凭据库里、重启后还在 ⇒ 对面的请求照样有效。
+- **只有源监视（`watch_sources`）需要留一手**：它盯的是"等对方点头"那个窗口
+  （`TargetState::Invited`），一旦开始传就卸掉 —— 但重启之后要能**挂回去**，而它要的是
+  **用户当时点的那几项**（`roots`，不是清单里解析过的绝对路径）→ 所以 `roots` 一定要落盘。
+
+**结论：Tier 2 = "把那条 job（+界面那张卡）落盘，重启后重建"**，协议、数据面、接收端、同意流程
+一个字都没动。
+
+### 落盘那份（新文件 `push_out.json`）
+
+**为什么单独一个文件**（不塞进 `resume.json`）：老版本会重写 `resume.json`（它认识那个文件），
+"读进来 → 原样写回"会把不认识的顶层键抹掉；而 `push_out.json` 老版本**压根不认识** → 降级不会
+被抹掉（新版留在这儿，升回来还能用）。与 `groups.json` 从 `chat.json` 分家是同一条理由。
+
+`OutJob { id, batchId, peerId, peerName, name, isDir, peerPaired, sources[](相对→绝对), accepted,
+updatedAt }`、`OutBatch { id, name, count, skipped, perTargetTotal, targets[](…state, received, error),
+roots[] }`，外加 `version`（镜像 `groups.json`：**写盘那一刻补上**）。
+
+**写点 / 删点**（与接收端那套纪律一致：只在能定下来的时刻动盘）：
+
+| 时刻 | 写什么 |
+|---|---|
+| `push_paths` 建 job / 建批次 | 都落一份（job 的 `accepted = false`，批次的 `roots` 只有这一刻知道） |
+| 对面**真的开始拉了**（`PushStatus` 离开 `Invited`：收到"同意"或第一条进度） | 把那条 job 升级成 `accepted = true` —— 这是"重启后恢复成一张卡"的依据 |
+| 任何一台**真的换了档**（`batch_set` 走到赋值那一步） | 那条批次 |
+| 有字节在动（`Downloading`） | 只把内存里的 TTL 锚点往前挪（攒到 5 分钟才写一次）——**进度不写盘** |
+| 终态 | `remove_job` / `drop_batch` 各一处删（取消/完成/失败/整批走完全走这两条） |
+
+### 启动重建的规则（`push_job::restore_outbound`）
+
+- **批次照原样恢复**（含还挂着的「等待对方同意」那一档）—— **对面那台可能还在跑**：它手上那张
+  邀请卡照样点得动，而恢复出来的 job 正是它点下去之后来要块时能命中的凭据。少了这一档，
+  就会出现"发送端在传、界面上一条记录都没有"的隐形传输。
+- `accepted = true` 的那几台：邀请档**强制升成「传输中」**（对面明明已经在拉，别写「等待对方同意」）。
+- 源监视按盘上那几项 `roots` 挂回去 → "源一变就撤这次推送"这条承诺不会因为重启就没了。
+- 全是终态的批次不恢复（顺手把盘上那份也删掉）；认不出的状态值当终态丢掉（不造假的"还在等"）。
+- job 走 `insert_job`（**不碰盘**）：恢复不是"新建一次推送"，别把盘上那份的 `accepted` 写回 false。
+
+### 界面那张卡：初值靠拉，不靠启动事件
+
+新增命令 `push_batches()`；桌面端挂载时 `pushBatches = await api.pushBatches()`（与
+`chat_snapshot` / `list_devices` 同一个路数）。**不**在启动时发 `push://batch`：后端启动那一刻
+webview 可能还没注册监听，事件就丢了（事件是"变化"，初值必须能拉）。
+
+### TTL / 过期 / 撤销 / 重放
+
+- 发送端这一半 **7 天**（`OUTBOUND_TTL_SECS`，锚点是"最后一次跃迁或有字节在动"），每 5 秒一拍扫
+  （挂在探活那个循环里，与 `resume_pending` 同一处）。到点按**最后已知的进度**分两种收尾
+  （`expired_target_state`，不许混：混了就是把一次成功的传输报成失败）：
+  - **最后报满了全量** → 落「已送达」。完成回执是"三次尝试、尽力而为"（`report_to_sender`：
+    0s / 1s / 3s），丢了就会走到这儿 —— 把"对面把最后一个字节都报了"说成"对端一直没来续传"
+    就是假话；
+  - 其余 → 落「失败」：原因写「对端一直没来续传，已放弃」。两者都是撤 job + 让卡片 3 秒后自己收。
+- **发送端不能比接收端先过期**（接收端 `pending` 也是 7 天）：否则对面还在按台阶重试，这边已经
+  开始答 410 了。两处的窗口要一起改。
+- 撤销照旧：恢复出来的 job 能被逐台的 ✕（`cancel_push`）与「取消全部」（`cancel_push_batch`）撤
+  —— 这两条路只查 `jobs` / `batches`。
+- 重放防护：TTL + "终态不落盘" + 白名单仍限于那份 `sources`（要别的相对路径一律 `NotInManifest`）
+  ⇒ 恢复出来的 job 不比重启前多任何权限。
+
+### 取舍（说在明处）
+
+| 取舍 | 说明 |
+|---|---|
+| `sources` 落盘体积 | 几万文件 ≈ 2–4 MB/job，**只写一次**（与接收端 `pending` 那份同量级） |
+| "从未被接受"的推送**不**重发邀请 | F-53 的延续（够不着就是够不着）；但那份 job 会恢复，所以**对面那台还在跑时**，它手上那张邀请卡照样点得动 |
+| 死邀请可能挂 7 天 | 对面也重启过时，那张「等待对方同意」没人能点，要等 TTL 收尾。**这仍比今天好**：今天这种卡在没长连接的场景下**永远不会**收（`await1` 的对端没有时钟，对账又要求长连接） |
+| 进度初值可能偏旧 | 恢复到"最后一次状态跃迁"那一刻的数（进度不写盘），对端一上报就追上 |
+| 降级 | 老版本不认识 `push_out.json`：**不会抹掉**它，只是恢复不了 |
+| 完成回执是**尽力而为**的（三次尝试） | 没有长连接的场合（未配对、或配对但没连）它丢了，发送端那张卡就会停在 99%（**这是既有设计**：`PushAsk` 对账要求有长连接）。改动后不再让它变成假话：7 天窗口到点按"最后报满了 → 已送达"收尾，而不是说成"对端没来续传" |
+
+### 校验
+
+- 单测（`push_out::`，4 条）：任务与卡片**逐字段活过一次重启**（含白名单两列、`roots`、逐台行）、
+  终态即删、同 id 再存是覆盖、TTL 按"最后一次有动静"算且 `touch_job` 能往前挪。
+- 单测（`push_job::tests`，1 条）：过期收尾那条判据 —— 报满全量 → 已送达，差一块 / 一个字节没来
+  / 连总量都不知道 → 放弃。
+- 集成（`tests/push_stream.rs`）：
+  - `both_sides_restarted_resume`：A 推 → B 自动收下（A 记下"对面开始拉了"并落盘）→ 用"写不进去的
+    落盘根"确定性掐断 → **两边都换一身 AppState** → `restore_outbound` 断言（job 回来、卡片回来
+    且那一行写着「传输中」）→ 按运行时节拍叫 `resume_pending` 收完 → **逐字节一致**、接收端那份
+    结局是「完成」、两侧盘上那份凭据都清干净。
+    发送端那半边的收尾（尽力而为的回执）**两种结局都接受、但都不许变成假话**：到了就断言凭据
+    删干净，没到就断言"绝没被判成失败"并打一行 `[note]` —— 实测三轮全量里出现过一次"回执丢了"
+    （卡片停在 100%），这正是那条既有短板的真实频率，不该让测试去掩盖它。
+  - `without_the_sender_record_the_receiver_is_told_so`：故意不恢复（模拟老版本/记录被删）→ 对面
+    来要块拿 410 → 收尾，且理由是 `SENDER_GONE`（**不是「发送方已取消」**）。
+- 静态：`npx svelte-check`、两端 `vite build`（桌面 / `--mode mobile`）。
+
+### 坑
+
+- **`insert_job` / `insert_batch` 保持"纯插入"**：落盘只发生在**建新推送**与**状态跃迁**两处。
+  把落盘塞进 `insert_*` 的话，恢复那一趟会把 `accepted` 又写回 false —— "恢复成一张卡"当场丢掉。
+- **`roots` 要在 upsert 时保住**：状态跃迁那一刻只有批次自己（没有 `roots`），传空的会被当成
+  "没有新信息"，由 `PushOutStore::save_batch` 保留盘上现有一份。
+- **进度绝不写盘**：`touch_job` 只挪内存里的锚点、攒 5 分钟写一次 —— 否则整份 JSON 会被按
+  5 次/秒重写。
+- `stop_server` 是**优雅**停机（在飞的请求会跑完），测试里掐断一律用"写不进去的落盘根"。
+- **测试要按运行时的节拍反复叫 `resume_pending`**（而不是只叫一次）：够不着/恰好撞上握手的边都是
+  常态，真实的 5s 探活循环下一拍会再试 —— 单叫一次会把"本会自愈的那一次"记成失败（这条踩过一次：
+  单叫一版间歇性地等不到收尾）。
+- 调试这类并发路径时，**别在一条语句里连锁两次同一把锁**：`eprintln!("{:?} {:?}", a.jobs.lock()…,
+  a.jobs.lock()…)` 的实参临时量活到整条语句结束 → 当场死锁（整条测试永远不返回，一行输出都没有）。
+- **恢复与界面挂载是并发的**：后端那一趟在启动块里（与 `restore_links_on_startup` 同一批），界面
+  挂载时的 `push_batches` 可能抢在它前面 → 那一次拉到空；卡片会在对端第一次上报（`push://batch`）
+  时出现。要更早的话得把恢复挪到建窗之前，这次没动（与既有启动顺序保持一致）。
+- **集成测试里那两样东西是"整个进程共用"的**（数据目录按 pid 分，不按用例分）：`push_out.json`
+  与凭据库。踩过两次，都值得记住：
+  - 断言只能认**自己那条邀请**（`iter().any(|b| … t.invite_id == invite)`），别数总量 —— 兄弟用例
+    留下的记录（例如刚走完、还在 `SETTLED_GRACE` 里的批次）也在同一个文件里，数总量必挂。
+  - 配对 token **每对设备各自新铸一枚**（`pairing_token()`），别全文件共用一个常量：凭据库里
+    "token → 设备 id"的解析在**同一枚 token 对上多台设备**时是"谁先命中谁说话"，任何一条用例先
+    失败（没走到清理那一步）就会把它的设备留在库里，后面每条用例的邀请都可能解析到**别人**身上
+    —— 表现是 `POST /push/invite` 一片 **401**，而错误信息只说"联系不上"，看着像网络问题。
+
+## 37. 安卓：会话里的「＋」——选图片 / 选文件（F-118，2026-10-14）
+
+需求一句话：**安卓端会话界面在发送按钮左侧加一颗「＋」，可以发文件 / 图片，与桌面端一致**。
+
+### 桌面端那颗「＋」长什么样（要对齐的东西）
+
+- 位置：`ConvoPanel.svelte` 的 `.chat-compose` 里，顺序是 `输入框 → ＋ → 发送`（`.chat-plus`，
+  `src/styles/main.css` 里那一条同名的圆按钮）。
+- 它做的事：`onSendFiles` → `App.svelte` 的 `chatSendFiles` → `requestPushMany` → **自绘的本机
+  文件浏览器** `FilePicker.svelte`（文件与文件夹混选、选中项跨目录累积、顶部「常用」）→
+  `pushPaths` → `noteOutgoingFiles`。
+- 那条路的后端是 `fs_drives / fs_list / path_picks / list_picker_favorites / set_picker_favorites`，
+  注册处在 `lib.rs` —— **每一条都带 `#[cfg(desktop)]`**；就算摘掉门控也没用，安卓上
+  `fs_browse::drives()` 的 unix 分支只会返回一个 `/`（没有盘符这个概念），而 `fs_list` 的
+  `std::fs::read_dir` 在分区存储下列不出"用户的文件"。
+
+### 为什么不能照搬（安卓的三条硬事实）
+
+1. **按路径列共享存储走不通**：分区存储下应用读不到别的应用放进共享存储的**非媒体**文件
+   （pdf / zip / apk 这类），读授权只能通过 SAF 的 URI 拿到 —— 要"像桌面那样翻目录"就得申请
+   「所有文件访问」（`MANAGE_EXTERNAL_STORAGE`，要用户去系统设置里手动开）或另写一套
+   MediaStore / SAF 的后端。这一版不做（与 `N-09` 的"暂缓"同一个口径）。
+2. **`content://` 在 WebView 的 JS 里读不出字节**（它属于 ContentResolver，不是网页能取的地址），
+   而推送（F-50）与会话图片（F-116）两条路都只认本机**真实路径**。
+3. **所以选择器回来的东西必须先落盘**：这一步与输入法剪贴板那条（`resolve_image_uri`）是同一件事，
+   先例就是 `PasteImagePlugin.kt` —— 拷进 `cacheDir` 下、把路径交回界面。
+
+### 怎么做
+
+**原生**（`PickFilePlugin.kt`，新插件）：一条 `pick` 命令开一次系统选择器 —— `kind = "image"`
+走 **照片选择器**（Android 13 起 `ACTION_PICK_IMAGES`，这台机器上没有它时退回 `ACTION_GET_CONTENT`
+`image/*`），`"file"` 走 `ACTION_GET_CONTENT` + `*/*`；两者都 `EXTRA_ALLOW_MULTIPLE`，
+**不需要任何存储权限**（系统把选中那几个 URI 的读授权随结果一起给）。回来后逐个拷进
+`cacheDir/pick/`，名字取系统给的真实名（`OpenableColumns.DISPLAY_NAME`），大小以**拷好的那份
+文件**为准（provider 常常不报 SIZE）。两条边界：
+
+- **取消 = 空表**（`RESULT_CANCELED` → `{files: []}`），不是 `reject`：用户反悔是正常操作，
+  写成一个错误的话他每次反悔都会看到一条"失败"提示。
+- **图片那一档的扩展名要落在 `paste::mime_of` 的名单里**（png/jpg/jpeg/gif/webp/bmp/avif）：
+  真机上的 `IMG_20261014.heic` 这种不在名单里，按 URI 声明的 MIME 换一个、MIME 也说不上来就按
+  png —— 与 `PasteImagePlugin.extOf` 同一条取舍（扩展名先让这条路走通，解不出来的那一层如实说）。
+  **文件那一档不动名字**：推送就是"用户要发什么就发什么"，对端落盘用的也是同一个名字。
+
+**Rust**（`mobile::pick_plugin` / `mobile::pick_files`）：注册插件（与 `open_plugin`、
+`paste_plugin` 同款）＋ 一条 `#[cfg(mobile)]` 的 `pick_files` 命令，把 Kotlin 回的
+`{path,name,size,mime}` 交给界面。**取消仍然是空 `Vec`**。
+
+**界面**：
+
+- `ChatScreen.svelte` 的 `.compose` 里，发送键**左边**加一颗 `.cbtn.cplus`（`.cplus` 这个类
+  早就在 `mobile.css` / 原型里备着，一直没有用），点它开底板 `AttachSheet.svelte`。
+- **两项而不是一个框**：图片与文件在这套系统里是两条**语义不同**的路 —— 图片是**消息内容**
+  （字节随会话消息过去，对端直接看得见），文件是**推送**（对端收到一张「接收 / 拒绝」卡）。
+  混在一个框里让用户猜"我选的这张图会被当成哪一种"，不如让他自己挑一下。
+- 「图片」：选完落进**输入区**（`composer.insertImagePicks`：把原生拷好的路径读成预览 +
+  复用粘贴那条路的 `insertChip`），还能配文字再发 —— 与 F-116 是同一个模型。
+- 「文件」：选完就**推送**（`mobile/store.svelte.ts` 的 `sendFilesToConvo`，与桌面
+  `chatSendFiles` → `pushPicked` 同一套：收件人取会话参与者、只发此刻在线的、群发那条记
+  `chatBatchId`、群聊记 `groupId`）。
+- **底板与输入区之间那一跳走 store 里的一个槽位**（`pendingImages = {key, files}`）：
+  "把图插进输入框"只有会话子屏做得到（`contenteditable` 那个元素在它手上），让 store 攥一个
+  DOM 回调或者让底板去 `querySelector` 都不如一个带 `key` 的槽位干净。**带 `key` 是因为
+  选图那一步在系统选择器里、可能停很久**：用户回来时可能已经换到别的会话，那几张图只属于当时
+  那条会话 —— 键对不上就谁也不插。
+
+### 校验（做了什么、看到什么）
+
+- `npm run check`（svelte-check）：147 文件 0 错。
+- 安卓目标的 Rust：`cargo check --target aarch64-linux-android`。**必须带 NDK 那套
+  `CC_aarch64_linux_android / AR_aarch64_linux_android / CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER`**，
+  否则 `cc-rs` 找不到 clang 当场失败（第一次就是这么挂的）；宿主 `cargo check` 里
+  `#[cfg(mobile)]` 那段根本不会被编译，别拿它当过了。宿主这边也照跑了一次（`cargo check`，
+  与本次改动无关的既有代码照旧编译通过）。
+- Kotlin：`npm run android:build:debug` 出 APK（`gen/android/app/build/outputs/apk/universal/debug/`）。
+  这一层是 `PickFilePlugin.kt` 唯一的编译器 —— 第一次就是这么抓到一个真错的：注释里那句
+  "`*/*`" 里的 `*/` 提前把块注释结束了，报的是一串 `Expecting member declaration`
+  （所以任意类型那个通配符现在写成常量 `ANY_TYPE`）。
+- **界面（真产物 + 假 IPC 桩，真 Edge headless，视口 393×852）**：`npm run build:mobile` 的
+  `dist-mobile` 起一个静态服务，页面里注入一份 `window.__TAURI_INTERNALS__` 桩
+  （`list_devices` 一台在线设备、`chat_snapshot` 一条会话、`pick_files` 按 kind 回一件、
+  `push_paths` 回一份批次），逐条点：
+  - 会话子屏 compose 里的顺序是 `输入框 → ＋ → 发送`（`.cinput.cx` / `.cbtn.cplus` / `.cbtn.csend`）。
+  - 「＋」→ 底板标题「发送」、两项「图片」「文件」。
+  - 选「图片」：发出 `pick_files({kind:"image"})` → 输入区出现一枚 `.cx-img`（`data-path` 就是
+    原生交回的那条缓存路径）、发送键从禁用变可用 → 点发送 → 发出 `chat_send_image`
+    （`{peerIds:["dev1"], path:"…/cache/pick/IMG_20261014.png", name:"IMG_20261014.png"}`）
+    → 输入区清空、会话里多一条图片气泡。
+  - 选「文件」：发出 `pick_files({kind:"file"})` → `push_paths`
+    （`{paths:["…/cache/pick/清单.xlsx"], peerIds:["dev1"]}`）→ 会话里出现文件气泡
+    「清单.xlsx / 4.0 KB / 传输中 0%」＋ 一句 toast「正在推送到「客厅台式机」」。
+  - **取消那一档**：让 `pick_files` 回空表 → 输入区、会话记录、toast 一个字都没变（底板照常关上）。
+- 真机没验：这台机器上 `adb devices` 是空的。**没有实测到的**：系统照片选择器 / 文件选择器的
+  真实长相、`content://` 拷进 `cacheDir/pick/` 的真实耗时、以及对端收到那张「接收 / 拒绝」卡
+  之后的完整往返（F-118 的前半段——选择器到 `push_paths`——在桩上验到了，后半段是既有的推送链路）。
+
+### 边界（这一版不做）
+
+- **文件夹**：系统选择器不能在同一个对话框里混选文件与目录（`ACTION_OPEN_DOCUMENT_TREE` 是另一条
+  Intent），而推一个文件夹要先把整棵拷进缓存 —— 等真有需求再单开一档。
+- **自绘浏览器 / 全盘浏览**：要 `MANAGE_EXTERNAL_STORAGE`（用户得去系统设置里开"所有文件访问"）
+  或一套 MediaStore + SAF 的后端，见上面第 1 条。
+- **系统分享菜单入口（F-85）**：仍然没做，与本条不冲突（那条是"从别的应用分享到 OrbDrop"，
+  入口在别的应用里，不在我们的界面上）。
+- 暂存文件落在 `cacheDir/pick/`（系统可回收），既没有按龄清理也不删：缓存目录本来就归系统管，
+  与粘贴那条路（`paste::sweep` 只管桌面临时目录）保持"谁的地盘谁负责"。
+
+## 38. 悬浮球窗口"不见了"的运行中兜底：看门狗 + 空窗上界 + 托盘叫回（2026-10-15）
+
+### 现象与判据
+
+桌面端偶现：**置顶悬浮窗与主界面同时不见，托盘图标还在**；点别的应用之后"可能出现也可能不出现"。
+两种情况必须分开看，判据只有一个 —— **在被控/出问题那台机器**本机看（或本机截屏）：
+
+| | 机制 | 本机看 | 远程画面里 |
+| --- | --- | --- | --- |
+| **A. 没被画出来** | 单窗口无边框 + 全透明：什么都没画 = 屏幕上什么都没有，与"窗口没了"无法区分 | 也不见 | 不见 |
+| **B. 窗口不在该在的地方** | 显示拓扑/分辨率/缩放变化之后，窗口留在没有任何显示器覆盖的坐标上 | 不见 | 不见 |
+| **C. 取画面拿不到** | 透明度靠 `DwmEnableBlurBehindWindow` + WebView2 透明背景，远控取画面路径可能整块丢 | **看得见** | 不见 |
+
+代码侧的三条成因（`docs` 里逐条给过证据）：
+
+1. **故意的空窗 + 无界等待**：`expand` / `collapse` / 折叠态菜单撑窗这三趟中间，球由 `.hold` 藏着、
+   面板要等 `expanded` 才显形（`main.css` 的 `.orb-stage.hold` / `.panel`）、撑窗那一两帧连卡片都不出镜
+   （`.menu-busy`）。而每一趟都要走出好几步 await（`orb_set_rect` 等命令 + `waitForViewport`）。
+   原来 `waitForViewport` 数的是**帧数**（6 帧），而帧不是时间的函数 —— 页面被判为隐藏（窗口被整个盖住、
+   被最小化、远控切会话）时 rAF 会节流甚至整个不跑，那 6 帧可能是 6 秒、也可能是永远。
+   **这个状态不可恢复**：`expand` 一进门就 `if (opening || expanded) return`，托盘那条 `orb://show` 也是空操作。
+2. **运行时零兜底**：`show`/`unminimize`/`set_focus` 全仓只在单实例那条分支里出现过一次，
+   `orb_set_rect` 固定 `SWP_NOZORDER`（不重新置顶、不 `SW_SHOW`）；`on_window_event` 只在 `#[cfg(mobile)]` 下挂了；
+   前端也没有 `onResized` / 缩放变化监听。显示器拓扑变化在这台机器上很常见：日志里
+   `上次的悬浮球位置已不在任何显示器上，保持居中` 实测出现过 44 次。
+3. **远控的虚拟屏**：UU远程官方文档写明"被控端没有接入显示屏时，远程连接将自动创建 1 个虚拟屏"
+   （<https://uuyc.163.com/help/4.0virtualscreen.html>），而它的分辨率/缩放与物理屏可能不同 →
+   被控端在**运行中**经历了一次拓扑 + 缩放变化（tao 会按 `WM_DPICHANGED` 的系统建议矩形自己搬窗口，
+   而前端只在自己动手那一刻现读 `scaleFactor`，手上那份吸附偏移/展开方向/命中区域就过时了）。
+
+### 改了什么
+
+| 位置 | 动作 |
+| --- | --- |
+| `orb_window::raise` | 置顶 + `ShowWindow(SW_SHOWNOACTIVATE)` + `unminimize` + `set_focus`。**不走 `window.show()`**：tao 的 `set_visible(true)` 在它缓存里已是可见时是空操作（diff 为空直接返回），而要修的恰恰是"缓存说可见、OS 说不可见"那条缝。 |
+| `orb_window::os_state` / `force_repaint` / `clamp_into_work_area` / `topology_fingerprint` | 运行时判据：`IsWindowVisible` + `IsIconic`（不看 tao 缓存）、`RedrawWindow`、搬回最近工作区、工作区集合+缩放的指纹 |
+| `lib.rs::start_orb_watchdog`（桌面，2s 一拍） | 不可见/被最小化 → 叫回台面；落在所有显示器之外 → 搬回最近工作区；指纹变了 → 让界面重排。三件里发生一件就顺手 `force_repaint` 并 emit `orb://recover`。**空闲时只做几次查询，不碰窗口**（N-04） |
+| `tray.rs::bring_orb_back` | 托盘左键单击/双击在 emit 之前先 `raise` —— 托盘图标是唯一"进程还在就一定看得见"的东西，它那一下必须能救回窗口。单实例那条分支改用同一个 helper |
+| `App.svelte` | `waitForViewport` 改**时间预算**（240ms）+ rAF/定时器取先到者；`expand`/`collapse`/`placeOrbMenu` 各挂一个 `STUCK_MS`(1200ms) 兜底 → `releaseStuckOrb` 先把悬浮体放出来；`settleDrag` 的落位那段抽成 `replanDock`；新增 `recoverGeometry` 挂在 `orb://recover` 上 |
+
+### 怎么验（不依赖"再遇一次"）
+
+- **几何与判据**：`cargo test --lib -- orb_window`（指纹只判变没变、搬运目标挑最近的工作区、工作区比窗口小时取 min）。
+- **看门狗端到端**：起 exe 之后用 `SetWindowPos` 把窗口搬到工作区之外（探针脚本见下），2~4 s 内它应当
+  自己回到工作区，日志里出现 `看门狗：悬浮球窗口已不在任何显示器上…`，并且界面重排过吸附落位。
+- **现场探针**（下次真遇到时用）：列出 `orbdrop` 进程的顶层窗口状态 ——
+  `vis / iconic / cloaked / rect / ex=TOPMOST+LAYERED… / responding` 以及当前工作区列表；
+  `rect` 落在工作区外 = B，`vis=True` 且 rect 正常却在屏幕上什么都没有 = A/C。
+- 远程的那一档（C）要在**被控端本机**截屏对照：本机看得见而远控画面里没有 = 取画面/透明度的问题，不是本条的几何问题。
+
+---
+
+## 39. 设备行不再显示「经 X 中转」（F-106 的界面那一格，2026-10-15）
+
+### 需求（用户）
+
+- **交换名单的口径不动**：仍然只有**已配对**的两台设备互换 `/discover` 视野（保持 §18 的四条边界）。
+- **中转不上界面**：两端一律不写「经 X 中转」，**所有会显示中转的地方**都收掉。
+
+### 收掉了什么
+
+| 位置 | 之前 | 现在 |
+| --- | --- | --- |
+| 桌面设备行（`lib/components/DeviceTab.svelte`） | 地址下面再加一行「经 `<relayVia>` 中转」（`.d-relay`，`--accent-deep`） | 只有地址那一行 |
+| 安卓设备行（`mobile/tabs/DevicesTab.svelte`） | 第二行在"经中转"时改写成「经 `<relayVia>` 中转」（`.drelay`） | 第二行**恒为** `ip:port` |
+| 手机会话页副标题（`mobile/ChatScreen.svelte`） | 一对一够得着时写「经 `<relayVia>` 中转 · 在线」 | 「在线」（长连接那档仍是「长连接 · 在线」） |
+| 桌面设备行悬停（`DeviceTab::linkHint` + `stores/devices` 的 `transitHint`） | 追加一句"这一段有中转记忆：直连不通时走 `<cidr>` 那一跳（池里 N 台…）" | 整条删掉（`transitHint` 与 `PeerDevice.transit` 一并删除，`list_devices` 不再算/不再报 `transit`） |
+| `stores/devices::unicastBlockedTip` | 结尾那句"由它接管之后这一行会写「经 X 中转」" | 只留"这张 Wi-Fi 可能把客户端之间的单播隔开了…打开设置里的「允许为其它设备中转」" |
+| 死 CSS | `main.css` 的 `.d-relay`、`mobile.css` 的 `.drelay` | 删 |
+
+**后端一个功能都没少**：`relayVia`（`list_devices` 的 `relayVia` / `PeerDevice::relay_via()`）留着 —— 前端
+`unicastBlocked`（`seen && !online && !relayVia`）靠它区分"拨的是借来的中转端点"与"直连这一跳不通"；
+中转本身（`relay::ensure_for` / `/relay/open` / 中转记忆 / `allowRelay` / 中转流量计数）全部照旧。
+
+### 顺带说明（历史章节的读法）
+
+- §21 里关于这一行的那几处排版量测（"第二行 = 经 X 中转"、`dnrow + drelay`、`--accent-deep`、行高 68 的
+  来源，以及真机实测里 `HUAWEI ABC-AL00 · 经 D0622 中转 · 在线` 那一句）描述的是**当时**的形态；
+  本变更之后安卓设备行第二行恒为地址，行数不变（仍是两行 68 —— 第二行一直都在，只是不再换文案）。
+- `docs/relay.md` 的 §3 现状表、§12.3「设备行」、§14 的副标题口径三处已同步改成"不上界面"；
+  `README.zh-CN.md` §4 里那句"使用期间设备行会标「经 X 中转」"也改掉了。
+
+### 怎么验
+
+- 静态门禁：`npm run check`（147 文件 0 错）→ `npm run build` + `npm run build:mobile`（两份产物里
+  grep `经 .* 中转` / `这一段有中转记忆` / `drelay` / `d-relay` **全空**）→ `npm run legacy:gen`（`.drelay`
+  那条规则没了 → `static/legacy-gap.css` 的行号注释跟着变，`--check` 恢复同步）→ `npm run check:compat`
+  → `npm run tokens:check` → `cargo check` 全干净。
+- 界面（不是"看代码觉得对"）：`vite preview` 起两份产物，真 Edge + 一份 `window.__TAURI_INTERNALS__`
+  假 IPC 桩（`list_devices` 三台：一台 `relayVia="D0622"` 且在线已配对、一台长连接、一台"看得见但连不通"）：
+  - 桌面：设备页三行的 `.d-ip` 分别是 `192.168.1.32:3891` / `192.168.50.7:3890` / `192.168.1.77:3892`，
+    查不到 `.d-relay`；状态胶囊的 `title` 里没有"中转记忆"那句。
+  - 安卓：设备行第二行恒为地址（`relayVia` 那台写 `192.168.50.7:3890`，查不到 `.drelay`）；
+    点那一行「发消息」进会话 → 副标题是**「在线」**，这一页全文查不到"中转"二字；控制台 0 错误。
+  - **面板里仍能看到"中转"字样的只有设置面板**：`允许中转` 开关与 `中转流量` 读数（它们是"本机替别人做事"
+  的开关与用量账，不是某台设备的选路状态）—— 用户若也要收，见本轮末尾的待定项。
+
+---
+
+## 40. 「反向记录带进来的行」能被担保人的转述升格（F-10 / F-107 交界的影子 bug，2026-10-15）
+
+### 症状（真机，用户报的）
+
+新增一台手机 A：A 与 B 同网段，A 的列表里只有 B，而 A 上 B 那一行写着「经 C 中转」；**C 从来
+没出现在 A 的列表里**。功能上 A 确实在借 C 中转（能借到、能发消息），只是列表里没有它。
+
+### 根因（读代码定的，两条叠加）
+
+1. 那一行是 `adopt_devices` 建出来的（反向路由记录 / 中转方 `/relay/open` 回话自报池）：`online: false`、
+   `paired: false`、**从不打 `seen`**，而且 `probe_peers_once` 显式跳过 `adopted`。界面准入是
+   `online || paired || seen` → 三条都不满足 = **后端有行、界面没有**。
+2. 这一档唯一能"活过来"的路是**已配对的对端**在它的 `/discover` 表里报来同一台（F-10 那条交换）——
+   而 `learn_peers` 对"已存在的行"只在它**已经是** `learned` 成员时才接管，否则只修占位名就
+   `continue`：不写 `online`、也不记进 `learned`。于是这一行永远停在第 1 条那一档，直到 900s 的
+   `ADOPTED_TTL` 到期被 `sweep_relay_memory` 收走 —— 表现是"偶尔闪一下就没了"。
+   附带：`adopt_devices` 的 `known` 判据（`peers ∪ 地址簿`）让后续记录也不再刷新它的 adopted 时间戳，
+   所以是"900s 到点、下一条记录再重建"的循环。
+
+也就是说：第一个 `learned` 状态永远进不去（影子），而它本该是"担保人一报就接管"。
+
+### 改了什么（`state.rs::learn_peers`，仍只有这一个写点）
+
+- 先取两份快照：`booked`（地址簿 id）与 `adopted`（这一档的 id）——`learned → peers` 是本处的加锁顺序，
+  快照先取，避免在守卫里再锁 `adopted` / `config`（那是 `adopt_devices` / `sweep_relay_memory` 的
+  另一套顺序）。
+- "已有行能否被这次转述接管"的判据从"它已是 `learned` 成员"扩成"**或**它只是 `adopted` 那一档
+  （且不在地址簿里、未配对）"。
+- 升格那一下：写 `online = true`、名字/地址按担保人的观察值、记进 `learned`；出了守卫再从
+  `adopted` 摘掉（存活改由 20s 那张表管，也才会跟着 `sweep_learned` 一起走 —— 留在 `adopted` 里
+  只会让它继续被探活跳过）。
+- **本机自己的行**（mDNS 发现 / 手动添加 / 已配对 / 中转核实过地址的）一个字都不动（仍只修占位名）：
+  存活的唯一来源仍然是探活。
+
+### 怎么验
+
+- 回归用例（`src-tauri/src/state.rs` 的 `tests`）：
+  - `a_vouched_device_promotes_an_adopted_row`：先 `adopt_devices` 摆出那一档（前提断言 `online == false`），
+    再由担保人 `learn_peers` 报来同一台 → 断言 `online`、名字、进 `learned`、**并从 `adopted` 摘掉**。
+  - `a_vouched_device_never_takes_over_our_own_row`：地址簿里的行即使同时也在 `adopted` 里，也不被这次
+    转述声明在线 / 改写地址 / 改写名字，且不归 `learned`。
+- **失败在前**：把升格判据临时置 `false` → `cargo test --lib -- state::tests::a_vouched_device` 里
+  `a_vouched_device_promotes_an_adopted_row` 在「担保人报来了就按在线算」那一行 FAILED，边界那条照旧通过；
+  恢复判据后两条都过。
+- 文档：`docs/relay.md` §10.3 补了"`adopted` 能被担保人的转述升格"这条规则；`state.rs::adopt_devices`
+  的文档点明这一档"唯一的出路"就是这条路。
+- 全量 `cargo test --no-fail-fast`（工作区可编译之后复跑）：**除 `push_stream` 外全绿** ——
+  `lib` **359 passed / 0 failed**（含本轮两条新用例）、`p1_integration` **45 passed / 0 failed**、
+  `relay_memory` 12、`link_consent` 4、`peer_metadata` 4、`share_visibility` 5、`mirror_hydrate` 1、
+  `credentials_vault` 1。
+- 上一轮那条 `nat_peer_keeps_no_address_and_its_liveness_follows_the_link`
+  （`connect_ws` → rustls `ApplicationVerificationFailure`）复跑**转绿** —— 它是并行跑那几个真开端口/
+  真投 TLS 的用例时的假红（本仓已记过这类），与本条改动无关；`p1_integration` 这一轮 45 条全过。
+- 唯一还红的是 `push_stream`（5 passed / 3 failed）：`a_restarted_receiver_resumes_on_its_own`
+  （收完留了 `<hash>.orbdrop-part`）、`both_sides_restarted_resume`（`restore_outbound` 返回 2、期望 1）、
+  `without_the_sender_record_the_receiver_is_told_so`（终态 `unknown`、期望 `failed` + `SENDER_GONE`）。
+  三条都在**推送 / 续传的状态机**里，与本条改动（设备表的记账）没有共用路径；那一块当时正有未提交的
+  改动（`transfer/mod.rs` 的老协议收尾清理、`server/routes_dav.rs` 的 PUT 临时文件惯例）。
+  **在 HEAD（`dffa578`）上另开一个 worktree 单跑同一 target 也是红的：2 passed / 4 failed**
+  （`a_restarted_receiver_resumes_on_its_own`、`interrupted_push_resumes_from_the_block_record`、
+  `stream_push_transfers_mixed_folder_intact`、`the_same_file_into_two_dirs_keeps_both_records`）——
+  所以这几条**不是本条改动带来的**；工作区那 3 条与 HEAD 那 4 条只有
+  `a_restarted_receiver_resumes_on_its_own` 重合，差别来自当时未提交的那几处改动。
+  这一 target 归推送 / 续传那条线自己收口。
+
+## 41. 安卓：「＋」→「应用」——把设备上的应用发过去（F-119，2026-10-16）
+
+需求一句话：**安卓端会话的「＋」里再加一项「应用」：从设备上已安装的应用里挑一个发过去，落盘名 = `应用名_versionName(versionCode)_包名.apk`**（对方一眼看出是哪个应用、哪个版本、哪个包）。
+
+### 一、为什么能"直接发 base.apk"（既不拷一份，也不重新打包）
+
+1. **读得到**：`ApplicationInfo.sourceDir` 就是那份 `/data/app/~~<hash>~~/<pkg>-<hash>==/base.apk`。DAC 这一层它是世界可读的，SELinux 给**所有** app 域开了读权限 —— AOSP `public/app.te`：
+
+   ```
+   allow appdomain apk_data_file:dir r_dir_perms;
+   allow appdomain apk_data_file:file rx_file_perms;
+   ```
+
+   所以**不需要 root、也不需要任何运行时权限**（"APK 提取器"那类应用用的就是同一个机制）。这一点决定了这条路可行：没有它，"发送应用"就只能靠 `root` 或者让用户先去系统里找文件。
+2. **列得到**：Android 11 起有包可见性过滤，不声明就只回极少数几项（常常只有本应用自己）——**表会是空的，而且看不出哪里错了**。所以清单里加了 `<queries>`（intent 签名 `MAIN` + `LAUNCHER`），不用 `QUERY_ALL_PACKAGES`：用户说"应用"指的就是有桌面图标的那些，而后者会把服务类的包一起放进来（表里全是噪声）。
+3. **但改不了名**：清单里每一份的顶层名字**唯一来源是路径的 basename**（`transfer::manifest_for_named_paths` 里的 `prefix`）。两条"不动源文件就能改名"的捷径都堵着：
+   - **符号链接**：`unsendable::is_link` 当场拒（"「x」是一个链接，不能作为推送源"）；
+   - **硬链接**：Android 上 `protected_hardlinks=1`，源文件不属于本应用 uid，`link()` 必失败。
+
+   于是"改名"必须在**清单那一层**解决（下一节）。**拷一份是最没必要的那条路**：既多占几十到几百 MB 缓存（系统空间紧张时还会被回收 → 传到一半读不到），也不比直读稳（应用更新/卸载会删掉旧目录，两边都有各自的失效窗口，而直读的失败是可重推的诚实失败）。
+
+### 二、覆盖名：清单里的名字与本机读字节的路径本来分开
+
+`PushSource` 里早就分成两件事：
+
+- `files: Vec<FileEntry>` —— **告诉对端的样子**（相对路径 + 大小 + 时间戳）；
+- `sources: HashMap<rel, PathBuf>` —— **本机的翻译表**（下载端点每次请求按它开文件）。
+
+`manifest_for_paths` 里那个 `prefix` 就是"写进清单的名字"。所以新增的只是**一个口子**：
+
+- `manifest_for_named_paths(&[(PathBuf, Option<String>)])`：`prefix` 取覆盖名（没有就用 `file_name_of(path)`）；单文件推送（`is_dir == false`）还要把 `PushSource.name` 一起换成覆盖名 —— 那条路上对端**只认邀请里的名字**（`InboundInvite::manifest()` 拿 `self.name` 合成唯一那条清单项）。
+- `push_paths(..., names: Option<Vec<String>>, ...)`：逐位对齐，空串 = 这一项不改名；长度对不上当场拒绝（宁可报错，也不按错位的名字发出去）。
+- **协议一个字没改**：对端仍然只是"按清单落盘"，所以**老版本对端照收** —— 这是这条路最大的便宜。
+
+名字净化（`resume::sanitize_file_name`，新增）：
+
+- 字符：控制字符与 `< > : " / \ | ? *` → `_`（`scrub`，**从 `safe_dir_name` 里抽出来共用**，不许多出一条能过这边、过不了那边的缝）；
+- 首尾：点与空白去掉（`".. "` 这类在 Windows 上会被吃掉后半截；`.hidden` 在 Unix 上变成隐藏文件）；
+- 长度：超 **200 字节**按**字符边界**截断并保住扩展名 —— 200 而不是 255 是因为对端还要把名字拼成 `<名字>.orbdrop-part`（13 字节）与同名去重的 ` (2)`，而 Linux 单名上限是 255 **字节**（中文一个字三字节）；
+- 保留设备名（`CON` / `NUL` / `COM1`…，Windows 连 `NUL.txt` 都当设备名）加 `_` 前缀 —— `is_reserved_device_name` 改成 `pub(crate)` 与接收侧共用。
+
+**为什么非要净化**：应用标签是**别的应用自己声明的字符串**（`"X: 编辑器"` 这种真的存在），而对端落盘那关（`resume::safe_join`）遇到这些字符**不是跳过这一项，而是整次接收判失败**（"非法路径"，见 `push_job` 与 `download` 两处落盘点）。不净化就等于"随手把一整次推送打死"。
+
+那份名字（`resume::apk_file_name`）：
+
+| 情形 | 结果 |
+|---|---|
+| 正常 | `微信_8.0.50(2600)_com.tencent.mm.apk` |
+| `versionName` 为空（有的应用就是不写） | `计算器_34_com.android.calculator2.apk`（空括号看着像漏了一段） |
+| 标签为空（只有包名的裸包） | 用包名顶着 |
+| 全空（不该发生） | `应用_0_.apk` —— 不许拼出空名字 |
+
+### 三、原生（`InstalledAppsPlugin.kt`，新插件）
+
+一条 `list` 命令：`queryIntentActivities(MAIN + LAUNCHER)` → 按**包名去重**（一个包可以有多个入口 Activity）→ 每包一次 `getPackageInfo`（正好被卸载的跳过它一个）→ `sourceDir` + `File.length()` + `splitSourceDirs` 非空即"拆包安装"。按 `Collator`（系统语言）排序，中文按拼音。
+
+**这一层只报事实、不拼名字**：拼与净化都在 Rust（`mobile::list_installed_apps` → `transfer::resume::apk_file_name`）。理由是净化判据住在 Rust（`safe_join` 那一关），两处各写一套迟早就分叉。整趟是**只读**的（一次查询 + 每包一次 `getPackageInfo` + 一次 `stat`），**不拷任何字节** —— 与 `PickFilePlugin`（选中项要整份拷进缓存）完全不是一回事。
+
+### 四、Rust 接线
+
+- `mobile::apps_plugin()`（插件名 `orbdrop-installed-apps` ↔ 类名 `InstalledAppsPlugin`）+ `mobile::list_installed_apps()`；
+- `lib.rs`：注册插件（`#[cfg(mobile)]`）与命令 `#[cfg(mobile)] list_installed_apps`（形状与 `pick_files` 一致：`lib.rs` 里一个薄壳，实现在 `mobile.rs`）；
+- 返回 `InstalledApp { label, packageName, versionName, versionCode, path, size, fileName, hasSplits }` —— `fileName` 是后端拼好并净化过的那个名字，界面只显示、只交回。
+
+### 五、界面
+
+- `AttachSheet` 第三项「应用」（图标用 `zip` 那颗"包裹"）→ 关表之后开**另一张底板** `appPicker`（`SheetHost` 新一档）；
+- `AppPickerSheet.svelte`：进表即 `store.loadApps()`（**旧表留着先画**，右上说「读取中…」而不是一片空白；每次都重读，装了/卸了应用表要跟着变）、搜索框（应用名或包名 —— 同名应用真的存在，包名才是唯一认得出的那个）、一行一个应用；
+- 点一行 = 发送（**先关表再干活**，与「图片 / 文件」同规）：`store.sendApp(app)` → 走的就是「文件」那条推送路（`sendFilesToConvo`），只是这一项带 `rename: true`，`pushPaths` 因此多带一张覆盖名表；会话里那条气泡写的也是落盘名（用户看到的与对方收到的是同一个名字）。
+- **图标**：第一版用的是字母头像（与「新建会话」那份 `.pick .pav` 同形同尺寸，`.aav`）；真图标怎么取见下面 §五之二。
+
+### 五之二、应用图标：按行按需取（F-119 的后续）
+
+表里每一行**显示真图标**，做法是"分开取、按需取"，不是列表那一趟一起给：
+
+- **原生**（`InstalledAppsPlugin.icon`）：`getApplicationIcon(pkg)` → 画进一张 144px 的位图 → PNG → `data:image/png;base64,…`，**进程内缓存按包名存一份**（同一行重复取就是白花）。自适应图标（API 26+）要多做两件事：`AdaptiveIconDrawable` **自己不带遮罩**，直接铺满会把"打底色"也画出来、前景比别处小一圈 —— 所以先把 108 帧放大到让中间那块 72 正好铺满目标尺寸（`box = size * 108 / 72`，居中），再按系统那套比例裁一圈圆角（半径 22%）。
+- **Rust**：`mobile::app_icon(package_name)` → `#[cfg(mobile)] app_icon` 命令（与 `list_installed_apps` 分开就是"表先出来、图标随后补"）。
+- **界面**：`src/mobile/appIcons.ts` 一层缓存（**必需的，不是优化**：搜索框每敲一个字都重建整张表的行，缓存住才不会重复走 IPC；规模上限就是"这台设备上的应用数"，不淘汰）+ 同时在飞 **4** 条的池（一张表一百多行，全放开就是一次让主线程卡一下）+ `components/AppIcon.svelte`（取到之前显示首字母，取不到就一直显示它 —— 那一行照样能点、能发；缓存里已有那一张时**首帧**就画出来，不闪首字母）。
+- 尺寸与圆角与首字母那块**逐字一致**（实测：两者都是 34×34、`border-radius: 11px`），换的那一下不跳。
+
+### 五之三、顺手修掉的一个 UI bug：长列表在底板里滚不动
+
+写这张表时发现的**既有**问题（`mobile.css`，影响所有底板）：`.card.list` 是 `overflow: hidden`（行底色要贴着圆角裁），而 `.sheet-body` 是 `display: grid` —— 在 grid 的自动轨道里，这个滚动容器**不贡献内容高度**。实测（Chromium，与安卓 WebView 同一套布局）：`.card.list` 里 150 行合计 **19501px**，卡片自己塌成 **26.9px**，于是 `.sheet-body` 的 `scrollHeight == clientHeight` —— **整段列表既看不见、也滚不动**。修法是给 sheet 里的卡片一个显式内容高度：
+
+```css
+.sheet-body > .card { height: max-content; }
+```
+
+修后同一个探针：卡片 19501px、`scrollHeight` 19753 vs `clientHeight` 279，能滚到底。手机尺寸（390×844）复测：`clientHeight` 635 / `scrollHeight` 10154，滚动确实动了行。为什么别的底板没碰上：它们的长列表直接摆在 `.sheet-body` 里（`.stack` / `.pick` 是普通 div），用 `.card.list` 包的只有空状态那两三行。
+
+### 六、已知取舍与边界
+
+- **拆包安装（AAB）的应用**：表里标「拆包」，但发出去的就是 `base.apk` 一个文件 —— 对方（安卓端）点开多半装不上（`INSTALL_FAILED_MISSING_SPLIT`）。要不要连 `splitSourceDirs` 一起发（同一个文件夹，或一份 `.apks` zip）**没做**：那会把"发一个应用"变成"发一组文件"，接收侧的落盘形状与两端文案都得跟着改，属于另一条需求。
+- **源在传输中消失**：应用**更新/卸载**会删掉旧的 `/data/app/<dir>/`，这一条就失败（诚实的失败 + 可重推）。拷一份并不更稳（`cacheDir` 被系统回收同样会中途读不到）。
+- **标签里的 `/` 被洗成 `_`**：应用标签不能拼出目录 —— "一个应用一个文件夹"我们不摆这一档（要摆就得先定拆包那条）。
+- **口径 = 有桌面图标**：没有入口的服务类包列不出来（也不需要），与系统"设置 → 应用"里那一列同一个口径。
+
+### 七、验证
+
+- **单元**：`transfer::resume::path_tests` 新增三条 —— `sanitized_names_always_pass_the_landing_gate`（**属性测试**：一批真会碰上的脏名字，净化后必然过 `safe_join`，且净化幂等）、`sanitize_replaces_illegal_keeps_the_rest`（该换的换、该留的留、超长保扩展名、中文不切半个字）、`apk_names_follow_the_agreed_shape`；`transfer::tests` 新增三条 —— `an_override_only_changes_the_name_the_peer_sees`（清单名是覆盖名、`sources` 仍指着源路径、`is_dir == false`）、`dirty_override_names_are_cleaned_or_dropped`、`duplicate_override_names_are_deduped`。
+- **端到端**（真 HTTP + 真 TLS，两个 AppState）：`tests/push_stream.rs::a_renamed_source_lands_under_the_override_name` —— 源是一份与名字毫无关系的 `base.apk`，发送时给覆盖名 `微信_8.0.50(2600)_com.tencent.mm.apk`；对端落盘的就是 **`<下载目录>/PC-NA/微信_8.0.50(2600)_com.tencent.mm.apk`**、逐字节一致，且对端那份里**没有** `base.apk`、没有 `.orbdrop-part` 残留。这条同时证明了"名字确实是从清单/邀请走的"，而不只是那个纯函数算对了。
+- **编译**：`cargo check --lib --target aarch64-linux-android`（`cfg(mobile)` 那一半）通过；`gradlew :app:compileArmDebugKotlin` **BUILD SUCCESSFUL**，且 merged manifest 里 `<queries>` 那一条确实在（`app/build/intermediates/packaged_manifests/armDebug/.../AndroidManifest.xml`）。
+- **全量**：`cargo test --no-fail-fast` —— `lib` **367 passed / 1 ignored**、`p1_integration` **45 passed / 1 ignored**、`relay_memory` 12、`link_consent` 4、`peer_metadata` 4、`share_visibility` 5、`credentials_vault` 1、`mirror_hydrate` 1，`push_stream` **6 passed / 3 failed** —— 那三条（`a_restarted_receiver_resumes_on_its_own`、`both_sides_restarted_resume`、`without_the_sender_record_the_receiver_is_told_so`）正是 §40 记着的**改动之前就在红**的那三条（同一个 target、同一组名字，与推送/续传的状态机有关），与本条改动没有共用路径。
+- `npm run check`（svelte-check）148 文件 **0 错 0 警告**。
+- **没有真机验证**：应用表本身（`queryIntentActivities` 在真机上列多少、`<queries>` 是否让表满）与"点一行真的把 base.apk 推过去"这两件，在开发机上做不了 —— 需要一台安卓设备（见 `docs/README.md` §四）。
+
+---
+
+## 42. 真机反馈（第八轮）：**"先显示一串 deviceid"与"明明在说话却一直离线"**（2026-10-16）
+
+### 一、两条现象（用户报的）
+
+一台**手机**在桌面端的**会话列表**里、**设备列表**里却没有它：
+
+1. 手机开机之后，会话列表那一行先显示 **deviceid**，过一会儿才变成设备名；
+2. 同一台设备**明明在线、也能正常发消息**，可那一行**一直显示离线**。
+
+### 二、根因：两条现象各自落进一条缝，缝的两侧是"本机视角"与"对端视角"
+
+| # | 根因 | 证据 |
+|---|---|---|
+| 1 | `online` 的**唯一**判据是"本机拨得动它"（5s 探活成功 / 长连接活着），而**从对端拨进来**这件事**故意不置在线**（怕设备行在"离线 / 已配对"之间来回跳） | `state.rs::probe_peers_once` 的三个写点；`server/routes_chat.rs:335-338` 的 `_ => (String::new(), 0, false)` |
+| 2 | 于是"能拨进来、拨不回去"的那一台（AP 隔开单播 / 跨段 / 只有一条借来的中转链）= `online:false`；它又**未绑定**、而这张网**收不到它的 mDNS** 时 `seen:false` → `visibleDevices` 把它**整行挡在设备列表外**，可会话还在（记录是用户数据） | `devices.svelte.ts:34-42` 那条 filter；`lib.rs:552`（`seen` 只有 mDNS 给） |
+| 3 | **第二条独立的谎（显示层）**：会话那一行的状态点只查**可见那份**设备表（名字那条路早就查了两份），查不到 = `deviceDotState(undefined)` = `offline` —— 与后端真实状态无关 | `chat.svelte.ts:479-481`、`devices.svelte.ts::threadDotState`、`TabContent.svelte:34`、`mobile/ChatScreen.svelte:49` |
+| 4 | 名字是**占位名**（`name == 设备 id`）时的填充路只有四条（mDNS TXT / HTTP 会话信封 / 探活回话 / 担保人转述），而这几条对"跨段、只经中转"的那一台**都慢或不通**；中转控制面那条报文只带 `id + port`，**连名字都没有** | `state.rs`（`observe_verified_addr` 建行）+ 旧 `RelayRequester { id, port }` |
+| 5 | 长连接那条会话消息**不带名字**：接收方只能取本机设备表里那份（占位名），还把它**写进了会话记录**（`ChatRecord::from_name`）—— 于是"deviceid"在记录里也留了痕，`nameFromHistory` 回落的也是它 | `ws/session.rs` 旧 `ChatText` 臂 |
+| 6 | 三处"本机这一侧证据用完了就翻离线"**各写一遍**：5s 探活的 `Offline` 档、mDNS 告别包/TTL 过期、长连接断开且没有地址 | 见下面 §三 的表 |
+| 7 | 两个小 bug：① HTTP 会话自报端口用的是 `server_port` 原子（服务器还没绑好 = **0**）→ 对端记下 `ip:0`，永远拨不动；② `is_relayed_source` 只要**任意一行**的 `ip` 撞上来源地址就算"经它中转" → 残留行（重装换了 device id、DHCP 换手）会让**直连**的发送方地址不记、在线不置，永久离线 | `chat.rs`（旧 `body["port"] = server_port.load(..)`）、`state.rs::is_relayed_source` |
+
+### 三、修复（A / B / C / D）
+
+| 组 | 改动 | 位置 |
+|---|---|---|
+| **A 显示层** | 新增 `deviceById` / `devicesById`（**先可见那份、再后端原样那份**），把"这台现在怎么样"的查表全部收口：会话列表行、会话标题、收件人栏、右键/配对/连接那几处、移动端四张表与两台页；`unicastBlocked` 的判据从 `!online` 改成"**手里没有一条拨得动的路**"（地址或借来的端点）—— 否则"刚发来消息、但本机没有它地址"的那台在点「连接」时会一句话都没有 | `src/lib/stores/devices.svelte.ts`、`stores/chat.svelte.ts`、`stores/peers.svelte.ts`、`components/ConvoPanel.svelte`、`App.svelte`、`mobile/{store.svelte.ts,ChatScreen.svelte,sheets/*}` |
+| **B 入站证据** | `AppState.heard`（`设备 id → 最近一次收到它的东西的时刻`，`HEARD_TTL = 60s`，只活在内存）+ `note_heard` / `heard_recently` / `note_heard_online` / `set_peer_offline_unless_heard` / `prune_heard`；**写点**＝会话入站那条唯一漏斗（`ws::session::handle_inbound` 顶部，长连接与 HTTP 都汇到这里）、推送邀请、`/discover` 问表、中转核实成功那几处；**不再翻**的位置＝探活的 `Offline` 档、探活里"一条路都没有"那一支、mDNS 告别/TTL 过期、长连接断开且无地址（四处共用 `set_peer_offline_unless_heard`）。`apply_offline`（隐身）一并清空这一档 | `state.rs`、`ws/session.rs`、`lib.rs`、`server/{routes_push,routes_discover,routes_relay}.rs`、`relay.rs` |
+| **C 名字通道** | ① 中转控制面的自报身份补上 `name`（`RelayRequester`，`serde(default)`）；`verify_identity_at` 把 `/pair/info` 回话里的**观察到的**名字带回来（**核实过的 → 直接更新设备行**，自报的那份只填占位行；分界在 §六 统一过）；② 长连接的会话事件（`ChatText` / `ChatImage`）新增 `#[serde(default)] from_name`，发送侧填本机此刻的名字（含排队补发那一路），接收侧 `note_peer_name`（token 换来的身份 = 核实过）；③ 新判据 `should_take_name(current, incoming, id)`：**空名 / 占位名不许冲掉真名**，真名之间照旧互相覆盖（对端改名走的就是后者）—— 用在 `upsert_peer` / `mark_paired` / `add_peer_book` | `relay.rs`、`server/routes_relay.rs`、`ws/{events,session}.rs`、`chat.rs`、`server/routes_chat.rs`、`state.rs` |
+| **D 小 bug** | ① HTTP 会话自报端口改 `state.listening_port()`（与 `/pair/info`、中转控制面报的是同一个数）；② `is_relayed_source` 要求对上的那一行**此刻确实还在本机视野里**（在线 / 已配对 / 刚听到过 / 被 mDNS 看见）；③ mDNS 记录被撤**不再直接翻 `online`**（记录到期不是"不可达"的证据，可达性交给探活） | `chat.rs`、`state.rs`、`lib.rs` |
+
+### 四、改后的口径（一句话）
+
+> **在线 = 本机够得着它（探活成功 / 长连接）** 或 **它刚跟本机说过话（60s 内）**；
+> **能不能立刻送到**仍然只看"有没有拨得动的路"（`PeerDevice::dialable()`：直连地址或借来的端点）——
+> 所以"在网、但本机没有它的地址"那一台会显示**在线**，消息**排队**等路出现（推送/配对仍各自再判一次地址，不会被这一档带偏）。
+
+### 四之二、这一档的边界（写完自查抓出来的四处，都已修）
+
+`online` 变成"两条证据之一"之后，"它在线"不再蕴含"本机拨得动它" —— 凡是**拿 `online` 当
+"从本机这一侧够得着"用**的地方都得再看一眼。逐条过完之后改了四处：
+
+| # | 问题 | 修法 |
+|---|---|---|
+| 1 | **`adopted` 行会永远停在线**：探活的候选过滤把它整类跳过、mDNS 从没提过它、长连接那一条也轮不到它 —— 它的"在线"只由 `heard` 撑着，而那一档过期时**没有任何地方**把它翻回来（只能等 900s 的 `ADOPTED_TTL` 把行整个收走） | `prune_heard` 收走过期记录时，对 `adopted` 的行顺手标回离线（`learned` 不在此列：那一档由担保人每 5s 的转述自己刷新，在这里翻会闪） |
+| 2 | **行预算漏了一格**：`enforce_row_budget` 原来把 `online` 当"有归宿"，而 `online` 现在也能由"别人一条报文"给（未配对的会话信封不需要 token）→ 换着 id 发报文就能攒出**收不走**、还每 5s 被探活敲一次的行 | 那一格改成 **`online && dialable()`**：能留住的是"有直连地址或手里有一条端点"的（正是这一档要保护的"看得见、能用"的设备）；只被听到过、一条路都没有的行照旧可收（= `heard` 之前的行为） |
+| 3 | **「单播被隔开」那句 tip 被整条灭掉**（自查时改错的一处）：新判据只留"手里没有路"，而 mDNS 发现出来的行**一定带着记录里的地址** —— F-106 的原始那一档（记录在、探活不成）于是再也不会弹那句话 | 判据两半都要：`seen && !relayVia && (!online \|\| 手里没有路)` —— 原来那一半管 F-106，新补的一半管"听到过、但本机没有它的地址" |
+| 4 | **担保人转述会把真名冲成 deviceid**：`learn_peers` 的接管分支（`adopted` 升格走的就是它）无条件写 `l.name`，而担保人没报名字时上面刚把 `l.name` 填成**设备 id** | 同一处也走 `should_take_name`（与 `upsert_peer`/`mark_paired`/`add_peer_book` 同一个判据） |
+
+**没改、记在这里的一处**（要动的是选路、不是存在性）：`relay::open` 挑"用本机地址簿里那份地址"
+还是"用请求方捎来的 `addr`（到那儿核实一遍）"时，看的是 `online && 有地址` —— 而这一问自己也
+刚把目标标成在线（`heard`，60s），于是**下一次**中转在这 60s 里会优先拨本机那份可能过期的地址，
+而不是重新核实请求方那份（它刚刚被证明能用）。影响有界：请求方经那条端点的那一次会失败，
+`ensure_for` 按 30s 的限流重来；`heard` 之前同一个形状也存在，只是窗口 ≤ 5s（探活那一拍就会把它
+翻回离线）。**要真修就得给"这份地址最后一次被本机验证过是什么时候"留一格**（`direct_streak`
+只覆盖被探活的那几类行）—— 那是选路层的改动，不在本轮口径变更的范围里。
+
+### 五、验证
+
+- **单元**（`lib`，新增 6 条）：`being_heard_keeps_a_peer_online_until_the_evidence_expires`（听到 → 在线；TTL 外如实落回；表里没有的行不配凭空造出"在线设备"；记录被 `prune_heard` 收走）、`unpairing_forgets_being_heard`、`a_real_name_survives_reports_that_carry_none`（空名/占位名不冲真名、真名之间照旧覆盖、占位行被真名填上）、`a_dead_row_does_not_make_a_direct_sender_look_relayed`（残留行不算"经它中转"，活着的那一台才算）、`an_adopted_row_falls_back_offline_when_being_heard_expires`（§四之二 第 1 处）、`ws::session::an_inbound_chat_fills_the_placeholder_name_and_marks_it_online`（占位名被载荷里的真名填上 + 会话记录里那条也变真名 + 真的在线；再来一个自称名不覆盖）；`unbooked_rows_are_kept_within_budget` 里补了"只被听到过、一条路都没有的行照旧可收"（第 2 处）。
+- **显示层冒烟**（真代码、真夹具、假 IPC，`npx vite build --ssr` + `node`）：17 条断言全过 —— "刚听到过它"的那台在设备列表里、会话列表那一行是 `online`/蓝环且用真名；残留行照旧列在会话里但点画灰、按 id 查得到；`unicastBlocked` 的三档（F-106 原始档 / 听到过但没路 / 有地址在线）逐条对上。
+- **全量**：`cargo test --no-fail-fast` —— `lib` **373 passed / 1 ignored**、`p1_integration` **45 / 1 ignored**、`relay_memory` 12、`share_visibility` 5、`link_consent` 4、`peer_metadata` 4、`credentials_vault` 1、`mirror_hydrate` 1；`push_stream` **6 passed / 3 failed** —— 仍是 §40/§41 记着的那三条**改动之前就在红**的用例（`a_restarted_receiver_resumes_on_its_own`、`both_sides_restarted_resume`、`without_the_sender_record_the_receiver_is_told_so`，全是推送/续传的状态机），与本轮没有共用路径。
+- `npm run check`（svelte-check）150 文件 **0 错误 1 警告**（`mobile/sheets/RemarkDeviceSheet.svelte:14` 那条"初值只取一次"的提示，改动前就在）；`npm run build` 通过。
+- **没有在真机 / 真实窗口里跑**：这台开发机的浏览器守护起不来（Chromium 起不来，`omp ps` 里没有可用的 omp.browser.*），所以上面那条冒烟是"真代码 + 假 IPC"的 Node 跑法，不是真实窗口里的目视确认；两条现象本身的现场（AP 隔离客户端单播 / 跨段 / 中转）也需要一台手机 + 那张网才能复现（见 `docs/README.md` §四）。
+
+### 六、追问（同日）：**启动那一刻还是 deviceid**（已修）
+
+**现象**（用户）："启动的时候还是显示的 deviceid，而不是设备名 —— 是不是启动的时候立刻拉一遍？过了一段时间才会变成在线状态，且显示设备名。"
+
+**分析**：这是**两笔不同的账**，被看成了一笔。
+
+| 账 | 启动那一刻手里有什么 | 该不该等 |
+|---|---|---|
+| **名字** | 已经有**耐久**来源：会话记录里那条消息带来的 `fromName`（落盘在 `chat.json`，跨重启还在）—— 但两处没用它 | **不该等** |
+| **在线** | 什么都没有，而且是**故意**的：`AppState::new` 把落盘的 `online` 一律降级成离线，"刚听到过它"（`heard`）只活在内存里 | **必须等**新证据 |
+
+"启动时立刻拉一遍"**本来就有**：探活循环的**第一拍就在启动时立刻跑**（`lib.rs`，`sleep` 写在探活之后，注释里就是为这件事）。那一拍干的正是"拉一遍"（问 `/discover` / `/pair/info`），**名字与在线是同一次回话里一起拿到的** —— 用户看到的"过一会儿两件一起发生"就是它成功的那一刻。它对**本机拨不动**的对端（只有入站：跨段 / AP 隔开单播 / 只有借来的中转）永远不成立，只能等**它自己开口**（§二 B 那一档）。
+
+名字那笔账的缺口在**判据**上：名字有两条来源（设备行那份 = 观察值；会话记录里那份 = 对端自己发来的消息带着的），而
+
+```
+deviceNameOf(id) = peerShortName(id, 记录里的 fromName)
+peerShortName: 设备表里有这一行 → 用它那一行的名字（**哪怕是占位名 = 设备 id**）
+               没有这一行 → 才回落到记录
+```
+
+—— 设备行**存在但不含信息**时，旧写法把它当成"已经知道了"，于是启动那一刻（还没有任何新观察）必然先显示一串 deviceid。而占位名（空串 / 等于设备 id）在后端**早就有判据**（`name_is_placeholder`），前端缺对应的一半。
+
+**修法**（两处，都不加新字段、都不落盘）：
+
+| 处 | 改动 |
+|---|---|
+| **F1 前端** | `peerShortName`：设备行那份是**空串或等于设备 id** 时视为"还没有名字"，回落到调用方给的回落（会话记录里那个真名）。判据与后端一字不差；备注（F-101）照旧优先。会话列表那一行的收件人胶囊也改成走 `peerShortName`（原来直接读设备行那份）；App 的两处 toast/右键菜单文案改走 `chat.deviceNameOf` |
+| **F2 后端** | `ChatStore::last_inbound_names()`（每台设备**最后一个非空的、对端自己报过的名字**）＋ `AppState::new` 里给**占位名**的行播种。只补占位名、**不落盘**（每次启动重新取，配置里不多一份会漂移的副本），而且它只是"本机已有过的观察"：之后任何一条**核实过**的自报名字都能改写它（见下面那一节）。于是**设备列表**那一行启动那一刻也是真名，推送卡/通知同理 |
+
+**边界（追问第二轮：核实过的自报名字总是生效，2026-10-16 同日）**
+
+F2 把"记录里那个名字"播进了设备行的名字格，于是暴露出一条**旧规矩**的问题：`fill_peer_name`
+原先**只填占位名**（"真名一个字都不动"）。后果是"对端改名"这件事只有 mDNS TXT / HTTP 会话信封 /
+担保人转述能纠正，"配过对、只走长连接、mDNS 又看不见"那一档（真机上就是跨段的手机）**一条都
+轮不到** → 旧名字赖着不走、不会自愈。
+
+核完全仓之后按"两档入口"统一了口径（改动在 `state.rs`，调用点 7 处）：
+
+| 入口 | 谁在用 | 规矩 |
+|---|---|---|
+| `note_peer_name`（核实过） | 探活 `/pair/info` 的回话、**有 token 的长连接会话**里的 `from_name`（会话消息 / 推送邀请）、在它自己的地址上问出来的名字（中转那一跳） | **直接更新**名字（对端改名跟着走），并跟着落进地址簿那份 |
+| `fill_peer_name`（只是自报） | 经中转方送来的路由记录、邀请里的自称（`carried_by_named_relay` 那一档） | **只填占位名**，本机已有的名字一个字都不动 |
+
+两条入口共用同一半实现，差别只有那一格 `trusted`；空名 / 占位名（= 设备 id）任何一条都不算名字。
+
+为什么放开"真名永不覆盖"是安全的：**设备行的 `name` 从来不是用户填的** —— 手动添加（F-11）
+也只让用户填 IP/端口，名字是问对端 `/pair/info` 要的；**用户自己的命名只走备注**（F-101，
+另一个字段、另一张表）。这一格没有"用户的东西"要保护，只有"对端以前叫什么"——而
+`upsert_peer`（mDNS / 会话信封 / 担保人）**本来就是真名之间互相覆盖**，于是口径也统一了。
+
+剩下的那条残留：老记录里**写着一串 deviceid** 的（旧版本在长连接那条路把占位名写进了 `fromName`）
+会被 `name_is_placeholder` 过滤掉、不播种，那台只能等下一次观察变名字 —— **它一发下一条消息就
+变**（新消息带名字，记录里那条也跟着更新），新版本起不会再往记录里写 id（见 §二 C）。
+
+**验证**（三段各自钉住自己那一层）：
+
+- **F1/F2（启动那一刻的名字）**：新增单元 `a_placeholder_name_is_seeded_from_the_chat_record_on_boot`（占位名被记录里的真名补上、真名不动、**落盘那份不动**）；显示层冒烟补到 **20/20**（含 F1 两条：会话列表那一行用记录里的真名、真名照旧优先）。
+- **口径统一（核实过的自报名字总是生效）**：新增单元 `a_verified_self_report_updates_the_name_and_the_book`（核实过的名字更新真名 + 落进地址簿；占位名/空名两条入口都不写）；`ws::session` 那条入站用例的尾巴改成钉新口径（同一个 token 会话上再报一个新名字 → 跟着更新）；`fill_peer_name_only_fills_placeholders` 保留（它钉的是**主张**那条入口，行为没变，注释与用例名同步）。
+- **全量（本轮结束时）**：`cargo test --no-fail-fast` —— `lib` **375 passed / 1 ignored**、`p1_integration` **45 / 1 ignored**、`relay_memory` 12、`share_visibility` 5、`link_consent` 4、`peer_metadata` 4、`credentials_vault` 1、`mirror_hydrate` 1；`push_stream` **6 passed / 3 failed**（仍是 §40/§41 记着的那三条改动前就在红的）。`npm run check` 0 错 1 警告（改动前就在的那条）、`npm run build` 通过。
+
+### 七、追问（第三轮，同日）：**那一行根本没有** —— 名字在本机没有"家"（已修）
+
+**现象**（用户，重装之后）：启动时**还是**先显示 deviceid；**在线状态与设备名一起出现**，都要等一段时间；那台设备在**会话列表**里，但**不在设备列表**里（启动那一刻）。
+
+**根因**（两条结构性事实，与"显示层判据"无关）：
+
+| # | 事实 | 后果 |
+|---|---|---|
+| 1 | 设备行**只有"地址簿里的 / 已配对的"才落盘**（`upsert_peer` 只在地址簿里才写配置；`observe_verified_addr` 只补已有行）—— 未配对、又没手动添加过的行**只活在内存里** | 一重启那一行就没了 → **设备列表里当然没有它**；要等它下一次被观察到（它开口 / 探活问到 / mDNS）才**重新建行** |
+| 2 | 建行那一刻，**在线与名字是同一批证据给的两半**（`accept` → `handle_inbound` 顶部 `note_heard_online` + 载荷里那个名字，或探活回话一次给两样） | 你看到的"两件一起出现"不是巧合，是同一个动作的两半 |
+| 3 | 那台的名字**在本机没有持久化的家**：设备行是内存级；会话记录里的 `fromName` **只有"对端发来的消息"才写**（只发过消息、或只收过文件时是空的），而旧版本在长连接那条路写进去的还是**占位名（= id）** | 会话列表那一行只能一路回落到最后一档：**原始 deviceid** |
+
+**用户提的"启动时也探活一次（含需要中转的设备）"** —— 方向对，而且**已经有**：探活循环的第一拍就在启动时立刻跑，里面包含"没地址 → 当场借一次中转"那一路。但它**要有东西可探**：没有那一行，就没有 id、没有地址、也没有名字。
+
+**修法**：新增 `config.known_peers`（**观察记忆**：`设备 id → 名字 + 最后一次地址 + 最后见到`，与 `device_remarks` 同一形状/同一理由 —— 键跟设备走、不跟地址走，`PeerDevice` 构造点几十处不动），启动时给"**地址簿与凭据库里都没有的 id**"补一行（`online: false`）：
+
+- **名字当场就有**（那一格是上次知道的名字）；**第一拍立刻有东西可拨 / 可借中转**（路线记忆本来就是落盘的）→ 状态由这一趟的证据给；
+- **设备列表的准入一个字不改**（离线 + 未绑定照样不列）—— 所以看到的是"会话列表那一行启动就有名字、点随状态如实；设备列表里等它在线/已配对/被 mDNS 看见才出现"。
+
+**为什么不塞进地址簿**：地址簿的语义是**关系**（行预算不淘汰它、`unpair` 的语义、`relay::open` 的 `target_in_book`、`learn_peers` 的接管判定、"我手动加过哪些设备"都按它判），把"只见过一次的名字"塞进去等于凭空宣称有关系。**互斥**规则把它焊死：一个 id 进了地址簿（`add_peer_book` / `mark_paired`）就从观察记忆里删掉；解除配对时再记回来（`unpair`）。读的优先级：**内存行 > 地址簿 > 观察记忆** —— 启动补行只补"前两者都没有的 id"，地址簿里已经有那一行就一个字都不动。淘汰也只冲观察记忆（`MAX_KNOWN_PEERS = 64` + `KNOWN_PEER_TTL_DAYS = 14`，满了按 `seen_at` 最旧淘汰）——记忆丢了没代价，关系丢了才是大事。
+
+**口径一句话**：**名字可以是"上次的"，状态一定是"这次的"**（`online` 一律从离线起步、`heard` 只活在内存里）。
+
+**追问（同一轮）：装上新版之后，为什么"要它发一次消息"才生效？**
+
+因为**这张表只有"观察到过"才写得进去**：它发来的一条会话消息（信封里的名字）、一次成功的探活回话、一条 mDNS 记录 —— 三者任意一条都会同时把名字写进设备行 / 会话记录 / `known_peers`。装上新版之后的**第一次**启动，这张表还是空的（它这一轮才被加进来），而会话记录里那份又**给不出名字**（只见你发出去的消息、或那份是旧版本写进去的 id）→ 于是回落到最后一档：deviceid。它说一句话之后（或探活问到它、mDNS 看见它），此后**每次启动都有名字** —— 名字是对端告诉本机的，从来没收到过就无从知道，这是信息层面的下限，不是缓存的问题。
+
+**顺手补的一格**：让"需要中转的设备"连那一次都不必等 —— 启动时把**设备级链路记忆**（`config.relay_links`：上次经谁够着它，F-107 §4.1，S-10 开着才有）也补成一行（**名字先拿 id 顶着**，地址空着）：启动第一拍 `probe_peer` 就走"一条路都没有 → `ensure_for`"，借那条记得的路 → 端点探到 → **名字与在线一起回来**（几秒，不必等它开口）。只剩"只能由它拨进来、本机连借都没借过"的那种确实只能等它开口 —— 那种情况本机**没有任何东西可以拨**。
+
+**验证（第三轮）**：新增 4 条 —— `config::tests::known_peers_round_trip_prune_and_forget`（往返 + 只在值变化时算"写" + 上限按最旧淘汰 + TTL + `forget`）、`state::tests::a_known_peer_gets_a_row_at_boot`（补行：名字/地址都在、`online=false`、`paired=false`；**地址簿里那一行优先**，观察记忆不越级覆盖）、`state::tests::the_known_table_and_the_address_book_never_hold_the_same_id`（互斥双向：配对 → 删；解除配对 → 记回；已配对/占位名不写）、`state::tests::a_remembered_relay_link_gets_a_row_at_boot`（只有链路记忆、名字与地址都不知道时也补一行）。显示层冒烟补了**最贴近你这一台的那一条夹具**（后端补出来的行：会话记录里只有本机发出去的消息 → 那一行显示行里的名字、点如实画灰、不进设备列表）—— **15/15**。`lib` **379 passed / 1 ignored**；`p1_integration` 45、`relay_memory` 12、`share_visibility` 5、`link_consent` 4、`peer_metadata` 4、`credentials_vault` 1、`mirror_hydrate` 1 全绿（`push_stream` 仍是那三条改动前就在红的）。
+
+### 八、追问（第四轮，同日）：**备注优先在"没有那一行"时失效**（已修）
+
+**现象**（用户）："会话中显示的设备名应该是优先备注、其次才是设备名（之前就是这么设计的）；现在发现**对端不在线**时，会话里显示的是**设备名**而不是备注。"
+
+**根因**：备注（F-101）此前**只跟着设备行走** —— 前端唯一能读到它的地方是 `list_devices` 每一行里那一格 `remark`（`devices.svelte.ts` 的 `deviceShortName` = `remark || name`）。而"对端不在线"常常伴随**那一行根本不在**（未配对 + 不在地址簿 = 内存行，重启即忘 / 这一趟还没被观察到，见 §七），于是：
+
+```
+会话那一行的名字 = deviceNameOf(id) = peerShortName(id, 记录里对端自报的名字)
+                   没有那一行 → 既读不到备注，也读不到设备名 → 只剩下记录里那份 = 对端自己的设备名
+```
+
+`config.device_remarks` 里那份备注**一直都在**（键是设备 id、跟"有没有那一行"无关），只是从来没有单独送给界面过 —— 所以"备注优先"这条设计在**行不在**时整条失效。顺带两处同类问题：
+
+- **群聊的发言人名字**：`fromName`（消息里对端自报的设备名）**优先于** `deviceNameOf`，备注又一次被压掉（桌面端 `ConvoPanel.speakerOf`、移动端 `ChatScreen.speakerName`）；
+- `saveDeviceRemark` 的本地镜像**只改可见那份**（`devices`），没改 `allDevices`（掉出可见集的那台会短暂显示旧名字，等后端事件刷新才对）。
+
+**修法**：
+
+| 处 | 改动 |
+|---|---|
+| 后端 | 新增命令 `list_device_remarks`（整份 `设备 id → 备注`）—— 备注是**用户数据**，与"此刻有没有那一行"无关，所以按 id 单独给一份；`list_devices` 里那格照旧（设备列表要用「备注(设备名)」） |
+| 前端 | 设备 store 多存一份备注表（与设备表**一起拉**，事件刷新时同进同出）；新增 `deviceRemarkOf(peerId)`（行里那份 → 备注表那份）；**`peerShortName` 先看备注**（不管有没有那一行），再走"设备行 → 记录 → id"；群聊发言人名字改成**备注优先**（两处）；`saveDeviceRemark` 三份镜像一起改 |
+| 不动 | 设备列表那一行仍是「备注(设备名)」（`deviceDisplayName`）—— 那里是"挑哪一台机器"的地方 |
+
+**验证**：显示层冒烟换成这一条的正面判据 —— **一行都没有**的设备（不在设备表里）在会话列表里显示的是**备注**（"客厅的手机"）而不是记录里那个设备名（"小米 15"）；隐藏行（只在 `allDevices`）同样备注优先；有备注的行：会话只写备注、设备列表写「备注(设备名)」—— **11/11**。`npm run check` 150 文件 0 错 1 警告（改动前就在的那条）、`npm run build` 通过；`lib` **379 passed / 1 ignored**、`cargo check --all-targets` 0 warning。
+
+**没做（要说清的一处）**：**给"没有那一行"的设备改备注**仍然要点得进那张表 —— 桌面端右键「修改备注」与移动端的备注底板都要求那一行存在（`ctxRemark` 里 `if (!device) toast('该设备已被移除')`），理由是那张表还要显示"对端**自己的**设备名"。显示这一半已经修好；要连编辑也放开，是另一条（需要定"行不在时那一格写什么"）。
+
+---
+
+## 43. 手动添加的另一半：被添加的一方也建一行（F-11，2026-10-16）
+
+### 一、现象与口径（用户提的）
+
+两台设备**互相发现不了**（跨网段 / 组播被 AP 隔开）时：A 手动添加 B → A 的列表里有 B，**B 的列表里没有 A**。
+
+用户给的口径：**"手动添加只是为了能发现"** —— 同网段时 mDNS 本来就两边都看得见，所以"添加之后互相能看到"是对的；配对、连接这些**关系**仍要主动操作。本轮就按这个口径落。
+
+### 二、三条事实（先核代码，再动手）
+
+| # | 事实 | 位置 |
+|---|---|---|
+| 1 | 手动添加只探一次公开的 `GET /pair/info`，只写**本机**地址簿；对端零状态变化 —— 协议上根本没有"我来过"这条报文 | `lib.rs::add_peer` → `state.rs::add_peer_book` |
+| 2 | **配对完成之后本来就是双向的**：两条配对路各写两次（`mark_paired` 有则改、无则插入）—— 所以"配好了对方还不显示本机"在现有代码里不成立，那是配对**没走完**的状态 | `pair_confirm` / `pair_handshake` / `accept_invite` / `invite_peer` 四处 `commit_pairing` |
+| 3 | 死局在**配对码那条路的入口**：B 要点「配对」得先有 A 那一行（`pair_confirm` 要求 `get_peer` 存在，弹窗候选取自 `visibleDevices`）→ 跨网段（B 收不到 A 的 mDNS）时 **B 连码都没地方输**，只能等 A 点「发起邀请」。这一跳补的正是它 | `lib.rs::pair_confirm`、`App.svelte::confirmPair` |
+
+### 三、改动
+
+| 处 | 改动 |
+|---|---|
+| 后端路由 | 新增**公开面** `POST /pair/hello`（`routes_pair::pair_hello`）：`{peerId, peerName, port}` → `upsert_peer` 建/更新一行。**地址取 TCP 来源、端口取它自报的实际监听端口**，且过 `net::observed_dial_target` + `is_relayed_source` 两道（与入站会话 `routes_chat::accept` 逐条同规：来源是本机自己的端点 / 经中转来的那一跳 → 一处都不记）。**自称本机已配对设备必须出示 token**（与 `/push/invite`、`/chat/*` 同一道关）—— 没有它，谁都能自称老搭档、把那一行的地址改写到他自己那个地址上；**自称是本机自己**（id 是每份数据目录一份的随机值，只能来自抄配置/伪造）直接 400 —— 不给列表里插一行"自己"。隐身/离线由 `presence_middleware` 拦成 503 |
+| 客户端 | `add_peer` 记完本机这一行之后 `crate::task::spawn` 一条 `notify_manual_add`：到刚探过的那个地址上 POST 一次；手里有凭据就带上（"重新添加一台已配对设备的地址"走这一档）。**best-effort 且不挡在添加前面**（最坏等满 1.5s 超时，而添加在本机已经成立）：对端老版本 404 / 隐身 503 / 离线，都只当"它那边没有这一行" |
+| 顺手的收口 | `bearer_token`（`Authorization: Bearer …` 那三行）从 `routes_chat` / `routes_push` 各抄一份收进 `server/auth.rs`，三处共用一个 |
+
+**只建行、不建关系**：配对 / 长连接 / 共享 / 推送同意制一条都不动；对方那一行是**未绑定 + 在线**（来源地址可拨），与一条 mDNS 公告同档 —— 兜底是 `upsert_peer` 的行预算（`MAX_UNBOOKED_ROWS`）与 `visibleDevices` 的"未绑定的离线行不列"。**持久化也不对称**（与 mDNS 一致）：添加方那一行进**地址簿**（用户动作，永远记着），被添加方那一行走 `note_known_peer`（观察记忆：重启后名字与地址还在，关系没有）。
+
+### 四、验证
+
+- 单元（`server::routes_pair::tests::the_hello_route_registers_the_adder_without_trusting_a_paired_claim`）：没见过的 id → 未绑定行 + 地址/端口取自这条连接；自称已配对拿不出凭据 → **401 且那一行一个字不动**；带凭据 → 放行；自称是**本机自己** → 400（不许给列表里插一行"自己"）。
+- 真 TLS / 真 HTTP（`tests::a_manual_add_shows_up_on_the_peer_as_an_unbound_row`，两个实例 + 内网地址）：`add_peer` 那一半 + 自报之后，**对端设备表里真有本机这一行** —— `paired=false`、`online=true`、地址 = 对端观察到的 TCP 来源、端口 = 本机实际在听的那个。
+- `cargo test --lib`：**381 passed / 0 failed / 1 ignored**（含本轮新增 2 条）。
+- **没在真机（两台设备 + 那张 mDNS 双向失效的网）上跑**：单机复现不了"跨网段/组播被隔"，那一档只能由真机决定（同 §42 的现场限制）。
+- **真进程（接收那一半，本机实测）**：起一份自己的实例（`ORBDROP_ALLOW_MULTI=1` + 独立 `ORBDROP_DATA_DIR`/端口）→ `POST /pair/hello` 回 **204**，日志落 `对方手动添加了本机，已登记设备行 peer_id=… paired=false ip=… port=… online=true`，`config.toml` 落 `[knownPeers.<id>] name = …` —— 与 `list_devices` 返回的那一行对得上（它把设备表整份返回，不额外过滤）。
+
+### 五、真机反馈：电脑端没出现这台手机（当日排查）
+
+**现象**（用户）：手机手动添加电脑的 IP → 手机里有电脑，**电脑上没有这台手机**。
+
+排查（全是实测，不是推断）：
+
+| 查什么 | 怎么查 | 结果 |
+|---|---|---|
+| 电脑端**正在跑的那一份**有没有这条路由 | `POST https://127.0.0.1:3890/pair/hello`（空体） | **422 missing field `peerId`** —— 路由在（对照组 `POST /pair/nope` **404**；`GET /pair/hello` **405** 同理） |
+| 那台手机**到底发过没有** | 电脑端日志（`%LOCALAPPDATA%\OrbDrop\logs\`，全部 9 个日志文件）里数 `手动添加` | **0 条** —— 成功与两种拒绝各会留一行，一条都没有就是报文一次都没到 |
+| 接收这一半本身行不行 | 见上一格那条真进程冒烟 | 204 + 日志 + 落盘，都对 |
+
+**结论**：接收那一半在真进程里成立；**发送那一半在手机里**（`add_peer` → `notify_manual_add`），而手机上装的还是旧包（0.0.2 发行版里没有这段代码）—— 所以一个报文都没发出。**两端都得是新构建**：电脑端要有这条路由（接收那一半），手机端要有这次自报（发送那一半；`npm run android:release` 出包并装上）。
+
+**下次一句话自查**：电脑端日志里搜 `对方手动添加了本机`（N-11 排障那一套）。
+
+| 日志 | 含义 | 下一步 |
+|---|---|---|
+| 有，`online=true` | 那一行按规矩该出现在设备列表里（未绑定、在线） | 列表里还是没有 → 界面这一层的问题，回来报 |
+| 有，`online=false` | 落在"未绑定 + 离线"：来源地址像本机自己 / 像"经中转来的"（`observed_dial_target` / `is_relayed_source` 两道），界面按规矩不列未绑定的离线行 | 看日志里那三个字段（`ip`/`port`/`online`）定位是"来源地址被当成中转方"还是"来源地址是本机自己" |
+| 一条都没有 | 报文没到 | 对方是旧包 / 被防火墙挡住 |

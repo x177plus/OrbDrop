@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::config::data_dir;
 
@@ -31,6 +31,19 @@ pub struct ResumeFile {
     /// 字段名保持 `records`：老文件（`{"records":{…}}`）读进来就是它，不迁移、不丢数据。
     #[serde(default)]
     pub records: HashMap<String, HashMap<String, u64>>,
+    /// 上面那份老记录的**最后使用时刻**：invite_id → unix 秒。
+    ///
+    /// 为什么另起一个字段、不把时间戳塞进 `records` 的值里：那会把 `HashMap<String, u64>` 换成
+    /// 带时间戳的结构，老版本 serde 解析**失败**，`with_path` 的 `unwrap_or_default()` 会把整份
+    /// 续传记录直接丢光（那才是真的破坏兼容）。多一个顶层键相反：老版本读到不认识的键按 serde
+    /// 默认行为忽略，照样读得进（在老版本上跑一圈会被它连带抹掉，升回来就是"没有时间戳" ——
+    /// 那种由 `with_path` 补一个从现在起算的窗口，不会当场判死）。
+    ///
+    /// 它的用处只有一个：给这张按**邀请 id** 存的表一个年龄（`sweep_stale` 的 30 天窗口）。
+    /// 这张表正常不会涨 —— 每条邀请走到终态时都会被 `clear` 掉（见 `push_job::discard_legacy`），
+    /// 这里只是"以后哪条收尾路漏了一处"的兜底。
+    #[serde(default)]
+    pub record_times: HashMap<String, i64>,
     /// 新协议：文件身份（`stream::resume_key`）→ 记录（块位图 + 临时文件名）。
     #[serde(default)]
     pub files: HashMap<String, FileResume>,
@@ -138,10 +151,25 @@ impl ResumeStore {
 
     /// 指定文件的构造（单测用：不碰真实数据目录）。
     pub fn with_path(path: PathBuf) -> Self {
-        let records = std::fs::read_to_string(&path)
+        let mut records = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<ResumeFile>(&s).ok())
             .unwrap_or_default();
+        // 没有时间戳的老记录（老版本写的文件，或在老版本上跑过一圈被抹掉时间戳的）：给它们一个
+        // **从现在起算**的窗口，而不是当成"太老了"当场删掉 —— 它们可能是正在续传的那一条，
+        // 升级第一拍就把它判死没有道理（`sweep_stale` 判死只看时间戳）。
+        let missing: Vec<String> = records
+            .records
+            .keys()
+            .filter(|id| !records.record_times.contains_key(*id))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            let now = now_secs();
+            for id in missing {
+                records.record_times.insert(id, now);
+            }
+        }
         Self {
             path,
             inner: Mutex::new(Inner {
@@ -177,6 +205,12 @@ impl ResumeStore {
             .entry(invite_id.to_string())
             .or_default()
             .insert(file_path.to_string(), offset);
+        // 这条记录"最后一次被用"的时刻（`sweep_stale` 按它判死）：只要还有人在续这条邀请，
+        // 它就一直是新的。
+        guard
+            .records
+            .record_times
+            .insert(invite_id.to_string(), now_secs());
         guard.dirty = true;
         if guard.last_flush.elapsed() >= FLUSH_INTERVAL {
             persist_locked(&self.path, &mut guard);
@@ -187,9 +221,17 @@ impl ResumeStore {
     ///
     /// 立刻落盘：这是一次**状态跃迁**（"这些记录不再需要"），拖到下一拍才写没有意义，
     /// 而且传完之后进程正好被杀时，留着一条已完成的记录只会让下次重新核对一遍。
+    ///
+    /// 时间戳跟着记录一起删（它是为这条记录存在的，没有别的用途）。真的没有这条记录时**不落盘**
+    /// —— 现在终态清理那条路（`push_job::discard_legacy`）也会叫它，而新协议那条路的邀请在这里
+    /// 查不到老记录，不该为"一无所有"重写一份 `resume.json`。
     pub fn clear(&self, invite_id: &str) {
         let mut guard = self.inner.lock();
-        guard.records.records.remove(invite_id);
+        let had_record = guard.records.records.remove(invite_id).is_some();
+        let had_time = guard.records.record_times.remove(invite_id).is_some();
+        if !had_record && !had_time {
+            return;
+        }
         guard.dirty = true;
         persist_locked(&self.path, &mut guard);
     }
@@ -240,6 +282,8 @@ impl ResumeStore {
     /// 淘汰放太久的记录（连同它指着的 `.part` 一起删）—— 兜底，避免 `.part` 越堆越多。
     ///
     /// `keep_seconds` 之内的记录都留着：用户"明天再推一次"是正常用法，不能当天就清掉。
+    /// **两张表同一个窗口**：新协议那份按文件身份存（`files`，按 `rec.updated` 判），老协议那份
+    /// 按邀请 id 存（`records`，按 `record_times` 里那条邀请的最后一次续传时刻判）。
     /// 返回删掉的条数。
     pub fn sweep_stale(&self, keep_seconds: i64) -> usize {
         let now = now_secs();
@@ -251,7 +295,24 @@ impl ResumeStore {
             .filter(|(_, rec)| now.saturating_sub(rec.updated) > keep_seconds)
             .map(|(k, rec)| (k.clone(), rec.part.clone()))
             .collect();
-        if stale.is_empty() {
+        // 老协议那份（邀请 id → 相对路径 → offset）：它靠"这条邀请还在续传"活着，正常由终态
+        // 清理删掉（`push_job::discard_legacy`）；这里是**兜底** —— 万一以后哪条收尾路漏了一处，
+        // 这张表也不该没有上界地躺着。
+        //
+        // 它指着的那些**半截文件不在这里删**：那是在**最终路径**上的文件，要判断"哪一个是我们
+        // 写了一半的"得拿清单里的 size 比（见 `push_job::discard_legacy`），这里的记录里没有 size
+        // ——不看 size 就删等于把用户自己的文件、或上一次收完的文件一起删掉。
+        let old_invites: Vec<String> = guard
+            .records
+            .records
+            .keys()
+            .filter(|id| {
+                now.saturating_sub(guard.records.record_times.get(*id).copied().unwrap_or(now))
+                    > keep_seconds
+            })
+            .cloned()
+            .collect();
+        if stale.is_empty() && old_invites.is_empty() {
             return 0;
         }
         for (key, part) in &stale {
@@ -259,9 +320,17 @@ impl ResumeStore {
             // `part` 记的是**绝对路径**（本机落盘根下的那个 `.part`）：直接删，不做路径拼装。
             let _ = std::fs::remove_file(part);
         }
+        for id in &old_invites {
+            guard.records.records.remove(id);
+            guard.records.record_times.remove(id);
+        }
+        // 时间戳表跟着记录走：记录没了的键一律丢掉（否则它自己就是第二张没有上界的表）。
+        let live: std::collections::HashSet<String> =
+            guard.records.records.keys().cloned().collect();
+        guard.records.record_times.retain(|k, _| live.contains(k));
         guard.dirty = true;
         persist_locked(&self.path, &mut guard);
-        stale.len()
+        stale.len() + old_invites.len()
     }
 
     // -- 待续传任务（进程重启后接着收）--------------------------------------------------
@@ -393,16 +462,8 @@ pub fn safe_dir_name(raw: &str) -> String {
     const MAX: usize = 64;
     const FALLBACK: &str = "unknown-device";
 
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        // 控制字符与 Windows 禁用字符（含 `:` —— 它既是盘符也是 NTFS 数据流的分隔符）。
-        let bad = ch.is_control()
-            || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*');
-        out.push(if bad { '_' } else { ch });
-    }
-
     // 首尾空白，以及**结尾的圆点**（Windows 会静默丢掉，`".. "` 这类就危险了）。
-    let mut name = out.trim().to_string();
+    let mut name = scrub(raw).trim().to_string();
     while name.ends_with('.') {
         name.pop();
     }
@@ -427,8 +488,104 @@ pub fn safe_dir_name(raw: &str) -> String {
     name
 }
 
-/// Windows 保留设备名（大小写不敏感，取第一个圆点之前的词干）。
-fn is_reserved_device_name(name: &str) -> bool {
+/// 控制字符与 Windows 禁用字符（含 `:` —— 它既是盘符也是 NTFS 数据流的分隔符）→ `_`。
+///
+/// 替换成 `_` 而不是删掉：名字里少一个字符用户看不出来，两头接起来反而像另一件东西。
+/// 发送方名那一层目录（[`safe_dir_name`]）与文件自己的名字（[`sanitize_file_name`]）
+/// 共用这一份名单 —— 不许多出一条能过这边、过不了那边的缝。
+fn scrub(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        let bad = ch.is_control()
+            || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*');
+        out.push(if bad { '_' } else { ch });
+    }
+    out
+}
+
+/// 一个名字在**落盘前**最多占多少字节（含扩展名）。
+///
+/// 200 而不是 255：Linux 上单个名字的上限是 255 **字节**（中文一个字三字节），而这个名字
+/// 到了对端还要先变成 `<名字>.orbdrop-part`（13 字节，见 `stream::part_name`）、同名时再插
+/// 一个 ` (2)`（见 `transfer::dedupe_name`）—— 卡着 255 写，最后那一步就会 ENAMETOOLONG。
+const MAX_FILE_NAME_BYTES: usize = 200;
+
+/// 把一个**外来的**名字净化成"两端都能吃"的形状（F-119）。
+///
+/// 谁需要它：名字来自**别的应用自己声明的字符串**（`PackageManager.loadLabel`，`"X: 编辑器"`
+/// 这种真的存在），而清单里的相对路径要过对端 [`safe_join`] 那道闸门 —— 那里遇到 `:`、
+/// `\`、控制字符、结尾的点/空格、Windows 保留设备名（`CON`/`NUL`/`COM1`…）时**不是跳过
+/// 这一项，而是整次接收判失败**（"非法路径"，见 `push_job` 与 `download` 两处落盘点）。所以净化必须发生在**发送侧**，而且按**接收侧那份判据**净化：
+/// 保留设备名两处共用 [`is_reserved_device_name`]，不各写一套。
+///
+/// 与 [`safe_dir_name`]（发送方名那一层目录）的分工：那个按**字符**截断、不管扩展名；
+/// 这个按**字节**截断并尽量保住扩展名 —— 扩展名是"这是什么文件"在两端唯一的线索
+/// （安卓那边正是按 `.apk` 落到系统安装器的，见 F-109）。
+///
+/// 净化后为空串是**可能的**（名字整份都是非法字符），由调用方决定退成什么。
+/// 幂等：`sanitize_file_name(sanitize_file_name(x)) == sanitize_file_name(x)`。
+pub fn sanitize_file_name(raw: &str) -> String {
+    let mut name = scrub(raw)
+        .trim_matches(|c: char| c == '.' || c.is_whitespace())
+        .to_string();
+
+    if name.len() > MAX_FILE_NAME_BYTES {
+        // 扩展名只在"最后一个点之后那截不长"时算扩展名（`…_com.tencent.mm.apk` 里的 `apk`）；
+        // 太长的那截更可能是版本号里带的点，当词干一起截。
+        let (stem, ext) = match name.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() && ext.len() <= 16 => {
+                (stem.to_string(), Some(ext.to_string()))
+            }
+            _ => (name.clone(), None),
+        };
+        let budget = MAX_FILE_NAME_BYTES - ext.as_ref().map(|e| e.len() + 1).unwrap_or(0);
+        // 按**字符边界**裁：中文一个字三字节，切在半个字上会造出非法 UTF-8。
+        let mut end = budget.min(stem.len());
+        while end > 0 && !stem.is_char_boundary(end) {
+            end -= 1;
+        }
+        name = match ext {
+            Some(ext) => format!("{}.{ext}", &stem[..end]),
+            None => stem[..end].to_string(),
+        };
+    }
+
+    // 截断之后可能又冒出结尾的点/空格；保留设备名要加前缀（Windows 连 `NUL.txt` 都当设备名）。
+    while name.ends_with('.') || name.ends_with(' ') {
+        name.pop();
+    }
+    if is_reserved_device_name(&name) {
+        name.insert(0, '_');
+    }
+    name
+}
+
+/// 发送**应用**时那份安装包叫什么（F-119）：`应用名_versionName(versionCode)_包名.apk`。
+///
+/// 三段都来自 PackageManager，标签更是**应用自己声明的**字符串，所以整份结果再过一遍
+/// [`sanitize_file_name`]。两处兜底：`versionName` 为空（有的应用就是不写）时省掉它 ——
+/// 留着 `应用名_(2600)_包名.apk` 那种空括号看着像漏了一段；标签为空时用包名顶着，好歹
+/// 认得出是哪一个。
+pub fn apk_file_name(label: &str, version_name: &str, version_code: i64, package: &str) -> String {
+    let package = sanitize_file_name(package);
+    let label = match sanitize_file_name(label) {
+        l if !l.is_empty() => l,
+        _ => package.clone(),
+    };
+    let label = if label.is_empty() { "应用".to_string() } else { label };
+    let declared = sanitize_file_name(version_name);
+    let version = if declared.is_empty() {
+        version_code.to_string()
+    } else {
+        format!("{declared}({version_code})")
+    };
+    sanitize_file_name(&format!("{label}_{version}_{package}.apk"))
+}
+
+/// Windows 保留的设备名（`CON` / `NUL` / `COM1`…）。**只看第一个点之前那一截** ——
+/// Windows 把 `NUL.txt` 也当设备名。`pub(crate)`：发送侧净化名字时也用它（F-119），
+/// 两处的判据必须是同一份 —— 那边洗干净、这边才放行。
+pub(crate) fn is_reserved_device_name(name: &str) -> bool {
     let stem: String = name
         .split('.')
         .next()
@@ -759,6 +916,94 @@ mod path_tests {
             );
         }
     }
+
+    // ── 发送侧的名字净化（F-119）────────────────────────────────────────────
+
+    /// 净化出来的名字**必然**过 `safe_join` —— 这条是那两个函数存在的全部理由。
+    ///
+    /// 对端落盘那关遇到非法字符是**整次接收判失败**（不是跳过这一项），所以发送侧洗完必须
+    /// 让那道闸门一个字都不挑。用一批"真会碰上的脏名字"当输入：应用标签是别的应用自己
+    /// 声明的字符串，什么都可能有。
+    #[test]
+    fn sanitized_names_always_pass_the_landing_gate() {
+        let root = PathBuf::from("C:\\dl");
+        for raw in [
+            "微信",
+            "X: 编辑器",
+            "A/B 工具",
+            "报告 ..",
+            "  .hidden  ",
+            "NUL",
+            "con.txt",
+            "COM1",
+            "LPT9",
+            "a\\b\\c",
+            "带*星号?的\"名字\"",
+            "结尾点.",
+            "结尾空格 ",
+            "…省略号…",
+            "emoji 🚀 应用",
+            &"长".repeat(300),
+            &"x".repeat(500),
+            "\u{7}响铃",
+        ] {
+            let clean = sanitize_file_name(raw);
+            if clean.is_empty() {
+                continue; // 整份都是非法字符的那几种：由调用方退成别的名字，这里不算数
+            }
+            assert!(
+                safe_join(&root, &clean).is_some(),
+                "{raw:?} 净化成 {clean:?} 之后仍然过不了落盘闸门"
+            );
+            // 幂等：净化过的再洗一遍必须一模一样（界面会拿它显示，也只洗一次）。
+            assert_eq!(sanitize_file_name(&clean), clean, "{clean:?} 不幂等");
+        }
+    }
+
+    /// 该换的换、该留的留：非法字符变 `_`、首尾的点与空白去掉、保留设备名加前缀、
+    /// 超长的按**字节**截断但保住扩展名（中文一个字三字节，不能切出半个字）。
+    #[test]
+    fn sanitize_replaces_illegal_keeps_the_rest() {
+        assert_eq!(sanitize_file_name("X: 编辑器"), "X_ 编辑器");
+        assert_eq!(sanitize_file_name("a\\b/c"), "a_b_c");
+        assert_eq!(sanitize_file_name("报告 .."), "报告");
+        assert_eq!(sanitize_file_name(".hidden"), "hidden");
+        assert_eq!(sanitize_file_name("NUL"), "_NUL");
+        assert_eq!(sanitize_file_name("con.txt"), "_con.txt");
+        assert_eq!(sanitize_file_name("COM1"), "_COM1");
+        assert_eq!(sanitize_file_name("COM0"), "COM0", "COM0 不是设备名");
+        assert_eq!(sanitize_file_name("中文 空格.txt"), "中文 空格.txt");
+
+        let long = format!("{}.apk", "很长的名字".repeat(40));
+        let clean = sanitize_file_name(&long);
+        assert!(clean.len() <= MAX_FILE_NAME_BYTES, "长度没压住：{}", clean.len());
+        assert!(clean.ends_with(".apk"), "扩展名要保住：{clean}");
+        assert!(clean.is_char_boundary(clean.len()));
+
+        // 扩展名过长的那一截（版本号里的点）不当作扩展名 —— 整份一起截。
+        let dotted = "1.2.3.4.5.6.7.8".repeat(30);
+        assert!(sanitize_file_name(&dotted).len() <= MAX_FILE_NAME_BYTES);
+    }
+
+    /// 那份 APK 的名字：三段各就各位，空版本名省掉括号，标签为空时用包名顶着 ——
+    /// 全空的极限情况下也不许拼出空名字（对端会收到一条打不开的路径）。
+    #[test]
+    fn apk_names_follow_the_agreed_shape() {
+        assert_eq!(
+            apk_file_name("微信", "8.0.50", 2600, "com.tencent.mm"),
+            "微信_8.0.50(2600)_com.tencent.mm.apk"
+        );
+        // 版本名没写：省掉括号那一段。
+        assert_eq!(apk_file_name("计算器", "", 34, "com.android.calculator2"), "计算器_34_com.android.calculator2.apk");
+        // 标签是脏的（别的应用自己声明的字符串）：净化后仍然是一条能落盘的路径。
+        assert_eq!(
+            apk_file_name("X: 编辑器", "1.2", 7, "com.x.edit"),
+            "X_ 编辑器_1.2(7)_com.x.edit.apk"
+        );
+        // 标签为空用包名顶着；包名也是空的（不该发生）时退成「应用」。
+        assert_eq!(apk_file_name("", "1.0", 1, "com.a"), "com.a_1.0(1)_com.a.apk");
+        assert_eq!(apk_file_name("", "", 0, ""), "应用_0_.apk");
+    }
 }
 
 #[cfg(test)]
@@ -800,6 +1045,84 @@ mod bitmap_tests {
             let (_, len) = block_range(size, DEFAULT_BLOCK_SIZE, i).unwrap();
             assert!(len > 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod legacy_record_tests {
+    use super::*;
+
+    fn store(name: &str) -> (ResumeStore, PathBuf) {
+        let path = std::env::temp_dir()
+            .join(format!("orbdrop_legacy_{name}_{}", uuid::Uuid::new_v4()));
+        (ResumeStore::with_path(path.clone()), path)
+    }
+
+    /// 老协议那份按**邀请 id** 存的记录也在 30 天窗口里：只要没人再来续它（`save` 会刷新那个
+    /// 时刻），到点就得清掉 —— 收尾路一多，漏一处这张表就没有上界。
+    #[test]
+    fn a_legacy_record_is_swept_after_the_window() {
+        let (s, path) = store("sweep");
+        s.save("inv-old", "a.bin", 16);
+        s.save("inv-new", "b.bin", 32);
+        // 模拟"最后有人续这条是 31 天前"。
+        s.inner
+            .lock()
+            .records
+            .record_times
+            .insert("inv-old".into(), now_secs() - 31 * 86400);
+
+        assert_eq!(s.sweep_stale(30 * 86400), 1, "只清过窗的那条");
+        assert_eq!(s.load("inv-old", "a.bin"), 0, "过窗的清掉");
+        assert_eq!(s.load("inv-new", "b.bin"), 32, "窗口里的留着（用户明天再推一次还要用）");
+        // 时间戳表跟着记录走：不留孤儿键，落盘也是这个状态。
+        let reopened = ResumeStore::with_path(path.clone());
+        assert_eq!(reopened.load("inv-old", "a.bin"), 0);
+        assert_eq!(reopened.load("inv-new", "b.bin"), 32);
+        assert_eq!(reopened.inner.lock().records.record_times.len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 老文件（顶层没有 `record_times` 那一层）必须**照样读得进**，而且不能因为"没有时间戳"
+    /// 就被当成太老当场删掉 —— 它可能就是正在续传的那一条（`with_path` 给它一个从现在起算的窗口）。
+    #[test]
+    fn an_old_file_without_timestamps_still_loads() {
+        let path = std::env::temp_dir()
+            .join(format!("orbdrop_legacy_old_{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, r#"{"records":{"inv-1":{"a.bin":1024}},"files":{},"pending":{}}"#)
+            .unwrap();
+
+        let s = ResumeStore::with_path(path.clone());
+        assert_eq!(s.load("inv-1", "a.bin"), 1024, "老记录一条不丢");
+        assert_eq!(s.sweep_stale(30 * 86400), 0, "没有时间戳的按「刚续过」算，不当场判死");
+        assert_eq!(s.load("inv-1", "a.bin"), 1024);
+        // 再续一次就有时刻了。
+        s.save("inv-1", "a.bin", 2048);
+        assert!(s.inner.lock().records.record_times.contains_key("inv-1"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `clear`（终态清理走它）把记录与它那个时刻一起删；没有这条记录时**什么都不做** ——
+    /// 新协议那条路的邀请在这里查不到老记录，不该为"一无所有"重写一份 `resume.json`。
+    #[test]
+    fn clear_drops_the_record_and_its_timestamp() {
+        let (s, path) = store("clear");
+        s.save("inv-1", "a.bin", 16);
+        s.save("inv-2", "b.bin", 8);
+        assert_eq!(s.load("inv-1", "a.bin"), 16);
+
+        s.clear("inv-1");
+        assert_eq!(s.load("inv-1", "a.bin"), 0, "记录没了");
+        assert!(
+            !s.inner.lock().records.record_times.contains_key("inv-1"),
+            "时刻跟着记录走"
+        );
+        assert_eq!(s.load("inv-2", "b.bin"), 8, "别人的记录别带走");
+
+        // 再清一次（本来就没有）不该炸、也不该动别人的。
+        s.clear("inv-1");
+        assert_eq!(s.load("inv-2", "b.bin"), 8);
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -906,9 +1229,4 @@ mod pending_tests {
         assert!(!s.pending_entries()[0].expired(now), "刚有进展就不该过期");
         let _ = std::fs::remove_file(path);
     }
-}
-
-#[allow(dead_code)]
-pub fn log_done(invite_id: &str, file_path: &str, offset: u64) {
-    info!(invite_id, file_path, offset, "resume offset updated");
 }

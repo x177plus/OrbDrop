@@ -60,6 +60,20 @@
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
+    <!-- 包可见性（Android 11+，F-119）：不声明的话 `queryIntentActivities` / `getInstalledPackages`
+         只回极少数几项（常常只有本应用自己）——「发送应用」那张表会是空的，而且看不出哪里错了。
+
+         用 **intent 签名**（MAIN + LAUNCHER）而不是 `QUERY_ALL_PACKAGES`：要的正是"有桌面图标的
+         那些" —— 用户说"应用"指的就是它们（与系统"设置 → 应用"里那一列同一个口径），而
+         `QUERY_ALL_PACKAGES` 会把服务类的包一起放进来（表里全是噪声），它本身还是 Play 的受限权限
+         （本应用不经商店分发，但没必要背这一条）。清单声明，不弹任何权限框。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"

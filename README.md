@@ -27,6 +27,28 @@ OrbDrop is a LAN file tool whose whole UI is an always-on-top floating orb. Two 
 
 LAN only: no NAT traversal, no relay servers, no cloud, no accounts.
 
+## Download
+
+| Platform | File | GitHub | Gitee |
+| --- | --- | --- | --- |
+| Windows desktop (x86_64) | `orbdrop.exe` | [latest](https://github.com/x177plus/OrbDrop/releases/latest) | [latest](https://gitee.com/x177plus/OrbDrop/releases) |
+| Android (universal) | `app-universal-release.apk` | [latest](https://github.com/x177plus/OrbDrop/releases/latest) | [latest](https://gitee.com/x177plus/OrbDrop/releases) |
+| Android (arm64) | `app-arm64-release.apk` | [latest](https://github.com/x177plus/OrbDrop/releases/latest) | [latest](https://gitee.com/x177plus/OrbDrop/releases) |
+
+The desktop build is a single portable exe (no installer). If an APK refuses to install, pick by device:
+almost every phone is arm64 (`app-arm64-release.apk`, smaller and lighter); if unsure, use the universal build.
+
+### Update manifest and verification
+
+The manifest URL is a compile-time constant in the client, so this repository serves two fixed locations:
+
+- GitHub: the `update.json` release asset — `https://github.com/x177plus/OrbDrop/releases/latest/download/update.json`
+- Gitee: `update.json` at the repository root — `https://gitee.com/x177plus/OrbDrop/raw/master/update.json`
+
+Every artifact URL inside the manifest is pinned to a tag (`releases/download/vX.Y.Z/...`), so an old client
+never fetches the wrong build after a new release. Each artifact carries `size` and `sha256` (Windows builds
+additionally carry a Tauri update signature in `sig`), so a download can be checked by hand: `sha256sum orbdrop.exe`.
+
 ## Highlights
 
 ### 1. Floating orb: drag in, drag out
@@ -56,7 +78,7 @@ Messaging is built in, and it is the host of the push feature rather than an add
 
 ### 4. Works when the Wi-Fi isolates clients, and across subnets
 
-- **AP isolation** (same subnet, devices visible via mDNS, unicast blocked): when a direct dial fails, OrbDrop asks a reachable device that advertises relay (opt-in, **off by default**) for an endpoint. The relay copies bytes blindly — end-to-end TLS is untouched, so it cannot read anything — single hop, at most 8 concurrent relays. Device rows show “via X” while the relay is in use.
+- **AP isolation** (same subnet, devices visible via mDNS, unicast blocked): when a direct dial fails, OrbDrop asks a reachable device that advertises relay (**on by default** since first launch — turn it off in Settings; a config written before this switch existed also reads as on) for an endpoint. The relay copies bytes blindly — end-to-end TLS is untouched, so it cannot read anything — single hop, at most 8 concurrent relays. Device rows show “via X” while the relay is in use.
 - **Relay memory**: once a target is really reached through a relay, OrbDrop remembers *“that segment is reached through this segment”* in the address book. The memory persists across restarts, generalizes to the rest of the target segment (one decision covers that entire subnet), fails over to another relay in the pool when the anchor goes offline, and is propagated back to the relayed side over the same link. Direct connections always win, and the relay is dropped the moment they recover.
 - **Cross-subnet discovery**: mDNS cannot cross a router, so paired devices exchange their **entire** mDNS view over unicast every 5 seconds. Add and pair **one anchor** per subnet and everything the anchor can see appears — multi-NIC hosts report what each interface sees. Discovery itself stays single-hop; group messages have their own member-to-member relay.
 - **Manual add** (IP, or `IP:port`; a blank port scans 3890–3899), multi-NIC address reporting with subnet-aware dialing, and a read-only counter of how many bytes you have relayed for others.
@@ -83,6 +105,14 @@ No internet traversal or relay servers — relaying happens strictly inside the 
 
 Rust core, shared verbatim by the desktop and Android builds: an axum HTTP/WebSocket server on a single port (the listener tells TLS from plaintext by the first byte), self-signed identities and fingerprint pinning via rustls/rcgen, mDNS via `mdns-sd`, WebSocket signalling via tokio-tungstenite, plus hand-written WebDAV and a Windows Cloud Filters (CFAPI) provider for drag-out. The shell is Tauri 2; the UI is Svelte 5 + Vite.
 
+## Documentation
+
+Deep documentation lives in [`docs/`](./docs/README.md) (Simplified Chinese): the requirements
+document, the orb-form design proposal, the main implementation record (38 sections), and topic
+notes on the CFAPI drag-out mirror, the Beyond Compare integration, LAN relay, and the
+self-update/release chain. [`docs/README.md`](./docs/README.md) is the map — what each file is,
+what state it is in, and which code it belongs to.
+
 ## Build from source
 
 Requirements: Node.js, a Rust toolchain, and — for Android — the Android SDK/NDK.
@@ -92,13 +122,16 @@ npm install          # install dependencies
 npm run tauri dev    # desktop dev (vite + tauri)
 npm run android:dev  # Android dev
 npm run check        # svelte-check type check
+npm run android:build:arm64  # Android release APK for arm64 only
 ```
+
+`npm run android:build` compiles the Rust crate for all four ABIs sequentially, so it is the slow one — use `android:build:arm64` while iterating (one ABI, roughly a quarter of the work) and save the full build for release day. Note that `--target aarch64` only limits which ABIs Rust builds: the Gradle flavor stays `universal`, so the arm64-only APK lands in (and overwrites) `apk/universal/release/`.
 
 Packaging: `npm run tauri build` (desktop), `npm run android:release` (arm64 APK, installed to the device), `npm run release` (bump version, build, publish to both release remotes). `npm run mirror` runs the local mirror harness used to test the updater.
 
 Running several instances on one machine (useful for testing against yourself) needs a distinct data directory and port per instance: set `ORBDROP_ALLOW_MULTI=1` and `ORBDROP_DATA_DIR` accordingly.
 
-Release artifacts and the update manifest live in the [release repository](https://github.com/x177plus/OrbDrop/releases/latest).
+Release artifacts and the update manifest live in the [releases](https://github.com/x177plus/OrbDrop/releases/latest) of this repository.
 
 ## License
 

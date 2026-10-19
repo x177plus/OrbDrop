@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tick, untrack } from 'svelte';
+  import { tick, untrack, onDestroy } from 'svelte';
   import { dragOut } from '$lib/dragOut';
   import { RECT_CARD_W } from '$lib/orbShape';
   import Logo from '$lib/components/Logo.svelte';
@@ -46,7 +46,7 @@
     /** 第一页永远是本机；空 = 数据还没到位（渲染一张本机空态卡）。 */
     pages?: RectPage[];
     deviceCount?: number;
-    /** 左上角那颗待处理数（面板里那组通知与在途推送，**加上会话未读与还没确认的群邀请**）。 */
+    /** 左上角那颗待处理数（面板里那组通知 —— **不含本机在途的推送卡** —— **加上会话未读与还没确认的群邀请**）。 */
     notifCount?: number;
     expanded?: boolean;
     /** 贴边收起态（`App` 的 `rectDock !== 0`）：卡片已滑出窗口、露在屏幕边上的换成那条竖条。
@@ -113,6 +113,8 @@
   let started = false;
   let pendingDot = -1;
   let flipTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 翻页后的那一次"别再接着翻"的锁：也留个句柄，销毁时一并收掉（见 `onDestroy`）。 */
+  let lockTimer: ReturnType<typeof setTimeout> | null = null;
   let acc = 0;
   let lastDir = 0;
   let locking = false;
@@ -233,7 +235,7 @@
     if (acc >= FLIP_AT) {
       acc = 0;
       locking = true;
-      window.setTimeout(() => { locking = false; }, LOCK_MS);
+      lockTimer = window.setTimeout(() => { locking = false; lockTimer = null; }, LOCK_MS);
       void goto(idx + dir, dir);
     }
   }
@@ -419,6 +421,18 @@
       ? `${page.name}，${page.items.length} 个共享项`
       : `${page.name}，${page.items.length} 个可见共享项`;
   }
+
+  /**
+   * 组件被销毁：切形态（`App.svelte` 的 `{#if orbShape === 'rect'}`）时整棵卡片被摘掉。
+   * 这里不 cancel 的话，那个自续期的 `requestAnimationFrame`（`animateScroll`）会一直排下一帧 ——
+   * 元素已经不在文档里，`scrollTop` 恒为 0、与目标永远差着，收敛不了就是一辈子的 60Hz 空转，
+   * 顺带把整棵 DOM（连同 `bind:this` 的那几个数组）钉在内存里。两个定时器同样收掉。
+   */
+  onDestroy(() => {
+    if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
+    if (flipTimer !== null) { clearTimeout(flipTimer); flipTimer = null; }
+    if (lockTimer !== null) { clearTimeout(lockTimer); lockTimer = null; }
+  });
 </script>
 
 <div
@@ -438,7 +452,8 @@
     <!-- 两枚角标骑在卡片的两个上角（原型 `.rq-shellbadge`：28px 高的宽体圆角矩形、2px 卡底
          描边、等宽数字）。**含义、角位、配色都与悬浮球逐项一致**：收起态从球换成这张卡时，
          同一个数还在同一个角、还是同一个颜色，只是外壳从圆球变成卡片。
-         左 = 待处理数（橙，同球左上那颗：通知 + 在途推送 + 会话未读 + 群邀请）；右 = 长连接设备数（绿，同球右上那颗）。
+         左 = 待处理数（橙，同球左上那颗：通知 + 发送侧"有台没成"那张卡 + 会话未读 + 群邀请；
+         **本机在途的推送卡不算** —— 那是自己在做事，不是有事等你）；右 = 长连接设备数（绿，同球右上那颗）。
          翻页时轻微呼吸一下，和翻页动作产生关联。 -->
     <span class="rq-shellbadge is-alert num" bind:this={alertBadgeEl} role="img" hidden={notifCount === 0}
       aria-label="待处理 {notifCount} 条：通知、未读消息与群邀请">{notifCount}</span>

@@ -154,6 +154,51 @@ pub struct RelayRoute {
     pub seen_at: Option<String>,
 }
 
+/// 「以前见过这台设备」：名字 + 最后一次地址 + 最后见到的时刻（RFC3339）。
+///
+/// 与 `device_remarks` 同一形状、同一理由地**单独一张表**（不塞进 `peers` 条目）：这是
+/// "本机跟它之间"的**观察记忆** —— 键是设备 id（跟设备走、不跟地址走），而 `PeerDevice`
+/// 的构造点全仓几十处，往那个结构上加字段会把每一处都拖下水。
+///
+/// **与地址簿互斥**：只装"没有关系的"设备（未配对、也没手动添加过）。一个 id 进了地址簿
+/// （`add_peer_book` / `mark_paired`）就从这里删掉 —— 于是两张表永远不同时持有一个 id；
+/// 启动时合成行也只补"地址簿与凭据库里都没有的 id"（内存行 > 地址簿 > 这张表）。
+///
+/// 用途只有一个：**启动那一刻那一行别消失**。未配对、也不在地址簿的设备行只活在内存里
+/// （`upsert_peer` 只在地址簿里才落盘），重启即忘 —— 表现就是"会话列表还在，设备名却要等
+/// 一段时间"。有了这张表，启动时照它合成一行（`online: false`，可达性由启动即跑的第一拍
+/// 探活给），名字当场就有，第一拍也才有东西可拨 / 可借中转。
+///
+/// 一句话记法：**名字可以是"上次的"，状态一定是"这次的"**（与地址簿里那份名字同一性质）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownPeer {
+    /// 上次知道的名字（对端自己报的；空 = 不知道，那种条目不该写进来）。
+    #[serde(default)]
+    pub name: String,
+    /// 上次知道的地址（可能是空串：只知道它叫什么、不知道它在哪 —— 那台靠中转够着）。
+    #[serde(default)]
+    pub ip: String,
+    #[serde(default)]
+    pub port: u16,
+    /// 最后一次见到它的时刻（RFC3339；淘汰按它，字典序可比）。
+    #[serde(default)]
+    pub seen_at: String,
+}
+
+/// 「以前见过」那一档的条数上限（与 `device_remarks` 一样属于"本机的小记忆"，不是关系）。
+///
+/// 它唯一的功能是启动时补一行、好让第一拍有东西探 —— 所以规模按"一台设备最近可能打过交道的
+/// 那几台"算，64 足够；超了按 `seen_at` 最旧的淘汰（那台再开口又会记回来）。
+pub const MAX_KNOWN_PEERS: usize = 64;
+
+/// 这一档的寿命：太久没见过的就不记了（14 天）。
+///
+/// 为什么要有 TTL（而不是只留上限）：每一条启动时都会补一行、每 5s 被探活敲一次
+/// （`PROBE_CONCURRENCY` 只有 8）—— 一堆几个月前的旧设备会让"一拍"变慢，而它们回来的
+/// 可能性已经很小；真回来时它一开口就又记上了。
+pub const KNOWN_PEER_TTL_DAYS: i64 = 14;
+
 /// 网段级策略的条数上限：一张表被塞满就按"最久没成功过"淘汰。
 ///
 /// 每一条都指向"某一段"—— 家用/办公场景不会有几十段需要中转的网段。没有上限时，一个
@@ -269,6 +314,9 @@ impl PeerDevice {
 ///
 /// 只存定位需要的东西；`label` 是前端给的可读名字——对端共享项的名字本机不知道
 /// （只有 id），所以菜单/toast 里要显示的名字只能由界面带下来，缺失时后端再凑一个。
+///
+/// **不是持久化类型**：左侧槽只有一处存储 —— BC 自己的 `Saved*Left`（见 `bc` 模块），
+/// 这里只是那条注册表值反解出来的形状（所以才有 `Raw` 这一档）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum BcTarget {
@@ -289,6 +337,20 @@ pub enum BcTarget {
         path: String,
         #[serde(default, rename = "label", skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+    },
+    /// 左侧槽里那条**不属于我们任何一项**的原始 BC 参数：资源管理器在共享项之外放的路径
+    /// （或掩码）。它只由「读槽」（`bc::status`）产生，**从不写进配置** —— 槽本身（BC 的
+    /// 注册表值）就是它的存储。
+    ///
+    /// `arg` 是**喂给 BC 的原文**（读到什么就是什么）：反解只为菜单显示和"是不是同一项"
+    /// 的判定服务，反解不出来也照样能比。
+    Raw {
+        arg: String,
+        #[serde(default)]
+        label: String,
+        /// 它原本占的是哪个槽（`SavedFolderLeft` = true）—— 只用于显示。
+        #[serde(default)]
+        dir: bool,
     },
 }
 
@@ -321,9 +383,9 @@ pub struct AppSettings {
     pub orb_shape: OrbShape,
     /// 新添加的目录/文件是否默认开播（设置里的「添加后自动共享」，默认关）。见 `Config::auto_broadcast_new`。
     pub auto_broadcast_new: bool,
-    /// 是否允许本机为群聊**中转**消息（跨网段那一档，默认关）。见 `Config::group_relay`。
+    /// 是否允许本机为群聊**中转**消息（跨网段那一档，默认开）。见 `Config::group_relay`。
     pub group_relay: bool,
-    /// 是否允许本机**替其它设备中转字节**（F-106，默认关）。见 `Config::allow_relay`。
+    /// 是否允许本机**替其它设备中转字节**（F-106，默认开）。见 `Config::allow_relay`。
     pub allow_relay: bool,
     /// 记住并自动复用跨网段中转（F-107，S-10，默认开）。见 `Config::relay_memory`。
     pub relay_memory: bool,
@@ -346,8 +408,8 @@ impl Default for AppSettings {
             online: true,
             orb_shape: OrbShape::default(),
             auto_broadcast_new: false,
-            group_relay: false,
-            allow_relay: false,
+            group_relay: default_relay_enabled(),
+            allow_relay: default_relay_enabled(),
             relay_memory: true,
             transfer_workers: default_transfer_workers(),
             transfer_block_mb: default_transfer_block_mb(),
@@ -454,11 +516,6 @@ pub struct Config {
     /// BeyondCompare 可执行文件（留空 = 自动探测）。便携版 BC 不在注册表里，只能靠这项。
     #[serde(default)]
     pub bc_exe_path: Option<PathBuf>,
-    /// 「添加到左侧/右侧比较位」的两个槽位（跨重启保留，BC 自己的右键扩展也是这么做的）。
-    #[serde(default)]
-    pub bc_left: Option<BcTarget>,
-    #[serde(default)]
-    pub bc_right: Option<BcTarget>,
     /// Stable device identity advertised via mDNS / used as peer id.
     ///
     /// Every other field is optional on load: a config written by an older
@@ -513,20 +570,22 @@ pub struct Config {
     /// 同一个坑里（重装会清数据目录，于是这个标记也跟着没了，正好）。
     #[serde(default)]
     pub keepalive_guided: bool,
-    /// 是否允许本机**为群聊中转消息**（设置里的「允许为群聊中转消息」，默认关）。
+    /// 是否允许本机**为群聊中转消息**（设置里的「允许中转」那颗开关管的第二条路，默认开）。
     ///
     /// 只在**群消息**上生效，而且是"本机也在那个群里"时才转（见 `group::relay_to`）：
     /// 跨网段时两端之间没有路径，缺的那一段只能由链路上的成员帮着搬。代价是本机替别人
-    /// 占用上行带宽，且这条与本项目"只走单播、不做多跳"的取舍相冲 —— 所以它必须由用户
-    /// 显式打开，默认关（需求文档里那两条非目标也随之改写）。
-    #[serde(default)]
+    /// 占用上行带宽，且这条与本项目"只走单播、不做多跳"的取舍相冲 —— 所以它由用户显式
+    /// 在设置里**关掉**（关掉写成落盘的 `false`），但**缺省是开**（见 [`default_relay_enabled`]）：
+    /// 首次启动就能当跨段锚点，不必先翻设置。
+    #[serde(default = "default_relay_enabled")]
     pub group_relay: bool,
-    /// 是否允许本机**替其它设备中转字节**（设置里的「允许为其它设备中转」，默认关，F-106）。
+    /// 是否允许本机**替其它设备中转字节**（设置里的「允许中转」，默认开，F-106）。
     ///
     /// 用在一种网络里：AP 把同一 Wi‑Fi 上客户端之间的单播隔开了（组播还能过、单播全灭），
     /// 于是两台设备各自只够得着本机。开着时本机会为它们开一条**盲转**的中转端点：
     /// 两端 TLS 端到端不变，本机只搬字节、看不到内容。代价是本机替别人占用上行带宽 ——
-    /// 与自己"只走单播、不做多跳"的取舍相冲，所以必须由用户显式打开，默认关。
+    /// 与自己"只走单播、不做多跳"的取舍相冲，用户在设置里关掉即可（缺省见
+    /// [`default_relay_enabled`]：**开**）。
     ///
     /// 关着时 `POST /relay/open` 一律拒绝（见 `server::routes_relay`）。
     ///
@@ -534,7 +593,7 @@ pub struct Config {
     /// 请本机开中转，不再要求它与本机已配对；强制保留的只剩"到请求方给的那个地址核实目标
     /// 身份"这一关（少了它，本机就成了给任意局域网地址开隧道的工具）。代价如实写在设置项
     /// 副文案里：同一张网里谁都能借本机的上行带宽。
-    #[serde(default)]
+    #[serde(default = "default_relay_enabled")]
     pub allow_relay: bool,
     /// 设备级链路记忆（F-107）：`设备 id → 上一次是怎么够着它的`。见 [`RelayLink`]。
     #[serde(default)]
@@ -571,6 +630,12 @@ pub struct Config {
     /// 广播出去（对端看到的始终是它自己的名字，见 `lib.rs::list_devices`）。
     #[serde(default)]
     pub device_remarks: HashMap<String, String>,
+    /// 「以前见过」那一档（见 [`KnownPeer`]）：`设备 id → 名字 + 最后一次地址 + 最后见到`。
+    ///
+    /// 只装"没有关系的"设备（与地址簿互斥）；启动时给它们补一行，好让名字当场就有、
+    /// 第一拍探活有东西可拨。它是观察记忆，可以随便淘汰（上限 + TTL），关系丢了才是大事。
+    #[serde(default)]
+    pub known_peers: HashMap<String, KnownPeer>,
     /// 接收推送时的并发数（同一个邀请同时几路在拉）。
     ///
     /// 为什么要有这个旋钮：小文件多的时候，时间几乎全花在"每个文件的往返"上，几路并行
@@ -623,6 +688,16 @@ fn default_online() -> bool {
 /// S-10 的缺省：**开**。旧配置里没有这一项（升级上来的）也按"开"读 —— 它是本机的选路
 /// 优化，不是替别人做事，默认开才让 F-107 的"记忆/泛化/反向"在用户升级后直接生效。
 pub fn default_relay_memory() -> bool {
+    true
+}
+
+/// 「允许中转」两颗位（S-08 `group_relay` / S-09 `allow_relay`）的缺省：**开**。
+///
+/// 首次启动（还没有配置文件）就是开着的 —— 用户要的是"装上就能当中转方"，不必先去设置里
+/// 翻开关；旧配置里没有这两项（比开关还早的版本）同样按"开"读，理由与
+/// [`default_relay_memory`] 一致：字段缺失 = 用户从没表过态，不该被读成"关"。
+/// 用户在设置里关掉之后，落盘的是显式 `false`，此后一直按 `false` 读。
+pub fn default_relay_enabled() -> bool {
     true
 }
 
@@ -698,6 +773,74 @@ impl Config {
         let remark: String = remark.chars().take(REMARK_MAX_CHARS).collect();
         self.device_remarks.insert(peer_id.to_string(), remark.clone());
         Some(remark)
+    }
+
+    /// 记下"以前见过这台设备"：名字 + 最后一次地址。返回 `true` = 真的写进去了
+    /// （调用方据此决定落盘 —— 值没变就一个字都不写）。
+    ///
+    /// 判据（**空名 / 等于设备 id 的名字不写**：那不是名字，是"还没有名字"）；地址可以是空串
+    /// （只知道它叫什么、不知道它在哪 —— 那台靠中转够着）。写之前顺手按 TTL/上限清一遍。
+    pub fn note_known_peer(&mut self, peer_id: &str, name: &str, ip: &str, port: u16) -> bool {
+        let name = name.trim();
+        if peer_id.is_empty() || name.is_empty() || name == peer_id {
+            return false;
+        }
+        let now = Utc::now().to_rfc3339();
+        if self
+            .known_peers
+            .get(peer_id)
+            .is_some_and(|k| k.name == name && k.ip == ip && k.port == port)
+        {
+            // 值没变也要刷新"最后见到"（淘汰看它）—— 但那种刷新不值得为它写盘一次：
+            // 只有**内容真的变了**才返回 true。
+            if let Some(k) = self.known_peers.get_mut(peer_id) {
+                k.seen_at = now;
+            }
+            return false;
+        }
+        self.known_peers.insert(
+            peer_id.to_string(),
+            KnownPeer {
+                name: name.to_string(),
+                ip: ip.to_string(),
+                port,
+                seen_at: now,
+            },
+        );
+        self.prune_known_peers();
+        true
+    }
+
+    /// 忘掉一台（它进了地址簿 = 关系接管了这一格，见 [`KnownPeer`] 的互斥约定）。
+    pub fn forget_known_peer(&mut self, peer_id: &str) -> bool {
+        self.known_peers.remove(peer_id).is_some()
+    }
+
+    /// 清一遍：过期的（[`KNOWN_PEER_TTL_DAYS`] 没见过了）、以及超上限时最旧的那些。
+    /// 返回清掉几条。
+    pub fn prune_known_peers(&mut self) -> usize {
+        let cutoff = (Utc::now() - chrono::Duration::days(KNOWN_PEER_TTL_DAYS)).to_rfc3339();
+        let before = self.known_peers.len();
+        // 空 `seen_at` 的（手改出来的、或老格式）当过期处理：没有时刻就没有淘汰依据。
+        self.known_peers
+            .retain(|_, k| !k.seen_at.is_empty() && k.seen_at >= cutoff);
+        if self.known_peers.len() > MAX_KNOWN_PEERS {
+            let mut by_age: Vec<(String, String)> = self
+                .known_peers
+                .iter()
+                .map(|(id, k)| (id.clone(), k.seen_at.clone()))
+                .collect();
+            by_age.sort_by(|a, b| a.1.cmp(&b.1));
+            for (id, _) in by_age.into_iter().take(self.known_peers.len() - MAX_KNOWN_PEERS) {
+                self.known_peers.remove(&id);
+            }
+        }
+        before - self.known_peers.len()
+    }
+
+    /// 以前见过的这台叫什么（启动时补行用；没有这一条 = `None`）。
+    pub fn known_peer(&self, peer_id: &str) -> Option<&KnownPeer> {
+        self.known_peers.get(peer_id)
     }
 
     // ------------------------------------------------------------------
@@ -784,8 +927,6 @@ impl Default for Config {
             auto_start: true,
             shares: Vec::new(),
             bc_exe_path: None,
-            bc_left: None,
-            bc_right: None,
             device_id: new_device_id(),
             peers: Vec::new(),
             orb_center: None,
@@ -795,14 +936,15 @@ impl Default for Config {
             online: true,
             auto_broadcast_new: false,
             keepalive_guided: false,
-            group_relay: false,
-            allow_relay: false,
+            group_relay: default_relay_enabled(),
+            allow_relay: default_relay_enabled(),
             relay_links: HashMap::new(),
             relay_routes: Vec::new(),
             relay_memory: true,
             relay_bytes_total: 0,
             relay_conns_total: 0,
             device_remarks: HashMap::new(),
+            known_peers: HashMap::new(),
             transfer_workers: default_transfer_workers(),
             transfer_block_mb: default_transfer_block_mb(),
             update_mirror: None,
@@ -1414,12 +1556,6 @@ mod tests {
             device_id: "device-test-1".into(),
             peers: vec![],
             bc_exe_path: Some(PathBuf::from("D:/Tools/BCompare/BCompare.exe")),
-            bc_left: Some(BcTarget::Share {
-                share_id: "share-1".into(),
-                path: "src".into(),
-                label: None,
-            }),
-            bc_right: None,
             orb_center: Some(OrbPos { x: -1280, y: 40 }),
             orb_pos: None,
             transfer_workers: default_transfer_workers(),
@@ -1469,6 +1605,15 @@ mod tests {
                 PickerFavorite { name: "项目".into(), path: "D:/项目".into() },
             ],
             device_remarks: HashMap::from([("peer-1".to_string(), "客厅台式机".to_string())]),
+            known_peers: HashMap::from([(
+                "peer-2".to_string(),
+                KnownPeer {
+                    name: "小米 15".into(),
+                    ip: "10.0.0.7".into(),
+                    port: 3890,
+                    seen_at: "2026-09-30T12:00:00Z".into(),
+                },
+            )]),
             // 镜像记忆必须能落盘：它就是靠"重启后还记得上次哪条路走得通"来免掉
             // 国内每次检查都白等一遍 GitHub 超时的（见 `update::read_pref`）。
             update_mirror: Some(UpdateMirror { host: "gitee.com".into(), at: 1_791_000_000_000 }),
@@ -1546,16 +1691,6 @@ mod tests {
             "池里那些设备的地址也要落盘 —— 锚点离散后 id 是拨不动的（真机就卡在这里）"
         );
         assert_eq!(loaded.relay_routes[0].ok_count, 3);
-        assert_eq!(
-            loaded.bc_left,
-            Some(BcTarget::Share {
-                share_id: "share-1".into(),
-                path: "src".into(),
-                label: None
-            }),
-            "比较位要跨重启保留"
-        );
-        assert_eq!(loaded.bc_right, None);
         assert_eq!(loaded.online, false, "「离线」要跨重启保留（用户选了就一直离线）");
         assert_eq!(
             loaded.orb_center,
@@ -1579,6 +1714,11 @@ mod tests {
             loaded.device_remarks.get("peer-1").map(String::as_str),
             Some("客厅台式机"),
             "设备备注要跨重启保留（F-101：只在本机，重启后还在）"
+        );
+        assert_eq!(
+            loaded.known_peer("peer-2").map(|k| (k.name.clone(), k.ip.clone(), k.port)),
+            Some(("小米 15".into(), "10.0.0.7".into(), 3890)),
+            "「以前见过」那一档也要跨重启保留（启动时靠它补一行：名字才不用等）"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1623,6 +1763,40 @@ mod tests {
         assert!(Config::default().settings().device_subdir);
     }
 
+    /// 「允许中转」（S-08 `group_relay` / S-09 `allow_relay`）**首次启动就是开的**：
+    /// 装上就能当锚点，不必先翻设置。旧配置里没有这两项（比开关还早的版本）同样按"开"读 ——
+    /// 字段缺失 = 用户从没表过态，不该被读成"关"。
+    #[test]
+    fn relay_switches_default_on_for_configs_that_never_had_them() {
+        let cfg: Config = toml::from_str("downloadDir = 'C:/dl'\n").unwrap();
+        assert!(cfg.group_relay, "缺项：为群聊中转消息按开读");
+        assert!(cfg.allow_relay, "缺项：替其它设备中转字节按开读");
+        // 首次启动（还没有配置文件）走的就是这两个缺省。
+        assert!(Config::default().allow_relay);
+        assert!(Config::default().group_relay);
+        // 用户在设置里关掉之后，落盘的是显式 `false` —— 照读，不被缺省翻回来。
+        let cfg: Config =
+            toml::from_str("groupRelay = false\nallowRelay = false\n").unwrap();
+        assert!(!cfg.group_relay);
+        assert!(!cfg.allow_relay);
+        // 界面拿到的整份设置也带着这两颗位（按它画那颗「允许中转」开关）。
+        let view = Config::default().settings();
+        assert!(view.allow_relay && view.group_relay);
+
+        // 首次启动实打实走一遍：没有配置文件 → `load_config_at` 落一份默认并原样返回。
+        let dir = std::env::temp_dir().join(format!("orbdrop_relaydefault_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let fresh = load_config_at(&path);
+        assert!(fresh.allow_relay && fresh.group_relay, "首次启动（还没有配置文件）就是开着的");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("allowRelay = true") && written.contains("groupRelay = true"),
+            "落盘的那一份也是开（之后一直按它读）：{written}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 旧配置里的 `inboxDir`（收件目录已并入 `downloadDir`）不能把配置文件判成损坏：
     /// 未知字段照旧忽略，共享项和配对表保住（解析失败会把文件改名成 `.toml.bad` 再写默认值）。
     #[test]
@@ -1632,6 +1806,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.download_dir, PathBuf::from("C:/dl"));
+        assert_eq!(config.device_id, "device-1");
+    }
+
+    /// 退役的「左右比较位」两个字段（`bcLeft`/`bcRight`）在用户手上的 `config.toml` 里还躺着：
+    /// 槽已经搬到 BC 自己的 `Saved*Left`（见 `bc` 模块），这两行**必须照旧能加载** ——
+    /// 未知字段忽略掉就行，解析失败会牵连整份配置（共享项、配对表一起没）。
+    #[test]
+    fn config_with_retired_slot_fields_keeps_loading() {
+        let config: Config = toml::from_str(
+            "deviceId = \"device-1\"\n\
+             bcLeft = { kind = 'share', shareId = 'share-1', path = 'src' }\n\
+             bcRight = { kind = 'share', shareId = 'share-1', path = 'src' }\n",
+        )
+        .unwrap();
         assert_eq!(config.device_id, "device-1");
     }
 
@@ -1837,6 +2025,75 @@ mod tests {
         assert_eq!(config.device_remarks.get("peer-c").unwrap(), &stored);
     }
 
+    /// 「以前见过」那一档：往返、只在值变化时算"写"、按 TTL/上限淘汰、进地址簿就忘掉。
+    #[test]
+    fn known_peers_round_trip_prune_and_forget() {
+        let mut config = Config::default();
+        assert!(config.known_peer("dev-1").is_none(), "老配置没有这一节：没有记忆");
+
+        assert!(config.note_known_peer("dev-1", "小米 15", "10.0.0.7", 3890));
+        assert!(
+            !config.note_known_peer("dev-1", "小米 15", "10.0.0.7", 3890),
+            "值没变就不算写（调用方据此不落盘）"
+        );
+        assert!(config.note_known_peer("dev-1", "小米 15 Pro", "10.0.0.7", 3890), "名字变了：写");
+        assert!(!config.note_known_peer("dev-2", "", "", 0), "空名不写：那不是名字");
+        assert!(
+            !config.note_known_peer("dev-2", "dev-2", "10.0.0.8", 3890),
+            "等于设备 id 的占位名不写"
+        );
+        assert!(!config.note_known_peer("", "谁", "10.0.0.8", 3890), "没有 id 不写");
+
+        let text = toml::to_string(&config).unwrap();
+        let loaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(
+            loaded.known_peer("dev-1").map(|k| (k.name.clone(), k.ip.clone(), k.port)),
+            Some(("小米 15 Pro".into(), "10.0.0.7".into(), 3890)),
+            "要跨重启保留（它就是靠这个在启动时补一行）"
+        );
+
+        // 上限：满了淘汰**最旧**的那个（时间戳各不相同，结果确定）。
+        let mut config = Config::default();
+        for i in 0..MAX_KNOWN_PEERS {
+            let at = (Utc::now() - chrono::Duration::minutes(i as i64)).to_rfc3339();
+            config.known_peers.insert(
+                format!("old-{i:03}"),
+                KnownPeer {
+                    name: format!("PC-{i:03}"),
+                    ip: "10.0.0.9".into(),
+                    port: 3890,
+                    seen_at: at,
+                },
+            );
+        }
+        assert!(config.note_known_peer("dev-new", "PC-NEW", "10.0.0.10", 3890));
+        assert_eq!(config.known_peers.len(), MAX_KNOWN_PEERS);
+        assert!(config.known_peer("dev-new").is_some());
+        assert!(
+            config.known_peer(&format!("old-{:03}", MAX_KNOWN_PEERS - 1)).is_none(),
+            "满了就淘汰最旧的那一台（它再开口又会记回来）"
+        );
+
+        // TTL：太久没见过的、以及没有时刻的（手改出来的）都清掉。
+        let mut config = Config::default();
+        let stale = (Utc::now() - chrono::Duration::days(KNOWN_PEER_TTL_DAYS + 1)).to_rfc3339();
+        config.known_peers.insert(
+            "old".into(),
+            KnownPeer { name: "旧".into(), ip: String::new(), port: 0, seen_at: stale },
+        );
+        config.known_peers.insert(
+            "no-clock".into(),
+            KnownPeer { name: "没时刻".into(), ip: String::new(), port: 0, seen_at: String::new() },
+        );
+        assert!(config.note_known_peer("fresh", "新", "10.0.0.11", 3890));
+        assert_eq!(config.known_peers.len(), 1, "过期的与没有时刻的一起清掉");
+
+        // 互斥的另一半：进了地址簿就忘掉这一格。
+        assert!(config.forget_known_peer("fresh"));
+        assert!(config.known_peer("fresh").is_none());
+        assert!(!config.forget_known_peer("fresh"), "再删一次什么都没动");
+    }
+
     /// 安卓默认设备名（S-05）的挑选规则：**厂商市场名优先**，其次是"品牌 + 型号"。
     ///
     /// 这是"这台设备到底是谁"唯一的来源：`ro.product.model` 在国行 ROM 上是型号代码
@@ -1926,7 +2183,7 @@ mod tests {
             "换不出更好的就别写盘（否则每次启动都白落一次盘）"
         );
         assert!(
-            !should_replace_auto_name("王磊的手机", "Pixel 7"),
+            !should_replace_auto_name("小明的手机", "Pixel 7"),
             "用户自己起的名字不动 —— 哪怕它更好看"
         );
     }
@@ -1953,12 +2210,12 @@ mod tests {
         assert_eq!(peer.relay_via(), None);
 
         peer.relay = Some(RelayAddr {
-            host: "[::ffff:10.198.71.106]".into(),
+            host: "[::ffff:198.51.100.6]".into(),
             port: 41000,
             via: "relay-node".into(),
             via_name: "书房的台式机".into(),
         });
-        assert_eq!(peer.dial(), ("[::ffff:10.198.71.106]", 41000), "挂了中转就走中转端点");
+        assert_eq!(peer.dial(), ("[::ffff:198.51.100.6]", 41000), "挂了中转就走中转端点");
         assert_eq!(peer.relay_via(), Some("书房的台式机"), "界面文案用中转方的名字");
     }
 
@@ -2041,7 +2298,7 @@ mod tests {
             ..Default::default()
         };
         peer.relay = Some(RelayAddr {
-            host: "[::ffff:10.198.71.106]".into(),
+            host: "[::ffff:198.51.100.6]".into(),
             port: 41000,
             via: "relay-node".into(),
             via_name: "R".into(),

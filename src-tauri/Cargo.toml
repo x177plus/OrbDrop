@@ -8,7 +8,9 @@ edition = "2021"
 
 [lib]
 name = "orbdrop_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# `staticlib` 只有 iOS 用得到（Android 走 cdylib、桌面端走 rlib），留着它每个 ABI 都要多写一份
+# 150–166 MB 的 `liborbdrop_lib.a`。以后真加 iOS 支持时再把它加回来。
+crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -125,8 +127,14 @@ windows = { version = "0.61", features = [
 ] }
 
 [profile.release]
-codegen-units = 1
-lto = true
+# 每个 ABI 的 cargo 编译:1m56s/2m13s(fat + 1 CGU)→ 37.6s/38.9s/39.6s/39.8s(thin + 16),四 ABI 全量
+# 8m48s → 2m45s(同机同命令,四个 target 各测一次)。提速来自 `thin`:fat 那条是把全图塞进一个
+# LLVM 模块重新优化,thin 的 summary/import 那一步轻得多。
+# 注意 `codegen-units = 16` 目前**不生效**:打开 LTO 时 rustc 实际收到 `-C codegen-units=1`
+# (`-vv` 实录),所以别指望它再快;哪天要试关掉 `lto` 蹭多核,这行才起作用 —— 但关 LTO 会丢掉
+# 跨 crate 内联(rustls/aes-gcm 是传输链路的热点),没量过吞吐不要动。
+lto = "thin"
+codegen-units = 16
 opt-level = 3
 panic = "abort"
 strip = true

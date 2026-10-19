@@ -41,15 +41,49 @@
     void loadPeerShares(device.id);
 
     // 对端目录变更（F-33）：根层就地重拉，展开中的子层靠 refreshSignal 各自重拉。
+    // **节流 + 尾沿**（见 `queueShareRefresh`）：逐条刷会把对端与本机界面一起压住。
     const changed = listen<{ shareId: string; path: string; kind: string }>('share://changed', (ev) => {
       const shareId = ev.payload.shareId;
       if (!treeState(shareId).loaded) return;      // 没打开过的共享项不用管
-      refreshSignal += 1;
-      if (treeState(shareId).expanded) void loadShareRoot(shareId, true);
+      queueShareRefresh(shareId);
     });
 
-    return () => { void changed.then((fn) => fn()); };
+    return () => {
+      if (changedTimer !== null) { clearTimeout(changedTimer); changedTimer = null; }
+      pendingChanged.clear();
+      void changed.then((fn) => fn());
+    };
   });
+
+  /**
+   * 一轮变更之后多久再刷一次（尾沿也算一次）。
+   *
+   * 为什么必须节流：对端一次构建能在几百毫秒里连着报几百条变更，而这里每收一条就
+   * `refreshSignal += 1`（展开中的每一层树各自重拉一遍）+ 重拉一次根层 —— 1300 条/秒
+   * 就是一场请求风暴（打的是对端的 HTTP，卡的是本机界面）。**节流而不是单纯防抖**：
+   * 持续爆发期间仍然每 `CHANGED_REFRESH_MS` 刷一次（"远端在跟着刷新"这件事不能丢），
+   * 而**尾沿**保证爆发停下来之后还会再刷最后一次 —— 不会停在中间态。
+   */
+  const CHANGED_REFRESH_MS = 400;
+  let changedTimer: ReturnType<typeof setTimeout> | null = null;
+  let changedAt = 0;
+  const pendingChanged = new Set<string>();
+
+  function queueShareRefresh(shareId: string) {
+    pendingChanged.add(shareId);
+    if (changedTimer !== null) clearTimeout(changedTimer);
+    const wait = Math.max(0, CHANGED_REFRESH_MS - (Date.now() - changedAt));
+    changedTimer = setTimeout(() => {
+      changedTimer = null;
+      changedAt = Date.now();
+      const ids = [...pendingChanged];
+      pendingChanged.clear();
+      refreshSignal += 1;                          // 展开中的子层各自重拉
+      for (const id of ids) {
+        if (treeState(id).expanded) void loadShareRoot(id, true);
+      }
+    }, wait);
+  }
 
   async function loadShareRoot(shareId: string, inPlace = false) {
     // 刷新已展开的层时保持原样（不显示"加载中…"、不清空条目）：否则树会被卸载重建，

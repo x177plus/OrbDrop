@@ -12,6 +12,16 @@ let devices = $state<PeerDevice[]>([]);
  * 本身很小（一屏设备数），多留一份引用不值一提。
  */
 let allDevices = $state<PeerDevice[]>([]);
+/**
+ * 本机的设备备注（F-101）：`设备 id → 备注`，从后端整份读来（`list_device_remarks`）。
+ *
+ * 为什么与上面两份设备表**各存一份**：备注**不跟着设备行走**。没有那一行的设备（未配对、
+ * 也不在地址簿：那一行只活在内存里，重启即忘 / 这一趟还没被观察到）在会话列表里照样要显示
+ * 成用户起的那个备注 —— 而 `list_devices` 里根本没有它的行，于是"备注优先"会整条失效、
+ * 退回"对端自报的设备名"（真机反馈：离线时会话里显示的是设备名而不是备注）。
+ * 备注是用户数据（`config.toml` 的 `deviceRemarks`），与"此刻有没有那一行"无关。
+ */
+let remarks = $state<Record<string, string>>({});
 let loading = $state(false);
 
 export function getDevices() { return devices; }
@@ -47,9 +57,12 @@ export function visibleDevices(all: PeerDevice[]): PeerDevice[] {
 export async function loadDevices() {
   loading = true;
   try {
-    const all = await api.listDevices();
+    // 两份一起拉（备注那一份很小）：事件（`devices://changed`）来时两个都跟着刷新，
+    // 所以本地镜像不会与后端分叉。
+    const [all, saved] = await Promise.all([api.listDevices(), api.deviceRemarks()]);
     allDevices = all;
     devices = visibleDevices(all);
+    remarks = saved ?? {};
   } catch (e) {
     console.error('Failed to load devices:', e);
   } finally {
@@ -85,18 +98,78 @@ export function deviceShortName(d: PeerDevice): string {
 }
 
 /**
+ * 按 id 取设备行：**先查可见的那份（设备页用的），再查后端原样那份**（`allDevices`）。
+ *
+ * 为什么必须查两份：`visibleDevices` 把"离线 + 未绑定 + 没被 mDNS 看见"的行整行挡住了
+ * （它没有任何可做的动作），可**跟它的会话还在**（记录是用户数据）—— 那些行只有
+ * `allDevices` 里才有。名字那条路早就是这么取的（见 `peerShortName`），状态那条路漏了：
+ * 会话列表那一行于是恒画灰点（`deviceDotState(undefined)` = `offline`），与后端真实状态无关。
+ *
+ * **凡是要"这台现在怎么样"的地方（点、胶囊、动作可用性）都走这里**；设备页自己那份列表
+ * （`DeviceTab`/`DevicesTab`）照旧只认可见的行 —— 它画的就是"设备页里列得出来的那几台"。
+ */
+export function deviceById(peerId: string): PeerDevice | undefined {
+  return devices.find((d) => d.id === peerId) ?? allDevices.find((d) => d.id === peerId);
+}
+
+/**
+ * 一批 id → 设备行（每个都走 [`deviceById`]）：**取不到的丢掉**（设备表里真没有这一台 ——
+ * 记录里只有名字的那种）。
+ *
+ * 与 `getDevices().filter(...)` 的区别只在第二份表：会话那一侧（聊过天但设备页列不出来的
+ * 那几台）要用它算"有几台在线 / 送得到"。
+ */
+export function devicesById(peerIds: string[]): PeerDevice[] {
+  const rows: PeerDevice[] = [];
+  for (const id of peerIds) {
+    const d = deviceById(id);
+    if (d) rows.push(d);
+  }
+  return rows;
+}
+
+/**
+ * 一台设备的**备注**（F-101）：先看设备行那份，再看整份备注表（`list_device_remarks`）。
+ *
+ * 两份都要看：行里那份是"此刻这一行带的备注"，而**没有那一行的设备**（未配对、也不在地址簿，
+ * 重启即忘）在会话列表里照样要显示成用户起的备注 —— 那份备注只存在本机的 `deviceRemarks` 里。
+ * 空串按"没备注"处理（后端不存空串，手改过的 `config.toml` 里可能有）。
+ */
+export function deviceRemarkOf(peerId: string): string | null {
+  const row = deviceById(peerId)?.remark?.trim();
+  if (row) return row;
+  return remarks[peerId]?.trim() || null;
+}
+
+/**
  * 按设备 id 取**短名**（拿不到这台设备时用 `fallback`，没给就退回 id 本身）。
+ *
+ * **备注优先**（F-101 的设计）：有备注就是备注本身，**不管此刻有没有那一行** —— 它是用户起的
+ * 名字，比设备名更该被看见（行不在时靠 `list_device_remarks` 那份，见 `deviceRemarkOf`）。
  *
  * `fallback` 是给"名字来自别处"的场合用的：会话消息、推送卡与通知里的名字是**收到那一刻**
  * 存下来的字符串，设备表里可能已经没有这一台（移除过、或还没学到它），那时至少要有名字可显示。
  *
- * **设备页那份列表里没有的这台，再去后端原样那份里找一遍**（`allDevices`）：解绑又离线的设备
- * 会被 `visibleDevices` 挡在设备页之外，可跟它的会话还在（记录是用户数据，见 `stores/chat`
+ * **设备页那份列表里没有的这台，再去后端原样那份里找一遍**（见 `deviceById`）：解绑又离线的
+ * 设备会被 `visibleDevices` 挡在设备页之外，可跟它的会话还在（记录是用户数据，见 `stores/chat`
  * 的 `convoRows`）—— 会话列表与标题要拿它的名字，而不是一串设备 id。
  */
 export function peerShortName(peerId: string, fallback?: string): string {
-  const d = devices.find((x) => x.id === peerId) ?? allDevices.find((x) => x.id === peerId);
-  return d ? deviceShortName(d) : fallback ?? peerId;
+  // 备注优先（F-101 的设计）：**不管此刻有没有那一行** —— 它是用户起的名字，比设备名更该被看见。
+  const remark = deviceRemarkOf(peerId);
+  if (remark) return remark;
+  const d = deviceById(peerId);
+  const known = d ? deviceShortName(d).trim() : '';
+  // **占位名 = "还没有名字"**：设备行是拿设备 id（或空串）顶着的 —— `AppState::new` 给
+  // "只有凭据、地址簿里没有"的行起名就是 id，中转核实过的行（`observe_verified_addr`）也是。
+  // 判据与后端 `name_is_placeholder` 一字不差：空串、或等于设备 id。
+  //
+  // 为什么必须这么判：名字有**两条来源**（设备行那份 = 观察值，会话记录里那份 = 对端自己
+  // 发来的消息带着的 `fromName`，落盘、跨重启还在），而设备行**存在但不含信息**时旧写法
+  // 会把它当成"已经知道了"，于是启动那一刻（还没有任何新的观察）永远先显示一串 deviceid，
+  // 要等探活回话/它自己开口才变成名字 —— 而这句话本机早就有了。
+  if (known && known !== peerId) return known;
+  return fallback || known || peerId;
 }
 
 /**
@@ -107,7 +180,15 @@ export function peerShortName(peerId: string, fallback?: string): string {
  */
 export async function saveDeviceRemark(peerId: string, remark: string): Promise<string | null> {
   const stored = (await api.setDeviceRemark(peerId, remark)) ?? null;
-  devices = devices.map((d) => (d.id === peerId ? { ...d, remark: stored } : d));
+  // 两份设备表都改（只改可见那份的话，掉出可见集的那台在会话里一直显示旧名字），
+  // 备注表也跟着改 —— 它与"有没有那一行"无关，是会话侧那一路的来源。
+  const patch = (list: PeerDevice[]) => list.map((d) => (d.id === peerId ? { ...d, remark: stored } : d));
+  devices = patch(devices);
+  allDevices = patch(allDevices);
+  const next = { ...remarks };
+  if (stored) next[peerId] = stored;
+  else delete next[peerId];
+  remarks = next;
   return stored;
 }
 
@@ -142,8 +223,11 @@ export function noteLocalOnline(on: boolean) {
  * 灰点同时意味着"在线、能送到"和"离线、送不到"。
  *
  * - `live`：在线 + 长连接（消息即时到；共享项变更的自动广播也只发给长连接设备）；
- * - `online`：在线、没有长连接 —— **能送到**（走 HTTP 兜底；已配对的对端直接收，未绑定的
- *   要对方点一次同意）；
+ * - `online`：在线、没有长连接 —— 已配对的那个方向直接收，未绑定的要对方点一次同意。
+ *   **在线 ≠ 此刻一定拨得动**：判据是"探活成功（本机够得着）**或**刚听到过它"（对端能拨进来、
+ *   本机拨不回去 —— AP 隔开单播、跨段、只有一条借来的中转链时就是这样，见后端 `AppState::heard`）。
+ *   本机这一侧没有路时消息会排队（`chat::deliver` 只认 `dialable()`），但"不在网上"这句是错的：
+ *   它刚刚才跟本机说过话；
  * - `offline`：不在网上（**此刻送不到**：消息会排队等它上线，推送则就地失败 —— 见 F-95/F-53）；
  * - `retrying`：本机在等（拨号重连中 / 等对端上线）——"还没连上，但也没放弃"；
  * - `repair`：关系失效（对端不认本机 token / 证书换过），出路只有重新配对。
@@ -162,17 +246,30 @@ export function needsRepair(d: PeerDevice): boolean {
 }
 
 /**
- * 「看得见但连不上」的**唯一判据**（F-106）：mDNS 记录还在（对端在喊），探活却不成 ——
- * 有些 AP 把同一网段里客户端之间的单播隔开了（组播还过得去，于是"设备看得见、连不上"）。
+ * 「看得见但连不上」的**唯一判据**（F-106）：mDNS 记录还在（对端在喊），可本机**手里没有
+ * 一条拨得动的路** —— 有些 AP 把同一网段里客户端之间的单播隔开了（组播还过得去，于是
+ * "设备看得见、连不上"）。
  *
  * **它只管一件事：发起连接那一刻说不说那句话**（`unicastBlockedTip`）。设备行本身不给这一档
  * —— 关系没建立就是「未绑定」，点照旧按 `offline` 画；理由等到用户真要拨号时才说，那时它才是
  * "这一次为什么连不上"的解释，而不是列表上一条要用户自己维护的标签。
  *
- * 经中转（`relayVia`）不算：那条路已经绕开直连这一跳，此刻拨的是中转端点。
+ * 判据两半，缺一不可：
+ *
+ * - **`seen && !relayVia && !online`**：mDNS 看得见它、探活却不成 —— 这正是这句 tip 写的
+ *   那一档（AP 把单播隔开）。**这一半不能删**：mDNS 发现出来的行**一定带着记录里的地址**
+ *   （`lib.rs` 的 `PeerEvent::Online`），所以"有没有地址"在这条路上一点区分度都没有。
+ * - **`seen && !relayVia && 手里没有路`**：`online` 现在还能由"刚听到过它"撑起来（后端
+ *   `AppState::heard`：对端能拨进来、本机拨不回去），那时 `!online` 不再蕴含"拨不动" ——
+ *   一台"刚发来消息、但本机没有它的地址"的设备点「连接」会一句话都没有。补的这一半专治它。
+ *
+ * `relayVia` 不算：那一行此刻拨的是**借来的中转端点**，不是直连这一跳 —— "单播被隔开"那句
+ * 就不适用。中转本身不上界面（用户要求），但这条判据照旧要看它。
  */
 export function unicastBlocked(d: PeerDevice | undefined): boolean {
-  return !!d && d.seen && !d.online && !d.relayVia;
+  // "此刻拨得动吗"：地址在手（或手里有一条借来的端点）。
+  const hasRoute = !!d && ((d.ip !== '' && d.port !== 0) || !!d.relayVia);
+  return !!d && d.seen && !d.relayVia && (!d.online || !hasRoute);
 }
 
 /**
@@ -181,20 +278,7 @@ export function unicastBlocked(d: PeerDevice | undefined): boolean {
  */
 export function unicastBlockedTip(d: PeerDevice | undefined): string | null {
   if (!d || !unicastBlocked(d)) return null;
-  return `「${deviceShortName(d)}」直连不通：它在同一网段（能收到它的 mDNS 记录），但这张 Wi-Fi 可能把客户端之间的单播隔开了。要立刻连上它，得有一台两端都够得着的设备打开设置里的「允许为其它设备中转」——由它接管之后这一行会写「经 X 中转」。`;
-}
-
-/**
- * F-107：这台设备**所在的网段**有没有中转记忆 —— 有就返回一句悬停说明，没有就 `null`。
- *
- * 与 `relayVia`（此刻经 X 中转）是两件事：那是"现在这条路"，这是"这一段直连不通时该走哪一段"
- * 的**持久策略**（后端 `config.toml` 的 `relayRoutes`）。所以它跟 `unicastBlocked` 同一档：
- * 只在悬停说明里说话，**不是**设备行上的状态档，也不参与排序。
- */
-export function transitHint(d: PeerDevice | undefined): string | null {
-  const t = d?.transit;
-  if (!t) return null;
-  return `这一段有中转记忆：直连不通时走 ${t.viaCidr} 那一跳（池里 ${t.poolSize} 台，掉线会自动换一台）；直连一通就自动回到直连。`;
+  return `「${deviceShortName(d)}」直连不通：它在同一网段（能收到它的 mDNS 记录），但这张 Wi-Fi 可能把客户端之间的单播隔开了。要立刻连上它，得有一台两端都够得着的设备打开设置里的「允许为其它设备中转」。`;
 }
 
 /**
@@ -222,7 +306,10 @@ const DOT_RANK: Record<DeviceDotState, number> = { live: 4, online: 3, retrying:
 export function threadDotState(peerIds: string[]): DeviceDotState {
   let best: DeviceDotState = 'offline';
   for (const id of peerIds) {
-    const state = deviceDotState(devices.find((d) => d.id === id));
+    // 查两份表：可见那份里没有的行（离线 + 未绑定 + 没被 mDNS 看见）在后端原样那份里，
+    // 而会话列表/群成员那一行照样要用它算状态 —— 只查 `devices` 的话，找不到 = 恒 `offline`，
+    // 与后端真实状态无关（见 `deviceById`）。
+    const state = deviceDotState(deviceById(id));
     if (DOT_RANK[state] > DOT_RANK[best]) best = state;
   }
   return best;

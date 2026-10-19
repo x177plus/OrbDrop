@@ -1,7 +1,7 @@
 import { listen } from '@tauri-apps/api/event';
 import type { PeerShareItem } from '$lib/types';
 import * as api from '$lib/api';
-import { getDevices } from './devices.svelte';
+import { deviceById } from './devices.svelte';
 
 /**
  * 对端设备标签的数据源：某一台设备「广播给本机」的共享项列表。
@@ -38,7 +38,7 @@ function patch(peerId: string, next: Partial<PeerSharesState>) {
  * WebView 不会认我们的证书，也不该认。
  */
 export async function loadPeerShares(peerId: string): Promise<void> {
-  const peer = getDevices().find((d) => d.id === peerId);
+  const peer = deviceById(peerId);
   if (!peer) {
     patch(peerId, { items: [], loaded: true, loading: false, error: '设备不在列表中' });
     return;

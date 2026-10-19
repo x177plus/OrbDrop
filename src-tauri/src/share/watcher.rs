@@ -162,6 +162,9 @@ fn change_kind(kind: &EventKind) -> Option<&'static str> {
 
 /// 把一批变更发给**此刻处于长连接**的对端。
 ///
+/// 一批是"同一个共享项、同一个 300ms 窗口"，发出去的是**一条**（窗口内的"最近的样子"，
+/// 理由见下面那段注 —— 逐条发会把对端与本机一起压住）。
+///
 /// 与 `/shares` 的可见性判定同一套规则（开播开关 + 当前连接），因此对端连接/断开时
 /// 变更通知范围立刻跟着变。
 fn broadcast(state: &Arc<AppState>, sid: &str, batch: Vec<ChangeEvent>) {
@@ -178,17 +181,24 @@ fn broadcast(state: &Arc<AppState>, sid: &str, batch: Vec<ChangeEvent>) {
         return;
     }
     for target in state.ws.connected_peers() {
-        for ev in &batch {
-            ws::send_to_peer(
-                state,
-                &target,
-                WsEvent::ShareChanged {
-                    share_id: ev.share_id.clone(),
-                    path: ev.path.clone(),
-                    kind: ev.kind.clone(),
-                },
-            );
-        }
+        // **一批只发一条**：一批 = 同一个共享项、同一个 300ms 窗口（见 `QUIET_WINDOW`）内的变更，
+        // 而窗口里可能有几百条 —— 实测一台机器在共享目录里跑多通道 Gradle 构建时，本机这边
+        // 峰值收到 1300 条/秒（对端逐条发、本机逐条记 + 逐条刷界面）。逐条发等于把本机的文件
+        // 变动量原样压到网络上，而接收端把它们当的是**同一件事**：它只认 `share_id`
+        // （`PeerTab` 的 `share://changed` 处理只读它，前端收到就去重拉那一层）。
+        //
+        // 留**最后一条**：与 `MAX_PENDING` 超出时丢最老的那套口径一致 —— 报的仍是"最近的样子"。
+        // 旧接收端收到的是更粗的通知，但"该刷新的那一下"一条都没少（它本来也是重拉整层）。
+        let Some(ev) = batch.last() else { continue };
+        ws::send_to_peer(
+            state,
+            &target,
+            WsEvent::ShareChanged {
+                share_id: ev.share_id.clone(),
+                path: ev.path.clone(),
+                kind: ev.kind.clone(),
+            },
+        );
     }
 }
 
@@ -235,6 +245,45 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// 一批变更只发**一条**帧（`broadcast`）：对端一次构建能在 300ms 窗口里攒几百条，
+    /// 逐条发就是实测的 1300 帧/秒 —— 而接收端只认 `share_id`，那几百条对它是一件事。
+    /// 报的是窗口内**最后一条**（"最近的样子"，与 `MAX_PENDING` 丢最老同一套口径）。
+    #[tokio::test]
+    async fn a_burst_goes_out_as_a_single_frame() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_burst_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut share = crate::config::ShareItem::new(dir.clone());
+        share.broadcast_enabled = true;
+        let sid = share.id.clone();
+        let mut config = crate::config::test_config();
+        config.shares.push(share);
+        let state = Arc::new(AppState::new(config, dir.join("config.toml")));
+        let (tx, mut rx) = mpsc::channel(64);
+        state.ws.register("peer-a", tx);
+
+        let batch: Vec<ChangeEvent> = (0..200)
+            .map(|i| ChangeEvent {
+                share_id: sid.clone(),
+                path: format!("build/out-{i}.class"),
+                kind: "modified".into(),
+            })
+            .collect();
+        broadcast(&state, &sid, batch);
+
+        match rx.try_recv().expect("这一批该发出去") {
+            WsEvent::ShareChanged { share_id, path, .. } => {
+                assert_eq!(share_id, sid);
+                assert_eq!(path, "build/out-199.class", "报的该是窗口内最后一条");
+            }
+            other => panic!("期望 ShareChanged，得到 {}", other.type_name()),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "一批只该发一条 —— 多出来的就是逐文件那条老路"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 一个安静窗口 = 一批；同一批里重复的（一次复制会疯狂重报同一个文件）合并。

@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
- * 本机镜像演练台：把发布仓当静态站点伺服，用来实测客户端的**镜像切换**。
+ * 本机镜像演练台：把仓库根当静态站点伺服，用来实测客户端的**镜像切换**。
  *
  *   node scripts/dev-mirror.mjs --port 8788 --gh-hang --gitee-kbps 20
  *
  * 路由（两个前缀映射的是**同一份文件**，模拟 GitHub / Gitee 两处放的东西一样）：
- *   /gh/**      → <发布仓>/<路径>   --gh-hang 时只收请求、永不回数据（模拟连不上 GitHub）
+ *   /gh/**      → <仓库根>/<路径>   --gh-hang 时只收请求、永不回数据（模拟连不上 GitHub）
  *                                   --gh-kbps N 时按 N KB/s 限速
- *   /gitee/**   → <发布仓>/<路径>   默认按 --gitee-kbps 限速（模拟 Gitee 只有几 KB/s）
- *   /manifest.json 直接吐发布仓根目录的 update.json（客户端用 ORBDROP_UPDATE_MANIFEST 覆盖它）
+ *   /gitee/**   → <仓库根>/<路径>   默认按 --gitee-kbps 限速（模拟 Gitee 只有几 KB/s）
+ *   /manifest.json 直接吐仓库根目录的 update.json（客户端用 ORBDROP_UPDATE_MANIFEST 覆盖它）
  *
  * 为什么要有它：客户端的清单地址是**编译期常量**，两个镜像的"快 / 慢 / 挂"三种情况只有
  * 在真机拔网线、改 hosts 才能复现 —— 这里用限速与"挂起"在本地精确复现，改一行参数就能重来。
@@ -33,7 +33,7 @@ const USAGE = `用法：node scripts/dev-mirror.mjs [选项]
   --gitee-kbps <N>     /gitee/** 限速（KB/s，默认 10；0 = 不限速）
   --gh-kbps <N>        /gh/** 限速（KB/s，默认 0 = 不限速）
   --gh-hang            /gh/** 只接受连接、永不回数据（模拟连不上 GitHub；优先于 --gh-kbps）
-  --root <路径>        发布仓路径（默认取配置里的 releasesRepo）
+  --root <路径>        仓库根路径（默认取配置里的 repoPath，即本仓根）
   --version <版本号>   期望清单里的版本（只用于启动时提示，对不上会警告）`;
 
 const argv = process.argv.slice(2);
@@ -62,7 +62,7 @@ if (!Number.isInteger(port) || port <= 0 || port > 65535) die(`端口不合法�
 if (!Number.isFinite(giteeKbps) || giteeKbps < 0) die(`--gitee-kbps 不合法：${opt("--gitee-kbps")}`);
 if (!Number.isFinite(ghKbps) || ghKbps < 0) die(`--gh-kbps 不合法：${opt("--gh-kbps")}`);
 if (!fs.existsSync(root)) {
-  die(`发布仓不存在：${root}`, `先跑本机发布（会顺便建出目录）：node scripts/release.mjs --local --skip-build --version 0.0.1`);
+  die(`仓库根不存在：${root}`, `仓库根就是本仓；确认路径，或先跑一次本机发布：node scripts/release.mjs --local --skip-build --version 0.0.1`);
 }
 
 /** KB/s → B/s。这里按 1 KB = 1024 B 算，说"20 KB/s"就是 20480 B/s。 */
@@ -72,7 +72,7 @@ const GITEE_RATE = bytesPerSec(giteeKbps);
 
 const MANIFEST = path.join(root, "update.json");
 
-/** 只允许读发布仓里的文件：防止 `..` 穿出去（静态服务器最容易翻车的地方）。 */
+/** 只允许读仓库根里的文件：防止 `..` 穿出去（静态服务器最容易翻车的地方）。 */
 function resolveInRoot(relPath) {
   const abs = path.resolve(root, relPath);
   const prefix = root.endsWith(path.sep) ? root : root + path.sep;
@@ -172,10 +172,10 @@ function handleManifest(res) {
 
 function handleIndex(req, res) {
   const text = [
-    `OrbDrop 镜像演练台 · 发布仓 ${root}`,
+    `OrbDrop 镜像演练台 · 仓库根 ${root}`,
     "",
-    `  /gh/**         → <发布仓>/<路径>${ghHang ? "   当前：挂起（收请求，永不回数据）" : GH_RATE ? `   当前：限速 ${GH_RATE / 1024} KB/s` : "   当前：不限速"}`,
-    `  /gitee/**      → <发布仓>/<路径>${GITEE_RATE ? `   当前：限速 ${GITEE_RATE / 1024} KB/s` : "   当前：不限速"}`,
+    `  /gh/**         → <仓库根>/<路径>${ghHang ? "   当前：挂起（收请求，永不回数据）" : GH_RATE ? `   当前：限速 ${GH_RATE / 1024} KB/s` : "   当前：不限速"}`,
+    `  /gitee/**      → <仓库根>/<路径>${GITEE_RATE ? `   当前：限速 ${GITEE_RATE / 1024} KB/s` : "   当前：不限速"}`,
     `  /manifest.json → ${rel(MANIFEST)}`,
     "",
     "客户端启动（清单地址是编译期常量，只能用环境变量覆盖）：",
@@ -219,7 +219,7 @@ async function handler(req, res) {
     return;
   }
   if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
-    sendText(res, 404, `发布仓里没有这个文件：${rel(file)}\n`);
+    sendText(res, 404, `仓库根里没有这个文件：${rel(file)}\n`);
     log(`[${tier}] ${req.method} ${pathname} → 404（${rel(file)} 不存在）`);
     return;
   }
@@ -242,7 +242,7 @@ server.on("error", (e) => die(`镜像台启动失败（端口 ${port}）`, e.mes
 
 server.listen(port, "127.0.0.1", () => {
   step(`镜像演练台已启动：http://127.0.0.1:${port}`);
-  note(`发布仓 ${root}`);
+  note(`仓库根 ${root}`);
   note(`/gh/**    ${ghHang ? "挂起（收请求，永不回数据）" : GH_RATE ? `限速 ${GH_RATE / 1024} KB/s` : "不限速"}`);
   note(`/gitee/** ${GITEE_RATE ? `限速 ${GITEE_RATE / 1024} KB/s` : "不限速"}`);
   if (ghHang && ghKbps) note("--gh-hang 优先于 --gh-kbps：GitHub 档现在是挂起。");
