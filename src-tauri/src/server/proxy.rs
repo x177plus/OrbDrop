@@ -437,7 +437,7 @@ mod tests {
         let caller_id = format!("device-caller-{}", uuid::Uuid::new_v4());
         let token = format!("tok-{}", uuid::Uuid::new_v4());
         crate::credential::set_peer(&caller_id, &token).unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(crate::ws::EVENT_QUEUE_CAPACITY);
         peer_state.ws.register(&caller_id, tx);
 
         // ---- A：本机（代理这一侧） ----

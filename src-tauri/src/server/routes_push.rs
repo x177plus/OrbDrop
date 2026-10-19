@@ -15,6 +15,7 @@ use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
 use crate::net;
+use crate::server::auth::bearer_token;
 use crate::state::AppState;
 use crate::transfer::push_job::{DownloadTarget, InboundInvite};
 use crate::transfer::stream::StreamRequest;
@@ -101,6 +102,10 @@ pub async fn push_invite_handler(
     }
 
     let invite_id = body.invite_id;
+    // 一条推送邀请也是"**从它那边收到了东西**"：对端能拨进来、本机拨不回去时（AP 把单播
+    // 隔开、跨段、地址过期），会话/邀请这类入站报文是它还在网上的唯一证据（见
+    // `AppState::heard`）。只对设备表里已有的行生效 —— 载荷里的 id 不配凭空造出"在线设备"。
+    state.note_heard_online(&body.sender.id);
     // `await1` = 发送方是"投递即回"那一版（见 `push_job::CAP_AWAIT`）。哪一端老，看这一行
     // 最快：**没有**这个位就是对面老 —— 那这条邀请只能按老规矩（60 秒没人处理就作废）办。
     let await_capable = body.caps.iter().any(|c| c == crate::transfer::push_job::CAP_AWAIT);
@@ -180,15 +185,6 @@ pub async fn push_invite_handler(
         _ => false,
     };
     Ok(Json(InviteResponse { accepted, pending: false, reason: None }))
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("Authorization")?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(|t| t.to_string())
 }
 
 // ---------------------------------------------------------------------------

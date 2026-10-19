@@ -27,6 +27,25 @@ OrbDrop 是一个局域网文件工具，界面主体是一个始终置顶的悬
 
 只在局域网内使用：不做公网穿透、不做中继服务器、不依赖云、不需要账号。
 
+## 下载
+
+| 平台 | 文件 | GitHub | Gitee |
+| --- | --- | --- | --- |
+| Windows 桌面端（x86_64） | `orbdrop.exe` | [最新版](https://github.com/x177plus/OrbDrop/releases/latest) | [最新版](https://gitee.com/x177plus/OrbDrop/releases) |
+| 安卓（通用包） | `app-universal-release.apk` | [最新版](https://github.com/x177plus/OrbDrop/releases/latest) | [最新版](https://gitee.com/x177plus/OrbDrop/releases) |
+| 安卓（arm64） | `app-arm64-release.apk` | [最新版](https://github.com/x177plus/OrbDrop/releases/latest) | [最新版](https://gitee.com/x177plus/OrbDrop/releases) |
+
+桌面端是单文件绿色版（不带安装器）。APK 装不上时按机型选包：手机上绝大多数是 arm64（`app-arm64-release.apk` 更小、更省内存），拿不准就用通用包。
+
+### 更新清单与校验
+
+清单地址是客户端的**编译期常量**，所以本仓承担两个固定位置：
+
+- GitHub：Release 附件 `update.json` —— `https://github.com/x177plus/OrbDrop/releases/latest/download/update.json`
+- Gitee：仓库根目录 `update.json` —— `https://gitee.com/x177plus/OrbDrop/raw/master/update.json`
+
+清单里的下载地址都钉了 tag（`releases/download/vX.Y.Z/...`），老版本客户端不会因为新版本发布而下错包。每个产物都带 `size` 与 `sha256`（Windows 版另有 Tauri 更新签名 `sig`），下载后可以自己核对：`sha256sum orbdrop.exe`。
+
 ## 功能亮点
 
 ### 1. 悬浮窗：拖入即共享，拖出即落地
@@ -56,7 +75,7 @@ OrbDrop 是一个局域网文件工具，界面主体是一个始终置顶的悬
 
 ### 4. AP 隔离中转 + 跨网段互相发现
 
-- **AP 隔离**（同网段、mDNS 看得见、单播被掐死）：直连拨不通时，OrbDrop 向一台"自报允许中转"的设备（**默认关**，需自行打开）请一条端点。中转方**只盲搬字节** —— 端到端 TLS 不变，它看不到内容 —— 单跳、并发上限 8 条。使用期间设备行会标「经 X 中转」。
+- **AP 隔离**（同网段、mDNS 看得见、单播被掐死）：直连拨不通时，OrbDrop 向一台"自报允许中转"的设备（**默认开** —— 首次启动就是开的，不想出这笔上行带宽在设置里关掉）请一条端点。中转方**只盲搬字节** —— 端到端 TLS 不变，它看不到内容 —— 单跳、并发上限 8 条。中转**不上界面**：设备行只按在线 / 离线画，走的是直连还是借来的端点由 OrbDrop 自己决定。
 - **中转记忆**：一条目标**真的经中转到达过**之后，OrbDrop 把「那一段要经这一段」记进地址簿。这条记忆**跨重启保留**、按网段泛化（同段的其他设备共用一条决策）、锚点掉线时自动换池内的另一台，并且会顺着已经建立的链路**反向告知**被中转的那一侧。直连恒优先，直连一恢复中转立刻收起。
 - **跨网段互相发现**：mDNS 跨不过路由，所以已配对的设备每 5 秒用单播互换**各自完整的 mDNS 视野**。每个网段只需要手动添加并配对**一台锚点**，它看得见的东西就都会出现 —— 多网卡主机会把它每块网卡上看到的都报出来。发现本身只走单跳；跨段的群消息另有成员间转发那条路。
 - **手动添加**（填 IP，或 `IP:端口`；端口留空自动扫 3890–3899）、多网卡地址上报与同网段优先选路，以及一个只读的"本机替别人中转了多少"计数。
@@ -72,7 +91,7 @@ OrbDrop 是一个局域网文件工具，界面主体是一个始终置顶的悬
 | 传输内核 | 按文件身份记的**块级续传**（传失败重推是接着传；接收端重启后还会自己接着收）、每块 SHA-256 校验、先写 `<名字>.orbdrop-part` 再原子改名，并发数（1–8）与分块大小（1–32 MB）可配。本机回环 TLS、热缓存实测：3000 个 4 KB 小文件 1.72 s，单个 128 MB 文件 101 MB/s。 |
 | 设备管理 | 设备备注**只存在本机**（不随任何报文发出去）、按名字或 IP 搜索、待处理角标、随时解除配对（不需要对方在线）。 |
 | 设置 | 下载目录与下载模式、推送按发送方分目录、本机名称、端口、开机自启、中转开关、传输并发与分块。日志按天轮转，落在数据目录。 |
-| 安卓端 | 前台服务保活（后台仍在线、仍能收到推送），消息通知与保活通知是**两个渠道**（能单独关掉提醒而保住在线），可以在会话里发文件，收件点一下用系统程序打开（`.apk` 直接进系统安装器），手机也能当中转方。 |
+| 安卓端 | 前台服务保活（后台仍在线、仍能收到推送），消息通知与保活通知是**两个渠道**（能单独关掉提醒而保住在线），可以在会话里发文件、也可以把一个已安装应用的安装包发过去（落盘名带应用名、版本与包名），收件点一下用系统程序打开（`.apk` 直接进系统安装器），手机也能当中转方。 |
 | 自更新 | 清单里的产物同时带 `sha256` 与 minisign 签名；桌面端单文件 exe 用刚下好的新 exe 当 helper 覆盖自己（失败回滚回旧版）；下载按 GitHub → Gitee 顺序测速切换，并记住 24 小时内的优选镜像。 |
 
 ## 明确不做
@@ -83,6 +102,10 @@ OrbDrop 是一个局域网文件工具，界面主体是一个始终置顶的悬
 
 Rust 核心，桌面端与安卓端共用同一份：单端口上的 axum HTTP/WebSocket 服务（监听口按首字节区分 TLS 与明文）、rustls/rcgen 的自签身份与指纹 pinning、`mdns-sd` 做发现、tokio-tungstenite 做长连接信令，另有手写的 WebDAV 面与用于拖出的 Windows 云文件（CFAPI）provider。外壳是 Tauri 2，界面是 Svelte 5 + Vite。
 
+## 文档
+
+深度文档在 [`docs/`](./docs/README.md)（简体中文）：需求文档、悬浮球形态提案、实现主记录（38 节），以及 CFAPI 拖拽镜像、Beyond Compare 集成、局域网中转、自更新与发行链路四份专题。[`docs/README.md`](./docs/README.md) 是地图 —— 每份文档是什么、什么状态、对应哪些代码。
+
 ## 从源码构建
 
 需要 Node.js、Rust 工具链；安卓端另需 Android SDK/NDK。
@@ -92,13 +115,16 @@ npm install          # 安装依赖
 npm run tauri dev    # 桌面端开发（vite + tauri）
 npm run android:dev  # 安卓端开发
 npm run check        # svelte-check 类型检查
+npm run android:build:arm64  # 只编 arm64 的安卓 release 包
 ```
+
+`npm run android:build` 会把 Rust crate 按四个 ABI **串行**编一遍（每个 ABI 一次全量重链接），所以它慢；改功能期间用 `android:build:arm64`（只编一个 ABI，工作量约四分之一），通用包留到发布时再出。注意 `--target aarch64` 只是限制 Rust 编哪个 ABI，Gradle 的 flavor 仍是 `universal` —— 这个单 ABI 包落在 `apk/universal/release/`，并会**覆盖**那里的通用包。
 
 打包：`npm run tauri build`（桌面端）、`npm run android:release`（arm64 APK 并安装到设备）、`npm run release`（升版本 + 构建 + 发布到两个发行仓）。`npm run mirror` 启动本机镜像演练台，用来测更新链路。
 
 在一台机器上开多份（拿自己当两台设备测）需要每份各自的数据目录与端口：设 `ORBDROP_ALLOW_MULTI=1` 与对应的 `ORBDROP_DATA_DIR`。
 
-发行版产物与更新清单见[发布仓](https://github.com/x177plus/OrbDrop/releases/latest)。
+发行版产物与更新清单见本仓的[发行版](https://github.com/x177plus/OrbDrop/releases/latest)。
 
 ## 许可证
 

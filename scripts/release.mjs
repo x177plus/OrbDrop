@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
  * 一条命令发布一版：
- *   构建 → 签名 → 生成 update.json → 落入发布仓（含 README / LICENSE / CHANGELOG）→
+ *   构建 → 签名 → 生成 update.json → 落入本仓根目录（update.json + CHANGELOG.md）→
  *   （远端）commit + tag + push 两个远端 → 建 Release 传附件 → 回读校验。
  *
  * 两种模式：
  *   默认（远端）：上面全走。需要配置里的 owner/repo，以及环境变量 GITHUB_TOKEN / GITEE_TOKEN。
- *   `--local`：不联网、不 push、不调任何 API，只把产物与清单落到本机发布仓，
+ *   `--local`：不联网、不 push、不调任何 API，只把产物与清单落到本仓根目录，
  *              清单里的 mirrors 指向本机镜像台（scripts/dev-mirror.mjs），
  *              并在 stdout 打印可直接照抄的客户端启动命令。
  *
@@ -17,10 +17,11 @@
  *  3. `tauri signer sign` 会在**文件旁边**写 `<文件>.sig`。私钥不在仓库里，构建产物在
  *     `src-tauri/` 下（不该多出文件），而清单里的 sig 是**内联字符串**，所以这里先把 exe
  *     拷到临时目录去签，读完 .sig 就地删掉临时文件，磁盘上不留多余文件。
- *  4. update.json 要写**两份**：发布仓根目录（客户端走 Gitee raw 读它）＋ 本次 Release 的附件
+ *  4. update.json 要写**两份**：本仓根目录（客户端走 Gitee raw 读它）＋ 本次 Release 的附件
  *     （客户端走 GitHub `releases/latest/download/` 读它，所以 Release 绝不能是 draft/prerelease，
  *     否则 `latest` 别名不指它）。
- *  5. 发布仓**不提交** assets/ —— 那是本机演练用的产物缓存，十几 MB × N 个版本进 git 会把仓库搞爆。
+ *  5. 本仓**不提交** assets/ —— 那是本机演练用的产物缓存，十几 MB × N 个版本进 git 会把仓库搞爆
+ *     （本仓根 `.gitignore` 已经忽略 `/assets/`）。
  *
  * 用法：
  *   node scripts/release.mjs --local --skip-build --version 0.0.1        # 本机演练（不联网）
@@ -76,7 +77,7 @@ const USAGE = `用法：node scripts/release.mjs [选项]
   node scripts/release.mjs --verify-only --version 0.0.1`;
 
 /** Release 阶段失败时，git 侧（代码 + 清单）已经推上去了：说清这一点，别让人以为什么都没发生。 */
-const PUSHED_HINT = "git 侧已经推送完成（发布仓的提交与 tag 都在远端了）：修好之后重跑发布；若 tag 已存在，先删本地和远端的 tag 再发。";
+const PUSHED_HINT = "git 侧已经推送完成（本仓的提交与 tag 都在远端了）：修好之后重跑发布；若 tag 已存在，先删本地和远端的 tag 再发。";
 
 const argv = process.argv.slice(2);
 const flag = (n) => argv.includes(n);
@@ -113,14 +114,14 @@ const VERIFY_ONLY = flag("--verify-only");
  * 同版本重发：版本号不动、**产物必须换掉**的那种补发（例如发布之后才发现客户端有缺陷）。
  *
  * 与普通远端发布的差别只有两处，都跟"这一版已经存在"有关：
- *  - **tag 不新建、也不移动**（它已经指向那一版最初那次提交）：只往发布仓的分支上追加一个
+ *  - **tag 不新建、也不移动**（它已经指向那一版最初那次提交）：只往本仓的发布分支上追加一个
  *    提交（清单与 CHANGELOG 变了）。所以远端 Release 的附件与 tag 指向的提交会不一致 ——
  *    客户端读的是清单（GitHub 走 Release 附件、Gitee 走分支上的仓库文件），两边都是新的。
  *  - **Release 是复用的**：GitHub 先删掉旧附件再传（同名附件会 422）；Gitee 直接删掉整个
  *    Release 再建一个同 tag 的（它没有"删单个附件"这一步，而且这样也顺带释放配额）。
  */
 const REPUBLISH = flag("--republish");
-if (REPUBLISH && LOCAL) die("--republish 只在远端模式有意义", "本机演练直接覆盖发布仓即可，不用它。");
+if (REPUBLISH && LOCAL) die("--republish 只在远端模式有意义", "本机演练直接覆盖本仓根目录的清单即可，不用它。");
 // --verify-only 只读远端（清单 + 资产 URL），不需要 token，也不碰构建与 git。
 const tokens = LOCAL || VERIFY_ONLY ? null : requireRemoteConfig(cfg);
 const keyPath = requireSigningKey(cfg);
@@ -131,7 +132,7 @@ const versions = readVersions();
 const drifted = Object.entries(versions).filter(([, v]) => v !== ver.raw);
 
 step(`发布 OrbDrop ${ver.raw}（versionCode ${ver.code}）· ${LOCAL ? "本机演练（--local）" : "远端发布"}`);
-note(`配置 ${rel(cfg.__source)} · 发布仓 ${cfg.repoPath} · 私钥 ${keyPath}`);
+note(`配置 ${rel(cfg.__source)} · 本仓 ${cfg.repoPath} · 私钥 ${keyPath}`);
 note(`模式 ${VERIFY_ONLY ? "只回读校验（不构建 / 不 push / 不调 API）" : LOCAL ? "不联网 / 不 push / mirrors 指向本机镜像台" : "构建 + push 两个远端 + 调 API + 回读校验"}${SKIP_BUILD ? " · --skip-build（用现有产物）" : ""}${REPUBLISH ? " · --republish（同版本重发：复用已发布的 tag 与 Release）" : ""}`);
 
 if (drifted.length) {
@@ -252,7 +253,7 @@ ok(`签名 OK：${sig.split("\n").length} 行 / ${sig.length} 字符（清单里
 
 /**
  * 在临时目录的副本上签名：signer 会在文件旁边写 `<文件>.sig`，
- * 留在 src-tauri/ 下是多余文件（且那目录本次任务不许碰），留在发布仓里又会让
+ * 留在 src-tauri/ 下是多余文件（且那目录本次任务不许碰），留在仓库根 assets/v{ver}/ 里又会让
  * assets/v{ver}/ 多出一个清单并不引用的文件。
  */
 function signFile(file, keyPath, password) {
@@ -302,10 +303,10 @@ const manifest = {
   android: { universal: entry(byKind.universal), "arm64-v8a": entry(byKind.arm64) },
 };
 
-/* ---------- 落入发布仓 ---------- */
+/* ---------- 落入本仓根目录 ---------- */
 
-step(`落入发布仓：${cfg.repoPath}`);
-ensureRepoFiles(cfg.repoPath, cfg);
+step(`落入本仓：${cfg.repoPath}`);
+ensureRepoFiles(cfg.repoPath);
 const verDir = path.join(cfg.repoPath, "assets", tag);
 fs.mkdirSync(verDir, { recursive: true });
 for (const a of ARTIFACTS) {
@@ -315,7 +316,7 @@ for (const a of ARTIFACTS) {
 upsertChangelog(cfg.repoPath, cfg, ver.raw, notes, pubDate.slice(0, 10));
 const manifestPath = path.join(cfg.repoPath, ASSET_NAMES.manifest);
 fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-ok(`${ASSET_NAMES.manifest} · 发布仓根目录（Gitee raw 走这里）`);
+ok(`${ASSET_NAMES.manifest} · 本仓根目录（Gitee raw 走这里）`);
 for (const f of listTracked(cfg.repoPath)) note(`  跟踪文件 ${f}`);
 if (LOCAL) warn("根目录 update.json 现在指向本机镜像台；正式发布要重跑一次远端模式才会换回真实地址。");
 
@@ -334,7 +335,7 @@ if (LOCAL) {
 
 step("完成");
 note(`${LOCAL ? "本机演练" : "远端发布"} · OrbDrop ${ver.raw}（versionCode ${ver.code}）· ${pubDate}`);
-note(`发布仓 ${cfg.repoPath}/（assets/${tag}/ 三个产物 + 清单）`);
+note(`本仓 ${cfg.repoPath}/（assets/${tag}/ 三个产物 + 清单）`);
 for (const a of ARTIFACTS) note(`  ${a.name.padEnd(26)} ${humanSize(a.size)}  sha256=${a.sha256.slice(0, 16)}…`);
 note("mirrors（GitHub → Gitee）：");
 for (const m of manifest.desktop["windows-x86_64"].mirrors) note(`  ${m}`);
@@ -361,11 +362,11 @@ function printLocalRecipe(cfg, manifest) {
   note("   镜像台还会直接吐清单：GET /manifest.json");
 }
 
-/** 发布仓当前分支。Gitee 的 raw 清单地址是 `raw/<分支>/update.json`，只能发在默认分支上。 */
+/** 本仓当前分支。Gitee 的 raw 清单地址是 `raw/<分支>/update.json`，只能发在默认分支上。 */
 function branchOfRepo(cfg) {
   const r = git(["rev-parse", "--abbrev-ref", "HEAD"], { allowFail: true });
   if (r.status !== 0) {
-    die(`读不出发布仓的当前分支：${cfg.repoPath}`, "发布仓还不是 git 仓库？先 git init 并提交骨架。");
+    die(`读不出本仓的当前分支：${cfg.repoPath}`, "本仓还不是 git 仓库？先 git init 并提交。");
   }
   return r.stdout.trim();
 }
@@ -374,13 +375,13 @@ function branchOfRepo(cfg) {
 
 async function publishRemote(cfg, tokens, ver, tag, notes, branch, files) {
   /* git：commit + tag + push（先落仓库，再建 Release —— GitHub 建 Release 时 tag 必须已存在） */
-  step("发布仓：commit + tag + push");
+  step("本仓：commit + tag + push");
   if (!fs.existsSync(path.join(cfg.repoPath, ".git"))) {
-    die(`发布仓还不是 git 仓库：${cfg.repoPath}`, "先 git init 并提交骨架（README/LICENSE/CHANGELOG）。");
+    die(`本仓还不是 git 仓库：${cfg.repoPath}`, "先 git init 并提交。");
   }
   if (branch !== cfg.gitee.manifestBranch) {
     die(
-      `发布仓当前分支是 ${branch}，但客户端读 Gitee 清单的地址固定是 raw/${cfg.gitee.manifestBranch}/update.json`,
+      `本仓当前分支是 ${branch}，但客户端读 Gitee 清单的地址固定是 raw/${cfg.gitee.manifestBranch}/update.json`,
       `git -C "${cfg.repoPath}" checkout -B ${cfg.gitee.manifestBranch} 之后再造提交（raw 只走默认分支）。`,
     );
   }
@@ -394,9 +395,11 @@ async function publishRemote(cfg, tokens, ver, tag, notes, branch, files) {
   } else if (REPUBLISH) {
     die(`--republish 要复用的 tag ${tag} 不存在`, "这一版还没发过 —— 去掉 --republish 走普通发布。");
   }
-  git(["add", "-A"]);
-  if (!git(["status", "--porcelain"]).stdout.trim()) {
-    die("发布仓没有任何变更（要发的内容跟已提交的一模一样）", "换个版本号，或确认产物/清单确实更新了。");
+  // 只加发布相关路径：本仓工作树里常年有源码改动，`add -A` 会把它们一起卷进
+  // `Released vX（产物与更新清单）` 这个提交里。assets/ 由根 `.gitignore` 忽略，不进 git。
+  git(["add", "--", ASSET_NAMES.manifest, "CHANGELOG.md"]);
+  if (!git(["status", "--porcelain", "--", ASSET_NAMES.manifest, "CHANGELOG.md"]).stdout.trim()) {
+    die("本仓没有任何变更（要发的内容跟已提交的一模一样）", "换个版本号，或确认产物/清单确实更新了。");
   }
   git(["commit", "-m", `Released ${tag}（产物与更新清单）`], { inherit: true, label: "git commit" });
   // 重发不碰 tag：它已经指向这一版最初那次提交，"移动已发布的 tag"会把两条历史打乱。
@@ -406,9 +409,13 @@ async function publishRemote(cfg, tokens, ver, tag, notes, branch, files) {
   } else {
     ok(`已提交（--republish：tag ${tag} 保持不动）`);
   }
-  for (const remote of [cfg.github.remote, cfg.gitee.remote]) {
+  for (const [platform, conf] of [["github", cfg.github], ["gitee", cfg.gitee]]) {
+    const remote = conf.remote;
     const url = git(["remote", "get-url", remote], { allowFail: true });
-    if (url.status !== 0) die(`发布仓没有配置远端 ${remote}`, `git -C "${cfg.repoPath}" remote add ${remote} <仓库地址>`);
+    if (url.status !== 0) {
+      die(`本仓没有配置远端 ${remote}`,
+        `git -C "${cfg.repoPath}" remote add ${remote} git@${platform}.com:${conf.owner}/${conf.repo}.git`);
+    }
     git(["push", remote, branch], { inherit: true, label: `git push ${remote} ${branch}（推送失败：代理/权限/仓库不存在，别忽略）` });
     if (!REPUBLISH) {
       git(["push", remote, `refs/tags/${tag}`], { inherit: true, label: `git push ${remote} ${tag}` });

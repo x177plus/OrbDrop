@@ -8,7 +8,7 @@
  *   这类"移动端才有的视图"，后者的数据来自后端命令。
  */
 import * as api from "$lib/api";
-import type { ChatFileMsg, InboxEntry, PeerShareItem, TreeEntry } from "$lib/types";
+import type { ChatFileMsg, InboxEntry, InstalledApp, LocalPick, PeerShareItem, PickedFile, TreeEntry } from "$lib/types";
 import * as chat from "$lib/stores/chat.svelte";
 import * as devices from "$lib/stores/devices.svelte";
 import type { IconName } from "./icons";
@@ -233,6 +233,173 @@ export async function answerInvite(msg: ChatFileMsg, accept: boolean): Promise<v
   }
 }
 
+// ── 会话里的那颗「＋」：选图片 / 选文件 / 选应用（F-118、F-119）──────────────────
+
+/**
+ * 刚选好、等着落进输入区的那几张图（`null` = 没有）。
+ *
+ * **为什么要过 store 这一道**：选图片是由底板（`AttachSheet`）发起的，而"把图插进输入框"
+ * 只有会话子屏做得到（`contenteditable` 那个元素在它手上，见 `ChatScreen.svelte`）。底板因此
+ * 只把结果放这儿，由会话子屏取走 —— 比让 store 攥着一个 DOM 回调干净，也比让底板自己去
+ * `querySelector` 找那个输入框牢靠。
+ *
+ * **带着 `key` 一起存**：等结果回来时用户可能已经退到别的会话去了（选图那一步在系统选择器
+ * 里，可能停留很久）。那几张图只属于当时那条会话 —— 键对不上就谁也不插（子屏取的时候核对）。
+ */
+let pendingImages = $state<{ key: string; files: PickedFile[] } | null>(null);
+
+/** 会话子屏取走属于自己那条会话的待插图片（取走即清空；不是自己那条就原封不动）。 */
+export function takePendingImages(key: string): PickedFile[] | null {
+  const held = pendingImages;
+  if (!held || held.key !== key) return null;
+  pendingImages = null;
+  return held.files;
+}
+
+/**
+ * 那颗「＋」选了之后要走的路：图片进输入区当草稿，文件当场推送。
+ *
+ * **两条路的语义不同，所以是两项而不是一个框**：图片是**消息内容**（字节随会话消息过去，
+ * 对端直接看得见），文件是**推送**（对端收到一张「接收 / 拒绝」卡）。混在一个框里让用户
+ * 猜"我选的这张图会被当成哪一种"，不如让他自己挑。
+ *
+ * 目标会话就是**此刻开着的那条**（与桌面端 `chatSendFiles` 同一条判据）——「＋」只长在会话
+ * 子屏上，没有会话时这个动作根本不会被调到。
+ */
+export async function pickAttach(kind: "image" | "file"): Promise<void> {
+  const t = chat.activeThread();
+  if (!t) return;
+  let files: PickedFile[];
+  try {
+    files = await api.pickFiles(kind);
+  } catch (e) {
+    failed("选择文件", e);
+    return;
+  }
+  // 取消（空表）什么都不做：用户反悔是正常操作，不该看到任何提示。
+  if (files.length === 0) return;
+  if (kind === "image") {
+    pendingImages = { key: t.key, files };
+    return;
+  }
+  await sendFilesToConvo(
+    t,
+    files.map((f) => ({ path: f.path, name: f.name, size: f.size })),
+  );
+}
+
+/**
+ * 要推送的一项：本机路径 + 会话里那条气泡显示的名字 + 字节数。
+ *
+ * `rename` = 这个名字**只是给对端看的**（本机那份文件的真名不是它）：只有「应用」那一项会
+ * 置它 —— 源是 `/data/app/…/base.apk`，落盘名该是
+ * `应用名_versionName(versionCode)_包名.apk`（见 `transfer::manifest_for_named_paths`）。
+ */
+interface PushItem {
+  path: string;
+  name: string;
+  size: number;
+  rename?: boolean;
+}
+
+/**
+ * 把这几份东西推送到这条会话的每一台设备（一对一就是那一台）。
+ *
+ * 与桌面端 `App.svelte` 的 `chatSendFiles` → `pushPicked` 是同一套：收件人取自这条会话的
+ * 参与者，群发那条会话把这批文件记进自己的记录（`chatBatchId`），群聊同样是"拿群成员当收件人
+ * 跑一次多目标推送"、本机这条记录挂 `groupId`（群里发文件没有单独的后端命令）。
+ *
+ * 只发给**此刻在线**的那几台（与桌面端同一条判据）：推送不会排队，一台都够不着时当场说清楚，
+ * 而不是让用户对着一张永远不动的进度条等。
+ */
+async function sendFilesToConvo(t: chat.ConvoThread, files: PushItem[]): Promise<void> {
+  const peers = devices.devicesById(t.participants);
+  const live = peers.filter((d) => d.online);
+  if (live.length === 0) {
+    toast(
+      peers.length === 1
+        ? `「${devices.deviceShortName(peers[0])}」不在网上，推送未发送`
+        : "所选设备都不在网上，推送未发送",
+    );
+    return;
+  }
+  const items: LocalPick[] = files.map((f) => ({ path: f.path, name: f.name, isDir: false, size: f.size }));
+  // 覆盖名逐位对齐：不改名的那些给空串（后端按空串 = 不覆盖处理）。整表全空时干脆不传
+  // —— 老那条路（选择器选的文件）与以前一个字节都不差。
+  const names = files.map((f) => (f.rename ? f.name : ""));
+  const keepName = names.some((n) => n !== "");
+  try {
+    const batch = await api.pushPaths(
+      files.map((f) => f.path),
+      live.map((d) => d.id),
+      undefined,
+      keepName ? names : undefined,
+    );
+    // 会话里那条文件气泡当场就有了（进度与成败随后由 `push://batch` 推着走，见 `events.ts`）。
+    chat.noteOutgoingFiles(
+      live.map((d) => d.id),
+      items,
+      batch,
+      t.mode === "broadcast" ? t.id : "",
+      t.mode === "group" ? t.id : "",
+    );
+    toast(
+      live.length === 1
+        ? `正在推送到「${devices.deviceShortName(live[0])}」`
+        : `正在推送到 ${live.length} 台设备`,
+      "file",
+    );
+  } catch (e) {
+    failed("推送", e);
+  }
+}
+
+// ── 会话里那颗「＋」的第三项：发送应用（F-119）──────────────────────────────
+
+/**
+ * 设备上已安装的应用（`null` = 还没读过）。
+ *
+ * **留着上一份**：这张表是原生现查的（一次包管理器走查），而底板是"点开就重现"的东西 ——
+ * 每次都只画一个转圈会让这张表显得很慢。留着旧的一份先画出来，新的回来再换（`loadApps`
+ * 每次都重查：装了/卸了应用之后表得跟着变）。
+ */
+let apps = $state<InstalledApp[] | null>(null);
+let appsLoading = $state(false);
+let appsError = $state<string | null>(null);
+
+export function installedApps(): InstalledApp[] | null {
+  return apps;
+}
+
+export function appsState(): { loading: boolean; error: string | null } {
+  return { loading: appsLoading, error: appsError };
+}
+
+/** 重新读一遍设备上的应用（进那张底板时调一次；失败把话说出来，不留一个空表）。 */
+export async function loadApps(): Promise<void> {
+  appsLoading = true;
+  appsError = null;
+  try {
+    apps = await api.listInstalledApps();
+  } catch (e) {
+    appsError = e instanceof Error ? e.message : String(e);
+  } finally {
+    appsLoading = false;
+  }
+}
+
+/**
+ * 发送一个应用：把**它自己的 `base.apk`** 推给这条会话的每一台，落盘名用后端拼好的那个
+ * （`应用名_versionName(versionCode)_包名.apk`）。
+ *
+ * **不拷文件**：本机从 `/data/app/…/base.apk` 直接读，名字只写在清单里（见 `PushItem.rename`）。
+ */
+export async function sendApp(app: InstalledApp): Promise<void> {
+  const t = chat.activeThread();
+  if (!t) return;
+  await sendFilesToConvo(t, [{ path: app.path, name: app.fileName, size: app.size, rename: true }]);
+}
+
 // ── 浏览对端共享项 ──────────────────────────────────────────────────────────
 
 let browsePeer = $state<string | null>(null);
@@ -338,7 +505,7 @@ export async function downloadEntry(shareId: string, path: string, name: string)
 
 /** 连接/断开、解除配对、手动添加：全部转发到后端，再由设备 store 的事件刷新列表。 */
 export async function toggleConnection(peerId: string, connected: boolean): Promise<void> {
-  const peer = devices.getDevices().find((d) => d.id === peerId);
+  const peer = devices.deviceById(peerId);
   const name = peer ? devices.deviceShortName(peer) : "设备";
   // 这一台此刻"看得见却直连不通"时，那句解释在这里说（连接是一个动作，不是一个常驻状态）。
   const tip = connected ? null : devices.unicastBlockedTip(peer);
@@ -452,6 +619,8 @@ export type Sheet =
   | { kind: "remarkDevice"; peerId: string }
   | { kind: "fileActions"; entry: InboxEntry }
   | { kind: "chatActions"; key: string }
+  | { kind: "attach" }
+  | { kind: "appPicker" }
   | { kind: "convo" }
   | { kind: "editRecipients"; key: string }
   | { kind: "keepAlive" }

@@ -110,6 +110,16 @@ async fn dispatch(
 const ALLOW_METHODS: &str =
     "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, COPY";
 
+/// `PUT` 的请求体上限（`Content-Length` 预检 + 流上硬截断都用它）。
+///
+/// 取 64MiB：与本仓现有"单个请求体"最大的那一档 `MANIFEST_BODY_LIMIT`（`server/mod.rs`，
+/// `/push/invite` 等清单路由）同档。依据是不能按传输粒度来卡 —— 推送分块走的是
+/// `transfer_block_mb`（默认几 MB）/ `BUNDLE_MAX_BYTES`（8MiB），而 BC 的"保存"是**整份
+/// PUT 回来**（没有分块、没有续传），几十 MB 的日志/镜像保存一次是日常操作，卡在几 MB
+/// 会把正常写回打死。64MiB 之上已超出"人在 BC 里点一次保存"的规模，正是这条要挡的
+/// "写满共享方磁盘"。
+const PUT_BODY_LIMIT: u64 = 64 << 20;
+
 // ---------------------------------------------------------------------------
 // 路径解析（共享项根目录内的相对路径 → 绝对路径，且不可逃逸）
 // ---------------------------------------------------------------------------
@@ -497,12 +507,47 @@ fn parse_range(headers: &HeaderMap, total: u64) -> (u64, u64) {
 // PUT / MKCOL / DELETE / MOVE / COPY
 // ---------------------------------------------------------------------------
 
+/// 一个 PUT 落在哪：先写同目录的 `<name>.orbdrop-part`，写完再原子改名
+/// （与 `transfer`、`lib.rs::stream_peer_file` 同一套惯例）。
+///
+/// 必须**同目录**：跨卷 `rename` 会失败，而共享项目录与系统临时目录不保证在同一个卷上。
+fn part_path(target: &Path) -> PathBuf {
+    target.with_file_name(format!(
+        "{}.orbdrop-part",
+        target
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "upload".into())
+    ))
+}
+
+/// `PUT` 写回：**原子替换** + 有界。
+///
+/// 旧写法 `File::create(target)` 是就地把请求体写进最终路径：那会当场截断用户的原文件，
+/// 写到一半断流（BC 取消保存、连接掉了、进程被杀）就**永久损坏原文件**，还在共享目录里
+/// 留一个半截文件顶着真名。现在一律先写 `<name>.orbdrop-part`，**写成功才改名覆盖** ——
+/// 目标路径上只有两种状态：原样不动，或是整份新内容。
 async fn write_response(
     target: &Path,
     req: Request<Body>,
 ) -> Result<Response, (StatusCode, String)> {
     if target.is_dir() {
         return Err((StatusCode::METHOD_NOT_ALLOWED, "目标是目录".into()));
+    }
+    // 体积预检：`Content-Length` 摆在那儿就先拒，不必先读一遍再拒（BC 保存超大文件时立刻
+    // 拿到明确原因，而不是等传完才 413）。放在建父目录之前 —— 被拒的请求不该在磁盘上留痕。
+    if let Some(len) = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if len > PUT_BODY_LIMIT {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("请求体过大: {len} 字节，上限 {PUT_BODY_LIMIT} 字节"),
+            ));
+        }
     }
     // 新建：父目录不存在就建（F-42「新建」要能直接落盘，不能要求调用方先 MKCOL）。
     if let Some(parent) = target.parent() {
@@ -518,14 +563,39 @@ async fn write_response(
         .into_body()
         .into_data_stream()
         .map_err(|e| std::io::Error::other(e.to_string()));
-    let mut reader = StreamReader::new(stream);
-    let mut file = tokio::fs::File::create(target)
+    let reader = StreamReader::new(stream);
+    let part = part_path(target);
+    // 建不出临时文件 = 这一层目录不可写：与旧写法（`File::create(target)` 失败）同码同文案。
+    let mut file = tokio::fs::File::create(&part)
         .await
         .map_err(|e| (StatusCode::FORBIDDEN, format!("写入失败: {e}")))?;
-    let written = tokio::io::copy(&mut reader, &mut file)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("写入失败: {e}")))?;
+    // 兜底：`Content-Length` 是调用方自己写的，可缺失也可撒谎（这条路由直接吃 body 流，
+    // 绕过 axum 提取器那一档上限），真正卡住体积的是这里的 `take`。读 `PUT_BODY_LIMIT + 1`
+    // 而不是正好 `PUT_BODY_LIMIT`：正好截断会把"刚好多一点"的写回**当成成功**，用户拿到
+    // 一个被砍掉尾巴的文件 —— 那比直接拒掉更坏。
+    let written = match tokio::io::copy(&mut reader.take(PUT_BODY_LIMIT + 1), &mut file).await {
+        Ok(n) => n,
+        Err(e) => {
+            drop(file);
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("写入失败: {e}")));
+        }
+    };
+    if written > PUT_BODY_LIMIT {
+        drop(file);
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("请求体过大: 超过 {PUT_BODY_LIMIT} 字节"),
+        ));
+    }
     file.flush().await.ok();
+    // Windows 上打开着的文件删不掉（改名也会被占用打扰），先放句柄再改名/清残骸。
+    drop(file);
+    if let Err(e) = tokio::fs::rename(&part, target).await {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err((StatusCode::FORBIDDEN, format!("落盘失败: {e}")));
+    }
 
     Ok(if existed {
         debug!(bytes = written, path = ?target, "WebDAV 覆盖写回");
@@ -837,7 +907,7 @@ mod tests {
         let (state, port, root, share_id) = serve(4120).await;
         // BC 只看得见"开着广播 + 当刻长连接"的设备侧共享项，这里把两个条件都摆齐。
         state.config.lock().shares[0].broadcast_enabled = true;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(crate::ws::EVENT_QUEUE_CAPACITY);
         state.ws.register("dav-peer", tx);
 
         let token = format!("dav-tok-{}", uuid::Uuid::new_v4());
@@ -1096,6 +1166,129 @@ mod tests {
         assert_eq!(hidden, StatusCode::NOT_FOUND);
 
         crate::server::stop_server(&state).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 拼一个 PUT 请求（`dispatch` 之下的这一层直接吃 body 流，测试也直接在函数层调）。
+    fn put_request(body: Body, content_length: Option<u64>) -> Request<Body> {
+        let mut builder = Request::builder().method(Method::PUT).uri("/dav/x/a.txt");
+        if let Some(len) = content_length {
+            builder = builder.header(header::CONTENT_LENGTH, len.to_string());
+        }
+        builder.body(body).unwrap()
+    }
+
+    /// **PUT 的体积上限**：`Content-Length` 说超了就当场拒（413），原文件逐字不动。
+    ///
+    /// 旧写法在这条路由上没有任何上限（上限只挂在 `/push/*`），而这个处理函数直接吃
+    /// `req.into_body().into_data_stream()`，绕过提取器那一档 → 对端可以把共享方磁盘写满。
+    /// 这里 body 是空的、只有声明，所以**不该发生任何真实读写**：既能验证"预检在用声明的
+    /// 长度"，也能验证"被拒的请求一个字节都不落盘"。
+    #[tokio::test]
+    async fn an_over_long_put_is_refused_before_anything_is_written() {
+        let root = fixture_root();
+        let target = root.join("hello.txt");
+        let before = std::fs::read(&target).unwrap();
+
+        let err = write_response(
+            &target,
+            put_request(Body::empty(), Some(PUT_BODY_LIMIT + 1)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            err.1.contains("过大") && err.1.contains("上限"),
+            "拒绝原因要说清为什么、上限是多少: {}",
+            err.1
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), before, "原文件必须逐字不变");
+        assert!(!part_path(&target).exists(), "被拒的写回不该留下临时文件");
+
+        // 边界：正好等于上限的声明要放行（判据是 `>`，别把"等于"也一起拒了）。
+        let fresh = root.join("edge.txt");
+        let resp = write_response(&fresh, put_request(Body::from("ok"), Some(PUT_BODY_LIMIT)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "ok");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// **兜底那一道**：`Content-Length` 可以缺失、也可以撒谎，所以流本身也要有界。
+    ///
+    /// 用的是"没有声明长度、真的往上传超限数据"的流；写超了就整体作废 —— 目标路径上既没有
+    /// 半截文件，也没有临时文件。注意判据必须是"写出 `PUT_BODY_LIMIT` 字节就算超"：写成
+    /// `take(PUT_BODY_LIMIT)` 会把超限的写回**当成成功**并交出被砍掉尾巴的文件，这条用例会挂。
+    #[tokio::test]
+    async fn a_stream_without_content_length_is_capped_too() {
+        let root = fixture_root();
+        let target = root.join("streamed.bin");
+
+        // 懒生成：一次只有一块（1MiB）在内存里，总量 65MiB > 上限。
+        let chunks = (0..65)
+            .map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; 1 << 20])));
+        let body = Body::from_stream(futures_util::stream::iter(chunks));
+
+        let err = write_response(&target, put_request(body, None))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!target.exists(), "超限的写回不能在目标路径上留下任何东西");
+        assert!(
+            !part_path(&target).exists(),
+            "超限的写回必须把临时文件也清掉"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// **覆盖写到一半断流 → 原文件内容不变**（本次修的核心可观察结果）。
+    ///
+    /// 旧写法 `File::create(target)` 在这条路上会当场截断原文件，断在哪里就烂在哪里，还留
+    /// 一个半截文件顶着真名；现在是"写临时文件 → 成功才改名"，失败分支把临时文件删掉。
+    #[tokio::test]
+    async fn an_interrupted_overwrite_leaves_the_original_file_intact() {
+        let root = fixture_root();
+        let target = root.join("hello.txt");
+        let before = std::fs::read(&target).unwrap();
+
+        let body = Body::from_stream(futures_util::stream::iter(vec![
+            Ok(axum::body::Bytes::from_static(b"half of a new file")),
+            Err(std::io::Error::other("对端断开")),
+        ]));
+        let err = write_response(&target, put_request(body, Some(64)))
+            .await
+            .unwrap_err();
+        // 与旧写法同一个状态码与文案（这条不是本次要改的行为）。
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(std::fs::read(&target).unwrap(), before, "原文件必须逐字不变");
+
+        let leftovers: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".orbdrop-part"))
+            .collect();
+        assert!(leftovers.is_empty(), "断流后残留了临时文件: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 失败分支的落点：`write_response` 不覆盖目录（405，与旧写法一致）——
+    /// 顺手钉住"原子改名这一改没把这条判断挪走"。
+    #[tokio::test]
+    async fn a_put_onto_a_directory_is_still_method_not_allowed() {
+        let root = fixture_root();
+        let err = write_response(
+            &root.join("sub"),
+            put_request(Body::from("x"), Some(1)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::METHOD_NOT_ALLOWED);
+        assert!(root.join("sub").is_dir(), "目录必须原样还在");
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

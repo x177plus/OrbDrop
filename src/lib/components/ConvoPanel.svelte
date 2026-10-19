@@ -1,7 +1,7 @@
 <script lang="ts">
   import * as chat from '$lib/stores/chat.svelte';
   import type { ChatItem } from '$lib/stores/chat.svelte';
-  import { getDevices, deviceDotState, threadDotState, deviceShortName } from '$lib/stores/devices.svelte';
+  import { getDevices, deviceById, deviceDotState, threadDotState, deviceRemarkOf, peerShortName } from '$lib/stores/devices.svelte';
   import { getSettings } from '$lib/stores/settings.svelte';
   import { undeliverableText, type PendingGroup, type Undeliverable } from '$lib/types';
   import {
@@ -71,7 +71,7 @@
   const canSend = $derived(thread ? chat.draftHasContent(thread.key) : false);
   /** 最后一条的 id：新消息进来就跳到底（按 id 而不是长度，编辑/替换也算变化）。 */
   const tail = $derived(items.length ? items[items.length - 1].id : '');
-  const openDev = $derived(thread?.mode === 'direct' ? devices.find((d) => d.id === thread.participants[0]) : undefined);
+  const openDev = $derived(thread?.mode === 'direct' ? deviceById(thread.participants[0]) : undefined);
   /**
    * 这个群里**明确拒绝加入**的那些成员（后端 `Group::declined`）：收件人那一排把它们染红，
    * 消息那行小字也改口说「已拒绝加入」。不是群 = 空表。
@@ -226,6 +226,8 @@
    *
    * 同一个人连着说几句只在头一条上面标一次（原型也是这么分组的，一屏里就不会满眼都是名字）。
    * 比的是**设备 id**：名字会变，拿名字比会把改过名的同一个人当成两个人。
+   *
+   * 显示名**备注优先**（F-101）：有备注就是备注本身，没有才用消息里那个对端自报的名字。
    */
   function speakerOf(i: number): { cls: string; initial: string; name: string } | null {
     if (thread?.mode !== 'group') return null;
@@ -233,7 +235,7 @@
     if (!item || item.fromMe || item.kind !== 'text' || !('from' in item)) return null;
     const prev = items[i - 1];
     if (prev && !prev.fromMe && prev.kind === 'text' && 'from' in prev && prev.from === item.from) return null;
-    const name = item.fromName.trim() || chat.deviceNameOf(item.from);
+    const name = deviceRemarkOf(item.from) ?? (item.fromName.trim() || chat.deviceNameOf(item.from));
     return { cls: `sp-${chat.speakerIndex(item.from)}`, initial: (name.charAt(0) || '?').toUpperCase(), name };
   }
 
@@ -610,16 +612,17 @@
         <span class="recip-label">{thread.mode === 'broadcast' ? '群发至' : '发送给'}</span>
         <div class="recip-chips">
           {#each thread.participants as peerId (peerId)}
-            {@const dev = devices.find((d) => d.id === peerId)}
+            {@const dev = deviceById(peerId)}
             <!-- 群成员不一定还在本机设备表里（被解除了配对、或只是没再加回来）：那时用名册上
                  随群带来的名字，别把一串设备 id 摆给用户看。一对一那台的设备行也可能已经不在
-                 表里了（解绑又离线、会话还留着）：名字退回记录里那个（`deviceNameOf`）。 -->
+                 可见那份里（解绑又离线、会话还留着）：所以查**两份表**（`deviceById`）——
+                 名字与状态点都要它，退回设备 id 只该是最后手段。 -->
             {@const rosterName = thread.mode === 'group' ? chat.groupOf(thread.id)?.members.find((m) => m.id === peerId)?.name.trim() : ''}
             <!-- 这一栏用的是**短名**（F-101）：有备注就只写备注，**不挂设备名** —— 一排胶囊
                  （群发/群聊常常好几台）里装不下「备注(设备名)」，用户起备注本来就是为了少看那
                  串机器名。头像字跟着同一个 label 走；名字长了悬停看全（`title`）。
                  本机只有**局域网设备列表**那一行是「备注(设备名)」（`deviceDisplayName`）。 -->
-            {@const label = dev ? deviceShortName(dev) : rosterName || chat.deviceNameOf(peerId)}
+            {@const label = peerShortName(peerId, rosterName || chat.deviceNameOf(peerId))}
             <!-- 明确拒绝加入这个群的那几台：整枚胶囊染红 + 悬停说明**为什么** —— 它们看着一切
                  正常（链路是通的、点名也在名册里），不说出来用户根本不知道这条消息它收不到。
                  旁边那颗状态点照旧画**链路**（绿 = 长连接…）：那是"拨得动它吗"，与"它收不收

@@ -288,6 +288,35 @@ export async function insertImages(el: HTMLElement, files: readonly File[], onEr
 }
 
 /**
+ * 把**系统选择器选中的那几张图**插到光标处（安卓那颗「＋」→「图片」那条路，F-118）。
+ *
+ * 与粘贴那条路的区别只在"字节从哪来"：粘贴给我们的是 `File` / `content://`，这一条给的是
+ * **原生已经拷好的本机路径**（见 `pickFiles`），所以不必再落盘一次 —— 只把预览读出来
+ * （`readImageDataUrl`，与草稿重建用的是同一个读法），做出一段与粘贴完全同形的图片段。
+ * 之后的事一条都不用改：发送顺序、对端的图、草稿里那张缩略图都走同一份模型。
+ *
+ * 读不出预览的那一张（超过预览上限的大图、扩展名不在名单里的）报一句原话并跳过 ——
+ * 与粘贴那条路的失败口径一致。
+ */
+export async function insertImagePicks(
+  el: HTMLElement,
+  picks: readonly { path: string; name: string; size: number }[],
+  onError: (msg: string) => void,
+): Promise<boolean> {
+  let ok = false;
+  for (const p of picks) {
+    try {
+      const url = await readImageDataUrl(p.path);
+      insertChip(el, { kind: 'image', path: p.path, url, name: p.name, size: p.size });
+      ok = true;
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  }
+  return ok;
+}
+
+/**
  * 认领浏览器**自己塞进输入区**的图（`input` 事件那条路）。
  *
  * 为什么两套路：桌面端 WebView 的 `paste` 事件一般会连字节一起给我们（上面那条路），但
@@ -310,6 +339,13 @@ export async function adoptDomImages(el: HTMLElement, onError: (msg: string) => 
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
       img.remove();
+    } finally {
+      // 认领这一步会给新 chip **另 mint 一条** `blob:` URL（见 `stageSrc`）；原来那个 `<img>`
+      // （无论成功被换掉、还是失败被摘掉）此刻已经不在 DOM 里 —— 它那条 `blob:` URL 再没人读，
+      // 不 revoke 就是一份永不释放的浏览器内存。放在 `finally`、且在 `replaceWith`/`remove`
+      // **之后**才 revoke：这一刻原图确已不在任何 chip/预览里，不会把正在显示的图弄裂。
+      // `data:` / `content://` 不是对象 URL，revoke 无意义也不该收。
+      if (src.startsWith('blob:')) URL.revokeObjectURL(src);
     }
   }
   return ok;

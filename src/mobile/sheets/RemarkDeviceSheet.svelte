@@ -8,10 +8,10 @@
   // 两边的字段与文案要对着核（改一处就核另一处）。
   let { peerId, onClose }: { peerId: string; onClose: () => void } = $props();
 
-  const d = $derived(devices.getDevices().find((x) => x.id === peerId));
+  const d = $derived(devices.deviceById(peerId));
 
   // 初值只取一次：输入框里是"用户正在改的东西"，后端事件随后再刷新设备表也不该把它冲掉。
-  const open = devices.getDevices().find((x) => x.id === peerId);
+  const open = devices.deviceById(peerId);
   /** 对端**自己的设备名**（不含备注）：提示里说的是这台机器，不是它的显示名。 */
   const rawName = open?.name ?? "";
   /** 打开那一刻后端里存着的备注（'' = 没备注）：用它决定画不画「清除备注」。 */

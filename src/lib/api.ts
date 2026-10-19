@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, ChatFileMsg, ChatSnapshot, InboxEntry, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState } from './types';
+import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, PickedFile, InstalledApp, ChatFileMsg, ChatSnapshot, InboxEntry, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState } from './types';
 import type { ScreenMetrics, ScreenRect } from './orbLayout';
 
 // Share management
@@ -65,6 +65,16 @@ export function localAddresses(): Promise<{ primary: string | null; all: string[
 
 export function listDevices(): Promise<PeerDevice[]> {
   return invoke('list_devices');
+}
+
+/**
+ * 本机给设备起的备注（F-101，`设备 id → 备注`），整份读一次。
+ *
+ * 为什么单独取这一份：备注**不跟着设备行走** —— 没有那一行的设备（未配对、也不在地址簿，
+ * 重启即忘）在会话列表里照样要显示成用户起的备注，而 `list_devices` 里根本没有它的行。
+ */
+export function deviceRemarks(): Promise<Record<string, string>> {
+  return invoke('list_device_remarks');
 }
 
 // 中转（F-106 / S-09）：本机替别人中转的**累计流量**与连接数 —— 设置里显示"替别人搬了多少"。
@@ -217,9 +227,25 @@ export function pathPicks(paths: string[]): Promise<LocalPick[]> {
  * 推送本机一批文件/目录给**一台或多台**设备；返回整批快照。
  * 一次操作只开一次文件选择框：多选的文件合并成**每台一条**推送（对端只弹一张卡、只同意一次），
  * 各台独立推进 —— 谁成谁败、还差几台，看 `push://batch` 事件推进的那张卡片。
+ *
+ * `names` = 与 `paths` **逐位对齐**的覆盖名（F-119，空串 = 这一项不改名），可以整个省掉。
+ * 它只换"对端落盘用的那个名字"，本机读字节仍走 `paths` —— 「发送应用」就是靠它把设备上那份
+ * `/data/app/…/base.apk` 发成 `应用名_versionName(versionCode)_包名.apk`
+ * （见 `transfer::manifest_for_named_paths`）。
  */
-export function pushPaths(paths: string[], peerIds: string[], at?: number): Promise<PushBatch> {
-  return invoke('push_paths', { paths, peerIds, at: at ?? null });
+export function pushPaths(paths: string[], peerIds: string[], at?: number, names?: string[]): Promise<PushBatch> {
+  return invoke('push_paths', { paths, peerIds, names: names ?? null, at: at ?? null });
+}
+
+/**
+ * 发送侧那张卡的**初值**：界面挂载时拉一次。
+ *
+ * `push://batch` 只是"变化"，而重启之后那些**恢复出来的批次**只躺在后端（后端一启动就把
+ * 没走完的推送捡回来了，见 `push_job::restore_outbound`）—— 不拉这一次，用户会看到
+ * "没传完的推送不见了"，明明对端还在来要块。与 `chat_snapshot` 同一个路数：初值靠拉、变化靠推。
+ */
+export function pushBatches(): Promise<PushBatch[]> {
+  return invoke('push_batches');
 }
 
 /**
@@ -246,6 +272,43 @@ export function readImageDataUrl(path: string): Promise<string> {
  */
 export function resolveImageUri(uri: string): Promise<{ path: string; size: number }> {
   return invoke('resolve_image_uri', { uri });
+}
+
+/**
+ * 安卓：开一次**系统选择器**（会话里那颗「＋」），把选中的几项拷成应用缓存里的暂存文件。
+ *
+ * `kind = 'image'` 走系统的照片选择器（Android 13 起；老系统退回「文件」应用），`'file'` 走
+ * 通用的文件选择器，两条都**不要任何存储权限** —— 系统把选中那几个 URI 的读授权随结果一起给。
+ * 返回的 `path` 已经是本机真实路径（原生拷过一道），可以直接进 `pushPaths` / 图片消息。
+ *
+ * **用户取消回空数组**（不是异常）：界面据此什么都不做。
+ */
+export function pickFiles(kind: 'image' | 'file'): Promise<PickedFile[]> {
+  return invoke('pick_files', { kind });
+}
+
+/**
+ * 安卓：列出设备上**有桌面图标**的应用（F-119，会话里那颗「＋」的「应用」那一项）。
+ *
+ * 每一项带着自己的 `base.apk` 路径与**后端拼好并净化过的落盘名**（`fileName`）—— 这份列表
+ * 就是"发送应用"的全部输入，界面不自己拼名字（净化判据在后端，与接收侧落盘那道闸门同一份）。
+ *
+ * 读别人的 APK 不需要 root、不需要任何权限（SELinux 对 apk 文件是放行的）；但要在清单里声明
+ * `<queries>`（MAIN + LAUNCHER）—— 少了它这张表是空的，见 `AndroidManifest.xml`。
+ */
+export function listInstalledApps(): Promise<InstalledApp[]> {
+  return invoke('list_installed_apps');
+}
+
+/**
+ * 安卓：取**一个**应用的图标（`data:image/png;base64,…`，F-119）。
+ *
+ * 与列表分开、按行按需取：一百多个图标一起画完再一起回来会把"打开这张表"变成一次等待，而图标
+ * 是看得见才需要的东西（表先出来、图标随后补上）。缓存与节流在 `src/mobile/appIcons.ts`；
+ * 失败（正在卸载、图标坏了）会 reject，那一行退回首字母。
+ */
+export function appIcon(packageName: string): Promise<string> {
+  return invoke('app_icon', { packageName });
 }
 
 /** 发送方取消一整批推送（各台各撤一条）。 */
@@ -424,18 +487,24 @@ export function groupLeave(id: string): Promise<ChatSnapshot> {
   return invoke('group_leave', { id });
 }
 
-// BeyondCompare 比较（本机 / 长连接设备的共享项）。四个命令都返回最新 BcStatus，
-// 只有 bc_compare 返回 null（启动失败时 reject，错误为字符串）。
-export function bcStatus(): Promise<BcStatus> {
-  return invoke('bc_status');
+// BeyondCompare（本机 / 长连接设备的共享项）。**左侧槽只有一处存储**：BC 自己的
+// `SavedFileLeft`/`SavedFolderLeft` 注册表值 —— 资源管理器右键那套「选择左侧 / 对比」用的就是
+// 它，所以这三个命令读写的是同一处：谁放左侧谁覆盖它（两个值名都写，见 `bc.rs::write_slot`）。
+// 都返回最新 BcStatus，只有「与左侧比对」返回 null（启动失败时 reject，错误为字符串）。
+//
+// `slotFor`：右键菜单里那一项是文件还是文件夹 —— BC 按类型取槽，我们也按类型取，
+// 好让菜单里那行与真正要比的那一档一致（不传 = 没有上下文，文件夹槽优先）。
+export function bcStatus(slotFor?: 'file' | 'folder'): Promise<BcStatus> {
+  return invoke('bc_status', { slotFor: slotFor ?? null });
 }
 
-export function bcSetSide(side: 'left' | 'right', target: BcTarget): Promise<BcStatus> {
-  return invoke('bc_set_side', { side, target });
+/** 放入左侧槽（覆盖原有的那一项；两个值名都写）。 */
+export function bcSetLeft(target: BcTarget): Promise<BcStatus> {
+  return invoke('bc_set_left', { target });
 }
 
-export function bcClearSide(side: 'left' | 'right'): Promise<BcStatus> {
-  return invoke('bc_clear_side', { side });
+export function bcCompareWithLeft(target: BcTarget): Promise<null> {
+  return invoke('bc_compare_with_left', { target });
 }
 
 export function bcCompare(a: BcTarget, b: BcTarget): Promise<null> {
@@ -578,7 +647,8 @@ export function orbSaveCenter(x: number, y: number): Promise<void> {
 }
 
 /**
- * 告诉托盘：此刻**有没有事等处理**（未读消息 / 群邀请 / 待确认通知 / 在途推送 / 发现新版本）。
+ * 告诉托盘：此刻**有没有事等处理**（未读消息 / 群邀请 / 待确认通知 / 发现新版本 /
+ * 发送侧那张"有台没成"的卡 —— 本机在途的推送不算：那是自己在做事，不是有事等你）。
  *
  * 有事那一档托盘图标会挂一颗红点并闪动，左键单击则落到"该看的那一件事"上
  * （`orb://tray_alert` 事件，见 `App.svelte`）。这里传的布尔与悬浮球左上角那颗角标是**同一个

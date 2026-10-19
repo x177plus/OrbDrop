@@ -69,16 +69,17 @@
    */
   let autoBroadcastNew = $state(false);
 /**
-   * 允许本机替别人中转（后端 `AppSettings.allowRelay` + `groupRelay`，默认关）。
+   * 允许本机替别人中转（后端 `AppSettings.allowRelay` + `groupRelay`，**默认开**）。
    *
    * **一个开关管住"本机替别人做事"的两条路**：① 替其它设备盲转字节（两台设备单播不通但
    * 都连得上本机时，本机替它们搬字节，两端 TLS 端到端不变、本机看不到内容）；② 替够不着的
-   * 同群成员转一份群消息（最多 3 跳）。代价都是本机的上行带宽 —— 所以默认关，由用户自己选。
+   * 同群成员转一份群消息（最多 3 跳）。代价都是本机的上行带宽 —— 但**首次启动就是开的**
+   * （见后端 `Config::default`）：装上就能当锚点，不必先翻设置；不想出这笔开销再关掉。
    *
    * 「记住并自动复用跨网段中转」（`relayMemory`）不在这颗开关里：它不替别人做事、也不向对端
    * 暴露本机的新能力，只是本机自己的选路提示，**默认开、不给控制**（保存时一律写成开）。
    */
-  let relay = $state(false);
+  let relay = $state(true);
   /** 本机替别人中转的累计流量（`relay_traffic`）：只读的用量记录，打开面板时现拉。 */
   let traffic = $state<RelayTraffic | null>(null);
   /**
@@ -447,7 +448,8 @@
         这一关，少了它本机就成了给任意局域网地址开隧道的工具）。<br />
         <strong>② 替群聊中转消息</strong>：群里两个成员互相够不着时（跨网段、只有本机跟它们都
         连得上），本机替它们把消息转一份，最多 3 跳，同一份转过一次就不再转（不来回绕圈）。<br />
-        <strong>默认关闭</strong>：两条路都占本机上行带宽 —— 这笔开销该不该出由你定；对端之间
+        <strong>默认打开</strong>：两条路都占本机上行带宽 —— 这笔开销该不该出由你定，
+        首次启动就是开的，不想出这笔开销就关掉；对端之间
         直连得了时，这个开关开不开都一样。关闭会<strong>立刻收掉</strong>本机正在替别人转的每一条。
       </Hint></label>
       <div style="display:flex; align-items:center; justify-content:space-between;">

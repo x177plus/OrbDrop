@@ -13,3 +13,16 @@ vite.config.ts.timestamp-*
 scripts/release.local.json
 # 本机发布 token（GITHUB_TOKEN / GITEE_TOKEN）—— 远端模式要它调 API，泄露 = 别人能改发行版
 scripts/release.local.env
+
+# 前端构建产物：`npm run build` → dist/、`npm run build:mobile` → dist-mobile/（见 vite.config.js；
+# Tauri 的 beforeBuildCommand 每次构建都会重建，不进仓库）
+/dist
+/dist-mobile
+
+# 根目录的临时截图：全仓没有任何文档或脚本引用它
+/.shot.png
+
+# 本机演练用的产物缓存：镜像台（scripts/dev-mirror.mjs）直接伺服这个目录。
+# 正式产物在 GitHub/Gitee 的 Release 附件里，不进 git（十几 MB × 每个版本）—— 这条原先是发布仓
+# 单独一个 .gitignore 承担的，单仓化之后归到这里。
+/assets/

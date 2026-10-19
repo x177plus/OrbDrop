@@ -265,6 +265,7 @@ fn on_left_up(app: &AppHandle) {
         // 与"第二份进程被启动"同一条路（`lib.rs` 的单实例分支）：界面收到就展开面板；
         // 面板已经开着时那次展开是空操作（`expand` 一进门就早退）。
         info!("托盘：左键双击 → 展开面板");
+        bring_orb_back(app);
         if let Err(e) = app.emit(ORB_SHOW, ()) {
             warn!("托盘双击的展开事件发不出去: {e}");
         }
@@ -275,9 +276,30 @@ fn on_left_up(app: &AppHandle) {
     // （这正是这次改动要的：左键从"弹菜单"变成"单击看事、双击开面板"）。
     if ALERT.load(Ordering::SeqCst) {
         info!("托盘：左键单击 → 界面落到该看的那件事上");
+        bring_orb_back(app);
         if let Err(e) = app.emit(TRAY_ALERT, ()) {
             warn!("托盘单击的事件发不出去: {e}");
         }
+    }
+}
+
+/// 托盘左键那一档先把窗口**真的**叫回来（置顶 / 显示 / 不最小化 / 前台），再谈"打开哪个视图"。
+///
+/// 托盘图标是唯一"进程还在台上就一定看得见"的东西（它由资源管理器画，跟本进程状态无关），
+/// 所以它那一下必须能救回窗口。只往前端发一条事件是不够的：
+///
+/// - 前端若正卡在一次展开里（`opening`），那条 `orb://show` 一到就是空操作（`expand` 一进门早退）；
+/// - "窗口被系统藏起来 / 被最小化 / 被搬出所有显示器"这些事，前端根本不知道，
+///   它手上那条 `orb://show` 只能让一个看不见的窗口去展开。
+///
+/// 失败不报错、也不拦事件：叫不回来（比如句柄失效）时那条事件照发，至少还能救一种情况。
+fn bring_orb_back(app: &AppHandle) {
+    let Some(win) = app.get_webview_window("main") else {
+        warn!("托盘：未找到 main 窗口，无法叫回台面");
+        return;
+    };
+    if let Err(e) = crate::orb_window::raise(&win) {
+        warn!("托盘叫回悬浮球窗口失败: {e}");
     }
 }
 

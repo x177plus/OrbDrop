@@ -1,5 +1,6 @@
 pub mod download;
 pub mod push_job;
+pub mod push_out;
 pub mod resume;
 pub mod stream;
 pub mod stream_send;
@@ -81,15 +82,29 @@ pub struct PushSource {
 ///
 /// `name` 只剩下显示用途（通知/卡片里"推的是什么"）：单源 = 它自己，
 /// 多源 = 这批源的共同父目录名，跨目录/跨盘取不到就用「N 项」。
-pub async fn manifest_for_paths(paths: &[PathBuf]) -> Result<PushSource, String> {
-    if paths.is_empty() {
+///
+/// 每项可以带一个**覆盖名**（`Option<String>`，F-119）：清单里写什么名字、本机从哪条路径
+/// 读字节，本来就是两件事（`files` 是"告诉对端的样子"，`sources` 是"本机的翻译表"）——
+/// 覆盖名只是把前者换成调用方给的串，**源路径一个字节都不动**。第一个用它的场合是
+/// "发送应用"：源是设备上某个 `/data/app/…/base.apk`（只读、不可能改名，也不可能拷一份
+/// 出来），而对端看到的应当是 `应用名_versionName(versionCode)_包名.apk`（见
+/// [`resume::apk_file_name`]）。
+///
+/// 覆盖名一律先过 [`resume::sanitize_file_name`]：它是**别的应用给的字符串**，而对端落盘
+/// 那关遇到非法字符是整次接收判失败（理由见那个函数自己）。净化后为空则退回源自己的名字。
+pub async fn manifest_for_named_paths(items: &[(PathBuf, Option<String>)]) -> Result<PushSource, String> {
+    if items.is_empty() {
         return Err("没有可推送的文件".into());
     }
 
-    let name = if paths.len() == 1 {
-        file_name_of(&paths[0])
+    let name = if items.len() == 1 {
+        // 单源：清单名**就是**那条路径（见 `is_dir` 那段），所以覆盖名要在这里就给出去 ——
+        // 对端"只认名字与大小"那条单文件路拿的正是它。
+        let (path, rename) = &items[0];
+        shown_name_of(path, rename.as_deref())
     } else {
-        common_parent_name(paths).unwrap_or_else(|| format!("{} 项", paths.len()))
+        common_parent_name(&items.iter().map(|(p, _)| p).collect::<Vec<_>>())
+            .unwrap_or_else(|| format!("{} 项", items.len()))
     };
 
     let mut files: Vec<FileEntry> = Vec::new();
@@ -101,8 +116,10 @@ pub async fn manifest_for_paths(paths: &[PathBuf]) -> Result<PushSource, String>
     // 算一次：`data_dir()` 要读环境变量，别在走查里每个文件项都问一遍。
     let own_data_dir = crate::config::data_dir();
 
-    for path in paths {
+    for (path, rename) in items {
         let base = file_name_of(path);
+        // 下面这几道闸门看的是**源自己**的名字与路径（要读的就是它），覆盖名不参与判定 ——
+        // 覆盖名只决定"对端看到什么"，不该因为它是另一个字符串就放行一个本来不能推的源。
         // 顶层源是用户**明确点的**：链接/系统目录/自家数据目录一律**当场报错**，不静默跳过 ——
         // 静默跳到最后一个文件都不剩，用户只会看到一句"没有可推送的文件"，根本不知道自己
         // 做错了什么。（走查里遇到的那些才跳过 + 计数：那是清单少一项，不是选错了源。）
@@ -126,16 +143,18 @@ pub async fn manifest_for_paths(paths: &[PathBuf]) -> Result<PushSource, String>
         }
         // 同名去重：`C:\a\报告.txt` 与 `D:\b\报告.txt` 不能在清单里撞成同一条路径
         // （Windows 的文件名比较本来就大小写不敏感，比对时照此办理）。
-        let mut prefix = base.clone();
+        // 去重比的是**对端看到的名字**：覆盖名（下面 `shown`）才是写进清单的那一个。
+        let shown = shown_name_of(path, rename.as_deref());
+        let mut prefix = shown.clone();
         let mut n = 2;
         while used.iter().any(|u| u.eq_ignore_ascii_case(&prefix)) {
-            prefix = dedupe_name(&base, n);
+            prefix = dedupe_name(&shown, n);
             n += 1;
         }
         used.push(prefix.clone());
 
         if meta.is_file() {
-            single_file = paths.len() == 1;
+            single_file = items.len() == 1;
             files.push(FileEntry {
                 path: prefix.clone(),
                 size: meta.len(),
@@ -175,9 +194,28 @@ pub async fn manifest_for_paths(paths: &[PathBuf]) -> Result<PushSource, String>
         // 单文件推送没有清单可言（对端只有一条名字，见 `spawn_download`）——
         // 这就是 `is_dir` 的真正含义：**清单是否权威**。
         is_dir: !single_file,
-        count: paths.len(),
+        count: items.len(),
         skipped,
     })
+}
+
+/// 没有覆盖名的那条路（桌面端选择框、拖进会话、镜像……语义见
+/// [`manifest_for_named_paths`]）。
+pub async fn manifest_for_paths(paths: &[PathBuf]) -> Result<PushSource, String> {
+    let items: Vec<(PathBuf, Option<String>)> =
+        paths.iter().map(|p| (p.clone(), None)).collect();
+    manifest_for_named_paths(&items).await
+}
+
+/// 一项在清单里叫什么：有覆盖名就用它（先净化），没有就是源自己的名字。
+///
+/// 净化后为空（名字整份都是非法字符）也算"没有覆盖名"—— 空名字不是名字，退回源名至少
+/// 还能落到盘上，而不是在清单里留一条谁都打不开的路径。
+fn shown_name_of(path: &Path, rename: Option<&str>) -> String {
+    match rename.map(resume::sanitize_file_name) {
+        Some(shown) if !shown.is_empty() => shown,
+        _ => file_name_of(path),
+    }
 }
 
 pub(crate) fn file_name_of(path: &Path) -> String {
@@ -196,7 +234,7 @@ fn dedupe_name(base: &str, n: usize) -> String {
 }
 
 /// 这批路径的共同父目录名（都同一个父目录才算；跨盘/跨目录返回 None）。
-fn common_parent_name(paths: &[PathBuf]) -> Option<String> {
+fn common_parent_name(paths: &[&PathBuf]) -> Option<String> {
     let first = paths.first()?.parent()?;
     if paths.iter().skip(1).any(|p| p.parent() != Some(first)) {
         return None;
@@ -317,12 +355,37 @@ async fn collect_dir_manifest(dir: &Path) -> Result<(Vec<FileEntry>, u64, usize)
 /// 交错着一次发出去"那条路会点名给它（见 `chat::send_text` 的同名参数）：接收方那条文件消息
 /// 的 `at` 就是它 —— 不带过去的话，对端只能拿"邀请到达的那一刻"当位置，夹在前后两段文字
 /// 中间的那张图就会掉到后面去。不点名 = 当场取现在。
+///
+/// `names` = 与 `paths` **逐位对齐**的覆盖名（F-119，空串 = 这一项不改名），可以整个省掉。
+/// 它只改"对端看到的那个名字"，本机读字节仍走 `paths` 那一条 —— 见
+/// [`manifest_for_named_paths`] 那段。唯一的调用方是安卓那颗「＋」的「应用」那一项：源是
+/// 设备上某个 `/data/app/…/base.apk`，而它落盘后该叫
+/// `应用名_versionName(versionCode)_包名.apk`。
 pub async fn push_paths(
     state: Arc<AppState>,
     paths: Vec<String>,
     peer_ids: Vec<String>,
+    names: Option<Vec<String>>,
     at: Option<u64>,
 ) -> Result<push_job::BatchView, String> {
+    // 逐位对齐是**调用方的契约**：长度对不上说明界面把两条表拼错了，与其按错位的名字发出去
+    // （对端落盘的文件名全是别人的），不如当场拒绝。
+    let names = names.unwrap_or_default();
+    if !names.is_empty() && names.len() != paths.len() {
+        return Err(format!(
+            "改名表与文件数对不上（内部错误）：{} 个名字 vs {} 个文件",
+            names.len(),
+            paths.len()
+        ));
+    }
+    let items: Vec<(PathBuf, Option<String>)> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let rename = names.get(i).filter(|n| !n.is_empty()).cloned();
+            (PathBuf::from(p), rename)
+        })
+        .collect();
     let at = at.unwrap_or_else(crate::chat::now_ms);
     // 同一台设备勾两次只发一条（保持勾选顺序）。
     let mut ids: Vec<String> = Vec::new();
@@ -335,8 +398,8 @@ pub async fn push_paths(
         return Err("没有选择目标设备".into());
     }
 
-    let roots: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-    let source = manifest_for_paths(&roots).await?;
+    let roots: Vec<PathBuf> = items.iter().map(|(p, _)| p.clone()).collect();
+    let source = manifest_for_named_paths(&items).await?;
     if source.files.is_empty() {
         return Err("没有可推送的文件".into());
     }
@@ -382,7 +445,7 @@ pub async fn push_paths(
             continue;
         }
         let invite_id = uuid::Uuid::new_v4().to_string();
-        state.push.insert_job(PushJob::new(
+        let job = PushJob::new(
             invite_id.clone(),
             batch_id.clone(),
             peer.id.clone(),
@@ -391,7 +454,12 @@ pub async fn push_paths(
             source.is_dir,
             source.sources.clone(),
             peer.paired,
-        ));
+        );
+        // **这条从这一刻起就该被接手**：先落盘再进内存（`accepted = false` —— 等对面真的开始拉，
+        // 由 `update_status` 升级成 `true`，见 `push_out::OutJob::accepted`）。
+        // 一次发送只在"建"与"对面开始拉"这两个时刻动盘，进度不写。
+        state.push.out.save_job(push_job::out_job_of(&job, false));
+        state.push.insert_job(job);
         targets.push(push_job::BatchTarget {
             peer_id: peer.id.clone(),
             peer_name: peer.name.clone(),
@@ -414,7 +482,7 @@ pub async fn push_paths(
         });
     }
 
-    let view = state.push.insert_batch(push_job::PushBatch {
+    let batch = push_job::PushBatch {
         id: batch_id.clone(),
         name: source.name.clone(),
         count: source.count,
@@ -422,7 +490,10 @@ pub async fn push_paths(
         per_target_total: source.total,
         targets,
         last_emit: Instant::now(),
-    });
+    };
+    // 卡片也落一份（含**用户这次点的那几项** `roots`：重启后要按它把源监视挂回去）。
+    state.push.out.save_batch(push_job::out_batch_of(&batch, &roots));
+    let view = state.push.insert_batch(batch);
     if let Ok(value) = serde_json::to_value(&view) {
         ws::emit_ui(&state, ws::events::ui::PUSH_BATCH, &value);
     }
@@ -844,7 +915,37 @@ fn reject_shared(state: &AppState, invite: InboundInvite, reason: &str) {
     );
 }
 
-/// 接收方：取消正在进行的接收（保留续传记录，下次可接着拉）。
+/// 老协议那条路写下的**半截文件**的清理入口：算好落盘根，剩下的交给 `push_job::discard_legacy`。
+///
+/// 落盘根用 `resume::landing_dir(<根>, <对端名>, <设置里的那层>)` —— 与下载循环是**同一份输入**
+/// （那次邀请的根 / 对端自报的名字 / 设置），差一样删的就不是它写的那个位置。
+///
+/// `files` = (清单里的相对路径, 总大小)：只有"本机写过、还没写完"的那几个会被删（判据在
+/// `discard_legacy` 里，别在这里改口径）。
+fn discard_legacy_receive(
+    state: &AppState,
+    invite_id: &str,
+    sender_name: &str,
+    root: Option<&std::path::Path>,
+    files: &[(&str, u64)],
+) {
+    let (download_dir, device_subdir) = {
+        let config = state.config.lock();
+        (config.download_dir.clone(), config.device_subdir)
+    };
+    let base = resume::landing_dir(
+        root.unwrap_or(download_dir.as_path()),
+        sender_name,
+        device_subdir,
+    );
+    push_job::discard_legacy(state, invite_id, &base, files, None);
+}
+
+/// 接收方：取消正在进行的接收（**新协议**那份按文件身份存的块位图留着，用户手动重推一次仍省得下）。
+///
+/// **老协议**那条路不一样：它那份记录按**邀请 id** 存、半截文件又写在最终路径上，取消之后这条
+/// 邀请不会再被接手（下面第一行的 `drop_pending`）、重推一次又是新 id —— 留着就是一对
+/// "永远没人清"的记录 + 假文件，所以一并收掉（见 `push_job::discard_legacy`）。
 ///
 /// **但不再自动接着拉**（`resume_pending` 的名单里把它去掉）：自动续传的前提是"用户没喊停"，
 /// 而这里正是用户喊停的那一下 —— 关掉应用是"可能想停"，点这颗按钮是"就是要停"。
@@ -853,6 +954,10 @@ pub fn cancel_receive(state: &AppState, invite_id: &str) {
     let Some(invite) = state.push.take_invite(invite_id) else {
         return;
     };
+    // 老协议那条路的收尾清理（邀请此刻已经在手里，落盘根与清单都从它推）。
+    let manifest = invite.manifest();
+    let sizes: Vec<(&str, u64)> = manifest.iter().map(|f| (f.path.as_str(), f.size)).collect();
+    discard_legacy_receive(state, invite_id, &invite.sender.name, invite.root.as_deref(), &sizes);
     // 下载循环发现邀请没了就会收手；这里替它把话带到发送方 ——
     // 否则对面永远停在"正在传输"，那条 job 没有超时兜底。
     push_job::report_to_sender(
@@ -877,9 +982,10 @@ pub fn cancel_receive(state: &AppState, invite_id: &str) {
         0,
         Some("接收方已取消".into()),
     );
-    // 取消 = "下次接着传"，所以那些还没落盘的进度必须现在就落地（见 `ResumeStore::flush`）。
+    // 取消 = 那条还没传完的推送要能接着传，所以那些还没落盘的进度必须现在就落地
+    // （见 `ResumeStore::flush`）：新协议的块位图靠它，老的续传记录则刚被上面那条清理收掉了。
     state.push.resume.flush();
-    warn!(%invite_id, "receive cancelled; resume record kept");
+    warn!(%invite_id, "receive cancelled; 老协议的半截文件与记录已收掉，块位图留着");
 }
 
 // ---------------------------------------------------------------------------
@@ -908,6 +1014,19 @@ pub fn resume_pending(state: &Arc<AppState>) {
             continue;
         }
         if rec.expired(now) {
+            // 这条待续传任务到此为止。老协议那条路的**半截文件与记录一并收掉**：邀请早就不在
+            // `inbound` 里了（这条任务一直在退避重试、没跑起来），所以落盘根与清单得从这条任务
+            // 自己推 —— 输入与下载循环用的是同一套（那次邀请的根 + 对端名 + 设置），
+            // 见 `discard_legacy_receive`。不这么做，这对记录 + 最终路径上的半截文件就没人清了。
+            let files: Vec<(&str, u64)> =
+                rec.files.iter().map(|f| (f.path.as_str(), f.size)).collect();
+            discard_legacy_receive(
+                state,
+                &rec.invite_id,
+                &rec.sender_name,
+                rec.root.as_deref().map(std::path::Path::new),
+                &files,
+            );
             push_job::fail_download(
                 state,
                 &rec.sender_id,
@@ -1208,6 +1327,82 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    // ── 覆盖名（F-119）：对端看到的名字与本机读字节的路径 ────────────────────
+
+    /// 覆盖名只改**清单里的那一个词**：`files` 写它、`sources` 仍指着源路径。
+    ///
+    /// 这条钉的是"发送应用"那条路的地基：源是设备上某个 `/data/app/…/base.apk`（只读、
+    /// 不会改名、也不会拷一份出来），对端该看到的是应用自己的名字。
+    #[tokio::test]
+    async fn an_override_only_changes_the_name_the_peer_sees() {
+        let dir = temp_dir("rename");
+        let apk = dir.join("base.apk");
+        std::fs::write(&apk, b"fake-apk").unwrap();
+        let shown = "微信_8.0.50(2600)_com.tencent.mm.apk";
+
+        let items = vec![(apk.clone(), Some(shown.to_string()))];
+        let source = manifest_for_named_paths(&items).await.unwrap();
+
+        // 单文件推送：清单名就是落盘名（对端只认名字与大小），所以 `name` 也得是覆盖名 ——
+        // 少了这一处，对端收到的会是一条叫 `base.apk` 的文件。
+        assert_eq!(source.name, shown);
+        assert_eq!(source.files.len(), 1);
+        assert_eq!(source.files[0].path, shown);
+        assert_eq!(source.files[0].size, 8);
+        assert!(!source.is_dir, "单文件推送没有清单可言");
+
+        // 本机那份翻译表仍指着真的那份文件（下载端点每次请求都按它开文件）。
+        let real = source
+            .sources
+            .get(shown)
+            .expect("翻译表要按**清单里的名字**建键");
+        assert_eq!(std::fs::read(real).unwrap(), b"fake-apk");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 脏覆盖名进不来：净化在对端落盘那关是**必需**的（`:` 会让整次接收判失败），
+    /// 净化后为空 = 没有覆盖名，退回源自己的名字。
+    #[tokio::test]
+    async fn dirty_override_names_are_cleaned_or_dropped() {
+        let dir = temp_dir("rename_dirty");
+        let a = dir.join("base.apk");
+        std::fs::write(&a, b"a").unwrap();
+
+        let items = vec![(a.clone(), Some("X: 编辑器.apk".to_string()))];
+        let source = manifest_for_named_paths(&items).await.unwrap();
+        assert_eq!(source.files[0].path, "X_ 编辑器.apk");
+
+        let items = vec![(a.clone(), Some("...".to_string()))];
+        let source = manifest_for_named_paths(&items).await.unwrap();
+        assert_eq!(source.files[0].path, "base.apk", "洗成空串就该退回源名");
+        assert_eq!(source.name, "base.apk");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 两个源带同一个覆盖名时**照样去重**（编号插在扩展名前面）：清单里的路径必须唯一，
+    /// 否则对端两条清单项落到同一个路径上，谁覆盖谁看运气。
+    #[tokio::test]
+    async fn duplicate_override_names_are_deduped() {
+        let dir = temp_dir("rename_dup");
+        let a = dir.join("one.apk");
+        let b = dir.join("two.apk");
+        std::fs::write(&a, b"1").unwrap();
+        std::fs::write(&b, b"2").unwrap();
+
+        let items = vec![
+            (a.clone(), Some("同名.apk".to_string())),
+            (b.clone(), Some("同名.apk".to_string())),
+        ];
+        let source = manifest_for_named_paths(&items).await.unwrap();
+        assert_eq!(source.files[0].path, "同名.apk");
+        assert_eq!(source.files[1].path, "同名 (2).apk");
+        assert_eq!(source.sources.len(), 2);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     // ── 混版本：对面回的那句"拒绝"该怎么说 ────────────────────────────────────
 
     /// `accepted:false` 而且**没有 `pending`** = 对端不认识 `await1`（老版本）。
@@ -1408,7 +1603,7 @@ mod tests {
             target_of("p1", "done", push_job::TargetState::Done),
             target_of("p2", "other-peer", push_job::TargetState::Invited),
         ]));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(crate::ws::EVENT_QUEUE_CAPACITY);
         state.ws.register("p1", tx);
 
         reconcile(&state, "p1");
@@ -1442,7 +1637,7 @@ mod tests {
     #[tokio::test]
     async fn report_falls_back_to_http_when_the_ws_queue_is_dead() {
         let state = reconcile_state();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(crate::ws::EVENT_QUEUE_CAPACITY);
         state.ws.register("p1", tx);
         drop(rx); // 会话还在册，但队列已经没人接
 
@@ -1469,7 +1664,7 @@ mod tests {
         assert_eq!(head.first(), Some(&0x16), "TLS 握手：确实拨到了那个地址，head={head:?}");
 
         // 有活儿干的会话不该走这条路：回执进的是 WS 队列。
-        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::channel(crate::ws::EVENT_QUEUE_CAPACITY);
         state.ws.register("p2", tx2);
         push_job::report_to_sender(
             &state,

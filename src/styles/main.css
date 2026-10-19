@@ -10,7 +10,8 @@
 
   --ok:      oklch(58% 0.16 158);
   --warn:    oklch(62% 0.15 60);
-  /* 「待处理」角标的橙：悬浮球/悬浮框左上那颗待处理数（通知 + 在途推送 + 会话未读 + 群邀请）
+  /* 「待处理」角标的橙：悬浮球/悬浮框左上那颗待处理数（通知 + **发送侧"有台没成"那张卡** +
+     会话未读 + 群邀请；**本机在途的推送卡不算**）
      与 footer 的铃铛角标都用它。
      与 `--warn` 分开：`--warn` 是那支琥珀色，给文案/图标用；直接把它压到 22px 的圆点上
      会发闷（`color-mix(warn 82%, black)` = #975100，看着是棕的）。这一档把明度与饱和度
@@ -789,7 +790,8 @@ input { font: inherit; }
 }
 .icon-btn:hover { background: var(--fg-soft); color: var(--fg); }
 .icon-btn svg { width: 16px; height: 16px; }
-/* 通知铃铛：展开/收起右下角那组通知气泡。角标 = 未处理的通知数（含在途），
+/* 通知铃铛：展开/收起右下角那组通知气泡。角标 = 未处理的通知数（**本机在途的推送卡不算**，
+   见 App 的 `pushPendingCount`），
    与悬浮球左上角那个橙标是同一个数 —— 收起 ≠ 已读，角标照旧挂着，颜色也跟着它（`--notif`）。 */
 .icon-btn.bell { position: relative; }
 .icon-btn.bell.active { background: var(--accent-soft); color: var(--accent); }
@@ -1054,9 +1056,6 @@ input { font: inherit; }
 }
 .d-name .state-chip { flex: none; }
 .d-ip { margin-top: 1px; font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* 「经 X 中转」：与地址同一档小字，但取强调色 —— 它说的是"这条路不是直连"，
-   不该跟 ip:port 长得一模一样而被扫过去。 */
-.d-relay { margin-top: 1px; font-size: var(--fs-xs); color: var(--accent-deep); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* ─── peer browse tab（对端设备标签）───────────────────────────── */
 /* 顶部设备条：来自哪台设备 + 连接状态 + 手动刷新兜底（F-33）。 */

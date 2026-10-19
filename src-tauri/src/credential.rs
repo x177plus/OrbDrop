@@ -428,14 +428,30 @@ pub fn get_peer_fingerprint(id: &str) -> Result<Option<String>> {
 ///
 /// **只该在两处调用**：配对成功时（那是这段关系成立的那一刻）、以及老记录第一次连上时
 /// 补写。绝不能在"指纹对不上"时调用 —— 那正是它要拦下来的情况（对方换机器、或有人在中间）。
-pub fn set_peer_fingerprint(id: &str, fingerprint: &str) -> Result<()> {
+///
+/// 返回值 = **这次到底把指纹写进凭据库了没有**。三种"没写"都回 `false`，而且它们都不该
+/// 被调用方当成"钉住了"：
+/// - 凭据库里没有这台设备（未配对）—— 没有可钉的东西，**但它也不是错误**（探活队列里
+///   的内网设备全是这一档，每 5s 一拍都会走到这儿，见 `state::remember_peer_fingerprint`）；
+/// - 写下去的值与原来一模一样（重写一遍整份 vault 只是白烧盘，token 缓存的失效由
+///   `write_vault` 里的版本号驱动，而指纹不参与那张缓存，所以跳过这次写不会让谁读到旧值）；
+/// - 取不到整份记录（读失败会走 `Err`）。
+///
+/// 为什么要有这个返回值：以前它一律回 `Ok(())`，调用方分不清"写了"与"根本没法写"，
+/// 于是只要对端在回话，日志里就每 5 秒一条"已钉住对端证书指纹" —— 实测一天 7.5 万条、
+/// 19 MB，占当日日志九成，而那台设备压根没被钉住（未配对）。
+pub fn set_peer_fingerprint(id: &str, fingerprint: &str) -> Result<bool> {
     let _guard = STORE_LOCK.lock();
     let mut peers = read_unlocked()?;
     let Some(entry) = peers.get_mut(id) else {
-        return Ok(()); // 没有这台设备（已解除配对）：没有可钉的东西
+        return Ok(false); // 没有这台设备（已解除配对）：没有可钉的东西
     };
+    if entry.fingerprint == fingerprint {
+        return Ok(false); // 值没变：不重写整份文件
+    }
     entry.fingerprint = fingerprint.to_string();
-    save_credentials(&peers)
+    save_credentials(&peers)?;
+    Ok(true)
 }
 
 /// Remove a single peer's token from the stored map.
@@ -729,7 +745,9 @@ mod tests {
     fn fingerprint_round_trips_through_the_vault() {
         set_peer("device-a", "tok-a").unwrap();
         assert_eq!(get_peer_fingerprint("device-a").unwrap(), None);
-        set_peer_fingerprint("device-a", &"c".repeat(64)).unwrap();
+        // 第一次钉：真写了。同一个值再来一次是空操作（不重写整份 vault）。
+        assert!(set_peer_fingerprint("device-a", &"c".repeat(64)).unwrap());
+        assert!(!set_peer_fingerprint("device-a", &"c".repeat(64)).unwrap());
         assert_eq!(
             get_peer_fingerprint("device-a").unwrap(),
             Some("c".repeat(64))
@@ -737,8 +755,8 @@ mod tests {
         // token 没被指纹那次写入碰掉
         assert_eq!(get_peer_token("device-a").unwrap(), Some("tok-a".into()));
 
-        // 没有这台设备（已解除配对）时钉指纹是空操作，不该新建一条
-        set_peer_fingerprint("device-gone", &"d".repeat(64)).unwrap();
+        // 没有这台设备（已解除配对）时钉指纹是空操作，不该新建一条，也不许自称写成功
+        assert!(!set_peer_fingerprint("device-gone", &"d".repeat(64)).unwrap());
         assert!(!has_peer("device-gone"));
 
         // 解除配对把整条（token + 指纹）一起清掉

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
+use futures_util::StreamExt;
 use parking_lot::Mutex;
 use serde::Serialize;
 use tauri::AppHandle;
@@ -110,6 +111,19 @@ pub struct AppState {
     /// 记录的存续本身就是信号：mDNS 缓存里的记录被撤（对端发 TTL=0 告别、或 TTL 过期）
     /// 时这里跟着清掉。只属于本进程（重启即忘），与 `learned` 同一档。
     pub seen: Mutex<HashMap<String, Instant>>,
+    /// 「刚听到过它」：某台设备最近一次**从它那边收到东西**的时刻（会话报文、控制面核实）。
+    ///
+    /// 为什么需要这一档：`online` 原来的唯一判据是"本机拨得动它"（5s 探活成功，或长连接
+    /// 活着）—— 而对端**能拨进来**与**本机拨得回去**是两件事。AP 把同段客户端的单播隔开、
+    /// 两端跨段、只有一条借来的中转链、或者地址簿里那条地址早就过期时，对端明明在会话里
+    /// 说着话（本机一直在收它的消息），却永远画成「离线」：会话列表那一行灰点、设备列表
+    /// 还因为"离线 + 未绑定 + 没被 mDNS 看见"把它整行挡在外面。
+    ///
+    /// 语义边界（[`HEARD_TTL`]）：**"它在网上"**这一条成立，**不**代表"本机够得着它" ——
+    /// 地址/端口仍然只由"观察到的来源地址 + 自报端口"与 mDNS 记录决定，推送与配对的门槛
+    /// 照旧要求地址（`transfer`/`pair` 都自己再判一次），所以这一档不会让本机往死路上发东西。
+    /// 只活在内存里（重启即忘），与 `seen`/`learned` 同一档。
+    pub heard: Mutex<HashMap<String, Instant>>,
     /// 对端**自报的网段**（F-107）：`设备 id → 它自己报的网段列表`（`192.168.1.0/24` 这种）。
     ///
     /// 来源三处，全都是对端自己说的：mDNS TXT 的 `nets`（同段零请求）、`/pair/info` 与
@@ -140,7 +154,42 @@ pub struct AppState {
     /// 两个用途：① 有 TTL，不会永久留在设备表里；② 探活时**跳过**它们 —— 本机跟这些设备
     /// 之间没有任何关系，没必要每 5s 敲一遍（要借中转时按需拨，那一次就验证了可达性）。
     adopted: Mutex<HashMap<String, Instant>>,
+    /// 对端报来的「共享项变更」的**节流**表：`共享项 id → 上次真的向上报的时刻`。
+    ///
+    /// 为什么需要：对端那条路上一次窗口（300ms）里可能装着**几百条**逐文件事件 —— 实测一台
+    /// 机器在共享目录里跑多通道 Gradle 构建，本机一天收到 42 万条、峰值 1300 条/秒。而每一条
+    /// 在这里都会变成一次 Tauri 事件，前端每收到一条就把 `refreshSignal` +1 并重拉根层，
+    /// 于是展开中的每一层树各发一次 HTTP `/tree` 给对端：1300 条/秒 = 一场请求风暴，
+    /// 而对端和本机界面一起被压住。
+    ///
+    /// 口径是**前缘节流**（不是等安静下来再报）：窗口内第一条立刻上报 —— 正常场景（有人往共享
+    /// 目录里丢一个文件）零延迟，这正是要保住的行为；窗口内的重复一律吞掉。**尾沿**那一半
+    /// （一轮爆发结束之后还要再刷一次、别停在中间态）由前端自己的防抖负责（`PeerTab.svelte`）。
+    ///
+    /// 键是**对端给的共享项 id**（未鉴权的载荷）：满了就按时间戳清一遍陈旧的（见
+    /// [`AppState::share_changed_due`]），不给它无界增长的机会。
+    share_changed_at: Mutex<HashMap<String, Instant>>,
 }
+
+/// 同一条共享项的两次上报之间至少隔这么久（见 [`AppState::share_changed_due`]）。
+///
+/// 取 300ms 与发送端那个攒批窗口（`share::watcher` 的 `QUIET_WINDOW`）同一个量级：
+/// 它决定的是"一批能不能合并成一次上报"，比它小就等于不合并，比它大则开始感觉得到延迟。
+const SHARE_CHANGED_THROTTLE: Duration = Duration::from_millis(300);
+
+/// 共享项变更节流表最多记多少个 id（键是**对端给的字串**，见 [`AppState::share_changed_due`]）。
+///
+/// 一台对端真有的共享项是"几十个"量级；256 是给"对端刷 id"那种情况的上界：真刷满了，
+/// 新 id 的变化**一律按窗口内的重复处理**（不上报、也不建表项）—— 宁可少刷一次界面，
+/// 也不让这张表无界长。
+const MAX_SHARE_CHANGED_KEYS: usize = 256;
+
+/// 「刚听到过它」的保留时长（见 [`AppState::heard`]）。
+///
+/// 取 60s = 12 拍 5s 探活：够长，能盖住"消息之间的停顿"（说完一句、隔半分钟再说一句，
+/// 中间那几拍不该把它翻成离线）；够短，早就不在的那一台最迟一分钟就从"在线"落回来
+/// （探活那一刻仍会如实把它标离线 —— 这一档只是"别把会说话的设备画成不在网上"）。
+const HEARD_TTL: Duration = Duration::from_secs(60);
 
 /// 反向记录带进来的设备行的寿命（长于记录 5 分钟一次的刷新间隔）。
 ///
@@ -152,6 +201,48 @@ const ADOPTED_TTL: Duration = Duration::from_secs(900);
 ///
 /// 没有上限时，一次 64MB 的请求体就能往设备表里塞上万行，还得每 5s 逐个探活。
 const MAX_ADOPTED_DEVICES: usize = 64;
+
+/// 设备表里**没有归宿**的行最多留多少。"没有归宿" = 既不在 `config.toml` 的地址簿里、
+/// 也没配对、也没被 `learned`/`adopted` 那两档 TTL 管着，而且此刻既不可达也没被 mDNS 看见。
+///
+/// **这个数不管"互换设备列表"**：对端 `/discover` 报来的表进的是 `learned`（20 秒 TTL，跟着
+/// 担保人刷新），反向路由记录带进来的进 `adopted`（15 分钟 TTL），两者都在判据里被显式排除，
+/// 不由这份预算承担。它要挡的只有一类：**别人能凭一条报文凭空造出来的 id** —— mDNS 公告里一个
+/// 没见过的 id（`upsert_peer`），或中转控制面一次自报核实（`observe_verified_addr`，那条路
+/// 未鉴权）。不加界时，局域网上一台机器换着 id 喊、或换着 id 请求中转，本机就一行行攒：每行
+/// 还要每 5s 探活一次（`PROBE_CONCURRENCY` 是并发上限，不是行的上限），内存与空转一起涨。
+///
+/// 为什么是 256 而不是更大：**真正的成本不是内存**（一行 `PeerDevice` 约 250 字节，256 行 ≈
+/// 64 KB），而是 5s 那一拍探活是 **O(行数)** 的 —— 每台不通的设备最多吃掉 1.5s 的探活超时、
+/// 并发只有 8；而同一拍还负责给**所有**对端补发排队消息（`chat::flush_queued`）与推送对账
+/// （`transfer::reconcile`）。行数上了几百，"一拍"就会被拖到几十秒，那是拿"给所有设备补发消息
+/// 的及时性"换来的。256 已经是一个公司在同一网段的设备量级；真要有几百台跨段、且此刻全都不通
+/// 的设备要同时留着，该做的是**按行退避探活**（长不通的那几行拉长间隔），而不是把这里的数
+/// 继续调大 —— 那件事的代价是"对端回来之后多久被发现"（跨段时 mDNS 看不见它，只能靠探活）。
+///
+/// 淘汰的后果只是把它从**列表**里去掉：它下次公告/请求时重新建行，而这一档本来就只活在内存里
+/// （不落地址簿，重启一样没有它）—— 收掉它只是把重启会做的事提前了，不是丢用户数据。
+/// **不动有归宿的行**：地址簿里的、已配对的、`learned`/`adopted` 管着的、以及此刻在线或
+/// 被 mDNS 看见的，一个都不淘汰 —— 淘汰一个正在网上的设备行就是用户眼里"它没了"。
+const MAX_UNBOOKED_ROWS: usize = 256;
+
+/// 一台设备最多记几条**自报**网段（`/discover`、`/pair/info` 的 `nets`）。
+///
+/// `nets` 是对端说的话，而这段列表会**原样存下来**（`note_peer_nets`）跟着进程活很久。用它的
+/// 地方只有 `cidr_of`（找覆盖它地址的那一条）—— 一台设备有几块网卡就有几条，8 条已经宽到
+/// 离谱。没有上限时，一个回话里塞几十万条就能让这张表涨几十兆。
+const MAX_PEER_NETS: usize = 8;
+
+/// 网段归属这张表最多记几台设备的（键的条数，不是每条的长度）。
+///
+/// 与 [`MAX_UNBOOKED_ROWS`] 同一类问题：键来自"反向路由记录里的设备"（未鉴权的那条路）与
+/// 对端自报，而这张表**没有删除路径**。比行预算高出一档（512 > 256）：行都可能留着的那几台，
+/// 它们的段更该留着 —— 少了段的后果是"这台设备的段算不出来"（`cidr_of` 本来就允许"都不知道
+/// → 退回本机掩码/None"），路由退成设备级，不会把谁的行判错。
+///
+/// 满了就**不再收养新 id**（已有的一个不动），不是淘汰旧的：这里换掉谁都会让一台**还在用的**
+/// 设备丢掉它的段归属，而不收养只是让最新的那台退回"不知道"。
+const MAX_PEER_NET_IDS: usize = 512;
 
 /// 刚失败过的中转方在这么久内排到最后（之后它可能有别的目标还能用，不永久拉黑）。
 pub const FAILED_RELAY_COOLDOWN: Duration = Duration::from_secs(300);
@@ -297,16 +388,35 @@ const LINK_TTL_DAYS: i64 = 30;
 ///
 /// `AppState::new`（凭据库里有、地址簿里没有的已配对行）与 `observe_verified_addr`
 /// （中转控制面核实过的地址）建行时都拿设备 id 顶着名字当占位。这两处之后各有别的路能
-/// 补上真名（mDNS / 会话信封 / [`AppState::fill_peer_name`] / [`AppState::learn_peers`]），
-/// 判据统一在这里：**占位名可以被任何一条更可信的路改写，真名永不**（真名是"本机自己
-/// 知道的"，不该被对端的转述改写）。
+/// 补上真名（mDNS / 会话信封 / [`AppState::note_peer_name`] / [`AppState::learn_peers`]），
+/// 判据统一在这里。
+///
+/// 名字这一格的规矩（2026-10-16 起，见 `docs/p1-implementation.md` §42.六）：
+/// **占位名（空串 / 等于设备 id）任何一条路都能改写**；**真名只有"核实过的自报"能改**
+/// —— [`AppState::note_peer_name`]（探活回话 / 有 token 的会话 / 在它自己的地址上问出来的）
+/// 与 `upsert_peer` 收的 mDNS TXT / 会话信封是同一档，所以"对端改名"跟着走；
+/// **没核实的主张**（经中转送来的路由记录、邀请里的自称）只填占位行
+/// （[`AppState::fill_peer_name`]）。
+///
+/// 用户自己的命名不在这里：那是**备注**（F-101，另一个字段、另一张表），从不被这些路径碰。
 pub(crate) fn name_is_placeholder(name: &str, id: &str) -> bool {
     let n = name.trim();
     n.is_empty() || n == id
 }
 
+/// 刚收到的名字该不该写进设备行（`current` = 现有那份，`incoming` = 这次收到的）。
+///
+/// **只有一条禁令：空名 / 占位名（== id）不许冲掉已有的真名。** 对端某一条报文没带名字
+/// （老版本、或那条报文本来就不带 —— 比如一条只报 id + 端口的控制面请求）时，一次无条件
+/// 覆盖就把用户看得见的名字换成一串设备 id，地址簿落盘的那一份也跟着一起坏。
+/// 真名之间照旧互相覆盖：对端改名走的正是这条路（mDNS TXT、会话信封、配对握手报的都是
+/// 它自己），所以不能反过来把名字冻住 —— 那是另一个 bug。
+pub(crate) fn should_take_name(current: &str, incoming: &str, id: &str) -> bool {
+    !name_is_placeholder(incoming, id) || name_is_placeholder(current, id)
+}
+
 impl AppState {
-    pub fn new(config: Config, config_path: PathBuf) -> Self {
+    pub fn new(mut config: Config, config_path: PathBuf) -> Self {
         // Peers: config address book + paired entries from the credential store.
         // Our own device id is never a peer: two instances sharing one credential
         // store (same machine, one OS user) would otherwise both key the same
@@ -318,6 +428,15 @@ impl AppState {
             .into_iter()
             .filter(|p| p.id != own_id)
             .collect();
+        // 落盘的 `online` **不作为首帧真相**：本机这一趟还一台都没探过，那个值只是"那一行
+        // 被创建时的那一刻"的残留 —— `set_peer_online` 从不回写它（见 `PeerDevice::online`）。
+        // 拿它当真会同时得到两种假象：真不在网的设备顶着"在线"、真在网的设备先画成离线，
+        // 而后者要等第一拍探活才纠正（用户看到的就是"启动后 A 离线、过几秒又在线"）。
+        // 一律从「离线」起步，真相只由**启动即跑的第一拍探活**（`lib.rs` 的探活循环）与
+        // 链路建立（`ws::restore_links_on_startup` / 入站会话）给出 —— 都在毫秒到几百毫秒这一档。
+        for p in peers.iter_mut() {
+            p.online = false;
+        }
         let tokens = crate::credential::load_peers().unwrap_or_default();
         for (id, _) in tokens.iter() {
             if id == &own_id {
@@ -336,6 +455,64 @@ impl AppState {
             } else if let Some(p) = peers.iter_mut().find(|p| &p.id == id) {
                 p.paired = true;
             }
+        }
+
+        // 「以前见过」那一档（`config.known_peers`）：**没有关系**的那些设备也补一行。
+        //
+        // 为什么必须有这一步：未配对、也不在地址簿的设备行只活在内存里（`upsert_peer` 只在
+        // 地址簿里才落盘），重启即忘 —— 那台明明还在会话列表里，却"设备名要等一段时间、
+        // 在线也要等一段时间（两件一起出现）"。补上这一行之后：名字**当场就有**（那一格是
+        // 上次知道的名字），而可达性由**启动即跑的第一拍探活**给（拨得动就直接拨；一条路都
+        // 没有的走"借一次中转"，路线记忆本来也是落盘的）。
+        //
+        // **名字可以旧、状态必须新**：这里一律 `online: false`（与上面那份落盘值同一条规矩），
+        // 真相只由这一趟的证据给。
+        //
+        // 只补"地址簿与凭据库里都没有的 id"：地址簿里已经有那一行就一个字都不动（内存行 >
+        // 地址簿 > 这张表，谁也不能越级覆盖）。顺带清一遍过期的条目（TTL 只在内存里，不值得
+        // 为它单独写一次盘 —— 下次真有变化时落盘的就是清过的那一份）。
+        config.prune_known_peers();
+        let known_rows: Vec<(String, crate::config::KnownPeer)> = config
+            .known_peers
+            .iter()
+            .map(|(id, k)| (id.clone(), k.clone()))
+            .collect();
+        for (id, k) in known_rows {
+            if id == own_id || peers.iter().any(|p| p.id == id) {
+                continue;
+            }
+            peers.push(PeerDevice {
+                id,
+                name: k.name,
+                ip: k.ip,
+                port: k.port,
+                online: false,
+                paired: false,
+                auto_connect: false, paused: false, relay: None,
+            });
+        }
+
+        // 「本机记得上次是怎么够着它的」那一档（设备级链路记忆，F-107 §4.1）也补一行，
+        // **哪怕不知道它叫什么、也不知道它在哪**：名字先拿 id 顶着，靠启动第一拍去借
+        // 那条记得的路（`probe_peer` → `!dialable()` → `ensure_for` → 端点探到 → 名字与
+        // 在线一起回来）。少了这一行，"需要中转的设备"就得**等它自己先开口**才有状态
+        // （它的名字/地址本机都没有，除了这条记忆之外没有别的线索）。
+        //
+        // 只在开着记忆（S-10，默认开）时才会有这些条目 —— 关着就是"每次现开"，那也
+        // 意味着没有可恢复的线索，与设计一致。
+        for (id, link) in config.relay_links.iter() {
+            if id == &own_id || link.via_id.is_empty() || peers.iter().any(|p| &p.id == id) {
+                continue;
+            }
+            peers.push(PeerDevice {
+                id: id.clone(),
+                name: id.clone(),
+                ip: String::new(),
+                port: 0,
+                online: false,
+                paired: false,
+                auto_connect: false, paused: false, relay: None,
+            });
         }
 
         // 「断开」的暂停标记从地址簿读回来（F-16）：它和 `auto_connect` 是同一个意图的
@@ -358,6 +535,33 @@ impl AppState {
             Some(dir) => dir.join("chat.json"),
             None => crate::config::data_dir().join("chat.json"),
         };
+
+        // 占位名（空串 / 等于设备 id）的行：先用**会话记录里那个真名**补上。
+        //
+        // 为什么必须在这一刻做：占位名是"还没有名字"的起步值（`AppState::new` 给"只有凭据、
+        // 地址簿里没有"的行起名就是 id，中转核实建的行也一样），而填它的路此前全是**观察值**
+        // （探活回话 / 它自己发来的报文 / mDNS / 担保人转述）—— 启动那一刻一条都还没发生，
+        // 用户看到的就是"设备列表与会话列表先显示一串 deviceid，过一会儿才变成名字"。
+        // 而这个名字本机**早就知道过**：对端自己发来的消息带着它当时的设备名，落盘在
+        // `chat.json` 里、跨重启还在。没有理由等第二次观察。
+        //
+        // 只补占位名：地址簿里那份真名一个字都不动（那可能是**配对握手**报的、也可能是用户手动
+        // 添加时的观察值）。也**不落盘**：每次启动都从记录里重新取，配置文件里不因此多一份
+        // 会漂移的副本。方法论上它只是"本机已经有过的观察"，所以之后任何一条**核实过的**
+        // 自报名字（探活回话 / 有 token 的会话）都能改写它（`note_peer_name`）—— 记录里的
+        // 名字不会因此变成"改不掉的旧名字"。
+        let chat = crate::chat::ChatStore::with_path(chat_path);
+        {
+            let known = chat.last_inbound_names();
+            for p in peers.iter_mut() {
+                if !name_is_placeholder(&p.name, &p.id) {
+                    continue;
+                }
+                if let Some(name) = known.get(&p.id).filter(|n| !name_is_placeholder(n, &p.id)) {
+                    p.name = name.clone();
+                }
+            }
+        }
         // 群聊（`groups.json`）与它同一个家、同一个理由：都是一个实例自己的用户数据。
         let group_path = match config_path.parent() {
             Some(dir) => dir.join("groups.json"),
@@ -380,7 +584,7 @@ impl AppState {
             drag: crate::drag::DragStore::new(),
             pair: PairStore::new(),
             link: crate::link::LinkStore::new(),
-            chat: crate::chat::ChatStore::with_path(chat_path),
+            chat,
             groups: crate::group::GroupStore::with_path(group_path),
             app_handle: Mutex::new(None),
             watchers: Mutex::new(std::collections::HashMap::new()),
@@ -391,12 +595,14 @@ impl AppState {
             relay_capable: Mutex::new(HashSet::new()),
             relay_attempts: Mutex::new(HashMap::new()),
             seen: Mutex::new(HashMap::new()),
+            heard: Mutex::new(HashMap::new()),
             peer_nets: Mutex::new(HashMap::new()),
             relay_pool: Mutex::new(HashMap::new()),
             direct_streak: Mutex::new(HashMap::new()),
             route_push: Mutex::new(HashMap::new()),
             relay_failed: Mutex::new(HashMap::new()),
             adopted: Mutex::new(HashMap::new()),
+            share_changed_at: Mutex::new(HashMap::new()),
         }
     }
 
@@ -407,27 +613,40 @@ impl AppState {
     /// Upsert a peer into the in-memory list. Persists the address book
     /// entry (config.peers) if the peer is paired or was manually added.
     pub fn upsert_peer(&self, peer: &PeerDevice) {
-        let mut peers = self.peers.lock();
-        if let Some(existing) = peers.iter_mut().find(|p| p.id == peer.id) {
-            existing.name = peer.name.clone();
-            if !peer.ip.is_empty() {
-                existing.ip = peer.ip.clone();
+        let mut created = false;
+        {
+            let mut peers = self.peers.lock();
+            if let Some(existing) = peers.iter_mut().find(|p| p.id == peer.id) {
+                // 名字走 `should_take_name`：空名/占位名不许冲掉真名（见那一条的说明）。
+                if should_take_name(&existing.name, &peer.name, &peer.id) {
+                    existing.name = peer.name.clone();
+                }
+                if !peer.ip.is_empty() {
+                    existing.ip = peer.ip.clone();
+                }
+                if peer.port != 0 {
+                    existing.port = peer.port;
+                }
+                existing.online = existing.online || peer.online;
+                existing.paired = existing.paired || peer.paired;
+            } else {
+                peers.push(peer.clone());
+                created = true;
             }
-            if peer.port != 0 {
-                existing.port = peer.port;
-            }
-            existing.online = existing.online || peer.online;
-            existing.paired = existing.paired || peer.paired;
-        } else {
-            peers.push(peer.clone());
         }
-        drop(peers);
+        // 只有**新行**才过一遍预算：改一行早就存在的不会让表变长，而这一步要读一次凭据库，
+        // mDNS 的重复公告是常事，别让它每拍都花（见 [`MAX_UNBOOKED_ROWS`]）。
+        if created {
+            self.enforce_row_budget();
+        }
 
         // Persist if in the address book.
         let mut config = self.config.lock();
         if config.peers.iter().any(|p| p.id == peer.id) {
             if let Some(p) = config.peers.iter_mut().find(|p| p.id == peer.id) {
-                p.name = peer.name.clone();
+                if should_take_name(&p.name, &peer.name, &peer.id) {
+                    p.name = peer.name.clone();
+                }
                 if !peer.ip.is_empty() {
                     p.ip = peer.ip.clone();
                 }
@@ -438,6 +657,10 @@ impl AppState {
             }
             let _ = crate::config::save_config_at(&self.config_path, &config);
         }
+        drop(config);
+        // 没有关系的那一档（未配对、也不在地址簿）单独记一份：它只活在内存里，
+        // 不记下来重启之后那一行连名字都没有（见 `KnownPeer`）。
+        self.note_known_peer(&peer.id);
         self.emit_devices_changed();
     }
 
@@ -448,11 +671,12 @@ impl AppState {
     /// 于是"添加设备"填的地址会被静默忽略 —— 之后配对学到的地址也是空的，长连接
     /// 永远拨不出去（表现为设备行显示 `:0`）。
     pub fn add_peer_book(&self, peer: PeerDevice) {
+        let peer_id = peer.id.clone();
         {
             let mut peers = self.peers.lock();
             match peers.iter_mut().find(|p| p.id == peer.id) {
                 Some(p) => {
-                    if !peer.name.is_empty() {
+                    if should_take_name(&p.name, &peer.name, &peer.id) {
                         p.name = peer.name.clone();
                     }
                     if !peer.ip.is_empty() {
@@ -470,7 +694,7 @@ impl AppState {
             let mut config = self.config.lock();
             match config.peers.iter_mut().find(|p| p.id == peer.id) {
                 Some(p) => {
-                    if !peer.name.is_empty() {
+                    if should_take_name(&p.name, &peer.name, &peer.id) {
                         p.name = peer.name.clone();
                     }
                     if !peer.ip.is_empty() {
@@ -483,6 +707,8 @@ impl AppState {
                 }
                 None => config.peers.push(peer),
             }
+            // **互斥**：关系接管了这一格，观察记忆那份删掉（两张表永不同时持有一个 id）。
+            config.forget_known_peer(&peer_id);
             let _ = crate::config::save_config_at(&self.config_path, &config);
         }
         self.emit_devices_changed();
@@ -500,6 +726,7 @@ impl AppState {
         if peer_id.is_empty() || ip.is_empty() || port == 0 {
             return;
         }
+        let mut created = false;
         let changed = {
             let mut peers = self.peers.lock();
             match peers.iter_mut().find(|p| p.id == peer_id) {
@@ -528,12 +755,19 @@ impl AppState {
                         paused: false,
                         relay: None,
                     });
+                    created = true;
                     true
                 }
             }
         };
         if !changed {
             return;
+        }
+        // 这条路是**未鉴权**的（`/relay/open` 的自报核实、`/relay/route` 的自报），设备 id
+        // 由请求方给 —— 建出来的行一定要过预算，否则换着 id 请求就能把设备表撑爆
+        // （见 [`MAX_UNBOOKED_ROWS`]）。
+        if created {
+            self.enforce_row_budget();
         }
         // 地址簿里本来就有这一行（配对过 / 手动加的）、只是地址空着：补上就顺手落盘。
         {
@@ -546,20 +780,42 @@ impl AppState {
                 }
             }
         }
+        // 没有关系的那一档也记一份（地址+名字）：它重启即忘，记下来启动才有东西可拨。
+        self.note_known_peer(peer_id);
         self.emit_devices_changed();
     }
 
-    /// 这一行还顶着占位名（见 [`name_is_placeholder`]）的时候，把刚核实到的真名填进去。
+    /// 一台设备**经核实**的自报名字：直接更新（对端改名就跟着走）。
     ///
-    /// 唯一写点为什么需要它：`observe_verified_addr` 建行时拿设备 id 顶着名字，而这类行
-    /// **本机 mDNS 看不见**（跨段，正是它走中转的原因），会话信封与 mDNS 也就都救不了它
-    /// —— 表现就是"设备列表里那台设备显示的是 deviceid"。机会其实一直在手里：这条行有
-    /// 地址、每 5s 被探活敲一次，`/pair/info` 的回话里就带着它的真名（见
-    /// [`probe_identity`]），只是此前没人把它写回设备行。
+    /// "核实过"指这几条路：5s 探活的 `/pair/info` 回话、**有 token 的长连接会话**里的
+    /// `from_name`（会话消息 / 推送邀请）、在它自己的地址上问出来的名字（中转那一跳）。
+    /// 它们与 `upsert_peer` 收的 mDNS TXT / 会话信封是**同一档证据** —— 于是口径统一了：
+    /// **对端最新的自报名字总是生效**。
     ///
-    /// **只填占位行**：真名一旦有了就一个字都不动 —— 那可能是用户手改过的名字，也可能是
-    /// 对端换过名之前本机存下的，都不该被这里的观察值抹掉。
+    /// 为什么可以放开"真名永不覆盖"（那条老规矩守的东西不存在）：设备行的 `name`
+    /// **从来不是用户填的** —— 手动添加（F-11）也只让用户填 IP/端口，名字是问对端
+    /// `/pair/info` 要的；用户自己的命名只走**备注**（F-101，另一个字段、另一张表）。
+    /// 所以这一格没有"用户的东西"可保护，只有"对端以前叫什么" —— 而旧名字赖着不走
+    /// 是真会发生的：手机改名之后，只有 mDNS / HTTP 信封 / 担保人转述能纠正它，而
+    /// "配过对、只走长连接、mDNS 又看不见"那一档（真机上就是跨段的手机）一条都轮不到。
+    pub fn note_peer_name(&self, peer_id: &str, name: &str) {
+        self.merge_peer_name(peer_id, name, true);
+    }
+
+    /// 对端**只是自报**的名字（未核实的那几条：经中转送来的路由记录、配对邀请里的自称）
+    /// 只用来填**占位名**（本机已有的名字一个字都不动）。
+    ///
+    /// 与 [`Self::note_peer_name`] 的分界就是"这份名字我们核过没有"：核实过的当事实更新，
+    /// 声称的只用来补"本机还不知道它叫什么"那一档。
     pub fn fill_peer_name(&self, peer_id: &str, name: &str) {
+        self.merge_peer_name(peer_id, name, false);
+    }
+
+    /// 两条入口共用的那一半：能不能写、写哪儿（内存行 + 地址簿那份）。
+    ///
+    /// 占位名（空串 / 等于设备 id）任何一条路都能改写；**真名只有核实过的那条路能改**
+    /// （`trusted`）—— 这就是上面两条入口唯一的区别。
+    fn merge_peer_name(&self, peer_id: &str, name: &str, trusted: bool) {
         let name = name.trim();
         if name.is_empty() || name == peer_id {
             return;
@@ -568,7 +824,8 @@ impl AppState {
         {
             let mut peers = self.peers.lock();
             if let Some(p) = peers.iter_mut().find(|p| p.id == peer_id) {
-                if name_is_placeholder(&p.name, &p.id) {
+                let take = trusted || name_is_placeholder(&p.name, &p.id);
+                if take && p.name != name {
                     p.name = name.to_string();
                     changed = true;
                 }
@@ -577,18 +834,47 @@ impl AppState {
         if !changed {
             return;
         }
-        // 地址簿里也有这一行（配对过 / 手动加的）就顺手更正它 —— 只占位名那一档，
-        // 免得把用户改过的名字落盘冲成对端自报的。
+        // 地址簿里也有这一行（配对过 / 手动加的）就跟着更新：不然重启之后又回到旧名字
+        // （那份是落盘的，`AppState::new` 直接读它）。空名/占位名不许冲掉真名那条闸
+        // 仍然在 `should_take_name` 里，对两条入口一视同仁。
         {
             let mut config = self.config.lock();
             if let Some(p) = config.peers.iter_mut().find(|p| p.id == peer_id) {
-                if name_is_placeholder(&p.name, &p.id) {
+                if should_take_name(&p.name, name, &p.id) {
                     p.name = name.to_string();
                     let _ = crate::config::save_config_at(&self.config_path, &config);
                 }
             }
         }
+        // 没有关系的那一档也记一份（`config.known_peers`）：它只活在内存里，不记下来
+        // 重启之后那一行就没有名字可显示了（见 `KnownPeer`）。
+        self.note_known_peer(peer_id);
         self.emit_devices_changed();
+    }
+
+    /// 把这一台记进「以前见过」那一档（`config.known_peers`）—— **值没变就一个字都不写**。
+    ///
+    /// 只在名字或地址真的变了时落盘一次（不是每条消息都写 config）；**与地址簿互斥**：
+    /// 已配对的、或在地址簿里的 id 一律跳过（关系表说了算，那边自己会落盘）；名字还是占位名
+    /// （空串 / 等于设备 id）时也不写（那不是名字）。
+    ///
+    /// 调用点：学到名字那条路（`merge_peer_name`）与学到地址那条路（`upsert_peer` /
+    /// `observe_verified_addr`）的尾巴上各一次 —— 于是"见过它"这件事三处都收得住。
+    pub fn note_known_peer(&self, peer_id: &str) {
+        let Some(p) = self.get_peer(peer_id) else {
+            return;
+        };
+        if p.paired || name_is_placeholder(&p.name, &p.id) {
+            return;
+        }
+        let (name, ip, port) = (p.name.clone(), p.ip.clone(), p.port);
+        let mut config = self.config.lock();
+        if config.peers.iter().any(|b| b.id == peer_id) {
+            return; // 地址簿里那一行由它自己维护（`merge_peer_name` / `upsert_peer`）
+        }
+        if config.note_known_peer(peer_id, &name, &ip, port) {
+            let _ = crate::config::save_config_at(&self.config_path, &config);
+        }
     }
 
     /// Mark a peer paired in both lists and persist the address book.
@@ -597,7 +883,9 @@ impl AppState {
             let mut peers = self.peers.lock();
             if let Some(p) = peers.iter_mut().find(|p| p.id == peer.id) {
                 p.paired = true;
-                p.name = peer.name.clone();
+                if should_take_name(&p.name, &peer.name, &peer.id) {
+                    p.name = peer.name.clone();
+                }
                 if !peer.ip.is_empty() {
                     p.ip = peer.ip.clone();
                 }
@@ -612,7 +900,9 @@ impl AppState {
             let mut config = self.config.lock();
             if let Some(p) = config.peers.iter_mut().find(|p| p.id == peer.id) {
                 p.paired = true;
-                p.name = peer.name.clone();
+                if should_take_name(&p.name, &peer.name, &peer.id) {
+                    p.name = peer.name.clone();
+                }
                 if !peer.ip.is_empty() {
                     p.ip = peer.ip.clone();
                 }
@@ -622,6 +912,8 @@ impl AppState {
             } else {
                 config.peers.push(peer.clone());
             }
+            // **互斥**：关系接管了这一格，观察记忆那份删掉（两张表永不同时持有一个 id）。
+            config.forget_known_peer(&peer.id);
             let _ = crate::config::save_config_at(&self.config_path, &config);
         }
         // 配对只确立关系、不建链（F-16）：把上一次留下的拨号状态清掉。最要紧的是
@@ -814,9 +1106,15 @@ impl AppState {
             return;
         }
         let mut table = self.peer_nets.lock();
+        // 这张表没有删除路径，键的条数因此要在这里把住（满了就不再收养新 id，已有的不动）。
+        if !table.contains_key(peer_id) && table.len() >= MAX_PEER_NET_IDS {
+            return;
+        }
+        // 值也封顶：`nets` 是对端说的话，条数由它定（见 [`MAX_PEER_NETS`]）。
+        let capped: Vec<String> = nets.iter().take(MAX_PEER_NETS).cloned().collect();
         let slot = table.entry(peer_id.to_string()).or_default();
-        if slot.as_slice() != nets {
-            *slot = nets.to_vec();
+        if slot.as_slice() != capped.as_slice() {
+            *slot = capped;
         }
     }
 
@@ -982,6 +1280,12 @@ impl AppState {
             return;
         }
         let mut table = self.peer_nets.lock();
+        // 与 `note_peer_nets` 同一道闸：键来自**未鉴权的反向路由记录**里那些设备 id，
+        // 而这张表没有删除路径。满了不再收养新 id —— 后果只是它那台设备的段算不出来
+        // （`cidr_of` 退回本机掩码/None），路由退成设备级，不会误判谁的行。
+        if !table.contains_key(peer_id) && table.len() >= MAX_PEER_NET_IDS {
+            return;
+        }
         table
             .entry(peer_id.to_string())
             .or_insert_with(|| vec![cidr.to_string()]);
@@ -1304,6 +1608,8 @@ impl AppState {
                 }
                 self.adopt_devices(devices, &[]);
             }
+            // **这条事件唯一的 INFO 在这里**（HTTP 那一层只记 `debug`）：它只在真的采纳了
+            // 记录时才走，所以日志里出现的每一条都意味着"本机的路由记忆确实变了"。
             info!(
                 from = %from,
                 accepted = accepted.len(),
@@ -1330,6 +1636,9 @@ impl AppState {
     /// 归 [`AppState::adopted`] 那一档：有 TTL、不进探活队列。**已有的行一个字都不动** ——
     /// `upsert_peer` 是覆盖语义（空名字会抹掉对方的名字、地址会被改写、`paired` 会被写成
     /// `false` 并落盘），而这正是"反向推回来的记录里含着锚点自己"那条路会踩到的坑。
+    ///
+    /// 这一档**唯一的出路**是已配对的对端在 `/discover` 里报来同一台（[`Self::learn_peers`]
+    /// 会把它升格成"学来的"行：那一档不探活也不打 `seen`，界面的准入一条都不满足）。
     ///
     /// 返回真正并进来的台数。
     pub fn adopt_devices(&self, devices: &[crate::relay::RouteDevice], exclude: &[&str]) -> usize {
@@ -1822,6 +2131,96 @@ impl AppState {
         self.seen.lock().contains_key(peer_id)
     }
 
+    /// **听到**它了：从它那边收到了一条东西（会话信封、控制面核实过的回话）。
+    ///
+    /// 这是"它在网上"的第二条证据（第一条是探活/长连接）。写点多在**入站**那条路上：
+    /// 对端能拨进来、本机拨不回去时，这是唯一能说明"它还在"的东西（见 [`AppState::heard`]）。
+    /// 与 `note_seen` 同一档：只记时刻，不碰 `online`（那一位的写点仍然只有
+    /// [`AppState::set_peer_online`] 一处）。
+    pub fn note_heard(&self, peer_id: &str) {
+        if peer_id.is_empty() {
+            return; // 载荷里没带 id 的（老版本/中间有代理）：不当"听到"
+        }
+        self.heard.lock().insert(peer_id.to_string(), Instant::now());
+    }
+
+    /// [`HEARD_TTL`] 之内听到过它吗。
+    pub fn heard_recently(&self, peer_id: &str) -> bool {
+        match self.heard.lock().get(peer_id) {
+            Some(at) => at.elapsed() < HEARD_TTL,
+            None => false,
+        }
+    }
+
+    /// 忘掉"听到过"（解绑、清空凭据这类关系终结的场合：留着它会让一个已经不存在的关系
+    /// 在 60s 里继续算"在网上"）。
+    pub fn clear_heard(&self, peer_id: &str) {
+        self.heard.lock().remove(peer_id);
+    }
+
+    /// 入站证据落地：**听到**它，并按这一档把在线状态当场收口（`online = true`）。
+    ///
+    /// 为什么不只记时刻、等 5s 那一拍：会话那一行正是用户看着的地方 —— 对端刚发来一条消息，
+    /// 而那一行还挂着"离线"（设备页还会因为"离线 + 未绑定 + 没被 mDNS 看见"把它整行挡在
+    /// 外面），是最刺眼的一处。收到就先记先收口；探活那一拍只负责在 [`HEARD_TTL`] 之后
+    /// 如实落回来（[`AppState::set_peer_offline_unless_heard`]）。
+    ///
+    /// 只对**已经在设备表里的行**生效（`set_peer_online` 就是这样：表里没有那一行时它什么
+    /// 都不做）—— 入站载荷里的 id 不配凭空造出一行"在线设备"。
+    pub fn note_heard_online(self: &Arc<Self>, peer_id: &str) {
+        self.note_heard(peer_id);
+        self.set_peer_online(peer_id, true);
+    }
+
+    /// 全部忘掉（切「离线」= 隐身：那一刻设备列表就该是"谁都不在线"，回来的路要靠探活重走）。
+    pub fn clear_all_heard(&self) {
+        self.heard.lock().clear();
+    }
+
+    /// 收掉过期的"听到过"（5s 那一拍顺手跑，别让它跟着设备表无界长）。
+    ///
+    /// 判据两条：时间过了 [`HEARD_TTL`]、或设备表里已经没有这一行（行被预算/解绑收走之后，
+    /// 这条记录再留着就只是内存垃圾）。
+    pub fn prune_heard(self: &Arc<Self>) {
+        let alive: HashSet<String> = self.peers.lock().iter().map(|p| p.id.clone()).collect();
+        let mut dropped: Vec<String> = Vec::new();
+        self.heard.lock().retain(|id, at| {
+            let keep = at.elapsed() < HEARD_TTL && alive.contains(id);
+            if !keep {
+                dropped.push(id.clone());
+            }
+            keep
+        });
+        // 探活**跳过**的那两类里，`adopted`（只由反向记录带进来的行）在别处没有降级路径：
+        // 候选过滤把它挡在探活之外、mDNS 从没提过它、`ws::session` 那条也轮不到它 ——
+        // 它的"在线"只由这一档撑着（`learn_peers` 也一样，但它由担保人每 5s 的转述自己
+        // 刷新，在这里翻会闪）。所以证据一过期就在这儿如实落回来：不然一台只在 60s 前
+        // 说过一次话的设备会一直挂着"在线"，直到 900s 的 `ADOPTED_TTL` 把整行收走。
+        for id in dropped {
+            if self.is_adopted(&id) {
+                self.set_peer_online(&id, false);
+            }
+        }
+    }
+
+    /// 把一台设备标回**离线** —— 除非[`HEARD_TTL`]之内刚听到过它（那时它只是"本机拨不动"，
+    /// 不是"不在网上"）。
+    ///
+    /// 返回 `true` = 真的翻了（调用方据此决定要不要记日志/发事件）。三处"本机这一侧证据
+    /// 用完了"的地方共用它：5s 探活的 `Offline` 那一档、mDNS 记录被撤、长连接断开且没有
+    /// 可拨地址（`ws::session`）。
+    ///
+    /// 为什么不能各写一遍：这三处都在**本机视角**下结论（探活失败 / 记录没了 / 链路断了），
+    /// 而对端可能正在往本机发消息 —— 少一处判据，"会说话的设备画成离线"就从那个口子漏出来。
+    pub fn set_peer_offline_unless_heard(self: &Arc<Self>, peer_id: &str) -> bool {
+        if self.heard_recently(peer_id) {
+            return false;
+        }
+        let was = self.get_peer(peer_id).is_some_and(|p| p.online);
+        self.set_peer_online(peer_id, false);
+        was
+    }
+
     /// 数据面该拨的地址（F-106）：优先地址簿里**此刻**的拨号地址（可能就是中转端点），
     /// 地址簿里没有这一台、或它没有可拨地址时，才退回调用方手里那个"对端自己声明过的"
     /// 地址（推送邀请里带来的 `callback` 就是这种）。
@@ -1850,10 +2249,49 @@ impl AppState {
     /// 拿它去拨请求方（结果是拨到中转方自己的服务或某条中转端点上），表现成"消息/请求
     /// 发给了一台不相干的设备"。请求方自己的地址由它那条路（mDNS / 手动填 / 它自己请的
     /// 中转）确立，这里不猜。
+    ///
+    /// **判据里那一条"还活着"不能省**：只按"地址簿里有一行的 ip 等于来源地址"判，会把
+    /// **直连**进来的发送方误判成"经它中转" —— 残留行的 ip 撞上（对端重装/清数据后换了
+    /// device id、DHCP 把同一个地址分给了另一台、或某次观察值留下的旧行）时，本机就不记地址、
+    /// 也不认那条连接的可达性，那一行于是永久停在「离线」。所以要求对上的那一行**此刻确实
+    /// 还在本机视野里**（在线 / 已配对 / 刚听到过 / 被 mDNS 看见）—— 这是"本机真的认识它、
+    /// 它也确实在网"，而一条残留行四条都不占。
     pub fn is_relayed_source(&self, source: std::net::IpAddr, caller_id: &str) -> bool {
-        self.peers.lock().iter().any(|p| {
-            p.id != caller_id && crate::net::parse_host(&p.ip).is_some_and(|ip| ip == source)
-        })
+        // 锁顺序：`peers` → (`seen`/`heard`) 单向，且**不嵌套**（先把需要的 id 拷出来），
+        // 与 `probe_peers_once`/`sweep_*` 那两处的取锁顺序一致。
+        let (candidates, alive_by_row): (Vec<String>, HashSet<String>) = {
+            let peers = self.peers.lock();
+            let mut candidates = Vec::new();
+            let mut alive = HashSet::new();
+            for p in peers.iter() {
+                if p.id == caller_id || !crate::net::parse_host(&p.ip).is_some_and(|ip| ip == source) {
+                    continue;
+                }
+                if p.online || p.paired {
+                    alive.insert(p.id.clone());
+                }
+                candidates.push(p.id.clone());
+            }
+            (candidates, alive)
+        };
+        if candidates.is_empty() {
+            return false;
+        }
+        let (seen, heard) = {
+            let seen = self.seen.lock();
+            let heard = self.heard.lock();
+            (
+                seen.keys().cloned().collect::<HashSet<String>>(),
+                heard
+                    .iter()
+                    .filter(|(_, at)| at.elapsed() < HEARD_TTL)
+                    .map(|(id, _)| id.clone())
+                    .collect::<HashSet<String>>(),
+            )
+        };
+        candidates
+            .iter()
+            .any(|id| alive_by_row.contains(id) || seen.contains(id) || heard.contains(id))
     }
 
     /// 解除配对（F-14）：清 token、断链，但**保留设备行**并把它标回"未绑定"。
@@ -1863,6 +2301,9 @@ impl AppState {
     /// 配对"的机会：解除本身是本机动作，不需要对方在线（见 `lib.rs::unpair_peer`）。
     /// 地址簿（config.peers）里删掉，重启后不再记着它 —— 除非它再次被发现（或再次配对）。
     pub fn unpair(&self, peer_id: &str) {
+        // "刚听到过"是**关系**层面的一条证据：关系解除了就不该再拿它撑着 60s 的"在线"
+        // （那一行照旧在列表里，但状态由探活决定）。
+        self.clear_heard(peer_id);
         {
             let mut peers = self.peers.lock();
             if let Some(p) = peers.iter_mut().find(|p| p.id == peer_id) {
@@ -1874,6 +2315,9 @@ impl AppState {
             config.peers.retain(|p| p.id != peer_id);
             let _ = crate::config::save_config_at(&self.config_path, &config);
         }
+        // 关系没了，但"见过它"这件事还在：记进观察记忆那一档（互斥规则的**反方向** ——
+        // 出了地址簿就该由它接手），于是重启后那一行照样有名字、第一拍照样有东西可探。
+        self.note_known_peer(peer_id);
         self.emit_devices_changed();
     }
 
@@ -1993,16 +2437,31 @@ impl AppState {
     ///
     /// - **只接手没见过的 id**：已经在本机列表里的行（mDNS 发现的、手动添加的、已配对的）
     ///   一个字都不动。那是"本机自己知道的"，不该被对端的转述改写，更不能让它被这一层
-    ///   的超时清掉 —— 否则 B 一离线，A 连自己 mDNS 看得见的设备都会掉。**唯一例外**是
-    ///   名字还顶着占位符的行（空串 / 就是设备 id，见 [`name_is_placeholder`]）：跨段设备
-    ///   本机 mDNS 看不见，占位名只有这条转述能改掉。
+    ///   的超时清掉 —— 否则 B 一离线，A 连自己 mDNS 看得见的设备都会掉。**两个例外**：
+    ///   ① 名字还顶着占位符的行（空串 / 就是设备 id，见 [`name_is_placeholder`]）：跨段设备
+    ///   本机 mDNS 看不见，占位名只有这条转述能改掉；② 只是**反向记录带进来的**那一档
+    ///   （`adopted`，见 [`Self::adopt_devices`]）—— 本机跟它之间没有任何关系，它自己也没有
+    ///   存活来源（不探活、不打 `seen`），所以担保人报来的就是它唯一的活路（升格成正常行，
+    ///   并从 `adopted` 摘掉）。
     /// - **临时**：不写地址簿、不进凭据库，重启即忘。本机没跟它们建立过任何关系。
     /// - **存活跟着担保人**：刷新时间戳。担保人不再提到它（或担保人自己掉了、问不到了），
     ///   超过 [`LEARNED_TTL`] 就由 [`Self::sweep_learned`] 收走。
     pub fn learn_peers(&self, voucher_id: &str, learned: Vec<PeerDevice>) {
         let now = Instant::now();
-        let own_id = self.config.lock().device_id.clone();
+        let (own_id, booked) = {
+            let config = self.config.lock();
+            (
+                config.device_id.clone(),
+                config.peers.iter().map(|p| p.id.clone()).collect::<HashSet<String>>(),
+            )
+        };
+        // 「反向记录带进来的」那一档的快照（升格判据用）。**先取快照**：下面持
+        // `learned`/`peers` 守卫时不再去锁 `adopted` —— 那是 `adopt_devices` 与
+        // `sweep_relay_memory` 的另一套顺序（`adopted → peers`）。
+        let adopted: HashSet<String> = self.adopted.lock().keys().cloned().collect();
         let mut changed = false;
+        // 这次真的被升格的（出了守卫再摘 `adopted`，顺序同上）。
+        let mut promoted: Vec<String> = Vec::new();
         {
             let mut table = self.learned.lock();
             let mut peers = self.peers.lock();
@@ -2021,12 +2480,20 @@ impl AppState {
                 }
                 match peers.iter_mut().find(|p| p.id == l.id) {
                     Some(existing) => {
-                        // 已经是本机自己的行（mDNS/手动/配对/中转核实过地址的）：不接管它的
-                        // 存活、地址与真名，一个字都不动。
-                        if !table.contains_key(&l.id) {
-                            // **唯一的例外是占位名**：`observe_verified_addr` 与
+                        // 这次转述能不能**接管**这一行（写存活、地址、名字）？默认不能：那是
+                        // 本机自己的行，不该被对端的转述改写。能接管的有两类 ——
+                        // ① 它已经是「学来的」那一档（下面 `table.contains_key`，刷新它的时间戳）；
+                        // ② 它只是**反向记录带进来的**（`adopted`）：本机跟它没有关系、它也没有
+                        // 别的存活来源，不接管它就永远进不了列表（本机借它中转、列表里却没有它，
+                        // 而那一行只在 900s 的 `ADOPTED_TTL` 到期时才被收走）。地址簿里有它的
+                        // （用户手动加过）或已配对的，仍按本机自己的行办 —— 存活只由探活说。
+                        let promotable = adopted.contains(&l.id)
+                            && !booked.contains(&l.id)
+                            && !existing.paired;
+                        if !table.contains_key(&l.id) && !promotable {
+                            // **例外只有占位名**：`observe_verified_addr` 与
                             // `AppState::new` 建行时拿设备 id 顶着名字，此后本机 mDNS 看不见
-                            // 它（跨段）、探活也填不回（`fill_peer_name` 走的是它，但被学来的
+                            // 它（跨段）、探活也填不回（`note_peer_name` 走的是它，但被学来的
                             // 行恰好在探活队列之外）。担保人此刻报来了真名，就该收下 ——
                             // 不然那台设备在列表里永远显示 deviceid。
                             if name_is_placeholder(&existing.name, &existing.id)
@@ -2047,9 +2514,18 @@ impl AppState {
                             existing.ip = l.ip;
                             existing.port = l.port;
                         }
-                        existing.name = l.name;
+                        // 名字也走 `should_take_name`：担保人没说出名字时上面刚拿 id 顶过，
+                        // 那条占位名不许把本机记着的真名冲成 `deviceid`（升格进来的那一档
+                        // —— `promotable` —— 走的正是这条路，而它此前只在"填占位名"那一档
+                        // 收名字）。真名之间照旧覆盖：担保人报的就是对端自己说的名字。
+                        if should_take_name(&existing.name, &l.name, &l.id) {
+                            existing.name = l.name.clone();
+                        }
                         existing.online = true;
                         table.insert(l.id.clone(), now);
+                        if promotable {
+                            promoted.push(l.id.clone());
+                        }
                         changed = true;
                     }
                     None => {
@@ -2067,6 +2543,15 @@ impl AppState {
                     }
                 }
             }
+        }
+        if !promoted.is_empty() {
+            // 升格之后它不再是"反向记录带进来的"：存活归这一层管（20s、跟着担保人刷新），
+            // 也该跟着 `learned` 一起被收走。留在 `adopted` 里只会让它继续被探活跳过。
+            let mut ad = self.adopted.lock();
+            for id in &promoted {
+                ad.remove(id);
+            }
+            debug!(n = promoted.len(), "反向记录带进来的行被担保人的转述升格");
         }
         if changed {
             self.emit_devices_changed();
@@ -2122,6 +2607,109 @@ impl AppState {
             self.emit_devices_changed();
         }
     }
+
+    /// 把设备表里**没有归宿**的行收到 [`MAX_UNBOOKED_ROWS`] 以内，返回收掉几行。
+    ///
+    /// 判据要**同时**成立才收：不在地址簿里、没配对、不在 `learned`/`adopted` 那两档 TTL 里、
+    /// 此刻不在线、也没被 mDNS 看见。前两条 =「重启之后它也不会在表里」（这一档的行只活在
+    /// 内存里，`config.toml` 里没它、凭据库里也没它），后三条 =「它此刻不是活的」——
+    /// 收掉一个正在网上的行，用户看到的就是"设备没了"，所以宁可让那几行暂时超预算，
+    /// 也一个都不碰。
+    ///
+    /// 淘汰顺序按表里的先后：`peers` 是追加的 `Vec`，越靠前越老，而刷 id 的那一方攒出来的
+    /// 正是靠前的那些。
+    ///
+    /// **调用点只有两处**（`upsert_peer` / `observe_verified_addr` 建成新行之后）：没建新行
+    /// 就没什么可收的，不进 5s 拍 —— 那一拍已经有 `sweep_learned`/`sweep_relay_memory` 在
+    /// 管另外两档。
+    fn enforce_row_budget(&self) -> usize {
+        // 快路：表本身就不到预算（`peers.len()` 恒 ≥ 可收的行数），连一次凭据读取都不花。
+        if self.peers.lock().len() <= MAX_UNBOOKED_ROWS {
+            return 0;
+        }
+        // 谁"有归宿"：地址簿里的、已配对的、两档 TTL 管着的、此刻看得见的。
+        let booked: HashSet<String> = self
+            .config
+            .lock()
+            .peers
+            .iter()
+            .map(|p| p.id.clone())
+            .collect();
+        let paired: HashSet<String> = crate::credential::load_peers()
+            .unwrap_or_default()
+            .keys()
+            .cloned()
+            .collect();
+        let learned: HashSet<String> = self.learned.lock().keys().cloned().collect();
+        let adopted: HashSet<String> = self.adopted.lock().keys().cloned().collect();
+        let seen: HashSet<String> = self.seen.lock().keys().cloned().collect();
+        // 谁"有归宿"：地址簿里的、已配对的、两档 TTL 管着的、此刻看得见的，以及**本机
+        // 确实拨得动**的在线行。
+        //
+        // 最后那一格为什么是"在线**且**拨得动"而不是光"在线"：`online` 现在还能由
+        // "刚听到过它"（`heard`）撑起来，而那一条**别人一条报文就能给**（未配对的会话信封
+        // 没有 token，见 `routes_chat::accept`）—— 光看 `online`，一台换着 id 发报文的机器
+        // 就能一行行攒出**收不走**的行（每一行还每 5s 被探活敲一次）。加上"拨得动"之后，
+        // 能留住的是"有直连地址或手里有一条端点"的那些 —— 那正是这一档要保护的
+        // "看得见、能用"的设备；只有听到过、本机一条路都没有的行照旧按可收处理
+        // （与 `heard` 之前的行为一致）。
+        let homeless = |p: &PeerDevice| {
+            !booked.contains(&p.id)
+                && !paired.contains(&p.id)
+                && !learned.contains(&p.id)
+                && !adopted.contains(&p.id)
+                && !seen.contains(&p.id)
+                && !(p.online && p.dialable())
+        };
+
+        let mut peers = self.peers.lock();
+        let over = peers.iter().filter(|p| homeless(p)).count();
+        if over <= MAX_UNBOOKED_ROWS {
+            return 0;
+        }
+        let mut budget = over - MAX_UNBOOKED_ROWS;
+        let before = peers.len();
+        peers.retain(|p| {
+            if budget > 0 && homeless(p) {
+                budget -= 1;
+                false
+            } else {
+                true
+            }
+        });
+        let dropped = before - peers.len();
+        if dropped > 0 {
+            warn!(
+                dropped,
+                kept = MAX_UNBOOKED_ROWS,
+                "设备表里没有归宿的行超了预算，收掉最老的那几行（地址簿/已配对/在线/看得见的都没动）"
+            );
+        }
+        dropped
+    }
+
+    /// 对端报来一条「共享项变更」：这一次该不该向上报（口径见 [`SHARE_CHANGED_THROTTLE`]）。
+///
+/// `true` = 这条是窗口内的第一条，调用方照常发 Tauri 事件；`false` = 同一个窗口里的重复，
+/// 吞掉（**不是错误**，调用方什么都不用做）。
+pub fn share_changed_due(&self, share_id: &str) -> bool {
+    let now = Instant::now();
+    let mut table = self.share_changed_at.lock();
+    if table.len() >= MAX_SHARE_CHANGED_KEYS {
+        let cutoff = now - SHARE_CHANGED_THROTTLE * 8;
+        table.retain(|_, at| *at > cutoff);
+        if table.len() >= MAX_SHARE_CHANGED_KEYS {
+            return false; // 清不动 = 这一瞬真的见过这么多不同 id：不建表项、也不上报
+        }
+    }
+    match table.get(share_id) {
+        Some(at) if now.duration_since(*at) < SHARE_CHANGED_THROTTLE => false,
+        _ => {
+            table.insert(share_id.to_string(), now);
+            true
+        }
+    }
+}
 
     pub fn emit_devices_changed(&self) {
         if let Some(app) = self.app_handle.lock().as_ref() {
@@ -2179,6 +2767,10 @@ pub fn refresh_trust(state: &Arc<AppState>) {
 ///
 /// 只在**本机还没有它的指纹**时写：已经有了，就说明这次握手正是拿那枚指纹校验过的，
 /// 没有别的可记。调用点都在"刚跟对端成功建立了一条 TLS 连接"的地方。
+///
+/// **调用频率与日志级别是一件事**：这条函数在 5s 探活里被每台有地址的设备各调一次，
+/// 其中绝大多数是未配对的内网设备（凭据库里根本没有它们）—— 那一档现在回 `Ok(false)`，
+/// 只记 `debug`。别把那里改回 `info`：一句话不是新闻却按新闻记，就是每天十几兆的刷屏。
 pub fn remember_peer_fingerprint(state: &Arc<AppState>, peer_id: &str, ip: &str) {
     if matches!(
         crate::credential::get_peer_fingerprint(peer_id),
@@ -2190,13 +2782,28 @@ pub fn remember_peer_fingerprint(state: &Arc<AppState>, peer_id: &str, ip: &str)
         return; // 这一跳没走 TLS（回环 / 测试），没什么可记
     };
     match crate::credential::set_peer_fingerprint(peer_id, &observed) {
-        Ok(()) => {
+        Ok(true) => {
             info!(
                 %peer_id,
                 fingerprint = %crate::net::short_fingerprint(&observed),
                 "已钉住对端证书指纹"
             );
             refresh_trust(state);
+        }
+        // `false` = 凭据库里**没有这台设备**（未配对）、或值本来就是这个 —— 一个字节都没写，
+        // 所以既没有"新钉住"可报，也没有 Trust 需要重灌。
+        //
+        // 这一档为什么必须**不是** INFO：调用点在 5s 探活里（`state.rs` 的 `probe_peer`），
+        // 而探活队列里的内网设备绝大多数是未配对的（mDNS 发现的行）。于是每台设备每 5 秒
+        // 都会走到这里，日志里一天刷 7.5 万条同样的"已钉住对端证书指纹"（同 id 同指纹），
+        // 实测占当日日志的 90%（19 MB/天）。那句话还是**假的**：什么都没钉住。
+        Ok(false) => {
+            debug!(
+                %peer_id,
+                %ip,
+                fingerprint = %crate::net::short_fingerprint(&observed),
+                "这台设备不在凭据库里（未配对），没有可钉的指纹"
+            );
         }
         Err(e) => warn!(%peer_id, "指纹落库失败: {e}"),
     }
@@ -2542,6 +3149,11 @@ static PROBE_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock:
         .unwrap_or_default()
 });
 
+/// 同时探几台设备。探活是**本地**的一跳（同段/近段，1.5s 超时），一屏设备数的并发不值一提；
+/// 定这个上限只为一件事：一台够不着的设备（1.5s 超时）别把排在它后面的每一台都拖住 ——
+/// 串行时一屏死行能把最后那一台拖到十几秒，而它其实第一拍就该被判在线。
+const PROBE_CONCURRENCY: usize = 8;
+
 /// 身份核对用的客户端（超时比探活宽一点：这一步的回话更长，一问一答里带整段设备表）。
 static RECONCILE_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     crate::net::client_builder()
@@ -2591,8 +3203,11 @@ async fn probe_addr(
 ///
 /// 由 lib.rs 的 5s 循环调用；单独成函数是为了让"地址上现在是另一台设备"这条路径
 /// 能在测试里对着真服务器跑（见 tests/p1_integration.rs）。
+///
+/// **各台之间并发、互不排队**（上限 [`PROBE_CONCURRENCY`]）：一台够不着的设备要占满一次
+/// 1.5s 超时，串行时它后面每一台都得跟着等 —— 而这正是"启动后某台明明在线却画成离线"
+/// 的放大器（列表里几台死行在前，真在网的那台排在最后）。
 pub async fn probe_peers_once(state: &Arc<AppState>) {
-    let client = &PROBE_CLIENT;
     // 「学来的」行不在这里探：它们不是本机发现的，本机跟它们之间没有关系，拨过去既没有
     // 意义（本机到不了它时那一跳纯属空转），也正是这条路要避免的多余一跳。它们的存活由
     // 担保人的 `/discover` 表刷新 —— 见 `learn_peers` / `sweep_learned`。
@@ -2615,7 +3230,19 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
         })
         .cloned()
         .collect();
-    for p in candidates {
+
+    /// 探一台设备：判死活、收拾换了 id 的行、顺带交换视野与"配对还活不活着"的活口供。
+    ///
+    /// 从原来的循环体里提出来只为一件事：好让下面用 `buffer_unordered` 并发跑 ——
+    /// 慢的那一台不再挡着后面每一台。
+    async fn probe_peer(state: &Arc<AppState>, p: PeerDevice, own_id: &str) {
+        let client = &PROBE_CLIENT;
+        // 入站证据先落地：这一拍不管拨不拨得动它，只要 [`HEARD_TTL`] 之内听到过它就算在线
+        // （拨不动 ≠ 不在网上 —— 见 `AppState::heard`）。放在这一支之前，是因为下面三条
+        // 出口（链路活着 / 一条路都没有 / 真的去拨）都会提前 `return`，各写一遍迟早漏一处。
+        if state.heard_recently(&p.id) {
+            state.set_peer_online(&p.id, true);
+        }
         // 链路活着就不用再探身份 —— **但正走中转的那几台要除外**：链路证明的是"本机跟它
         // 之间的关系"，而中转那条链是**借来的**，直连什么时候回来只能靠直连那一跳自己说
         // （见下，直连一通就收起中转）。少了这一条，只要中转链不断，本机就永远不再试直连。
@@ -2633,21 +3260,26 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
             // （`LEARNED_TTL`）内被 `sweep_learned` 收走，而且再也不会回来。
             // 凭据库读不到只是这一拍换不成，不动上面那三件事。
             if let Ok(Some(token)) = crate::credential::get_peer_token(&p.id) {
-                learn_from_peer(state, &p.id, &p.ip, p.port, &token, &own_id).await;
+                learn_from_peer(state, &p.id, &p.ip, p.port, &token, own_id).await;
             }
-            continue;
+            // 这一台到此为止（原来是 `continue`：现在是这一台的独立任务）
+            return;
         }
         // 一条路都没有（没地址、没借来的端点、也没有长连接 —— 上面那一支已经滤掉有链路的）：
         // 直连与中转都无处可探，但**出路可能就在手里**（记录里的池）。试着借一次：
         // 借到了，下一拍就有探活、设备行也就说得清"经谁中转"（不再等用户先发一条消息）；
         // 借不到也不亏 —— `ensure_for` 没候选时一次请求都不发，有候选时 30s 才一次。
         if !p.dialable() {
+            // 一条路都没有时，可达性只剩"刚听到过它"这一条证据（`HEARD_TTL`）—— 而这一支
+            // 会直接返回，下面那个 `Offline` 档永远轮不到它：不在一个 TTL 之后自己收回来，
+            // 一台"只闻其声、本机压根拨不动"的设备就永久停在在线了。
+            state.set_peer_offline_unless_heard(&p.id);
             let st = Arc::clone(state);
             let id = p.id.clone();
             crate::task::spawn("relay warm-up", async move {
                 crate::relay::ensure_for(&st, &id).await;
             });
-            continue;
+            return;
         }
         // 手里那条 token 一起捎上：对端顺带回答"它把本机认作谁"，那是配对关系
         // 是否还活着的证据。**读不到 ≠ 没有**：凭据库的瞬时故障（凭据管理器忙、同机多
@@ -2657,7 +3289,7 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
             Ok(t) => t,
             Err(e) => {
                 warn!(peer_id = %p.id, "凭据库读失败，这一轮跳过探活: {e}");
-                continue;
+                return;
             }
         };
         // 直连那一跳**恒用地址簿里的地址**：它同时是"直连通不通"的信号 —— 决定要不要走
@@ -2668,7 +3300,7 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
         let direct = if p.ip.is_empty() || p.port == 0 {
             IdentityProbe::Unreachable
         } else {
-            probe_addr(state, client, &p.id, &p.ip, p.port, token.as_deref(), &own_id).await
+            probe_addr(state, client, &p.id, &p.ip, p.port, token.as_deref(), own_id).await
         };
         // F-107 §9.2：直连这一拍的结果（连续 3 拍可达 → 清设备级记忆）。在 `direct` 被
         // move 走之前先记下来。
@@ -2686,7 +3318,7 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
                     &relay.host,
                     relay.port,
                     token.as_deref(),
-                    &own_id,
+                    own_id,
                 )
                 .await;
                 match retry {
@@ -2716,7 +3348,7 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
                     reason: crate::ws::StopReason::IdentityChanged,
                 },
             );
-            continue;
+            return;
         }
         let seen = match probe {
             IdentityProbe::Seen(identity) => Some(identity),
@@ -2729,12 +3361,12 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
                 if !via_relay {
                     crate::relay::clear_for(state, &p.id);
                 }
-                // 顺带把"它叫什么"填回设备行：这一问的回话里就带着名字，而**占位名**
-                // （`observe_verified_addr` 拿设备 id 顶着的那种）此前没有哪条路能填它
+                // 顺带把"它叫什么"更新到设备行：这一问的回话里就带着名字，而且**是核实过的**
+                // （这个地址上答话的确实是这台设备），所以对端改名跟着走（`note_peer_name`）；
+                // 占位名（`observe_verified_addr` 拿设备 id 顶着的那种）也正是靠这一条修好的
                 // —— 这类设备本机 mDNS 看不见（跨段）、学来的行又在探活队列之外。
-                // 只填占位行，真名一个字都不动（见 `fill_peer_name`）。
                 if let Some(identity) = &seen {
-                    state.fill_peer_name(&p.id, &identity.name);
+                    state.note_peer_name(&p.id, &identity.name);
                 }
                 // 指纹只在这一档才认：这个地址上答话的确实是**这台设备**，见到的证书
                 // 才是它的。在 `Seen` 里就钉（不管 id 对不对）会把别台设备的证书记到
@@ -2798,10 +3430,16 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
                 }
             }
             ProbeStep::Offline => {
-                if p.online {
+                // **拨不动 ≠ 不在网上**：这一拍问不到它（地址过期、AP 把单播隔开、跨段、
+                // 或者它根本没有可拨的地址），但本机可能一直在收它的消息。那时"在线"
+                // 由入站证据撑着（`HEARD_TTL`），别把一台正在说话的设备画成离线
+                // （见 `AppState::set_peer_offline_unless_heard`）。
+                if state.heard_recently(&p.id) {
+                    debug!(peer_id = %p.id, "probe missed but recently heard from it, keeping online");
+                } else if p.online {
                     info!(peer_id = %p.id, "peer unreachable, marking offline");
                 }
-                state.set_peer_online(&p.id, false);
+                state.set_peer_offline_unless_heard(&p.id);
                 // 直连不通：如果本机认识"愿意替别人中转、又够得着它"的设备，请一台替它开
                 // 条路（F-106）。只在**这一档**发起，而且 `ensure_for` 自带限流（同一台
                 // 设备 30s 一次）—— 直连恢复时上面那一档已经把中转收掉了。
@@ -2822,9 +3460,17 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
         }
     }
 
+    futures_util::stream::iter(candidates)
+        .map(|p| probe_peer(state, p, own_id.as_str()))
+        .buffer_unordered(PROBE_CONCURRENCY)
+        .for_each(|()| async {})
+        .await;
+
     // 担保人这一轮没再提到、或担保人自己掉了的学习条目，从这里收走。放在一轮之末：
     // 这一轮里刚被提到的都已经刷新过时间戳，不会误伤。
     state.sweep_learned();
+    // "刚听到过"这一档也一样：过期的、或设备表里已经没有的行，从这里收掉（别让它无界长）。
+    state.prune_heard();
     // F-107 §11：网段级策略的退休与 TTL、设备级链接的兜底寿命、没有策略的池。
     state.sweep_relay_memory();
 }
@@ -3514,8 +4160,98 @@ mod tests {
         );
     }
 
-    /// `fill_peer_name` 的边界：只填占位名（空串 / 等于 id），真名原样不动；报来的名字
-    /// 若本身就是占位（空串 / 等于 id）也不算真名。
+    /// 回归（真机反馈）：**反向记录带进来的行，不能被担保人后来的转述挡住**。
+    ///
+    /// `adopt_devices` 建出来的行是 `online: false`、不打 `seen`、也不进探活队列 —— 界面准入
+    /// （`online || paired || seen`）三条一条都不满足，所以担保人（F-10 那条 `/discover` 表）的
+    /// 转述是它唯一的活路。此前 `learn_peers` 对"已存在的行"只在它已经是 `learned` 成员时才
+    /// 接管，于是这台设备**永远**不进列表：本机在借它中转（池里有地址）、设备行却看不见它，
+    /// 而那一行只在 900s 的 `ADOPTED_TTL` 到期时才被收走（`sweep_relay_memory`）—— 真机上就是
+    /// "经它中转，列表里却没有它"，偶尔还闪一下就没了。
+    #[test]
+    fn a_vouched_device_promotes_an_adopted_row() {
+        let state = memory_state();
+        let devices = vec![crate::relay::RouteDevice {
+            id: "dev-c".into(),
+            name: "C".into(),
+            ip: "192.168.50.7".into(),
+            port: 3890,
+        }];
+        assert_eq!(
+            state.adopt_devices(&devices, &[]),
+            1,
+            "前提：这一台先经「反向记录」那一档进来"
+        );
+        assert!(state.is_adopted("dev-c"));
+        assert!(
+            !state.get_peer("dev-c").unwrap().online,
+            "前提：adopted 行不声明在线（也不打 seen）"
+        );
+
+        // 一台**已配对**的对端每 5s 把它的 mDNS 视野报来。
+        state.learn_peers(
+            "voucher-b",
+            vec![PeerDevice {
+                id: "dev-c".into(),
+                name: "书房的台式机".into(),
+                ip: "192.168.50.7".into(),
+                port: 3890,
+                online: true,
+                ..Default::default()
+            }],
+        );
+
+        let row = state.get_peer("dev-c").expect("行还在");
+        assert!(row.online, "担保人报来了就按在线算（与其它学来的行同一档）");
+        assert_eq!(row.name, "书房的台式机", "名字跟着担保人走");
+        assert!(state.is_learned("dev-c"), "并进「学来的」那一档：20s、跟着担保人刷新");
+        assert!(
+            !state.is_adopted("dev-c"),
+            "升格之后不再是 adopted —— 不该继续被探活跳过"
+        );
+    }
+
+    /// 上一条的边界：**本机自己的行**（地址簿里的、已配对的）不会被转述声明在线 ——
+    /// 存活只由探活说。这一档即便碰巧也在 `adopted` 里（先被采纳、之后用户手动添加），
+    /// 也不归转述接管。
+    #[test]
+    fn a_vouched_device_never_takes_over_our_own_row() {
+        let state = memory_state();
+        state.add_peer_book(PeerDevice {
+            id: "dev-c".into(),
+            name: "书房的台式机".into(),
+            ip: "10.9.9.9".into(),
+            port: 3890,
+            ..Default::default()
+        });
+        // 直接摆出"它同时也在 adopted 里"这个状态（正常流程里 `adopt_devices` 会跳过地址簿里的 id）。
+        state.adopted.lock().insert("dev-c".into(), Instant::now());
+
+        state.learn_peers(
+            "voucher-b",
+            vec![PeerDevice {
+                id: "dev-c".into(),
+                name: "别人叫它 C".into(),
+                ip: "10.44.0.8".into(),
+                port: 3890,
+                online: true,
+                ..Default::default()
+            }],
+        );
+
+        let row = state.get_peer("dev-c").expect("行还在");
+        assert!(!row.online, "地址簿里的行：存活只由探活说");
+        assert_eq!(row.ip, "10.9.9.9", "地址不被转述改写");
+        assert_eq!(row.name, "书房的台式机", "真名不被转述改写");
+        assert!(!state.is_learned("dev-c"), "它不归「学来的」那一档");
+        assert!(state.is_adopted("dev-c"), "adopted 那一档也不被这次转述动");
+    }
+
+    /// `fill_peer_name` 的边界 —— 它是**没核实过的主张**那条路：只填占位名（空串 / 等于 id），
+    /// 本机已有的名字一个字都不动；报来的名字本身就是占位（空串 / 等于 id）也不算名字。
+    ///
+    /// 对照：核实过的自报名字走 `note_peer_name`，那条路**会**更新真名（改名跟着对端走）
+    /// —— 见 `a_verified_self_report_updates_the_name_and_the_book`。
     #[test]
     fn fill_peer_name_only_fills_placeholders() {
         let state = memory_state();
@@ -3533,6 +4269,334 @@ mod tests {
         assert_eq!(state.get_peer("dev-q").unwrap().name, "dev-q", "等于 id = 占位，不写");
         state.fill_peer_name("dev-q", "   ");
         assert_eq!(state.get_peer("dev-q").unwrap().name, "dev-q", "空串 = 占位，不写");
+    }
+
+    /// 名字这一格：**空名 / 占位名不许冲掉真名，真名之间照旧互相覆盖**（对端改名走的就是后者）。
+    ///
+    /// 以前 `upsert_peer` / `mark_paired` 无条件覆盖：一条不带名字的报文（老版本对端、
+    /// 或控制面那条只报 id + 端口的请求）就能把用户看得见的名字换成一串 deviceid，
+    /// 地址簿落盘的那一份也跟着一起坏。
+    #[test]
+    fn a_real_name_survives_reports_that_carry_none() {
+        let state = memory_state();
+        state.observe_verified_addr("dev-r", "10.0.0.9", 3890);
+        state.fill_peer_name("dev-r", "PC-R");
+        let report = |name: &str| PeerDevice {
+            id: "dev-r".into(),
+            name: name.into(),
+            ip: "10.0.0.9".into(),
+            port: 3890,
+            ..Default::default()
+        };
+        for name in ["", "   ", "dev-r"] {
+            state.upsert_peer(&report(name));
+            assert_eq!(
+                state.get_peer("dev-r").unwrap().name,
+                "PC-R",
+                "占位名/空名不该冲掉真名：{name:?}"
+            );
+        }
+        // 真名之间照旧覆盖：对端改名（mDNS TXT / 会话信封 / 配对握手报的都是它自己）。
+        state.upsert_peer(&report("PC-R2"));
+        assert_eq!(state.get_peer("dev-r").unwrap().name, "PC-R2");
+        // 反向：占位行要被真名填上（不然"设备列表显示的是 deviceid"永远修不回来）。
+        state.observe_verified_addr("dev-s", "10.0.0.10", 3890);
+        state.upsert_peer(&PeerDevice {
+            id: "dev-s".into(),
+            name: "PC-S".into(),
+            ip: "10.0.0.10".into(),
+            port: 3890,
+            ..Default::default()
+        });
+        assert_eq!(state.get_peer("dev-s").unwrap().name, "PC-S");
+    }
+
+    /// 入站证据那一档（`heard`）：**拨不动 ≠ 不在网上**。
+    ///
+    /// 这是"明明在会话里说着话、设备行却一直画离线"的正面判据 —— 本机拨不回去的那些
+    /// （AP 隔开单播、跨段、只有一条借来的中转链）靠它才算在线；过了 TTL 要如实落回来，
+    /// 免得一台早就走了的设备永久停在线。
+    #[test]
+    fn being_heard_keeps_a_peer_online_until_the_evidence_expires() {
+        let state = memory_state();
+        state.observe_verified_addr("dev-h", "10.0.0.11", 3890);
+        assert!(!state.get_peer("dev-h").unwrap().online, "前提：新行是离线的");
+
+        state.note_heard_online("dev-h");
+        assert!(
+            state.get_peer("dev-h").unwrap().online,
+            "刚收到它的东西 = 它在网上（哪怕本机拨不动它）"
+        );
+        assert!(!state.set_peer_offline_unless_heard("dev-h"), "听到过就不翻");
+        assert!(state.get_peer("dev-h").unwrap().online);
+
+        // 设备表里没有的行：载荷里的 id 不配凭空造出一台"在线设备"。
+        state.note_heard_online("ghost");
+        assert!(state.get_peer("ghost").is_none());
+        state.prune_heard();
+
+        // 过了 TTL：如实翻回离线，记录也被收掉（`prune_heard` 那一档）。
+        state
+            .heard
+            .lock()
+            .insert("dev-h".into(), Instant::now() - HEARD_TTL - Duration::from_secs(1));
+        assert!(!state.heard_recently("dev-h"));
+        assert!(state.set_peer_offline_unless_heard("dev-h"), "TTL 之外要真的翻");
+        assert!(!state.get_peer("dev-h").unwrap().online);
+        state.prune_heard();
+        assert!(state.heard.lock().is_empty(), "过期记录不该留着");
+    }
+
+    /// 解绑要把"刚听到过"一起忘掉：关系都解除了，那一档不该再撑着 60s 的"在线"。
+    #[test]
+    fn unpairing_forgets_being_heard() {
+        let state = memory_state();
+        state.observe_verified_addr("dev-u", "10.0.0.12", 3890);
+        state.note_heard_online("dev-u");
+        state.unpair("dev-u");
+        assert!(!state.heard_recently("dev-u"));
+    }
+
+    /// `is_relayed_source`：**残留行不算**。
+    ///
+    /// 只按"地址簿里有一行的 ip 等于来源地址"判，会把**直连**的发送方误判成"经它中转"
+    /// （对端重装/清数据后换了 device id、DHCP 把同一个地址分给了另一台……那次留下的行
+    /// 都在地址簿里）—— 误判的代价是地址不记、可达性不认，那一行于是永久停在「离线」。
+    #[test]
+    fn a_dead_row_does_not_make_a_direct_sender_look_relayed() {
+        let state = memory_state();
+        let source: std::net::IpAddr = "10.30.0.7".parse().unwrap();
+        let stale = PeerDevice {
+            id: "dev-old".into(),
+            name: "旧行".into(),
+            ip: "10.30.0.7".into(),
+            port: 3890,
+            ..Default::default()
+        };
+        // 残留行：同地址、离线、未配对、没被 mDNS 看见、也没听到过 —— 四条一条都不占。
+        state.add_peer_book(stale.clone());
+        assert!(
+            !state.is_relayed_source(source, "dev-new"),
+            "一条死行不该把直连的发送方说成中转"
+        );
+        // 它活着（已配对 / 在线 / 看得见 / 刚听到过）才配当"这条连接是它转发来的"。
+        state.mark_paired(&PeerDevice { paired: true, ..stale.clone() });
+        assert!(state.is_relayed_source(source, "dev-new"), "关系活着的那一台才当转发方");
+        // 自己永远不算"另一台"。
+        assert!(!state.is_relayed_source(source, "dev-old"));
+    }
+
+    /// 启动那一刻：占位名的行**先拿会话记录里那个真名补上**（地址簿里的真名一个字不动）。
+    ///
+    /// 这是"启动时先显示一串 deviceid、过一会儿才变名字"的直接判据 —— 名字本机早就有了
+    /// （对端自己发来的消息带着它当时的设备名、落盘在 `chat.json` 里），不该等第二次观察。
+    #[test]
+    fn a_placeholder_name_is_seeded_from_the_chat_record_on_boot() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_boot_name_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 记录里：dev-x 有一条**对端发来的**消息（带真名），dev-y 只有本机发出去的（没名字）。
+        std::fs::write(
+            dir.join("chat.json"),
+            r#"{"convos":{
+                "dev-x":{"messages":[{"id":"m1","fromMe":false,"fromName":"小米 15","text":"你好","at":1,"delivery":"received","targets":["dev-x"]}]},
+                "dev-y":{"messages":[{"id":"m2","fromMe":true,"fromName":"","text":"喂","at":2,"delivery":"sent","targets":["dev-y"]}]}
+            }}"#,
+        )
+        .unwrap();
+        let mut config = crate::config::test_config();
+        config.device_id = "me".into();
+        config.peers = vec![
+            // 占位名（= id）：该被记录里那个真名补上。
+            PeerDevice {
+                id: "dev-x".into(),
+                name: "dev-x".into(),
+                ..Default::default()
+            },
+            // 真名：一个字都不动（哪怕记录里也有名字）。
+            PeerDevice {
+                id: "dev-y".into(),
+                name: "我的笔记本".into(),
+                ..Default::default()
+            },
+        ];
+        let state = AppState::new(config, dir.join("config.toml"));
+        assert_eq!(
+            state.get_peer("dev-x").unwrap().name,
+            "小米 15",
+            "占位名要用记录里那个真名补上（不然启动那一刻显示的是 deviceid）"
+        );
+        assert_eq!(
+            state.get_peer("dev-y").unwrap().name,
+            "我的笔记本",
+            "已经有真名：记录不动它"
+        );
+        // 播种只在内存里：配置那份不该因此多出一份会漂移的副本。
+        crate::config::save_config_at(&dir.join("config.toml"), &state.config.lock()).unwrap();
+        let on_disk = crate::config::load_config_at(&dir.join("config.toml"));
+        assert_eq!(
+            on_disk.peers.iter().find(|p| p.id == "dev-x").map(|p| p.name.clone()),
+            Some("dev-x".into()),
+            "落盘那份不动（每次启动都从记录里重新取）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **核实过的**自报名字会更新真名（对端改名跟着走），并且落进地址簿那份 —— 不然重启之后
+    /// 又回到旧名字。占位名/空名的自报一律不算名字（两条入口共用的那一关）。
+    ///
+    /// 这是"手机改名之后本机停在旧名字"那个残留的正面判据：老规矩（`fill_peer_name` 只填
+    /// 占位行）下，配过对、只走长连接、mDNS 又看不见的那一档没有任何一条路能纠正它。
+    #[test]
+    fn a_verified_self_report_updates_the_name_and_the_book() {
+        let state = memory_state();
+        state.add_peer_book(PeerDevice {
+            id: "dev-r".into(),
+            name: "PC-R".into(),
+            ip: "10.0.0.9".into(),
+            port: 3890,
+            ..Default::default()
+        });
+        assert_eq!(state.get_peer("dev-r").unwrap().name, "PC-R");
+
+        state.note_peer_name("dev-r", "PC-R2");
+        assert_eq!(
+            state.get_peer("dev-r").unwrap().name,
+            "PC-R2",
+            "核实过的名字要更新真名（改名跟着对端走）"
+        );
+        let on_disk = {
+            crate::config::save_config_at(&state.config_path, &state.config.lock()).unwrap();
+            crate::config::load_config_at(&state.config_path)
+        };
+        assert_eq!(
+            on_disk.peers.iter().find(|p| p.id == "dev-r").map(|p| p.name.clone()),
+            Some("PC-R2".into()),
+            "地址簿那份也要跟着更新（否则重启又回到旧名字）"
+        );
+
+        // 占位名/空名不算名字：两条入口共用这一关。
+        for bad in ["", "   ", "dev-r"] {
+            state.note_peer_name("dev-r", bad);
+            state.fill_peer_name("dev-r", bad);
+            assert_eq!(state.get_peer("dev-r").unwrap().name, "PC-R2", "占位名不写：{bad:?}");
+        }
+    }
+
+    /// 「以前见过」那一档（`config.known_peers`）：**启动时给没有关系的设备补一行** ——
+    /// 名字当场就有（不必等第二次观察），可达性交给启动即跑的第一拍探活。
+    ///
+    /// 这是"重新安装/重启之后那一台要等一段时间才有名字、而且不在设备列表里"的正面判据：
+    /// 未配对 + 不在地址簿的行只活在内存里，不记这一份就重启即忘。
+    #[test]
+    fn a_known_peer_gets_a_row_at_boot() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_known_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = crate::config::test_config();
+        config.device_id = "me".into();
+        assert!(config.note_known_peer("dev-k", "小米 15", "10.0.0.7", 3890));
+        // 地址簿里也有一台（它有联系方式、名字以它为准）。
+        config.peers = vec![PeerDevice {
+            id: "dev-booked".into(),
+            name: "我的笔记本".into(),
+            ip: "10.0.0.8".into(),
+            port: 3890,
+            ..Default::default()
+        }];
+        assert!(config.note_known_peer("dev-booked", "旧的观察名", "10.0.0.99", 999));
+        crate::config::save_config_at(&dir.join("config.toml"), &config).unwrap();
+
+        let loaded = crate::config::load_config_at(&dir.join("config.toml"));
+        let state = AppState::new(loaded, dir.join("config.toml"));
+
+        let k = state.get_peer("dev-k").expect("没有关系的设备也要有一行（名字才不用等）");
+        assert_eq!(k.name, "小米 15", "名字当场就有（上次知道的名字）");
+        assert_eq!((k.ip.as_str(), k.port), ("10.0.0.7", 3890), "地址也补上了：第一拍才有东西可拨");
+        assert!(!k.online, "状态必须新：一律从离线起步，真相只由这一趟的证据给");
+        assert!(!k.paired, "没有关系就是没有关系");
+        assert!(
+            !state.get_peer("dev-booked").unwrap().name.contains("旧的观察名"),
+            "地址簿里那一行优先：观察记忆不能越级覆盖它"
+        );
+        assert_eq!(state.get_peer("dev-booked").unwrap().ip, "10.0.0.8", "地址同理");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 两张表**互斥**：学到名字/地址时记进观察记忆那一档（未配对、且不在地址簿）；
+    /// 进了地址簿（配对 / 手动添加）就把那一格删掉，出了地址簿（解除配对）再记回来。
+    #[test]
+    fn the_known_table_and_the_address_book_never_hold_the_same_id() {
+        let state = memory_state();
+        // 未配对、也不在地址簿：学到名字与地址 → 记进观察记忆。
+        state.upsert_peer(&PeerDevice {
+            id: "dev-n".into(),
+            name: "小米 15".into(),
+            ip: "10.0.0.7".into(),
+            port: 3890,
+            ..Default::default()
+        });
+        let k = state.config.lock().known_peer("dev-n").cloned().expect("该记下来");
+        assert_eq!((k.name.as_str(), k.ip.as_str(), k.port), ("小米 15", "10.0.0.7", 3890));
+
+        // 值没变就不再算"写"（调用方据此不落盘）。
+        let before = state.config.lock().known_peers.len();
+        state.note_known_peer("dev-n");
+        assert_eq!(state.config.lock().known_peers.len(), before);
+
+        // 配对（关系接管）→ 那一格删掉。
+        state.mark_paired(&PeerDevice {
+            id: "dev-n".into(),
+            name: "小米 15".into(),
+            ip: "10.0.0.7".into(),
+            port: 3890,
+            paired: true,
+            ..Default::default()
+        });
+        assert!(state.config.lock().known_peer("dev-n").is_none(), "进了地址簿就从观察记忆里删掉");
+        assert!(state.config.lock().peers.iter().any(|p| p.id == "dev-n"), "关系那一份在");
+
+        // 解除配对（关系没了）→ 观察记忆接手。
+        state.unpair("dev-n");
+        assert!(state.config.lock().known_peer("dev-n").is_some(), "出了地址簿就记回观察记忆");
+        assert!(!state.config.lock().peers.iter().any(|p| p.id == "dev-n"));
+
+        // 已配对的 id 不许被写进观察记忆（那条路由关系表自己维护）。
+        state.mark_paired(&PeerDevice {
+            id: "dev-p2".into(),
+            name: "PC-P2".into(),
+            ip: "10.0.0.12".into(),
+            port: 3890,
+            paired: true,
+            ..Default::default()
+        });
+        state.note_known_peer("dev-p2");
+        assert!(state.config.lock().known_peer("dev-p2").is_none());
+
+        // 占位名（= 设备 id）不写：那不是名字。
+        state.upsert_peer(&PeerDevice { id: "dev-ph".into(), name: "dev-ph".into(), ..Default::default() });
+        state.note_known_peer("dev-ph");
+        assert!(state.config.lock().known_peer("dev-ph").is_none());
+    }
+
+    /// 设备级链路记忆（"上次是怎么够着它的"）也补一行：**哪怕不知道它叫什么、在哪** ——
+    /// 启动第一拍就会去借那条记得的路，于是"需要中转的设备"不必先自己开口。
+    #[test]
+    fn a_remembered_relay_link_gets_a_row_at_boot() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_relayrow_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = crate::config::test_config();
+        config.device_id = "me".into();
+        config.set_relay_link("dev-via", "relay-c", "192.168.50.0/24", "2026-09-30T12:00:00Z");
+        // 只有一条链路记忆、名字与地址都没有的那种：也要补行（不然没有任何线索）。
+        crate::config::save_config_at(&dir.join("config.toml"), &config).unwrap();
+
+        let loaded = crate::config::load_config_at(&dir.join("config.toml"));
+        let state = AppState::new(loaded, dir.join("config.toml"));
+        let row = state.get_peer("dev-via").expect("记得怎么够着它的设备也要有一行");
+        assert_eq!(row.name, "dev-via", "名字先拿 id 顶着（探到之后再填）");
+        assert!(row.ip.is_empty() && row.port == 0, "地址不知道就是不知道");
+        assert!(!row.online, "状态仍然从离线起步");
+        // 关掉记忆就没有条目，也就不会有这一行（与"每次现开"的设计一致）。
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 记忆的退休：直连**连续** 3 拍可达才清（中间抖一拍就重新数）。
@@ -3798,5 +4862,187 @@ mod tests {
         let json = state.relay_traffic_json();
         assert_eq!(json["bytes"], 1300);
         assert_eq!(json["connections"], 1, "只有盲转那条算连接");
+    }
+
+    /// **地址簿里落盘的 `online` 不当首帧真相**：重启后本机一台都还没探过，那个值只是
+    /// 上一次运行留下来的残留（`set_peer_online` 从不回写它）。全信它会同时得到两种假象
+    /// —— 真不在网的设备顶着「在线」、真在网的设备先画成离线，而后者要等第一拍探活才
+    /// 纠正（真机报的"启动后 A 与 B 明明同网段，A 却先写离线、过几秒才转在线"）。
+    /// 真相只由启动即跑的第一拍探活与链路建立给出，见 `probe_peers_once` 的调用点（`lib.rs`）。
+    #[test]
+    fn persisted_online_is_not_the_first_frame() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_boot_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(AppState::new(
+            crate::config::Config {
+                device_id: "own-boot".into(),
+                device_name: "OWN".into(),
+                peers: vec![
+                    // 落盘写着"在线"的那一行（上次运行留下的，本机这一趟还没探过）
+                    PeerDevice {
+                        id: "boot-online".into(),
+                        name: "P1".into(),
+                        ip: "192.168.1.9".into(),
+                        port: 3890,
+                        online: true,
+                        paired: true,
+                        ..Default::default()
+                    },
+                    // 没有地址的那一行（配对时就没学到可拨地址）
+                    PeerDevice {
+                        id: "boot-no-addr".into(),
+                        name: "P2".into(),
+                        ip: String::new(),
+                        port: 0,
+                        online: false,
+                        paired: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            dir.join("config.toml"),
+        ));
+        for p in state.peers.lock().iter() {
+            assert!(!p.online, "首帧不许拿落盘的 online 当真相：{}", p.id);
+        }
+        // 地址簿里那份**一个字都不动**：它是用户的记录，不是"此刻在不在"——下一趟启动照样
+        // 从离线起步，再被那一趟的探活纠正。
+        assert!(
+            state.config.lock().peers.iter().any(|p| p.id == "boot-online" && p.online),
+            "落盘的 online 只是不作数，不该被重写"
+        );
+    }
+
+    /// 对端「共享项变更」的节流（`share_changed_due`）：窗口内第一条**立刻**过（正常场景零延迟），
+    /// 之后的重复一律吞掉；窗口过了又放行；节流按共享项各算各的。
+    #[test]
+    fn share_changed_is_throttled_per_share() {
+        let state = memory_state();
+        assert!(
+            state.share_changed_due("share-a"),
+            "第一条必须立刻上报 —— 正常场景（丢一个文件进共享目录）不能有延迟"
+        );
+        for _ in 0..100 {
+            assert!(
+                !state.share_changed_due("share-a"),
+                "窗口里的重复一律吞掉（实测一轮构建 1300 条/秒）"
+            );
+        }
+        assert!(state.share_changed_due("share-b"), "节流按共享项各算各的");
+        assert!(!state.share_changed_due("share-b"));
+
+        // 时间往前走一个窗口（直接改时间戳，不 sleep）：又该放行。
+        *state
+            .share_changed_at
+            .lock()
+            .get_mut("share-a")
+            .expect("刚写过") -= SHARE_CHANGED_THROTTLE * 2;
+        assert!(state.share_changed_due("share-a"), "过了窗口就该再放行一次");
+    }
+
+    /// 设备行的预算（[`MAX_UNBOOKED_ROWS`]）：**没有归宿**的行（不在地址簿、没配对、不在
+    /// 两档 TTL 里、不在线、没被 mDNS 看见）才是别人能无限往里塞的那一类 —— 只收它们，
+    /// 收的是最老的那几行；有归宿的一个都不许动（那是用户眼里的"设备没了"）。
+    #[test]
+    fn unbooked_rows_are_kept_within_budget() {
+        let state = memory_state();
+
+        // 一行"有归宿"的：在地址簿里，而且此刻在线 —— 预算再紧也不许碰它。
+        state.add_peer_book(PeerDevice {
+            id: "booked".into(),
+            name: "BOOKED".into(),
+            ip: "10.198.1.5".into(),
+            port: 3890,
+            online: true,
+            paired: false,
+            ..Default::default()
+        });
+
+        // 一批"没有归宿"的（未配对设备每 5s 探活走到 `observe_verified_addr` 时的样子），
+        // 靠前的先建 → 也就是最老的。
+        let extra = MAX_UNBOOKED_ROWS + 5;
+        for i in 0..extra {
+            state.observe_verified_addr(&format!("ghost-{i:03}"), "10.198.9.9", 3890);
+        }
+        // 每一行都过了预算（`observe_verified_addr` 建新行之后就会跑一次），所以收到上限为止。
+        let ids: Vec<String> = state.peers.lock().iter().map(|p| p.id.clone()).collect();
+        let ghosts = ids.iter().filter(|id| id.starts_with("ghost-")).count();
+        assert_eq!(ghosts, MAX_UNBOOKED_ROWS, "没有归宿的行收到预算为止：{ids:?}");
+        assert!(ids.iter().any(|id| id == "booked"), "地址簿里那行不许被收掉");
+        assert!(
+            !ids.iter().any(|id| id == "ghost-000"),
+            "先建的那几行（最老的）先走：{ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id == &format!("ghost-{:03}", extra - 1)),
+            "刚建的那一行必须留着"
+        );
+
+        // 反例：其它条件全中，但只要它"看得见"（mDNS 有记录）或"在线"，就不收。
+        state.observe_verified_addr("seen-row", "10.198.9.10", 3890);
+        state.seen.lock().insert("seen-row".into(), Instant::now());
+        state.observe_verified_addr("online-row", "10.198.9.11", 3890);
+        if let Some(p) = state.peers.lock().iter_mut().find(|p| p.id == "online-row") {
+            p.online = true;
+        }
+        for i in 0..extra {
+            state.observe_verified_addr(&format!("flood-{i:03}"), "10.198.9.12", 3890);
+        }
+        let ids: Vec<String> = state.peers.lock().iter().map(|p| p.id.clone()).collect();
+        assert!(ids.iter().any(|id| id == "seen-row"), "看得见的行不许被收");
+        assert!(ids.iter().any(|id| id == "online-row"), "在线的行不许被收");
+
+        // 反例之二（`heard` 之后新增的那一格）：**只被"刚听到过"撑着、本机一条路都没有**的行
+        // 照旧算"没有归宿"。`online` 现在也能由"刚听到过它"撑起来，而那一条**别人一条报文
+        // 就能给**（未配对的会话信封不需要 token）—— 只认 `online`，一台换着 id 发报文的
+        // 机器就能攒出一堆收不走、还要每 5s 被探活敲一次的行。
+        state.note_heard_online("heard-row"); // 表里没有这一行：它连行都不该建出来
+        assert!(state.get_peer("heard-row").is_none(), "载荷里的 id 不配凭空建行");
+        state.upsert_peer(&PeerDevice {
+            id: "heard-row".into(),
+            name: "heard-row".into(),
+            ..Default::default()
+        });
+        state.note_heard_online("heard-row");
+        assert!(state.get_peer("heard-row").unwrap().online, "前提：它此刻算在线");
+        assert!(!state.get_peer("heard-row").unwrap().dialable(), "前提：本机没有它的路");
+        for i in 0..extra {
+            state.observe_verified_addr(&format!("heardflood-{i:03}"), "10.198.9.13", 3890);
+        }
+        let ids: Vec<String> = state.peers.lock().iter().map(|p| p.id.clone()).collect();
+        assert!(
+            !ids.iter().any(|id| id == "heard-row"),
+            "只被听到过、本机一条路都没有的行照旧可收：{ids:?}"
+        );
+    }
+
+    /// 只有"刚听到过"撑着的那一类行（`adopted`：探活跳过它、mDNS 从没提过它）在证据过期时
+    /// 要**自己落回离线** —— 不然它会一直挂着"在线"，直到 900s 的 `ADOPTED_TTL` 把整行收走
+    /// （那是"设备行永远停在在线"的新来源，本轮 `heard` 引入的）。
+    #[test]
+    fn an_adopted_row_falls_back_offline_when_being_heard_expires() {
+        let state = memory_state();
+        state.adopt_devices(
+            &[crate::relay::RouteDevice {
+                id: "dev-ad".into(),
+                name: "AD".into(),
+                ip: "10.55.0.9".into(),
+                port: 3890,
+            }],
+            &[],
+        );
+        assert!(state.is_adopted("dev-ad"));
+        state.note_heard_online("dev-ad");
+        assert!(state.get_peer("dev-ad").unwrap().online, "刚听到过 = 在线");
+
+        // 探活那一拍收走过期的记录 —— 同一个时刻它就该被标回离线。
+        state.heard.lock().insert(
+            "dev-ad".into(),
+            Instant::now() - HEARD_TTL - Duration::from_secs(1),
+        );
+        state.prune_heard();
+        assert!(!state.get_peer("dev-ad").unwrap().online, "证据过期要如实落回离线");
+        assert!(!state.heard_recently("dev-ad"));
     }
 }

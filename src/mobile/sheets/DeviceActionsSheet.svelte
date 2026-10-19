@@ -6,7 +6,7 @@
 
   let { peerId, onClose }: { peerId: string; onClose: () => void } = $props();
 
-  const d = $derived(devices.getDevices().find((x) => x.id === peerId));
+  const d = $derived(devices.deviceById(peerId));
 
   // 设备在表开着的时候被删掉（对端注销、别处解除了配对）这张表就没有主语了：收起，
   // 而不是留一张指着空气的操作表（原型是 `if (!d) return;` —— 它连表都不开）。

@@ -2,7 +2,7 @@
  * 发布工具链的共用底座：日志、外部命令、semver/versionCode、配置加载、清单 URL 拼接。
  *
  * 为什么单独抽一层：`release.mjs` 与 `dev-mirror.mjs` 必须读**同一份** `release.local.json`
- * （发布仓路径、镜像台地址前缀要对得上），各写一份迟早会漂；而 `update.json` 里的
+ * （仓库根路径、镜像台地址前缀要对得上），各写一份迟早会漂；而 `update.json` 里的
  * `mirrors` 顺序（GitHub 前、Gitee 后）与 `versionCode` 算法也都是两处共用的契约。
  */
 import { spawnSync } from "node:child_process";
@@ -131,8 +131,6 @@ function deepMerge(base, patch) {
 }
 
 const DEFAULTS = {
-  // 发布仓默认放在源码仓旁边（源码仓之外，独立 git 仓库）
-  releasesRepo: path.resolve(ROOT, "..", "OrbDrop-releases"),
   // owner/repo 必须与客户端**编译期常量**一致（src-tauri/src/update/mod.rs 的 MANIFEST_ENDPOINTS：
   // github.com/x177plus/OrbDrop/releases/latest/download/update.json 与 gitee.com/x177plus/OrbDrop/raw/master/update.json），
   // 否则清单与资产 URL 会指到别的仓库，客户端读不到。配置里显式写了就以配置为准（写空字符串也能覆盖默认值）。
@@ -165,10 +163,16 @@ export function loadConfig() {
   } catch (e) {
     die(`发布配置不是合法 JSON：${rel(src)}`, e.message);
   }
+  // 已废弃的 `releasesRepo`（曾经指向旁边那个独立发布仓）：报错，别静默忽略 ——
+  // 免得配置里还钉着旧路径，人以为产物落到了那里。
+  if (Object.hasOwn(raw, "releasesRepo")) {
+    die(`配置里有已废弃的 releasesRepo：${rel(src)}`,
+      "独立的发布仓已取消：清单与产物缓存直接落在本仓根目录（repoPath 恒为本仓根）。把配置里 releasesRepo 这一段删掉。");
+  }
   const cfg = deepMerge(DEFAULTS, raw);
   cfg.__source = src;
-  // 相对路径按**源码仓根目录**解析：不跟当前工作目录挂钩，从哪个目录调都一样
-  cfg.repoPath = path.resolve(ROOT, String(cfg.releasesRepo));
+  // 清单仓 = 源码仓：repoPath 恒为本仓根目录，不再另开一个发布仓
+  cfg.repoPath = ROOT;
   return cfg;
 }
 
@@ -184,7 +188,7 @@ export const tagOf = (cfg, version) => `${cfg.tagPrefix}${version}`;
 
 /**
  * 清单里的 mirrors：**GitHub 在前、Gitee 在后**（客户端先试 GitHub，超时/太慢再切 Gitee）。
- * 本机演练时换成镜像台地址：`/gh/**` 与 `/gitee/**` 分别映射到发布仓根目录，所以
+ * 本机演练时换成镜像台地址：`/gh/**` 与 `/gitee/**` 分别映射到仓库根目录，所以
  * `assets/v{ver}/orbdrop.exe` 在这里就是 `<base>/gh/assets/v{ver}/orbdrop.exe`。
  */
 export function mirrorsFor(cfg, version, file, { local = false } = {}) {
@@ -202,7 +206,7 @@ export function mirrorsFor(cfg, version, file, { local = false } = {}) {
 /**
  * 客户端的清单地址是**编译期常量**（不进清单），所以发布侧必须往这两个地方都放 update.json：
  *  - GitHub：本次 Release 的附件（`latest/download` 别名要求该 Release 不是 prerelease/draft）
- *  - Gitee：发布仓分支上的仓库文件（raw 直出）
+ *  - Gitee：本仓分支（master）上的仓库文件（raw 直出）
  */
 export function manifestUrls(cfg) {
   return [

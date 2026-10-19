@@ -24,6 +24,31 @@ use crate::ws::events::WsEvent;
 // WS Manager
 // ---------------------------------------------------------------------------
 
+/// 出站事件队列的容量（**有界**，两条会话（入站 `session.rs` / 拨号 `spawn_outbound_link`）
+/// 共用这一个数）。
+///
+/// 为什么必须有界：消费方把 `write.send(..).await` **写在 `select!` 的臂里**（单任务
+/// 结构，见 `run_inbound_session` 的说明）—— 写一阻塞，`rx` 就再没人 poll，队列静默长大。
+/// 对端笔记本一休眠（TCP 窗口关死、没有 FIN）、进程被挂起，本机这边的聊天、广播共享项
+/// （`share::watcher` 每批一条 `ShareChanged`）、推送进度就全堆在这条队列里；旧实现是无界
+/// 通道，那是"几个 GB 的内存"和"客户端悄悄卡住"的区别。
+///
+/// 8 千这个数从**生产方最密的一次突发**倒推，不是随手取整：
+///
+/// - 最密的一批是共享变更：`share::watcher` 每个 300ms 窗口最多发
+///   `MAX_PENDING` = 4096 条（那是"一批"的上界），而一次大目录复制期间可能同时有两个
+///   共享项各发一批 —— 8192 正好装得下"两批满额"。
+/// - 界取得比这更小，就会**在正常路径上掐线**（对端只是文件系统/网络喘了一下，
+///   队列却因为一次合法突发而满），那正是要避免的事。界更大没有意义：真到"对端不读"，
+///   内核发送缓冲（几十 KB~几 MB）先被填满，之后队列才开始积，积多少都救不回来。
+/// - 内存上界：`ShareChanged` 这一档事件百字节级，8192 条 ≈ 1~2 MB / 会话，而会话数由
+///   已配对设备数与连接上限约束 —— 从无界变成有界，且是"几百 KB 级"的有界。
+///
+/// 满了怎么办（策略只此一条）：`WsManager::send` 掐掉这条会话（`send` 返回 false =
+/// 既有语义里的"此刻没有长连接"，调用方照旧退回 HTTP 那条路）。**不丢事件改投**：
+/// 聊天消息/回执没有等价的 HTTP 兜底，丢一条就是用户看得见的消息消失。
+pub(crate) const EVENT_QUEUE_CAPACITY: usize = 8192;
+
 /// One live WS session with a peer.
 ///
 /// `gen` identifies the session for [`WsManager::unregister`]: only the session
@@ -32,7 +57,9 @@ use crate::ws::events::WsEvent;
 /// what ends an inbound session, the two links then kill each other.
 struct Session {
     gen: u64,
-    tx: mpsc::UnboundedSender<WsEvent>,
+    /// 有界队列的发送端：容量与理由见 [`EVENT_QUEUE_CAPACITY`]。丢弃它 = 那条会话的
+    /// `rx.recv()` 立刻返回 `None`（"本机断开"的既有收尾方式）。
+    tx: mpsc::Sender<WsEvent>,
 }
 
 /// 拨号循环对外可见的状态。
@@ -143,15 +170,43 @@ impl WsManager {
     }
 
     /// Send an event to a connected peer; returns false if not connected.
+    ///
+    /// 队列**有界**（[`EVENT_QUEUE_CAPACITY`]）。满 = 对端已经不读那条套接字了：消费方同
+    /// 时也是写方（`write.send(..).await` 卡在 `select!` 的臂里），没人再 poll `rx`，
+    /// 连"3 次丢 pong"那个兜底也卡在同一个任务里等不到。此时唯一正确的做法是**掐掉这条
+    /// 会话**（丢掉它的 sender → 它的 `rx.recv()` 立刻返回 `None` → 会话自己收尾注销），
+    /// 而不是继续往队列里塞 —— 塞下去只是把本机内存吃光，而且"没有长连接"那条既有语义
+    /// （`send` 返回 false）正是调用方要的：回执/推送/共享变更照旧退回 HTTP 那条路。
+    ///
+    /// **不选"丢事件"那条策略**：聊天消息与回执没有等价的 HTTP 兜底（丢一条就是用户看得见
+    /// 的消息消失），而掐线至少是"这段链路不成立"，两边都会在界面上如实说出来。
     pub fn send(&self, peer_id: &str, event: WsEvent) -> bool {
         let mut senders = self.senders.lock();
         let Some(sessions) = senders.get_mut(peer_id) else { return false };
         // 新会话优先；它刚死掉时（还没注销）退回旧会话。
         while let Some(session) = sessions.last() {
-            if session.tx.send(event.clone()).is_ok() {
-                return true;
+            // `gen` 先取出来（日志要用），投递结果单独接住：`session` 的借用到此为止，
+            // 下面那两个分支才能动 `sessions`。
+            let gen = session.gen;
+            let outcome = session.tx.try_send(event.clone());
+            match outcome {
+                Ok(()) => return true,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // 消费方已经没了（会话正在收尾）：这一格作废。
+                    sessions.pop();
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // 停滞：这条会话不再读队列（见上面）。掐线，把"现在没有长连接"如实
+                    // 交回给调用方 —— 日志每会话至多一次（这一格马上被丢掉）。
+                    warn!(
+                        %peer_id,
+                        gen,
+                        capacity = EVENT_QUEUE_CAPACITY,
+                        "WS 出站队列已满（对端不再读取）：断开这条会话，调用方退回 HTTP"
+                    );
+                    sessions.pop();
+                }
             }
-            sessions.pop();
         }
         senders.remove(peer_id);
         false
@@ -175,7 +230,10 @@ impl WsManager {
 
     /// Register a session's channel; returns the generation to hand back to
     /// [`WsManager::unregister`].
-    pub fn register(&self, peer_id: &str, tx: mpsc::UnboundedSender<WsEvent>) -> u64 {
+    ///
+    /// 入参是**有界**通道的发送端（[`EVENT_QUEUE_CAPACITY`]）：容量由会话自己建通道时定，
+    /// 这里只是收下来（`send` 据此判"对端还读不读"）。
+    pub fn register(&self, peer_id: &str, tx: mpsc::Sender<WsEvent>) -> u64 {
         let gen = self.next_gen.fetch_add(1, Ordering::Relaxed);
         let mut senders = self.senders.lock();
         let slot = senders.entry(peer_id.to_string()).or_default();
@@ -584,7 +642,10 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
                     idle_logged = false;
 
                     let (mut write, mut read) = ws_stream.split();
-                    let (tx, mut rx) = mpsc::unbounded_channel::<WsEvent>();
+                    // 队列**有界**：对端不读时（写卡在下面的 `select!` 臂里、`rx` 没人 poll）
+                    // 它由 `WsManager::send` 掐线，不会无声长下去（容量与理由见
+                    // `EVENT_QUEUE_CAPACITY`）。
+                    let (tx, mut rx) = mpsc::channel::<WsEvent>(EVENT_QUEUE_CAPACITY);
                     let gen = state.ws.register(&peer_id, tx);
                     state.emit_devices_changed();
                     // 同 `run_inbound_session`：链路上来了补一次已读回执。
@@ -804,5 +865,28 @@ mod tests {
 
         ws.clear_link_state("peer-a");
         assert!(!ws.needs_repair("peer-a"));
+    }
+
+    /// 出站队列**有界**、且满了就按停滞处理：掐线（`send` 返回 false → 调用方退回 HTTP），
+    /// 绝不继续往队列里堆。容量之内那一段同时钉住"正常路径一条不丢"。
+    #[test]
+    fn a_full_queue_disconnects_the_session_instead_of_growing() {
+        let ws = WsManager::new();
+        let (tx, rx) = mpsc::channel::<WsEvent>(EVENT_QUEUE_CAPACITY);
+        ws.register("peer-a", tx);
+        let event = WsEvent::PeerOffline { peer_id: "peer-a".into() };
+
+        for i in 0..EVENT_QUEUE_CAPACITY {
+            assert!(ws.send("peer-a", event.clone()), "容量之内第 {i} 条不该失败");
+        }
+        assert_eq!(rx.len(), EVENT_QUEUE_CAPACITY, "容量之内一条都不该丢");
+        assert!(ws.has_connection("peer-a"), "还没满，链路照旧算在册");
+
+        assert!(
+            !ws.send("peer-a", event),
+            "满了必须掐线（返回 false = 既有语义里的「此刻没有长连接」）"
+        );
+        assert!(!ws.has_connection("peer-a"), "掐线 = 注销这条会话（调用方据此退回 HTTP）");
+        assert_eq!(rx.len(), EVENT_QUEUE_CAPACITY, "队列自己不再长");
     }
 }

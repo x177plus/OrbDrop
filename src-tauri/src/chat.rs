@@ -347,6 +347,29 @@ impl ChatStore {
         Snapshot { convos: views, batches: guard.batches.clone(), unread }
     }
 
+    /// 每台设备**最后一个非空的、对端自己报过的名字**（`设备 id → 名字`）。
+    ///
+    /// 名字的第二个来源（第一个是设备行那份观察值）：对端自己发来的消息带着它当时的设备名，
+    /// 落在这里、跨重启还在。用途见 `AppState::new` —— 启动时用它给**占位名**的设备行播种，
+    /// 否则"设备列表/会话列表先显示一串 deviceid"要等到第二次观察（探活回话 / 它再开口）。
+    ///
+    /// 只认对端发来的那几条（`from_me` 的 `from_name` 按约定是空串）、空串一律跳过；
+    /// 从最后一条往前找，找到就用（"它现在叫什么"比"它当年叫什么"更接近事实）。
+    pub fn last_inbound_names(&self) -> HashMap<String, String> {
+        let guard = self.inner.lock();
+        let mut out = HashMap::new();
+        for (peer_id, convo) in guard.convos.iter() {
+            for m in convo.messages.iter().rev() {
+                let name = m.from_name.trim();
+                if !m.from_me && !name.is_empty() {
+                    out.insert(peer_id.clone(), name.to_string());
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     /// 本机发出一条消息：每台目标各存一份（同一个 id），送达状态逐台记。
     ///
     /// `targets` 已经由调用方定过这一份的初态（`send_text` / `send_image`）：`Sent` = 写进了
@@ -901,7 +924,11 @@ async fn deliver_http(state: &Arc<AppState>, peer_id: &str, event: &crate::ws::e
         Ok(v) => v,
         Err(_) => return Outcome::Rejected,
     };
-    body["port"] = serde_json::json!(state.server_port.load(std::sync::atomic::Ordering::Relaxed));
+    // 端口报**本机实际在听的那个**：`server_port` 是"服务器绑好了没有"的原子，服务器还没
+    // 起来（或被重启的窗口里）它是 0 —— 对端照 0 记下来的地址永远拨不动（那一行于是永久
+    // 停在离线）。`listening_port()` 就是这一处的收口（服务器没起时退回配置端口，与
+    // `/pair/info`、中转控制面报的是同一个数）。
+    body["port"] = serde_json::json!(state.listening_port());
     body["sender"] = serde_json::json!({ "id": own_id, "name": own_name });
 
     let url = format!("{}{}", crate::net::peer_base(host, port), path);
@@ -975,7 +1002,14 @@ pub fn send_text(
 ) -> SendResult {
     let id = uuid::Uuid::new_v4().to_string();
     let at = at.unwrap_or_else(now_ms);
-    let event = crate::ws::events::WsEvent::ChatText { id: id.clone(), text: text.to_string(), at };
+    let event = crate::ws::events::WsEvent::ChatText {
+        id: id.clone(),
+        text: text.to_string(),
+        at,
+        // 本机此刻的名字：长连接那条路上没有信封，接收方只能从这里知道"这台叫什么"
+        // （否则它只能拿设备表里那份占位名 —— 表现就是一串 deviceid）。
+        from_name: state.config.lock().device_name.clone(),
+    };
     let (deliveries, inflight) = dispatch(state, targets, &event);
     // 多台 = 群发（复用/新建一份名单）；单台且没点名某个群发 = 一对一发。
     let batch = match (batch_id, targets.len() > 1) {
@@ -1021,6 +1055,8 @@ pub fn send_image(
         name: name.to_string(),
         size: bytes.len() as u64,
         data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        // 与 `ChatText` 同一条理由：名字只用来填对端的占位行。
+        from_name: state.config.lock().device_name.clone(),
     };
     let (deliveries, inflight) = dispatch(state, targets, &event);
     let batch = match (batch_id, targets.len() > 1) {
@@ -1138,13 +1174,18 @@ pub fn accept_inbound_image(
 ///
 /// 文字那一档直接从消息本体拼；图片那一档得回 `blobs` 把内容读回来（消息里只存了名字与字节数）
 /// —— 读不到就是"这条送不出去了"（`Err`，调用方落「未送达」，见 `flush_queued`）。
-fn queued_event(msg: &ChatMessage, root: &std::path::Path) -> Result<crate::ws::events::WsEvent, String> {
+fn queued_event(
+    msg: &ChatMessage,
+    root: &std::path::Path,
+    from_name: &str,
+) -> Result<crate::ws::events::WsEvent, String> {
     use base64::Engine;
     if !msg.image {
         return Ok(crate::ws::events::WsEvent::ChatText {
             id: msg.id.clone(),
             text: msg.text.clone(),
             at: msg.at,
+            from_name: from_name.to_string(),
         });
     }
     let bytes = crate::blobs::read_in(root, &msg.id, &msg.name)
@@ -1155,6 +1196,7 @@ fn queued_event(msg: &ChatMessage, root: &std::path::Path) -> Result<crate::ws::
         name: msg.name.clone(),
         size: bytes.len() as u64,
         data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        from_name: from_name.to_string(),
     })
 }
 
@@ -1185,7 +1227,10 @@ pub fn flush_queued(state: &Arc<AppState>, peer_id: &str) {
     crate::task::spawn("chat flush", async move {
         loop {
             while let Some(msg) = state.chat.next_queued(&peer) {
-                let event = match queued_event(&msg, state.chat.blobs_root()) {
+                // 补发也要带上本机此刻的名字（与第一次发出去时同一条理由：接收方只能从这里
+                // 知道"这台叫什么"，否则它只能拿设备表里那份占位名）。
+                let own_name = state.config.lock().device_name.clone();
+                let event = match queued_event(&msg, state.chat.blobs_root(), &own_name) {
                     Ok(event) => event,
                     Err(reason) => {
                         // 内容不在了（图片消息那几 MB 的字节没落下来 / 被人删了）：这一条
@@ -1431,16 +1476,21 @@ mod tests {
             None,
         );
         let msg = s.next_queued("a").expect("排队了就该取得到");
-        match queued_event(&msg, &root) {
-            Ok(crate::ws::events::WsEvent::ChatImage { name, data, size, .. }) => {
+        match queued_event(&msg, &root, "PC-ME") {
+            Ok(crate::ws::events::WsEvent::ChatImage { name, data, size, from_name, .. }) => {
                 assert_eq!(name, "图片.png");
                 assert_eq!(size, 4);
                 assert_eq!(data, "REFUQQ==", "base64(DATA)");
+                // 补发这一跳也要带着本机名字（接收方靠它填占位行）。
+                assert_eq!(from_name, "PC-ME");
             }
             other => panic!("应当是图片事件：{other:?}"),
         }
         crate::blobs::remove_in(&root, "img-1", "图片.png");
-        assert!(queued_event(&msg, &root).is_err(), "内容不在了要报错，不能装作发得出去");
+        assert!(
+            queued_event(&msg, &root, "PC-ME").is_err(),
+            "内容不在了要报错，不能装作发得出去"
+        );
     }
 
     /// 落定的规矩：**只从"还没定"的那两档（在途 / 排队）改到终态** —— 已读不回退成

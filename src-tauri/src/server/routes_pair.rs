@@ -7,9 +7,11 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::config::PeerDevice;
 use crate::credential;
 use crate::net;
 use crate::pair;
+use crate::server::auth::bearer_token;
 use crate::state::AppState;
 use crate::ws;
 use crate::ws::events::ui;
@@ -52,6 +54,99 @@ pub async fn pair_info(
         // 但这是**活回话**（网卡换了当场就变），TXT 只是注册那一刻的快照。
         "nets": crate::subnet::format_list(&crate::subnet::host_nets()),
     }).into()
+}
+
+/// POST /pair/hello 的请求体：**添加方**自报身份（地址不在这里 —— 取 TCP 来源）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairHello {
+    /// 添加方的设备 id。
+    pub peer_id: String,
+    /// 添加方的显示名。
+    pub peer_name: String,
+    /// 添加方**实际监听**的端口（服务器顺延过的话，配置值是不对的，见 `/pair/info`）。
+    pub port: u16,
+}
+
+/// POST /pair/hello —— 「手动添加」的另一半（F-11）：被添加的那一方据此把添加者记成一行。
+///
+/// 手动添加是**手动版的 mDNS**：同网段时两边本来就互相看得见（`discover::scan` 收到一条
+/// 公告就各建一行），而 mDNS 跨不过路由 —— 跨网段只剩这一条单播。所以添加成功后由添加方到
+/// 它刚探测过的那个地址上自报一次，让对方也有一行：对方的设备列表里出现本机、它的配对弹窗
+/// 里能选中本机，用户才有地方输本机屏幕上那 6 位码（没有这一行时，跨网段那台**根本没法
+/// 发起配对** —— `pair_confirm` 要求设备行已存在）。
+///
+/// **只建行，不建关系**：配对、长连接、共享、推送同意制一条都不动。这一行就是"未绑定"。
+///
+/// 信任分档与入站会话（`routes_chat::accept`）逐条同规：
+/// - 自称的是本机**已配对**的设备 → 必须出示本机给它铸的那枚 token。否则谁都能自称你的
+///   老搭档，把那一行的地址改写到他自己那个地址上（`upsert_peer` 对已有行会改写 `ip`）；
+/// - 其余（没见过的 id / 未绑定）→ 不验：这一行的地址取 **TCP 来源**（不可伪造）、端口取
+///   它自报的服务端口 —— 与一条 mDNS 公告是同一档证据，兜底的是 `upsert_peer` 的行预算
+///   （`MAX_UNBOOKED_ROWS`）与"未绑定的离线行不列"（`visibleDevices`）。
+///
+/// 本机隐身/离线时入站整个被 `presence_middleware` 拦成 503（与 mDNS 注销广播同一件事）；
+/// 添加方那边是 best-effort，收不到就算了，添加在本机已经成立。
+pub async fn pair_hello(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<PairHello>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let peer_id = req.peer_id.trim().to_string();
+    if peer_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "缺少 peerId".into()));
+    }
+    // 自称是本机自己：id 是每份数据目录一份的随机值，"另一台设备拿着本机的 id"只可能是
+    // 抄了配置/伪造。收下它就等于给本机列表里插一行"自己"（地址还是别人的），后面所有关系
+    // 判定都跟着乱 —— 与手动添加那一侧的"填的是本机自己的地址"同一个口径，直接拒。
+    if peer_id == state.config.lock().device_id {
+        info!(%peer_id, "手动添加的自报被拒：自称是本机自己");
+        return Err((StatusCode::BAD_REQUEST, "不能把本机自己加进来".into()));
+    }
+    let paired = state.get_peer(&peer_id).is_some_and(|p| p.paired);
+    if paired {
+        let claimed =
+            bearer_token(&headers).and_then(|t| ws::session::peer_id_from_token(&state, &t));
+        if claimed.as_deref() != Some(peer_id.as_str()) {
+            info!(%peer_id, "手动添加的自报被拒：自称已配对设备但 token 不认");
+            return Err((StatusCode::UNAUTHORIZED, "身份校验失败".into()));
+        }
+    }
+
+    // 来源地址要在**不是本机自己的监听端点**时才是一次可用的观察，理由与入站会话那一跳
+    // 完全相同（模拟器/NAT 后面的对端会把自己看到的本机地址回连进来；经中转来的那一跳的
+    // 来源是中转方）。那种情形一行都不记：没有可拨的地址，可达性只能由长连接证明。
+    let (ip, port, online) =
+        match net::observed_dial_target(addr.ip(), req.port, state.listening_port()) {
+            Some((ip, port)) if !state.is_relayed_source(addr.ip(), &peer_id) => (ip, port, true),
+            _ => (String::new(), 0, false),
+        };
+    let row = PeerDevice {
+        id: peer_id.clone(),
+        name: req.peer_name.clone(),
+        ip,
+        port,
+        online,
+        paired,
+        auto_connect: false,
+        paused: false,
+        relay: None,
+    };
+    state.upsert_peer(&row);
+    // 记成什么要跟着日志走：`online=false`（来源地址是本机自己 / 像"经中转来的"）时那一行是
+    // **未绑定 + 离线**，而界面按 `visibleDevices` 不列未绑定的离线行 —— 用户那边就是"对方
+    // 添加了我，我却没看见"。这一行日志是唯一能分清"报文根本没到"与"到了但这一格没认下"的地方。
+    info!(
+        %peer_id,
+        name = %row.name,
+        paired,
+        ip = %row.ip,
+        port = row.port,
+        online = row.online,
+        "对方手动添加了本机，已登记设备行"
+    );
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]
@@ -429,6 +524,94 @@ mod tests {
             StatusCode::FORBIDDEN,
             "邀请要挂到通知里等用户决定（由撤回/超时收场），不能是 401"
         );
+
+        crate::server::stop_server(&state).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 手动添加的另一半（F-11）：被添加的一方据此也建一行，而这一行是**低信任**的。
+    ///
+    /// 三档一次测完：
+    /// - 没见过的 id：不验凭据，落一行"未绑定"（地址取 TCP 来源、端口取它自报的那个）；
+    /// - 自称本机**已配对**的设备却拿不出凭据：401，且那一行一个字都不动 —— 地址不会被改写到
+    ///   来源地址上。这一档挡的就是"自称你的老搭档，把那一行指到他自己身上"的冒充者；
+    /// - 同一台带上本机铸给它的那枚 token：放行（"重新添加一台已配对设备的地址"走这一档）。
+    #[tokio::test]
+    async fn the_hello_route_registers_the_adder_without_trusting_a_paired_claim() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_hello_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(AppState::new(crate::config::test_config(), dir.join("config.toml")));
+        let port = crate::server::start_server_loopback(state.clone(), 4321)
+            .await
+            .expect("server start");
+        let url = format!("http://127.0.0.1:{port}/pair/hello");
+        let post = |body: serde_json::Value, token: Option<&'static str>| {
+            let url = url.clone();
+            async move {
+                let mut req = reqwest::Client::new().post(&url).json(&body);
+                if let Some(t) = token {
+                    req = req.bearer_auth(t);
+                }
+                req.send().await.unwrap()
+            }
+        };
+        let body = |id: &str, name: &str| {
+            serde_json::json!({ "peerId": id, "peerName": name, "port": 3890 })
+        };
+
+        // ① 没见过的 id：进设备表，未绑定 + 在线，地址是这条 TCP 连接的来源。
+        assert_eq!(
+            post(body("peer-new", "PC-N"), None).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        let row = state.get_peer("peer-new").expect("被添加的一方要建这一行");
+        assert!(!row.paired, "只建行、不建关系");
+        assert!(row.online);
+        assert_eq!((row.ip.as_str(), row.port), ("127.0.0.1", 3890));
+
+        // ①之二 自称是本机自己：不是本机自己加自己（`manual_peer` 那一侧也拦着这个），直接拒。
+        let own_id = state.config.lock().device_id.clone();
+        assert_eq!(
+            post(body(&own_id, "本机"), None).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(state.get_peer(&own_id).is_none(), "设备表里不许冒出本机自己那一行");
+
+        // ② 自称已配对、拿不出凭据 → 401，那一行原样不动。
+        state.mark_paired(&PeerDevice {
+            id: "peer-p".into(),
+            name: "PC-P".into(),
+            ip: "10.0.0.5".into(),
+            port: 4000,
+            online: true,
+            paired: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            post(body("peer-p", "冒充者"), None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let row = state.get_peer("peer-p").unwrap();
+        assert_eq!(
+            (row.ip.as_str(), row.port, row.name.as_str()),
+            ("10.0.0.5", 4000, "PC-P"),
+            "冒充者不许把那一行改到他自己身上"
+        );
+
+        // ③ 带上本机铸给它的那枚 token：放行（这一档是"重新添加一台已配对设备的地址"）。
+        //
+        // 地址那一格在这里**不能断言**：回环上所有连接都来自 `127.0.0.1`，而 ① 刚建的那一行
+        // 正占着这个来源地址 → `is_relayed_source` 会判定"这条连接可能是经它中转来的"，
+        // 按规矩不记地址（真机上"两台设备共用一个来源地址"就是中转那一跳）。地址取自
+        // TCP 来源这件事由 `a_manual_add_shows_up_on_the_peer_as_an_unbound_row` 在内网
+        // 地址上走真 TLS 验。
+        crate::credential::set_peer_credential("peer-p", "tok-hello", "").unwrap();
+        assert_eq!(
+            post(body("peer-p", "PC-P"), Some("tok-hello")).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        let row = state.get_peer("peer-p").unwrap();
+        assert!(row.paired && row.name == "PC-P", "凭据对得上：这一行照旧");
 
         crate::server::stop_server(&state).await;
         let _ = std::fs::remove_dir_all(&dir);

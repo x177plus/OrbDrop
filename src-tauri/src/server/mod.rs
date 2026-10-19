@@ -114,6 +114,9 @@ fn build_router(state: Arc<AppState>) -> Router {
     // 各自的认人规则写在 handler 里（routes_push::authorize / push_invite_handler）。
     let public_routes = Router::new()
         .route("/pair/info", axum::routing::get(routes_pair::pair_info))
+        // 「手动添加」的另一半（F-11）：被添加的一方据此也建一行（低信任，与 mDNS 公告同档；
+        // 自称已配对设备仍要出示 token）。添加方那边 best-effort。
+        .route("/pair/hello", axum::routing::post(routes_pair::pair_hello))
         .route("/pair", axum::routing::post(routes_pair::pair_handshake))
         .route(
             "/pair/invite",
@@ -281,6 +284,12 @@ fn build_router(state: Arc<AppState>) -> Router {
     // **不能挂 CORS 层**（同 `proxy_routes` 那条）：tower-http 的 CORS 会把 OPTIONS 直接
     // 抢答成 preflight 响应，而 BC 正是用 `OPTIONS` 协商 DAV 能力（`DAV: 1,2`）。
     // 路径命名空间用 shareId：共享项名字带空格/中文且会和上面的 REST 路由抢前缀。
+    //
+    // 这里**不挂 `DefaultBodyLimit`**（与 `/push/*` 那几条不同）：那一层只对走
+    // `into_limited_body()` 的提取器生效，而 DAV 的 `PUT` 是在 `routes_dav::write_response`
+    // 里直接吃 `req.into_body().into_data_stream()`（为了流式落盘，不把整份文件读进内存），
+    // 上限挂在这儿等于不生效。PUT 的体积上限因此写在 `write_response` 里
+    // （`PUT_BODY_LIMIT`，`Content-Length` 预检 + 流上 `take` 双保险）。
     let dav_routes = Router::new()
         .route(
             "/dav/{share_id}",

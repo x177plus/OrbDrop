@@ -171,11 +171,14 @@ pub struct UpdateSettingsRequest {
     /// 字段缺失 = 沿用 `Config` 的缺省（关），不是替用户打开。
     #[serde(default)]
     pub auto_broadcast_new: bool,
-    /// 是否允许本机为群聊中转消息（设置里的「允许为群聊中转消息」，默认关）。
-    #[serde(default)]
+    /// 是否允许本机为群聊中转消息（设置里的「允许中转」那颗开关管的第二条路，默认开）。
+    /// 缺省用配置的缺省（**开**）而不是 `bool::default()`（关）：老界面不带这个字段时，
+    /// 不该把用户已经开着的开关悄悄关掉。
+    #[serde(default = "config::default_relay_enabled")]
     pub group_relay: bool,
-    /// 是否允许本机替其它设备中转字节（设置里的「允许为其它设备中转」，默认关，F-106）。
-    #[serde(default)]
+    /// 是否允许本机替其它设备中转字节（设置里的「允许中转」，默认开，F-106）。缺省同
+    /// `group_relay`：**开**。
+    #[serde(default = "config::default_relay_enabled")]
     pub allow_relay: bool,
     /// 记住并自动复用跨网段中转（设置里的「记住并自动复用跨网段中转」，默认开，F-107/S-10）。
     /// 缺省用配置的缺省（**开**）而不是 `bool::default()`（关）：字段缺失不该替用户把它关掉。
@@ -461,65 +464,43 @@ async fn update_settings(
 // BeyondCompare 集成（F-41 ~ F-43）
 // ---------------------------------------------------------------------------
 
+/// `slot_for` = 右键菜单里那一项是文件还是文件夹（前端给 `"file"` / `"folder"`）：
+/// BC 按类型取槽，我们也按类型取，好让菜单里那行与真正要比的那一档**一致**。
+/// 没有上下文（启动、设置面板）时传 `null`。
 #[cfg(desktop)]
 #[tauri::command]
-fn bc_status(state: State<'_, Arc<AppState>>) -> bc::BcStatusDto {
-    bc::status(state.inner())
+fn bc_status(
+    slot_for: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> bc::BcStatusDto {
+    let prefer = match slot_for.as_deref() {
+        Some("file") => Some(bc::ShellSlot::File),
+        Some("folder") => Some(bc::ShellSlot::Folder),
+        _ => None,
+    };
+    bc::status(state.inner(), prefer)
 }
 
 #[cfg(desktop)]
 #[tauri::command]
-fn bc_set_side(
-    side: String,
+fn bc_set_left(
     target: BcTarget,
     state: State<'_, Arc<AppState>>,
 ) -> Result<bc::BcStatusDto, String> {
-    {
-        let mut config = state.config.lock();
-        match side.as_str() {
-            "left" => config.bc_left = Some(target),
-            "right" => config.bc_right = Some(target),
-            other => return Err(format!("未知比较位: {other}")),
-        }
-        config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
-    }
-    Ok(bc::status(state.inner()))
+    bc::set_left(state.inner(), &target)?;
+    // 刚写完两个槽都是这一项：读哪一档都一样，给 `None`（文件夹槽优先）
+    Ok(bc::status(state.inner(), None))
 }
 
+/// 与左侧比对：左边读槽里的**原文**，右边是右键这一项 —— 本机共享项给本地路径，
+/// 对端共享项给 `profile:<ip:port>?<shareId>/<路径>`（顺手写好 WebDAV profile）。
 #[cfg(desktop)]
 #[tauri::command]
-fn bc_clear_side(
-    side: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<bc::BcStatusDto, String> {
-    {
-        let mut config = state.config.lock();
-        match side.as_str() {
-            "left" => config.bc_left = None,
-            "right" => config.bc_right = None,
-            other => return Err(format!("未知比较位: {other}")),
-        }
-        config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
-    }
-    Ok(bc::status(state.inner()))
-}
-
-/// 用 BeyondCompare 打开两侧比较：目标是本机共享项就直接给本地路径，
-/// 是对端共享项就给 `profile:<ip:port>?<shareId>/<路径>`（顺手写好 WebDAV profile）。
-#[cfg(desktop)]
-#[tauri::command]
-fn bc_compare(
-    a: BcTarget,
-    b: BcTarget,
+fn bc_compare_with_left(
+    target: BcTarget,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let exe = bc::locate_exe(state.config.lock().bc_exe_path.as_deref())
-        .ok_or_else(|| "未找到 BeyondCompare 可执行文件，请在设置里指定路径".to_string())?;
-    let left = bc::resolve_side(state.inner(), &exe, &a)?;
-    let right = bc::resolve_side(state.inner(), &exe, &b)?;
-    bc::launch_compare(&exe, &left.arg, &right.arg)?;
-    info!(left = %left.arg, right = %right.arg, "已在 BeyondCompare 中打开比较");
-    Ok(())
+    bc::compare_with_left(state.inner(), &target)
 }
 
 // ---------------------------------------------------------------------------
@@ -557,22 +538,7 @@ fn list_devices(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
     // 死锁面（两处顺序不同就够）。设备表本身很小（一屏设备数），拷一份不值一提。
     let peers = state.peers.lock().clone();
     let remarks = state.config.lock().device_remarks.clone();
-    // F-107：本机的中转记忆（网段级）—— 设备行要据此说一句"这一段经 <中转段> 中转"。
-    // 只读一次、按目标段建索引，避免在遍历设备时反复锁配置表。
-    let routes: std::collections::HashMap<String, (String, usize)> = state
-        .config
-        .lock()
-        .relay_routes
-        .iter()
-        .map(|r| (r.target_cidr.clone(), (r.via_cidr.clone(), r.pool_ids().len())))
-        .collect();
     peers.iter().map(|p| {
-    // 这台设备属于哪一段（对端自报优先，其次按本机掩码算）—— 中转记忆的键。
-    let cidr = state.cidr_of(&p.id, &p.ip);
-    let transit = cidr
-        .as_ref()
-        .and_then(|c| routes.get(c))
-        .map(|(via_cidr, pool)| serde_json::json!({ "viaCidr": via_cidr, "poolSize": pool }));
     serde_json::json!({
         "id": p.id,
         "name": p.name,
@@ -584,11 +550,9 @@ fn list_devices(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
         // 留在列表里，并在用户**发起连接**时补一句"这张网可能把单播隔开了"；**不是**一个状态档
         // （那一行照常画「未绑定」/「离线」）。`online` 的定义不动（探活成功 = 真连得上）。
         "seen": state.is_seen(&p.id),
-        // 此刻是不是经别人中转（F-106）：界面上标一句「经 X 中转」，用户才知道
-        // 这条路不是直连（而中转是自动接管/自动收起的）。
+        // 此刻是不是经别人中转（F-106）：**不上界面**（用户要求，两端都不写「经 X 中转」），
+        // 只留给前端 `unicastBlocked` 那条判据 —— 它区分"拨的是借来的中转端点"与"直连不通"。
         "relayVia": p.relay_via(),
-        // F-107：这一段的中转记忆（有的话）——悬停说明里那句"该网段经 … 中转"。
-        "transit": transit,
         // Real WS link state — "长连接" in the UI follows this, not `online`
         // (a peer can answer HTTP push invites without any WS session).
         "connected": state.ws.has_connection(&p.id),
@@ -680,6 +644,19 @@ fn set_device_remark(
     Ok(stored)
 }
 
+/// 本机给设备起的**备注**（F-101）：`设备 id → 备注`，整份读一次。
+///
+/// 为什么要单独开一条命令（`list_devices` 的每一行里也带着 `remark`）：**备注不跟着设备行走**。
+/// 没有那一行的设备（未配对、也不在地址簿：那一行只活在内存里，重启即忘 / 还没被观察到）
+/// 在会话列表里照样要显示成用户起的那个备注，而那时前端手上只有"记录里对端自报的名字"
+/// —— 于是"备注优先"这条设计在**离线且没有行**的时候整条失效（真机反馈：会话里显示成了
+/// 设备名而不是备注）。备注是**本机的用户数据**（`config.toml` 的 `deviceRemarks`，键是设备 id），
+/// 与"此刻有没有那一行"无关，所以按 id 单独给一份。
+#[tauri::command]
+fn list_device_remarks(state: State<'_, Arc<AppState>>) -> std::collections::HashMap<String, String> {
+    state.config.lock().device_remarks.clone()
+}
+
 #[tauri::command]
 async fn start_http_server(state: State<'_, Arc<AppState>>) -> Result<u16, String> {
     let arc_state = state.inner().clone();
@@ -722,6 +699,10 @@ pub fn apply_offline(arc: &Arc<AppState>) {
     unregister_mdns(arc);
     arc.ws.drop_all();
     crate::relay::close_all(arc);
+    // "刚听到过"那一档也一起清掉：离线 = 隐身，这一刻设备列表就该是"谁都不在线"，
+    // 而这一档是**本机在线上**才成立的知识 —— 留着它，切回在线之后会有一批行靠 60s 内
+    // 的旧证据"凭空"在线（探活还没敲过它们）。切回在线由探活重新建立。
+    arc.clear_all_heard();
     let ids: Vec<String> = arc.peers.lock().iter().map(|p| p.id.clone()).collect();
     for id in ids {
         arc.set_peer_online(&id, false);
@@ -924,6 +905,9 @@ const MANUAL_PORT_SCAN: u16 = 10;
 
 /// Add a device manually by IP:port. Probes /pair/info to get identity.
 ///
+/// 本机这一半是"存一行"；**对方那一半**由 [`notify_manual_add`] 补上（同一件事的两侧：
+/// 同网段时 mDNS 会让两边互相看见，跨网段只剩这一条单播）。
+///
 /// `port == 0` = 用户没填端口：从默认端口起探 `MANUAL_PORT_SCAN` 个（见 `manual_peer`）。
 #[tauri::command]
 async fn add_peer(ip: String, port: u16, state: State<'_, Arc<AppState>>) -> Result<PeerDevice, String> {
@@ -933,7 +917,57 @@ async fn add_peer(ip: String, port: u16, state: State<'_, Arc<AppState>>) -> Res
     let name = info["name"].as_str().unwrap_or(&ip).to_string();
     let peer = PeerDevice { id, name, ip, port, online: true, paired: false, ..Default::default() };
     state.add_peer_book(peer.clone());
+    // 另一半（F-11）：到对方那个地址上自报一次，让它也建一行（见 `notify_manual_add`）。
+    // 甩到后台：最坏要等满 1.5s 超时，而"添加"在本机已经成立，不该被它拖住。
+    crate::task::spawn("manual add hello", notify_manual_add(state.inner().clone(), peer.clone()));
     Ok(peer)
+}
+
+/// 手动添加成功之后的另一半（F-11）：到对方那个地址上自报一次身份，让对方也有一行。
+///
+/// 手动添加是**手动版的 mDNS** —— 同网段时两边本来就互相看得见（收到一条公告各建一行），
+/// 而 mDNS 跨不过路由：跨网段那台"添加得上，却只有本机看得见对方"。这一跳把另一半补上：
+/// 对方的设备列表里出现本机（未绑定、在线），它才有地方输本机屏幕上那 6 位配对码
+/// （没有这一行时，跨网段那台连配对都发起不了 —— `pair_confirm` 要求设备行已存在）。
+/// **只建行、不建关系**：配对 / 长连接 / 共享 / 推送同意制一条都不动，关系照旧要双方主动。
+///
+/// 已有凭据就带上：`/pair/hello` 对"自称已配对设备"要求出示 token（与推送邀请同一道关，
+/// 重新添加一台已配对设备的地址时走的就是这一档）。**best-effort**：对端是老版本（没有这条
+/// 路由 → 404）、此刻隐身（503）、离线或被防火墙挡住，都只是"对方那边没有这一行"。
+async fn notify_manual_add(state: Arc<AppState>, peer: PeerDevice) {
+    // 取锁顺序：`listening_port` 自己会锁 config（`server_port == 0` 那一支），不能套在外面。
+    let own_port = bound_port(&state);
+    let (own_id, own_name) = {
+        let config = state.config.lock();
+        (config.device_id.clone(), config.device_name.clone())
+    };
+    let url = format!("{}/pair/hello", net::peer_base(&peer.ip, peer.port));
+    let client = match net::client_builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(peer = %peer.id, "failed to build a client for the manual-add hello: {e}");
+            return;
+        }
+    };
+    let mut req = client.post(&url).json(&serde_json::json!({
+        "peerId": own_id,
+        "peerName": own_name,
+        "port": own_port,
+    }));
+    if let Ok(Some(token)) = credential::get_peer_token(&peer.id) {
+        req = req.bearer_auth(token);
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            info!(peer = %peer.id, "peer told about the manual add")
+        }
+        // 404 = 对端还是老版本（没有这条路由）；503 = 它此刻隐身。都不是错误。
+        Ok(resp) => info!(peer = %peer.id, status = %resp.status(), "peer did not register this device"),
+        Err(e) => info!(peer = %peer.id, "peer unreachable for the manual-add hello: {e}"),
+    }
 }
 
 /// 在 `ip` 上找到那台设备：返回**它答话的端口**与 `/pair/info` 的回话。
@@ -1269,15 +1303,21 @@ fn reject_pair_invite(invite_id: String, state: State<'_, Arc<AppState>>) {
 /// 文字与图片交错着一次发出去"那条路会点名给它：一条消息里图片夹在前后两段文字中间，两端
 /// 都要按这个顺序排（见 `stores/chat.svelte.ts` 的 `sendComposer`）。**没人点名时（普通推送）
 /// 由后端当场取现在** —— 与文本消息同一个口径。
+///
+/// `names` = 与 `paths` **逐位对齐**的覆盖名（F-119，空串 = 这一项不改名），可以整个省掉。
+/// 它只换"对端落盘用的那个名字"，本机读字节仍走 `paths` 那一条 —— 安卓「＋」里的「应用」
+/// 就是靠它把 `/data/app/…/base.apk` 发成 `应用名_versionName(versionCode)_包名.apk`
+/// （见 `transfer::manifest_for_named_paths`）。
 #[tauri::command]
 async fn push_paths(
     paths: Vec<String>,
     peer_ids: Vec<String>,
+    names: Option<Vec<String>>,
     at: Option<u64>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<transfer::push_job::BatchView, String> {
     ensure_online(&state)?;
-    transfer::push_paths(state.inner().clone(), paths, peer_ids, at).await
+    transfer::push_paths(state.inner().clone(), paths, peer_ids, names, at).await
 }
 
 /// 把剪贴板里的图片字节落成一个**暂存文件**，返回它的绝对路径（见 `paste`）。
@@ -1457,6 +1497,13 @@ fn chat_mark_read(peer_ids: Vec<String>, state: State<'_, Arc<AppState>>) -> gro
     chat::mark_read(&state, &peer_ids);
     group::emit(&state);
     group::snapshot(&state)
+}
+
+/// 发送侧那张卡的**初值**：界面挂载时拉一次（`push://batch` 只管"变化"，重启后那些恢复出来的
+/// 卡只能靠它拿到 —— 与 `chat_snapshot` 同一个路数：初值靠拉、变化靠推）。
+#[tauri::command]
+fn push_batches(state: State<'_, Arc<AppState>>) -> Vec<transfer::push_job::BatchView> {
+    state.push.all_batch_views()
 }
 
 /// 会话（聊天）命令的返回里那一小截：这份群发名单的 id + 整份快照。
@@ -1870,9 +1917,13 @@ pub async fn stream_peer_file(
         let _ = tokio::fs::remove_file(&part).await;
         return Err(e);
     }
-    tokio::fs::rename(&part, target)
-        .await
-        .map_err(|e| format!("改名失败: {e}"))?;
+    if let Err(e) = tokio::fs::rename(&part, target).await {
+        // 改名失败同样要清残骸：目标被别的进程占着（Windows 上很常见）或目标是个目录时
+        // 都会走到这里，而这之后没人再管这个 `.orbdrop-part` 了 —— 留着它只会在下载目录里
+        // 越积越多（文件已经收全但顶着临时名，用户看不见、也不会去删）。
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(format!("改名失败: {e}"));
+    }
     Ok(offset)
 }
 
@@ -1991,6 +2042,39 @@ async fn open_path(path: String) -> Result<(), String> {
 #[tauri::command]
 async fn resolve_image_uri(uri: String) -> Result<mobile::PickedImage, String> {
     mobile::resolve_image_uri(uri).await
+}
+
+/// 安卓：开一次系统选择器（图片 / 文件，可多选），把选中的几项拷成应用缓存里的暂存文件，
+/// 返回它们的路径 / 真实名字 / 大小。
+///
+/// 桌面端那颗「＋」开的是自绘的本机文件浏览器（`fs_browse` 那几条命令只在桌面端登记），安卓上
+/// 没有对等物：分区存储下非媒体文件拿不到可读路径，只能走 SAF 的 URI 读授权 —— 而推送与
+/// 会话图片都只认本机真实路径，所以 URI 必须在原生那一侧换成文件。取消回空表（**不是**错误）。
+/// 机制与取舍见 `mobile::pick_files`。
+#[cfg(mobile)]
+#[tauri::command]
+async fn pick_files(kind: String) -> Result<Vec<mobile::PickedFile>, String> {
+    mobile::pick_files(kind).await
+}
+
+/// 安卓：列出设备上已安装的应用（F-119）—— 会话里那颗「＋」的「应用」那一项就是它。
+///
+/// 每一项带着自己的 `base.apk` 路径与**拼好并净化过的落盘名**；发送时把两者分别交给
+/// `push_paths` 的 `paths` 与 `names`（源文件一个字节都不动，见
+/// `transfer::manifest_for_named_paths`）。机制与取舍见 `mobile::list_installed_apps`。
+#[cfg(mobile)]
+#[tauri::command]
+async fn list_installed_apps() -> Result<Vec<mobile::InstalledApp>, String> {
+    mobile::list_installed_apps().await
+}
+
+/// 安卓：取一个应用的图标（`data:image/png;base64,…`，F-119）—— 表里**每一行**按需取一张。
+///
+/// 与 `list_installed_apps` 分开是为了"表先出来、图标随后补"：见 `mobile::app_icon`。
+#[cfg(mobile)]
+#[tauri::command]
+async fn app_icon(package_name: String) -> Result<String, String> {
+    mobile::app_icon(package_name).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2177,6 +2261,97 @@ fn place_orb_on_startup(app: &AppHandle) {
     }
 }
 
+/// 看门狗线程的代号：`Exit` 时 +1，跑着的那一份看到代号变了就自己退场
+/// （与 `tray.rs` 那个闪动线程同一个套路：不 join、不阻塞退出）。
+#[cfg(desktop)]
+static ORB_WATCHDOG_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 悬浮球窗口看门狗（桌面端）：把"窗口没了但进程还在"这一类事故从**不可恢复**变成**自己回来**。
+///
+/// **为什么非要有它**：全仓没有第二处会在运行时把窗口叫回来（`show`/`unminimize`/`set_focus`
+/// 只在单实例那条分支里出现过一次），而这几件事都发生在运行中：
+///
+/// - 窗口被系统藏起来或被最小化（"显示桌面"、别的程序的系统动作、会话切换）——
+///   tao 自己那份"可见"缓存察觉不到，前端的 `holdOrb` 之类状态更是无从知道；
+/// - 窗口落在**没有任何显示器覆盖**的坐标上：拔掉显示器、分辨率变小、远控工具（UU 远程等在
+///   被控端没有物理屏时会自动建虚拟屏）临时插进来的虚拟屏随后又撤掉 —— 启动那一次兜底
+///   （`place_orb_on_startup`）只管启动那一刻，而这里的日志里"上次的悬浮球位置已不在任何
+///   显示器上"实测出现过几十次，说明这种拓扑变化在这台机器上很常见；
+/// - 显示器拓扑/缩放变了：tao 会按系统建议矩形**自己**搬窗口（`WM_DPICHANGED`），而前端
+///   只在自己动手那一刻现读 `scaleFactor`，手上那份几何（吸附偏移、展开方向、命中区域）就过时了。
+///
+/// 用户看到的现象是同一件事："置顶窗口和主界面都不见了，托盘还在"（托盘图标由资源管理器画，
+/// 跟本进程状态无关），而透明无边框窗口没有标题栏可以拖回来 —— 只能靠这里。
+///
+/// 空闲时（状态正常、拓扑没变）这个线程只做几次 `IsWindowVisible`/`GetMonitorInfo` 级别的查询，
+/// 不碰窗口 —— 不影响 N-04（空闲近 0 CPU）。
+#[cfg(desktop)]
+fn start_orb_watchdog(app: tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+
+    let gen = ORB_WATCHDOG_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let spawned = std::thread::Builder::new().name("orb-watchdog".into()).spawn(move || {
+        // 拓扑指纹的初值在第一次拍里取（那一刻窗口一定已经在，`setup` 里排在落位之后）
+        let mut last: Option<u64> = None;
+        loop {
+            std::thread::sleep(orb_window::WATCHDOG_TICK);
+            if ORB_WATCHDOG_GEN.load(Ordering::SeqCst) != gen {
+                return; // 退出（或又起了一份）：自己退场
+            }
+            let Some(win) = app.get_webview_window("main") else {
+                continue; // 窗口还没建好 / 正在退出：下一拍再看
+            };
+
+            let mut rescue = false;
+
+            // 1) OS 眼里的真实状态：不可见或被最小化 → 叫回台面
+            let (visible, minimized) = orb_window::os_state(&win);
+            if !visible || minimized {
+                warn!(visible, minimized, "看门狗：悬浮球窗口被藏起或最小化，叫回台面");
+                if let Err(e) = orb_window::raise(&win) {
+                    warn!("看门狗叫回窗口失败: {e}");
+                }
+                rescue = true;
+            }
+
+            // 2) 落在所有显示器之外 → 搬回最近的工作区
+            match orb_window::clamp_into_work_area(&win) {
+                Ok(true) => {
+                    warn!("看门狗：悬浮球窗口已不在任何显示器上，搬回最近的工作区");
+                    rescue = true;
+                }
+                Ok(false) => {}
+                Err(e) => warn!("看门狗查询窗口位置失败: {e}"),
+            }
+
+            // 3) 拓扑/缩放变了 → 界面那份几何过时了，要它重排一次
+            let fp = orb_window::topology_fingerprint(&win);
+            match last {
+                Some(prev) if prev == fp => {}
+                Some(_) => {
+                    info!("看门狗：显示器拓扑或缩放变了，要求界面重排几何");
+                    rescue = true;
+                }
+                None => {}
+            }
+            last = Some(fp);
+
+            // 救过就顺手逼一次重画：透明窗口"什么都没画"时 OS 侧一切正常，
+            // 没有任何状态可以判据 —— 这一下是唯一不看运气就能把它逼回来的手段。
+            if rescue {
+                orb_window::force_repaint(&win);
+                if let Err(e) = app.emit(ws::events::ui::ORB_RECOVER, ()) {
+                    warn!("看门狗：通知界面重排几何失败: {e}");
+                }
+            }
+        }
+    });
+    match spawned {
+        Ok(_) => info!("悬浮球看门狗已启动（每 {:.0}s 一拍）", orb_window::WATCHDOG_TICK.as_secs_f64()),
+        Err(e) => warn!("悬浮球看门狗线程起不来: {e}"),
+    }
+}
+
 /// 折叠态窗口的标称尺寸（逻辑像素，宽 × 高）。
 ///
 /// 圆球取 tauri.conf 里 main 窗口的 `width`/`height`（90×90）；圆角矩形悬浮框是**定尺**
@@ -2310,9 +2485,14 @@ fn setup_server_task(app: &AppHandle) {
                                     }
                                 }
                                 PeerEvent::Offline(id) => {
-                                    s2.set_peer_online(&id, false);
                                     // 记录被撤（告别包 / TTL 过期）：不再"看得见"。
                                     s2.clear_seen(&id);
+                                    // **记录没了不等于它不可达**：告别包/TTL 过期只说明"这条
+                                    // mDNS 记录不在了"，而对端可能正在跟本机说话（组播被 Wi-Fi
+                                    // 过滤、跨段、它刚换过网卡）。可达性交给 5s 探活去判，这里
+                                    // 至多按"刚听到过"那一档收口 —— 少了这一条，一台正在收发的
+                                    // 设备会被一次记录过期画成离线（见 `AppState::heard`）。
+                                    s2.set_peer_offline_unless_heard(&id);
                                 }
                             }
                         }
@@ -2333,6 +2513,9 @@ fn setup_server_task(app: &AppHandle) {
                     // 上次关机/强杀时**没收完的那几条推送**：对端还持有那条推送的话，
                     // 自己接着收（块位图与 `.part` 都还在盘上，见 `transfer::resume_pending`）。
                     transfer::resume_pending(&arc_state);
+                    // 发送端那一半：上次没走完的**发出去**的推送捡回来（job + 卡片）——
+                    // 这样"两端都重启过"时，对面来要块照样要得到（见 `push_job::restore_outbound`）。
+                    transfer::push_job::restore_outbound(&arc_state);
 
                     // Liveness backstop: mDNS only reports a departure when the peer
                     // sends goodbye or its records expire (up to ~2 min), and a
@@ -2348,16 +2531,24 @@ fn setup_server_task(app: &AppHandle) {
                     let probe_state = arc_state.clone();
                     tokio::spawn(async move {
                         loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            // **启动即跑第一拍**（之后每 5s 一拍）。放在 `sleep` 之后的话，
+                            // 地址簿里那份落盘的 `online` 就会当满 5 秒的"真相"：真在网的设备
+                            // 先画成离线，要到第一拍探活才纠正 —— 用户看到的就是"启动后某台
+                            // 离线、过几秒又在线"。真相只该由这一拍给（`AppState::new` 已经把
+                            // 落盘值一律降级成离线，两者是同一件事的两半）。
+                            //
                             // 离线（隐身）期间不发探活：本机对入站一律 503，探活只会把
                             // 一个"能回话的对端"反复标成在线，与状态框自相矛盾。
-                            if !probe_state.is_online() {
-                                continue;
+                            if probe_state.is_online() {
+                                state::probe_peers_once(&probe_state).await;
+                                // 没传完的那些接收任务：这一拍顺手看一眼（退避台阶在
+                                // `resume::attempt_due` 里把关，"够不着"就只是跳过）。
+                                transfer::resume_pending(&probe_state);
+                                // 发出去、可对面一直没来续传的那些：过了窗口就按"放弃"收尾
+                                // （发送端这一半的 TTL，见 `push_out::OUTBOUND_TTL_SECS`）。
+                                transfer::push_job::sweep_outbound(&probe_state);
                             }
-                            state::probe_peers_once(&probe_state).await;
-                            // 没传完的那些接收任务：这一拍顺手看一眼（退避台阶在
-                            // `resume::attempt_due` 里把关，"够不着"就只是跳过）。
-                            transfer::resume_pending(&probe_state);
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         }
                     });
 
@@ -2506,9 +2697,12 @@ pub fn run() {
             builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
                 info!("另一实例被启动：把本实例调到前台并展开面板");
                 if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.show();
-                    let _ = win.unminimize();
-                    let _ = win.set_focus();
+                    // 置顶 / 显示 / 不最小化 / 前台：与托盘那一档共用同一个 helper
+                    // （这里的"显示"必须真的能显示 —— tao 缓存说可见时 `show()` 是空操作，
+                    // 而窗口可能是被系统藏起来的，见 `orb_window::raise`）。
+                    if let Err(e) = orb_window::raise(&win) {
+                        warn!("单实例：叫回悬浮球窗口失败: {e}");
+                    }
                     let _ = win.emit(ws::events::ui::ORB_SHOW, ());
                 }
             }))
@@ -2537,6 +2731,18 @@ pub fn run() {
     // 得请原生那一跳拷成暂存文件（会话里发图片走推送，只认本机路径）—— 见 `mobile::resolve_image_uri`。
     #[cfg(mobile)]
     let builder = builder.plugin(mobile::paste_plugin());
+
+    // 会话里那颗「＋」（F-118）：桌面端开的是自绘的本机文件浏览器，安卓上没有对等物
+    // （分区存储不给"按路径列共享存储"）—— 换成系统选择器，选中的 URI 由原生拷成暂存文件，
+    // 界面拿到的是一条能直接进推送 / 会话图片的路径。见 `mobile::pick_files`。
+    #[cfg(mobile)]
+    let builder = builder.plugin(mobile::pick_plugin());
+
+    // 「发送应用」（F-119）：会话里那颗「＋」的第三项要列设备上已安装的应用（各自的 base.apk）。
+    // 列表由原生查（包可见性靠清单里的 `<queries>`），名字（`应用名_版本号(版本名)_包名.apk`）
+    // 与净化在 Rust 这一侧拼 —— 与接收侧落盘那道闸门同一份判据。见 `mobile::list_installed_apps`。
+    #[cfg(mobile)]
+    let builder = builder.plugin(mobile::apps_plugin());
 
     // 引擎太低（WebView 低于下限）时兜底页上那个「去应用商店更新 WebView」按钮：那种状态下前端是死的，
     // 浮层只能发一次 `market://` 导航，由这个插件的导航钩子接住换成系统 Intent —— 见 `mobile::store_plugin`。
@@ -2575,14 +2781,13 @@ pub fn run() {
             #[cfg(desktop)]
             bc_status,
             #[cfg(desktop)]
-            bc_set_side,
+            bc_set_left,
             #[cfg(desktop)]
-            bc_clear_side,
-            #[cfg(desktop)]
-            bc_compare,
+            bc_compare_with_left,
             get_actual_port,
             local_addresses,
             list_devices,
+            list_device_remarks,
             set_device_remark,
             relay_memory,
             clear_relay_memory,
@@ -2617,6 +2822,7 @@ pub fn run() {
             #[cfg(desktop)]
             set_picker_favorites,
             push_paths,
+            push_batches,
             save_pasted_image,
             read_image_data_url,
             cancel_push_batch,
@@ -2650,6 +2856,12 @@ pub fn run() {
             mobile::delete_inbox_file,
             #[cfg(mobile)]
             resolve_image_uri,
+            #[cfg(mobile)]
+            pick_files,
+            #[cfg(mobile)]
+            list_installed_apps,
+            #[cfg(mobile)]
+            app_icon,
             // 「让应用在后台活着」所需的系统那一层（F-87）：读回电池优化白名单在不在、把用户送到
             // ROM 的自启动页；外加通知这一层的自查与跳转（F-108 的横幅那一半）。
             // 全是"读状态 + 跳系统页"，没有业务逻辑 —— 只有安卓有实体，见 `system_settings`。
@@ -2755,6 +2967,11 @@ pub fn run() {
             #[cfg(desktop)]
             place_orb_on_startup(app.handle());
 
+            // 运行中的兜底：窗口被系统藏起来 / 被最小化 / 落在所有显示器之外 / 显示器拓扑变了，
+            // 都得有人把它叫回来（上面那次落位只管启动那一刻，见 `start_orb_watchdog`）。
+            #[cfg(desktop)]
+            start_orb_watchdog(app.handle().clone());
+
             // 粘贴图片的暂存目录：清掉上次留下的过期文件（草稿只活在内存里，进程一退，
             // 那些还没发出去的图就只剩这一个回收时机了，见 `paste::MAX_AGE`）。
             paste::sweep();
@@ -2789,6 +3006,9 @@ pub fn run() {
             // 退出时松开镜像连接。**注册留着**：注册一次长期存在（注销是 O(N)，实测 10,100 个
             // 占位符 1.9 s），下次启动 `mirror::ensure_ready` 只做连接；注销属于卸载路径。
             if let tauri::RunEvent::Exit = event {
+                // 看门狗跟着退场（它每一拍都会查窗口，退出后那些查询没有意义）
+                #[cfg(desktop)]
+                ORB_WATCHDOG_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 #[cfg(desktop)]
                 mirror::shutdown();
             }
@@ -2933,6 +3153,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(&peer_dir);
     }
 
+    /// 手动添加的另一半（F-11）：本机添加对端之后，**对端的设备表里也要有本机这一行**。
+    ///
+    /// 跨网段那台"添加得上、却只有本机看得见对方"时，它连配对都发起不了（`pair_confirm`
+    /// 要求设备行已存在）—— 这条自报补的就是那一半。这里走**真 TLS + 真 HTTP**：路由名、
+    /// 字段名、来源地址的算法、以及"对端真的建了一行"只有打过去才知道。地址用**本机的内网
+    /// 地址**（理由同 `manual_add_without_a_port_finds_the_peer_and_skips_itself`：回环上那枚
+    /// 指纹会被别的用例污染）。
+    #[tokio::test]
+    async fn a_manual_add_shows_up_on_the_peer_as_an_unbound_row() {
+        const BASE: u16 = 4900;
+        let Some(lan) = local_lan_ip() else {
+            eprintln!("这台机器没有内网地址（纯离线）：跳过");
+            return;
+        };
+        let lan = lan.to_string();
+        let own_dir = std::env::temp_dir().join(format!("orbdrop_hello_own_{}", uuid::Uuid::new_v4()));
+        let peer_dir = std::env::temp_dir().join(format!("orbdrop_hello_peer_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&own_dir).unwrap();
+        std::fs::create_dir_all(&peer_dir).unwrap();
+        let own = Arc::new(AppState::new(
+            crate::config::test_config(),
+            own_dir.join("config.toml"),
+        ));
+        let peer = Arc::new(AppState::new(
+            crate::config::test_config(),
+            peer_dir.join("config.toml"),
+        ));
+        let own_id = own.config.lock().device_id.clone();
+        let peer_id = peer.config.lock().device_id.clone();
+
+        let own_port = crate::server::start_server(own.clone(), BASE).await.unwrap();
+        let peer_port = crate::server::start_server(peer.clone(), BASE + 1).await.unwrap();
+        let client = crate::net::client();
+        for port in [own_port, peer_port] {
+            let url = format!("{}/pair/info", crate::net::peer_base(&lan, port));
+            let ok = wait_until_async(|| {
+                let (client, url) = (client.clone(), url.clone());
+                async move {
+                    client
+                        .get(&url)
+                        .send()
+                        .await
+                        .map(|r| r.status().is_success())
+                        .unwrap_or(false)
+                }
+            })
+            .await;
+            assert!(ok, "服务器还没起在 {lan}:{port} 上");
+        }
+
+        // 真机那一步是 `add_peer`：先把对端记进本机地址簿（这一步本机自己那一半就成立了）。
+        let target = crate::config::PeerDevice {
+            id: peer_id.clone(),
+            name: "PC-B".into(),
+            ip: lan.clone(),
+            port: peer_port,
+            online: true,
+            paired: false,
+            ..Default::default()
+        };
+        own.add_peer_book(target.clone());
+
+        // 然后是另一半：直接 await（不经过 `crate::task::spawn`）—— 测试里不等后台任务。
+        notify_manual_add(own.clone(), target).await;
+
+        let row = peer.get_peer(&own_id).expect("对端设备表里要有本机这一行");
+        assert!(!row.paired, "只建行、不建关系");
+        assert!(row.online, "刚打过招呼：这一行是活的");
+        assert_eq!(row.ip, lan, "地址取对端观察到的 TCP 来源");
+        assert_eq!(row.port, own_port, "端口取本机自报的那个（实际在听的那个）");
+        // 关系确实没被顺手建立：本机这一侧那一行也还是未绑定。
+        assert!(!own.get_peer(&peer_id).unwrap().paired);
+
+        crate::server::stop_server(&own).await;
+        crate::server::stop_server(&peer).await;
+        let _ = std::fs::remove_dir_all(&own_dir);
+        let _ = std::fs::remove_dir_all(&peer_dir);
+    }
+
     /// 本机在局域网上的出口地址（拿不到 = 这台机器没有可用网卡，用它拨号的那几条用例跳过）。
     fn local_lan_ip() -> Option<std::net::IpAddr> {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -3042,6 +3341,50 @@ mod tests {
         );
 
         release_mdns(&state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 改名失败（目标被占着 / 目标是个目录）**也要把 `.orbdrop-part` 清掉**。
+    ///
+    /// 收全了才改名，所以走到这条分支时临时文件里已经是完整数据 —— 可它顶着临时名躺在用户的
+    /// 下载目录里，没人会去认它、更不会去删：每失败一次堆一个。对端是个只说 5 字节的桩
+    /// （小于一个 `READ_CHUNK`，一轮就够），目标给一个**已存在的目录**让 `rename` 必失败。
+    #[tokio::test]
+    async fn a_failed_rename_does_not_leave_the_part_file_behind() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stub = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await; // 桩不看请求内容
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello").await.unwrap();
+        });
+
+        let dir = std::env::temp_dir()
+            .join(format!("orbdrop_stream_part_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("occupied")).unwrap();
+        let file = crate::peer_fs::PeerFile {
+            base: format!("http://127.0.0.1:{port}"),
+            token: "t".into(),
+            share_id: "s".into(),
+            path: "a.bin".into(),
+        };
+
+        let err = stream_peer_file(&reqwest::Client::new(), &file, &dir.join("occupied"))
+            .await
+            .expect_err("目标是个目录时改名必须失败");
+        assert!(err.contains("改名失败"), "错误信息要说清: {err}");
+        assert!(
+            !dir.join("occupied.orbdrop-part").exists(),
+            "改名失败后不能把临时文件留在下载目录里"
+        );
+        assert!(dir.join("occupied").is_dir(), "目标本身不能被动过");
+
+        // 只 abort 不 await：桩要是没被连上（比如这条路在建连接之前就失败了），`await` 会
+        // 永远等在那个 `accept()` 上，把用例吊死。
+        stub.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

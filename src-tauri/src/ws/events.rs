@@ -152,6 +152,20 @@ pub enum WsEvent {
         text: String,
         /// 发送方的墙上时间（epoch 毫秒）：接收方原样存，回执按它比水位。
         at: u64,
+        /// 发送方**自报的设备名**（F-101 那一串里"它叫什么"）。
+        ///
+        /// 为什么消息要自己带名字：长连接那条路上没有信封（HTTP 那条路的名字在
+        /// `sender` 里），接收方只认得出"这条连接是谁的"，认不出"它现在叫什么" ——
+        /// 名字于是只能取本机设备表里那一份，而那一份可能还是**占位名**（= 设备 id，
+        /// 见 `name_is_placeholder`）。表现就是"先显示一串 deviceid、过一会儿才变成
+        /// 设备名"，还会把这个 id 写进会话记录（`ChatRecord::from_name`）。
+        ///
+        /// 只用来**更新设备行的名字**：这条连接是 token 换来的身份，所以这个名字算**核实过**的
+        /// （`AppState::note_peer_name`：对端改名跟着走），不再是"只填占位行"。
+        /// 用户自己的命名不受影响 —— 那是备注（F-101），另一个字段。
+        /// `default` 让老对端（不带这个字段）照旧可用。
+        #[serde(default)]
+        from_name: String,
     },
     /// 会话：Sender → Receiver 的一条**图片消息**。
     ///
@@ -170,6 +184,9 @@ pub enum WsEvent {
         size: u64,
         /// 图片字节（base64；`data [<mediatype>][;base64],<data>` 里那后半段）。
         data: String,
+        /// 发送方自报的设备名 —— 与 `ChatText::from_name` 同一个用途（核实过 → 直接更新设备行）。
+        #[serde(default)]
+        from_name: String,
     },
     /// 会话：Receiver → Sender 的已读回执。`up_to` 是接收方**见到过的、你发来的最大 `at`**。
     ///
@@ -199,7 +216,8 @@ pub enum WsEvent {
         rev: u64,
         author: PeerInfo,
         /// 这条被**中转**了几跳（发送方自己发 = 0）。跨网段时两端之间没有路径，缺的那一段
-        /// 只能由链路上也在群里的成员帮着搬（本机开关 `groupRelay`，默认关）；跳数封顶
+        /// 只能由链路上也在群里的成员帮着搬（本机开关 `groupRelay`，缺省**开**，可在设置里关掉）；
+        /// 跳数封顶
         /// （`group::MAX_HOPS`）保证转发一定停下来。
         #[serde(default)]
         hops: u8,
@@ -370,6 +388,14 @@ pub mod ui {
     /// 与 `ORB_SHOW` 分开：那条是"打开主界面"（双击 / 第二份进程），这条是"打开该看的那件事"，
     /// 两者在界面上落到的视图不同，合成一条就得在界面里再猜一次"这次是哪种"。
     pub const TRAY_ALERT: &str = "orb://tray_alert";
+    /// 窗口那边刚被看门狗救过一次（被系统藏起来 / 被最小化 / 落在所有显示器之外 / 显示器拓扑
+    /// 或缩放变了）：界面把**自己那份几何**重排一遍（当前形态的尺寸 + 吸附落位；面板开着就夹回
+    /// 工作区）。这些都是照"上一次拓扑"算的 —— 远控的虚拟屏、拔显示器、分辨率/缩放变化之后
+    /// 它们全都过时了，而界面自己收不到任何通知（它只在动手那一刻现读 `scaleFactor`）。
+    ///
+    /// 载荷为空：几何由界面现读（`orb_screen_metrics` / `outerPosition` / `scaleFactor`），
+    /// 后端再传一份就是两处真相。
+    pub const ORB_RECOVER: &str = "orb://recover";
     /// 本机「在线 / 离线」变了（面板右上角状态框）：界面更新那个框。载荷 `{ online: bool }`。
     pub const LOCAL_ONLINE: &str = "local://online";
     /// 本机网卡地址变了（插网线、开/关热点、切 Wi-Fi、VPN 起来）：界面重新拉一次

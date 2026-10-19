@@ -303,6 +303,200 @@ pub struct PickedImage {
     pub size: u64,
 }
 
+// ── 「会话里那颗＋：从系统选择器里挑图片 / 文件」（`pick_files`）──────────────────
+
+/// 系统选择器插件的句柄（与文件打开、粘贴图片同款：插件 `setup` 那一刻注册，用的时候取）。
+#[cfg(mobile)]
+static PICK_HANDLE: OnceLock<PluginHandle<tauri::Wry>> = OnceLock::new();
+
+/// 「选图片 / 选文件」插件（只在安卓构建里挂，见 `lib.rs`）。
+#[cfg(mobile)]
+pub fn pick_plugin() -> TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("orbdrop-pick-file")
+        .setup(|_app, api| {
+            // 类名与 Kotlin 那边的 `@TauriPlugin class PickFilePlugin` 对应。
+            let handle = api.register_android_plugin("com.x177plus.orbdrop", "PickFilePlugin")?;
+            if PICK_HANDLE.set(handle).is_err() {
+                warn!("选文件插件重复注册：沿用第一份句柄");
+            }
+            Ok(())
+        })
+        .build()
+}
+
+/// 原生选择器交回来的一项。
+///
+/// `name` 是系统给的**真实名字**（`OpenableColumns.DISPLAY_NAME`）：会话里那条文件气泡、对端
+/// 落盘的那一份都写它，用户才认得出"我发的是哪一张"；`size` 以拷好的那份文件为准（有些
+/// provider 不报大小）；`mime` 给界面判"这是不是图片"（推送与图片消息是两条路）。
+#[cfg(mobile)]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickedFile {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+}
+
+/// 安卓：开一次系统选择器（`kind` = `"image"` 或 `"file"`），把选中的几项拷成应用缓存里的
+/// 暂存文件，返回它们的路径 / 名字 / 大小。
+///
+/// **为什么必须有这一跳**：桌面端那颗「＋」开的是自绘的本机文件浏览器（`fs_browse` 那几条命令
+/// 全被 `#[cfg(desktop)]` 门控），安卓上没有对等物 —— 分区存储不给"按路径列共享存储"，非媒体
+/// 文件连读都读不到，只能走 SAF 的 URI 读授权。而发文件（推送）与发图片（会话消息）只认本机
+/// **真实路径**，所以 URI 必须在原生这一侧换成文件，界面拿到的才是一条能直接进
+/// `push_paths` / `chat_send_image` 的路径（与粘贴图片那条路同一个形状，见 `resolve_image_uri`）。
+///
+/// **取消不是错误**：用户在系统选择器里按返回键，Kotlin 回一份空表 —— 这里原样返回空 `Vec`，
+/// 界面据此什么都不做（写成一个错误的话，用户每次反悔都会看到一条"失败"提示）。
+#[cfg(mobile)]
+pub async fn pick_files(kind: String) -> Result<Vec<PickedFile>, String> {
+    let Some(handle) = PICK_HANDLE.get() else {
+        return Err("选文件插件没注册上（内部错误）".into());
+    };
+    let value = handle
+        .run_mobile_plugin_async::<serde_json::Value>("pick", serde_json::json!({ "kind": kind }))
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(items) = value["files"].as_array() else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .iter()
+        .filter_map(|it| {
+            let path = it["path"].as_str()?.to_string();
+            Some(PickedFile {
+                name: it["name"].as_str().unwrap_or_default().to_string(),
+                size: it["size"].as_u64().unwrap_or(0),
+                mime: it["mime"].as_str().unwrap_or_default().to_string(),
+                path,
+            })
+        })
+        .collect())
+}
+
+// ── 「发送应用」：列出设备上已安装的应用（`list_installed_apps`）──────────────────
+
+/// 应用列表插件的句柄（与文件打开、粘贴图片同款：插件 `setup` 那一刻注册，用的时候取）。
+#[cfg(mobile)]
+static APPS_HANDLE: OnceLock<PluginHandle<tauri::Wry>> = OnceLock::new();
+
+/// 「已安装应用」插件（只在安卓构建里挂，见 `lib.rs`）。
+#[cfg(mobile)]
+pub fn apps_plugin() -> TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("orbdrop-installed-apps")
+        .setup(|_app, api| {
+            // 类名与 Kotlin 那边的 `@TauriPlugin class InstalledAppsPlugin` 对应。
+            let handle = api.register_android_plugin("com.x177plus.orbdrop", "InstalledAppsPlugin")?;
+            if APPS_HANDLE.set(handle).is_err() {
+                warn!("应用列表插件重复注册：沿用第一份句柄");
+            }
+            Ok(())
+        })
+        .build()
+}
+
+/// 设备上一个已安装的应用（会话里「＋」→「应用」那张表的一行）。
+///
+/// `path` 是**它自己的 `base.apk`**（`/data/app/…/base.apk`，不需要 root 就读得到，见
+/// `InstalledAppsPlugin.kt`）。我们**不拷**它：推送那条路只认"本机路径"，而清单里那份
+/// "对端看到的名字"是另一件事 —— 发送时把 `file_name` 当覆盖名交给 `push_paths`
+/// （见 `transfer::manifest_for_named_paths`），源路径一个字节都不动。
+#[cfg(mobile)]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledApp {
+    /// 应用自己声明的显示名（可以带 `:`、可以很长、可以是别的语言）。
+    pub label: String,
+    pub package_name: String,
+    /// 可能为空：有的应用就是不写版本名。
+    pub version_name: String,
+    pub version_code: i64,
+    /// `base.apk` 的绝对路径。
+    pub path: String,
+    pub size: u64,
+    /// 落盘名（后端拼好并**净化过**）：`应用名_versionName(versionCode)_包名.apk`。
+    ///
+    /// 在**这里**拼而不是在 Kotlin 里拼：净化判据（哪些字符会让对端整次接收判失败）住在这边
+    /// （`transfer::resume::sanitize_file_name`），两处各写一套迟早分叉。界面拿到它只负责显示
+    /// 与原样交回，不再自己拼一次。
+    pub file_name: String,
+    /// 拆包安装（AAB）：单发 `base.apk` 对端多半装不上（`INSTALL_FAILED_MISSING_SPLIT`），
+    /// 界面据此在那一行标出来 —— 不标就是"发过去对方点开报错，用户以为功能坏了"。
+    pub has_splits: bool,
+}
+
+/// 安卓：列出这台设备上**有桌面图标**的应用（会话里「＋」→「应用」）。
+///
+/// 原生命令那一趟是只读的（`queryIntentActivities` + 每包一次 `getPackageInfo` + 一次 `stat`，
+/// 见 `InstalledAppsPlugin.kt`）；这一层只做两件事：**拼落盘名**（净化在这里，与接收侧的闸门
+/// 同一份判据）与把 Kotlin 的 `JSObject` 翻成 Rust 结构。
+#[cfg(mobile)]
+pub async fn list_installed_apps() -> Result<Vec<InstalledApp>, String> {
+    let Some(handle) = APPS_HANDLE.get() else {
+        return Err("应用列表插件没注册上（内部错误）".into());
+    };
+    let value = handle
+        .run_mobile_plugin_async::<serde_json::Value>("list", serde_json::json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(items) = value["apps"].as_array() else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .iter()
+        .filter_map(|it| {
+            let path = it["path"].as_str()?.to_string();
+            let label = it["label"].as_str().unwrap_or_default().to_string();
+            let version_name = it["versionName"].as_str().unwrap_or_default().to_string();
+            let version_code = it["versionCode"].as_i64().unwrap_or(0);
+            let package_name = it["packageName"].as_str().unwrap_or_default().to_string();
+            Some(InstalledApp {
+                file_name: crate::transfer::resume::apk_file_name(
+                    &label,
+                    &version_name,
+                    version_code,
+                    &package_name,
+                ),
+                label,
+                package_name,
+                version_name,
+                version_code,
+                size: it["size"].as_u64().unwrap_or(0),
+                has_splits: it["hasSplits"].as_bool().unwrap_or(false),
+                path,
+            })
+        })
+        .collect())
+}
+
+/// 安卓：取一个应用的图标（`data:image/png;base64,…`，F-119）。
+///
+/// **按行按需取**，不是列表那一趟一起给：一百多个图标一起画、一起塞进一次返回值，会把"打开
+/// 这张表"变成一次几百毫秒的等待，而图标是"看得见才需要"的东西（界面上那一行先显示首字母，
+/// 图标随后补上，取过的在两端都缓存 —— 见 `InstalledAppsPlugin.kt` 与 `src/mobile/appIcons.ts`）。
+///
+/// 失败如实返回错误（正在卸载、图标坏了）：界面那一行退回首字母 —— 一张表不该因为某一行没有
+/// 图标就空一块。
+#[cfg(mobile)]
+pub async fn app_icon(package_name: String) -> Result<String, String> {
+    let Some(handle) = APPS_HANDLE.get() else {
+        return Err("应用列表插件没注册上（内部错误）".into());
+    };
+    let value = handle
+        .run_mobile_plugin_async::<serde_json::Value>(
+            "icon",
+            serde_json::json!({ "packageName": package_name }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    value["icon"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "原生那一跳没给出图标".to_string())
+}
+
 // ── 「引擎太旧时，一键去应用商店更新 WebView」────────────────────────────────────
 
 /// 商店打开插件的句柄（与文件打开、粘贴图片同款：插件 `setup` 那一刻注册，用的时候取）。

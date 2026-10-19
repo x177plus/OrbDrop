@@ -95,6 +95,10 @@ pub async fn discover(
         let config = state.config.lock();
         (config.device_id.clone(), config.device_name.clone(), config.allow_relay)
     };
+    // 它来问"本机此刻看得见谁"：这一问本身就说明**它在网上**（token 换来的身份，这一档
+    // 只对已配对对端开放，见上）。本机拨不回去的那些（AP 隔开单播 / 跨段）靠这条证据
+    // 才不会被画成离线 —— 见 `AppState::heard`。
+    state.note_heard_online(&caller_id);
     let port = listening_port(&state);
 
     // 「学来的」行不进表（发现只走单播、不做多跳）。**先锁 `learned` 再锁 `peers`**：

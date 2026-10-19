@@ -3,7 +3,7 @@ import { formatFileSize } from '$lib/types';
 import { hasContent, revokeSegs, type ComposerSeg } from '$lib/composer';
 import type { ChatDelivery, ChatFileMsg, ChatGroup, ChatGroupMsg, ChatSnapshot, ChatMessage, ChatPeerConvo, ConvoMode, LocalPick, PendingGroup, PushBatch, PushInvite, PushTargetState } from '$lib/types';
 import * as api from '$lib/api';
-import { getDevices, deviceDotState, threadDotState, peerShortName, type DeviceDotState } from './devices.svelte';
+import { getDevices, deviceById, deviceDotState, threadDotState, peerShortName, type DeviceDotState } from './devices.svelte';
 
 /**
  * 会话（聊天）：后端那份记录在前端的影子 + 会话界面自己的状态。
@@ -469,7 +469,10 @@ export function convoRows(): ConvoRow[] {
   for (const peerId of directPeerIds()) {
     const last = lastOf(peerId);
     if (!last) continue;
-    const dev = getDevices().find((d) => d.id === peerId);
+    // 这一台查**两份表**（见 `deviceById`）：设备页列不出来的那几台（解绑又离线）在后端
+    // 原样那份里，而这一行的名字与**状态点**都要用它们 —— 只查可见那份的话，
+    // 找不到 = 恒 `offline`，与后端真实状态无关。
+    const dev = deviceById(peerId);
     rows.push({
       key: deviceKey(peerId),
       mode: 'direct' as const,
@@ -761,7 +764,8 @@ export function isChatOpen(): boolean {
  */
 export function setChatOpen(next: boolean) {
   open = next;
-  if (next) openKey = null;
+  if (next) { flushPendingDraftDrop(openKey); openKey = null; }
+  else flushPendingDraftDrop(openKey);
 }
 
 /**
@@ -775,9 +779,87 @@ export function draftSegsOf(key: string): ComposerSeg[] {
   return draft[key] ?? [];
 }
 
+/** 只换草稿，不做任何 URL 回收（回收判据因调用点而异，见 `setDraftSegs` / `sendComposer`）。 */
+function writeDraft(key: string, segs: ComposerSeg[]) {
+  draft = { ...draft, [key]: segs };
+}
+
 /** 整份换掉这个会话的草稿（输入区每次 `input` 之后叫一次）。 */
 export function setDraftSegs(key: string, segs: ComposerSeg[]) {
-  draft = { ...draft, [key]: segs };
+  const prev = draft[key];
+  writeDraft(key, segs);
+  if (prev) revokeDroppedSegs(prev, segs);
+}
+
+/**
+ * 上一版里有、这一版里没有的图片段 = 刚从输入区删掉的那几张芯片。它们的预览 `blob:` URL
+ * 再没人读，当场回收 —— 这一版正是照着"框里此刻有什么"重算出来的（`composer.serializeComposer`
+ * 读的就是 DOM 里的芯片），没了的那些确已不在 DOM / 预览里，回收不会把正在显示的图弄裂。
+ * 按 `url` 字符串比对（不是对象）：序列化每次都给图片段新建对象，但 URL 是同一份。
+ */
+function revokeDroppedSegs(prev: readonly ComposerSeg[], next: readonly ComposerSeg[]): void {
+  const kept = new Set<string>();
+  for (const s of next) if (s.kind === 'image') kept.add(s.url);
+  for (const s of prev) {
+    if (s.kind === 'image' && s.url.startsWith('blob:') && !kept.has(s.url)) URL.revokeObjectURL(s.url);
+  }
+}
+
+/**
+ * 因为"这条会话正开着"而没能在 `clearPeer` 里当场清掉的草稿（键 = 会话键）。正开着的时候，
+ * 草稿里的 `blob:` 预览还挂在输入区的芯片上：当场丢掉会让输入区"有图却发不出去"
+ * （`draftHasContent` 变 false），当场 revoke 又会把正在显示的图弄裂 —— 所以整件事推迟到
+ * **离开这条会话**（`backToList` / 开下一条 / 收起面板）时再做：那一刻芯片已不在屏幕上。
+ */
+const pendingDraftDrop = new Map<string, ComposerSeg[]>();
+
+/** 清掉一条会话的草稿（`clearPeer` 用）：正开着则推迟到离开时（见 `pendingDraftDrop`）。 */
+function dropDraft(key: string) {
+  const segs = draft[key];
+  if (!segs) return;
+  if (openKey === key) {
+    // 记的是**当时那几段**，不是"这个键"：推迟这段时间里用户可能又往框里敲字、粘图，
+    // 那些一个字都不该动（推迟是为了显示，不是"离开时把草稿清空"）。
+    pendingDraftDrop.set(key, segs);
+    return;
+  }
+  clearDraftNow(key);
+}
+
+/** 真正丢掉草稿并回收它的预览 URL（这一刻它的芯片确已不在任何输入区/预览里）。 */
+function clearDraftNow(key: string) {
+  const segs = draft[key];
+  if (!segs) return;
+  const next = { ...draft };
+  delete next[key];
+  draft = next;
+  revokeSegs(segs);
+}
+
+/** 离开一条会话时把推迟的那些**段**清掉（见 `pendingDraftDrop`）。正常路径下这里是空操作。 */
+function flushPendingDraftDrop(key: string | null) {
+  if (!key) return;
+  const dropped = pendingDraftDrop.get(key);
+  if (!dropped) return;
+  pendingDraftDrop.delete(key);
+  const gone = new Set<string>();
+  for (const s of dropped) {
+    if (s.kind === 'image' && s.url.startsWith('blob:')) gone.add(s.url);
+  }
+  if (gone.size === 0) return;
+  const cur = draft[key];
+  if (!cur) return; // 草稿已经不在了（发出去 / 被换成别的）：没有可收的
+  const removed = cur.filter((s) => s.kind === 'image' && gone.has(s.url));
+  if (removed.length === 0) return; // 这几段早被别的路（删芯片 / 发送）收过了
+  const kept = cur.filter((s) => !(s.kind === 'image' && gone.has(s.url)));
+  if (kept.length === 0) {
+    const next = { ...draft };
+    delete next[key];
+    draft = next;
+  } else {
+    writeDraft(key, kept);
+  }
+  revokeSegs(removed);
 }
 
 /** 这条草稿里有没有值得发的东西（两段空白文字不算）。 */
@@ -911,6 +993,7 @@ function syncGroup(id: string) {
 /** 打开一个会话（键见 `deviceKey`；已完成/失效的名单在这里被挡掉）。 */
 export function openConversation(key: string) {
   if (!threadOf(key)) return;
+  if (openKey !== key) flushPendingDraftDrop(openKey);
   openKey = key;
   open = true;
   // 打开群会话时补拉一次：开它的人就是马上要看的人，缺的那几条此刻去要最值（`group_sync`）。
@@ -926,6 +1009,7 @@ export function openDeviceChat(peerId: string) {
 
 /** 回到会话列表（草稿留着）。 */
 export function backToList() {
+  flushPendingDraftDrop(openKey);
   openKey = null;
 }
 
@@ -1177,10 +1261,13 @@ export async function sendComposer(key: string): Promise<ComposerSendResult | nu
 
   // 发出去的那几段连同它们的预览 URL 一起丢掉；没发出去的**原样留着**（图还在草稿里，
   // 它的暂存文件也还在盘上，直接再点一次发送就能重发）。
+  // 回收的判据用**开始时捕获的 `segs`**（不是此刻的 `draft[key]`）：发送是异步的，期间用户
+  // 若又粘了一张图，那张不在 `segs` 里、也不该被这里回收 —— 所以这里只 `writeDraft`，回收交给
+  // 上面那趟显式循环（按 `segs` 逐段判），不用 `setDraftSegs` 的"按当前草稿差值回收"。
   for (const seg of segs) {
     if (!failedSegs.includes(seg)) revokeSegs([seg]);
   }
-  setDraftSegs(key, failedSegs);
+  writeDraft(key, failedSegs);
   return result;
 }
 
@@ -1206,6 +1293,9 @@ export async function clearPeer(peerId: string): Promise<void> {
   // 后端那份清掉了，本机这条文件消息也一起走 —— 只清一半的话，会话列表的"最近一条"
   // 还会挂着一条已经不存在的记录。
   dropLocalFiles(peerId);
+  // 这条会话名下的草稿也一起丢：它里面的图片段挂着预览用的 `blob:` URL，`draft` 是按会话累积的，
+  // 不清就会跟着这条已经不存在的会话一直活着。正开着这条会话时改为推迟回收（见 `dropDraft`）。
+  dropDraft(deviceKey(peerId));
 }
 
 /** 丢掉一台设备的本机文件消息（清空聊天记录时用）。 */

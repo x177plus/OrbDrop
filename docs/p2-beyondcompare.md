@@ -125,8 +125,10 @@
   - `prune_webdav_profiles()`：清理**我们自己写下、但已失效**的条目（解除配对后 / 地址漂移的旧名字），见 1.2。
   - `profile_spec()`：`profile:<ip:port>` / `profile:<ip:port>?<shareId>/<子路径>`。
   - `resolve_side()`：本机共享项 → 本地绝对路径；对端共享项 → 要求**长连接** + 取出该设备 token → 写 profile → 返回 spec。
-- 配置：`Config.bc_exe_path`（留空=自动探测）、`Config.bc_left` / `Config.bc_right`（"添加到左侧/右侧比较位"，跨重启保留）。
-- Tauri 命令：`bc_status` / `bc_set_side` / `bc_clear_side` / `bc_compare`。
+  - `read_slot()/write_slot()`：左侧槽的读写（见 2.3）——**两个值名都写**、读按右键项类型取（`pick_slot`）、只写 HKCU 且只碰那两个值名。
+  - `status()/set_left()/compare_with_left()`：槽可写判据（父键在不在）、放入左侧（覆盖）、与左侧比对（左边读槽的**原文**）。
+- 配置：`Config.bc_exe_path`（留空=自动探测）。**左侧槽不在配置里**：它只有一处存储 —— BC 自己的 `Saved*Left`（见 2.3）。
+- Tauri 命令：`bc_status` / `bc_set_left` / `bc_compare_with_left`。
 - DAV 端点：`src-tauri/src/server/routes_dav.rs`，命名空间 `/dav/<shareId>/<相对路径>`，方法 `OPTIONS/GET/HEAD/PUT/DELETE/MKCOL/MOVE/COPY/PROPFIND/PROPPATCH`，可见性复用 `Caller::sees_share`（不可见与不存在都回 404），路径逃逸防护走"逐级向上 canonicalize"（PUT/MKCOL 的目标可以还不存在）。
 
 ### 2.2 两个必须记住的坑
@@ -134,10 +136,44 @@
 1. **DAV 路由不能挂 CORS 层**。tower-http 的 CORS 会把 `OPTIONS` 直接抢答成 preflight 响应，而 BC 正是用 `OPTIONS` 协商 DAV 能力——被抢答 = BC 认为"这不是 WebDAV"，远端目录直接加载不了。所以 `build_router` 里 REST 走 CORS、DAV 单独一棵树。
 2. **带尾斜杠的路由要单独注册**：BC 对目录用 `/dav/<shareId>/`，只注册 `/dav/{share_id}` 会让目录级请求 404。
 
+### 2.3 左侧槽 = BC 自己的 `Saved*Left`（全系统只有一个左侧）
+
+资源管理器那套右键（BC 5.2 的 `BCShellEx64.dll`）与 OrbDrop 共用**同一处**左侧状态：
+
+- **值**：`HKCU\SOFTWARE\Scooter Software\Beyond Compare 5\BcShellEx` 下的 `SavedFolderLeft` / `SavedFileLeft`
+  （本机 DLL 串表里左侧只有这两个值名，另有合并用的 `Saved*Center`；**没有 `Saved*Right`** —— 官方
+  Explorer Integration 一页列全了：`Select Left File/Folder` + `Select Center File/Folder`，
+  "右侧"永远是你在资源管理器里右键点的那一项）。
+- **写**：OrbDrop 的「添加到左侧比较位」→ `write_slot()`，**两个值名写同一个值**。BC 按右键项类型取槽
+  （右键文件看 `SavedFileLeft`、右键文件夹看 `SavedFolderLeft`），只写一个的后果是**另一类条目在资源管理器里
+  看不到「对比」项**（真机实测踩到：OrbDrop 放了个目录进去，右键**文件**就没有对比项了）。BC 自己的扩展也
+  不清理另一个槽（实测：资源管理器"选择左侧文件"之后，之前那个文件夹左侧还在），我们跟着它走。这就是"覆盖"语义。
+- **读**：`read_slot(prefer)` —— `prefer` 就是"右键的那一项是文件还是文件夹"，**跟着 BC 的类型规矩取**
+  （要的那一档空着退另一个，`pick_slot`）；没有上下文（启动/设置面板）时文件夹槽优先。HKCU 优先、32 位那份
+  （`HKLM\SOFTWARE\WOW6432Node\…`）只作回退。读到什么就**原样喂给 BC**（`resolve_side` 的 `Raw` 分支）；
+  反解成 `Share`/`Peer`/`Raw` 只影响菜单显示与"是不是同一项"的判定，反解不出来也照样能比。
+- **两个槽可能不一致**，只有一种来路：你在资源管理器里选过左侧（BC 只更新它那一档），我们镜像的另一个还在。
+  那时我们的行为与 BC 的右键菜单一致：右键文件用文件槽、右键文件夹用文件夹槽。
+- **保护**（"不能让 BC 出问题"）：只写 HKCU、只碰这两个值名（同一把键里还住着 BC 自己的 `Viewers` /
+  `ArchiveMasks` / `PictureMasks` / `RegistryViewer`，一个都不动）、不删键、不写掩码、值类型固定
+  REG_SZ、覆盖前把旧值写进日志；`HKCU\…\Beyond Compare 5` 父键不存在（= 本机没装过 BC5）或
+  **父键开不出写权限**时**一个值都不写**，前端整个 BC 菜单区也不显示。
+- **写权限要用写句柄探**：`winreg` 的 `open_subkey` 只给 `KEY_READ`，拿它写注册表会
+  `ERROR_ACCESS_DENIED`（实测踩过一次）；所以 `slot_writable()` 用 `open_subkey_with_flags(…,
+  KEY_READ | KEY_WRITE)` 真开一次，写路径也从父键的写句柄 `create_subkey("BcShellEx")` 拿子键。
+- **没有"移除左侧"**：与官方一致（BC 也只有"选择左侧"覆盖）。
+
 ## 3. 验证记录
 
 - `cargo test`：25 个单元测试（含 BC 加密互通 fixture、profile 合并/幂等/清理、Basic 凭据拆分、spec 语法、DAV 方法/可见性/非回环 401 挑战/局域网 Basic 认证）+ 7 个 P1 集成（含解除配对清理 profile、重启恢复长连接）+ 4 个共享可见性，全绿。
+  - 左侧槽另有 6 条：`clean_slot_value`（引号/空白）、`split_profile_spec`、`share_of_path`（分量边界 + 大小写 + 嵌套）、`compare_command` 的 argv 原样传递、`pick_slot`（按右键项类型取槽 + 退另一档）、以及**拿临时键走同一条代码路径**的 `write_slot_values`/`read_slot_values`（钉住"两个值名都写"）。
   - 注：DAV 测试各自持有**独立端口段**（4100/4110/…）。都从同一基址往上探会在并行跑时互相抢端口，表现为偶发 `IncompleteMessage`。
+- 真机取证（左侧槽，2026-10-13，脚本/命令驱动，非 GUI）：
+  - 生产代码 `write_slot()` 真写 `HKCU\…\Beyond Compare 5\BcShellEx`：`reg query` 读出 `SavedFileLeft` / `SavedFolderLeft` 两条 `REG_SZ`，同一把键里的 `Viewers` / `ArchiveMasks` / `PictureMasks` / `RegistryViewer` / `SavedLeft` 一个字节未动。
+  - **两个槽是独立的**（用户实测修正了第一版设计）：OrbDrop 往文件夹槽写了目录之后，资源管理器右键**文件**没有「对比」项；而同一时刻注册表里 `SavedFileLeft` 还留着上一次"选择左侧文件"的路径 —— 说明 BC 的扩展只更新与右键项同类型的那一档、且**不清另一个**（第一版"写一个删另一个"因此是错的：另一类条目直接失去了左侧）。现在 `write_slot()` 两个值名都写，读按右键项类型取（`pick_slot`，与 BC 的右键菜单同一规矩）。
+  - 踩到的坑：`winreg::open_subkey` 只给 `KEY_READ`，拿那个句柄写注册表必然 `ERROR_ACCESS_DENIED` —— 写路径改成父键的 `KEY_READ|KEY_WRITE` 句柄 + `create_subkey("BcShellEx")`，`slot_writable()` 也用同一把写句柄探（"键存在"不等于"能写"）。
+  - `launch_compare` 那两个裸参数：`BCompare.exe "E:\…\docs" "E:\…\src"` → BC 窗口标题 `docs <--> src - 文件夹比较(F)`（参数顺序 = 左、右，没引号、没拼接）。
+  - **还没跑到的一层**：OrbDrop 菜单在真窗口里的渲染与点击（本环境没有可用的桌面 UI 自动化），以及下面 Test 1/2/3（都必须人在资源管理器里点 BC 菜单）。
 - 端到端冒烟（真机 BC 5.2，脚本驱动，非 GUI）：
   - spec `profile:127.0.0.1:3997?<shareId>/共享 目录`（含中文与空格）
   - BC 报告：左边基点 `http://127.0.0.1:3997/dav/<shareId>/共享 目录`，左边独有 `remote-only.txt`、右边独有 `local-only.txt` —— 真实比较结果
@@ -152,4 +188,7 @@
 | 非便携安装 | 本机是便携版；`%APPDATA%` 分支未在本机实测 |
 | macOS | `bcomp` 路径与行为未验证 |
 | 只读策略 | F-73（共享方可设"允许写回/只读"）尚未接入 DAV 端点，目前 DAV 一律可写 |
-| 未装 BC | `bc_status().exePath === null` ⇒ 前端 **整个 BC 菜单区不显示**（`ContextMenu.svelte` 的 `bcAvailable`；比较位标签/「用 BeyondCompare 比较」/「添加到左·右比较位」/「清除比较位」连同分隔线一起隐藏）。设置面板保存/取消后重连一次 `bc_status`，所以刚填上的 BC 路径不用重启就生效。后端 `bc_compare` 的"未找到…请在设置里指定路径"只剩兜底作用（前端已挡住入口） |
+| 未装 BC | `bc_status().exePath === null` ⇒ 前端 **整个 BC 菜单区不显示**（`ContextMenu.svelte` 的 `bcAvailable`；「左：X」/「用 BeyondCompare 比较 · 与左侧：X」/「添加到左侧比较位」连同分隔线一起隐藏）。设置面板保存/取消后重连一次 `bc_status`，所以刚填上的 BC 路径不用重启就生效。后端 `bc_compare_with_left` 的"未找到…请在设置里指定路径"只剩兜底作用（前端已挡住入口） |
+| 槽不可写 | `bc_status().slotWritable === false`（没装过 BC5，或那把键开不出写权限；前端判据是 `exePath && slotWritable`）⇒ 整区同样不显示：没有卡槽的地方，我们也不去造 |
+| 左侧槽未真机联动 | Test 1/2/3 还没跑（都要人在资源管理器里点 BC 菜单）：①BC 的「选择左侧」是否真写 `SavedFolderLeft`/`SavedFileLeft`、值的格式（带不带引号）；②我们写进去的值，资源管理器里的「对比」是否立刻认；③把 `profile:` 位置写进槽后资源管理器里点「对比」时 BC 的行为（若异常，退化成"对端目标不写槽"） |
+| 对端槽会陈旧 | 槽里那条 `profile:<ip:端口>` 在设备离线 / 端口变了以后失效（BC 报"配置文件找不到"）——与 BC 自己的最近比较同一类陈旧，重新「添加到左侧比较位」覆盖即可 |

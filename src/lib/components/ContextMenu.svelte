@@ -13,10 +13,9 @@
     peerName,
     bcAvailable = true,
     bcLeftLabel = null,
-    bcRightLabel = null,
+    bcLeftExists = true,
     bcCompareLabel = '',
     bcCompareEnabled = true,
-    bcThisStaged = false,
     chatSel = false,
     convoBrowse = false,
     convoThread = false,
@@ -39,8 +38,6 @@
     onPeerDownload,
     onBcCompare,
     onBcAddLeft,
-    onBcAddRight,
-    onBcClear,
     onChatCopy,
     onConvoFiles,
     onConvoEdit,
@@ -68,14 +65,13 @@
     peerName?: string;
     /** 本机是否探测到 BeyondCompare（后端 `bc_status.exePath` 非空）；false = 整个 BC 菜单区不显示。 */
     bcAvailable?: boolean;
-    /** 已在比较位上的项（null = 空），文案由后端给的 label 提供。 */
+    /** 左侧槽里的那一项（null = 还没人放过左侧），文案由后端给的 label 提供。 */
     bcLeftLabel?: string | null;
-    bcRightLabel?: string | null;
-    /** 追加在「用 BeyondCompare 比较」后的对手方说明；'' = 无可比对象。 */
+    /** 槽里那条此刻还在不在（本机路径被删/改名 → 把那行标出来）。 */
+    bcLeftExists?: boolean;
+    /** 追加在「用 BeyondCompare 比较」后的对手方说明；'' = 没有对手方（槽空，或右键的正是槽里那一项）。 */
     bcCompareLabel?: string;
     bcCompareEnabled?: boolean;
-    /** 当前右键的这一项是否已在某个比较位上。 */
-    bcThisStaged?: boolean;
     /** 消息右键时选区里那段可复制的文字（空 = 不显示「复制所选文字」）。 */
     chatSel?: boolean;
     /** 会话菜单：「查看该设备文件」只在对方**正处在长连接**时给 —— 对端浏览标签只存在于长连接设备。 */
@@ -125,8 +121,6 @@
     onPeerDownload: () => void;
     onBcCompare: () => void;
     onBcAddLeft: () => void;
-    onBcAddRight: () => void;
-    onBcClear: () => void;
     /** 复制会话里的一条消息：`all` = 整条，`sel` = 只复制选中的那段。 */
     onChatCopy: (which: 'all' | 'sel') => void;
     /** 会话菜单：切到那台设备的文件标签页（一对一才有）。 */
@@ -187,39 +181,25 @@
   };
 </script>
 
-<!-- BeyondCompare 菜单区：本机共享项与对端共享项共用同一份结构 -->
+<!-- BeyondCompare 菜单区：本机共享项与对端共享项共用同一份结构。
+     左侧槽只有一个（BC 自己的 `Saved*Left`）：那两行读同一个槽 —— 资源管理器里放的左侧
+     在这里照样显示，「添加到左侧比较位」就是覆盖它。 -->
 {#snippet bcSection()}
   <div class="ctx-sep"></div>
   {#if bcLeftLabel}
     <button class="ctx-item" disabled>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="3"/></svg>
-      左：{bcLeftLabel}
-    </button>
-  {/if}
-  {#if bcRightLabel}
-    <button class="ctx-item" disabled>
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="3"/></svg>
-      右：{bcRightLabel}
+      左：{bcLeftLabel}{bcLeftExists ? '' : '（已被移动或删除）'}
     </button>
   {/if}
   <button class="ctx-item" disabled={!bcCompareEnabled} onclick={() => handleItem(onBcCompare)}>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><rect x="3" y="4" width="7" height="16" rx="1.5"/><rect x="14" y="4" width="7" height="16" rx="1.5"/></svg>
-    用 BeyondCompare 比较{bcCompareLabel ? ` · ${bcCompareLabel}` : ''}
+    用 BeyondCompare 比较{bcCompareLabel ? ` · 与左侧：${bcCompareLabel}` : ''}
   </button>
   <button class="ctx-item" onclick={() => handleItem(onBcAddLeft)}>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H4M10 6l-6 6 6 6"/></svg>
     添加到左侧比较位
   </button>
-  <button class="ctx-item" onclick={() => handleItem(onBcAddRight)}>
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h16M14 6l6 6-6 6"/></svg>
-    添加到右侧比较位
-  </button>
-  {#if bcThisStaged}
-    <button class="ctx-item" onclick={() => handleItem(onBcClear)}>
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></svg>
-      清除比较位
-    </button>
-  {/if}
 {/snippet}
 
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->

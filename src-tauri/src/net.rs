@@ -43,6 +43,7 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower::Service;
 use tracing::{debug, info, warn};
 
@@ -58,6 +59,38 @@ const TLS_HANDSHAKE: u8 = 0x16;
 /// 等首字节的时限。明文 HTTP 客户端一定会先发请求行；超时说明对面连上就不说话
 /// （端口扫描、坏掉的客户端），别让它一直占着一个任务。
 const PEEK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// TLS 握手（`TlsAcceptor::accept`）的时限。**与首字节时限是两件事**：`PEEK_TIMEOUT`
+/// 只盖住"第一个字节到没到"，而这一个盖住"握手谈不谈得完"。
+///
+/// 为什么必须有：局域网上任何一台机器连上来、发一个 `0x16`（握手记录类型）就挂住
+/// （笔记本休眠、进程被挂起、敌意客户端），`accept` 就永远等不到对方的后续记录 ——
+/// 那条连接会带着一份 TLS 缓冲**永久**占着一个任务。挂住的任务没有任何东西会来收尾
+/// （`stop_server` 也不 abort 它们）。
+///
+/// 10s 的依据：局域网 RTT 亚毫秒，握手两个 RTT；唯一能把合法握手拖到这个量级的是
+/// 连续丢包 —— TCP 的重传阶梯（RTO 0.3/0.6/1.2/2.4/4.8s）累积约 9.3s，也就是连续丢近
+/// 五个包才够得着。到点就丢：那种连接不会有下文，对端下次拨号会重来（拨号一侧本来就有
+/// 退避重试）。
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 同时驻留的连接上限（本机监听端）。**一台机器连上就不说话**能开的门数才是内存与任务数
+/// 的上界，没有它，"连上"这个动作本身就是一次无界分配（任务 + TLS 缓冲，几十~上百 KB）。
+///
+/// 512 的依据是正常用量的逐项账：
+///
+/// - 本机前端（WebView）：一条 `/events` 的 UI 长连接 + 几条 REST（同一个 client 复用连接）；
+/// - BC 的 WebDAV 入口（回环明文，转成到对端的加密连接）：几条；
+/// - 每台**已配对对端**：1 条入站长连接，推送/镜像水合期间再加上并发的几条 HTTPS；
+/// - 5s 探活：每台有地址的设备一条短连接（毫秒级就结束）。
+///
+/// 局域网里十几台设备的量级下，正常同时打开在**几十条**；512 留了一个数量级的余量，
+/// 正常路径碰不到它（碰到了也不是"用得多"，是有人不开门地占着）。而按上面的单连接量级，
+/// 上限本身把驻留内存钉在**几十 MB** 这一档。
+///
+/// 超限时**丢弃新连接**（`try_acquire`，不排队）：本机已经满了，把新连接排队只是把
+/// "占内存"换个地方继续涨。
+const MAX_CONNECTIONS: usize = 512;
 
 // ---------------------------------------------------------------------------
 // 指纹
@@ -225,6 +258,16 @@ pub struct Trust {
     pinned: Mutex<HashMap<StdIpAddr, String>>,
     /// 这次进程里实际见到过的指纹。TOFU 靠它把"刚认下的那枚"交回给调用方落库——
     /// 校验器只负责放行/拒绝，**不写凭据库**（它在握手线程里，不该碰磁盘）。
+    ///
+    /// **故意不按 `pinned` 集合 prune**（别在这里"顺手清理"）：它的读取点只有两个，两个
+    /// 都只在"这个地址**还没有**钉住的指纹"时才读 —— `state::remember_peer_fingerprint`
+    /// （库里已有指纹就早退）与 `pair::commit_pairing`（那个地址的 pin 刚被
+    /// `forget_stale_pin` 清掉，接着要把这次见到的写回去，而 `forget_stale_pin` 自己就调了
+    /// `refresh_trust`）。按 `pinned` 去 prune，删掉的正好是**还有读者的那些**（未钉住的
+    /// 地址），留下的没人读；后果是"配对码那条路本机拨过去、明明见了对端证书，却把指纹写成
+    /// 空"，退回 TOFU。另外 `refresh_trust` 会被任意别的设备（配对/解除配对/指纹落库）在
+    /// 任意时刻调用，prune 还会把刚握手完、**还没被读走**的那条观察删掉 —— 那正是
+    /// `remember_peer_fingerprint` 唯一工作的窗口。
     observed: Mutex<HashMap<StdIpAddr, String>>,
 }
 
@@ -357,11 +400,25 @@ impl ServerCertVerifier for PinnedVerifier {
                 );
                 return Err(rejected());
             }
-            None => info!(
-                %ip,
-                seen = %short_fingerprint(&seen),
-                "首次见到该地址的证书，按 TOFU 认下并记住"
-            ),
+            None => {
+                // 只在"这个地址上见到的证书变了"（含第一次）时说一句 —— 与 `state::remember_peer_fingerprint`
+                // 那条刷屏同一个毛病，同一种修法：**未配对**的设备永远进不了 `pinned`（那张表只从
+                // 凭据库来，见 `seed`），于是它的**每一次握手**都落在这一支。按 `info` 记就等于
+                // "每次连接一条"，而重复同一枚证书不是新闻 —— 这一跳上"换了"才是。
+                if self.trust.observed.lock().get(&ip) != Some(&seen) {
+                    info!(
+                        %ip,
+                        seen = %short_fingerprint(&seen),
+                        "首次见到该地址的证书，按 TOFU 认下并记住"
+                    );
+                } else {
+                    debug!(
+                        %ip,
+                        seen = %short_fingerprint(&seen),
+                        "这一跳仍是那枚没钉住的证书（这个地址上已经见过）"
+                    );
+                }
+            }
         }
         self.trust.observe(ip, seen);
         Ok(ServerCertVerified::assertion())
@@ -574,6 +631,10 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) {
     let mut shutdown = std::pin::pin!(shutdown);
+    // 同时驻留的连接上限（[`MAX_CONNECTIONS`]）：每个监听循环一份。重启（`stop_server` +
+    // `start_server`）会换一份新的，而上一代已经在跑的任务本来就不归这里管 —— 两代合起来
+    // 也仍是 2×N 的有界值，不是无界。
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let accepted = tokio::select! {
             _ = &mut shutdown => {
@@ -589,14 +650,30 @@ pub async fn serve(
                 continue;
             }
         };
+        // 名额拿到才建任务；拿不到就把这条连接丢掉（`stream` 在这里 drop = 关掉它）。
+        let Some(permit) = acquire_slot(&slots) else {
+            // 用 debug 而不是 warn：上限被打满时这里是**每连接一条**日志，而这条日志要防的
+            // 正是"无界增长"—— 攻击期间别把内存的账挪到磁盘上。排障要看它时把日志级别调下来。
+            debug!(%addr, limit = MAX_CONNECTIONS, "并发连接已达上限，丢弃这条新连接");
+            continue;
+        };
         let router = router.clone();
         let tls = tls.clone();
         tokio::spawn(async move {
+            // 名额跟着这条连接走到头：任务收尾（正常/出错/握手超时）就自动还回去。
+            let _permit = permit;
             if let Err(e) = dispatch_conn(stream, addr, router, tls).await {
                 debug!(%addr, %e, "连接结束");
             }
         });
     }
+}
+
+/// 取一个连接名额：拿到 = 可以服务，`None` = 已满，**调用方丢弃这条连接**（不排队）。
+///
+/// 单独成函数是为了能被单测直接钉住"只判能不能，不等"这个语义（见 `net.rs` 的测试）。
+fn acquire_slot(slots: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    slots.clone().try_acquire_owned().ok()
 }
 
 async fn dispatch_conn(
@@ -620,7 +697,13 @@ async fn dispatch_conn(
 
     if head[0] == TLS_HANDSHAKE {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls);
-        let stream = acceptor.accept(stream).await.map_err(|e| e.to_string())?;
+        // 超时就把这条连接丢掉（`accept` 的 future 连同 `stream` 一起 drop = 关掉它）：
+        // 半途而废的握手不会有下文，钉在这里的只有本机的任务与 TLS 缓冲（见
+        // `TLS_HANDSHAKE_TIMEOUT`）。正常握手是亚毫秒级，这个时限在正常路径上不可达。
+        let stream = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+            .await
+            .map_err(|_| "TLS 握手超时".to_string())?
+            .map_err(|e| e.to_string())?;
         return serve_http(stream, addr, router).await;
     }
 
@@ -886,25 +969,66 @@ mod tests {
     /// （退到 TOFU）—— 也就是把中转这一跳的身份校验悄悄关掉。
     #[test]
     fn relay_host_is_a_distinct_pinning_key() {
-        let host = relay_host("10.198.71.106").expect("IPv4 能转");
-        assert_eq!(host, "[::ffff:10.198.71.106]", "URL 主机必须带方括号");
+        let host = relay_host("198.51.100.6").expect("IPv4 能转");
+        assert_eq!(host, "[::ffff:198.51.100.6]", "URL 主机必须带方括号");
 
-        let direct = parse_host("10.198.71.106").expect("直连字面量");
+        let direct = parse_host("198.51.100.6").expect("直连字面量");
         let relay = parse_host(&host).expect("带方括号的中转字面量也要认得");
         assert_ne!(
             direct, relay,
             "两者必须是**不同的键**，否则同一地址上钉两枚指纹 → 不钉 → TOFU"
         );
         assert!(
-            matches!(relay, StdIpAddr::V6(v6) if v6.to_ipv4_mapped() == Some("10.198.71.106".parse().unwrap())),
+            matches!(relay, StdIpAddr::V6(v6) if v6.to_ipv4_mapped() == Some("198.51.100.6".parse().unwrap())),
             "键位是 IPv4 映射的 IPv6，地址还是同一个: {relay:?}"
         );
 
         // 非 IPv4 的字面量（域名/垃圾）不产出中转主机：这条路上我们只认 IPv4。
         assert!(relay_host("example.com").is_none());
         assert!(relay_host("").is_none());
-        assert!(parse_host("[::ffff:10.198.71.106]").is_some());
-        assert!(parse_host("10.198.71.106").is_some());
+        assert!(parse_host("[::ffff:198.51.100.6]").is_some());
+        assert!(parse_host("198.51.100.6").is_some());
         assert!(parse_host("[]").is_none());
+    }
+
+    /// 并发上限只有"拿到名额"和"没有名额"两种结果：**不排队**（排队等于把连接堆在内存里
+    /// 等，涨的还是内存），名额跟着连接走（连接收尾就还回来，不是一次性的）。
+    #[test]
+    fn connection_slots_are_an_admission_check_never_a_queue() {
+        let slots = Arc::new(Semaphore::new(2));
+        let first = acquire_slot(&slots).expect("第一个名额");
+        let second = acquire_slot(&slots).expect("第二个名额");
+        assert!(acquire_slot(&slots).is_none(), "满了就是没有名额，不是等一个出来");
+        drop(first);
+        assert!(acquire_slot(&slots).is_some(), "连接收尾要把名额还回来");
+        drop(second);
+        // 上限本身是"远大于正常用量"的：正常同时打开在几十条（见 `MAX_CONNECTIONS`）。
+        assert!(MAX_CONNECTIONS >= 256, "上限不能小到正常用量就撞上：{MAX_CONNECTIONS}");
+    }
+
+    /// TLS 握手没有下文时**必须**放手：连上、发一个 `0x16`（握手记录类型）就挂住 ——
+    /// 这正是"笔记本休眠/进程被挂起"那条路，没有超时它就会带着一份 TLS 缓冲永久占着任务。
+    ///
+    /// 断言外面再包一层 `timeout` 是因为这里没得商量：`TLS_HANDSHAKE_TIMEOUT` 是刻意的
+    /// 10s 下界（正常路径上是给一台慢机器的余量），测试不能为了跑得快把它调小。
+    #[tokio::test]
+    async fn a_handshake_that_never_finishes_is_dropped() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tls = server_config(&generate_identity().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            dispatch_conn(stream, peer, Router::new(), tls).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[TLS_HANDSHAKE]).await.unwrap(); // 发完就什么都不说了
+        let result = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT + Duration::from_secs(5), server)
+            .await
+            .expect("握手谈不完也必须收尾，不能永远挂着")
+            .expect("任务不该 panic");
+        assert_eq!(result.unwrap_err(), "TLS 握手超时");
     }
 }

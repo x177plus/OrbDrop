@@ -59,6 +59,11 @@
     const added = ids.filter((id) => !knownPeerIds.includes(id));
     const firstPopulation = knownPeerIds.length === 0;
     knownPeerIds = ids;
+    // 设备断开后它那条标签的 DOM 引用跟着 `{#each}` 一起没了，这里把表项也清掉 ——
+    // 不然每接入一台就多留一个 detached 的 `<button>`（键按设备 id、长连接反复进出会一直涨）。
+    for (const id of Object.keys(peerEls)) {
+      if (!ids.includes(id)) delete peerEls[id];
+    }
     if (firstPopulation || added.length === 0) return;
     peerEls[added[added.length - 1]]?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
   });

@@ -1358,7 +1358,7 @@ font-family: var(--font-body);
         <div class="sheet-body">
           <div class="field">
             <label for="deviceName">设备名称</label>
-            <input class="input" id="deviceName" value="王磊的MacBook Pro" />
+            <input class="input" id="deviceName" value="小明的MacBook Pro" />
           </div>
           <div class="field">
             <label for="downloadDir">下载目录</label>
@@ -2080,7 +2080,7 @@ font-family: var(--font-body);
       {
         name: 'Windows (C:)', type: 'folder', drive: true, abs: 'C:', total: '512 GB', free: '128 GB', children: [
           { name: 'Users', type: 'folder', children: [
-            { name: '王磊', type: 'folder', children: [
+            { name: '小明', type: 'folder', children: [
               { name: 'Desktop', type: 'folder', children: [
                 { name: '项目设计稿', type: 'folder', children: [
                   { name: 'assets', type: 'folder', children: [
@@ -2197,9 +2197,9 @@ font-family: var(--font-body);
   }
   function pkDefaultFavs() {
     return [
-      { name: '桌面', segs: ['Windows (C:)', 'Users', '王磊', 'Desktop'] },
-      { name: '文档', segs: ['Windows (C:)', 'Users', '王磊', 'Documents'] },
-      { name: '下载', segs: ['Windows (C:)', 'Users', '王磊', 'Downloads'] },
+      { name: '桌面', segs: ['Windows (C:)', 'Users', '小明', 'Desktop'] },
+      { name: '文档', segs: ['Windows (C:)', 'Users', '小明', 'Documents'] },
+      { name: '下载', segs: ['Windows (C:)', 'Users', '小明', 'Downloads'] },
       { name: '项目', segs: ['数据 (D:)', '项目'] }
     ].map(function (f) { return { name: f.name, segs: f.segs, path: pkPath(f.segs) }; });
   }

@@ -9,6 +9,7 @@
     adoptDomImages,
     applyComposer,
     imageFiles,
+    insertImagePicks,
     insertImages,
     isImageName,
     serializeComposer,
@@ -45,7 +46,10 @@
   const canSend = $derived(chat.draftHasContent(convoKey));
 
   const dot = $derived(devices.threadDotState(participants));
-  const peers = $derived(devices.getDevices().filter((d) => participants.includes(d.id)));
+  // 这一份查**两份表**（`deviceById`）：设备页列不出来的那几台（离线 + 未绑定 + 没被 mDNS
+  // 看见，可会话还在）也得算进来 —— 只查可见那份时这里会变成空表，于是"0 台在线 / 离线 · 消息
+  // 不会送达"顶在一台其实刚发过消息的设备上（同一行那颗点已经按后端真实状态画了，两句自相矛盾）。
+  const peers = $derived(devices.devicesById(participants));
   /** 有长连接的那几台（"长连接"是这一档唯一的判据）。 */
   const linked = $derived(peers.filter((d) => d.connected).length);
   /**
@@ -57,16 +61,13 @@
    * 却写着离线"的那一句。
    */
   const reachable = $derived(peers.filter((d) => devices.deviceDotState(d) !== "offline").length);
-  const relayed = $derived(peers.find((d) => d.relayVia));
   /** 原型 `subText`：一对一按链路/可达性写，多台会话写"几台送得到"。 */
   const sub = $derived(
     mode === "direct"
       ? linked > 0
         ? "长连接 · 在线"
         : reachable > 0
-          ? relayed
-            ? `经 ${relayed.relayVia} 中转 · 在线`
-            : "在线"
+          ? "在线"
           : "离线 · 消息不会送达"
       : `${reachable}/${participants.length} 台在线`,
   );
@@ -78,10 +79,13 @@
   }
 
   /**
-   * 发言人的显示名：颜色**不**跟着它走（名字可改），这里只是给人看的。
-   * 名册里的成员可能不在本机设备表里，那时退回设备表里的名字 / 设备 id（`deviceNameOf` 兜底）。
+   * 发言人的显示名（F-101：**备注优先**）：有备注就是备注本身，没有备注才用消息里那个
+   * 对端自报的名字（群成员不一定在本机设备表里，`deviceNameOf` 兜底）。
+   * 颜色**不**跟着它走（名字可改），见 `speakerIndex`。
    */
   function speakerName(item: ChatItem): string {
+    const remark = devices.deviceRemarkOf(speakerOf(item));
+    if (remark) return remark;
     if (item.kind === "text" && item.fromName) return item.fromName;
     return chat.deviceNameOf(speakerOf(item));
   }
@@ -278,6 +282,30 @@
       markEmpty();
     });
     viewing = null;
+  });
+
+  /**
+   * 底板上刚选好的那几张图：从 store 里取过来插进输入区（F-118）。
+   *
+   * **要核对会话键**：选图那一步发生在系统选择器里，用户可能已经换到别的会话去了 —— 那几张图
+   * 只属于当时那条会话，键对不上就谁也不插（`takePendingImages` 原封不动地留着，别的会话也
+   * 拿不走）。`inputEl` 还没挂上时不取：一取就等于把图从队列里扔了，等它挂上这一条会再跑一次。
+   *
+   * 插完与粘贴那条路收尾一致：把输入区同步进草稿（否则切会话一回来图就没了），光标放回图后面，
+   * 焦点回到输入区 —— 用户接着就能打字配文字。
+   */
+  $effect(() => {
+    const el = inputEl;
+    if (!el) return;
+    const picks = store.takePendingImages(convoKey);
+    if (!picks || picks.length === 0) return;
+    void (async () => {
+      const ok = await insertImagePicks(el, picks, (msg) => store.toast(msg, "x"));
+      if (!ok) return;
+      syncDraft();
+      el.focus();
+      setCaretEnd(el);
+    })();
   });
 </script>
 
@@ -487,6 +515,20 @@
     onpaste={onPaste}
     onkeydown={onKey}
   ></div>
+  <!-- 那颗「＋」（F-118 / F-119）：桌面端它就在输入框与发送键之间（`ConvoPanel.svelte` 的 `chat-plus`），
+       安卓端同一个位置、同一个意思 —— 点开一张底板选「图片 / 文件 / 应用」。手机上没有桌面那种自绘的
+       本机文件浏览器可用（分区存储不给"按路径列共享存储"，非媒体文件连读都读不到），所以图片与文件借系统的
+       照片选择器与文件选择器，选中的东西由原生那一跳拷成暂存文件（见 `PickFilePlugin.kt`）；
+       「应用」不用借谁 —— 包管理器直接查得到，那张表由我们自己画（见 `AppPickerSheet.svelte`）。 -->
+  <button
+    class="cbtn cplus"
+    type="button"
+    aria-label="发送文件、图片或应用"
+    title="选图片（落进输入区）、选文件（当场推送）或发送一个应用"
+    onclick={() => store.openSheet({ kind: "attach" })}
+  >
+    <Icon name="plus" />
+  </button>
   <button class="cbtn csend" type="submit" aria-label="发送消息" disabled={!canSend}>
     <Icon name="send" />
   </button>

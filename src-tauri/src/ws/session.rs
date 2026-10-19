@@ -30,7 +30,11 @@ pub async fn run_inbound_session(state: Arc<AppState>, peer_id: String, ws: WebS
     state.ws.set_link_state(&peer_id, crate::ws::LinkState::Connected);
 
     let (mut sink, mut stream) = ws.split();
-    let (tx_events, mut rx_events) = mpsc::unbounded_channel::<WsEvent>();
+    // 队列**有界**（容量与理由见 `crate::ws::EVENT_QUEUE_CAPACITY`）：对端不再读时，
+    // 写那一臂会卡住、`rx` 再没人 poll —— 队列满了由 `WsManager::send` 掐掉这条会话
+    // （丢掉 sender = 下面的 `rx.recv()` 立刻拿到 `None` = 本机"断开"的既有收尾），
+    // 而不是在无界队列里把本机内存堆满。消费方这一侧不需要任何等待/丢弃逻辑。
+    let (tx_events, mut rx_events) = mpsc::channel::<WsEvent>(crate::ws::EVENT_QUEUE_CAPACITY);
     let gen = state.ws.register(&peer_id, tx_events);
     state.emit_devices_changed();
     // 链路上来了：把上一次没送出去的「已读」补一次（回执丢了，对端那条消息就永远只是「已送达」）。
@@ -96,8 +100,12 @@ pub async fn run_inbound_session(state: Arc<AppState>, peer_id: String, ws: WebS
     // 后面的那类），这条链路是它可达的**唯一**证据。断了就该如实回到"送不到"
     // （消息排队，等它下次拨进来时 `flush_queued` 送出去）—— 不翻的话设备行会一直挂着
     // 绿点，而本机其实一条消息都送不出去。
+    //
+    // 这一条同样要看"刚听到过它"：链路断掉那一刻它可能刚发来一条消息（那正是它这一侧
+    // 还活着的证据，见 `AppState::heard`），那就等探活在 `HEARD_TTL` 之后如实落回来，
+    // 而不是断链这一下就把它画成离线。
     if state.get_peer(&peer_id).is_some_and(|p| p.ip.is_empty() || p.port == 0) {
-        state.set_peer_online(&peer_id, false);
+        state.set_peer_offline_unless_heard(&peer_id);
     }
     state.emit_devices_changed();
     info!(%peer_id, "inbound WS session ended");
@@ -143,6 +151,11 @@ pub enum InboundResult {
 }
 
 pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent) -> InboundResult {
+    // 入站证据的**唯一落点**（长连接与 HTTP 那几条会话路由都汇到这里）：能从它那边收到东西，
+    // 就是"它在网上"——而本机拨不拨得回去是另一回事（AP 隔开单播、跨段、只有借来的中转），
+    // 见 `AppState::heard`。落在这里而不是每个臂里：少一处漏一处，而漏掉的那一处表现就是
+    // "会说话的设备画成离线"。
+    state.note_heard_online(peer_id);
     match event {
         WsEvent::PeerOnline { peer } => {
             // mDNS-driven; accept as an upsert for completeness.
@@ -163,6 +176,11 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
         WsEvent::PushInvite { invite_id, sender, name, size, is_dir, count, files, caps, at } => {
             // 身份以**这条会话**为准，不用载荷里自称的那个：长连接是 token 换来的，
             // 而载荷里的 sender.id 只是对端自己填的字符串。
+            //
+            // 名字反过来了：载荷里那个**是**要收的 —— 而这条连接是 token 换来的身份，
+            // 这个名字算**核实过**的（`note_peer_name`：对端改名跟着走）。少了这一步，
+            // 下面那句"设备表优先"取到的是占位名（= 设备 id），一张推送卡上就会顶着一串 deviceid。
+            state.note_peer_name(peer_id, &sender.name);
             let known = state.get_peer(peer_id);
             // 已绑定（已配对）的设备：身份是这条会话用 token 换来的，无需再问用户一次。
             let paired = known.as_ref().is_some_and(|p| p.paired);
@@ -287,7 +305,16 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             }));
         }
         WsEvent::ShareChanged { share_id, path, kind } => {
-            info!(%share_id, %path, %kind, "share changed");
+            // **这条是流量，不是新闻**：对端一次构建能在 300ms 的窗口里发来几百条逐文件事件
+            // （实测 1300 条/秒），每一条都记一条日志、发一次 Tauri 事件，前端就每一条重拉一次
+            // 整层树。按共享项**前缘节流**（见 `AppState::share_changed_due`）：窗口内第一条
+            // 立刻照旧走完全程，之后 300ms 内的重复只记一条 `debug` 就丢掉。
+            // 日志也随之降到"每次真的上报一条"，RUST_LOG=debug 时才看得到。
+            if !state.share_changed_due(&share_id) {
+                debug!(%share_id, %path, %kind, "share changed（窗口内的重复，已合并）");
+                return InboundResult::Accepted;
+            }
+            debug!(%share_id, %path, %kind, "share changed");
             emit_ui(state, ui::SHARE_CHANGED, &serde_json::json!({
                 "shareId": share_id,
                 "path": path,
@@ -314,8 +341,12 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             state.unpair(peer_id);
             emit_ui(state, ui::DEVICES_CHANGED, &serde_json::json!({}));
         }
-        WsEvent::ChatText { id, text, at } => {
-            // 名字以**本机设备表**为准：长连接是 token 换来的身份，载荷里没有自称的名字。
+        WsEvent::ChatText { id, text, at, from_name } => {
+            // 名字：载荷里那个自报的名字算**核实过**的（这条连接是 token 换来的身份）→
+            // 直接更新设备行（`note_peer_name`：对端改名跟着走），再从表里取。表里那份是权威
+            // （本机备注 F-101 走的是另一个字段）。以前这里没有 `from_name`，取到的一直是
+            // 占位名（= 设备 id），还被原样写进会话记录。
+            state.note_peer_name(peer_id, &from_name);
             let name = state
                 .get_peer(peer_id)
                 .map(|p| p.name)
@@ -332,8 +363,10 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             // 界面是不是**正开着**这个会话，只有界面知道（它自己会来 `chat_mark_read`）；
             // 这里不回已读回执 —— 收到 ≠ 读过。
         }
-        WsEvent::ChatImage { id, at, name, size: _, data } => {
-            let sender = crate::group::display_name(state, peer_id, "");
+        WsEvent::ChatImage { id, at, name, size: _, data, from_name } => {
+            // 与 `ChatText` 同一个口径：载荷里的名字算核实过的（token 换来的身份）→ 直接更新。
+            state.note_peer_name(peer_id, &from_name);
+            let sender = crate::group::display_name(state, peer_id, &from_name);
             debug!(%id, %peer_id, name = %name, "inbound chat image");
             // 内容先落盘再记账（见 `chat::accept_inbound_image`）：落不下来就不记。
             match crate::chat::accept_inbound_image(state, peer_id, &sender, &id, &name, &data, at) {
@@ -518,5 +551,59 @@ mod tests {
         );
 
         crate::credential::remove_peer("device-victim").ok();
+    }
+
+    /// 入站一条会话消息要做两件事：把**占位名**换成它自报的真名（那是"先显示一串 deviceid"
+    /// 的根因），并把"听到过它"落成在线（本机拨不回去的那些靠这条证据，见 `AppState::heard`）。
+    #[tokio::test]
+    async fn an_inbound_chat_fills_the_placeholder_name_and_marks_it_online() {
+        let st = state("chat_name");
+        // 这一行正是"跨段 / 经中转"那类的样子：拿 id 顶着名字、没有地址、离线。
+        st.observe_verified_addr("dev-hw", "10.20.30.40", 3890);
+        assert_eq!(st.get_peer("dev-hw").unwrap().name, "dev-hw");
+        assert!(!st.get_peer("dev-hw").unwrap().online);
+
+        let _ = handle_inbound(
+            &st,
+            "dev-hw",
+            WsEvent::ChatText {
+                id: "m1".into(),
+                text: "你好".into(),
+                at: 42,
+                from_name: "小米 15".into(),
+            },
+        )
+        .await;
+
+        let peer = st.get_peer("dev-hw").unwrap();
+        assert_eq!(peer.name, "小米 15", "占位名要被载荷里那个真名填上");
+        assert!(peer.online, "刚听到过它 = 它在网上（哪怕本机拨不动它）");
+        let convo = st
+            .chat
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == "dev-hw")
+            .expect("这条消息该被记下来");
+        assert_eq!(
+            convo.messages[0].msg.from_name, "小米 15",
+            "会话记录里那条也要是真名（以前写进去的是那串 deviceid）"
+        );
+
+        // 它自己**又报了一个新名字**（同一条 token 会话上）：跟着更新 —— 设备行的名字是对端
+        // 自己的名字，最新的自报就作数（用户自己的命名走**备注** F-101，不在这一格）。
+        // 老规矩（"真名一个字都不动"）在这里是反的：那会让一台改了名的手机永远停在旧名字。
+        let _ = handle_inbound(
+            &st,
+            "dev-hw",
+            WsEvent::ChatText {
+                id: "m2".into(),
+                text: "再一句".into(),
+                at: 43,
+                from_name: "小米 15 Pro".into(),
+            },
+        )
+        .await;
+        assert_eq!(st.get_peer("dev-hw").unwrap().name, "小米 15 Pro");
     }
 }

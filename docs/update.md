@@ -1,7 +1,7 @@
 # F-110 自更新与发行版发布
 
 本文写两件事：**应用怎么更新自己**（桌面端覆盖 exe、安卓端拉起系统安装器），以及**版本怎么发出去**
-（只往公开仓放 README / LICENSE / Release 产物，源码暂不公开）。
+（只往公开仓放 README / LICENSE / Release 产物与 `update.json`；源码同址公开 —— 见 §2 的口径说明）。
 
 ## 1. 为什么不用 `tauri-plugin-updater`
 
@@ -19,13 +19,21 @@
 
 ## 2. 发行形态与仓库布局
 
-| 位置 | 内容 |
+| 一个仓 | 两件事 |
 | --- | --- |
-| **发布仓（公开）** | `README.md` / `LICENSE` / `CHANGELOG.md` / `update.json` + 每个 Release 的附件 |
-| **源码仓（私有）** | 全部源码，含 `scripts/release.mjs`（发布流程） |
+| **源码** | 全部源码，含 `scripts/release.mjs`（发布流程） |
+| **发布** | `README.md` / `LICENSE` / `CHANGELOG.md` / `update.json` + 每个 Release 的附件 |
 
-发布仓里**没有源码**，只有产物与文档；源码将来要公开时，把源码推同一个仓（`main`）即可，发布仓
-顺势变成主仓。两处镜像（GitHub + Gitee）内容一致。
+**单仓**：发布与源码是**同一个仓库**（GitHub / Gitee 两个远端同址），发布脚本直接在**本仓** `master`
+上追加提交、打 tag、push。清单地址是编译期常量里的那两条（GitHub 走 Release 附件 `update.json`，
+Gitee 走仓库根 `raw/master/update.json`）—— 所以**发布必须落在 `master` 分支**，`update.json` 必须
+在仓库根。tag 分两套：发布的 `vX.Y.Z` 指向那次发布提交、Release 挂在它上面；源码侧的对应关系用
+`src-vX.Y.Z`（0.0.1 / 0.0.2 的源码提交是 `0f4a760` / `8b4582a`），两套不撞名。
+
+> **口径变更（2026-10-14）**：本节原写「发布仓（公开）+ 源码仓（私有）」与「源码将来要公开时，把源码
+> 推同一个仓（`main`）即可」，后来一版写「源码在 `main`、产物与清单在 `master`」。现在只有**一个仓、
+> 一个分支 `master`**：源码与发布文件都在上面，本机不再有 `../OrbDrop-releases` 这个目录。本文下方
+> 发布记录里的「发布仓 / 源码仓（私有）」字样是当时的事实，不回改。
 
 产物三件：`orbdrop.exe`（Windows 单文件）、`app-universal-release.apk`、`app-arm64-release.apk`。
 安卓两个包是因为 arm64 单包更小（14.6MB vs 50.7MB），而通用包兜住老机型与模拟器；客户端按本机架构
@@ -160,12 +168,13 @@ Windows 上**运行中的 exe 不能被写**（进程映像还映射着它，是
 
 ## 9. 发布流程
 
-`node scripts/release.mjs --version 0.0.2 --notes "…"`（构建 → 签名 → 生成清单 → 写发布仓 → commit/tag →
-push → 建 Release 传附件 → 回读校验）；本机演练用 `--local --skip-build`（不联网、不 push），
+`node scripts/release.mjs --version 0.0.2 --notes "…"`（构建 → 签名 → 生成清单 → 写本仓根 →
+commit/tag → push → 建 Release 传附件 → 回读校验）；本机演练用 `--local --skip-build`（不联网、不 push），
 配套 `scripts/dev-mirror.mjs` 起镜像台，按打印出来的命令启动客户端即可。
 远端模式要两个 token 调 API：**先读环境变量**（`GITHUB_TOKEN` / `GITEE_TOKEN`），**没有就读
 `scripts/release.local.env`**（已 gitignore，一行一个 `KEY=VALUE`，模板里写了去哪申请与要勾的权限；
-整体换路径用 `ORBDROP_RELEASE_SECRETS`）。token 只给到这一个发布仓的写权限就够。
+整体换路径用 `ORBDROP_RELEASE_SECRETS`）。脚本只会 `git add` 清单与 `CHANGELOG.md` 两处 ——
+本仓工作树里常年有源码改动，它们不会被卷进 `Released vX` 那个提交；token 只给这一个仓的写权限就够。
 随时复核某个已发布的版本：`node scripts/release.mjs --verify-only --version 0.0.1`（只读远端，
 不构建、不 push、不调 API）。
 
@@ -173,7 +182,7 @@ push → 建 Release 传附件 → 回读校验）；本机演练用 `--local --
 `node scripts/release.mjs --version 0.0.1 --republish --notes "…"`。它与普通发布的差别只有两处，
 都跟"这一版已经存在"有关：
 
-- **仓库里的 tag 不新建、也不移动**：只往发布仓的分支上追加一个提交（`update.json` 与 `CHANGELOG.md`
+- **仓库里的 tag 不新建、也不移动**：只往本仓 `master` 上追加一个提交（`update.json` 与 `CHANGELOG.md`
   变了）。于是 tag 指向的那次提交与 Release 的附件不再一致 —— 客户端读的是清单（GitHub 走 Release
   附件、Gitee 走分支上的仓库文件），两处都是新的；只有"拿 git 去核对 tag 内容"的场合要知道这一层。
 - **Release 是复用的**：GitHub 先 `DELETE` 掉旧附件再传新的（不删的话同名附件会 422）；Gitee 直接
@@ -213,7 +222,7 @@ Gitee 的公开仓需人工审核，审核期仓库"仅限成员访问"——所
 | 单元测试 | `cargo test --lib update::` | 8 项全过（含 `tauri signer sign` 产物能被我们的校验器认下、篡改必拒、地址策略、版本解析） |
 | 发布流程 | `node scripts/release.mjs --local --skip-build --version 0.0.1` | 三个产物（exe 13.06MB / 通用包 50.71MB / arm64 14.59MB）与清单一次落盘，清单里的 size/sha256 与磁盘文件逐项一致 |
 
-安卓端（真机，Meizu 17 / arm64-v8a）：
+安卓端（真机，手机乙 / arm64-v8a）：
 
 | 场景 | 做法 | 结果 |
 | --- | --- | --- |
@@ -233,7 +242,7 @@ Gitee 的公开仓需人工审核，审核期仓库"仅限成员访问"——所
 ## 11. 验收清单（改更新链路时重跑）
 
 1. `node scripts/release.mjs --local --skip-build --version <版本>`：本机发布一次，拿到镜像台命令。
-2. `node scripts/dev-mirror.mjs --port 8788 --root <本机发布仓> --gh-hang --gitee-kbps 0`：起镜像台。
+2. `node scripts/dev-mirror.mjs --port 8788 --gh-hang --gitee-kbps 0`：起镜像台（默认伺服本仓根的 `assets/`）。
 3. 桌面：把上一版 exe 放到一个临时目录、按 §10 的方式启动它（`ORBDROP_UPDATE_MANIFEST` 指向
    `/manifest.json`、`ORBDROP_ALLOW_MULTI=1`、`ORBDROP_DATA_DIR` 指到临时目录），点界面上的
    「立即更新」；确认 exe 被换掉、重启后版本变了、`<数据目录>/logs/update.log` 里有 helper 的记录。

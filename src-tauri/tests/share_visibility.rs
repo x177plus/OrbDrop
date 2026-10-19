@@ -45,7 +45,7 @@ fn make_state(root: std::path::PathBuf, peer_connected: bool) -> Arc<AppState> {
     let config_path = std::env::temp_dir().join(format!("orbdrop_vis_cfg_{}.toml", uuid::Uuid::new_v4()));
     let state = Arc::new(AppState::new(config, config_path));
     if peer_connected {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
         state.ws.register("peer-a", tx);
     }
     state
@@ -196,7 +196,7 @@ async fn peer_identity_from_token_scopes_the_share_list() {
         config.shares.push(ShareItem::new(hidden.clone()));        // 未开播
     }
     let hidden_id = state.config.lock().shares[1].id.clone();
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
     state.ws.register(PEER_ID, tx);                                // 对方处于长连接
     orbdrop_lib::credential::set_peer(PEER_ID, TOKEN).unwrap();
 
@@ -268,7 +268,7 @@ async fn new_share_inherits_auto_broadcast_setting() {
     let state = Arc::new(AppState::new(config, config_path));
     // `peer-a` 的长连接：**接收端要活到测试结束** —— 登记共享项会通知在线的对端，
     // 通道那头一断，发送失败就会把这条连接摘掉（判可见性时 `has_connection` 就成假了）。
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
     state.ws.register("peer-a", tx);
     assert!(
         !state.config.lock().auto_broadcast_new,
