@@ -1,34 +1,34 @@
 {
-  "version": "0.0.2",
-  "versionCode": 2,
-  "notes": "修复：0.0.1 里「检查更新」一条地址都拿不到（TLS 信任库为空）——已装 0.0.1 的用户请手动下载本版安装，应用内升不上来。\n新增：启动时那次静默检查查到新版本会**主动提示**一次 —— Windows 是右下角通知里的一条「有新版本」气泡（悬浮球左上角角标 +1），安卓是一张「发现新版本」底板；按「稍后」本次运行内不再自动弹（下次启动重新查、重新弹），点「立即更新」后同一格就地变成进度、失败会留在格子里带「重试」。\n安卓：设备页可直接「发消息」（未配对设备也能建会话）、长按整行开设备操作菜单、新增「后台与通知」自查页（电池优化白名单 / 自启动 / 通知横幅）、设置里新增「允许中转」与中转流量；原生库改压缩存储，两个包体积约减半（通用包 51→24MB、arm64 15→8MB）。\n桌面：把文件拖到会话浮层上松手即发送到这条会话；群聊无群名时标题显示成员名；底栏版本号改读真实版本；点「会话」总是从会话列表开始。\n同版本重发（2026-10-12）：产物换成带「主动提示」的这一份（版本号不变，发布仓的 tag v0.0.2 与 Release 均复用）。",
-  "pubDate": "2026-10-12T05:19:28Z",
+  "version": "0.0.3",
+  "versionCode": 3,
+  "notes": "修复：设备状态与名字的老毛病——「明明在互发消息却一直显示离线」「先显示一串 deviceid 才变名字」「手动添加的那台时有时无」都已纠正（60 秒内收到过对方消息即按在线显示；占位名不再冲掉真名；解绑后离线的会话仍留在会话列表里）。推送在等对方点「接收」期间源文件被改动或删除会自动取消这一批；任一侧重启过也能接着传完。铃铛与悬浮球橙标的数字不再把本机正在发出的推送算作「待处理」；设备行与会话页不再单独标注「经 X 中转」（中转本身照常工作）。\n新增：点「连接」改为同意制——对方面板弹「接受 / 拒绝」，接受才真的连上，拒绝或超时就不连并写明原因、再点一次可重发，发起侧等待时可「取消」。会话输入框可直接 Ctrl+V 粘图，图与文字按顺序落成消息（上限 8 MB），对端直接看得到；会话里的文件消息点一下即打开、图片点开看大图。手动添加一台设备后对方列表里也会出现本机；一对一会话右上「⋮」里也能「修改备注」「配对 / 重新配对」，会话详情顶部多一颗「别处还有 N 条未读」角标。设置里新增「推送按发送方分目录」，「允许中转」改为默认打开。\n安卓：会话「＋」新增图片、文件、应用三条入口——图片与文件走系统选择器，应用可直接发已安装应用的安装包（落盘名带应用名与版本）。界面下限压到 Chrome 81，老 WebView 也能正常用，内核更旧时才给一句提示和「去应用商店更新系统 WebView」的入口。设备行与一对一会话「⋯」里补齐「修改备注」。\n桌面：Beyond Compare 的「添加到左侧比较位」改为写进 BC 自己的左侧槽——资源管理器里右键那一项也能直接「对比」；写回（DAV）遇到超长或中途中断的 PUT 会挡下，不破坏原文件。悬浮球窗口被隐藏或最小化会自动叫回，显示器 / 缩放变化后搬回最近的工作区；托盘图标在有未处理通知时会亮红点并闪动。",
+  "pubDate": "2026-10-19T02:17:20Z",
   "desktop": {
     "windows-x86_64": {
-      "size": 13899264,
-      "sha256": "54f3b254e630f51f6909c5a3b212749fb201140915c45d0abf79653db0452a83",
-      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NG1VamxZU3BxWGhKaFBocXFucHVKaXRxMWtaTUVhVUUzaTRUeWVlaS9WNWs4OTdMMmZJcUFxaFhydW5lcTRCazRNRFNVQUgwdGoxN3RQRHhGTmhXd3dvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNzgyMzY4CWZpbGU6b3JiZHJvcC5leGUKME9Pb2JCY2lTWFpNYmJHWWlDMnp2a0dhejRQNDc5R2EzTElsbTdUWVFGcW9YZEptSVgxNmpsdm9Cd1NSdjgyT2IweGR3WXRQK21VL3pnTWJiMHdtQ1E9PQo=",
+      "size": 16179200,
+      "sha256": "143c081a299b0a9ed6dc69a5b7314c27c1bed66f7dc62a612db617460e8b68ee",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NGhudEI2OEdoekNVREcrUGdWNzQxZEpQQ0padURjVE8zMHVHbStCZ2g0WjF4R3lzSnQ4R3hrdHowdHVZeFVPUWFiM3FVaHkyT1A4QU5PRnpGR2RBV0FjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMzc2MjQwCWZpbGU6b3JiZHJvcC5leGUKL0NjRUN5YXd2NkoyYTREUS8rQWJUd3Y0QzNRWjZHSURXd3Q5cEdEd2JHSXZZSlpSTSthMVBPRFV3ampNTlk4RFdiMkRweHhYRk9JZFFvSEVsZTN3RFE9PQo=",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.2/orbdrop.exe",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.2/orbdrop.exe"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.3/orbdrop.exe",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.3/orbdrop.exe"
       ]
     }
   },
   "android": {
     "universal": {
-      "size": 25074467,
-      "sha256": "a009e1bf948caa3e4d7920f2a49c11f0dec666aaa8e715881de18cb3e9ad48cd",
+      "size": 27830179,
+      "sha256": "205316f941b85956ee4b0c07929ed21ac6ced9ab5dee785a2da102b81778bacd",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.2/app-universal-release.apk",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.2/app-universal-release.apk"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.3/app-universal-release.apk",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.3/app-universal-release.apk"
       ]
     },
     "arm64-v8a": {
-      "size": 8166923,
-      "sha256": "c0e2a205ca246a0c0fac533706909896033b35b61ad96248d10c2a23c218a6d2",
+      "size": 8851243,
+      "sha256": "21f56174133b3c6344d10d63bba7a105b91107f18c0e7f13f2983230db947d0f",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.2/app-arm64-release.apk",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.2/app-arm64-release.apk"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.3/app-arm64-release.apk",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.3/app-arm64-release.apk"
       ]
     }
   }
