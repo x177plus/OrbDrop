@@ -422,3 +422,26 @@ commit/tag/push → 建 Release 传附件 → 回读校验）。两个平台都�
   + 知道了/重试；清单换成 0.0.2（等于本机版本）→ 一格都不出现、角标 `0`。两次都是 0 报错。
 - 演练抓到一个真问题：失败之后那一格右上角还写着 `100%`（百分比原先只按"有没有 size"画）——
   现在只在 downloading/verifying 两档报百分比，其余报"要下多大"。
+
+## 17. 单仓化与 0.0.3 发布记录（2026-10-19）
+
+**单仓化**（取消 `../OrbDrop-releases`）：发布与源码合到**同一个仓、同一个分支 `master`**，两个远端
+（GitHub / Gitee）同址。并入方式是把发布仓的历史**合并**进 master（`git merge --allow-unrelated-histories
+releases/master`；冲突只有 `README.md` 与 `.gitignore`，都取本仓版本），所以发布仓那 7 个提交与
+`v0.0.1` / `v0.0.2` 两个 tag 都还在、**没有 force push**；源码侧的对应关系统一用 `src-vX.Y.Z`
+（`v0.0.2` → `8b4582a`）。构建产物 `dist/`、`dist-mobile/` 与演练缓存 `assets/` 不进库；
+`update.json` 与 `CHANGELOG.md` 落在仓库根，后者由发布脚本自己维护。
+
+**发布**：`node scripts/release.mjs --version 0.0.3 --notes "…"` 一次跑完（构建 → 签名 → 清单 → 提交
+`7152f1a` + tag `v0.0.3` → 推两个远端 → 建 Release → 回读）。
+
+- GitHub Release `#416841298`（`v0.0.3`）：`orbdrop.exe` 16,179,200 B、通用包 27,830,179 B、
+  arm64 包 8,851,243 B、`update.json` 3,749 B。
+- Gitee Release `#1217281`：同样四个附件（Gitee 侧累计附件约 174 MB）。
+- 三个产物的 sha256：`orbdrop.exe` `143c081a…`、通用包 `205316f9…`、arm64 包 `21f56174…`。
+- 核验：Gitee `raw/master/update.json` HTTP 200、`version 0.0.3 / versionCode 3`，清单里的 exe
+  sha256 与本机 `target/release/orbdrop.exe` 现算的一致；GitHub 侧走 API 看到的四个附件体积与 Gitee
+  那份清单逐项对上。
+- **本机网络如实记一条**：这台机器到 `github.com` 的**下载**路径（`releases/latest/download/*` 与附件
+  CDN）会 connect timeout，而走 `api.github.com` 的**上传**是通的 —— 所以 `--verify-only` 里 GitHub 那
+  几条"够不着"只是本机出口的问题；客户端在这台机器上会按设计退到 Gitee 那条清单。
