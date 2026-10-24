@@ -55,7 +55,12 @@ impl PendingLinkRequest {
         peer_name: String,
         responder: oneshot::Sender<Result<(), String>>,
     ) -> Self {
-        Self { request_id, peer_id, peer_name, responder: Some(responder) }
+        Self {
+            request_id,
+            peer_id,
+            peer_name,
+            responder: Some(responder),
+        }
     }
 
     /// 把决定送回发起方。返回 false = 发起方已经不在了（取消 / 断网 / 进程没了）。
@@ -102,7 +107,10 @@ impl LinkStore {
 
     /// 这条进来的请求此刻是不是还挂在本机界面上（等用户决定）。
     pub fn has_incoming(&self, request_id: &str) -> bool {
-        self.incoming.lock().iter().any(|r| r.request_id == request_id)
+        self.incoming
+            .lock()
+            .iter()
+            .any(|r| r.request_id == request_id)
     }
 
     /// 本机发出去的请求表里有没有这一台（撤回时凭它对上号）。
@@ -157,10 +165,14 @@ fn close_incoming(state: &AppState, request_id: &str, reason: &str) -> bool {
         return false;
     };
     req.decide(Err(reason.to_string()));
-    ws::emit_ui(state, ui::LINK_REQUEST_CLOSED, &serde_json::json!({
-        "requestId": request_id,
-        "reason": reason,
-    }));
+    ws::emit_ui(
+        state,
+        ui::LINK_REQUEST_CLOSED,
+        &serde_json::json!({
+            "requestId": request_id,
+            "reason": reason,
+        }),
+    );
     true
 }
 
@@ -195,13 +207,19 @@ pub fn request(state: &Arc<AppState>, peer_id: &str) -> Result<String, String> {
         return Err(format!("还没有与「{}」配对", peer.name));
     }
     let request_id = uuid::Uuid::new_v4().to_string();
-    state.link.insert_outgoing(request_id.clone(), peer_id.to_string());
+    state
+        .link
+        .insert_outgoing(request_id.clone(), peer_id.to_string());
     // 界面凭这条挂"等待对方同意"的卡片（与配对邀请同一套：发起方也看得到自己那一步）。
-    ws::emit_ui(state, ui::LINK_REQUEST_SENT, &serde_json::json!({
-        "requestId": request_id,
-        "peerId": peer.id,
-        "peerName": peer.name,
-    }));
+    ws::emit_ui(
+        state,
+        ui::LINK_REQUEST_SENT,
+        &serde_json::json!({
+            "requestId": request_id,
+            "peerId": peer.id,
+            "peerName": peer.name,
+        }),
+    );
 
     let own_name = state.config.lock().device_name.clone();
     let state2 = state.clone();
@@ -236,18 +254,24 @@ pub fn request(state: &Arc<AppState>, peer_id: &str) -> Result<String, String> {
                 info!(peer_id = %peer.id, request_id = %id2, "link request refused: {why}");
                 state2.ws.set_link_state(
                     &peer.id,
-                    ws::LinkState::Stopped { reason: ws::StopReason::PeerRejected },
+                    ws::LinkState::Stopped {
+                        reason: ws::StopReason::PeerRejected,
+                    },
                 );
                 state2.emit_devices_changed();
                 ("denied", why)
             }
         };
-        ws::emit_ui(&state2, ui::LINK_REQUEST_RESULT, &serde_json::json!({
-            "requestId": id2,
-            "peerId": peer.id,
-            "outcome": outcome,
-            "reason": reason,
-        }));
+        ws::emit_ui(
+            &state2,
+            ui::LINK_REQUEST_RESULT,
+            &serde_json::json!({
+                "requestId": id2,
+                "peerId": peer.id,
+                "outcome": outcome,
+                "reason": reason,
+            }),
+        );
     });
 
     Ok(request_id)
@@ -263,8 +287,11 @@ pub fn cancel(state: &Arc<AppState>, request_id: &str) -> Result<(), String> {
     };
     let id = request_id.to_string();
     crate::task::spawn("link request withdraw", async move {
-        let url = format!("{}/link/request/withdraw", crate::net::peer_base(peer.dial().0, peer.dial().1));
-        let mut req = crate::net::client()
+        let url = format!(
+            "{}/link/request/withdraw",
+            crate::net::peer_base(peer.dial().0, peer.dial().1)
+        );
+        let mut req = crate::net::dial_client(peer.dial().0, &peer.dial_pin())
             .post(&url)
             .timeout(WITHDRAW_TIMEOUT)
             .json(&serde_json::json!({ "requestId": id }));
@@ -297,7 +324,7 @@ async fn deliver_http(
         "{}/link/request",
         crate::net::peer_base(peer.dial().0, peer.dial().1)
     );
-    let mut req = crate::net::client()
+    let mut req = crate::net::dial_client(peer.dial().0, &peer.dial_pin())
         .post(&url)
         .timeout(HTTP_TIMEOUT)
         .json(&serde_json::json!({
@@ -340,7 +367,8 @@ fn outcome_of_status(status: reqwest::StatusCode) -> StatusOutcome {
     if status.is_success() {
         return StatusOutcome::Accepted;
     }
-    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+    {
         return StatusOutcome::NoSuchEndpoint;
     }
     StatusOutcome::Refused
@@ -356,10 +384,14 @@ async fn refusal_for_status(
 ) -> Result<(), Failure> {
     match outcome_of_status(status) {
         StatusOutcome::Accepted => Ok(()),
-        StatusOutcome::NoSuchEndpoint => Err(Failure::Unreachable("对端版本不支持连接请求".to_string())),
+        StatusOutcome::NoSuchEndpoint => {
+            Err(Failure::Unreachable("对端版本不支持连接请求".to_string()))
+        }
         StatusOutcome::Refused => {
             // 403（拒绝 / 超时未处理 / 已撤回）等：正文就是对端给的原因（axum 的文本响应）。
-            let reason = resp.text().await.unwrap_or_default();
+            let reason = crate::net::read_text_capped(resp, crate::net::CONTROL_BODY_MAX)
+                .await
+                .unwrap_or_default();
             Err(Failure::Refused(if reason.trim().is_empty() {
                 "对方没有接受连接请求".to_string()
             } else {
@@ -377,7 +409,10 @@ mod tests {
     /// 不能混进"对方拒绝" —— 那会让升级不同步的两台机器之间"点一次「连接」就被拒一次"。
     #[test]
     fn status_outcomes_separate_an_old_peer_from_a_refusal() {
-        assert_eq!(outcome_of_status(reqwest::StatusCode::OK), StatusOutcome::Accepted);
+        assert_eq!(
+            outcome_of_status(reqwest::StatusCode::OK),
+            StatusOutcome::Accepted
+        );
         assert_eq!(
             outcome_of_status(reqwest::StatusCode::NO_CONTENT),
             StatusOutcome::Accepted

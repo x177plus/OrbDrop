@@ -376,7 +376,13 @@ impl ResumeStore {
 
     /// 全部待续传任务（启动时/每一拍由 `transfer::resume_pending` 逐条接着收）。
     pub fn pending_entries(&self) -> Vec<PendingInbound> {
-        self.inner.lock().records.pending.values().cloned().collect()
+        self.inner
+            .lock()
+            .records
+            .pending
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// 还在接手的邀请 id。
@@ -394,7 +400,8 @@ impl ResumeStore {
             None => true,
             Some((round, at)) => {
                 // 已经试过 `round` 轮 → 等第 `round` 号台阶（第 1 轮试完等 30s，第 2 轮完等 2min…）。
-                let step = RETRY_BACKOFF[(*round).clamp(1, RETRY_BACKOFF.len() as u32) as usize - 1];
+                let step =
+                    RETRY_BACKOFF[(*round).clamp(1, RETRY_BACKOFF.len() as u32) as usize - 1];
                 at.elapsed().as_secs() >= step
             }
         }
@@ -403,7 +410,9 @@ impl ResumeStore {
     /// 记一次尝试（调用方刚从 `attempt_due` 拿到 `true`）。
     pub fn note_attempt(&self, invite_id: &str) {
         let mut attempts = self.attempts.lock();
-        let entry = attempts.entry(invite_id.to_string()).or_insert((0, Instant::now()));
+        let entry = attempts
+            .entry(invite_id.to_string())
+            .or_insert((0, Instant::now()));
         entry.0 = entry.0.saturating_add(1);
         entry.1 = Instant::now();
     }
@@ -411,7 +420,14 @@ impl ResumeStore {
     /// 清掉已经不存在的任务的退避记账（任务删了但记账还在 = 内存里一点点泄漏，
     /// 而且 approve 里那个 id 万一被复用会带着旧台阶）。
     pub fn prune_attempts(&self) {
-        let live = self.inner.lock().records.pending.keys().cloned().collect::<Vec<_>>();
+        let live = self
+            .inner
+            .lock()
+            .records
+            .pending
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         self.attempts.lock().retain(|k, _| live.contains(k));
     }
 }
@@ -496,8 +512,8 @@ pub fn safe_dir_name(raw: &str) -> String {
 fn scrub(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
-        let bad = ch.is_control()
-            || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*');
+        let bad =
+            ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*');
         out.push(if bad { '_' } else { ch });
     }
     out
@@ -572,7 +588,11 @@ pub fn apk_file_name(label: &str, version_name: &str, version_code: i64, package
         l if !l.is_empty() => l,
         _ => package.clone(),
     };
-    let label = if label.is_empty() { "应用".to_string() } else { label };
+    let label = if label.is_empty() {
+        "应用".to_string()
+    } else {
+        label
+    };
     let declared = sanitize_file_name(version_name);
     let version = if declared.is_empty() {
         version_code.to_string()
@@ -586,18 +606,18 @@ pub fn apk_file_name(label: &str, version_name: &str, version_code: i64, package
 /// Windows 把 `NUL.txt` 也当设备名。`pub(crate)`：发送侧净化名字时也用它（F-119），
 /// 两处的判据必须是同一份 —— 那边洗干净、这边才放行。
 pub(crate) fn is_reserved_device_name(name: &str) -> bool {
-    let stem: String = name
-        .split('.')
-        .next()
-        .unwrap_or(name)
-        .to_ascii_uppercase();
+    let stem: String = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
     if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$") {
         return true;
     }
     let mut chars = stem.chars();
-    let (Some(a), Some(b), Some(c), Some(d), None) =
-        (chars.next(), chars.next(), chars.next(), chars.next(), chars.next())
-    else {
+    let (Some(a), Some(b), Some(c), Some(d), None) = (
+        chars.next(),
+        chars.next(),
+        chars.next(),
+        chars.next(),
+        chars.next(),
+    ) else {
         return false;
     };
     (a == 'C' && b == 'O' && c == 'M' || a == 'L' && b == 'P' && c == 'T')
@@ -815,10 +835,7 @@ mod path_tests {
             &"长".repeat(300),
         ] {
             let dir = landing_root(&dl, raw);
-            assert!(
-                dir.starts_with(&dl),
-                "名字 {raw:?} 逃出了下载目录：{dir:?}"
-            );
+            assert!(dir.starts_with(&dl), "名字 {raw:?} 逃出了下载目录：{dir:?}");
             // 且必须只多一层（不是多级嵌套，更不是绝对路径）。
             assert_eq!(
                 dir.parent(),
@@ -848,17 +865,27 @@ mod path_tests {
     #[test]
     fn safe_dir_name_keeps_device_names_readable() {
         assert_eq!(safe_dir_name("PC-B"), "PC-B", "正常名字一个字不动");
-        assert_eq!(safe_dir_name("笔记本（客厅）"), "笔记本（客厅）", "中文原样保留");
+        assert_eq!(
+            safe_dir_name("笔记本（客厅）"),
+            "笔记本（客厅）",
+            "中文原样保留"
+        );
         assert_eq!(safe_dir_name("  spaced  "), "spaced");
         assert_eq!(safe_dir_name(""), "unknown-device");
         assert_eq!(safe_dir_name(".."), "unknown-device", "全是点 → 退成兜底名");
         // 分隔符与禁用字符换成下划线，绝不留下来。
         let cleaned = safe_dir_name("C:\\Windows\\Temp");
-        assert!(!cleaned.contains(['\\', '/', ':']), "净化后不该留分隔符/冒号: {cleaned}");
+        assert!(
+            !cleaned.contains(['\\', '/', ':']),
+            "净化后不该留分隔符/冒号: {cleaned}"
+        );
         // 净化后剩下的 `..` 只是普通字符（分隔符已经没了），真正要守的判据是：
         // 结果必须是**单个普通目录名** —— `safe_join` 会再验一次，落盘根因此钉在下载目录里。
         let dotted = safe_dir_name("..\\..\\..\\Users\\Public");
-        assert!(!dotted.contains(['\\', '/', ':']), "分隔符必须消失: {dotted}");
+        assert!(
+            !dotted.contains(['\\', '/', ':']),
+            "分隔符必须消失: {dotted}"
+        );
         assert!(
             safe_join(Path::new("C:\\dl"), &dotted).is_some(),
             "净化结果必须是单个普通目录名: {dotted}"
@@ -911,7 +938,11 @@ mod path_tests {
             let joined = safe_join(&root, ok).expect(ok);
             assert!(joined.starts_with(&root));
             assert_eq!(
-                joined.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"),
+                joined
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/"),
                 want
             );
         }
@@ -976,7 +1007,11 @@ mod path_tests {
 
         let long = format!("{}.apk", "很长的名字".repeat(40));
         let clean = sanitize_file_name(&long);
-        assert!(clean.len() <= MAX_FILE_NAME_BYTES, "长度没压住：{}", clean.len());
+        assert!(
+            clean.len() <= MAX_FILE_NAME_BYTES,
+            "长度没压住：{}",
+            clean.len()
+        );
         assert!(clean.ends_with(".apk"), "扩展名要保住：{clean}");
         assert!(clean.is_char_boundary(clean.len()));
 
@@ -994,14 +1029,20 @@ mod path_tests {
             "微信_8.0.50(2600)_com.tencent.mm.apk"
         );
         // 版本名没写：省掉括号那一段。
-        assert_eq!(apk_file_name("计算器", "", 34, "com.android.calculator2"), "计算器_34_com.android.calculator2.apk");
+        assert_eq!(
+            apk_file_name("计算器", "", 34, "com.android.calculator2"),
+            "计算器_34_com.android.calculator2.apk"
+        );
         // 标签是脏的（别的应用自己声明的字符串）：净化后仍然是一条能落盘的路径。
         assert_eq!(
             apk_file_name("X: 编辑器", "1.2", 7, "com.x.edit"),
             "X_ 编辑器_1.2(7)_com.x.edit.apk"
         );
         // 标签为空用包名顶着；包名也是空的（不该发生）时退成「应用」。
-        assert_eq!(apk_file_name("", "1.0", 1, "com.a"), "com.a_1.0(1)_com.a.apk");
+        assert_eq!(
+            apk_file_name("", "1.0", 1, "com.a"),
+            "com.a_1.0(1)_com.a.apk"
+        );
         assert_eq!(apk_file_name("", "", 0, ""), "应用_0_.apk");
     }
 }
@@ -1021,7 +1062,11 @@ mod bitmap_tests {
         bitmap_set(&mut bits, 9);
         assert!(bitmap_has(&bits, 9), "跨字节的位要能置上");
         assert!(!bitmap_has(&bits, 8));
-        assert_eq!(bitmap_hex_len(&bits), 4, "9 号位落在第二个字节 → 4 个 hex 字符");
+        assert_eq!(
+            bitmap_hex_len(&bits),
+            4,
+            "9 号位落在第二个字节 → 4 个 hex 字符"
+        );
         // 越界/越短一律读作"没有"，不 panic。
         assert!(!bitmap_has("", 1000));
         assert!(!bitmap_has("0f", 17));
@@ -1036,7 +1081,11 @@ mod bitmap_tests {
         assert_eq!(rec.done_bytes(), 0);
         assert!(!rec.is_complete());
         bitmap_set(&mut rec.blocks, 1);
-        assert_eq!(rec.done_bytes(), DEFAULT_BLOCK_SIZE as u64, "只算置位的那一块");
+        assert_eq!(
+            rec.done_bytes(),
+            DEFAULT_BLOCK_SIZE as u64,
+            "只算置位的那一块"
+        );
         bitmap_set(&mut rec.blocks, 0);
         bitmap_set(&mut rec.blocks, 2);
         assert!(rec.is_complete());
@@ -1053,8 +1102,8 @@ mod legacy_record_tests {
     use super::*;
 
     fn store(name: &str) -> (ResumeStore, PathBuf) {
-        let path = std::env::temp_dir()
-            .join(format!("orbdrop_legacy_{name}_{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("orbdrop_legacy_{name}_{}", uuid::Uuid::new_v4()));
         (ResumeStore::with_path(path.clone()), path)
     }
 
@@ -1074,7 +1123,11 @@ mod legacy_record_tests {
 
         assert_eq!(s.sweep_stale(30 * 86400), 1, "只清过窗的那条");
         assert_eq!(s.load("inv-old", "a.bin"), 0, "过窗的清掉");
-        assert_eq!(s.load("inv-new", "b.bin"), 32, "窗口里的留着（用户明天再推一次还要用）");
+        assert_eq!(
+            s.load("inv-new", "b.bin"),
+            32,
+            "窗口里的留着（用户明天再推一次还要用）"
+        );
         // 时间戳表跟着记录走：不留孤儿键，落盘也是这个状态。
         let reopened = ResumeStore::with_path(path.clone());
         assert_eq!(reopened.load("inv-old", "a.bin"), 0);
@@ -1087,14 +1140,21 @@ mod legacy_record_tests {
     /// 就被当成太老当场删掉 —— 它可能就是正在续传的那一条（`with_path` 给它一个从现在起算的窗口）。
     #[test]
     fn an_old_file_without_timestamps_still_loads() {
-        let path = std::env::temp_dir()
-            .join(format!("orbdrop_legacy_old_{}", uuid::Uuid::new_v4()));
-        std::fs::write(&path, r#"{"records":{"inv-1":{"a.bin":1024}},"files":{},"pending":{}}"#)
-            .unwrap();
+        let path =
+            std::env::temp_dir().join(format!("orbdrop_legacy_old_{}", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            r#"{"records":{"inv-1":{"a.bin":1024}},"files":{},"pending":{}}"#,
+        )
+        .unwrap();
 
         let s = ResumeStore::with_path(path.clone());
         assert_eq!(s.load("inv-1", "a.bin"), 1024, "老记录一条不丢");
-        assert_eq!(s.sweep_stale(30 * 86400), 0, "没有时间戳的按「刚续过」算，不当场判死");
+        assert_eq!(
+            s.sweep_stale(30 * 86400),
+            0,
+            "没有时间戳的按「刚续过」算，不当场判死"
+        );
         assert_eq!(s.load("inv-1", "a.bin"), 1024);
         // 再续一次就有时刻了。
         s.save("inv-1", "a.bin", 2048);
@@ -1140,8 +1200,16 @@ mod pending_tests {
             is_dir: true,
             count: 2,
             files: vec![
-                PendingFile { path: "a.bin".into(), size: 16, mtime: 7 },
-                PendingFile { path: "空.txt".into(), size: 0, mtime: 0 },
+                PendingFile {
+                    path: "a.bin".into(),
+                    size: 16,
+                    mtime: 7,
+                },
+                PendingFile {
+                    path: "空.txt".into(),
+                    size: 0,
+                    mtime: 0,
+                },
             ],
             caps: vec!["stream1".into()],
             root: Some("D:/下载".into()),
@@ -1151,7 +1219,8 @@ mod pending_tests {
     }
 
     fn store(name: &str) -> (ResumeStore, PathBuf) {
-        let path = std::env::temp_dir().join(format!("orbdrop_pending_{name}_{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("orbdrop_pending_{name}_{}", uuid::Uuid::new_v4()));
         (ResumeStore::with_path(path.clone()), path)
     }
 

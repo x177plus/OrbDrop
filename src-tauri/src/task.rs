@@ -63,7 +63,10 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     if tokio::runtime::Handle::try_current().is_err() {
-        tracing::debug!(task = what, "no current reactor; spawning on tauri's global runtime");
+        tracing::debug!(
+            task = what,
+            "no current reactor; spawning on tauri's global runtime"
+        );
     }
     handle().spawn(fut)
 }

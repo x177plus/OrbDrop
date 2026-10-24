@@ -44,7 +44,10 @@ fn make_state(port: u16, device_id: &str, device_name: &str) -> Arc<AppState> {
 fn two_free_ports() -> (u16, u16) {
     let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    (a.local_addr().unwrap().port(), b.local_addr().unwrap().port())
+    (
+        a.local_addr().unwrap().port(),
+        b.local_addr().unwrap().port(),
+    )
 }
 
 async fn wait_until<F: Fn() -> bool>(what: &str, ok: F) {
@@ -77,15 +80,22 @@ async fn paired_pair() -> (Arc<AppState>, Arc<AppState>) {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-link-a", "PC-LINK-A");
     let state_b = make_state(port_b, "device-link-b", "PC-LINK-B");
-    let port_a = server::start_server_loopback(state_a.clone(), port_a).await.expect("A server");
-    let port_b = server::start_server_loopback(state_b.clone(), port_b).await.expect("B server");
+    let port_a = server::start_server_loopback(state_a.clone(), port_a)
+        .await
+        .expect("A server");
+    let port_b = server::start_server_loopback(state_b.clone(), port_b)
+        .await
+        .expect("B server");
 
     const TOKEN: &str = "0f0f0f0f1e1e1e1e2d2d2d2d3c3c3c3c";
     credential::set_peer("device-link-a", TOKEN).unwrap();
     credential::set_peer("device-link-b", TOKEN).unwrap();
     state_a.add_peer_book(peer("device-link-b", "PC-LINK-B", "127.0.0.1", port_b));
     state_b.add_peer_book(peer("device-link-a", "PC-LINK-A", "127.0.0.1", port_a));
-    assert!(!state_a.ws.has_connection("device-link-b"), "前提：还没有长连接");
+    assert!(
+        !state_a.ws.has_connection("device-link-b"),
+        "前提：还没有长连接"
+    );
     (state_a, state_b)
 }
 
@@ -97,8 +107,17 @@ async fn a_link_request_without_a_valid_token_is_refused() {
     let url = format!("http://127.0.0.1:{port_b}/link/request");
     let body = serde_json::json!({ "requestId": "r-1", "peerName": "NOPE" });
 
-    let no_token = reqwest::Client::new().post(&url).json(&body).send().await.unwrap();
-    assert_eq!(no_token.status(), reqwest::StatusCode::UNAUTHORIZED, "不带 token");
+    let no_token = reqwest::Client::new()
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        no_token.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "不带 token"
+    );
     let bogus = reqwest::Client::new()
         .post(&url)
         .bearer_auth("not-a-real-token")
@@ -106,7 +125,11 @@ async fn a_link_request_without_a_valid_token_is_refused() {
         .send()
         .await
         .unwrap();
-    assert_eq!(bogus.status(), reqwest::StatusCode::UNAUTHORIZED, "token 不认");
+    assert_eq!(
+        bogus.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "token 不认"
+    );
     assert!(!b.link.has_incoming("r-1"), "被拒的请求不该挂到界面上");
     server::stop_server(&b).await;
 }
@@ -125,7 +148,10 @@ async fn an_accepted_request_ends_the_pause_and_the_link_comes_up() {
     assert!(b.ws.is_paused("device-link-a"), "前提：对端在暂停本机");
 
     let request_id = link::request(&a, "device-link-b").expect("发起请求");
-    wait_until("请求挂到对端界面上", || b.link.has_incoming(&request_id)).await;
+    wait_until("请求挂到对端界面上", || {
+        b.link.has_incoming(&request_id)
+    })
+    .await;
 
     let name = link::accept(&b, &request_id).expect("接受");
     assert_eq!(name, "PC-LINK-A", "回的是本机在对端眼里的名字");
@@ -133,9 +159,18 @@ async fn an_accepted_request_ends_the_pause_and_the_link_comes_up() {
     assert!(!b.link.has_incoming(&request_id), "处理过的请求不再挂着");
 
     // 请求的回执（200）一到，发起方就拨号 —— 两侧的长连接真的建起来。
-    wait_until("发起方建起长连接", || a.ws.has_connection("device-link-b")).await;
-    wait_until("对端也认这条链路", || b.ws.has_connection("device-link-a")).await;
-    assert!(!a.link.has_outgoing_for("device-link-b"), "结果已收，外发表清干净");
+    wait_until("发起方建起长连接", || {
+        a.ws.has_connection("device-link-b")
+    })
+    .await;
+    wait_until("对端也认这条链路", || {
+        b.ws.has_connection("device-link-a")
+    })
+    .await;
+    assert!(
+        !a.link.has_outgoing_for("device-link-b"),
+        "结果已收，外发表清干净"
+    );
 
     server::stop_server(&a).await;
     server::stop_server(&b).await;
@@ -147,7 +182,10 @@ async fn a_rejected_request_leaves_the_link_down_and_says_why() {
     let (a, b) = paired_pair().await;
 
     let request_id = link::request(&a, "device-link-b").expect("发起请求");
-    wait_until("请求挂到对端界面上", || b.link.has_incoming(&request_id)).await;
+    wait_until("请求挂到对端界面上", || {
+        b.link.has_incoming(&request_id)
+    })
+    .await;
     link::reject(&b, &request_id);
 
     // 本机把回执（403）落成"停手"：理由必须是"对方拒绝"，而不是网络那类可重试的说法。
@@ -173,10 +211,16 @@ async fn cancelling_the_request_closes_the_peers_notification() {
     let (a, b) = paired_pair().await;
 
     let request_id = link::request(&a, "device-link-b").expect("发起请求");
-    wait_until("请求挂到对端界面上", || b.link.has_incoming(&request_id)).await;
+    wait_until("请求挂到对端界面上", || {
+        b.link.has_incoming(&request_id)
+    })
+    .await;
     link::cancel(&a, &request_id).expect("取消");
 
-    wait_until("对端那条通知被撤掉", || !b.link.has_incoming(&request_id)).await;
+    wait_until("对端那条通知被撤掉", || {
+        !b.link.has_incoming(&request_id)
+    })
+    .await;
     // 取消之后本机不再等这次结果：不给它拨号，也不该留下"对方拒绝"的停手理由
     // （那是对方的决定，而这次是本机自己收的手）。
     tokio::time::sleep(Duration::from_millis(300)).await;

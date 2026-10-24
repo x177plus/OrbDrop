@@ -77,11 +77,19 @@ pub struct FsError {
 
 impl FsError {
     fn plain(message: String) -> Self {
-        Self { kind: "other", message, crumbs: Vec::new() }
+        Self {
+            kind: "other",
+            message,
+            crumbs: Vec::new(),
+        }
     }
 
     fn from_io(e: &std::io::Error, crumbs: &[FsCrumb]) -> Self {
-        Self { kind: kind_of(e), message: e.to_string(), crumbs: crumbs.to_vec() }
+        Self {
+            kind: kind_of(e),
+            message: e.to_string(),
+            crumbs: crumbs.to_vec(),
+        }
     }
 }
 
@@ -107,7 +115,11 @@ fn crumbs_of(path: &Path) -> Vec<FsCrumb> {
                 None => {
                     let raw = anc.to_string_lossy().to_string();
                     let trimmed = raw.trim_end_matches(['\\', '/']).to_string();
-                    if trimmed.is_empty() { raw } else { trimmed }
+                    if trimmed.is_empty() {
+                        raw
+                    } else {
+                        trimmed
+                    }
                 }
             },
             path: anc.to_string_lossy().to_string(),
@@ -171,7 +183,11 @@ fn list_dir(raw: &str) -> Result<FsListing, FsError> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
 
-    Ok(FsListing { path: raw.to_string(), crumbs, entries })
+    Ok(FsListing {
+        path: raw.to_string(),
+        crumbs,
+        entries,
+    })
 }
 
 /// 「设备与驱动器」：选择框打开时取一次（「常用」默认是空的，全靠用户右键加）。
@@ -226,7 +242,12 @@ fn pick_metas(paths: &[String]) -> Vec<FsEntry> {
                 Ok(meta) => (false, meta.len()),
                 Err(_) => (false, 0),
             };
-            FsEntry { name, path: raw.clone(), is_dir, size }
+            FsEntry {
+                name,
+                path: raw.clone(),
+                is_dir,
+                size,
+            }
         })
         .collect()
 }
@@ -377,7 +398,11 @@ mod tests {
         // 目录在前，各自按名排（'a' < '素'：先按 code point 比，中文排在 ASCII 之后）
         assert_eq!(names, vec!["assets", "素材", "readme.md", "中文名.txt"]);
 
-        let file = listing.entries.iter().find(|e| e.name == "中文名.txt").unwrap();
+        let file = listing
+            .entries
+            .iter()
+            .find(|e| e.name == "中文名.txt")
+            .unwrap();
         assert!(!file.is_dir);
         assert_eq!(file.size, 11);
         assert!(file.path.ends_with("中文名.txt"));
@@ -460,8 +485,16 @@ mod tests {
         // 前端按 camelCase 读（`src/lib/types.ts`）：字段名走形只会在运行时炸，这里钉死。
         let listing = serde_json::to_value(&FsListing {
             path: "C:\\".into(),
-            crumbs: vec![FsCrumb { name: "C:".into(), path: "C:\\".into() }],
-            entries: vec![FsEntry { name: "a".into(), path: "C:\\a".into(), is_dir: true, size: 0 }],
+            crumbs: vec![FsCrumb {
+                name: "C:".into(),
+                path: "C:\\".into(),
+            }],
+            entries: vec![FsEntry {
+                name: "a".into(),
+                path: "C:\\a".into(),
+                is_dir: true,
+                size: 0,
+            }],
         })
         .unwrap();
         assert!(listing.get("crumbs").is_some());
@@ -519,8 +552,14 @@ mod tests {
 
         let listing = list_dir(&dir.to_string_lossy()).unwrap();
         let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"System Volume Information"), "非卷根的同名目录照旧可见：{names:?}");
-        assert!(names.contains(&"pagefile.sys"), "非卷根的同名文件照旧可见：{names:?}");
+        assert!(
+            names.contains(&"System Volume Information"),
+            "非卷根的同名目录照旧可见：{names:?}"
+        );
+        assert!(
+            names.contains(&"pagefile.sys"),
+            "非卷根的同名文件照旧可见：{names:?}"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -563,7 +602,10 @@ mod tests {
             return;
         };
         assert!(
-            !listing.entries.iter().any(|e| Path::new(&e.path) == own.as_path()),
+            !listing
+                .entries
+                .iter()
+                .any(|e| Path::new(&e.path) == own.as_path()),
             "{} 不该出现在选择框里",
             own.display()
         );
@@ -595,7 +637,10 @@ mod tests {
         assert!(picks[1].is_dir);
         assert_eq!(picks[1].size, 0, "文件夹不报大小");
 
-        assert_eq!(picks[2].name, "不在了.txt", "取不到也要有名字，不能整批哑掉");
+        assert_eq!(
+            picks[2].name, "不在了.txt",
+            "取不到也要有名字，不能整批哑掉"
+        );
     }
 
     #[test]
@@ -615,10 +660,7 @@ mod tests {
         // 盘符顺序即字母顺序（A→Z），界面直接按返回顺序画
         #[cfg(windows)]
         {
-            let letters: Vec<char> = list
-                .iter()
-                .filter_map(|d| d.path.chars().next())
-                .collect();
+            let letters: Vec<char> = list.iter().filter_map(|d| d.path.chars().next()).collect();
             let mut sorted = letters.clone();
             sorted.sort();
             assert_eq!(letters, sorted);

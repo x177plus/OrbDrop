@@ -106,6 +106,12 @@ const SILENT_CHECK_CACHE: Duration = Duration::from_secs(30 * 60);
 /// webview 刷爆，而界面上要的只是"进度条在动"。
 const PROGRESS_EMIT_EVERY: Duration = Duration::from_millis(120);
 
+/// 清单体积上限：正常 `update.json` 只有几 KB（带全部安卓 ABI 也就几十 KB）。
+const MANIFEST_MAX_BYTES: usize = 1024 * 1024;
+/// 安装包体积的硬上限：清单不可信（见模块文档），体积字段本身也可能是任意值。
+/// 桌面端单个 exe / 安卓 apk 都在几十 MB 量级，512MB 留足余量。
+const ARTIFACT_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // 清单（`update.json`）
 // ---------------------------------------------------------------------------
@@ -270,7 +276,8 @@ struct Ctl {
     last_check: Option<Instant>,
 }
 
-static CTL: std::sync::LazyLock<Mutex<Ctl>> = std::sync::LazyLock::new(|| Mutex::new(Ctl::default()));
+static CTL: std::sync::LazyLock<Mutex<Ctl>> =
+    std::sync::LazyLock::new(|| Mutex::new(Ctl::default()));
 
 fn ctl() -> &'static Mutex<Ctl> {
     &CTL
@@ -474,7 +481,9 @@ async fn fetch_manifest_at(url: &str) -> Result<Manifest, String> {
         if !res.status().is_success() {
             return Err(format!("HTTP {}", res.status()));
         }
-        let body = res.bytes().await.map_err(|e| err_chain(&e))?;
+        // `.bytes()` 会先把整个身体读进内存；清单地址虽然固定，回话体积仍要卡死
+        // （错配的 CDN / 演练台 / 被改的镜像都不该能把进程撑爆）。
+        let body = crate::net::read_body_capped(res, MANIFEST_MAX_BYTES).await?;
         serde_json::from_slice::<Manifest>(&body).map_err(|e| format!("清单格式不对：{e}"))
     };
     match tokio::time::timeout(MANIFEST_TIMEOUT, fut).await {
@@ -505,13 +514,21 @@ fn manifest_endpoints() -> Vec<String> {
 /// 换镜像时**从零重下**（`File::create` 会截断）：Gitee 的发行版附件实测**不支持 Range**
 /// （发 `Range: bytes=…` 回来的是 `200` + 完整 `Content-Length`，没有 `Content-Range`），
 /// 而断点续传一旦跨了镜像，"已下多少"就没有意义了 —— 两个地址是两份独立文件。
-async fn download(app: &AppHandle, mirrors: &[String], dest: &Path) -> Result<(), String> {
+async fn download(app: &AppHandle, art: &Artifact, dest: &Path) -> Result<(), String> {
+    // 清单自身只受 HTTPS 保护，`size` 是远端可控的数字：超过硬上限直接拒，
+    // 否则它能把"按 size 截断"变成"按 8GB 截断"。
+    if art.size == 0 || art.size > ARTIFACT_MAX_BYTES {
+        return Err(format!(
+            "清单里的安装包大小不合理（{} 字节，上限 {ARTIFACT_MAX_BYTES}）",
+            art.size
+        ));
+    }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("建不了下载目录：{e}"))?;
     }
     let mut last = String::from("清单里没有可用的下载地址");
     let mut first = true;
-    for url in ordered_by_pref(app, mirrors.to_vec()) {
+    for url in ordered_by_pref(app, art.mirrors.clone()) {
         if let Err(e) = ensure_url_ok(&url) {
             last = e;
             continue;
@@ -520,7 +537,7 @@ async fn download(app: &AppHandle, mirrors: &[String], dest: &Path) -> Result<()
             tracing::info!("换镜像：{url}");
         }
         first = false;
-        match download_one(app, &url, dest).await {
+        match download_one(app, &url, dest, art.size).await {
             Ok(()) => {
                 remember_mirror(app, &url);
                 return Ok(());
@@ -538,10 +555,15 @@ async fn download(app: &AppHandle, mirrors: &[String], dest: &Path) -> Result<()
 }
 
 /// 单镜像下载：带首字节超时、静默超时与速率看门狗。
-async fn download_one(app: &AppHandle, url: &str, dest: &Path) -> Result<(), String> {
-    use futures_util::StreamExt;
-    use tokio::io::AsyncWriteExt;
-
+///
+/// `expected` 是清单声明的体积：超过它立刻中止——镜像不可信，一个"无限长"的响应
+/// 能把磁盘写满，也能把校验时的整份读取撑爆。
+async fn download_one(
+    app: &AppHandle,
+    url: &str,
+    dest: &Path,
+    expected: u64,
+) -> Result<(), String> {
     let host = host_of(url);
     let client = http_client()?;
     // 等响应头这一跳也要有超时：对方可以建好连接、收下请求，然后什么都不回。
@@ -559,13 +581,42 @@ async fn download_one(app: &AppHandle, url: &str, dest: &Path) -> Result<(), Str
     if !res.status().is_success() {
         return Err(format!("HTTP {}", res.status()));
     }
-    let total = res.content_length();
     put(app, |c| {
         c.state.phase = Phase::Downloading;
         c.state.mirror = Some(host.clone());
         c.state.received = 0;
         c.state.error = None;
     });
+    let received = stream_to_file(res, dest, expected, |received, total| {
+        put(app, |c| {
+            c.state.received = received;
+            c.state.size = total.or(c.state.size);
+        });
+    })
+    .await?;
+    put(app, |c| {
+        c.state.received = received;
+    });
+    Ok(())
+}
+
+/// 把响应体写进 `dest`，**超过 `expected` 立刻停**；进度按节流后的频率回报。
+async fn stream_to_file(
+    res: reqwest::Response,
+    dest: &Path,
+    expected: u64,
+    mut progress: impl FnMut(u64, Option<u64>),
+) -> Result<u64, String> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let total = res.content_length();
+    // 声明值只用于尽早拒绝：它可以是假的，所以下面按块写时还要再卡一次。
+    if let Some(len) = total {
+        if len > expected {
+            return Err(format!("响应比清单说的大（{len} > {expected} 字节）"));
+        }
+    }
 
     let mut file = tokio::fs::File::create(dest)
         .await
@@ -589,7 +640,11 @@ async fn download_one(app: &AppHandle, url: &str, dest: &Path) -> Result<(), Str
                 return Err(format!(
                     "{} 秒没有数据（{}）",
                     wait.as_secs(),
-                    if received == 0 { "还没开始" } else { "中途卡住" }
+                    if received == 0 {
+                        "还没开始"
+                    } else {
+                        "中途卡住"
+                    }
                 ))
             }
             Ok(None) => break,
@@ -597,7 +652,11 @@ async fn download_one(app: &AppHandle, url: &str, dest: &Path) -> Result<(), Str
             Ok(Some(Ok(c))) => c,
         };
 
-        received += chunk.len() as u64;
+        let next = received.saturating_add(chunk.len() as u64);
+        if next > expected {
+            return Err(format!("下载超过清单声明的大小（{expected} 字节），中止"));
+        }
+        received = next;
         win_bytes += chunk.len() as u64;
         file.write_all(&chunk)
             .await
@@ -621,19 +680,13 @@ async fn download_one(app: &AppHandle, url: &str, dest: &Path) -> Result<(), Str
 
         if last_emit.elapsed() >= PROGRESS_EMIT_EVERY {
             last_emit = Instant::now();
-            put(app, |c| {
-                c.state.received = received;
-                c.state.size = total.or(c.state.size);
-            });
+            progress(received, total);
         }
     }
 
     file.flush().await.map_err(|e| format!("落盘失败：{e}"))?;
     drop(file);
-    put(app, |c| {
-        c.state.received = received;
-    });
-    Ok(())
+    Ok(received)
 }
 
 // ---------------------------------------------------------------------------
@@ -643,19 +696,44 @@ async fn download_one(app: &AppHandle, url: &str, dest: &Path) -> Result<(), Str
 /// sha256 + minisign 两道校验。**少了任何一道都不许装**：
 /// sha256 防传输损坏，签名防"镜像/账号被拿去换了包"（清单不可信，见模块文档）。
 fn verify_file(path: &Path, art: &Artifact, require_sig: bool) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("读不回下载的文件：{e}"))?;
+    // 先对账再读：清单不可信，`art.size` 是**我们自己**准备接受的字节数，不能让镜像
+    // 给的文件决定要往内存里搬多少。元数据对不上就直接判死，连一个字节都不读。
+    if art.size > ARTIFACT_MAX_BYTES {
+        return Err(format!(
+            "安装包大得离谱（{} 字节，上限 {ARTIFACT_MAX_BYTES}），拒绝校验",
+            art.size
+        ));
+    }
+    let len = std::fs::metadata(path)
+        .map_err(|e| format!("读不到下载的文件：{e}"))?
+        .len();
+    if len != art.size {
+        return Err(format!("大小对不上（清单 {} ≠ 实际 {len}）", art.size));
+    }
+    // 即便元数据对上了，也只读 `art.size + 1` 字节：校验前文件被换大时，多出来的那一个
+    // 字节会让下面的长度检查失败，而不会把 `fs::read` 那套"整份进内存"的失败模式带回来。
+    use std::io::Read as _;
+    let mut bytes = Vec::with_capacity(art.size as usize);
+    std::fs::File::open(path)
+        .and_then(|f| f.take(art.size + 1).read_to_end(&mut bytes))
+        .map_err(|e| format!("读不回下载的文件：{e}"))?;
+    if bytes.len() as u64 != art.size {
+        return Err(format!(
+            "大小对不上（清单 {} ≠ 实际 {}）",
+            art.size,
+            bytes.len()
+        ));
+    }
     let got = hex_lower(&Sha256::digest(&bytes));
     if !got.eq_ignore_ascii_case(art.sha256.trim()) {
-        return Err(format!("sha256 对不上（清单 {} ≠ 实际 {}）", art.sha256.trim(), got));
-    }
-    if bytes.len() as u64 != art.size {
-        return Err(format!("大小对不上（清单 {} ≠ 实际 {}）", art.size, bytes.len()));
+        return Err(format!(
+            "sha256 对不上（清单 {} ≠ 实际 {}）",
+            art.sha256.trim(),
+            got
+        ));
     }
     if require_sig {
-        let sig = art
-            .sig
-            .as_deref()
-            .ok_or("清单里没有签名，拒绝安装")?;
+        let sig = art.sig.as_deref().ok_or("清单里没有签名，拒绝安装")?;
         verify_signature(&bytes, sig)?;
     }
     Ok(())
@@ -673,16 +751,16 @@ fn verify_signature(data: &[u8], sig_b64: &str) -> Result<(), String> {
             .map_err(|e| format!("内置公钥坏了：{e}"))?,
     )
     .map_err(|e| format!("内置公钥不是文本：{e}"))?;
-    let key = minisign_verify::PublicKey::decode(&pub_text)
-        .map_err(|e| format!("公钥格式不对：{e}"))?;
+    let key =
+        minisign_verify::PublicKey::decode(&pub_text).map_err(|e| format!("公钥格式不对：{e}"))?;
     let sig_text = String::from_utf8(
         engine
             .decode(sig_b64.trim())
             .map_err(|e| format!("签名不是 base64：{e}"))?,
     )
     .map_err(|e| format!("签名不是文本：{e}"))?;
-    let sig = minisign_verify::Signature::decode(&sig_text)
-        .map_err(|e| format!("签名格式不对：{e}"))?;
+    let sig =
+        minisign_verify::Signature::decode(&sig_text).map_err(|e| format!("签名格式不对：{e}"))?;
     key.verify(data, &sig, true)
         .map_err(|e| format!("签名校验不过：{e}（这个包不是本项目的私钥签的）"))
 }
@@ -716,7 +794,8 @@ pub async fn apply(app: AppHandle) -> Result<(), String> {
             Some(a) => a,
             None => {
                 check(app.clone(), true).await?;
-                ctl().lock()
+                ctl()
+                    .lock()
                     .artifact
                     .clone()
                     .ok_or("当前没有可安装的新版本")?
@@ -735,7 +814,7 @@ pub async fn apply(app: AppHandle) -> Result<(), String> {
         c.state.phase = Phase::Downloading;
         c.state.error = None;
     });
-    if let Err(e) = download(&app, &art.mirrors, &dest).await {
+    if let Err(e) = download(&app, &art, &dest).await {
         // 下载整条路走完都没成：**必须把阶段推成 `error`**。停在 `downloading` 的话界面会
         // 一直显示"正在下载"（进度条再也不动），用户看到的是一台卡住的应用而不是一条失败。
         put(&app, |c| {
@@ -842,8 +921,7 @@ fn ordered_by_pref(app: &AppHandle, urls: Vec<String>) -> Vec<String> {
     let Some(pref) = read_pref(app) else {
         return urls;
     };
-    let (mut first, rest): (Vec<_>, Vec<_>) =
-        urls.into_iter().partition(|u| host_of(u) == pref);
+    let (mut first, rest): (Vec<_>, Vec<_>) = urls.into_iter().partition(|u| host_of(u) == pref);
     first.extend(rest);
     first
 }
@@ -871,10 +949,7 @@ fn remember_mirror(app: &AppHandle, url: &str) {
     if cfg.update_mirror.as_ref().is_some_and(|p| p.host == host) {
         return;
     }
-    cfg.update_mirror = Some(crate::config::UpdateMirror {
-        host,
-        at: now_ms(),
-    });
+    cfg.update_mirror = Some(crate::config::UpdateMirror { host, at: now_ms() });
     if let Err(e) = crate::config::save_config_at(&state.config_path, &cfg) {
         tracing::warn!("记不住更新镜像偏好：{e}");
     }
@@ -973,4 +1048,3 @@ pub async fn update_check(app: AppHandle, force: bool) -> Result<UpdateState, St
 pub async fn update_apply(app: AppHandle) -> Result<(), String> {
     apply(app).await
 }
-

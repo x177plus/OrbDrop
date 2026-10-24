@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::rolling;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
-use tracing_appender::rolling;
 
 use crate::config::data_dir;
 
@@ -26,7 +26,11 @@ pub fn record_crash(path: &Path, message: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{} {message}", chrono::Local::now().to_rfc3339());
     }
 }
@@ -92,10 +96,7 @@ pub fn init_log() {
     }
 
     tracing_subscriber::registry()
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(fmt::Layer::new().with_writer(file_writer).json())
         .with(fmt::Layer::new().with_writer(std::io::stdout))
         .init();

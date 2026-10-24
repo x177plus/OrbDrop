@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -11,6 +11,94 @@ use tracing::{info, warn};
 
 /// mDNS 服务类型（`register` 与注销共用一份字面量）。
 const SERVICE_TYPE: &str = "_orbdrop._tcp.local.";
+
+/// 回环作用域下写进 SRV/A 记录的地址（不调 `enable_addr_auto`，避免把内网地址也报出去）。
+const LOOPBACK_IP: &str = "127.0.0.1";
+
+/// mDNS 作用的范围。
+///
+/// 默认（正式版）是 [`Scope::Lan`]：同网段的其他机器能发现本机。
+/// 同机多开联调（`ORBDROP_ALLOW_MULTI`）默认切成 [`Scope::Local`]：只走回环，
+/// 两份实例能互相发现，但**局域网上的其他用户收不到任何组播** —— 否则每跑一次调试，
+/// 所有用户的设备列表里都会多出一台同名、新 device id 的"幽灵设备"，退出后还要等
+/// mDNS TTL（PTR 4500s）才消失。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// 所有网卡（正式版的局域网发现）。
+    Lan,
+    /// 只走回环（同机多开联调；其他机器看不见）。
+    Local,
+    /// 不广播、不浏览（手动添加仍可用）。
+    Off,
+}
+
+impl Scope {
+    /// 当前进程该用哪个作用域。
+    ///
+    /// 优先级：`ORBDROP_MDNS_SCOPE=lan|local|off` 显式指定；否则
+    /// `ORBDROP_ALLOW_MULTI` 存在时为 `Local`，其余为 `Lan`。
+    pub fn current() -> Self {
+        let scope_env = std::env::var_os("ORBDROP_MDNS_SCOPE");
+        let scope = scope_env.as_deref().map(|raw| raw.to_string_lossy());
+        Self::resolve(
+            scope.as_deref(),
+            std::env::var_os("ORBDROP_ALLOW_MULTI").is_some(),
+        )
+    }
+
+    /// `current` 的纯策略部分（单测不走进程环境变量）：显式 scope 优先，
+    /// 否则同机多开 = 回环，单实例 = 局域网。
+    fn resolve(scope: Option<&str>, multi: bool) -> Self {
+        if let Some(raw) = scope {
+            return Self::parse(raw).unwrap_or_else(|| {
+                warn!(
+                    value = raw,
+                    "ORBDROP_MDNS_SCOPE 不认识（只认 lan/local/off），按 local 处理"
+                );
+                Self::Local
+            });
+        }
+        if multi {
+            Self::Local
+        } else {
+            Self::Lan
+        }
+    }
+
+    /// 纯字符串解析（`current` 要读进程环境，单测走这里）。
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "lan" => Some(Self::Lan),
+            "local" | "loopback" => Some(Self::Local),
+            "off" | "none" | "disabled" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// 按作用域挑 daemon 的网卡。
+///
+/// `Local` 只看回环：mdns-sd 默认关闭回环，要先禁用整族再把 `LoopbackV4` 打开。
+/// 这样注册与浏览的组播都只落在 `127.0.0.1` 上，不会从任何内网网卡发出去。
+fn select_interfaces(daemon: &ServiceDaemon, scope: Scope) -> bool {
+    if scope != Scope::Local {
+        return true;
+    }
+    for (what, result) in [
+        ("disable IPv4", daemon.disable_interface(IfKind::IPv4)),
+        ("disable IPv6", daemon.disable_interface(IfKind::IPv6)),
+        (
+            "enable loopback IPv4",
+            daemon.enable_interface(IfKind::LoopbackV4),
+        ),
+    ] {
+        if let Err(e) = result {
+            warn!("mDNS {what} failed: {e}");
+            return false;
+        }
+    }
+    true
+}
 
 /// 一次**挂着的** mDNS 注册：daemon 句柄 + 它自己报出来的服务全名。
 ///
@@ -49,6 +137,9 @@ pub fn release(reg: Registration) {
 /// addresses automatically. The TXT record carries the stable device id and
 /// display name so browsing peers can identify us without a service resolution.
 ///
+/// `scope = Scope::Local` 时反着来：daemon 只留回环网卡，记录里也只写 `127.0.0.1`
+/// （不调 `enable_addr_auto`），于是同机其他实例看得见本机，局域网上的机器看不见。
+///
 /// F-107 之后还带两项**自报**：
 /// - `relay`：本机此刻愿不愿意替别人中转（= `Config::allow_relay`，S-09）。与 `/pair/info`
 ///   的 `relay` 同义，放在 TXT 里是为了让同段的观察者**零请求**就能知道（否则要等它各自的
@@ -58,7 +149,17 @@ pub fn release(reg: Registration) {
 ///
 /// `nets` 是**提示**不是权威：网卡换了（插网线/开热点）不会重播 TXT（`enable_addr_auto`
 /// 只管地址记录），所以活回话（`/pair/info` 与 `/discover` 的 `nets`）才是真值。
-pub fn register(port: u16, device_name: &str, device_id: &str, allow_relay: bool) -> Option<Registration> {
+pub fn register(
+    port: u16,
+    device_name: &str,
+    device_id: &str,
+    allow_relay: bool,
+    scope: Scope,
+) -> Option<Registration> {
+    if scope == Scope::Off {
+        info!("mDNS registration disabled (scope=off)");
+        return None;
+    }
     let daemon = match ServiceDaemon::new() {
         Ok(d) => d,
         Err(e) => {
@@ -66,6 +167,10 @@ pub fn register(port: u16, device_name: &str, device_id: &str, allow_relay: bool
             return None;
         }
     };
+    if !select_interfaces(&daemon, scope) {
+        let _ = daemon.shutdown();
+        return None;
+    }
 
     let instance_name = format!("OrbDrop-{}", device_name);
     let service_type = SERVICE_TYPE;
@@ -85,17 +190,32 @@ pub fn register(port: u16, device_name: &str, device_id: &str, allow_relay: bool
         crate::subnet::format_list(&crate::subnet::host_nets()),
     );
 
-    let service = match ServiceInfo::new(
-        service_type,
-        &instance_name,
-        &host,
-        "", // ip (empty → addr_auto fills in)
-        port,
-        properties,
-    ) {
-        Ok(s) => s.enable_addr_auto(),
+    let service = if scope == Scope::Local {
+        // 只报回环地址：不调 `enable_addr_auto`，否则内网地址也会被塞进 A 记录。
+        ServiceInfo::new(
+            service_type,
+            &instance_name,
+            &host,
+            LOOPBACK_IP,
+            port,
+            properties,
+        )
+    } else {
+        ServiceInfo::new(
+            service_type,
+            &instance_name,
+            &host,
+            "", // ip (empty → addr_auto fills in)
+            port,
+            properties,
+        )
+        .map(|s| s.enable_addr_auto())
+    };
+    let service = match service {
+        Ok(s) => s,
         Err(e) => {
             warn!("Failed to build mDNS service info: {e}");
+            let _ = daemon.shutdown();
             return None;
         }
     };
@@ -107,11 +227,18 @@ pub fn register(port: u16, device_name: &str, device_id: &str, allow_relay: bool
 
     match daemon.register(service) {
         Ok(_) => {
-            info!(port, device_name, device_id, "mDNS service registered");
+            info!(
+                port,
+                device_name,
+                device_id,
+                ?scope,
+                "mDNS service registered"
+            );
             Some(Registration { daemon, fullname })
         }
         Err(e) => {
             warn!("mDNS registration failed: {e}");
+            let _ = daemon.shutdown();
             None
         }
     }
@@ -144,7 +271,11 @@ pub enum PeerEvent {
 /// to `AppState` and Tauri events.
 ///
 /// Skips the local device (matched by `own_device_id`).
-pub async fn scan(tx: mpsc::Sender<PeerEvent>, own_device_id: String) {
+pub async fn scan(tx: mpsc::Sender<PeerEvent>, own_device_id: String, scope: Scope) {
+    if scope == Scope::Off {
+        info!("mDNS scan disabled (scope=off)");
+        return;
+    }
     let daemon = match ServiceDaemon::new() {
         Ok(d) => d,
         Err(e) => {
@@ -152,17 +283,22 @@ pub async fn scan(tx: mpsc::Sender<PeerEvent>, own_device_id: String) {
             return;
         }
     };
+    if !select_interfaces(&daemon, scope) {
+        let _ = daemon.shutdown();
+        return;
+    }
 
     let service_type = "_orbdrop._tcp.local.";
     let receiver = match daemon.browse(service_type) {
         Ok(r) => r,
         Err(e) => {
             warn!("mDNS browse failed: {e}");
+            let _ = daemon.shutdown();
             return;
         }
     };
 
-    info!("mDNS scan started for {service_type}");
+    info!(?scope, "mDNS scan started for {service_type}");
 
     // Remember instance fullname → peer id so ServiceRemoved can emit offline.
     let mut known: HashMap<String, String> = HashMap::new();
@@ -210,14 +346,16 @@ pub async fn scan(tx: mpsc::Sender<PeerEvent>, own_device_id: String) {
                 let relay = matches!(txt("relay").as_str(), "1" | "true");
 
                 if let (Some(ip), port) = (ip, port) {
-                    let _ = tx.send(PeerEvent::Online {
-                        id: peer_id,
-                        name,
-                        ip,
-                        port,
-                        nets,
-                        relay,
-                    }).await;
+                    let _ = tx
+                        .send(PeerEvent::Online {
+                            id: peer_id,
+                            name,
+                            ip,
+                            port,
+                            nets,
+                            relay,
+                        })
+                        .await;
                 }
             }
             Ok(ServiceEvent::ServiceRemoved(_svc_type, full_name)) => {
@@ -252,7 +390,10 @@ pub async fn scan(tx: mpsc::Sender<PeerEvent>, own_device_id: String) {
 /// 4. 链路本地（169.254，通常是没拿到 DHCP 的残留）。
 ///
 /// 同级按地址升序：集合内容不变时结果相同，设备行的地址不会自己跳。
-fn pick_address(addrs: impl IntoIterator<Item = Ipv4Addr>, local: &[(u32, u32)]) -> Option<Ipv4Addr> {
+fn pick_address(
+    addrs: impl IntoIterator<Item = Ipv4Addr>,
+    local: &[(u32, u32)],
+) -> Option<Ipv4Addr> {
     let mut best: Option<(u8, u32)> = None;
     let mut best_ip = None;
     for ip in addrs {
@@ -292,7 +433,10 @@ mod tests {
 
     /// 本机在 `10.0.0.0/24`（另一块网卡才有的网段不进这一档）。
     fn local() -> Vec<(u32, u32)> {
-        vec![(u32::from(Ipv4Addr::new(10, 0, 0, 0)), u32::from(Ipv4Addr::new(255, 255, 255, 0)))]
+        vec![(
+            u32::from(Ipv4Addr::new(10, 0, 0, 0)),
+            u32::from(Ipv4Addr::new(255, 255, 255, 0)),
+        )]
     }
 
     fn ip(s: &str) -> Ipv4Addr {
@@ -310,7 +454,10 @@ mod tests {
     /// 掩码不是 /24 时也按真实边界判同网段。
     #[test]
     fn same_subnet_respects_the_real_netmask() {
-        let local = vec![(u32::from(Ipv4Addr::new(10, 0, 0, 0)), u32::from(Ipv4Addr::new(255, 255, 0, 0)))];
+        let local = vec![(
+            u32::from(Ipv4Addr::new(10, 0, 0, 0)),
+            u32::from(Ipv4Addr::new(255, 255, 0, 0)),
+        )];
         assert_eq!(pick_address([ip("10.0.9.7")], &local), Some(ip("10.0.9.7")));
     }
 
@@ -356,5 +503,130 @@ mod tests {
     #[test]
     fn no_addresses_means_no_target() {
         assert_eq!(pick_address([], &local()), None);
+    }
+
+    #[test]
+    fn scope_parsing_is_explicit() {
+        assert_eq!(Scope::parse("lan"), Some(Scope::Lan));
+        assert_eq!(Scope::parse(" LOCAL "), Some(Scope::Local));
+        assert_eq!(Scope::parse("loopback"), Some(Scope::Local));
+        assert_eq!(Scope::parse("off"), Some(Scope::Off));
+        assert_eq!(Scope::parse("none"), Some(Scope::Off));
+        assert_eq!(Scope::parse("nonsense"), None);
+    }
+
+    /// 默认策略：同机多开（`ORBDROP_ALLOW_MULTI`）只走回环；显式 scope 永远优先；
+    /// 写错的显式值按 local 处理（宁可看不见，也不要把临时实例撒到局域网）。
+    #[test]
+    fn multi_instance_defaults_to_loopback_and_explicit_scope_wins() {
+        assert_eq!(Scope::resolve(None, false), Scope::Lan);
+        assert_eq!(Scope::resolve(None, true), Scope::Local);
+        assert_eq!(Scope::resolve(Some("lan"), true), Scope::Lan);
+        assert_eq!(Scope::resolve(Some("off"), true), Scope::Off);
+        assert_eq!(Scope::resolve(Some("local"), false), Scope::Local);
+        assert_eq!(Scope::resolve(Some("nonsense"), false), Scope::Local);
+    }
+
+    /// `Scope::Local` 的记录只报回环地址；默认（LAN）扫描端回环是关着的，看不见它。
+    ///
+    /// 这是"同机多开联调不污染局域网"的回归：以前调试实例会以一个新 device id 出现在
+    /// 同一网段**所有用户**的设备列表里，退出后还要等 mDNS TTL 才消失。
+    #[test]
+    fn local_scope_keeps_advertisements_on_loopback() {
+        use std::time::{Duration, Instant};
+
+        let name = format!("lo-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let Some(reg) = register(39_123, &name, "lo-test-id", false, Scope::Local) else {
+            eprintln!("mDNS 起不来，跳过");
+            return;
+        };
+
+        let loopback = ServiceDaemon::new().expect("loopback daemon");
+        assert!(select_interfaces(&loopback, Scope::Local));
+        let rx = loopback.browse(SERVICE_TYPE).expect("browse");
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut seen = None;
+        while Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(ServiceEvent::ServiceResolved(info))
+                    if info.get_fullname() == reg.fullname.as_str() =>
+                {
+                    seen = Some(info);
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        // 默认网卡（LAN）的浏览端不该看见这条只走回环的记录。
+        let lan = ServiceDaemon::new().expect("lan daemon");
+        let lrx = lan.browse(SERVICE_TYPE).expect("lan browse");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut leaked = false;
+        while Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match lrx.recv_timeout(left) {
+                Ok(ServiceEvent::ServiceResolved(info))
+                    if info.get_fullname() == reg.fullname.as_str() =>
+                {
+                    leaked = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        release(reg);
+        let _ = loopback.shutdown();
+        let _ = lan.shutdown();
+
+        let Some(info) = seen else {
+            eprintln!("回环 mDNS 在这台机器上没解析到，跳过（{name}）");
+            return;
+        };
+        assert!(
+            !info.get_addresses().is_empty()
+                && info.get_addresses().iter().all(|a| a.is_loopback()),
+            "Local 作用域只能报回环地址：{:?}",
+            info.get_addresses()
+        );
+        assert!(!leaked, "Local 作用域的记录从局域网网卡漏出去了");
+    }
+
+    /// `scan(Scope::Local)` 能看见同机另一个 `register(Scope::Local)` 的实例 ——
+    /// 这就是同机多开联调依赖的那条路（两份都不出网卡）。
+    #[tokio::test]
+    async fn local_scan_sees_another_local_instance() {
+        use std::time::Duration;
+
+        let tag = uuid::Uuid::new_v4().to_string();
+        let name = format!("scan-{}", &tag[..8]);
+        let peer_id = format!("scan-peer-{tag}");
+        let Some(reg) = register(39_124, &name, &peer_id, false, Scope::Local) else {
+            eprintln!("mDNS 起不来，跳过");
+            return;
+        };
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let task = tokio::spawn(scan(tx, "own-id".to_string(), Scope::Local));
+        let found = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = rx.recv().await {
+                if let PeerEvent::Online { id, .. } = event {
+                    if id == peer_id {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+
+        task.abort();
+        release(reg);
+        assert!(found, "Local 扫描端应该能看见同机注册的实例");
     }
 }

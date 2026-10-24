@@ -15,8 +15,8 @@
 //! 因此这里：控制面与选路走真的 reqwest；**端点的数据面用裸 `TcpStream` 拨**（拨它映射到的那个
 //! IPv4，同一个监听、同一个端口），与 `p1_integration` 里那条中转用例同一个写法。
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use orbdrop_lib::config::{Config, PeerDevice};
@@ -32,6 +32,10 @@ fn isolate_data_dir() {
         let dir = std::env::temp_dir().join(format!("orbdrop_it_relaymem_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("建临时数据目录");
         std::env::set_var("ORBDROP_DATA_DIR", &dir);
+        // 这组用例把多个 `AppState` 跑在同一进程里，目标只能写 127.0.0.1。
+        // `relay::open` 会拒绝回环目标（P0：中转回环会拿到本机 UI 的免认证权限）；
+        // 这个测试开关只在 debug 构建生效，release 永远拒绝。
+        std::env::set_var("ORBDROP_TEST_ALLOW_LOOPBACK_RELAY", "1");
     });
     std::sync::LazyLock::force(&INIT);
 }
@@ -134,9 +138,13 @@ async fn probe_endpoint_bytes(host: &str, port: u16, payload: &[u8]) -> Vec<u8> 
     let mut sock = tokio::net::TcpStream::connect(std::net::SocketAddr::new(ip, port))
         .await
         .expect("连中转端点");
-    tokio::io::AsyncWriteExt::write_all(&mut sock, payload).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut sock, payload)
+        .await
+        .unwrap();
     let mut buf = vec![0u8; payload.len()];
-    let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await.unwrap();
+    let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+        .await
+        .unwrap();
     buf.truncate(n);
     buf
 }
@@ -174,7 +182,10 @@ async fn relay_open_verifies_a_non_paired_requester() {
 
     // ① 什么都不带（没有凭据、也没有自报身份）→ 401：连"谁在请求"都不知道，没得谈。
     assert_eq!(
-        ask(serde_json::json!({ "target": target_id })).await.unwrap().status(),
+        ask(serde_json::json!({ "target": target_id }))
+            .await
+            .unwrap()
+            .status(),
         reqwest::StatusCode::UNAUTHORIZED,
         "未配对设备必须自报身份"
     );
@@ -217,7 +228,10 @@ async fn relay_open_verifies_a_non_paired_requester() {
     .unwrap();
     let host = opened["host"].as_str().expect("host").to_string();
     let relay_port = u16::try_from(opened["port"].as_u64().expect("port")).unwrap();
-    assert!(host.starts_with("[::ffff:"), "端点字面量必须与直连键位不同: {host}");
+    assert!(
+        host.starts_with("[::ffff:"),
+        "端点字面量必须与直连键位不同: {host}"
+    );
     assert_eq!(
         opened["targetAddr"].as_str(),
         Some(format!("127.0.0.1:{}", echo.port()).as_str()),
@@ -298,9 +312,8 @@ async fn relay_route_accepts_only_paired_peers_and_local_targets() {
 
     let client = orbdrop_lib::net::client();
     let url = format!("https://{lan}:{receiver_port}/relay/route");
-    let device = |id: &str, ip: &str| {
-        serde_json::json!({ "id": id, "name": id, "ip": ip, "port": 3890 })
-    };
+    let device =
+        |id: &str, ip: &str| serde_json::json!({ "id": id, "name": id, "ip": ip, "port": 3890 });
     let body = serde_json::json!({ "routes": [
         {
             "targetCidr": own_net,
@@ -324,21 +337,6 @@ async fn relay_route_accepts_only_paired_peers_and_local_targets() {
         reqwest::StatusCode::UNAUTHORIZED,
         "要么带凭据，要么自报身份"
     );
-
-    let token = format!("tok-{tag}");
-    credential::set_peer(&sender_id, &token).unwrap();
-    let reply: serde_json::Value = client
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&body)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(reply["accepted"].as_array().unwrap().len(), 1, "只有含本机地址的那一条被采纳");
-    assert_eq!(reply["ignored"].as_array().unwrap().len(), 1);
 
     // 未配对的一侧（被中转的 B 常常从来没跟锚点配过）也要收得到：自报身份 + 被核实。
     // 少了这一条，B 就永远不知道"A 是怎么过来的"。
@@ -365,6 +363,34 @@ async fn relay_route_accepts_only_paired_peers_and_local_targets() {
         1,
         "自报身份核实通过就该收下（记录只是提示，用之前仍由中转方核实目标）"
     );
+    assert!(
+        receiver.is_ephemeral_route(&own_net),
+        "未认证来源的记录只做本进程内的临时提示（不落盘）"
+    );
+
+    // 已配对对端（Bearer）写的同一份记录：升格为可落盘的记忆。
+    let token = format!("tok-{tag}");
+    credential::set_peer(&sender_id, &token).unwrap();
+    let reply: serde_json::Value = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        reply["accepted"].as_array().unwrap().len(),
+        1,
+        "只有含本机地址的那一条被采纳"
+    );
+    assert_eq!(reply["ignored"].as_array().unwrap().len(), 1);
+    assert!(
+        !receiver.is_ephemeral_route(&own_net),
+        "Bearer 来源的记录可信，升格为可落盘的策略"
+    );
 
     // 自报身份对不上 → 拒。
     assert_eq!(
@@ -385,8 +411,14 @@ async fn relay_route_accepts_only_paired_peers_and_local_targets() {
         let config = receiver.config.lock();
         let route = config.relay_route(&own_net).expect("策略已落库");
         assert_eq!(route.via_cidr, "10.44.0.0/16");
-        assert_eq!(route.via_devices, vec!["relay-c".to_string(), "relay-d".to_string()]);
-        assert!(route.via_paired.is_empty(), "本机与它们都没配对：这里记的是**本机**的配对状态");
+        assert_eq!(
+            route.via_devices,
+            vec!["relay-c".to_string(), "relay-d".to_string()]
+        );
+        assert!(
+            route.via_paired.is_empty(),
+            "本机与它们都没配对：这里记的是**本机**的配对状态"
+        );
         assert!(route.seen_at.is_some(), "记下池的刷新时刻（TTL 靠它）");
         // 池里并进来的设备**不写地址簿** —— 那是别人的段。
         assert!(
@@ -394,9 +426,72 @@ async fn relay_route_accepts_only_paired_peers_and_local_targets() {
             "反向记录不该往地址簿里塞设备"
         );
     }
-    assert!(receiver.get_peer("relay-c").is_some(), "池里的设备要能被拨到");
+    assert!(
+        receiver.get_peer("relay-c").is_some(),
+        "池里的设备要能被拨到"
+    );
 
     credential::remove_peer(&sender_id).ok();
+    server::stop_server(&receiver).await;
+}
+
+/// `/relay/route` 的自报核实只能证明"这个地址上答得出这个 id"，不能改写**已配对设备**的
+/// 名字/地址/在线状态（与 `/relay/open` 同一道闸）。否则局域网里任何一台机器都能把自己
+/// 伪装成那台设备，把它的名字写进地址簿并把它标成在线。
+#[tokio::test]
+async fn relay_route_does_not_let_a_self_report_rewrite_a_paired_peer() {
+    isolate_data_dir();
+    let Some(lan) = local_lan_ip() else {
+        return;
+    };
+    let lan = lan.to_string();
+    let tag = uuid::Uuid::new_v4().to_string();
+    let receiver_id = format!("name-receiver-{tag}");
+    let paired_id = format!("paired-{tag}");
+
+    let receiver = make_state(4820, &receiver_id, "RECEIVER");
+    let receiver_port = server::start_server(receiver.clone(), 4820).await.unwrap();
+    receiver.add_peer_book(PeerDevice {
+        online: false,
+        paired: true,
+        ..peer(&paired_id, "ORIGINAL", "10.9.9.9", 3890)
+    });
+
+    // 冒充者把自己伪装成 paired_id：它的 `/pair/info` 会回这个 id 和另一个名字，
+    // 于是「自报 + 核实」这一关会通过 —— 但已配对设备的行不许被它改写。
+    let impostor = make_state(4821, &paired_id, "SPOOF");
+    let impostor_port = server::start_server(impostor.clone(), 4821).await.unwrap();
+
+    let url = format!("https://{lan}:{receiver_port}/relay/route");
+    let status = orbdrop_lib::net::client()
+        .post(&url)
+        .json(&serde_json::json!({
+            "routes": [],
+            "requester": { "id": paired_id, "port": impostor_port, "name": "SPOOF" },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert!(status.is_success(), "核实通过，请求本身要收下: {status}");
+
+    let row = receiver.get_peer(&paired_id).expect("已配对行还在");
+    assert_eq!(row.name, "ORIGINAL", "自报不能改写已配对设备的名字");
+    assert_eq!(row.ip, "10.9.9.9", "自报不能改写已配对设备的地址");
+    assert!(!row.online, "自报不能把已配对设备标成在线");
+    assert_eq!(
+        receiver
+            .config
+            .lock()
+            .peers
+            .iter()
+            .find(|p| p.id == paired_id)
+            .map(|p| p.name.clone()),
+        Some("ORIGINAL".to_string()),
+        "地址簿里的名字也不能被改写"
+    );
+
+    server::stop_server(&impostor).await;
     server::stop_server(&receiver).await;
 }
 
@@ -444,17 +539,21 @@ async fn relay_pool_directs_and_fails_over_to_an_unpaired_relay() {
     c.add_peer_book(peer(&d_id, "PC-D", &lan, port_d));
     c.set_relay_capable(&d_id, true);
 
-    // A 与 C 的关系：地址簿里记着"已配对"（池的排序按它），但**凭据库里没有 token** ——
-    // 于是两条路都要走放宽后的那一档（自报身份 + 被核实）。这比"假装已配对"更贴近
-    // "换一台没配过的设备也能借"的真实用法。
-    a.add_peer_book(PeerDevice {
-        paired: true,
-        ..peer(&c_id, "PC-C", &lan, port_c)
-    });
+    // A 与 C 的关系：**没有配对、也没有 token** —— 于是两条路都要走放宽后的那一档
+    // （自报身份 + 被核实）。这比"假装已配对"更贴近"换一台没配过的设备也能借"的真实用法。
+    //
+    // 不要在这里标 `paired: true`：已配对却没有指纹的出站拨号现在会在 TLS 阶段被拒
+    // （`credential::dial_pin` 的 `Deny`，那条收口是为了不把 token 发到未钉住的通道上），
+    // 与这条用例要走的"未配对"路径正好相反。
+    a.add_peer_book(peer(&c_id, "PC-C", &lan, port_c));
     // 等于"A 的 5s 探活问过 C 的 `/pair/info`"（本机首跳就是靠这一位把 C 挑出来的）：
     // 这一位不看配对，只看对方**开没开** S-09。
     a.set_relay_capable(&c_id, true);
-    assert_eq!(a.listening_port(), port_a, "请求方自报的端口就是它实际监听的端口");
+    assert_eq!(
+        a.listening_port(),
+        port_a,
+        "请求方自报的端口就是它实际监听的端口"
+    );
 
     // B1 在 A 眼里是"同一个网段里、但是够不着的那个地址"（AP 把同段单播隔开就是这个样子）。
     a.add_peer_book(peer(&t1_id, "B1", &unreachable, echo1.port()));
@@ -462,13 +561,20 @@ async fn relay_pool_directs_and_fails_over_to_an_unpaired_relay() {
     // 直连够不着 B1 → 请池里的中转方开端点（真的 HTTP + TLS）。
     let opened = orbdrop_lib::relay::ensure_for(&a, &t1_id).await;
     let relay = opened.expect("池里要有可用的中转方");
-    assert_eq!(relay.via, c_id, "池里标着已配对的那台排前面");
+    assert_eq!(relay.via, c_id, "此时唯一可用的中转方是 C");
     assert_eq!(
         probe_endpoint_bytes(&relay.host, relay.port, b"hello-through-c").await,
         b"hello-through-c",
         "端点是活的：字节经 C 到 B1 又原样回来"
     );
-    assert_eq!(a.get_peer(&t1_id).unwrap().relay.as_ref().map(|r| r.via.clone()), Some(c_id.clone()));
+    assert_eq!(
+        a.get_peer(&t1_id)
+            .unwrap()
+            .relay
+            .as_ref()
+            .map(|r| r.via.clone()),
+        Some(c_id.clone())
+    );
     assert!(c.relays.active() >= 1, "中转方那边确实开出去了一条");
 
     // bug 3 的回归：A **从来没跟 C 配对**、也没换过 C 的 `/discover` 视野（没有 token），
@@ -626,10 +732,19 @@ async fn discovery_reports_nets_and_per_peer_cidr() {
         .map(|c| c.to_cidr_string())
         .expect("本机网段");
     let rows = disc["peers"].as_array().unwrap();
-    let member = rows.iter().find(|p| p["id"] == member_id.as_str()).expect("表里有那台设备");
+    let member = rows
+        .iter()
+        .find(|p| p["id"] == member_id.as_str())
+        .expect("表里有那台设备");
     assert_eq!(member["relay"], true, "它允不允许中转要在表里（池靠它筛）");
-    assert_eq!(member["cidr"], expected_cidr, "这一段是哪一段由**报出方**填");
-    let far = rows.iter().find(|p| p["id"] == far_id.as_str()).expect("表里也有那台");
+    assert_eq!(
+        member["cidr"], expected_cidr,
+        "这一段是哪一段由**报出方**填"
+    );
+    let far = rows
+        .iter()
+        .find(|p| p["id"] == far_id.as_str())
+        .expect("表里也有那台");
     assert!(
         far["cidr"].is_null(),
         "算不出归属段时省略这一格（老对端读成未知，本机退回按自己的掩码算）"
@@ -700,11 +815,19 @@ async fn remembered_pool_from_a_route_record_opens_a_relay() {
         b"recorded-pool"
     );
     assert_eq!(
-        b.get_peer(&t_id).unwrap().relay.as_ref().map(|r| r.via.clone()),
+        b.get_peer(&t_id)
+            .unwrap()
+            .relay
+            .as_ref()
+            .map(|r| r.via.clone()),
         Some(c_id.clone()),
         "端点写进了那台设备的运行时段（`dial()` 的唯一来源）"
     );
-    assert_eq!(b.listening_port(), port_b, "B 自报的端口就是它实际监听的端口");
+    assert_eq!(
+        b.listening_port(),
+        port_b,
+        "B 自报的端口就是它实际监听的端口"
+    );
 
     server::stop_server(&b).await;
     server::stop_server(&c).await;
@@ -724,10 +847,7 @@ async fn going_offline_stops_relaying() {
     let lan = lan.to_string();
     let tag = uuid::Uuid::new_v4().to_string();
     let provider_id = format!("off-provider-{tag}");
-    let (target_id, requester_id) = (
-        format!("off-target-{tag}"),
-        format!("off-requester-{tag}"),
-    );
+    let (target_id, requester_id) = (format!("off-target-{tag}"), format!("off-requester-{tag}"));
 
     let provider = make_state(4790, &provider_id, "PROVIDER");
     provider.config.lock().allow_relay = true;
@@ -764,7 +884,11 @@ async fn going_offline_stops_relaying() {
     provider.set_local_online(false);
     orbdrop_lib::apply_offline(&provider);
 
-    assert_eq!(provider.relays.active(), 0, "离线要**当场**收掉全部中转端点");
+    assert_eq!(
+        provider.relays.active(),
+        0,
+        "离线要**当场**收掉全部中转端点"
+    );
     let dial_ip = match orbdrop_lib::net::parse_host(&host).expect("端点主机") {
         std::net::IpAddr::V6(v6) => std::net::IpAddr::V4(v6.to_ipv4_mapped().expect("映射地址")),
         other => other,
@@ -779,7 +903,10 @@ async fn going_offline_stops_relaying() {
             }
         }
     }
-    assert!(closed, "离线之后端点不该再接受连接（监听随监听任务一起 drop）");
+    assert!(
+        closed,
+        "离线之后端点不该再接受连接（监听随监听任务一起 drop）"
+    );
 
     // 控制面也进不来：隐身由 `presence_middleware` 统一回 503。
     assert_eq!(
@@ -849,9 +976,8 @@ async fn relay_route_accepts_a_record_carried_by_the_relay_it_names() {
 
     let client = orbdrop_lib::net::client();
     let url = format!("https://{lan}:{receiver_port}/relay/route");
-    let device = |id: &str, ip: &str| {
-        serde_json::json!({ "id": id, "name": id, "ip": ip, "port": 3890 })
-    };
+    let device =
+        |id: &str, ip: &str| serde_json::json!({ "id": id, "name": id, "ip": ip, "port": 3890 });
     // 记录里点名的中转方就是**这条连接的来源地址**（TCP 源地址伪造不了）。
     let via_lan = serde_json::json!([device("relay-c", &lan)]);
     let via_other = serde_json::json!([device("relay-c", "10.44.0.7")]);
@@ -902,17 +1028,28 @@ async fn relay_route_accepts_a_record_carried_by_the_relay_it_names() {
         1,
         "经它自己点名的中转方送来的记录要收下: {reply}"
     );
+    assert!(
+        receiver.is_ephemeral_route(&own_net),
+        "没有 Bearer 的来源只做本进程内的临时提示（不落盘）"
+    );
     let route = receiver
         .config
         .lock()
         .relay_route(&own_net)
         .cloned()
-        .expect("策略落库");
+        .expect("策略已在内存里（临时提示）");
     assert_eq!(route.via_devices, vec!["relay-c".to_string()]);
     assert_eq!(
         receiver.get_peer("relay-c").map(|p| p.ip),
         Some(lan.clone()),
         "被中转的那一侧要靠它拨得动中转方，所以地址也得并进来"
+    );
+    assert!(
+        receiver
+            .pool_for(&own_net)
+            .iter()
+            .any(|d| d.id == "relay-c"),
+        "临时提示也要能用于选路：池必须已经并进来"
     );
 
     server::stop_server(&receiver).await;
@@ -1125,7 +1262,9 @@ async fn an_arriving_route_record_kicks_the_queued_message_into_borrowing_a_rela
     // 记录到达就该自己动：`apply_relay_routes` → `flush_all_queued` → `flush_queued`
     // → 够不着 → 当场借一条中转。10s 内借不到就说明"上一发把额度吃掉了"或这条链断了。
     wait_until("记录一到，排队的那台就借到了路", || {
-        b.get_peer(&a_id).and_then(|p| p.relay.map(|r| r.via)).as_deref()
+        b.get_peer(&a_id)
+            .and_then(|p| p.relay.map(|r| r.via))
+            .as_deref()
             == Some(c_id.as_str())
     })
     .await;
@@ -1244,7 +1383,10 @@ async fn a_pooled_relay_is_still_dialable_after_its_row_is_reaped() {
             .collect(),
     );
     let pool_ids: Vec<String> = a.pool_for(&target_cidr).into_iter().map(|e| e.id).collect();
-    assert!(pool_ids.contains(&d_id), "池里要有 C 报来的 D：{pool_ids:?}");
+    assert!(
+        pool_ids.contains(&d_id),
+        "池里要有 C 报来的 D：{pool_ids:?}"
+    );
     assert!(a.get_peer(&d_id).is_some(), "D 这行要并进设备表");
 
     // ② 经 C 中转发过消息之后，A 的中转记忆就是这样：设备级链路 + 网段级策略，池与地址一起落盘
@@ -1437,7 +1579,10 @@ async fn a_probe_tick_borrows_a_relay_for_a_peer_with_no_path_at_all() {
         online: false,
         ..Default::default()
     });
-    assert!(!b.get_peer(&a_id).unwrap().dialable(), "起手就是「什么路都没有」");
+    assert!(
+        !b.get_peer(&a_id).unwrap().dialable(),
+        "起手就是「什么路都没有」"
+    );
 
     let Some(own_net) = orbdrop_lib::subnet::host_nets()
         .first()
@@ -1465,7 +1610,10 @@ async fn a_probe_tick_borrows_a_relay_for_a_peer_with_no_path_at_all() {
     // 一拍探活（没有排队消息、也没人点发送）：那一台就该被借回来。
     orbdrop_lib::state::probe_peers_once(&b).await;
     wait_until("探活那一拍自己借到了路", || {
-        b.get_peer(&a_id).and_then(|p| p.relay.map(|r| r.via)).as_deref() == Some(c_id.as_str())
+        b.get_peer(&a_id)
+            .and_then(|p| p.relay.map(|r| r.via))
+            .as_deref()
+            == Some(c_id.as_str())
     })
     .await;
     assert_eq!(

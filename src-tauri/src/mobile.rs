@@ -14,9 +14,9 @@ use std::time::UNIX_EPOCH;
 
 #[cfg(mobile)]
 use std::sync::OnceLock;
-use tauri::State;
 #[cfg(mobile)]
 use tauri::plugin::{PluginHandle, TauriPlugin};
+use tauri::State;
 use tracing::info;
 #[cfg(mobile)]
 use tracing::warn;
@@ -127,7 +127,10 @@ fn list_inbox_at(root: &Path) -> Vec<InboxEntryDto> {
 /// **同样必须 async**（P1-13⑥）：`canonicalize` 与 `remove_file` 都是阻塞系统调用，
 /// 在掉线的外置卡/慢存储上会卡成"点了没反应"。判据与删除动作一起挪到阻塞线程池上跑。
 #[tauri::command]
-pub async fn delete_inbox_file(path: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub async fn delete_inbox_file(
+    path: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
     let root = state.config.lock().download_dir.clone();
     tauri::async_runtime::spawn_blocking(move || delete_inbox_file_at(&root, &path))
         .await
@@ -181,9 +184,9 @@ pub fn repair_download_dir(state: &AppState) {
 /// 1. **平台兜底串**（`OrbDrop-Mac`）：早先的 Android 构建没有取型号那一支，一路退到非
 ///    Windows 那句兜底 —— 那个名字在手机上没有任何意义（机器是安卓的），同一局域网里两台
 ///    手机还会重名；
-/// 2. **型号本身**（`V2502A` / `24129PN74C`）：紧接着那版拿 `ro.product.model` 当默认名，
+/// 2. **型号本身**（`ABCD-1234` 这类型号代码）：紧接着那版拿 `ro.product.model` 当默认名，
 ///    而国行 ROM 的 `model` 是型号代码，名字认不出是哪台机器 —— 现在能取到厂商的市场名
-///    （`vivo X300` / `Xiaomi 15 Pro`）或至少"品牌 + 型号"，该换成那个。
+///    （一个可读的市场名）或至少"品牌 + 型号"，该换成那个。
 ///
 /// 判据在 `config::should_replace_auto_name` 里：**逐字节等于我们自己会写下的那几个值**才动，
 /// 用户自己起过的名字一个字都不碰。
@@ -242,7 +245,10 @@ pub async fn open_file(path: String) -> Result<(), String> {
         return Err("文件打开插件没注册上（内部错误）".into());
     };
     handle
-        .run_mobile_plugin_async::<serde_json::Value>("openFile", serde_json::json!({ "path": path }))
+        .run_mobile_plugin_async::<serde_json::Value>(
+            "openFile",
+            serde_json::json!({ "path": path }),
+        )
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -283,7 +289,10 @@ pub async fn resolve_image_uri(uri: String) -> Result<PickedImage, String> {
         return Err("粘贴图片插件没注册上（内部错误）".into());
     };
     let value = handle
-        .run_mobile_plugin_async::<serde_json::Value>("resolveImage", serde_json::json!({ "uri": uri }))
+        .run_mobile_plugin_async::<serde_json::Value>(
+            "resolveImage",
+            serde_json::json!({ "uri": uri }),
+        )
         .await
         .map_err(|e| e.to_string())?;
     // Kotlin 那边回的是 `{path, size}`（`Plugin.resolve` 收 `JSObject?`，塞不了裸字符串）。
@@ -291,7 +300,10 @@ pub async fn resolve_image_uri(uri: String) -> Result<PickedImage, String> {
         .as_str()
         .map(|s| s.to_string())
         .ok_or_else(|| "原生那一跳没给出暂存路径".to_string())?;
-    Ok(PickedImage { path, size: value["size"].as_u64().unwrap_or(0) })
+    Ok(PickedImage {
+        path,
+        size: value["size"].as_u64().unwrap_or(0),
+    })
 }
 
 /// 原生那一跳拷回来的东西：暂存路径 + 字节数（会话里那条气泡要显示"多大"，而这一层是唯一
@@ -388,7 +400,8 @@ pub fn apps_plugin() -> TauriPlugin<tauri::Wry> {
     tauri::plugin::Builder::new("orbdrop-installed-apps")
         .setup(|_app, api| {
             // 类名与 Kotlin 那边的 `@TauriPlugin class InstalledAppsPlugin` 对应。
-            let handle = api.register_android_plugin("com.x177plus.orbdrop", "InstalledAppsPlugin")?;
+            let handle =
+                api.register_android_plugin("com.x177plus.orbdrop", "InstalledAppsPlugin")?;
             if APPS_HANDLE.set(handle).is_err() {
                 warn!("应用列表插件重复注册：沿用第一份句柄");
             }
@@ -556,5 +569,6 @@ pub fn store_plugin() -> TauriPlugin<tauri::Wry> {
 /// 这条导航该不该交给系统去开：应用商店的 scheme，以及 Play 的网页版。
 #[cfg(mobile)]
 fn is_store_url(url: &tauri::Url) -> bool {
-    url.scheme() == "market" || (url.scheme() == "https" && url.host_str() == Some("play.google.com"))
+    url.scheme() == "market"
+        || (url.scheme() == "https" && url.host_str() == Some("play.google.com"))
 }

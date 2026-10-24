@@ -167,7 +167,11 @@ impl PushOutStore {
             Some(slot) => {
                 // `roots` 只有**建这批的那一刻**知道（用户这次选的那几项），后来的状态跃迁
                 // 不该把它抹掉 —— 空的那份当"没带新信息"，保留盘上现有的。
-                let roots = if batch.roots.is_empty() { slot.roots.clone() } else { batch.roots };
+                let roots = if batch.roots.is_empty() {
+                    slot.roots.clone()
+                } else {
+                    batch.roots
+                };
                 *slot = OutBatch { roots, ..batch };
             }
             None => guard.file.batches.push(batch),
@@ -305,7 +309,8 @@ mod tests {
     }
 
     fn store(name: &str) -> (PushOutStore, PathBuf) {
-        let path = std::env::temp_dir().join(format!("orbdrop_out_{name}_{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("orbdrop_out_{name}_{}", uuid::Uuid::new_v4()));
         (PushOutStore::with_path(path.clone()), path)
     }
 
@@ -323,7 +328,10 @@ mod tests {
         assert_eq!(j.id, "inv-1");
         assert_eq!(j.peer_id, "peer-a");
         assert!(j.peer_paired && j.accepted);
-        assert_eq!(j.sources[0], ("报告/a.bin".to_string(), "D:/src/a.bin".to_string()));
+        assert_eq!(
+            j.sources[0],
+            ("报告/a.bin".to_string(), "D:/src/a.bin".to_string())
+        );
         assert_eq!(jobs[0].sources.len(), 2);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].targets[0].invite_id, "inv-1");

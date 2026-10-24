@@ -13,9 +13,9 @@
 //! 通知气泡说的是别的事（推送与配对邀请），消息进去只会把面板变成第二个通知中心。
 
 #[cfg(mobile)]
-use std::sync::OnceLock;
-#[cfg(mobile)]
 use serde::{Deserialize, Serialize};
+#[cfg(mobile)]
+use std::sync::OnceLock;
 #[cfg(mobile)]
 use tauri::plugin::{PluginHandle, TauriPlugin};
 #[cfg(mobile)]
@@ -72,7 +72,8 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
     tauri::plugin::Builder::new("orbdrop-notifier")
         .setup(|_app, api| {
             // 类名与 Kotlin 那边的 `@TauriPlugin class MessageNotifierPlugin` 对应。
-            let handle = api.register_android_plugin("com.x177plus.orbdrop", "MessageNotifierPlugin")?;
+            let handle =
+                api.register_android_plugin("com.x177plus.orbdrop", "MessageNotifierPlugin")?;
             if HANDLE.set(handle).is_err() {
                 warn!("通知插件重复注册：沿用第一份句柄");
             }
@@ -161,7 +162,10 @@ pub async fn open_notification_settings() -> Result<(), String> {
         return Err("通知插件句柄不在（内部错误）".into());
     };
     handle
-        .run_mobile_plugin_async::<serde_json::Value>("openNotificationSettings", serde_json::json!({}))
+        .run_mobile_plugin_async::<serde_json::Value>(
+            "openNotificationSettings",
+            serde_json::json!({}),
+        )
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())

@@ -93,7 +93,11 @@ pub async fn discover(
 
     let (own_id, own_name, allow_relay) = {
         let config = state.config.lock();
-        (config.device_id.clone(), config.device_name.clone(), config.allow_relay)
+        (
+            config.device_id.clone(),
+            config.device_name.clone(),
+            config.allow_relay,
+        )
     };
     // 它来问"本机此刻看得见谁"：这一问本身就说明**它在网上**（token 换来的身份，这一档
     // 只对已配对对端开放，见上）。本机拨不回去的那些（AP 隔开单播 / 跨段）靠这条证据

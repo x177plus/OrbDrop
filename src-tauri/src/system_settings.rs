@@ -1,13 +1,17 @@
 //! 「让应用在后台活着」所需要的**系统那一层**（F-87，机制与真机观察见 `docs/p1-implementation.md` §22）。
 //!
-//! 为什么单独有这一块：前台服务（`OrbDropService`）加两把 Wi-Fi 锁在 AOSP 上就够了，但国产 ROM
-//! 另有一层自己的权限位（华为「应用启动管理」、小米「自启动」、OPPO/vivo 同类开关）。那一层是
-//! **ROM 私有的：应用既改不了，也读不到** —— 所以这里能做的只有两件：把用户送到那一页，
-//! 以及读回**唯一能读到的那个状态**（电池优化白名单，Google 官方 API）。
+//! 为什么单独有这一块：前台服务（`OrbDropService`）加两把 Wi-Fi 锁在 AOSP 上就够了，但部分厂商
+//! ROM 另有一层自己的权限位（自启动 / 关联启动 / 后台活动 / 后台耗电管理）。那一层是 **ROM 私有的：
+//! 应用既改不了，也读不到** —— 所以这里能做的只有两件：把用户送到那一页，以及读回**唯一能读到的
+//! 那个状态**（电池优化白名单，Google 官方 API）。
 //!
-//! 真机证据（华为 ABC-AL00）：那三个开关留在默认的「自动管理」时，进程在后台被冻结 —— 通知栏
-//! 那条常驻通知还挂着（它由系统栏画），而 mDNS 广播与 HTTP 应答一起停，对端看到的就是"这台离线
-//! 了"。所以"用户没开那三个开关"这件事必须在界面上说清楚，而不是等用户来问"为什么收不到"。
+//! 真机证据：这些开关留在默认档时，进程在后台被冻结 —— 通知栏那条常驻通知还挂着（它由系统栏画），
+//! 而 mDNS 广播与 HTTP 应答一起停，对端看到的就是"这台离线了"。所以"用户没开那些开关"这件事
+//! 必须在界面上说清楚，而不是等用户来问"为什么收不到"。
+//!
+//! 还有一层不在自启动页上的「后台耗电管理」：真机实测，熄屏后它把前台服务进程整个放进 freezer
+//! （`cgroup.freeze=1`），服务器与 5s 探活一起停，对端判离线；改成「允许后台运行 / 允许后台高耗电」
+//! 后同一测试立刻恢复。见 [`open_background_power_settings`]。
 //!
 //! 与 `notify` 的分工：那边只管"打通知"（渠道、横幅、通知设置页），这边只管"系统让不让我活着"。
 //! 桌面端没有实体：这一族的命令只在移动端登记（`lib.rs` 的 handler 列表里带 `#[cfg(mobile)]`）。
@@ -41,7 +45,8 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
     tauri::plugin::Builder::new("orbdrop-keepalive")
         .setup(|_app, api| {
             // 类名与 Kotlin 那边的 `@TauriPlugin class SystemSettingsPlugin` 对应。
-            let handle = api.register_android_plugin("com.x177plus.orbdrop", "SystemSettingsPlugin")?;
+            let handle =
+                api.register_android_plugin("com.x177plus.orbdrop", "SystemSettingsPlugin")?;
             if HANDLE.set(handle).is_err() {
                 warn!("保活设置插件重复注册：沿用第一份句柄");
             }
@@ -104,6 +109,23 @@ pub struct OpenedPage {
 pub async fn open_autostart_settings() -> Result<OpenedPage, String> {
     handle()?
         .run_mobile_plugin_async::<OpenedPage>("openAutoStartSettings", serde_json::json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 跳到 ROM 的「后台耗电管理」页（「允许后台运行 / 允许后台高耗电」通常在那里）。
+///
+/// 这一层和自启动/电池优化都不是一回事：部分厂商 ROM 会在熄屏后把前台服务进程放进 freezer，
+/// 只开自启动与 Doze 白名单挡不住（真机证据见 `docs/p1-implementation.md` §22）。开关状态
+/// ROM 不公开，所以这里只负责送用户到那一页；打不开时退到应用详情页（Kotlin 那边做的）。
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn open_background_power_settings() -> Result<OpenedPage, String> {
+    handle()?
+        .run_mobile_plugin_async::<OpenedPage>(
+            "openBackgroundPowerSettings",
+            serde_json::json!({}),
+        )
         .await
         .map_err(|e| e.to_string())
 }

@@ -84,10 +84,15 @@ pub fn locate_exe(configured: Option<&Path>) -> Option<PathBuf> {
 #[cfg(target_os = "windows")]
 fn registry_candidates() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    let roots = [RegKey::predef(HKEY_CURRENT_USER), RegKey::predef(HKEY_LOCAL_MACHINE)];
+    let roots = [
+        RegKey::predef(HKEY_CURRENT_USER),
+        RegKey::predef(HKEY_LOCAL_MACHINE),
+    ];
 
     for root in roots.iter() {
-        if let Ok(key) = root.open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\BCompare.exe") {
+        if let Ok(key) =
+            root.open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\BCompare.exe")
+        {
             if let Ok(v) = key.get_value::<String, _>("") {
                 if let Some(p) = clean_path(&v) {
                     out.push(p);
@@ -134,7 +139,10 @@ fn common_candidates() -> Vec<PathBuf> {
     {
         for var in ["ProgramFiles", "ProgramFiles(x86)"] {
             if let Ok(base) = std::env::var(var) {
-                for sub in [r"Beyond Compare 5\BCompare.exe", r"Beyond Compare 4\BCompare.exe"] {
+                for sub in [
+                    r"Beyond Compare 5\BCompare.exe",
+                    r"Beyond Compare 4\BCompare.exe",
+                ] {
                     out.push(PathBuf::from(&base).join(sub));
                 }
             }
@@ -228,9 +236,7 @@ pub fn provision_profiles(state: &AppState) -> usize {
     // 本机服务端口：profile 的 BaseURL 指向**本机**的 WebDAV 代理（`server::proxy`），
     // 不再是找对端直连 —— 传输走 TLS 之后 BC 没法直连对端（它不做证书指纹校验，
     // 而"让用户装证书"是不要的方案）。
-    let own_port = state
-        .server_port
-        .load(std::sync::atomic::Ordering::SeqCst);
+    let own_port = state.server_port.load(std::sync::atomic::Ordering::SeqCst);
     // 「现在还在册」的 profile 名：已配对且有地址的设备。prune 只删不在这个集合里的
     // 我们自己的条目（设备已解除配对，或地址漂移后留下的旧名字）。
     //
@@ -286,7 +292,9 @@ pub fn decrypt_password(key: &[u8], value: &str) -> Option<String> {
     }
     let (iv, rest) = payload.split_at(16);
     let cipher = AesGcm::<Aes256, U16>::new_from_slice(key).ok()?;
-    let plain = cipher.decrypt(aes_gcm::Nonce::<U16>::from_slice(iv), rest).ok()?;
+    let plain = cipher
+        .decrypt(aes_gcm::Nonce::<U16>::from_slice(iv), rest)
+        .ok()?;
     String::from_utf8(plain).ok()
 }
 
@@ -401,14 +409,19 @@ fn element_attrs(e: &quick_xml::events::BytesStart<'_>) -> Vec<(String, String)>
         .map(|a| {
             (
                 String::from_utf8_lossy(a.key.as_ref()).to_string(),
-                a.unescape_value().map(|v| v.to_string()).unwrap_or_default(),
+                a.unescape_value()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
             )
         })
         .collect()
 }
 
 fn attr(attrs: &[(String, String)], name: &str) -> Option<String> {
-    attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+    attrs
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.clone())
 }
 
 /// 从元素原文里抠一个属性值（用于判断"要不要重写"）。
@@ -559,7 +572,8 @@ pub fn prune_webdav_profiles(dir: &Path, keep: &[String]) -> usize {
     };
     let before = file.entries.len();
     file.entries.retain(|e| {
-        let ours = e.element == PROFILE_ELEMENT && attr_in_raw(&e.raw, "Username").as_deref() == Some(DAV_USER);
+        let ours = e.element == PROFILE_ELEMENT
+            && attr_in_raw(&e.raw, "Username").as_deref() == Some(DAV_USER);
         !ours || keep.iter().any(|k| k == &e.value)
     });
     let removed = before - file.entries.len();
@@ -567,7 +581,10 @@ pub fn prune_webdav_profiles(dir: &Path, keep: &[String]) -> usize {
         return 0;
     }
     // 文件级密钥照旧（`parse` 出来没有才生成）。
-    let key = file.key.clone().unwrap_or_else(|| random_bytes::<32>().to_vec());
+    let key = file
+        .key
+        .clone()
+        .unwrap_or_else(|| random_bytes::<32>().to_vec());
     match write_profile_file(&path, &file, &key, None) {
         Ok(()) => {
             info!(path = %path.display(), removed, "已清理失效的 BeyondCompare WebDAV profile");
@@ -1048,12 +1065,14 @@ fn join_relative(root: &Path, rel: &str) -> PathBuf {
 /// 对端这一路会顺手写好 WebDAV profile——每台设备一条，名字就是 `ip:port`（BC 自己的命名习惯），
 /// **BaseURL 指向本机的 WebDAV 代理**（`server::proxy`，回环），密码是该设备的 token。
 /// BC 因此永远不接触对端的证书，而本机到对端那一跳是 TLS + 指纹校验。
-pub fn resolve_side(state: &AppState, exe: &Path, target: &BcTarget) -> Result<ResolvedSide, String> {
+pub fn resolve_side(
+    state: &AppState,
+    exe: &Path,
+    target: &BcTarget,
+) -> Result<ResolvedSide, String> {
     let label = label_of(state, target);
     match target {
-        BcTarget::Share {
-            share_id, path, ..
-        } => {
+        BcTarget::Share { share_id, path, .. } => {
             let share_path = state
                 .config
                 .lock()
@@ -1077,6 +1096,12 @@ pub fn resolve_side(state: &AppState, exe: &Path, target: &BcTarget) -> Result<R
             path,
             ..
         } => {
+            // 两个 id 都会进 URL：`peer_id` 构成 BaseURL 的 `/proxy/<peer_id>/`，`share_id` 是
+            // profile 子路径的第一段（对端 DAV 面按 `/dav/<share_id>/<path>` 解析）。形态不合法
+            // 的一律拒绝 —— 含 `/`、`?`、`#` 的 id 本来就会让 BC 走到错误的位置（见 `crate::ids`）。
+            if !crate::ids::is_segment(peer_id) || !crate::ids::is_segment(share_id) {
+                return Err("设备或共享项标识不合法，无法在 BeyondCompare 中定位".into());
+            }
             let peer = state
                 .get_peer(peer_id)
                 .ok_or_else(|| "设备不在列表中".to_string())?;
@@ -1092,9 +1117,7 @@ pub fn resolve_side(state: &AppState, exe: &Path, target: &BcTarget) -> Result<R
 
             let (dial_host, dial_port) = peer.dial();
             let host_port = format!("{}:{}", dial_host, dial_port);
-            let own_port = state
-                .server_port
-                .load(std::sync::atomic::Ordering::SeqCst);
+            let own_port = state.server_port.load(std::sync::atomic::Ordering::SeqCst);
             if own_port == 0 {
                 return Err("本机服务未在运行：WebDAV 代理不可用".to_string());
             }
@@ -1161,7 +1184,10 @@ mod tests {
         let key = random_bytes::<32>();
         let value = encrypt_password(&key, "头文字D-秘密").unwrap();
         assert!(value.starts_with(ENC_PREFIX));
-        assert_eq!(decrypt_password(&key, &value).as_deref(), Some("头文字D-秘密"));
+        assert_eq!(
+            decrypt_password(&key, &value).as_deref(),
+            Some("头文字D-秘密")
+        );
     }
 
     /// 写入必须**合并**：别的 profile 原样保留、文件级密钥不换（换掉会让 BC 已存的密码解不开）。
@@ -1180,12 +1206,24 @@ mod tests {
         )
         .unwrap();
 
-        upsert_webdav_profile(&dir, "192.168.1.9:3890", "http://192.168.1.9:3890/dav/", "x", "tok-9")
-            .unwrap();
+        upsert_webdav_profile(
+            &dir,
+            "192.168.1.9:3890",
+            "http://192.168.1.9:3890/dav/",
+            "x",
+            "tok-9",
+        )
+        .unwrap();
 
         let written = fs::read_to_string(dir.join(PROFILE_FILE)).unwrap();
-        assert!(written.contains(other.trim()), "别人的 profile 必须原样保留:\n{written}");
-        assert!(written.contains(&format!("Encryption=\"{ENC_PREFIX}{}\"", b64().encode(original_key))));
+        assert!(
+            written.contains(other.trim()),
+            "别人的 profile 必须原样保留:\n{written}"
+        );
+        assert!(written.contains(&format!(
+            "Encryption=\"{ENC_PREFIX}{}\"",
+            b64().encode(original_key)
+        )));
 
         let parsed = parse_profile_file(&written).unwrap();
         assert_eq!(parsed.key.as_deref(), Some(original_key.as_slice()));
@@ -1199,7 +1237,10 @@ mod tests {
             Some("http://192.168.1.9:3890/dav/")
         );
         let pw = attr_in_raw(&entry.raw, "Password").unwrap();
-        assert_eq!(decrypt_password(&original_key, &pw).as_deref(), Some("tok-9"));
+        assert_eq!(
+            decrypt_password(&original_key, &pw).as_deref(),
+            Some("tok-9")
+        );
         assert!(entry.raw.contains(&format!("<{PROFILE_ELEMENT}")));
 
         let _ = fs::remove_dir_all(dir);
@@ -1243,10 +1284,31 @@ mod tests {
         let ftp = "\t<TFtpProfile Value=\"SomeFtp\">\n\t\t<Host Value=\"example.com\"/>\n\t</TFtpProfile>";
 
         // 我们的两条：一条仍在册，一条是设备解除配对后留下的孤儿
-        upsert_webdav_profile(&dir, "10.0.0.1:3890", "http://10.0.0.1:3890/dav/", DAV_USER, "tok-a").unwrap();
-        upsert_webdav_profile(&dir, "10.0.0.2:3890", "http://10.0.0.2:3890/dav/", DAV_USER, "tok-b").unwrap();
+        upsert_webdav_profile(
+            &dir,
+            "10.0.0.1:3890",
+            "http://10.0.0.1:3890/dav/",
+            DAV_USER,
+            "tok-a",
+        )
+        .unwrap();
+        upsert_webdav_profile(
+            &dir,
+            "10.0.0.2:3890",
+            "http://10.0.0.2:3890/dav/",
+            DAV_USER,
+            "tok-b",
+        )
+        .unwrap();
         // 用户自己手建的：名字同样像 IP:端口，但用户名不是我们的
-        upsert_webdav_profile(&dir, "10.0.0.3:1080", "http://10.0.0.3:1080/dav/", "bob", "pw").unwrap();
+        upsert_webdav_profile(
+            &dir,
+            "10.0.0.3:1080",
+            "http://10.0.0.3:1080/dav/",
+            "bob",
+            "pw",
+        )
+        .unwrap();
         // 再加一条别的类型（FTP），证明整个文件里的其它 profile 也不受影响
         let path = dir.join(PROFILE_FILE);
         let text = fs::read_to_string(&path).unwrap();
@@ -1260,12 +1322,25 @@ mod tests {
         let written = fs::read_to_string(&path).unwrap();
         let parsed = parse_profile_file(&written).unwrap();
         let by_name = |n: &str| parsed.entries.iter().find(|e| e.value == n);
-        assert!(by_name("10.0.0.1:3890").is_some(), "在册设备必须保留:\n{written}");
-        assert!(by_name("10.0.0.2:3890").is_none(), "孤儿条目该被清掉:\n{written}");
+        assert!(
+            by_name("10.0.0.1:3890").is_some(),
+            "在册设备必须保留:\n{written}"
+        );
+        assert!(
+            by_name("10.0.0.2:3890").is_none(),
+            "孤儿条目该被清掉:\n{written}"
+        );
         let users = by_name("10.0.0.3:1080").expect("用户手建的条目一个字都不该动");
         assert_eq!(attr_in_raw(&users.raw, "Username").as_deref(), Some("bob"));
-        assert!(written.contains(ftp.trim()), "其它 profile 类型原样保留:\n{written}");
-        assert_eq!(parsed.key.as_deref(), Some(key.as_slice()), "文件级密钥不能换");
+        assert!(
+            written.contains(ftp.trim()),
+            "其它 profile 类型原样保留:\n{written}"
+        );
+        assert_eq!(
+            parsed.key.as_deref(),
+            Some(key.as_slice()),
+            "文件级密钥不能换"
+        );
 
         // 没有孤儿条目时一个字都不写（BC 可能在跑，别平白触发它写 .bak）
         let stable = fs::read_to_string(&path).unwrap();
@@ -1273,7 +1348,11 @@ mod tests {
             prune_webdav_profiles(&dir, &["10.0.0.1:3890".into(), "10.0.0.3:1080".into()]),
             0
         );
-        assert_eq!(stable, fs::read_to_string(&path).unwrap(), "无可删条目时不该改动文件");
+        assert_eq!(
+            stable,
+            fs::read_to_string(&path).unwrap(),
+            "无可删条目时不该改动文件"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -1284,18 +1363,36 @@ mod tests {
     fn legacy_x_username_entries_are_migrated_to_the_app_user() {
         let dir = std::env::temp_dir().join(format!("orbdrop_bc_legacy_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
-        upsert_webdav_profile(&dir, "10.0.0.9:3890", "http://10.0.0.9:3890/dav/", "x", "tok-old").unwrap();
+        upsert_webdav_profile(
+            &dir,
+            "10.0.0.9:3890",
+            "http://10.0.0.9:3890/dav/",
+            "x",
+            "tok-old",
+        )
+        .unwrap();
 
-        upsert_webdav_profile(&dir, "10.0.0.9:3890", "http://10.0.0.9:3890/dav/", DAV_USER, "tok-old").unwrap();
+        upsert_webdav_profile(
+            &dir,
+            "10.0.0.9:3890",
+            "http://10.0.0.9:3890/dav/",
+            DAV_USER,
+            "tok-old",
+        )
+        .unwrap();
 
-        let parsed = parse_profile_file(&fs::read_to_string(dir.join(PROFILE_FILE)).unwrap()).unwrap();
+        let parsed =
+            parse_profile_file(&fs::read_to_string(dir.join(PROFILE_FILE)).unwrap()).unwrap();
         let ours: Vec<&ProfileEntry> = parsed
             .entries
             .iter()
             .filter(|e| e.value == "10.0.0.9:3890")
             .collect();
         assert_eq!(ours.len(), 1, "同一个名字只该有一条");
-        assert_eq!(attr_in_raw(&ours[0].raw, "Username").as_deref(), Some(DAV_USER));
+        assert_eq!(
+            attr_in_raw(&ours[0].raw, "Username").as_deref(),
+            Some(DAV_USER)
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -1308,7 +1405,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(PROFILE_FILE);
         let original_key = random_bytes::<32>();
-        let other = "\t<TFtpProfile Value=\"MyFtp\">\n\t\t<Host Value=\"example.com\"/>\n\t</TFtpProfile>";
+        let other =
+            "\t<TFtpProfile Value=\"MyFtp\">\n\t\t<Host Value=\"example.com\"/>\n\t</TFtpProfile>";
         // 用户把我们那条 WebDAV 条目删掉了，只留下自己的；文件级密钥还在
         fs::write(
             &path,
@@ -1319,24 +1417,53 @@ mod tests {
         )
         .unwrap();
 
-        upsert_webdav_profile(&dir, "10.2.0.1:3890", "http://10.2.0.1:3890/dav/", DAV_USER, "tok-1").unwrap();
+        upsert_webdav_profile(
+            &dir,
+            "10.2.0.1:3890",
+            "http://10.2.0.1:3890/dav/",
+            DAV_USER,
+            "tok-1",
+        )
+        .unwrap();
         let written = fs::read_to_string(&path).unwrap();
         let parsed = parse_profile_file(&written).unwrap();
         assert_eq!(
-            parsed.entries.iter().filter(|e| e.value == "10.2.0.1:3890").count(),
+            parsed
+                .entries
+                .iter()
+                .filter(|e| e.value == "10.2.0.1:3890")
+                .count(),
             1,
             "删掉的条目该被补回来，而且只有一条:\n{written}"
         );
-        assert!(written.contains(other.trim()), "别的 profile 不受影响:\n{written}");
-        assert_eq!(parsed.key.as_deref(), Some(original_key.as_slice()), "密钥不能换成新的");
+        assert!(
+            written.contains(other.trim()),
+            "别的 profile 不受影响:\n{written}"
+        );
+        assert_eq!(
+            parsed.key.as_deref(),
+            Some(original_key.as_slice()),
+            "密钥不能换成新的"
+        );
 
         // 整份文件被删：下一次比较要把文件重建出来（新密钥），不能报错
         fs::remove_file(&path).unwrap();
-        upsert_webdav_profile(&dir, "10.2.0.1:3890", "http://10.2.0.1:3890/dav/", DAV_USER, "tok-1").unwrap();
+        upsert_webdav_profile(
+            &dir,
+            "10.2.0.1:3890",
+            "http://10.2.0.1:3890/dav/",
+            DAV_USER,
+            "tok-1",
+        )
+        .unwrap();
         let recreated = parse_profile_file(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(recreated.key.is_some(), "重建的文件也要有文件级密钥");
         assert_eq!(
-            recreated.entries.iter().filter(|e| e.value == "10.2.0.1:3890").count(),
+            recreated
+                .entries
+                .iter()
+                .filter(|e| e.value == "10.2.0.1:3890")
+                .count(),
             1
         );
 
@@ -1350,9 +1477,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("orbdrop_bc_multi_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         for _ in 0..5 {
-            upsert_webdav_profile(&dir, "10.3.0.1:3890", "http://10.3.0.1:3890/dav/", DAV_USER, "tok-a").unwrap();
+            upsert_webdav_profile(
+                &dir,
+                "10.3.0.1:3890",
+                "http://10.3.0.1:3890/dav/",
+                DAV_USER,
+                "tok-a",
+            )
+            .unwrap();
         }
-        upsert_webdav_profile(&dir, "10.3.0.2:3890", "http://10.3.0.2:3890/dav/", DAV_USER, "tok-b").unwrap();
+        upsert_webdav_profile(
+            &dir,
+            "10.3.0.2:3890",
+            "http://10.3.0.2:3890/dav/",
+            DAV_USER,
+            "tok-b",
+        )
+        .unwrap();
 
         let path = dir.join(PROFILE_FILE);
         let written = fs::read_to_string(&path).unwrap();
@@ -1366,11 +1507,24 @@ mod tests {
         assert_eq!(ours.len(), 2, "两台设备 = 两条，比五次也不例外：{ours:?}");
 
         // 同一台设备的多个共享项/子路径共用同一条 profile
-        assert_eq!(profile_spec("10.3.0.1:3890", "share-a/sub"), "profile:10.3.0.1:3890?share-a/sub");
-        assert_eq!(profile_spec("10.3.0.1:3890", "share-b"), "profile:10.3.0.1:3890?share-b");
+        assert_eq!(
+            profile_spec("10.3.0.1:3890", "share-a/sub"),
+            "profile:10.3.0.1:3890?share-a/sub"
+        );
+        assert_eq!(
+            profile_spec("10.3.0.1:3890", "share-b"),
+            "profile:10.3.0.1:3890?share-b"
+        );
 
         // 再比一次：内容已经对了，文件一个字节都不该动
-        upsert_webdav_profile(&dir, "10.3.0.1:3890", "http://10.3.0.1:3890/dav/", DAV_USER, "tok-a").unwrap();
+        upsert_webdav_profile(
+            &dir,
+            "10.3.0.1:3890",
+            "http://10.3.0.1:3890/dav/",
+            DAV_USER,
+            "tok-a",
+        )
+        .unwrap();
         assert_eq!(written, fs::read_to_string(&path).unwrap());
 
         let _ = fs::remove_dir_all(dir);
@@ -1378,7 +1532,10 @@ mod tests {
 
     #[test]
     fn profile_spec_separates_subpath_with_question_mark() {
-        assert_eq!(profile_spec("192.168.1.9:3890", ""), "profile:192.168.1.9:3890");
+        assert_eq!(
+            profile_spec("192.168.1.9:3890", ""),
+            "profile:192.168.1.9:3890"
+        );
         assert_eq!(
             profile_spec("192.168.1.9:3890", "share-1/src/lib"),
             "profile:192.168.1.9:3890?share-1/src/lib"
@@ -1407,15 +1564,24 @@ mod tests {
         fs::write(&exe, b"stub").unwrap();
         assert_eq!(locate_exe(Some(&exe)), Some(exe.clone()));
         // 配的路径不存在 → 不能拿它当结果（退回自动探测）
-        assert_ne!(locate_exe(Some(&dir.join("nope.exe"))), Some(dir.join("nope.exe")));
+        assert_ne!(
+            locate_exe(Some(&dir.join("nope.exe"))),
+            Some(dir.join("nope.exe"))
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn join_relative_cannot_escape_the_share_root() {
         let root = PathBuf::from("/srv/share");
-        assert_eq!(join_relative(&root, "a/b.txt"), PathBuf::from("/srv/share/a/b.txt"));
-        assert_eq!(join_relative(&root, "../../etc/passwd"), PathBuf::from("/srv/share/etc/passwd"));
+        assert_eq!(
+            join_relative(&root, "a/b.txt"),
+            PathBuf::from("/srv/share/a/b.txt")
+        );
+        assert_eq!(
+            join_relative(&root, "../../etc/passwd"),
+            PathBuf::from("/srv/share/etc/passwd")
+        );
     }
 
     /// 便携版布局的临时环境：`<dir>\BCompare.exe` + `<dir>\BCState.xml` → 配置目录就是 `<dir>`。
@@ -1437,11 +1603,18 @@ mod tests {
         let config_path = dir.join("orbdrop.toml");
         let state = crate::state::AppState::new(config, config_path);
 
-        assert_eq!(provision_profiles(&state), 0, "没有已配对设备时不该写出任何 profile");
+        assert_eq!(
+            provision_profiles(&state),
+            0,
+            "没有已配对设备时不该写出任何 profile"
+        );
         let file = dir.join(PROFILE_FILE);
         assert!(file.is_file(), "没有设备也要把骨架文件立起来");
         let skeleton = fs::read_to_string(&file).unwrap();
-        assert!(skeleton.contains("<BCProfiles"), "骨架必须是合法文件: {skeleton}");
+        assert!(
+            skeleton.contains("<BCProfiles"),
+            "骨架必须是合法文件: {skeleton}"
+        );
 
         assert_eq!(provision_profiles(&state), 0);
         assert_eq!(
@@ -1470,7 +1643,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("orbdrop_bc_bad_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(PROFILE_FILE);
-        let args = ("10.0.0.1:3890", "http://10.0.0.1:3890/dav/", DAV_USER, "tok");
+        let args = (
+            "10.0.0.1:3890",
+            "http://10.0.0.1:3890/dav/",
+            DAV_USER,
+            "tok",
+        );
 
         // ① 非 UTF-8（UTF-16 落盘的 BCProfiles.xml，带 BOM）：`read_to_string` 失败 → 放弃写入
         let mut utf16: Vec<u8> = vec![0xFF, 0xFE];
@@ -1480,12 +1658,19 @@ mod tests {
                 .flat_map(|u| u.to_le_bytes()),
         );
         fs::write(&path, &utf16).unwrap();
-        assert!(fs::read_to_string(&path).is_err(), "前提：这份文件不是合法 UTF-8");
+        assert!(
+            fs::read_to_string(&path).is_err(),
+            "前提：这份文件不是合法 UTF-8"
+        );
         assert!(
             upsert_webdav_profile(&dir, args.0, args.1, args.2, args.3).is_err(),
             "读不出来的文件必须上抛错误，而不是重建"
         );
-        assert_eq!(fs::read(&path).unwrap(), utf16, "读不出来时一个字节都不能改");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            utf16,
+            "读不出来时一个字节都不能改"
+        );
         assert_eq!(prune_webdav_profiles(&dir, &[]), 0);
         assert_eq!(fs::read(&path).unwrap(), utf16);
 
@@ -1498,7 +1683,11 @@ mod tests {
             upsert_webdav_profile(&dir, args.0, args.1, args.2, args.3).is_err(),
             "解析失败必须上抛错误，而不是重建"
         );
-        assert_eq!(fs::read_to_string(&path).unwrap(), broken, "解析失败时一个字节都不能改");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            broken,
+            "解析失败时一个字节都不能改"
+        );
         assert_eq!(prune_webdav_profiles(&dir, &[]), 0);
         assert_eq!(fs::read_to_string(&path).unwrap(), broken);
 
@@ -1576,7 +1765,10 @@ mod tests {
             Some(("s1".to_string(), String::new())),
             "共享项根自己 → 空相对路径"
         );
-        assert_eq!(share_of_path(&shares, Path::new("E:\\workshop\\a.txt")), None);
+        assert_eq!(
+            share_of_path(&shares, Path::new("E:\\workshop\\a.txt")),
+            None
+        );
         assert_eq!(share_of_path(&shares, Path::new("D:\\other")), None);
     }
 
@@ -1612,14 +1804,16 @@ mod tests {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (key, _) = hkcu.create_subkey(&path).unwrap();
 
-        key.set_value("SavedFileLeft", &"E:\\stale".to_string()).unwrap();
+        key.set_value("SavedFileLeft", &"E:\\stale".to_string())
+            .unwrap();
         write_slot_values(&key, "E:\\work\\项目A").unwrap();
         let (folder, file) = read_slot_values(&key);
         assert_eq!(folder.as_deref(), Some("E:\\work\\项目A"));
         assert_eq!(file.as_deref(), Some("E:\\work\\项目A"), "文件槽也要写");
 
         // 旧值被覆盖（不是删掉就不再写回来）、带引号的写法读进来要干净
-        key.set_value("SavedFolderLeft", &"\"E:\\quoted\"".to_string()).unwrap();
+        key.set_value("SavedFolderLeft", &"\"E:\\quoted\"".to_string())
+            .unwrap();
         let (folder, file) = read_slot_values(&key);
         assert_eq!(folder.as_deref(), Some("E:\\quoted"));
         assert_eq!(file.as_deref(), Some("E:\\work\\项目A"), "另一个槽不受影响");
@@ -1633,9 +1827,7 @@ mod tests {
     fn pick_slot_follows_the_right_clicked_kind() {
         let folder = Some("E:\\dir".to_string());
         let file = Some("E:\\dir\\a.txt".to_string());
-        let pick = |prefer| {
-            pick_slot(folder.clone(), file.clone(), prefer).map(|s| (s.arg, s.dir))
-        };
+        let pick = |prefer| pick_slot(folder.clone(), file.clone(), prefer).map(|s| (s.arg, s.dir));
         assert_eq!(
             pick(Some(ShellSlot::File)),
             Some(("E:\\dir\\a.txt".to_string(), false)),

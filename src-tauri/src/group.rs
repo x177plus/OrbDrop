@@ -5,10 +5,10 @@
 //! 再逐个判断"这条到底算哪种"；分开之后两条路各自是直的，共享的只有很短的一段
 //! （投放与状态机：`chat::deliver` 与 `chat::Delivery`）。
 //!
-//! **为什么另立一个文件**：`chat.json` 没有版本位，老版本进程读进来（serde 静默忽略不认识的
-//! 顶层键）再原样写回，就会把新增的顶层键**抹掉** —— 这件事在本仓发生过（老文件里的 `groups`
-//! 字段今天被显式忽略，见 `chat.rs` 的 `a_legacy_file_with_a_groups_key_still_loads`）。
-//! 名册与群消息丢了不可恢复，所以放 `groups.json`，让老版本碰不到。
+//! **为什么另立一个文件**：老的一对一账本没有版本位，老版本进程读进来（serde 静默忽略不
+//! 认识的顶层键）再原样写回，就会把新增的顶层键**抹掉** —— 这件事在本仓发生过（老文件里的
+//! `groups` 字段今天被显式忽略，见 `chat.rs` 的 `a_legacy_file_with_a_groups_key_still_loads`）。
+//! 名册与群消息丢了不可恢复，所以单独放 `chat-vault/groups.dat`，让老版本碰不到。
 //!
 //! **模型**（拓扑约束见 `requirements.md:25,413-415`：仅局域网、无中继服务器、两两配对无组播）：
 //! - **名册**（`Group`）是一个 LWW 寄存器：`(rev, updated_by)` 大者胜。任何成员都能改名/加减人
@@ -34,6 +34,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+use base64::Engine as _;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -42,15 +44,38 @@ use tracing::{debug, warn};
 
 use crate::chat::{now_ms, Delivery, Outcome};
 use crate::config::{data_dir, write_atomic};
+use crate::envelope;
 use crate::state::AppState;
 use crate::ws::events::{ui, PeerInfo, WsEvent};
 
 /// 每个群最多留多少条（与一对一的 `chat::MAX_PER_PEER` 同一个取舍：砍最够不着的那一头）。
 const MAX_PER_GROUP: usize = 500;
 
+/// 一个群本地消息窗口的字节上限（序列化后的近似值）。500 条文本也可能很大，
+/// 只按条数裁不够；达到这个值就从最老开始裁。
+const MAX_GROUP_BYTES: usize = 1024 * 1024;
+
+/// 单条群文本上限。图片走 blob，另有 `blobs::MAX_IMAGE_BYTES`。
+pub const MAX_TEXT_BYTES: usize = 16 * 1024;
+
+/// 本机最多同时加入多少个群（待处理邀请另有 `MAX_PENDING`，不占这个数）。
+/// 手机存储更紧，单独设低一档。
+#[cfg(mobile)]
+pub const MAX_GROUPS: usize = 32;
+#[cfg(not(mobile))]
+pub const MAX_GROUPS: usize = 64;
+
 /// 一个群最多几个人。**不是随手定的**：发送是"每台各一份"（无组播），名册变更同理 ——
 /// 每加一个人就多一份投递、多一份失败面。
 const MAX_MEMBERS: usize = 32;
+
+/// 投递状态压缩用的**历史成员索引**上限。
+///
+/// `member_order` 只追加（删人不能重排，否则老消息的索引会错位），但名册可以被成员反复
+/// 改：没有上限的话，一个恶意成员每次塞 31 个新 id 就能让索引表无限长，所有消息的位图
+/// 跟着变大（`groups.dat` 的写放大）。到上限后不再追加；涉及未入索引的 id 的消息退回
+/// 未压缩的 map，宁可少省几字节，也不丢状态。
+const MAX_MEMBER_ORDER: usize = 256;
 
 /// 最多同时挂几张邀请卡（别人狂建群不该把界面撑爆）。
 const MAX_PENDING: usize = 32;
@@ -85,9 +110,22 @@ const SYNC_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3);
 /// 跳数则是最后那道闸。
 pub const MAX_HOPS: u8 = 3;
 
-/// `groups.json` 的形状版本：以后加字段/换语义时用它区分（`chat.json` 没这一栏，才吃着
+/// `groups.dat` 的形状版本：以后加字段/换语义时用它区分（一对一账本没这一栏，才吃着
 /// 老版本抹字段的亏）。
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 4;
+
+/// 入站补拉请求的时间窗：签名里的 `ts` 与本机墙钟相差超过它就算过期。
+///
+/// 取 2 分钟：大于一次正常往返，又短到重放窗口有限。设备之间时钟偏差比这还大时，
+/// 表现为"补拉一直 403"，设备行仍能正常收发消息 —— 这是故意选择的安全默认。
+pub const SYNC_PROOF_SKEW_MS: u64 = 120_000;
+
+/// 收到过的 `(发送方, ask_id)` 保留多久（防重放）。比时间窗长，覆盖整个可重放区间。
+const INCOMING_ASK_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 重放缓存的上限：未认证来源进不来（只在验签通过后写入），仍然设个硬顶，
+/// 防止一个成员用大量不同 `ask_id` 把内存拉大。
+const MAX_INCOMING_ASKS: usize = 4096;
 
 /// 名册里的一行。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +134,13 @@ pub struct Member {
     pub id: String,
     #[serde(default)]
     pub name: String,
+    /// 群签名公钥（Ed25519，base64）。空 = 老记录/还没绑定。
+    ///
+    /// **这一格只是共享名册里的提示，不是验签依据**：名册是 LWW 共享物，任何成员都能改；
+    /// 验签只认本机的 `GroupFile::bound` / `attested`。成员本人第一次直发签名消息或
+    /// 自签名册时绑定；别人代发的名册改不动它。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pubkey: String,
 }
 
 /// 一个群的名册（本机视角的唯一真相）。
@@ -136,6 +181,20 @@ pub struct Group {
     /// 老文件没有这一栏 → 空表（那时也没人记过这件事）。
     #[serde(default)]
     pub declined: Vec<String>,
+    /// 名册纪元：成员被移除时 +1。消息/名册签名都带它；老记录默认 1。
+    #[serde(default = "default_epoch")]
+    pub epoch: u64,
+    /// 本机最后一次看到/签出的名册签名（base64）。
+    #[serde(default)]
+    pub sig: String,
+    /// 这个群是否已经进入“要求签名”模式：新建群、或第一次见到带签名的名册/
+    /// 消息后置 true。老群在升级前保持 false，避免旧消息全部失效。
+    #[serde(default)]
+    pub require_sig: bool,
+    /// 成员索引的**稳定顺序**（只追加，不删除/重排）：投递状态按它压缩成字节数组。
+    /// 老文件没有这一栏 → 首次加载时从 `members` 初始化。
+    #[serde(default)]
+    pub member_order: Vec<String>,
 }
 
 impl Group {
@@ -150,7 +209,57 @@ impl Group {
 
     /// 除了 `except` 之外的成员 id（投递目标）。
     fn others(&self, except: &str) -> Vec<String> {
-        self.members.iter().filter(|m| m.id != except).map(|m| m.id.clone()).collect()
+        self.members
+            .iter()
+            .filter(|m| m.id != except)
+            .map(|m| m.id.clone())
+            .collect()
+    }
+
+    /// 成员索引只追加：投递状态压缩成字节数组时，老消息的索引不会因为名册增删而错位。
+    fn ensure_member_order(&mut self) {
+        for m in &self.members {
+            if self.member_order.len() >= MAX_MEMBER_ORDER {
+                break;
+            }
+            if !self.member_order.iter().any(|id| id == &m.id) {
+                self.member_order.push(m.id.clone());
+            }
+        }
+    }
+
+    fn member_pubkey(&self, id: &str) -> Option<&str> {
+        self.members
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.pubkey.as_str())
+            .filter(|p| !p.is_empty())
+    }
+
+    /// 用本机群身份签当前名册。失败（钥匙读不出来）时保持未签名，调用方决定是否拒绝。
+    fn sign_roster(&mut self) -> bool {
+        // 签名者那一格必须是**本机当前的群身份公钥**：共享名册可能被别的成员改写成
+        // 空/旧钥，照着它签会让接收方验不过。本人签名的名册顺便把这格修回来。
+        if let Some(me) = self.members.iter_mut().find(|m| m.id == self.updated_by) {
+            if let Ok(key) = crate::group_identity::public_key_b64() {
+                if !key.is_empty() {
+                    me.pubkey = key;
+                }
+            }
+        }
+        let mut roster = self.payload();
+        roster.sig.clear();
+        match crate::group_identity::sign_b64(&roster_signing_bytes(&roster)) {
+            Ok(sig) => {
+                self.sig = sig;
+                self.require_sig = true;
+                true
+            }
+            Err(e) => {
+                warn!(group = %self.id, %e, "名册签名失败，保持未签名");
+                false
+            }
+        }
     }
 
     /// 名册的线上/落盘形状。
@@ -161,11 +270,9 @@ impl Group {
             rev: self.rev,
             updated_by: self.updated_by.clone(),
             updated_at: self.updated_at,
-            members: self
-                .members
-                .iter()
-                .map(|m| PeerInfo { id: m.id.clone(), name: m.name.clone() })
-                .collect(),
+            members: self.members.clone(),
+            epoch: self.epoch,
+            sig: self.sig.clone(),
         }
     }
 }
@@ -187,8 +294,18 @@ pub struct GroupMsg {
     #[serde(default)]
     pub seq: u64,
     /// **仅本机发出的消息有意义**：成员 id → 这一份的投递状态。收来的消息是空的。
+    ///
+    /// 运行时/界面用这张 map；`groups.dat` 里另有压缩形状（见 `delivery_packed`）。
     #[serde(default)]
     pub delivery: HashMap<String, Delivery>,
+    /// `delivery` 的落盘压缩形状：按 `Group.member_order` 的索引，每个成员 4 bit
+    /// （0 = 这条消息不投给它，1..7 = `Delivery` 的固定编码），base64。
+    ///
+    /// 只在读写文件时使用；内存里始终以 `delivery` map 为准。单独放一个字段而不是改
+    /// `delivery` 的类型，是为了让旧版本读到新文件时仍然能解析（旧版本忽略这个字段、
+    /// 看到空 map；消息不丢，只是投递状态显示退化）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub delivery_packed: String,
     /// 这条是不是**图片消息**（图片是消息内容，不是文件 —— 与一对一那条路同一套语义，
     /// 见 `crate::blobs`）。老文件里没有这个键 = 文字消息。
     #[serde(default)]
@@ -199,6 +316,15 @@ pub struct GroupMsg {
     /// 图片消息的字节数（界面上写"多大"）。
     #[serde(default)]
     pub size: u64,
+    /// 作者在发这条消息时的名册纪元。
+    #[serde(default)]
+    pub epoch: u64,
+    /// 作者的群签名公钥（base64）。空 = 老消息/未签名。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pubkey: String,
+    /// 作者签名（base64）。空 = 老消息/未签名。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sig: String,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -227,6 +353,10 @@ struct GroupConvo {
     /// 要不到的名字），变成一条持续的后台流量。
     #[serde(default)]
     pruned_below: HashMap<String, u64>,
+    /// 用户最后一次“清空聊天记录”的时刻。补拉从这之后开始，避免把清掉的历史又拉回来；
+    /// 名册/成员关系/签名链头都不受影响，新消息照常收。
+    #[serde(default)]
+    cleared_at: u64,
 }
 
 /// 补拉闸门（内存，重启即忘）：同一（群，设备）的节奏与轮数。
@@ -241,6 +371,17 @@ struct SyncGate {
     /// F-99 承诺的"必然收敛"静默失效。现在只有追批占额度，普通一问把它重置。
     chase_rounds: u32,
 }
+
+/// 本机发出、还没被回答的补拉请求。回答必须带回同一个 `ask_id`，并且来自被问的那台
+/// 成员设备 —— 否则任何知道群 id 的局域网主机都能伪造 `GroupSyncPost` 往里灌消息。
+struct PendingAsk {
+    group_id: String,
+    peer_id: String,
+    at: std::time::Instant,
+}
+
+/// 补拉请求的有效期：比一次正常往返宽得多，但不会让 `asks` 无限增长。
+const ASK_TTL: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// 收到但**还没被用户确认**的群邀请。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,12 +414,17 @@ pub struct PendingInvite {
     updated_by: String,
     #[serde(default)]
     updated_at: u64,
+    /// 名册纪元与签名（加入时原样成为本地名册的一部分）。
+    #[serde(default = "default_epoch")]
+    epoch: u64,
+    #[serde(default)]
+    sig: String,
 }
 
 /// 邀请卡**给界面**的那份形状。
 ///
 /// 与落盘那份（`PendingInvite`）唯一的不同是多一个 `buffered`，而它只能活在这里：攒着几条
-/// 是"此刻"从 `orphans` 里数出来的事实，存进 `groups.json` 只会是一个过期的数（新消息进来
+/// 是"此刻"从 `orphans` 里数出来的事实，存进 `groups.dat` 只会是一个过期的数（新消息进来
 /// 时没人去改它）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -313,7 +459,17 @@ pub struct RosterPayload {
     #[serde(default)]
     pub updated_at: u64,
     #[serde(default)]
-    pub members: Vec<PeerInfo>,
+    pub members: Vec<Member>,
+    /// 名册纪元（成员移除时 +1）。
+    #[serde(default = "default_epoch")]
+    pub epoch: u64,
+    /// 名册签名（Ed25519 base64），覆盖除 `sig` 之外的全部字段。
+    #[serde(default)]
+    pub sig: String,
+}
+
+fn default_epoch() -> u64 {
+    1
 }
 
 /// 补拉：某个发送方身上"我**明确知道**缺了哪几条"（`seq` 号点名）。
@@ -352,6 +508,12 @@ pub struct GroupMsgWire {
     pub size: u64,
     #[serde(default)]
     pub data: String,
+    #[serde(default)]
+    pub epoch: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pubkey: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sig: String,
 }
 
 /// 名册吃进来之后发生了什么（命令与测试都看它）。
@@ -386,12 +548,45 @@ struct GroupFile {
     /// 截断之后 `max(seq)` 就比真实的小了，接着用会发出重复的号。
     #[serde(default)]
     my_seq: HashMap<String, u64>,
+    /// 已经**由配对身份认证过**的成员公钥：群 id → 成员 id → 公钥。
+    ///
+    /// 与 `Member.pubkey` 分开：后者是共享名册里的提示，名册是 LWW 共享物、任何成员都能改；
+    /// 这一格才是**本机对身份的认定**。只有在对端**已配对**（token 反解出的身份）的请求里
+    /// 绑上/确认过的公钥才进这张表；换钥冲突的强判定也用它。
+    ///
+    /// 不放进名册：写进名册会跟着签名/版本走，还会被其他成员的旧名册覆盖。
+    #[serde(default)]
+    attested: HashMap<String, HashMap<String, String>>,
+    /// 本机**TOFU 绑定**的成员公钥：群 id → 成员 id → 公钥。
+    ///
+    /// 只由"成员本人"的动作写入：本人直发的签名消息、本人签名的名册、自己的密钥绑定。
+    /// **共享名册里的 `Member.pubkey` 不能覆盖它** —— 否则任一成员发一份 rev 更大的名册
+    /// 就能把别人的钥换成自己的，再冒名发言。验签优先级：`attested` → `bound`，两者都没有
+    /// 就按"还没绑定"处理（不再回落到共享名册）。
+    #[serde(default)]
+    bound: HashMap<String, HashMap<String, String>>,
+}
+
+impl GroupFile {
+    /// 本机认定的成员公钥：配对认证过的优先，其次本人 TOFU 绑定的。
+    ///
+    /// **刻意不看 `Member.pubkey`**：那一格来自共享名册，任何成员都能改写；拿它当验签依据
+    /// 就等于把群身份交给最后一个写名册的人。
+    fn local_key(&self, group_id: &str, member_id: &str) -> Option<String> {
+        if let Some(key) = self.attested.get(group_id).and_then(|m| m.get(member_id)) {
+            return Some(key.clone());
+        }
+        self.bound
+            .get(group_id)
+            .and_then(|m| m.get(member_id))
+            .cloned()
+    }
 }
 
 pub struct GroupStore {
     path: PathBuf,
     /// 图片消息的**内容**目录（见 `crate::blobs`）：与一对一那份**同一个目录**
-    /// （`<数据目录>/chat-blobs`）—— 两边的消息 id 都是 uuid，内容文件按 id 认人，
+    /// （`<数据目录>/chat-vault/blobs`）—— 两边的消息 id 都是 uuid，内容文件按 id 认人，
     /// 分开放只会让"谁引用着它"多一份账（启动扫孤儿要把两边合起来看）。
     blobs_root: PathBuf,
     inner: Mutex<GroupFile>,
@@ -402,27 +597,133 @@ pub struct GroupStore {
     told: Mutex<HashMap<(String, String), u64>>,
     /// `(群, 设备)` → 补拉的节奏（内存）。
     sync: Mutex<HashMap<(String, String), SyncGate>>,
+    /// 本机发出的补拉请求：`ask_id` → 被问的群/设备。回答必须对得上才收。
+    asks: Mutex<HashMap<String, PendingAsk>>,
+    /// 收到过的 `(发送方, ask_id)`：验签通过后写入，防止同一枚签名 ask 被重放。
+    seen_asks: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl GroupStore {
     pub fn new() -> Self {
-        Self::with_path(data_dir().join("groups.json"))
+        let root = data_dir();
+        Self::with_blobs(envelope::groups_path(&root), envelope::blobs_dir(&root))
     }
 
     /// 指定文件的构造（单测用：不碰真实数据目录）。
     pub fn with_path(path: PathBuf) -> Self {
-        let inner = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<GroupFile>(&s).ok())
-            .unwrap_or_default();
         let blobs_root = crate::blobs::root_of(&path);
+        Self::with_blobs(path, blobs_root)
+    }
+
+    /// 指定账本文件与图片目录的构造（迁移回退时两者可能不在同一个目录）。
+    pub fn with_blobs(path: PathBuf, blobs_root: PathBuf) -> Self {
+        let mut inner = match std::fs::read(&path) {
+            Ok(raw) => {
+                let decoded = match envelope::decode_if(&raw) {
+                    Ok(Some((_, bytes))) => Some(bytes),
+                    // 老版本的明文：迁移还没跑到/回退时仍要能读。
+                    Ok(None) => Some(raw),
+                    Err(e) => {
+                        // 同 `ChatStore`：先备份损坏文件，再从空库启动，绝不静默覆盖。
+                        match envelope::backup_bad(&path, &raw) {
+                            Some(backup) => warn!("群记录损坏（{e}）：已备份到 {backup:?}"),
+                            None => warn!(
+                                "群记录损坏（{e}），且无法备份 {:?}：本次从空库启动，但不会主动覆盖原文件",
+                                path
+                            ),
+                        }
+                        None
+                    }
+                };
+                match decoded {
+                    Some(bytes) => match serde_json::from_slice::<GroupFile>(&bytes) {
+                        Ok(file) => file,
+                        Err(e) => {
+                            match envelope::backup_bad(&path, &bytes) {
+                                Some(backup) => warn!("群记录损坏（{e}）：已备份到 {backup:?}"),
+                                None => warn!(
+                                    "群记录损坏（{e}），且无法备份 {:?}：本次从空库启动，但不会主动覆盖原文件",
+                                    path
+                                ),
+                            }
+                            GroupFile::default()
+                        }
+                    },
+                    None => GroupFile::default(),
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => GroupFile::default(),
+            Err(e) => {
+                warn!("群记录读取失败（{e}）：本次从空库启动");
+                GroupFile::default()
+            }
+        };
+        repair_delivery_tables(&mut inner);
         Self {
             path,
             blobs_root,
             inner: Mutex::new(inner),
             told: Mutex::new(HashMap::new()),
             sync: Mutex::new(HashMap::new()),
+            asks: Mutex::new(HashMap::new()),
+            seen_asks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 启动时收紧 `read_by`：只留当前名册成员，并把水位夹到本机实际发出过的最大 `at`。
+    ///
+    /// 旧版本没有成员闸门，`groups.dat` 里可能已经躺着被伪造回执塞进来的幽灵 id 或
+    /// `u64::MAX`；只在写入路径上收紧不够 —— `u64::MAX` 会让此后每条新消息继续算「已读」，
+    /// 而水位只增不减，事后没有别的纠正点。这里在加载后洗一次，脏值立刻回落。
+    pub fn sanitize_read_by(&self, own_id: &str) -> bool {
+        let mut guard = self.inner.lock();
+        let groups: Vec<(String, bool, Vec<String>)> = guard
+            .groups
+            .iter()
+            .map(|g| {
+                (
+                    g.id.clone(),
+                    g.left,
+                    g.members.iter().map(|m| m.id.clone()).collect(),
+                )
+            })
+            .collect();
+        let mut changed = false;
+        for (gid, left, members) in groups {
+            let Some(convo) = guard.convos.get_mut(&gid) else {
+                continue;
+            };
+            // 本机已经不在这个群：这一格以后没有任何读者，直接清掉。
+            if left {
+                if !convo.read_by.is_empty() {
+                    convo.read_by.clear();
+                    changed = true;
+                }
+                continue;
+            }
+            let max_own = convo
+                .messages
+                .iter()
+                .filter(|m| m.from == own_id)
+                .map(|m| m.at)
+                .max()
+                .unwrap_or(0);
+            convo.read_by.retain(|id, at| {
+                if *at > max_own {
+                    *at = max_own;
+                    changed = true;
+                }
+                let keep = *at > 0 && id != own_id && members.iter().any(|m| m == id);
+                if !keep {
+                    changed = true;
+                }
+                keep
+            });
+        }
+        if changed {
+            persist(&self.path, &mut guard);
+        }
+        changed
     }
 
     /// 图片消息的内容目录（与 `ChatStore` 那个是同一个：见上面那段说明）。
@@ -490,16 +791,24 @@ impl GroupStore {
 
     /// 名册（`None` = 没有这个群）。
     pub fn group(&self, group_id: &str) -> Option<Group> {
-        self.inner.lock().groups.iter().find(|g| g.id == group_id).cloned()
+        self.inner
+            .lock()
+            .groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .cloned()
     }
 
     pub fn is_member(&self, group_id: &str, peer_id: &str) -> bool {
-        self.group(group_id).is_some_and(|g| !g.left && g.is_member(peer_id))
+        self.group(group_id)
+            .is_some_and(|g| !g.left && g.is_member(peer_id))
     }
 
     /// 这个群的成员设备 id（含本机）。
     pub fn members(&self, group_id: &str) -> Vec<String> {
-        self.group(group_id).map(|g| g.members.iter().map(|m| m.id.clone()).collect()).unwrap_or_default()
+        self.group(group_id)
+            .map(|g| g.members.iter().map(|m| m.id.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// 界面上那份群视图（`None` = 不在列表里）。
@@ -509,7 +818,12 @@ impl GroupStore {
         if g.left {
             return None;
         }
-        Some(view_of(g, guard.convos.get(group_id), own_id, &self.blobs_root))
+        Some(view_of(
+            g,
+            guard.convos.get(group_id),
+            own_id,
+            &self.blobs_root,
+        ))
     }
 
     /// 本机在这个群里下一条要用的 `seq`（1 起，只增）。
@@ -524,17 +838,20 @@ impl GroupStore {
     pub fn has_queued(&self, group_id: &str) -> bool {
         let guard = self.inner.lock();
         guard.convos.get(group_id).is_some_and(|c| {
-            c.messages.iter().any(|m| m.delivery.values().any(|d| *d == Delivery::Queued))
+            c.messages
+                .iter()
+                .any(|m| m.delivery.values().any(|d| *d == Delivery::Queued))
         })
     }
 
     /// 这台设备在这个群里还有没有排队等它的消息（补发循环的判据）。
     pub fn has_backlog_for(&self, peer_id: &str) -> bool {
         let guard = self.inner.lock();
-        guard
-            .convos
-            .values()
-            .any(|c| c.messages.iter().any(|m| m.delivery.get(peer_id) == Some(&Delivery::Queued)))
+        guard.convos.values().any(|c| {
+            c.messages
+                .iter()
+                .any(|m| m.delivery.get(peer_id) == Some(&Delivery::Queued))
+        })
     }
 
     /// 某一条的某一份此刻是不是还排着队（补发那一步用它确认"账真的落了"）。
@@ -571,8 +888,14 @@ impl GroupStore {
     pub fn next_queued_for(&self, peer_id: &str) -> Option<(String, GroupMsg)> {
         let guard = self.inner.lock();
         for g in &guard.groups {
-            let Some(convo) = guard.convos.get(&g.id) else { continue };
-            if let Some(m) = convo.messages.iter().find(|m| m.delivery.get(peer_id) == Some(&Delivery::Queued)) {
+            let Some(convo) = guard.convos.get(&g.id) else {
+                continue;
+            };
+            if let Some(m) = convo
+                .messages
+                .iter()
+                .find(|m| m.delivery.get(peer_id) == Some(&Delivery::Queued))
+            {
                 return Some((g.id.clone(), m.clone()));
             }
         }
@@ -581,7 +904,9 @@ impl GroupStore {
 
     /// 名册还没告诉过这台设备（版本对不上、或从没说过）→ 发消息前先补一条名册。
     pub fn needs_roster(&self, group_id: &str, peer_id: &str) -> bool {
-        let Some(rev) = self.group(group_id).map(|g| g.rev) else { return false };
+        let Some(rev) = self.group(group_id).map(|g| g.rev) else {
+            return false;
+        };
         self.told
             .lock()
             .get(&(group_id.to_string(), peer_id.to_string()))
@@ -641,9 +966,20 @@ impl GroupStore {
             .map(|g| g.id.clone())
     }
 
+    /// 当前已加入（未退出）的群数量。
+    pub fn group_count(&self) -> usize {
+        self.inner.lock().groups.iter().filter(|g| !g.left).count()
+    }
+
     /// 本机建群：名册含本机，`rev = 1`。返回群 id；**名单一样的群已经存在就复用那个 id**
     ///（见 `find_by_members` 的注释）。
     pub fn create(&self, own: Member, others: Vec<Member>, name: &str) -> String {
+        let mut own = own;
+        if own.pubkey.is_empty() {
+            own.pubkey = crate::group_identity::public_key_b64().unwrap_or_default();
+        }
+        let own_id = own.id.clone();
+        let own_key = own.pubkey.clone();
         let mut members = vec![own.clone()];
         normalize_members(&mut members, others);
         // **同一批人只该有一个群**：名单一样就复用现有的那个（不新建、也不改名 —— 改名是
@@ -652,10 +988,13 @@ impl GroupStore {
         if let Some(existing) = self.find_by_members(&members) {
             return existing;
         }
+        if self.group_count() >= MAX_GROUPS {
+            return String::new();
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_ms();
         let mut guard = self.inner.lock();
-        guard.groups.push(Group {
+        let mut group = Group {
             id: id.clone(),
             name: name.trim().to_string(),
             rev: 1,
@@ -663,10 +1002,24 @@ impl GroupStore {
             created_at: now,
             updated_by: own.id,
             updated_at: now,
-            members,
+            members: members.clone(),
             left: false,
             declined: Vec::new(),
-        });
+            epoch: 1,
+            sig: String::new(),
+            require_sig: false,
+            member_order: members.iter().map(|m| m.id.clone()).collect(),
+        };
+        group.ensure_member_order();
+        group.sign_roster();
+        guard.groups.push(group);
+        if !own_key.is_empty() {
+            guard
+                .bound
+                .entry(id.clone())
+                .or_default()
+                .insert(own_id, own_key);
+        }
         guard.convos.entry(id.clone()).or_default();
         guard.my_seq.entry(id.clone()).or_insert(1);
         persist(&self.path, &mut guard);
@@ -674,32 +1027,86 @@ impl GroupStore {
     }
 
     /// 本机改名/加减人：`rev + 1`（D5：任何成员都能改，冲突 LWW）。返回改后的名册。
-    pub fn edit_local(&self, group_id: &str, own_id: &str, name: &str, others: Vec<Member>) -> Option<Group> {
+    pub fn edit_local(
+        &self,
+        group_id: &str,
+        own_id: &str,
+        name: &str,
+        others: Vec<Member>,
+    ) -> Option<Group> {
         let mut guard = self.inner.lock();
         let now = now_ms();
-        let own_name = guard
-            .groups
+        let existing = guard.groups.iter().find(|g| g.id == group_id)?.clone();
+        let own_existing = existing.members.iter().find(|m| m.id == own_id);
+        let mut own_pubkey = own_existing.map(|m| m.pubkey.clone()).unwrap_or_default();
+        if own_pubkey.is_empty() {
+            own_pubkey = crate::group_identity::public_key_b64().unwrap_or_default();
+        }
+        let mut members = vec![Member {
+            id: own_id.to_string(),
+            name: own_existing.map(|m| m.name.clone()).unwrap_or_default(),
+            pubkey: own_pubkey,
+        }];
+        for o in others {
+            if o.id.is_empty() || members.iter().any(|m| m.id == o.id) {
+                continue;
+            }
+            let old = existing.members.iter().find(|m| m.id == o.id);
+            members.push(Member {
+                id: o.id.clone(),
+                name: if o.name.is_empty() {
+                    old.map(|m| m.name.clone()).unwrap_or_default()
+                } else {
+                    o.name
+                },
+                pubkey: old.map(|m| m.pubkey.clone()).unwrap_or_default(),
+            });
+            if members.len() >= MAX_MEMBERS {
+                break;
+            }
+        }
+        let removed = existing
+            .members
             .iter()
-            .find(|g| g.id == group_id)
-            .and_then(|g| g.members.iter().find(|m| m.id == own_id).map(|m| m.name.clone()))
-            .unwrap_or_default();
-        let mut members = vec![Member { id: own_id.to_string(), name: own_name }];
-        normalize_members(&mut members, others);
+            .any(|m| !members.iter().any(|x| x.id == m.id));
         let out = {
             let group = guard.groups.iter_mut().find(|g| g.id == group_id)?;
             group.name = name.trim().to_string();
             group.rev += 1;
+            if removed {
+                group.epoch += 1;
+            }
             group.updated_by = own_id.to_string();
             group.updated_at = now;
             group.members = members;
+            group.ensure_member_order();
             // "拒绝过"只对**还在名册里**的人有意义：名单里没有它了，那一格就跟着作废
             //（重新加回来 = 一次新的邀请，得重新看它答不答）。
-            group.declined.retain(|id| group.members.iter().any(|m| &m.id == id));
+            group
+                .declined
+                .retain(|id| group.members.iter().any(|m| &m.id == id));
             // 名册里又有本机了 → 之前"被移出"的标记作废（被重新拉回来了）。
             group.left = false;
+            group.sign_roster();
             group.clone()
         };
+        if let Some(convo) = guard.convos.get_mut(group_id) {
+            prune_read_by(convo, &out);
+        }
         guard.convos.entry(group_id.to_string()).or_default();
+        if let Some(key) = out
+            .members
+            .iter()
+            .find(|m| m.id == own_id)
+            .map(|m| m.pubkey.clone())
+            .filter(|k| !k.is_empty())
+        {
+            guard
+                .bound
+                .entry(group_id.to_string())
+                .or_default()
+                .insert(own_id.to_string(), key);
+        }
         persist(&self.path, &mut guard);
         Some(out)
     }
@@ -715,12 +1122,16 @@ impl GroupStore {
             }
             group.members.retain(|m| m.id != own_id);
             group.rev += 1;
+            group.epoch += 1;
             group.updated_by = own_id.to_string();
             group.updated_at = now;
+            group.sign_roster();
             group.clone()
         };
         // 本地删干净：用户按下的是「退出会话（本地删除并广播离开）」—— 会话该没了。
         guard.groups.retain(|g| g.id != group_id);
+        guard.bound.remove(group_id);
+        guard.attested.remove(group_id);
         let gone = guard.convos.remove(group_id).unwrap_or_default();
         guard.my_seq.remove(group_id);
         guard.pending.retain(|p| p.group_id != group_id);
@@ -732,15 +1143,210 @@ impl GroupStore {
         Some(out)
     }
 
+    /// 第一次收到某成员签名的消息/名册时，把它的公钥绑定进本地表，并顺手把名册里那一格
+    /// 修正成本地认定的钥（名册那一格只用于兼容/展示）。
+    ///
+    /// `trusted` = 这条绑定来自**已配对身份**（token 反解出的 peer_id）的直发请求。
+    /// 只有 trusted 的绑定才进 `attested`；普通直发自绑进 `bound`（TOFU）。
+    ///
+    /// 冲突判定只看**本机**的 `attested` / `bound`，不看共享名册里的 `Member.pubkey`：
+    /// - 本地没有绑定 → 接受本次这把钥（TOFU）；
+    /// - 本地绑定的钥与本次一致 → 顺手修复名册那格；trusted 时升级成 attested；
+    /// - 本地绑定的钥不一致：
+    ///   - 已有 attested → 拒绝（真正的换钥冲突）；
+    ///   - 只有 bound 且本次 trusted → 替换（这是"被冒名者抢先 TOFU 绑钥"的恢复路径）。
+    pub fn bind_member_key(
+        &self,
+        group_id: &str,
+        own_id: &str,
+        member_id: &str,
+        pubkey: &str,
+        trusted: bool,
+    ) -> Option<Group> {
+        if pubkey.is_empty() {
+            return None;
+        }
+        let mut guard = self.inner.lock();
+        let now = now_ms();
+        let existing_attested = guard
+            .attested
+            .get(group_id)
+            .and_then(|m| m.get(member_id))
+            .cloned();
+        let existing_bound = guard
+            .bound
+            .get(group_id)
+            .and_then(|m| m.get(member_id))
+            .cloned();
+        let known = existing_attested.clone().or(existing_bound.clone());
+        let mut newly_attested = false;
+        let mut newly_bound = false;
+        let out = {
+            let group = guard.groups.iter_mut().find(|g| g.id == group_id)?;
+            let member = group.members.iter_mut().find(|m| m.id == member_id)?;
+            let known_matches = known.as_deref() == Some(pubkey);
+            let can_replace = existing_attested.is_none() && trusted;
+
+            if !known_matches && known.is_some() && !can_replace {
+                warn!(
+                    group = %group_id, member = %member_id,
+                    "成员公钥绑定被拒：与本地绑定的钥匙不一致"
+                );
+                None
+            } else {
+                if known.is_some() && !known_matches {
+                    warn!(
+                        group = %group_id, member = %member_id,
+                        old = %crate::group_identity::short_key(known.as_deref().unwrap_or_default()),
+                        new = %crate::group_identity::short_key(pubkey),
+                        "成员公钥换钥：旧钥未经配对认证，按已配对身份替换"
+                    );
+                }
+                // 名册那一格跟着本地认定走：本地空/被别的成员改过时，用本次这把钥修正。
+                let roster_changed = member.pubkey != pubkey;
+                if roster_changed {
+                    member.pubkey = pubkey.to_string();
+                    group.rev += 1;
+                    group.updated_by = own_id.to_string();
+                    group.updated_at = now;
+                    group.require_sig = true;
+                    group.ensure_member_order();
+                    group.sign_roster();
+                }
+                newly_bound = existing_bound.as_deref() != Some(pubkey);
+                newly_attested = trusted && existing_attested.as_deref() != Some(pubkey);
+                if roster_changed || newly_attested {
+                    Some(group.clone())
+                } else {
+                    None
+                }
+            }
+        };
+        if newly_bound {
+            guard
+                .bound
+                .entry(group_id.to_string())
+                .or_default()
+                .insert(member_id.to_string(), pubkey.to_string());
+        }
+        if newly_attested {
+            guard
+                .attested
+                .entry(group_id.to_string())
+                .or_default()
+                .insert(member_id.to_string(), pubkey.to_string());
+        }
+        if out.is_some() || newly_bound || newly_attested {
+            persist(&self.path, &mut guard);
+        }
+        out
+    }
+
+    /// 这个成员的公钥有没有被**配对身份**认证过（见 `GroupFile::attested`）。
+    pub fn attested_key(&self, group_id: &str, member_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .attested
+            .get(group_id)
+            .and_then(|m| m.get(member_id))
+            .cloned()
+    }
+
+    /// 共享名册里这个成员那一格公钥（**只是提示，不是验签依据**）。
+    /// 给兼容/显示用；验签请用 [`GroupStore::effective_member_key`]。
+    pub fn member_pubkey(&self, group_id: &str, member_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .and_then(|g| g.member_pubkey(member_id))
+            .map(str::to_string)
+    }
+
+    /// 认证/验签实际使用的公钥：本机 `attested` → `bound`；两者都没有 = 还没绑定。
+    ///
+    /// **刻意不回落到共享名册里的 `Member.pubkey`**：名册是 LWW 共享物，任何成员都能改；
+    /// 一旦回落到那一格，任一成员就能把别人的钥换成自己的，再冒名发言/拉历史。名册里的
+    /// 那一格只用于兼容与显示，成员本人直发/自签名册才会把它写进本地 `bound`。
+    pub fn effective_member_key(&self, group_id: &str, member_id: &str) -> Option<String> {
+        let guard = self.inner.lock();
+        guard.local_key(group_id, member_id)
+    }
+
+    /// 本机是否已经"见过"这个群每个成员的钥：本机绑定（`attested`/`bound`）或共享
+    /// 名册里已经写着非空 `pubkey`。
+    ///
+    /// 只用于决定"要不要强制签名"（`on_group_text` 的 `all_bound`）：共享名册里的钥
+    /// **不能**用于验签，但把它算作"已知"只会让本机更严格（要求签名），不会让冒名更容易。
+    pub fn all_member_keys_known(&self, group_id: &str) -> bool {
+        let guard = self.inner.lock();
+        let Some(g) = guard.groups.iter().find(|g| g.id == group_id) else {
+            return false;
+        };
+        !g.members.is_empty()
+            && g.members
+                .iter()
+                .all(|m| !m.pubkey.is_empty() || guard.local_key(group_id, &m.id).is_some())
+    }
+
+    /// 记一枚收到的 `(发送方, ask_id)`；返回 `false` = 这枚已经见过（重放）。
+    ///
+    /// **只在签名验证通过后调用**：未认证来源不能把缓存撑大。缓存满时按最早的一条淘汰。
+    pub fn note_incoming_ask(&self, peer_id: &str, ask_id: &str) -> bool {
+        let mut map = self.seen_asks.lock();
+        let now = std::time::Instant::now();
+        map.retain(|_, at| now.duration_since(*at) < INCOMING_ASK_TTL);
+        let key = format!("{peer_id}\u{0}{ask_id}");
+        if map.contains_key(&key) {
+            return false;
+        }
+        if map.len() >= MAX_INCOMING_ASKS {
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(key, now);
+        true
+    }
+
     /// 名册进来了（建群邀请 / 成员变更）。**日志与界面都看它返回什么。**
-    pub fn apply_roster(&self, own_id: &str, roster: &RosterPayload, from: &PeerInfo) -> RosterOutcome {
+    ///
+    /// 这是兼容入口：调用方不知道发送方是否已配对。生产路径用
+    /// [`GroupStore::apply_roster_with_trust`] 把"已配对身份"传进来，才能认证成员公钥。
+    pub fn apply_roster(
+        &self,
+        own_id: &str,
+        roster: &RosterPayload,
+        from: &PeerInfo,
+    ) -> RosterOutcome {
+        self.apply_roster_with_trust(own_id, roster, from, false)
+    }
+
+    /// `sender_trusted` = 这份名册来自**已配对身份**（token 反解出的 peer_id）。
+    /// 只有此时、且名册是更新者本人签的，才把更新者的公钥记进 `attested`。
+    pub fn apply_roster_with_trust(
+        &self,
+        own_id: &str,
+        roster: &RosterPayload,
+        from: &PeerInfo,
+        sender_trusted: bool,
+    ) -> RosterOutcome {
         let mut members: Vec<Member> = Vec::new();
         members.extend(
             roster
                 .members
                 .iter()
                 .filter(|m| !m.id.is_empty())
-                .map(|m| Member { id: m.id.clone(), name: m.name.clone() }),
+                .map(|m| Member {
+                    id: m.id.clone(),
+                    name: m.name.clone(),
+                    pubkey: m.pubkey.clone(),
+                }),
         );
         let mut unique: Vec<Member> = Vec::new();
         for m in members {
@@ -749,20 +1355,132 @@ impl GroupStore {
             }
         }
         unique.truncate(MAX_MEMBERS);
+        let incoming_key = unique
+            .iter()
+            .find(|m| m.id == roster.updated_by)
+            .map(|m| m.pubkey.clone())
+            .filter(|p| !p.is_empty());
+
+        /// 这份名册的签名是怎么过的（只用于决定把哪把钥写进本地表）。
+        #[derive(Clone, Copy)]
+        enum Verified {
+            /// 用本机已绑定的钥验过（更新者本人签的；可以由别人代发）。
+            Local,
+            /// 本机还没绑定更新者：由更新者本人直发的名册做了一次 TOFU 自我介绍。
+            Incoming,
+            /// 本机还没绑定更新者，名册由**本机已绑定/已配对的成员**代发。
+            /// 只应用名册内容，**不**把更新者的钥写进本地表。
+            Relayed,
+            /// 老群的无签名名册（只在还没进入签名模式时放行）。
+            Legacy,
+        }
 
         let mut guard = self.inner.lock();
         if guard.dismissed.iter().any(|d| d == &roster.id) {
             debug!(group = %roster.id, "群名册被忽略：本机明确拒绝过这个群");
             return RosterOutcome::Ignored;
         }
-        // 发名册的这台设备必须**本来就是这个群的人**（P1-7）：名册是 LWW（rev 大者胜），谁都能写一个
-        // 更大的 rev —— 不校验发送者身份，任何知道群 id 的局域网主机都能把别人的群改写掉
-        // （改群名、踢人、把自己加进去）。
-        //
-        // 判据用**本机手上那份名册**，不是它自己送来的这份（攻击者当然会把自己写进去）。
-        // 自己退群（广播一份"没有我"的名册）那一档也照样成立：发送者在**本机手上的旧名册**里。
-        // 中转（F-100）那一跳的发送者同样是成员，所以正常路径不受影响。
+        // 名册签名/身份校验：只看**本机绑定**的公钥（attested/bound），不看共享名册那一格。
+        // - 本机已绑定更新者 → 必须带签名，用它验；
+        // - 本机没绑定 → 更新者**本人**送来的名册可以做一次 TOFU 自我介绍；由**本机
+        //   已绑定/已配对的成员**代发的名册也收，但只应用名册内容，不把更新者的钥
+        //   写进本地表（等本人直发再绑）。
+        // - 老群（还没进入签名模式）仍允许无签名名册，保持旧版本兼容。
         if let Some(idx) = guard.groups.iter().position(|g| g.id == roster.id) {
+            let local_key = guard.local_key(&roster.id, &roster.updated_by);
+            let trusted_updater = sender_trusted && from.id == roster.updated_by;
+            let verified = if local_key.is_some() {
+                if roster.sig.is_empty() {
+                    warn!(
+                        group = %roster.id, by = %roster.updated_by,
+                        "名册被忽略：更新者已有本地绑定但没有签名"
+                    );
+                    return RosterOutcome::Ignored;
+                }
+                let key = local_key.as_deref().unwrap_or_default();
+                if !crate::group_identity::verify_b64(
+                    key,
+                    &roster_signing_bytes(roster),
+                    &roster.sig,
+                ) {
+                    warn!(
+                        group = %roster.id, by = %roster.updated_by,
+                        "名册被忽略：签名校验失败"
+                    );
+                    return RosterOutcome::Ignored;
+                }
+                Verified::Local
+            } else if !roster.sig.is_empty() {
+                if from.id == roster.updated_by {
+                    let Some(key) = incoming_key.as_deref() else {
+                        warn!(
+                            group = %roster.id, by = %roster.updated_by,
+                            "名册被忽略：签名者没带公钥"
+                        );
+                        return RosterOutcome::Ignored;
+                    };
+                    if !crate::group_identity::verify_b64(
+                        key,
+                        &roster_signing_bytes(roster),
+                        &roster.sig,
+                    ) {
+                        warn!(
+                            group = %roster.id, by = %roster.updated_by,
+                            "名册被忽略：TOFU 签名校验失败"
+                        );
+                        return RosterOutcome::Ignored;
+                    }
+                    Verified::Incoming
+                } else {
+                    // 更新者本机还没绑定，名册由另一个成员代发：只允许**本机已绑定/已配对**
+                    // 的成员做搬运工，避免未绑定来源借别人的 id 改群状态。代发只应用
+                    // 成员/名字变化，不把更新者的钥写进本地表（等本人直发再绑）。
+                    let sender_bound =
+                        guard.local_key(&roster.id, &from.id).is_some() || sender_trusted;
+                    if !sender_bound {
+                        warn!(
+                            group = %roster.id, by = %roster.updated_by, sender = %from.id,
+                            "名册被忽略：未绑定更新者的名册不能由未绑定成员代发"
+                        );
+                        return RosterOutcome::Ignored;
+                    }
+                    let Some(key) = incoming_key.as_deref() else {
+                        warn!(
+                            group = %roster.id, by = %roster.updated_by,
+                            "名册被忽略：签名者没带公钥"
+                        );
+                        return RosterOutcome::Ignored;
+                    };
+                    if !crate::group_identity::verify_b64(
+                        key,
+                        &roster_signing_bytes(roster),
+                        &roster.sig,
+                    ) {
+                        warn!(
+                            group = %roster.id, by = %roster.updated_by,
+                            "名册被忽略：代发名册签名校验失败"
+                        );
+                        return RosterOutcome::Ignored;
+                    }
+                    Verified::Relayed
+                }
+            } else {
+                if guard.groups[idx].require_sig {
+                    warn!(
+                        group = %roster.id, by = %roster.updated_by,
+                        "名册被忽略：群已进入签名模式，名册缺签名"
+                    );
+                    return RosterOutcome::Ignored;
+                }
+                Verified::Legacy
+            };
+            // 发名册的这台设备必须**本来就是这个群的人**（P1-7）：名册是 LWW（rev 大者胜），谁都能写一个
+            // 更大的 rev —— 不校验发送者身份，任何知道群 id 的局域网主机都能把别人的群改写掉
+            // （改群名、踢人、把自己加进去）。
+            //
+            // 判据用**本机手上那份名册**，不是它自己送来的这份（攻击者当然会把自己写进去）。
+            // 自己退群（广播一份"没有我"的名册）那一档也照样成立：发送者在**本机手上的旧名册**里。
+            // 中转（F-100）那一跳的发送者同样是成员，所以正常路径不受影响。
             if !guard.groups[idx].is_member(&from.id) {
                 warn!(
                     group = %roster.id, sender = %from.id,
@@ -778,6 +1496,29 @@ impl GroupStore {
             if stale {
                 return RosterOutcome::Ignored;
             }
+            // 未绑定的更新者不能改群状态：群名与成员 id 集合算；**显示名不算**（那只是
+            // 名册附带的标签，且邀请/加入时本机名可能还是空的，拿它当闸门会把正常加入
+            // 挡掉）。只允许"只带自己公钥"的自我介绍先落地；否则一个自称未绑定成员 id
+            // 的局域网设备就能改群名/名单。已配对（token）的更新者不受这条限制；
+            // **还没进入签名模式的老群**保持旧行为。
+            let state_changed = {
+                let g = &guard.groups[idx];
+                g.name != roster.name || !same_member_ids(&g.members, &unique)
+            };
+            if state_changed
+                && guard.groups[idx].require_sig
+                && local_key.is_none()
+                && !trusted_updater
+                && !matches!(verified, Verified::Relayed)
+            {
+                warn!(
+                    group = %roster.id, by = %roster.updated_by, sender = %from.id,
+                    "名册被忽略：更新者还没绑定公钥，不能改群状态"
+                );
+                return RosterOutcome::Ignored;
+            }
+            // 名册变更后 `read_by` 只该留下当前成员；本机被移出时整表清空。
+            let member_ids: Vec<String> = unique.iter().map(|m| m.id.clone()).collect();
             let left;
             {
                 let g = &mut guard.groups[idx];
@@ -785,14 +1526,85 @@ impl GroupStore {
                 g.rev = roster.rev;
                 g.updated_by = roster.updated_by.clone();
                 g.updated_at = roster.updated_at;
+                g.epoch = roster.epoch;
+                g.sig = roster.sig.clone();
                 g.members = unique;
+                g.require_sig = g.require_sig
+                    || !roster.sig.is_empty()
+                    || g.members.iter().any(|m| !m.pubkey.is_empty());
+                g.ensure_member_order();
                 // 名册里还有本机 → 之前的"被移出"作废；没有了 → 停发（历史留着）。
                 g.left = !g.is_member(own_id);
                 // "拒绝过"的人被移出名单了 → 那一格作废（与 `edit_local` 同一条规矩）。
-                g.declined.retain(|id| g.members.iter().any(|m| &m.id == id));
+                g.declined
+                    .retain(|id| g.members.iter().any(|m| &m.id == id));
                 left = g.left;
             }
-            guard.convos.entry(roster.id.clone()).or_default();
+            // 本地绑定：**只动更新者自己的钥**。名册里其他成员的 pubkey 一律不进
+            // attested/bound —— 验签也就不会认它。已 attested 的更新者用旧钥签的轮换
+            // 同样合法（签名已经用旧钥验过），把 attested 一起更新到新钥。
+            if let Some(key) = incoming_key {
+                let already_attested = guard
+                    .attested
+                    .get(&roster.id)
+                    .and_then(|m| m.get(&roster.updated_by))
+                    .is_some();
+                match verified {
+                    Verified::Local => {
+                        guard
+                            .bound
+                            .entry(roster.id.clone())
+                            .or_default()
+                            .insert(roster.updated_by.clone(), key.clone());
+                        if already_attested || trusted_updater {
+                            guard
+                                .attested
+                                .entry(roster.id.clone())
+                                .or_default()
+                                .insert(roster.updated_by.clone(), key);
+                        }
+                    }
+                    Verified::Incoming => {
+                        guard
+                            .bound
+                            .entry(roster.id.clone())
+                            .or_default()
+                            .insert(roster.updated_by.clone(), key.clone());
+                        if trusted_updater {
+                            guard
+                                .attested
+                                .entry(roster.id.clone())
+                                .or_default()
+                                .insert(roster.updated_by.clone(), key);
+                        }
+                    }
+                    Verified::Relayed => {
+                        // 代发的名册只改成员/名字；更新者的钥等本人直发再绑。
+                    }
+                    Verified::Legacy => {
+                        if trusted_updater {
+                            guard
+                                .bound
+                                .entry(roster.id.clone())
+                                .or_default()
+                                .insert(roster.updated_by.clone(), key.clone());
+                            guard
+                                .attested
+                                .entry(roster.id.clone())
+                                .or_default()
+                                .insert(roster.updated_by.clone(), key);
+                        }
+                    }
+                }
+            }
+            let convo = guard.convos.entry(roster.id.clone()).or_default();
+            if left {
+                convo.read_by.clear();
+            } else {
+                convo
+                    .read_by
+                    .retain(|id, at| *at > 0 && id != own_id && member_ids.iter().any(|m| m == id));
+            }
             persist(&self.path, &mut guard);
             if left {
                 warn!(group = %roster.id, "本机已被移出这个群");
@@ -812,6 +1624,26 @@ impl GroupStore {
             );
             return RosterOutcome::Ignored;
         }
+        // 带签名的陌生名册先验一次自洽性：签名者就是名册里的 `updated_by` 本人。
+        // 这不是信任（用户还要点「加入」），只是不让一份被改过的名册变成邀请卡，
+        // 也避免一枚假签名把群标成"安全群"。
+        if !roster.sig.is_empty() {
+            let key = unique
+                .iter()
+                .find(|m| m.id == roster.updated_by)
+                .map(|m| m.pubkey.as_str())
+                .filter(|p| !p.is_empty());
+            let ok = key.is_some_and(|k| {
+                crate::group_identity::verify_b64(k, &roster_signing_bytes(roster), &roster.sig)
+            });
+            if !ok {
+                warn!(
+                    group = %roster.id, by = %roster.updated_by,
+                    "陌生群的名册被忽略：签名缺失或校验失败"
+                );
+                return RosterOutcome::Ignored;
+            }
+        }
         let invite = {
             let mut others = unique;
             others.retain(|m| m.id != own_id);
@@ -825,6 +1657,8 @@ impl GroupStore {
                 rev: roster.rev,
                 updated_by: roster.updated_by.clone(),
                 updated_at: roster.updated_at,
+                epoch: roster.epoch,
+                sig: roster.sig.clone(),
             }
         };
         match guard.pending.iter_mut().find(|p| p.group_id == roster.id) {
@@ -843,31 +1677,108 @@ impl GroupStore {
     /// 用户点了「加入」：邀请卡变成正式的群（从这一刻起名册变更静默采用）。
     pub fn accept_pending(&self, group_id: &str, own_id: &str) -> bool {
         let mut guard = self.inner.lock();
+        if guard.groups.iter().filter(|g| !g.left).count() >= MAX_GROUPS {
+            warn!(group = %group_id, limit = MAX_GROUPS, "加入被拒：群数量已达上限");
+            return false;
+        }
         let Some(idx) = guard.pending.iter().position(|p| p.group_id == group_id) else {
             return false;
         };
         let invite = guard.pending.remove(idx);
-        let mut members = vec![Member { id: own_id.to_string(), name: String::new() }];
-        normalize_members(&mut members, invite.members.clone());
-        guard.groups.push(Group {
+        let own_pubkey = crate::group_identity::public_key_b64().unwrap_or_default();
+        let mut members = vec![Member {
+            id: own_id.to_string(),
+            name: String::new(),
+            pubkey: own_pubkey.clone(),
+        }];
+        // **非邀请者的公钥一律不采信**：名册是共享 LWW 物，邀请者能写任何人的 pubkey；
+        // 若原样带进来，一个恶意邀请者就能在新成员这里预绑其他人的钥。只留 id/名字，
+        // 等成员本人第一次签名发言/自签名册时再绑。
+        //
+        // 例外是**签名者本人**（`updated_by`）：带签名的邀请就是它签的，用户点「加入」
+        // 就是对它的 TOFU；保留它的钥，新成员才能验它之后的同步/消息。
+        let updater_key = if invite.sig.is_empty() {
+            None
+        } else {
+            invite
+                .members
+                .iter()
+                .find(|m| m.id == invite.updated_by)
+                .map(|m| m.pubkey.clone())
+                .filter(|p| !p.is_empty())
+        };
+        let others = invite
+            .members
+            .iter()
+            .cloned()
+            .map(|mut m| {
+                if m.id != invite.updated_by {
+                    m.pubkey.clear();
+                }
+                m
+            })
+            .collect();
+        normalize_members(&mut members, others);
+        // 老群（邀请本身没有签名）不要因为“加入”就强行升级：那会把旧成员发来的
+        // 未签名消息全部判成 BadSignature。新群（邀请带签名）才由本机补上自己的
+        // 公钥、+1 版并签名广播。
+        let secure = !invite.sig.is_empty();
+        let mut group = Group {
             id: group_id.to_string(),
             name: invite.name.clone(),
-            rev: invite.rev,
+            rev: if secure { invite.rev + 1 } else { invite.rev },
             created_by: invite.from.clone(),
             created_at: invite.at,
-            updated_by: invite.updated_by.clone(),
-            updated_at: invite.updated_at,
-            members,
+            updated_by: if secure {
+                own_id.to_string()
+            } else {
+                invite.updated_by.clone()
+            },
+            updated_at: if secure { now_ms() } else { invite.updated_at },
+            members: members.clone(),
             left: false,
             // 本机这一刻才成为成员：在此之前没人对本机说过"拒绝"，这一栏从空起步。
             declined: Vec::new(),
-        });
+            epoch: invite.epoch,
+            // 安全群要由本机重签（成员/公钥在本地视角下已经变了）；先在构造时清掉邀请
+            // 那枚旧签名，签名失败时也不会留一枚对不上的。
+            sig: if secure {
+                String::new()
+            } else {
+                invite.sig.clone()
+            },
+            require_sig: secure,
+            member_order: members.iter().map(|m| m.id.clone()).collect(),
+        };
+        group.ensure_member_order();
+        if secure {
+            group.sign_roster();
+        }
+        guard.groups.push(group);
+        if !own_pubkey.is_empty() {
+            guard
+                .bound
+                .entry(group_id.to_string())
+                .or_default()
+                .insert(own_id.to_string(), own_pubkey);
+        }
+        if let Some(key) = updater_key {
+            guard
+                .bound
+                .entry(group_id.to_string())
+                .or_default()
+                .insert(invite.updated_by.clone(), key);
+        }
         guard.my_seq.entry(group_id.to_string()).or_insert(1);
         // 邀请挂着的那段时间里到的消息：这一刻并进会话（按 `(from, id)` 去重、按展示顺序排）。
         let buffered = guard.orphans.remove(group_id).unwrap_or_default();
         let convo = guard.convos.entry(group_id.to_string()).or_default();
         for m in buffered {
-            if convo.messages.iter().any(|x| x.from == m.from && x.id == m.id) {
+            if convo
+                .messages
+                .iter()
+                .any(|x| x.from == m.from && x.id == m.id)
+            {
                 continue;
             }
             convo.messages.push(m);
@@ -907,6 +1818,19 @@ impl GroupStore {
         at: u64,
         deliveries: &[(String, Delivery)],
     ) -> GroupMsg {
+        self.record_outbound_signed(group_id, msg_id, from, content, at, deliveries, "")
+    }
+
+    pub fn record_outbound_signed(
+        &self,
+        group_id: &str,
+        msg_id: &str,
+        from: &str,
+        content: impl Into<crate::blobs::Content>,
+        at: u64,
+        deliveries: &[(String, Delivery)],
+        data: &str,
+    ) -> GroupMsg {
         let content = content.into();
         let mut guard = self.inner.lock();
         let seq = {
@@ -915,7 +1839,28 @@ impl GroupStore {
             *next += 1;
             used
         };
-        let msg = msg_with(content, msg_id, from, "", at, seq, deliveries.iter().cloned().collect());
+        let mut msg = msg_with(
+            content,
+            msg_id,
+            from,
+            "",
+            at,
+            seq,
+            deliveries.iter().cloned().collect(),
+        );
+        if let Some(g) = guard.groups.iter().find(|g| g.id == group_id) {
+            msg.epoch = g.epoch;
+        }
+        // 自己的签名键永远是**本机的群身份**，不是共享名册里那一格 —— 后者可能被别的
+        // 成员改写成空/别人的钥，照着它签就会签出接收方验不过的包。
+        msg.pubkey = crate::group_identity::public_key_b64().unwrap_or_default();
+        if !msg.pubkey.is_empty() {
+            let bytes = group_msg_signing_bytes(
+                group_id, msg.epoch, from, msg_id, at, seq, &msg.text, msg.image, &msg.name,
+                msg.size, data,
+            );
+            msg.sig = crate::group_identity::sign_b64(&bytes).unwrap_or_default();
+        }
         let convo = guard.convos.entry(group_id.to_string()).or_default();
         convo.messages.push(msg.clone());
         let dropped = prune(convo);
@@ -935,6 +1880,23 @@ impl GroupStore {
         at: u64,
         seq: u64,
     ) -> bool {
+        self.record_inbound_signed(group_id, from, from_name, id, content, at, seq, 0, "", "")
+    }
+
+    /// 带群签名的入站消息：签名/公钥/纪元跟随消息落盘，补发与补拉都要原样再送。
+    pub fn record_inbound_signed(
+        &self,
+        group_id: &str,
+        from: &str,
+        from_name: &str,
+        id: &str,
+        content: impl Into<crate::blobs::Content>,
+        at: u64,
+        seq: u64,
+        epoch: u64,
+        pubkey: &str,
+        sig: &str,
+    ) -> bool {
         let content = content.into();
         let mut guard = self.inner.lock();
         let dropped;
@@ -945,7 +1907,15 @@ impl GroupStore {
                 debug!(%id, %from, group_id, "群消息重复投递，丢弃");
                 return false;
             }
-            convo.messages.push(msg_with(content, id, from, from_name, at, seq, HashMap::new()));
+            if seq > 0 && seq <= convo.pruned_below.get(from).copied().unwrap_or(0) {
+                debug!(%id, %from, group_id, seq, "群消息在本地已清空的历史下界之下，丢弃");
+                return false;
+            }
+            let mut msg = msg_with(content, id, from, from_name, at, seq, HashMap::new());
+            msg.epoch = epoch;
+            msg.pubkey = pubkey.to_string();
+            msg.sig = sig.to_string();
+            convo.messages.push(msg);
             dropped = prune(convo);
         }
         drop_content(&dropped, &self.blobs_root);
@@ -955,7 +1925,11 @@ impl GroupStore {
 
     /// 这个群此刻正挂着邀请卡（等用户点「加入」）。
     pub fn has_pending(&self, group_id: &str) -> bool {
-        self.inner.lock().pending.iter().any(|p| p.group_id == group_id)
+        self.inner
+            .lock()
+            .pending
+            .iter()
+            .any(|p| p.group_id == group_id)
     }
 
     /// 本机**明确拒绝过**这个群（用户点过那张卡上的「不加入」）—— 之后它的事件一律忽略。
@@ -981,7 +1955,12 @@ impl GroupStore {
 
     /// 邀请挂着期间攒下的消息条数（界面与测试都能看）。
     pub fn buffered_count(&self, group_id: &str) -> usize {
-        self.inner.lock().orphans.get(group_id).map(|v| v.len()).unwrap_or(0)
+        self.inner
+            .lock()
+            .orphans
+            .get(group_id)
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
     /// 邀请还没确认、但群里已经有消息进来了：先攒着（见 `MAX_ORPHANS`）。`true` = 攒下了。
@@ -997,6 +1976,24 @@ impl GroupStore {
         at: u64,
         seq: u64,
     ) -> bool {
+        self.buffer_pending_message_signed(
+            group_id, from, from_name, id, content, at, seq, 0, "", "",
+        )
+    }
+
+    pub fn buffer_pending_message_signed(
+        &self,
+        group_id: &str,
+        from: &str,
+        from_name: &str,
+        id: &str,
+        content: impl Into<crate::blobs::Content>,
+        at: u64,
+        seq: u64,
+        epoch: u64,
+        pubkey: &str,
+        sig: &str,
+    ) -> bool {
         let content = content.into();
         let mut guard = self.inner.lock();
         if !guard.pending.iter().any(|p| p.group_id == group_id) {
@@ -1009,7 +2006,11 @@ impl GroupStore {
         if list.iter().any(|m| m.from == from && m.id == id) {
             return false;
         }
-        list.push(msg_with(content, id, from, from_name, at, seq, HashMap::new()));
+        let mut msg = msg_with(content, id, from, from_name, at, seq, HashMap::new());
+        msg.epoch = epoch;
+        msg.pubkey = pubkey.to_string();
+        msg.sig = sig.to_string();
+        list.push(msg);
         if list.len() > MAX_ORPHANS {
             let drop = list.len() - MAX_ORPHANS;
             // 挤出去的那几条如果是图片，内容也跟着走（不然它会一直躺在那儿没人引用）。
@@ -1020,11 +2021,55 @@ impl GroupStore {
         true
     }
 
-    /// 把几条（本机发的）副本的投递状态一次落定（一次落盘）。**只动"还没定"的档**。
-    pub fn set_deliveries(&self, group_id: &str, msg_id: &str, updates: &[(String, Delivery)]) -> bool {
+    /// 清空一个群的本地聊天记录，但**保留群/名册/成员关系**。之后的新消息照常收；
+    /// 被清掉的历史下界写进 `pruned_below`，补拉不会再把它们拉回来。
+    pub fn clear_history(&self, group_id: &str, own_id: &str) -> bool {
         let mut guard = self.inner.lock();
-        let Some(convo) = guard.convos.get_mut(group_id) else { return false };
-        let Some(m) = convo.messages.iter_mut().find(|m| m.id == msg_id) else { return false };
+        if !guard
+            .groups
+            .iter()
+            .any(|g| g.id == group_id && !g.left && g.is_member(own_id))
+        {
+            return false;
+        }
+        let Some(convo) = guard.convos.get_mut(group_id) else {
+            return false;
+        };
+        let dropped = std::mem::take(&mut convo.messages);
+        if dropped.is_empty() {
+            // 空群：什么都不用改，尤其不要把同步锚点推到“现在”（可能漏掉离线期间的消息）。
+            return true;
+        }
+        for m in &dropped {
+            if m.seq > 0 {
+                let slot = convo.pruned_below.entry(m.from.clone()).or_insert(0);
+                *slot = (*slot).max(m.seq);
+            }
+        }
+        convo.cleared_at = now_ms();
+        convo.read_pos = None;
+        convo.read_by.clear();
+        // 已经“追过”这个群：不要把清空后的冷启动补拉又走一遍。
+        convo.bootstrapped = true;
+        persist(&self.path, &mut guard);
+        drop_content(&dropped, &self.blobs_root);
+        true
+    }
+
+    /// 把几条（本机发的）副本的投递状态一次落定（一次落盘）。**只动"还没定"的档**。
+    pub fn set_deliveries(
+        &self,
+        group_id: &str,
+        msg_id: &str,
+        updates: &[(String, Delivery)],
+    ) -> bool {
+        let mut guard = self.inner.lock();
+        let Some(convo) = guard.convos.get_mut(group_id) else {
+            return false;
+        };
+        let Some(m) = convo.messages.iter_mut().find(|m| m.id == msg_id) else {
+            return false;
+        };
         let mut changed = false;
         for (peer, next) in updates {
             match m.delivery.get(peer).copied() {
@@ -1047,8 +2092,25 @@ impl GroupStore {
     /// 为什么不走 `set_deliveries`：那个闸门只许 `Sending/Queued → 终态`（防一条迟到的失败
     /// 把已经写进长连接的那份降级）。而这条拒收是**对端自己说的**，它比任何推测都硬 ——
     /// 长连接那条路"写成功 = 已送达"正好是它要纠正的那种情形。
-    pub fn mark_rejected(&self, group_id: &str, msg_id: &str, peer_id: &str, declined: bool) -> bool {
+    pub fn mark_rejected(
+        &self,
+        group_id: &str,
+        msg_id: &str,
+        peer_id: &str,
+        declined: bool,
+    ) -> bool {
         let mut guard = self.inner.lock();
+        // 拒收回执只对**本群当前成员**有意义：没有这一道，任何知道群 id 的局域网主机
+        // 都能假冒一个未配对成员，把本机发出去的那一份标成「未送达」，或把成员标成
+        // 「已拒绝加入」。群成员本来就不要求配对（D6=b），所以 token 之外还得有成员闸门。
+        let allowed = guard
+            .groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .is_some_and(|g| !g.left && g.is_member(peer_id));
+        if !allowed {
+            return false;
+        }
         let mut changed = false;
         if let Some(convo) = guard.convos.get_mut(group_id) {
             if let Some(m) = convo.messages.iter_mut().find(|m| m.id == msg_id) {
@@ -1083,25 +2145,78 @@ impl GroupStore {
     /// 顺带把**那一份副本**升成「已读」：读回执本身就是"它收到了"的**证据** —— 跨网段时
     /// 本机可能一直没有到它的路径（那一格停在「排队」），但它从别人那儿补到、又读过了，
     /// 这一格就该跟着变过来（否则界面上永远写着"没送到"，而对方明明已经读过）。
-    pub fn mark_read_by_peer(&self, group_id: &str, reader: &str, up_to: u64) -> bool {
-        let mut guard = self.inner.lock();
-        let Some(convo) = guard.convos.get_mut(group_id) else { return false };
-        let mut changed = false;
-        let cur = convo.read_by.get(reader).copied().unwrap_or(0);
-        if up_to > cur {
-            convo.read_by.insert(reader.to_string(), up_to);
-            changed = true;
+    ///
+    /// **不是谁都能写这个水位**（P1-7 补遗）：`reader` 必须是当前名册成员，`up_to` 还要夹到
+    /// 本机实际发出过的最大 `at`。少了前者，任意局域网主机都能用幽灵 id 把 `read_by` 撑大、
+    /// 逼本机每次整份重写 `groups.dat`；少了后者，一枚 `up_to = u64::MAX` 会让**未来**所有
+    /// 消息都永远算「已读」（水位只增不减，事后无法纠正）。
+    pub fn mark_read_by_peer(
+        &self,
+        group_id: &str,
+        reader: &str,
+        own_id: &str,
+        up_to: u64,
+    ) -> bool {
+        // 自己不会给自己发回执；id 形状也做一次兜底校验（HTTP 入口已挡，账本方法另有调用点时
+        // 也不至于把超长/带分隔符的键写进盘里）。
+        if reader == own_id || !crate::ids::is_segment(reader) {
+            return false;
         }
-        for m in convo.messages.iter_mut() {
-            if m.at > up_to {
-                continue;
+        let mut guard = self.inner.lock();
+        // 当前名册成员才算数。被移出的、以及知道群 id 的任意主机都不该能改这一格。
+        let members: Vec<String> = match guard.groups.iter().find(|g| g.id == group_id) {
+            Some(g) if !g.left && g.is_member(reader) => {
+                g.members.iter().map(|m| m.id.clone()).collect()
             }
-            match m.delivery.get(reader).copied() {
-                Some(Delivery::Queued) | Some(Delivery::Sending) | Some(Delivery::Failed) | Some(Delivery::Synced) => {
-                    m.delivery.insert(reader.to_string(), Delivery::Read);
-                    changed = true;
+            _ => return false,
+        };
+        let Some(convo) = guard.convos.get_mut(group_id) else {
+            return false;
+        };
+        // 先清历史脏数据（旧版本被伪造回执塞进来的幽灵 id、被移出成员、0 水位）：
+        // 每次回执做一次是常数级（成员 <= MAX_MEMBERS），换来 read_by 永远不超过名册。
+        let mut changed = false;
+        convo.read_by.retain(|id, at| {
+            let keep = *at > 0 && id != own_id && members.iter().any(|m| m == id);
+            if !keep {
+                changed = true;
+            }
+            keep
+        });
+
+        // `up_to` 是"读者读到的、**本机发的**最大 at"：夹到本机实际发出的最大 at。
+        // 伪造的 u64::MAX 既不能改写更早的副本，也不能让未来消息永远算已读。
+        let max_own = convo
+            .messages
+            .iter()
+            .filter(|m| m.from == own_id)
+            .map(|m| m.at)
+            .max()
+            .unwrap_or(0);
+        let up_to = up_to.min(max_own);
+        if up_to > 0 {
+            let cur = convo.read_by.get(reader).copied().unwrap_or(0);
+            // 名册最多 MAX_MEMBERS 人；清理后这里只可能是满员状态，留给异常数据兜底。
+            if up_to > cur && (cur > 0 || convo.read_by.len() < MAX_MEMBERS) {
+                convo.read_by.insert(reader.to_string(), up_to);
+                changed = true;
+            }
+            for m in convo.messages.iter_mut() {
+                // 回执只覆盖**本机发的**那些（`up_to` 是本机时钟域里的水位，别的发送方的
+                // `at` 与它不可比）。
+                if m.from != own_id || m.at > up_to {
+                    continue;
                 }
-                _ => {}
+                match m.delivery.get(reader).copied() {
+                    Some(Delivery::Queued)
+                    | Some(Delivery::Sending)
+                    | Some(Delivery::Failed)
+                    | Some(Delivery::Synced) => {
+                        m.delivery.insert(reader.to_string(), Delivery::Read);
+                        changed = true;
+                    }
+                    _ => {}
+                }
             }
         }
         if changed {
@@ -1113,8 +2228,12 @@ impl GroupStore {
     /// 本机读过这个群了：读位推进到 `msg_id`（**只向前**，按群里的先后而不是墙钟大小）。
     pub fn mark_read_local(&self, group_id: &str, msg_id: &str) -> bool {
         let mut guard = self.inner.lock();
-        let Some(convo) = guard.convos.get_mut(group_id) else { return false };
-        let Some(target) = convo.messages.iter().find(|m| m.id == msg_id) else { return false };
+        let Some(convo) = guard.convos.get_mut(group_id) else {
+            return false;
+        };
+        let Some(target) = convo.messages.iter().find(|m| m.id == msg_id) else {
+            return false;
+        };
         let target_key = sort_key(target);
         let cur_key = convo
             .read_pos
@@ -1131,7 +2250,11 @@ impl GroupStore {
 
     /// 本机读到哪条了（界面算未读、回执都按它）。
     pub fn read_pos(&self, group_id: &str) -> Option<String> {
-        self.inner.lock().convos.get(group_id).and_then(|c| c.read_pos.clone())
+        self.inner
+            .lock()
+            .convos
+            .get(group_id)
+            .and_then(|c| c.read_pos.clone())
     }
 
     /// 本机读到的、**`sender` 发的**最大 `at` —— 回执带回去的那个水位（没读到 = 0）。
@@ -1140,7 +2263,9 @@ impl GroupStore {
     /// `sender` 维度，因为回执是发给**某一个人**的，而对方的时钟只有它自己那一条可比。
     pub fn read_up_to_for(&self, group_id: &str, sender: &str) -> u64 {
         let guard = self.inner.lock();
-        let Some(convo) = guard.convos.get(group_id) else { return 0 };
+        let Some(convo) = guard.convos.get(group_id) else {
+            return 0;
+        };
         let Some(pos) = convo
             .read_pos
             .as_ref()
@@ -1163,13 +2288,18 @@ impl GroupStore {
     /// 这个群**明确知道**缺了哪几条（按发送方分组的洞）。
     pub fn holes(&self, group_id: &str) -> Vec<SyncHole> {
         let guard = self.inner.lock();
-        let Some(convo) = guard.convos.get(group_id) else { return Vec::new() };
+        let Some(convo) = guard.convos.get(group_id) else {
+            return Vec::new();
+        };
         holes_in(convo)
     }
 
     /// 已知缺口的条数（界面那行提示就写它）。
     pub fn missing_count(&self, group_id: &str) -> u32 {
-        self.holes(group_id).iter().map(|h| h.seqs.len() as u32).sum()
+        self.holes(group_id)
+            .iter()
+            .map(|h| h.seqs.len() as u32)
+            .sum()
     }
 
     /// 这位发送方身上**还缺着号**吗（`on_group_text` 记完一条之后用它决定要不要当场补拉）。
@@ -1177,7 +2307,9 @@ impl GroupStore {
     /// 只看"有没有洞"，不管刚记下的那条的号有多大：洞补上之前，这个人每说一句都会再问一次
     /// （频率由补拉闸门收着），这才不会因为中间丢了一条就永远缺着。
     pub fn has_holes(&self, group_id: &str, from: &str) -> bool {
-        self.holes(group_id).iter().any(|h| h.from == from && !h.seqs.is_empty())
+        self.holes(group_id)
+            .iter()
+            .any(|h| h.from == from && !h.seqs.is_empty())
     }
 
     /// 这次补拉要问什么：`None` = 没什么可问（不在群里、或冷启动那批已经拿过了）。
@@ -1194,7 +2326,13 @@ impl GroupStore {
         let empty = GroupConvo::default();
         let convo = convo.unwrap_or(&empty);
         let holes = holes_in(convo);
-        let anchor = convo.messages.iter().map(|m| m.at).max().unwrap_or(0);
+        let anchor = convo
+            .messages
+            .iter()
+            .map(|m| m.at)
+            .max()
+            .unwrap_or(0)
+            .max(convo.cleared_at);
         if anchor == 0 {
             // 冷启动：只有还没追过的那一次才问。
             if convo.bootstrapped {
@@ -1246,30 +2384,80 @@ impl GroupStore {
         }
     }
 
+    /// 记下一条本机发出的补拉请求。回答必须带回同一个 `ask_id`，并且来自这里记的设备。
+    pub fn note_ask(&self, ask_id: &str, group_id: &str, peer_id: &str) {
+        let mut asks = self.asks.lock();
+        asks.retain(|_, a| a.at.elapsed() < ASK_TTL);
+        asks.insert(
+            ask_id.to_string(),
+            PendingAsk {
+                group_id: group_id.to_string(),
+                peer_id: peer_id.to_string(),
+                at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// 消费一条补拉请求。只有 `(ask_id, group_id, peer_id)` 三者都对得上才返回 `true`。
+    pub fn take_ask(&self, ask_id: &str, group_id: &str, peer_id: &str) -> bool {
+        let mut asks = self.asks.lock();
+        asks.retain(|_, a| a.at.elapsed() < ASK_TTL);
+        match asks.get(ask_id) {
+            Some(a) if a.group_id == group_id && a.peer_id == peer_id => {
+                asks.remove(ask_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// 对方要的那些：`at > since_at` 的全给（按展示顺序），上限 `cap` 条；返回 `(消息, 还有更多)`。
-    pub fn messages_after(&self, group_id: &str, since_at: u64, cap: usize) -> (Vec<GroupMsgWire>, bool) {
+    pub fn messages_after(
+        &self,
+        group_id: &str,
+        since_at: u64,
+        cap: usize,
+    ) -> (Vec<GroupMsgWire>, bool) {
         let guard = self.inner.lock();
-        let Some(convo) = guard.convos.get(group_id) else { return (Vec::new(), false) };
+        let Some(convo) = guard.convos.get(group_id) else {
+            return (Vec::new(), false);
+        };
         let mut list: Vec<&GroupMsg> = convo.messages.iter().filter(|m| m.at > since_at).collect();
         list.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
         let more = list.len() > cap;
         list.truncate(cap);
         // **带上内容**：图片消息那几条要把盘上那份读出来（`wire_of`）。读不到就只带元数据
         // 过去（收方那台如实显示"读不出来"）—— 补拉是尽力而为。
-        (list.into_iter().map(|m| wire_of(&self.blobs_root, m)).collect(), more)
+        (
+            list.into_iter()
+                .map(|m| wire_of(&self.blobs_root, m))
+                .collect(),
+            more,
+        )
     }
 
     /// 对方点名要的那几条（按 `(from, seq)` 精确找）。
-    pub fn messages_by_holes(&self, group_id: &str, holes: &[SyncHole], cap: usize) -> Vec<GroupMsgWire> {
+    pub fn messages_by_holes(
+        &self,
+        group_id: &str,
+        holes: &[SyncHole],
+        cap: usize,
+    ) -> Vec<GroupMsgWire> {
         let guard = self.inner.lock();
-        let Some(convo) = guard.convos.get(group_id) else { return Vec::new() };
+        let Some(convo) = guard.convos.get(group_id) else {
+            return Vec::new();
+        };
         let mut out: Vec<GroupMsgWire> = Vec::new();
         for hole in holes.iter().take(MAX_HOLE_SENDERS) {
             for seq in hole.seqs.iter().take(MAX_HOLES_PER_SENDER) {
                 if out.len() >= cap {
                     return out;
                 }
-                if let Some(m) = convo.messages.iter().find(|m| m.from == hole.from && m.seq == *seq) {
+                if let Some(m) = convo
+                    .messages
+                    .iter()
+                    .find(|m| m.from == hole.from && m.seq == *seq)
+                {
                     out.push(wire_of(&self.blobs_root, m));
                 }
             }
@@ -1281,15 +2469,94 @@ impl GroupStore {
     ///
     /// 返回值 = "这些消息里、**确实新增的**那些的发送方 → 它发的最大 `at`"：调用方据此给
     /// 原发送方回一条 `GroupAck`（"我拿到了"），别人才知道那一份其实到了。
-    pub fn apply_sync(&self, group_id: &str, own_id: &str, messages: &[GroupMsgWire]) -> Vec<(String, u64)> {
+    pub fn apply_sync(
+        &self,
+        group_id: &str,
+        own_id: &str,
+        messages: &[GroupMsgWire],
+    ) -> Vec<(String, u64)> {
         let mut guard = self.inner.lock();
         let mut acked: HashMap<String, u64> = HashMap::new();
+        // 补拉回来的消息只能以**本机名册里的成员**名义入库。否则知道群 id 的人可以
+        // 伪造任意 `from`/`from_name` —— 这是 `GroupSyncPost` 未鉴权时最直接的注入面。
+        let group = guard.groups.iter().find(|g| g.id == group_id).cloned();
+        let members: std::collections::HashSet<String> = group
+            .as_ref()
+            .map(|g| g.members.iter().map(|m| m.id.clone()).collect())
+            .unwrap_or_default();
+        let attested = guard.attested.get(group_id).cloned().unwrap_or_default();
+        let bound = guard.bound.get(group_id).cloned().unwrap_or_default();
+        // **只认本机绑定**（attested → bound）；共享名册里的 pubkey 只是提示，不能拿来
+        // 验补拉消息 —— 否则一份被别人改过的名册就能让补拉进来的消息冒名入库。
+        let mut pubkeys: HashMap<String, String> = group
+            .as_ref()
+            .map(|g| {
+                g.members
+                    .iter()
+                    .filter_map(|m| {
+                        let key = attested.get(&m.id).or_else(|| bound.get(&m.id)).cloned()?;
+                        (!key.is_empty()).then(|| (m.id.clone(), key))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut newly_bound: Vec<(String, String)> = Vec::new();
+        let require_sig = group.as_ref().is_some_and(|g| g.require_sig);
         let dropped;
         {
             let convo = guard.convos.entry(group_id.to_string()).or_default();
+            let floors = convo.pruned_below.clone();
             for m in messages {
                 if m.from == own_id || m.from.is_empty() {
                     continue;
+                }
+                if !members.contains(&m.from) {
+                    warn!(group = %group_id, from = %m.from, id = %m.id, "补拉消息被丢弃：发送者不在名册里");
+                    continue;
+                }
+                // 本机已经清空/裁剪过的历史下界：不再从补拉里拉回来。
+                if m.seq > 0 && m.seq <= floors.get(&m.from).copied().unwrap_or(0) {
+                    continue;
+                }
+                let member_key = pubkeys.get(&m.from).cloned().unwrap_or_default();
+                // 同 `on_group_text`：作者已绑定就必须验签；全员有钥提示时也强制验签。
+                // 作者还没绑定：补拉回答已经由成员签名，允许按消息自带的公钥做**第一次**
+                // TOFU 绑定（之后同一作者必须用同一把钥）。这不会覆盖任何已绑定/已认证
+                // 的钥 —— 已绑定的作者走下面那一支，公钥不一致直接丢。
+                let all_bound = group.as_ref().is_some_and(|g| {
+                    !g.members.is_empty()
+                        && g.members.iter().all(|x| {
+                            attested.contains_key(&x.id)
+                                || bound.contains_key(&x.id)
+                                || !x.pubkey.is_empty()
+                        })
+                });
+                let need_sig = !member_key.is_empty() || (require_sig && all_bound);
+                if need_sig || !m.sig.is_empty() {
+                    let bytes = group_msg_signing_bytes(
+                        group_id, m.epoch, &m.from, &m.id, m.at, m.seq, &m.text, m.image, &m.name,
+                        m.size, &m.data,
+                    );
+                    if member_key.is_empty() {
+                        if m.pubkey.is_empty()
+                            || !crate::group_identity::verify_b64(&m.pubkey, &bytes, &m.sig)
+                        {
+                            warn!(
+                                group = %group_id, from = %m.from, id = %m.id,
+                                "补拉消息被丢弃：作者公钥还没绑定，自带签名也验不过"
+                            );
+                            continue;
+                        }
+                        pubkeys.insert(m.from.clone(), m.pubkey.clone());
+                        newly_bound.push((m.from.clone(), m.pubkey.clone()));
+                    } else {
+                        let ok = (m.pubkey.is_empty() || m.pubkey == member_key)
+                            && crate::group_identity::verify_b64(&member_key, &bytes, &m.sig);
+                        if !ok {
+                            warn!(group = %group_id, from = %m.from, id = %m.id, "补拉消息签名校验失败，丢弃");
+                            continue;
+                        }
+                    }
                 }
                 // 图片消息的内容先落下来（补拉那一路内容跟着走）。落不下（id/名字不可用、
                 // 字节坏了）就把这一条当**没有内容的图片消息**收下 —— 界面那条气泡会写
@@ -1301,7 +2568,11 @@ impl GroupStore {
                         warn!(id = %m.id, %reason, "补拉回来的图片内容没能落下来");
                     }
                 }
-                if convo.messages.iter().any(|x| x.from == m.from && x.id == m.id) {
+                if convo
+                    .messages
+                    .iter()
+                    .any(|x| x.from == m.from && x.id == m.id)
+                {
                     continue;
                 }
                 convo.messages.push(GroupMsg {
@@ -1312,9 +2583,13 @@ impl GroupStore {
                     at: m.at,
                     seq: m.seq,
                     delivery: HashMap::new(),
+                    delivery_packed: String::new(),
                     image: m.image,
                     name: m.name.clone(),
                     size: m.size,
+                    epoch: m.epoch,
+                    pubkey: m.pubkey.clone(),
+                    sig: m.sig.clone(),
                 });
                 let entry = acked.entry(m.from.clone()).or_insert(0);
                 *entry = (*entry).max(m.at);
@@ -1322,6 +2597,12 @@ impl GroupStore {
             convo.bootstrapped = true;
             convo.messages.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
             dropped = prune(convo);
+        }
+        if !newly_bound.is_empty() {
+            let keys = guard.bound.entry(group_id.to_string()).or_default();
+            for (id, key) in newly_bound {
+                keys.insert(id, key);
+            }
         }
         drop_content(&dropped, &self.blobs_root);
         persist(&self.path, &mut guard);
@@ -1335,7 +2616,19 @@ impl GroupStore {
     /// 拒绝了本机的投递"不矛盾（他后来从别人那儿补到了）。
     pub fn mark_synced_by_peer(&self, group_id: &str, peer_id: &str, up_to: u64) -> bool {
         let mut guard = self.inner.lock();
-        let Some(convo) = guard.convos.get_mut(group_id) else { return false };
+        // 同 `mark_read_by_peer`：伪造的 `GroupAck` 会把排队副本改成「已同步」，
+        // 而补发只认「排队」—— 非成员写进来就等于让那一份**退出补发**。
+        let allowed = guard
+            .groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .is_some_and(|g| !g.left && g.is_member(peer_id));
+        if !allowed {
+            return false;
+        }
+        let Some(convo) = guard.convos.get_mut(group_id) else {
+            return false;
+        };
         let mut changed = false;
         for m in convo.messages.iter_mut() {
             if !m.delivery.contains_key(peer_id) {
@@ -1378,8 +2671,22 @@ fn normalize_members(members: &mut Vec<Member>, add: Vec<Member>) {
     }
 }
 
+/// 名册的成员集合有没有变：只比 id（顺序无关）。显示名与公钥都不算 —— 前者只是标签，
+/// 后者由本机 `bound`/`attested` 决定，不是共享名册能改的状态。
+fn same_member_ids(a: &[Member], b: &[Member]) -> bool {
+    a.len() == b.len() && a.iter().all(|m| b.iter().any(|n| n.id == m.id))
+}
+
 fn prune(convo: &mut GroupConvo) -> Vec<GroupMsg> {
-    let excess = convo.messages.len().saturating_sub(MAX_PER_GROUP);
+    let mut excess = convo.messages.len().saturating_sub(MAX_PER_GROUP);
+    // 条数没超、但字节超了：也要从最老开始裁。估算只用于触发裁剪，不追求精确。
+    let mut total: usize = convo.messages.iter().map(estimated_msg_bytes).sum();
+    let mut by_bytes = 0usize;
+    while total > MAX_GROUP_BYTES && by_bytes < convo.messages.len() {
+        total -= estimated_msg_bytes(&convo.messages[by_bytes]);
+        by_bytes += 1;
+    }
+    excess = excess.max(by_bytes);
     if excess == 0 {
         return Vec::new();
     }
@@ -1402,12 +2709,226 @@ fn prune(convo: &mut GroupConvo) -> Vec<GroupMsg> {
     dropped
 }
 
+fn estimated_msg_bytes(m: &GroupMsg) -> usize {
+    // 近似：正文、签名、公钥、名字、id/from，加固定的 JSON 字段开销。
+    m.text.len()
+        + m.name.len()
+        + m.sig.len()
+        + m.pubkey.len()
+        + m.id.len()
+        + m.from.len()
+        + m.from_name.len()
+        + m.delivery.len() * 40
+        + 192
+}
+
+// ── 投递表的落盘压缩 ─────────────────────────────────────────────────────
+//
+// `groups.dat` 里不再逐条写 "成员 id → 状态" 的对象，而是按 `Group.member_order`
+// 索引、每个成员 4 bit：
+//   0 = 这条消息不投给它；1..7 = `Delivery` 的固定编码。
+// 32 个成员的 map 约 1.2 KB/条，压缩后 16 B/条。内存和界面仍然是 map，压缩只发生在
+// 文件边界。字段仍是 `delivery`（写成空对象）+ `deliveryPacked`，旧版本能正常解析新
+// 文件；旧版本写回时会丢掉 `deliveryPacked`，但消息本身不会丢。
+
+const DELIVERY_ABSENT: u8 = 0;
+
+fn delivery_code(d: Delivery) -> u8 {
+    match d {
+        Delivery::Sending => 1,
+        Delivery::Sent => 2,
+        Delivery::Read => 3,
+        Delivery::Queued => 4,
+        Delivery::Received => 5,
+        Delivery::Synced => 6,
+        Delivery::Failed => 7,
+    }
+}
+
+fn delivery_from_code(code: u8) -> Delivery {
+    match code {
+        1 => Delivery::Sending,
+        2 => Delivery::Sent,
+        3 => Delivery::Read,
+        4 => Delivery::Queued,
+        5 => Delivery::Received,
+        6 => Delivery::Synced,
+        // 与 `Delivery::Failed` 上的 `#[serde(other)]` 同一个兜底：不认识的编码按
+        // 「未送达」处理，不要因为一条记录让整份 groups.dat 读不出来。
+        _ => Delivery::Failed,
+    }
+}
+
+/// 把一条消息的投递表压成 base64。`None` = 不压缩（空表，或有 id 不在 `order` 里，
+/// 后者保留原 map，宁可不省这几字节也不要丢状态）。
+fn encode_delivery(order: &[String], map: &HashMap<String, Delivery>) -> Option<String> {
+    if map.is_empty() || order.is_empty() {
+        return None;
+    }
+    if !map.keys().all(|id| order.iter().any(|x| x == id)) {
+        return None;
+    }
+    let mut bytes = vec![0u8; order.len().div_ceil(2)];
+    for (i, id) in order.iter().enumerate() {
+        let Some(d) = map.get(id) else { continue };
+        let code = delivery_code(*d);
+        if i % 2 == 0 {
+            bytes[i / 2] |= code & 0x0f;
+        } else {
+            bytes[i / 2] |= (code & 0x0f) << 4;
+        }
+    }
+    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+fn decode_delivery(packed: &str, order: &[String]) -> Result<HashMap<String, Delivery>, String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(packed.trim())
+        .map_err(|e| e.to_string())?;
+    let mut out = HashMap::new();
+    for (i, id) in order.iter().enumerate() {
+        let byte = bytes.get(i / 2).copied().unwrap_or(0);
+        let code = if i % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+        if code != DELIVERY_ABSENT {
+            out.insert(id.clone(), delivery_from_code(code));
+        }
+    }
+    Ok(out)
+}
+
+/// 让每个群的 `member_order` 覆盖当前成员、历史成员，以及所有消息里出现过的 id。
+///
+/// 只追加、不重排；老文件第一次升级时按 id 排序补进去，保证同一份文件多次加载得到
+/// 同一个索引表。`member_order` 里空串/重复项在这里清掉。
+fn ensure_delivery_orders(file: &mut GroupFile) {
+    for gi in 0..file.groups.len() {
+        let gid = file.groups[gi].id.clone();
+        let mut extra: Vec<String> = Vec::new();
+        if let Some(convo) = file.convos.get(&gid) {
+            for m in &convo.messages {
+                for id in m.delivery.keys() {
+                    if !extra.iter().any(|x| x == id) {
+                        extra.push(id.clone());
+                    }
+                }
+            }
+        }
+        extra.sort();
+        extra.dedup();
+        let g = &mut file.groups[gi];
+        g.ensure_member_order();
+        let mut seen: Vec<String> = Vec::new();
+        g.member_order.retain(|id| {
+            if id.is_empty() || seen.iter().any(|x| x == id) {
+                false
+            } else {
+                seen.push(id.clone());
+                true
+            }
+        });
+        for id in extra {
+            if g.member_order.len() >= MAX_MEMBER_ORDER {
+                break;
+            }
+            if !g.member_order.iter().any(|x| x == &id) {
+                g.member_order.push(id);
+            }
+        }
+    }
+}
+
+fn decode_message_delivery(m: &mut GroupMsg, order: &[String]) {
+    if m.delivery_packed.is_empty() {
+        return;
+    }
+    match decode_delivery(&m.delivery_packed, order) {
+        Ok(decoded) => {
+            // 老文件里同时有 map 和 packed 时以 map 为准，packed 只补缺的 id。
+            for (id, d) in decoded {
+                m.delivery.entry(id).or_insert(d);
+            }
+            m.delivery_packed.clear();
+        }
+        Err(e) => warn!(id = %m.id, %e, "压缩的投递表读不出来，保留原 map"),
+    }
+}
+
+/// 加载后把压缩字段展开成内存里的 map，并补齐索引表。
+fn repair_delivery_tables(file: &mut GroupFile) {
+    ensure_delivery_orders(file);
+    let orders: HashMap<String, Vec<String>> = file
+        .groups
+        .iter()
+        .map(|g| (g.id.clone(), g.member_order.clone()))
+        .collect();
+    for (gid, convo) in &mut file.convos {
+        let Some(order) = orders.get(gid) else {
+            continue;
+        };
+        for m in &mut convo.messages {
+            decode_message_delivery(m, order);
+        }
+    }
+}
+
+/// 把序列化出来的 `Value` 里每条消息的 `delivery` 换成 `{}` + `deliveryPacked`。
+fn pack_file_delivery(value: &mut serde_json::Value, file: &GroupFile) {
+    let Some(convos) = value
+        .get_mut("convos")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let orders: HashMap<&str, &Vec<String>> = file
+        .groups
+        .iter()
+        .map(|g| (g.id.as_str(), &g.member_order))
+        .collect();
+    let empty_order: Vec<String> = Vec::new();
+    for (gid, convo_value) in convos.iter_mut() {
+        let Some(convo) = file.convos.get(gid.as_str()) else {
+            continue;
+        };
+        let order = orders.get(gid.as_str()).copied().unwrap_or(&empty_order);
+        let Some(messages) = convo_value
+            .get_mut("messages")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for (m, m_value) in convo.messages.iter().zip(messages.iter_mut()) {
+            let Some(obj) = m_value.as_object_mut() else {
+                continue;
+            };
+            if let Some(packed) = encode_delivery(order, &m.delivery) {
+                obj.insert(
+                    "delivery".to_string(),
+                    serde_json::Value::Object(serde_json::Map::new()),
+                );
+                obj.insert(
+                    "deliveryPacked".to_string(),
+                    serde_json::Value::String(packed),
+                );
+            } else {
+                // 不压缩时不要留下过期的 packed 字段（老 map 才是准的）。
+                obj.remove("deliveryPacked");
+            }
+        }
+    }
+}
+
 /// 这几条群消息的**内容文件**一起删掉（裁剪 / 丢攒着的那几条 / 退群时）。
 ///
 /// 与 `chat::drop_blobs` 是同一件事（都走 `blobs::remove_many`）：内容目录是**同一个**，
 /// 两边各按自己的消息类型挑出"谁是图片消息"。
 fn drop_content(messages: &[GroupMsg], root: &std::path::Path) {
-    crate::blobs::remove_many(root, messages.iter().filter(|m| m.image).map(|m| (m.id.as_str(), m.name.as_str())));
+    crate::blobs::remove_many(
+        root,
+        messages
+            .iter()
+            .filter(|m| m.image)
+            .map(|m| (m.id.as_str(), m.name.as_str())),
+    );
 }
 
 /// 一条消息的**内容文件**此刻在哪（文字消息、或那份文件不在盘上 = 空串）。
@@ -1418,8 +2939,7 @@ fn content_path(root: &std::path::Path, m: &GroupMsg) -> String {
     if !m.image {
         return String::new();
     }
-    crate::blobs::path_in(root, &m.id, &m.name)
-        .filter(|p| p.is_file())
+    crate::blobs::existing_path(root, &m.id, &m.name)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default()
 }
@@ -1461,14 +2981,19 @@ fn holes_in(convo: &GroupConvo) -> Vec<SyncHole> {
         let mut have = by_sender.get(*from).cloned().unwrap_or_default();
         have.sort_unstable();
         have.dedup();
-        let Some(max) = have.last().copied() else { continue };
+        let Some(max) = have.last().copied() else {
+            continue;
+        };
         let floor = convo.pruned_below.get(*from).copied().unwrap_or(0);
         let missing: Vec<u64> = (floor + 1..=max)
             .filter(|seq| !have.contains(seq))
             .take(MAX_HOLES_PER_SENDER)
             .collect();
         if !missing.is_empty() {
-            out.push(SyncHole { from: (*from).to_string(), seqs: missing });
+            out.push(SyncHole {
+                from: (*from).to_string(),
+                seqs: missing,
+            });
         }
     }
     out
@@ -1488,7 +3013,14 @@ fn wire_of(root: &std::path::Path, m: &GroupMsg) -> GroupMsgWire {
         size: m.size,
         // 内容不在盘上（被裁剪过、或写了一半）：这一条就**没有内容**地过去 —— 收方那台会
         // 如实显示"读不出来"。补拉本来就是尽力而为，扣下整条不发反而让人以为丢了。
-        data: if m.image { image_data(root, m).unwrap_or_default() } else { String::new() },
+        data: if m.image {
+            image_data(root, m).unwrap_or_default()
+        } else {
+            String::new()
+        },
+        epoch: m.epoch,
+        pubkey: m.pubkey.clone(),
+        sig: m.sig.clone(),
     }
 }
 
@@ -1507,7 +3039,7 @@ pub struct GroupMsgView {
     /// 仅 `from_me` 有意义：读过这条的成员数（`read_by` 的水位 ≥ 这条的 `at`）。
     pub read_count: u32,
     /// 图片消息那几格（与一对一那条路同一套语义，见 `crate::blobs`）：`path` 是**本机此刻**
-    /// 那份内容文件（后端现算，不进 `groups.json`），内容不在盘上时是空串。
+    /// 那份内容文件（后端现算，不进 `groups.dat`），内容不在盘上时是空串。
     pub image: bool,
     pub name: String,
     pub size: u64,
@@ -1533,10 +3065,32 @@ pub struct GroupView {
     pub missing: u32,
 }
 
-fn view_of(group: &Group, convo: Option<&GroupConvo>, own_id: &str, blobs_root: &std::path::Path) -> GroupView {
+/// 名册变更后收掉 `read_by` 里已经不在名册的人；本机被移出时整表清空。
+/// `read_by` 只服务「已读 n/m」（只数当前成员），所以这些格子在成员离开后本来也不可见。
+fn prune_read_by(convo: &mut GroupConvo, group: &Group) {
+    if group.left {
+        convo.read_by.clear();
+    } else {
+        convo
+            .read_by
+            .retain(|id, at| *at > 0 && group.is_member(id));
+    }
+}
+
+fn view_of(
+    group: &Group,
+    convo: Option<&GroupConvo>,
+    own_id: &str,
+    blobs_root: &std::path::Path,
+) -> GroupView {
     let empty = GroupConvo::default();
     let convo = convo.unwrap_or(&empty);
-    let others: Vec<Member> = group.members.iter().filter(|m| m.id != own_id).cloned().collect();
+    let others: Vec<Member> = group
+        .members
+        .iter()
+        .filter(|m| m.id != own_id)
+        .cloned()
+        .collect();
     let mut ordered: Vec<&GroupMsg> = convo.messages.iter().collect();
     ordered.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
     let messages = ordered
@@ -1559,12 +3113,16 @@ fn view_of(group: &Group, convo: Option<&GroupConvo>, own_id: &str, blobs_root: 
                 at: m.at,
                 seq: m.seq,
                 from_me,
-                delivery: if from_me { m.delivery.clone() } else { HashMap::new() },
+                delivery: if from_me {
+                    m.delivery.clone()
+                } else {
+                    HashMap::new()
+                },
                 read_count,
                 image: m.image,
                 name: m.name.clone(),
                 size: m.size,
-                // 图片内容文件**本机此刻**在哪（不进 `groups.json`：换台机器就错了）。
+                // 图片内容文件**本机此刻**在哪（不进 `groups.dat`：换台机器就错了）。
                 path: content_path(blobs_root, m),
             }
         })
@@ -1614,12 +3172,24 @@ fn unread_of(group: &Group, convo: Option<&GroupConvo>, own_id: &str) -> u32 {
 fn persist(path: &PathBuf, file: &mut GroupFile) {
     // 版本位在**写盘这一刻**补上：读到老文件（没有这一栏）也能立刻升级成当前形状。
     file.version = FORMAT_VERSION;
-    match serde_json::to_vec(file) {
+    // 先把可能漏掉的投递 id 补进 member_order（老文件/异常路径），再压。
+    ensure_delivery_orders(file);
+    let mut value = match serde_json::to_value(&*file) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(%e, "group store serialize failed");
+            return;
+        }
+    };
+    pack_file_delivery(&mut value, file);
+    match serde_json::to_vec(&value) {
         Ok(bytes) => {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if let Err(e) = write_atomic(path, &bytes) {
+            // 与 `ChatStore` 同一层封装（**不是加密**）：双击打开看不到群聊明文。
+            let wrapped = envelope::encode("", &bytes);
+            if let Err(e) = write_atomic(path, &wrapped) {
                 warn!(path = %path.display(), %e, "group store persist failed");
             }
         }
@@ -1634,6 +3204,12 @@ fn persist(path: &PathBuf, file: &mut GroupFile) {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
+    /// 这份快照的版本号（进程内单调递增，见 `AppState::chat_rev`）。
+    ///
+    /// 命令返回与 `chat://changed` 事件走的不是同一条通道，到达顺序没有保证：界面**只认
+    /// 更大的那个**。没有它，"发送中"那份旧快照可能晚于"已送达"的新快照到达，消息就会
+    /// 一直停在「发送中」，直到重新拉一次整份状态（关掉再打开会话）。
+    pub rev: u64,
     pub convos: Vec<crate::chat::PeerConvoView>,
     pub batches: Vec<crate::chat::ChatBatch>,
     pub groups: Vec<GroupView>,
@@ -1646,12 +3222,17 @@ pub struct Snapshot {
 
 /// 整份会话状态：**一对一那份 + 群那份**（命令返回与 `chat://changed` 载荷共用这一个形状）。
 pub fn snapshot(state: &AppState) -> Snapshot {
+    let rev = state
+        .chat_rev
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
     let own_id = state.config.lock().device_id.clone();
     let chat = state.chat.snapshot();
     let groups = state.groups.views(&own_id);
     let pending_groups = state.groups.pending_views(&own_id);
     let unread = chat.unread + state.groups.unread_total(&own_id);
     Snapshot {
+        rev,
         convos: chat.convos,
         batches: chat.batches,
         groups,
@@ -1681,7 +3262,18 @@ pub fn create(state: &Arc<AppState>, members: &[String], name: &str) -> Option<S
     if others.is_empty() {
         return None;
     }
-    let id = state.groups.create(Member { id: own_id, name: own_name }, others, name);
+    let id = state.groups.create(
+        Member {
+            id: own_id,
+            name: own_name,
+            pubkey: String::new(),
+        },
+        others,
+        name,
+    );
+    if id.is_empty() {
+        return None;
+    }
     broadcast_roster(state, &id);
     Some(id)
 }
@@ -1690,7 +3282,11 @@ pub fn create(state: &Arc<AppState>, members: &[String], name: &str) -> Option<S
 pub fn edit(state: &Arc<AppState>, group_id: &str, members: &[String], name: &str) -> bool {
     let own_id = state.config.lock().device_id.clone();
     let others = resolve_members(state, members, &own_id);
-    if state.groups.edit_local(group_id, &own_id, name, others).is_none() {
+    if state
+        .groups
+        .edit_local(group_id, &own_id, name, others)
+        .is_none()
+    {
         return false;
     }
     broadcast_roster(state, group_id);
@@ -1712,7 +3308,12 @@ pub fn leave(state: &Arc<AppState>, group_id: &str) -> bool {
 /// 用户点了「加入」。名册是共享的、本机那一行本来就在里面，所以这里只需要本地落定。
 pub fn accept(state: &Arc<AppState>, group_id: &str) -> bool {
     let own_id = state.config.lock().device_id.clone();
-    state.groups.accept_pending(group_id, &own_id)
+    if !state.groups.accept_pending(group_id, &own_id) {
+        return false;
+    }
+    // 加入时本机把群公钥写进名册（rev+1、签名），广播出去让其他成员绑定。
+    broadcast_roster(state, group_id);
+    true
 }
 
 /// 用户点了「不加入」。
@@ -1728,7 +3329,15 @@ pub fn dismiss(state: &Arc<AppState>, group_id: &str) -> bool {
 /// `at` = 点名这条消息在时间线上的位置（只有输入区"图文混排"的每一段会点名，见
 /// `chat::send_text` 的同名参数）。**`seq` 仍然由这里按序发**（同一个发送方说话的先后），
 /// 所以点名 `at` 之后排序键（`at`，`seq`）照样是稳的。
-pub fn send_text(state: &Arc<AppState>, group_id: &str, text: &str, at: Option<u64>) -> Option<String> {
+pub fn send_text(
+    state: &Arc<AppState>,
+    group_id: &str,
+    text: &str,
+    at: Option<u64>,
+) -> Option<String> {
+    if text.len() > MAX_TEXT_BYTES {
+        return None;
+    }
     let (own_id, own_name) = own_ids(state);
     let group = sendable_group(state, group_id, &own_id)?;
     let at = at.unwrap_or_else(now_ms);
@@ -1738,7 +3347,17 @@ pub fn send_text(state: &Arc<AppState>, group_id: &str, text: &str, at: Option<u
         &own_id,
         text,
         at,
-        |msg| group_event_with(&group, &own_id, &own_name, msg, vec![own_id.clone()], String::new()),
+        String::new(),
+        |msg| {
+            group_event_with(
+                &group,
+                &own_id,
+                &own_name,
+                msg,
+                vec![own_id.clone()],
+                String::new(),
+            )
+        },
         None,
     );
     Some(msg.id)
@@ -1782,7 +3401,17 @@ pub fn send_image(
         &own_id,
         crate::blobs::Content::image(name, bytes.len() as u64),
         at,
-        |msg| group_event_with(&group, &own_id, &own_name, msg, vec![own_id.clone()], data.clone()),
+        data.clone(),
+        |msg| {
+            group_event_with(
+                &group,
+                &own_id,
+                &own_name,
+                msg,
+                vec![own_id.clone()],
+                data.clone(),
+            )
+        },
         Some(&id),
     );
     Ok(Some(msg.id))
@@ -1814,6 +3443,7 @@ fn send_group_msg(
     own_id: &str,
     content: impl Into<crate::blobs::Content>,
     at: u64,
+    data: String,
     event_of: impl FnOnce(&GroupMsg) -> WsEvent,
     pre_id: Option<&str>,
 ) -> GroupMsg {
@@ -1834,8 +3464,13 @@ fn send_group_msg(
         deliveries.push((peer.clone(), Delivery::Sending));
         inflight.push(peer.clone());
     }
-    let id = pre_id.map(str::to_string).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let msg = state.groups.record_outbound(group_id, &id, own_id, content, at, &deliveries);
+    let id = pre_id
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let msg =
+        state
+            .groups
+            .record_outbound_signed(group_id, &id, own_id, content, at, &deliveries, &data);
     // 落账之后才有 seq：事件在这之后造（内容也只编一次）。
     let event = event_of(&msg);
     // 长连接那条路当场发（写成功 = 已送达），写不进去的交给后台那一跳。
@@ -1856,7 +3491,12 @@ fn send_group_msg(
         if settled.iter().any(|(p, _)| p == &peer) {
             continue;
         }
-        spawn_group_event(state, &peer, event.clone(), Some((group_id.to_string(), msg.id.clone())));
+        spawn_group_event(
+            state,
+            &peer,
+            event.clone(),
+            Some((group_id.to_string(), msg.id.clone())),
+        );
     }
     for peer in needs_flush {
         crate::chat::flush_queued(state, &peer);
@@ -1869,8 +3509,12 @@ fn send_group_msg(
 /// 本机读过这个群：读位推进到最新那条，并给每个成员回一条**逐发送者水位**的已读回执。
 pub fn mark_read(state: &Arc<AppState>, group_id: &str) {
     let own_id = state.config.lock().device_id.clone();
-    let Some(view) = state.groups.view(group_id, &own_id) else { return };
-    let Some(last) = view.messages.last() else { return };
+    let Some(view) = state.groups.view(group_id, &own_id) else {
+        return;
+    };
+    let Some(last) = view.messages.last() else {
+        return;
+    };
     let moved = state.groups.mark_read_local(group_id, &last.id);
     if !moved && view.unread == 0 {
         // 读位没动、也没未读：不必再发一遍回执（每次聚焦都往对端丢一条空回执没有意义）。
@@ -1885,7 +3529,10 @@ pub fn mark_read(state: &Arc<AppState>, group_id: &str) {
         spawn_group_event(
             state,
             &member.id,
-            WsEvent::GroupRead { group_id: group_id.to_string(), up_to },
+            WsEvent::GroupRead {
+                group_id: group_id.to_string(),
+                up_to,
+            },
             None,
         );
     }
@@ -1895,7 +3542,9 @@ pub fn mark_read(state: &Arc<AppState>, group_id: &str) {
 /// 把本机的名册广播给全部其他成员（建群/改名/加减人/退群都用它）。
 pub fn broadcast_roster(state: &Arc<AppState>, group_id: &str) {
     let own_id = state.config.lock().device_id.clone();
-    let Some(group) = state.groups.group(group_id) else { return };
+    let Some(group) = state.groups.group(group_id) else {
+        return;
+    };
     for peer in group.others(&own_id) {
         spawn_roster_to(state, &peer, &group);
     }
@@ -1903,7 +3552,10 @@ pub fn broadcast_roster(state: &Arc<AppState>, group_id: &str) {
 
 /// 把一份名册投给一台设备（后台那一跳：长连接优先、HTTP 兜底；**投成功才记"告诉过了"**）。
 fn spawn_roster_to(state: &Arc<AppState>, peer_id: &str, group: &Group) {
-    let event = WsEvent::GroupRoster { roster: group.payload(), sender: own_info(state) };
+    let event = WsEvent::GroupRoster {
+        roster: group.payload(),
+        sender: own_info(state),
+    };
     let (state, peer, gid) = (state.clone(), peer_id.to_string(), group.id.clone());
     crate::task::spawn("group roster", async move {
         if crate::chat::deliver(&state, &peer, &event).await == Outcome::Delivered {
@@ -1941,17 +3593,27 @@ fn roster_step(outcome: Outcome) -> RosterStep {
 ///
 /// 为什么必须先补：对方不认识的群，群里那条消息无处可放（会被丢掉）—— 名册是它的入场券。
 /// `settle` 非空 = 这是一条本机发的消息，投递结果要落定到那一份副本上。
-fn spawn_group_event(state: &Arc<AppState>, peer_id: &str, event: WsEvent, settle: Option<(String, String)>) {
+fn spawn_group_event(
+    state: &Arc<AppState>,
+    peer_id: &str,
+    event: WsEvent,
+    settle: Option<(String, String)>,
+) {
     let (state, peer) = (state.clone(), peer_id.to_string());
     crate::task::spawn("group send", async move {
         let group_id = match &event {
-            WsEvent::GroupText { group_id, .. } | WsEvent::GroupRead { group_id, .. } => Some(group_id.clone()),
+            WsEvent::GroupText { group_id, .. } | WsEvent::GroupRead { group_id, .. } => {
+                Some(group_id.clone())
+            }
             _ => None,
         };
         if let Some(gid) = group_id {
             if state.groups.needs_roster(&gid, &peer) {
                 if let Some(g) = state.groups.group(&gid) {
-                    let roster = WsEvent::GroupRoster { roster: g.payload(), sender: own_info(&state) };
+                    let roster = WsEvent::GroupRoster {
+                        roster: g.payload(),
+                        sender: own_info(&state),
+                    };
                     match roster_step(crate::chat::deliver(&state, &peer, &roster).await) {
                         RosterStep::Proceed => state.groups.mark_told(&gid, &peer),
                         // 名册没送到就别发本体了：对方只会把它丢掉。
@@ -1978,8 +3640,18 @@ fn spawn_group_event(state: &Arc<AppState>, peer_id: &str, event: WsEvent, settl
 }
 
 /// 一条群消息的某一份落定（并推整份状态给界面）。
-pub fn settle_group(state: &Arc<AppState>, group_id: &str, msg_id: &str, peer_id: &str, outcome: Outcome) {
-    if state.groups.set_deliveries(group_id, msg_id, &[(peer_id.to_string(), outcome.delivery())]) {
+pub fn settle_group(
+    state: &Arc<AppState>,
+    group_id: &str,
+    msg_id: &str,
+    peer_id: &str,
+    outcome: Outcome,
+) {
+    if state.groups.set_deliveries(
+        group_id,
+        msg_id,
+        &[(peer_id.to_string(), outcome.delivery())],
+    ) {
         emit(state);
     }
 }
@@ -1995,9 +3667,18 @@ pub enum FlushStep {
 }
 
 /// 补发一条排队的群消息：**先补名册**（对方不认识的群，消息无处可放），再发本体，再落定。
-pub async fn flush_one(state: &Arc<AppState>, peer_id: &str, group_id: &str, msg: &GroupMsg, group: &Group) -> FlushStep {
+pub async fn flush_one(
+    state: &Arc<AppState>,
+    peer_id: &str,
+    group_id: &str,
+    msg: &GroupMsg,
+    group: &Group,
+) -> FlushStep {
     if state.groups.needs_roster(group_id, peer_id) {
-        let roster = WsEvent::GroupRoster { roster: group.payload(), sender: own_info(state) };
+        let roster = WsEvent::GroupRoster {
+            roster: group.payload(),
+            sender: own_info(state),
+        };
         match roster_step(crate::chat::deliver(state, peer_id, &roster).await) {
             RosterStep::Proceed => state.groups.mark_told(group_id, peer_id),
             RosterStep::Queue => return FlushStep::Blocked,
@@ -2061,19 +3742,28 @@ fn group_event_with(
         at: msg.at,
         seq: msg.seq,
         rev: group.rev,
-        author: PeerInfo { id: own_id.to_string(), name: own_name.to_string() },
+        author: PeerInfo {
+            id: own_id.to_string(),
+            name: own_name.to_string(),
+        },
         hops: 0,
         reached,
         image: msg.image,
         name: msg.name.clone(),
         size: msg.size,
         data,
+        epoch: msg.epoch,
+        pubkey: msg.pubkey.clone(),
+        sig: msg.sig.clone(),
     }
 }
 
 fn own_info(state: &AppState) -> PeerInfo {
     let c = state.config.lock();
-    PeerInfo { id: c.device_id.clone(), name: c.device_name.clone() }
+    PeerInfo {
+        id: c.device_id.clone(),
+        name: c.device_name.clone(),
+    }
 }
 
 /// 界面给的成员 id → 名册行（名字以**本机设备表**为准；地址簿里没有的用 id 顶着）。
@@ -2088,7 +3778,11 @@ fn resolve_members(state: &AppState, ids: &[String], own_id: &str) -> Vec<Member
             .map(|p| p.name)
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| id.clone());
-        out.push(Member { id: id.clone(), name });
+        out.push(Member {
+            id: id.clone(),
+            name,
+            pubkey: String::new(),
+        });
         if out.len() >= MAX_MEMBERS - 1 {
             break;
         }
@@ -2111,6 +3805,10 @@ pub const REASON_DECLINED: &str = "declined";
 pub const REASON_UNKNOWN: &str = "unknown";
 /// 这一帧的发送方不在名册里（P1-7 防冒名）。
 pub const REASON_NOT_MEMBER: &str = "not_member";
+/// 签名缺失/校验失败：发送方拿不出作者名册里的私钥。
+pub const REASON_BAD_SIG: &str = "bad_signature";
+/// 单条文本超过 `MAX_TEXT_BYTES`。
+pub const REASON_TOO_LONG: &str = "too_long";
 
 /// 收到一条群消息之后，本机到底把它放哪儿了。
 ///
@@ -2129,6 +3827,10 @@ pub enum GroupTextOutcome {
     Unknown,
     /// 这一帧的发送方不在名册里：丢掉（P1-7）。
     NotMember,
+    /// 名册要求签名，但这条没有/签名不对。
+    BadSignature,
+    /// 文本超过单条上限。
+    TooLong,
 }
 
 impl GroupTextOutcome {
@@ -2142,6 +3844,8 @@ impl GroupTextOutcome {
         match self {
             Self::Dismissed => REASON_DECLINED,
             Self::Unknown => REASON_UNKNOWN,
+            Self::BadSignature => REASON_BAD_SIG,
+            Self::TooLong => REASON_TOO_LONG,
             _ => REASON_NOT_MEMBER,
         }
     }
@@ -2170,7 +3874,11 @@ pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -
         //  连这个群的名册都没有 —— 与改动前的行为一致。）
         let sender_ok = (event.sender_id.is_empty() || event.sender_id == peer_id)
             && (state.groups.pending_has_member(&event.group_id, peer_id)
-                || state.groups.members(&event.group_id).iter().any(|m| m == peer_id));
+                || state
+                    .groups
+                    .members(&event.group_id)
+                    .iter()
+                    .any(|m| m == peer_id));
         if !sender_ok {
             warn!(
                 group = %event.group_id, %peer_id,
@@ -2182,7 +3890,7 @@ pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -
         // 攒下 = 对发送方算送达（它会在本机点「加入」那一刻出现），所以这一档不回拒收。
         let name = display_name(state, peer_id, &event.sender_name);
         stage_group_content(state, &event);
-        if state.groups.buffer_pending_message(
+        if state.groups.buffer_pending_message_signed(
             &event.group_id,
             peer_id,
             &name,
@@ -2190,6 +3898,9 @@ pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -
             event_content(&event),
             event.at,
             event.seq,
+            event.epoch,
+            &event.pubkey,
+            &event.sig,
         ) {
             debug!(group = %event.group_id, %peer_id, "邀请还没确认：先把这条群消息攒着");
             return GroupTextOutcome::Buffered;
@@ -2225,12 +3936,111 @@ pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -
         return GroupTextOutcome::NotMember;
     };
     let name = display_name(state, &author, &event.sender_name);
+    if event.text.len() > MAX_TEXT_BYTES {
+        warn!(group = %event.group_id, %author, bytes = event.text.len(), "群消息过长，拒收");
+        return GroupTextOutcome::TooLong;
+    }
+    // 签名校验：名册里已有作者公钥 → 必须与它匹配；还没有 → 允许用本条消息自带的
+    // 公钥做一次绑定（TOFU，前提是作者本来就在名册里）。群一旦进入 `require_sig`，
+    // 没有签名的消息一律不收。
+    let Some(group) = state.groups.group(&event.group_id) else {
+        return GroupTextOutcome::Unknown;
+    };
+    let direct = event.sender_id.is_empty() || event.sender_id == peer_id;
+    // 已配对 = 这条入站请求的身份是 token 换来的（HTTP 在 `accept` 验过，WS 升级时验过）。
+    // 只有它能证明"这个 id 就是这台设备"，也才有资格把公钥标成 attested。
+    let sender_paired = state.get_peer(peer_id).is_some_and(|p| p.paired);
+    let member_key = state.groups.effective_member_key(&event.group_id, &author);
+    // 公钥还没绑定（老群/新成员第一次说话）时按 TOFU 放行；一旦本机已经知道每个成员的
+    // 钥（本地绑定或名册里都有提示），或者作者本人已绑定，就必须签名。名册里的提示只用
+    // 来决定"要不要更严格"，**不参与验签**。
+    let all_bound = state.groups.all_member_keys_known(&event.group_id);
+    let need_sig = member_key.is_some() || (group.require_sig && all_bound);
+    let signed = !event.sig.is_empty() && !event.pubkey.is_empty();
+    // **中转消息不能给作者绑钥**：搬运工不是作者，它带来的 `pubkey` 只能算"作者自称"。
+    // 作者公钥还没绑定时，这条中转消息无处可验 —— 丢掉，等作者直发或补拉。
+    // 这一条放在签名分支外面：即使群还没进入 `require_sig`，也不能让第三方替作者占钥。
+    if member_key.is_none() && !direct {
+        warn!(
+            group = %event.group_id, %author, %peer_id,
+            "中转消息的作者公钥未绑定，丢弃（不允许经第三方绑钥）"
+        );
+        return GroupTextOutcome::BadSignature;
+    }
+    if need_sig || signed {
+        // 已配对的作者本人拿一把新钥来：只有旧钥**未经配对认证**时才允许替换。
+        // 这是"被冒名者抢先用 TOFU 占了公钥"的恢复路径。
+        let replace_untrusted = direct
+            && sender_paired
+            && !event.pubkey.is_empty()
+            && member_key
+                .as_deref()
+                .is_some_and(|known| known != event.pubkey)
+            && state
+                .groups
+                .attested_key(&event.group_id, &author)
+                .is_none();
+        let key = if replace_untrusted {
+            Some(event.pubkey.clone())
+        } else {
+            member_key
+                .clone()
+                .or_else(|| (!event.pubkey.is_empty()).then(|| event.pubkey.clone()))
+        };
+        let bytes = group_msg_signing_bytes(
+            &event.group_id,
+            event.epoch,
+            &author,
+            &event.id,
+            event.at,
+            event.seq,
+            &event.text,
+            event.image,
+            &event.name,
+            event.size,
+            &event.data,
+        );
+        let key_matches = match member_key.as_deref() {
+            Some(known) => replace_untrusted || key.as_deref() == Some(known),
+            None => true,
+        };
+        let ok = key_matches
+            && key
+                .as_deref()
+                .is_some_and(|k| crate::group_identity::verify_b64(k, &bytes, &event.sig));
+        if !ok {
+            warn!(
+                group = %event.group_id, %author,
+                "群消息签名缺失或校验失败，丢弃"
+            );
+            return GroupTextOutcome::BadSignature;
+        }
+        // 绑定/认证/修复这一把钥：本人直发才可能走到这里（中转那一路上面已经挡掉）。
+        // - 未配对本人：TOFU 绑定，只够普通消息，拉历史仍然拒绝；
+        // - 已配对本人：绑定并标 attested，拉历史从此放行（或恢复被冒名占掉的钥）；
+        // - 本地已绑定、名册那一格被别的成员改过：`bind_member_key` 会用本地钥修回来。
+        if direct && !event.pubkey.is_empty() {
+            if state
+                .groups
+                .bind_member_key(
+                    &event.group_id,
+                    &own_id,
+                    &author,
+                    &event.pubkey,
+                    sender_paired,
+                )
+                .is_some()
+            {
+                broadcast_roster(state, &event.group_id);
+            }
+        }
+    }
     // 图片消息：**先把内容落下来**（攒着的那一档上面那条路也落过一次；重投是幂等的）。
     // 落不下（解码失败 / id 不可用 / 超上限）就把这一条当**没有内容的图片消息**收下：
     // 界面那条气泡会写"读不出来"，比整条丢掉诚实，也比闷着不说强。
     stage_group_content(state, &event);
     let content = event_content(&event);
-    let inserted = state.groups.record_inbound(
+    let inserted = state.groups.record_inbound_signed(
         &event.group_id,
         &author,
         &name,
@@ -2238,6 +4048,9 @@ pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -
         content.clone(),
         event.at,
         event.seq,
+        event.epoch,
+        &event.pubkey,
+        &event.sig,
     );
     if !inserted {
         // 重复投递（补发/重连重投）：这条早就在群里了，对发送方**算收下** —— 别拿它回一条拒收。
@@ -2263,7 +4076,13 @@ pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -
 /// "写成功"在这里是可信的；HTTP 兜底那一跳要反拨发送方（地址是它这一次连接时留下的，
 /// 经中转来的那些对端不会留下地址 —— 那种情形这条回执会发不出去，此时发送方至少还有
 /// 409 那个状态码兜底，只是拿不到理由）。
-pub fn reject_text(state: &Arc<AppState>, peer_id: &str, group_id: &str, msg_id: &str, reason: &str) {
+pub fn reject_text(
+    state: &Arc<AppState>,
+    peer_id: &str,
+    group_id: &str,
+    msg_id: &str,
+    reason: &str,
+) {
     let event = WsEvent::GroupTextRejected {
         group_id: group_id.to_string(),
         id: msg_id.to_string(),
@@ -2280,9 +4099,24 @@ pub fn reject_text(state: &Arc<AppState>, peer_id: &str, group_id: &str, msg_id:
 
 /// 收到"这一条我收不下"（`GroupTextRejected`）：那一份落「未送达」；理由是"本机拒绝过"时，
 /// 还要把这位成员记进 `declined`（界面上那枚胶囊就是靠它变红）。
-pub fn on_group_text_rejected(state: &Arc<AppState>, peer_id: &str, group_id: &str, msg_id: &str, reason: &str) {
+pub fn on_group_text_rejected(
+    state: &Arc<AppState>,
+    peer_id: &str,
+    group_id: &str,
+    msg_id: &str,
+    reason: &str,
+) {
+    // 非成员/已移出成员的回执一律不收（P1-7 补遗）：群成员不要求配对，token 之外
+    // 只能靠名册闸门挡住"知道群 id 就能改别人投递状态"。
+    if !state.groups.is_member(group_id, peer_id) {
+        debug!(group = %group_id, %peer_id, "群拒收回执被忽略：发送者不在名册里");
+        return;
+    }
     let declined = reason == REASON_DECLINED;
-    if state.groups.mark_rejected(group_id, msg_id, peer_id, declined) {
+    if state
+        .groups
+        .mark_rejected(group_id, msg_id, peer_id, declined)
+    {
         debug!(group = %group_id, msg = %msg_id, %peer_id, %reason, "对端拒收了这条群消息");
         emit(state);
     }
@@ -2297,11 +4131,19 @@ pub fn on_group_text_rejected(state: &Arc<AppState>, peer_id: &str, group_id: &s
 /// **替别人搬消息要用户点头**（`Config::group_relay`，缺省**开**，用户可在设置里关掉）：
 /// 它占用本机上行带宽 ——
 /// 搬出去的字节按序列化后的消息体大小计入「中转流量」（S-11，`AppState::note_relay_message`）。
-fn maybe_relay(state: &Arc<AppState>, own_id: &str, author: &str, author_name: &str, event: &GroupTextIn) {
+fn maybe_relay(
+    state: &Arc<AppState>,
+    own_id: &str,
+    author: &str,
+    author_name: &str,
+    event: &GroupTextIn,
+) {
     if !state.config.lock().group_relay || event.hops >= MAX_HOPS {
         return;
     }
-    let Some(group) = state.groups.group(&event.group_id) else { return };
+    let Some(group) = state.groups.group(&event.group_id) else {
+        return;
+    };
     if group.left || !group.is_member(own_id) {
         return;
     }
@@ -2325,7 +4167,10 @@ fn maybe_relay(state: &Arc<AppState>, own_id: &str, author: &str, author_name: &
             at: event.at,
             seq: event.seq,
             rev: group.rev,
-            author: PeerInfo { id: author.to_string(), name: author_name.to_string() },
+            author: PeerInfo {
+                id: author.to_string(),
+                name: author_name.to_string(),
+            },
             hops: event.hops + 1,
             reached: reached.clone(),
             // 图片消息那几格**原样搬**（内容也在 `event.data` 里）—— 中转就是"替别人再送一遍"，
@@ -2334,6 +4179,9 @@ fn maybe_relay(state: &Arc<AppState>, own_id: &str, author: &str, author_name: &
             name: event.name.clone(),
             size: event.size,
             data: event.data.clone(),
+            epoch: event.epoch,
+            pubkey: event.pubkey.clone(),
+            sig: event.sig.clone(),
         };
         if let Ok(body) = serde_json::to_vec(&ev) {
             relayed_bytes += body.len() as u64;
@@ -2349,7 +4197,14 @@ fn maybe_relay(state: &Arc<AppState>, own_id: &str, author: &str, author_name: &
 
 /// 收到一枚群已读回执。
 pub fn on_group_read(state: &Arc<AppState>, peer_id: &str, group_id: &str, up_to: u64) -> bool {
-    let changed = state.groups.mark_read_by_peer(group_id, peer_id, up_to);
+    if !state.groups.is_member(group_id, peer_id) {
+        debug!(group = %group_id, %peer_id, "群已读回执被忽略：发送者不在名册里");
+        return false;
+    }
+    let own_id = state.config.lock().device_id.clone();
+    let changed = state
+        .groups
+        .mark_read_by_peer(group_id, peer_id, &own_id, up_to);
     if changed {
         emit(state);
     }
@@ -2357,13 +4212,23 @@ pub fn on_group_read(state: &Arc<AppState>, peer_id: &str, group_id: &str, up_to
 }
 
 /// 收到一份名册（建群邀请 / 成员变更）。
-pub fn on_roster(state: &Arc<AppState>, peer_id: &str, roster: RosterPayload, sender_name: &str) -> RosterOutcome {
+pub fn on_roster(
+    state: &Arc<AppState>,
+    peer_id: &str,
+    roster: RosterPayload,
+    sender_name: &str,
+) -> RosterOutcome {
     let own_id = state.config.lock().device_id.clone();
     let from = PeerInfo {
         id: peer_id.to_string(),
         name: display_name(state, peer_id, sender_name),
     };
-    let outcome = state.groups.apply_roster(&own_id, &roster, &from);
+    // 已配对 = 这条入站请求的身份是 token 换来的（HTTP 那一跳在 `accept` 里验过，
+    // WS 升级时验过）。只有这一档才配把更新者的群公钥标成 attested。
+    let trusted = state.get_peer(peer_id).is_some_and(|p| p.paired);
+    let outcome = state
+        .groups
+        .apply_roster_with_trust(&own_id, &roster, &from, trusted);
     match outcome {
         RosterOutcome::Ignored => {}
         RosterOutcome::Pending => {
@@ -2390,7 +4255,13 @@ pub fn sync_with(state: &Arc<AppState>, group_id: &str, peer_id: &str) {
 /// 但照样记轮数（`MAX_SYNC_ROUNDS`）。
 fn sync_with_inner(state: &Arc<AppState>, group_id: &str, peer_id: &str, chase: bool) {
     let own_id = state.config.lock().device_id.clone();
-    let Some((since_at, holes)) = state.groups.ask_payload(group_id, &own_id) else { return };
+    let Some((since_at, holes)) = state.groups.ask_payload(group_id, &own_id) else {
+        return;
+    };
+    if !can_sync_with(state, group_id, peer_id) {
+        debug!(group = %group_id, %peer_id, "群补拉：跳过未证明身份的成员（先配对）");
+        return;
+    }
     if !reachable(state, peer_id) {
         return;
     }
@@ -2400,11 +4271,41 @@ fn sync_with_inner(state: &Arc<AppState>, group_id: &str, peer_id: &str, chase: 
     debug!(group = %group_id, %peer_id, since_at, holes = holes.len(), "群补拉：问一台设备");
     let ask_id = uuid::Uuid::new_v4().to_string();
     debug!(%ask_id, "群补拉：这一问的凭据（对方的回答会原样带回来）");
+    let peer_paired = state.get_peer(peer_id).is_some_and(|p| p.paired);
+    let own_pubkey = crate::group_identity::public_key_b64()
+        .ok()
+        .or_else(|| state.groups.effective_member_key(group_id, &own_id))
+        .unwrap_or_default();
+    let ts = now_ms();
+    let sig = if own_pubkey.is_empty() {
+        String::new()
+    } else {
+        crate::group_identity::sign_b64(&sync_ask_signing_bytes(
+            group_id,
+            &ask_id,
+            since_at,
+            ts,
+            &own_id,
+            &own_pubkey,
+            &holes,
+        ))
+        .unwrap_or_default()
+    };
+    if !peer_paired && sig.is_empty() {
+        warn!(group = %group_id, %peer_id, "群补拉：本机拿不出成员签名，跳过未配对成员");
+        return;
+    }
+    // 回答必须带回这个 ask_id，并且来自被问的这台设备；否则任何知道群 id 的
+    // 局域网主机都能伪造 `GroupSyncPost` 往里灌消息。
+    state.groups.note_ask(&ask_id, group_id, peer_id);
     let event = WsEvent::GroupSyncAsk {
         group_id: group_id.to_string(),
         ask_id,
         since_at,
         holes,
+        ts,
+        pubkey: own_pubkey,
+        sig,
     };
     spawn_group_event(state, peer_id, event, None);
 }
@@ -2415,7 +4316,9 @@ fn sync_with_inner(state: &Arc<AppState>, group_id: &str, peer_id: &str, chase: 
 /// 的人同时收到好几个成员的同一批历史。
 pub fn sync_group(state: &Arc<AppState>, group_id: &str) {
     let own_id = state.config.lock().device_id.clone();
-    let Some(group) = state.groups.group(group_id) else { return };
+    let Some(group) = state.groups.group(group_id) else {
+        return;
+    };
     if group.left || !group.is_member(&own_id) {
         return;
     }
@@ -2427,6 +4330,9 @@ pub fn sync_group(state: &Arc<AppState>, group_id: &str) {
     for peer in group.others(&own_id) {
         if cold && asked {
             break;
+        }
+        if !can_sync_with(state, group_id, &peer) {
+            continue;
         }
         if !reachable(state, &peer) {
             continue;
@@ -2440,7 +4346,7 @@ pub fn sync_group(state: &Arc<AppState>, group_id: &str) {
 pub fn sync_with_peer(state: &Arc<AppState>, peer_id: &str) {
     let own_id = state.config.lock().device_id.clone();
     for g in state.groups.views(&own_id) {
-        if g.members.iter().any(|m| m.id == peer_id) {
+        if g.members.iter().any(|m| m.id == peer_id) && can_sync_with(state, &g.id, peer_id) {
             sync_with(state, &g.id, peer_id);
         }
     }
@@ -2464,6 +4370,9 @@ pub fn on_sync_ask(
     ask_id: &str,
     since_at: u64,
     holes: Vec<SyncHole>,
+    ts: u64,
+    pubkey: &str,
+    sig: &str,
 ) -> bool {
     let own_id = state.config.lock().device_id.clone();
     if !state.groups.is_member(group_id, &own_id) {
@@ -2476,8 +4385,27 @@ pub fn on_sync_ask(
         warn!(group = %group_id, %peer_id, "补拉请求被忽略：问的人不在名册里");
         return false;
     }
-    let (mut messages, has_more) = state.groups.messages_after(group_id, since_at, MAX_SYNC_MESSAGES);
-    let extra = state.groups.messages_by_holes(group_id, &holes, MAX_SYNC_MESSAGES);
+    // 身份证明：已配对走 token（HTTP 的 `accept` / WS 升级已经验过），未配对必须拿出
+    // 已认证成员公钥的签名。HTTP handler 已经做过一次；这里再做一次，保证任何调用点
+    // （包括以后新增的路径）都绕不过去。
+    let paired = state.get_peer(peer_id).is_some_and(|p| p.paired);
+    if paired {
+        attest_sync_ask(
+            state, peer_id, group_id, ask_id, since_at, ts, &holes, pubkey, sig,
+        );
+    } else if let Err(e) = verify_sync_ask(
+        state, peer_id, group_id, ask_id, since_at, ts, &holes, pubkey, sig,
+    ) {
+        warn!(group = %group_id, %peer_id, reason = e.reason(), "补拉请求被忽略：身份证明失败");
+        return false;
+    }
+    let (mut messages, has_more) =
+        state
+            .groups
+            .messages_after(group_id, since_at, MAX_SYNC_MESSAGES);
+    let extra = state
+        .groups
+        .messages_by_holes(group_id, &holes, MAX_SYNC_MESSAGES);
     for m in extra {
         if messages.len() >= MAX_SYNC_MESSAGES {
             break;
@@ -2490,6 +4418,16 @@ pub fn on_sync_ask(
     // 这两条来路（`messages_after` / `messages_by_holes`）给的**已经是线上形状**，
     // 图片消息的内容也在里面了（见 `wire_of`）。
     let roster = state.groups.group(group_id).map(|g| g.payload());
+    let post_ts = now_ms();
+    let post_sig = match crate::group_identity::sign_b64(&sync_post_signing_bytes(
+        group_id, ask_id, post_ts, has_more, &roster, &messages,
+    )) {
+        Ok(sig) => sig,
+        Err(e) => {
+            warn!(group = %group_id, %e, "补拉回答签名失败（未配对的请求方会拒收）");
+            String::new()
+        }
+    };
     debug!(group = %group_id, %peer_id, count = messages.len(), has_more, "补拉：把手上有的发回去");
     let event = WsEvent::GroupSyncPost {
         group_id: group_id.to_string(),
@@ -2497,6 +4435,8 @@ pub fn on_sync_ask(
         roster,
         has_more,
         messages,
+        ts: post_ts,
+        sig: post_sig,
     };
     spawn_group_event(state, peer_id, event, None);
     true
@@ -2507,11 +4447,41 @@ pub fn on_sync_post(
     state: &Arc<AppState>,
     peer_id: &str,
     group_id: &str,
+    ask_id: &str,
     roster: Option<RosterPayload>,
     has_more: bool,
     messages: Vec<GroupMsgWire>,
+    ts: u64,
+    sig: &str,
 ) -> bool {
     let own_id = state.config.lock().device_id.clone();
+    // 这条 HTTP/WS 消息必须同时满足：
+    // ① 来自本机名册里的成员；
+    // ② 带回本机刚发出、还没被回答的 ask_id；
+    // ③ 未配对来源还必须由**已认证的成员公钥**签整份回答。
+    // 少了 ③，知道群 id 的人就能伪造 `GroupSyncPost` 往里灌消息；少了 ②，同一份回答
+    // 可以无限重放。已配对来源的 ③ 由 token/WS 身份替代。
+    if !state.groups.is_member(group_id, peer_id) {
+        warn!(group = %group_id, %peer_id, "补拉回答被丢弃：发送者不在本机名册里");
+        return false;
+    }
+    let paired = state.get_peer(peer_id).is_some_and(|p| p.paired);
+    if !paired {
+        if let Err(e) = verify_sync_post(
+            state, peer_id, group_id, ask_id, ts, has_more, &roster, &messages, sig,
+        ) {
+            warn!(
+                group = %group_id, %peer_id,
+                reason = e.reason(),
+                "补拉回答被丢弃：回答方身份证明失败"
+            );
+            return false;
+        }
+    }
+    if !state.groups.take_ask(ask_id, group_id, peer_id) {
+        warn!(group = %group_id, %peer_id, %ask_id, "补拉回答被丢弃：ask_id 不存在/已过期/不属于这台设备");
+        return false;
+    }
     // 名册顺带回：补拉常常正是"本机的名册落后"那一档（LWW 自己会判断要不要采用）。
     if let Some(roster) = roster {
         on_roster(state, peer_id, roster, "");
@@ -2526,7 +4496,10 @@ pub fn on_sync_post(
     for (sender, up_to) in &acked {
         // "我拿到了"回给**原发送方**：他那边那条副本会从「排队/未送达」变成「已同步」。
         // 他到不了本机时这条回执自己也排队，等链路通了再送（回执丢了不影响消息本身）。
-        let event = WsEvent::GroupAck { group_id: group_id.to_string(), up_to: *up_to };
+        let event = WsEvent::GroupAck {
+            group_id: group_id.to_string(),
+            up_to: *up_to,
+        };
         spawn_group_event(state, sender, event, None);
     }
     let changed = !acked.is_empty();
@@ -2542,6 +4515,10 @@ pub fn on_sync_post(
 
 /// 收到"我手上有你发的这些"：那些副本升成「已同步」。
 pub fn on_ack(state: &Arc<AppState>, peer_id: &str, group_id: &str, up_to: u64) -> bool {
+    if !state.groups.is_member(group_id, peer_id) {
+        debug!(group = %group_id, %peer_id, "群同步回执被忽略：发送者不在名册里");
+        return false;
+    }
     let changed = state.groups.mark_synced_by_peer(group_id, peer_id, up_to);
     if changed {
         emit(state);
@@ -2583,6 +4560,261 @@ pub struct GroupTextIn {
     pub name: String,
     pub size: u64,
     pub data: String,
+    /// 作者名册纪元 + 群签名公钥/签名（老对端不带）。
+    pub epoch: u64,
+    pub pubkey: String,
+    pub sig: String,
+}
+
+/// 群消息签名覆盖的规范字节。字段顺序、分隔和长度前缀都是协议的一部分：
+/// 任何一端改了顺序/编码，验签就会失败——这是故意的。
+fn group_msg_signing_bytes(
+    group_id: &str,
+    epoch: u64,
+    author: &str,
+    id: &str,
+    at: u64,
+    seq: u64,
+    text: &str,
+    image: bool,
+    name: &str,
+    size: u64,
+    data: &str,
+) -> Vec<u8> {
+    let data_hash = {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(data.as_bytes());
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    format!(
+        "orbdrop-group-msg-v1\n{group_id}\n{epoch}\n{author}\n{id}\n{at}\n{seq}\n{}\n{}\n{}\n{}\n{data_hash}\n{text}",
+        u8::from(image),
+        name,
+        size,
+        text.len()
+    )
+    .into_bytes()
+}
+
+/// 补拉请求签名覆盖的规范字节。
+///
+/// 包含 `sender_id` 与 `pubkey`：前者防止成员 C 签一个"我是 B"的 ask，后者把签名和
+/// 具体公钥绑死（换钥后旧签名不能复用）。字段顺序与编码是协议的一部分。
+pub(crate) fn sync_ask_signing_bytes(
+    group_id: &str,
+    ask_id: &str,
+    since_at: u64,
+    ts: u64,
+    sender_id: &str,
+    pubkey: &str,
+    holes: &[SyncHole],
+) -> Vec<u8> {
+    let mut out = format!(
+        "orbdrop-group-sync-ask-v1\n{group_id}\n{ask_id}\n{since_at}\n{ts}\n{sender_id}\n{pubkey}\n"
+    );
+    for hole in holes {
+        out.push_str(&format!("{}\t{}\n", hole.from, hole.seqs.len()));
+        for seq in &hole.seqs {
+            out.push_str(&format!("{seq}\n"));
+        }
+    }
+    out.into_bytes()
+}
+
+/// 补拉回答签名覆盖的规范字节。
+///
+/// 消息本身各自带作者签名；这一层签的是"这批消息 + 名册 + has_more 确实是我发的"。
+/// 用 serde 序列化整份载荷：两端都是同一份 Rust 结构，字段顺序稳定。
+fn sync_post_signing_bytes(
+    group_id: &str,
+    ask_id: &str,
+    ts: u64,
+    has_more: bool,
+    roster: &Option<RosterPayload>,
+    messages: &[GroupMsgWire],
+) -> Vec<u8> {
+    let mut out = b"orbdrop-group-sync-post-v1\n".to_vec();
+    match serde_json::to_vec(&(group_id, ask_id, ts, has_more, roster, messages)) {
+        Ok(mut body) => out.append(&mut body),
+        Err(e) => warn!(%e, "补拉回答签名载荷序列化失败"),
+    }
+    out
+}
+
+/// 补拉证明失败的原因（HTTP 那一跳映射成状态码 + 稳定理由）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncProofError {
+    /// 本机或请求方不在这个群的名册里。
+    NotMember,
+    /// 请求方没有已认证的成员公钥：先配对。
+    ProofRequired,
+    /// 请求方自报的公钥与已认证的那把不一致。
+    KeyMismatch,
+    /// 签名缺失或验不过。
+    BadSignature,
+    /// `ts` 超出时间窗（或缺失）。
+    Stale,
+    /// 同一枚 `(发送方, ask_id)` 已经收过。
+    Replay,
+}
+
+impl SyncProofError {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NotMember => "not_member",
+            Self::ProofRequired => "proof_required",
+            Self::KeyMismatch => "key_mismatch",
+            Self::BadSignature => "bad_signature",
+            Self::Stale => "stale",
+            Self::Replay => "replay",
+        }
+    }
+}
+
+fn ts_fresh(ts: u64) -> bool {
+    ts != 0 && now_ms().abs_diff(ts) <= SYNC_PROOF_SKEW_MS
+}
+
+/// 本机眼里这台设备有没有资格参与补拉：已配对（token）或成员公钥已经绑在名册里。
+///
+/// 注意这里不要求公钥已 `attested`：TOFU 绑上的公钥仍可用于补拉（与群消息同一档信任），
+/// 但**永远不能从 ask 里绑钥**。`attested` 只用于"换钥时能不能覆盖"和"被冒名后恢复"。
+pub fn can_sync_with(state: &AppState, group_id: &str, peer_id: &str) -> bool {
+    state.get_peer(peer_id).is_some_and(|p| p.paired)
+        || state
+            .groups
+            .effective_member_key(group_id, peer_id)
+            .is_some()
+}
+
+/// 未配对来源的补拉请求：必须由**名册里已绑定的成员公钥**签名，且时间新鲜、没有重放。
+///
+/// 已配对来源不走这里（token 已经证明身份）。验证通过才允许 `accept`；调用方据此
+/// 决定"要不要更新设备地址" —— 未配对签名请求不更新，避免历史回答被引到别处。
+pub fn verify_sync_ask(
+    state: &Arc<AppState>,
+    sender_id: &str,
+    group_id: &str,
+    ask_id: &str,
+    since_at: u64,
+    ts: u64,
+    holes: &[SyncHole],
+    pubkey: &str,
+    sig: &str,
+) -> Result<(), SyncProofError> {
+    let own_id = state.config.lock().device_id.clone();
+    if !state.groups.is_member(group_id, &own_id) || !state.groups.is_member(group_id, sender_id) {
+        return Err(SyncProofError::NotMember);
+    }
+    let member_key = state
+        .groups
+        .effective_member_key(group_id, sender_id)
+        .ok_or(SyncProofError::ProofRequired)?;
+    if !pubkey.is_empty() && pubkey != member_key {
+        return Err(SyncProofError::KeyMismatch);
+    }
+    if sig.is_empty() {
+        return Err(SyncProofError::ProofRequired);
+    }
+    if !ts_fresh(ts) {
+        return Err(SyncProofError::Stale);
+    }
+    let bytes = sync_ask_signing_bytes(
+        group_id,
+        ask_id,
+        since_at,
+        ts,
+        sender_id,
+        &member_key,
+        holes,
+    );
+    if !crate::group_identity::verify_b64(&member_key, &bytes, sig) {
+        return Err(SyncProofError::BadSignature);
+    }
+    Ok(())
+}
+
+/// 已配对来源的补拉请求里带了 `pubkey`/`sig`：验一次，通过就把这把钥标成 attested。
+///
+/// 老客户端不带签名时什么都不做（token 已经够用）。签名覆盖 `pubkey` 本身，所以
+/// 换钥后旧签名不能复用。
+pub fn attest_sync_ask(
+    state: &Arc<AppState>,
+    sender_id: &str,
+    group_id: &str,
+    ask_id: &str,
+    since_at: u64,
+    ts: u64,
+    holes: &[SyncHole],
+    pubkey: &str,
+    sig: &str,
+) {
+    if pubkey.is_empty() || sig.is_empty() || !ts_fresh(ts) {
+        return;
+    }
+    let bytes = sync_ask_signing_bytes(group_id, ask_id, since_at, ts, sender_id, pubkey, holes);
+    if !crate::group_identity::verify_b64(pubkey, &bytes, sig) {
+        warn!(group = %group_id, %sender_id, "补拉请求自带的公钥签名无效，不做认证");
+        return;
+    }
+    let own_id = state.config.lock().device_id.clone();
+    if state
+        .groups
+        .bind_member_key(group_id, &own_id, sender_id, pubkey, true)
+        .is_some()
+    {
+        broadcast_roster(state, group_id);
+    }
+}
+
+/// 未配对来源的补拉回答：必须由名册里已绑定的成员公钥签整份载荷。
+pub fn verify_sync_post(
+    state: &Arc<AppState>,
+    sender_id: &str,
+    group_id: &str,
+    ask_id: &str,
+    ts: u64,
+    has_more: bool,
+    roster: &Option<RosterPayload>,
+    messages: &[GroupMsgWire],
+    sig: &str,
+) -> Result<(), SyncProofError> {
+    let own_id = state.config.lock().device_id.clone();
+    if !state.groups.is_member(group_id, &own_id) || !state.groups.is_member(group_id, sender_id) {
+        return Err(SyncProofError::NotMember);
+    }
+    let member_key = state
+        .groups
+        .effective_member_key(group_id, sender_id)
+        .ok_or(SyncProofError::ProofRequired)?;
+    if sig.is_empty() {
+        return Err(SyncProofError::ProofRequired);
+    }
+    if !ts_fresh(ts) {
+        return Err(SyncProofError::Stale);
+    }
+    let bytes = sync_post_signing_bytes(group_id, ask_id, ts, has_more, roster, messages);
+    if !crate::group_identity::verify_b64(&member_key, &bytes, sig) {
+        return Err(SyncProofError::BadSignature);
+    }
+    Ok(())
+}
+
+/// 名册签名覆盖的规范字节：成员按 id 排序，避免 JSON/数组顺序影响验签。
+fn roster_signing_bytes(roster: &RosterPayload) -> Vec<u8> {
+    let mut members: Vec<&Member> = roster.members.iter().collect();
+    members.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut out = format!(
+        "orbdrop-group-roster-v1\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        roster.id, roster.name, roster.rev, roster.epoch, roster.updated_by, roster.updated_at
+    );
+    for m in members {
+        out.push_str(&format!("{}\t{}\t{}\n", m.id, m.name, m.pubkey));
+    }
+    out.into_bytes()
 }
 
 /// 造一条落盘的群消息（三处都走它：本机发出的、收到的、以及邀请卡挂着时攒下的）。
@@ -2597,7 +4829,11 @@ fn msg_with(
     seq: u64,
     delivery: HashMap<String, Delivery>,
 ) -> GroupMsg {
-    let name = content.image.as_ref().map(|(n, _)| n.clone()).unwrap_or_default();
+    let name = content
+        .image
+        .as_ref()
+        .map(|(n, _)| n.clone())
+        .unwrap_or_default();
     let size = content.image.as_ref().map(|(_, s)| *s).unwrap_or(0);
     GroupMsg {
         id: id.to_string(),
@@ -2607,9 +4843,13 @@ fn msg_with(
         at,
         seq,
         delivery,
+        delivery_packed: String::new(),
         image: content.image.is_some(),
         name,
         size,
+        epoch: 1,
+        pubkey: String::new(),
+        sig: String::new(),
     }
 }
 
@@ -2631,7 +4871,12 @@ fn stage_group_content(state: &AppState, event: &GroupTextIn) {
     if !event.image || event.data.is_empty() {
         return;
     }
-    if let Err(reason) = crate::blobs::save_base64(state.groups.blobs_root(), &event.id, &event.name, &event.data) {
+    if let Err(reason) = crate::blobs::save_base64(
+        state.groups.blobs_root(),
+        &event.id,
+        &event.name,
+        &event.data,
+    ) {
         warn!(group = %event.group_id, id = %event.id, %reason, "群里的图片内容没能落下来");
     }
 }
@@ -2646,7 +4891,13 @@ pub(crate) fn display_name(state: &AppState, peer_id: &str, claimed: &str) -> St
         .get_peer(peer_id)
         .map(|p| p.name)
         .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| if claimed.is_empty() { peer_id.to_string() } else { claimed.to_string() })
+        .unwrap_or_else(|| {
+            if claimed.is_empty() {
+                peer_id.to_string()
+            } else {
+                claimed.to_string()
+            }
+        })
 }
 
 #[cfg(test)]
@@ -2654,11 +4905,17 @@ mod tests {
     use super::*;
 
     fn store(name: &str) -> GroupStore {
-        // 每个用例自己**一个目录**：图片消息的内容目录是从 `groups.json` 的位置推出来的
+        // 每个用例自己**一个目录**：图片消息的内容目录是从账本的位置推出来的
         // （见 `with_path`），共用一个临时目录的话，并行跑的几条会互相删对方的内容。
-        let dir = std::env::temp_dir().join(format!("orbdrop_group_{name}_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_group_{name}_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        GroupStore::with_path(dir.join("groups.json"))
+        GroupStore::with_path(dir.join("groups.dat"))
+    }
+
+    /// 读回落盘内容并解封装（测试里要看 JSON 形状时用）。
+    fn persisted_text(path: &std::path::Path) -> String {
+        String::from_utf8(crate::envelope::read_decoded(path).unwrap()).unwrap()
     }
 
     fn roster(id: &str, rev: u64, by: &str, members: &[&str]) -> RosterPayload {
@@ -2670,22 +4927,39 @@ mod tests {
             updated_at: rev * 10,
             members: members
                 .iter()
-                .map(|m| PeerInfo { id: m.to_string(), name: m.to_uppercase() })
+                .map(|m| Member {
+                    id: m.to_string(),
+                    name: m.to_uppercase(),
+                    pubkey: String::new(),
+                })
                 .collect(),
+            epoch: 1,
+            sig: String::new(),
         }
     }
 
     fn inviter() -> PeerInfo {
-        PeerInfo { id: "a".into(), name: "PC-A".into() }
+        PeerInfo {
+            id: "a".into(),
+            name: "PC-A".into(),
+        }
     }
 
     fn member(id: &str) -> Member {
-        Member { id: id.to_string(), name: id.to_uppercase() }
+        Member {
+            id: id.to_string(),
+            name: id.to_uppercase(),
+            pubkey: String::new(),
+        }
     }
 
     /// 建一个"本机已加入"的群（本机 + a + b）。
     fn joined(s: &GroupStore, group_id: &str) -> Group {
-        s.apply_roster("me", &roster(group_id, 1, "a", &["a", "me", "b"]), &inviter());
+        s.apply_roster(
+            "me",
+            &roster(group_id, 1, "a", &["a", "me", "b"]),
+            &inviter(),
+        );
         s.accept_pending(group_id, "me");
         s.group(group_id).unwrap()
     }
@@ -2695,7 +4969,8 @@ mod tests {
     fn a_group_image_keeps_its_content_and_its_path() {
         let s = store("image_round_trip");
         joined(&s, "g1");
-        let written = crate::blobs::save_in(s.blobs_root(), "img-1", "图片-1.png", b"PNGDATA").unwrap();
+        let written =
+            crate::blobs::save_in(s.blobs_root(), "img-1", "图片-1.png", b"PNGDATA").unwrap();
         let msg = s.record_outbound(
             "g1",
             "img-1",
@@ -2709,11 +4984,31 @@ mod tests {
         let view = s.view("g1", "me").unwrap();
         let m = &view.messages[0];
         assert!(m.image && m.name == "图片-1.png" && m.size == 7);
-        assert_eq!(m.path, written.to_string_lossy(), "视图里给的是本机那份内容文件");
+        assert_eq!(
+            m.path,
+            written.to_string_lossy(),
+            "视图里给的是本机那份内容文件"
+        );
 
         // 收到的同一条（重投第二次不写第二条）。
-        assert!(s.record_inbound("g1", "a", "PC-A", "img-2", crate::blobs::Content::image("图片-2.png", 3), 200, 1));
-        assert!(!s.record_inbound("g1", "a", "PC-A", "img-2", crate::blobs::Content::image("图片-2.png", 3), 200, 1));
+        assert!(s.record_inbound(
+            "g1",
+            "a",
+            "PC-A",
+            "img-2",
+            crate::blobs::Content::image("图片-2.png", 3),
+            200,
+            1
+        ));
+        assert!(!s.record_inbound(
+            "g1",
+            "a",
+            "PC-A",
+            "img-2",
+            crate::blobs::Content::image("图片-2.png", 3),
+            200,
+            1
+        ));
         assert_eq!(s.view("g1", "me").unwrap().messages.len(), 2);
     }
 
@@ -2723,7 +5018,15 @@ mod tests {
         let mine = store("sync_serve");
         joined(&mine, "g1");
         crate::blobs::save_in(mine.blobs_root(), "img-1", "图片.png", b"DATA").unwrap();
-        mine.record_inbound("g1", "a", "PC-A", "img-1", crate::blobs::Content::image("图片.png", 4), 100, 1);
+        mine.record_inbound(
+            "g1",
+            "a",
+            "PC-A",
+            "img-1",
+            crate::blobs::Content::image("图片.png", 4),
+            100,
+            1,
+        );
 
         let (wire, _) = mine.messages_after("g1", 0, 10);
         assert_eq!(wire.len(), 1);
@@ -2739,7 +5042,7 @@ mod tests {
         let view = theirs.view("g1", "me").unwrap();
         let m = &view.messages[0];
         assert!(m.image, "补回来的这条也是图片消息");
-        assert!(m.path.ends_with("img-1.png"), "内容落到了本机：{}", m.path);
+        assert!(m.path.ends_with("img-1.bin"), "内容落到了本机：{}", m.path);
         assert!(std::path::Path::new(&m.path).is_file());
     }
 
@@ -2749,13 +5052,28 @@ mod tests {
         let s = store("image_gc");
         joined(&s, "g1");
         let kept = crate::blobs::save_in(s.blobs_root(), "img-1", "图片.png", b"DATA").unwrap();
-        s.record_outbound("g1", "img-1", "me", crate::blobs::Content::image("图片.png", 4), 100, &[]);
+        s.record_outbound(
+            "g1",
+            "img-1",
+            "me",
+            crate::blobs::Content::image("图片.png", 4),
+            100,
+            &[],
+        );
         assert!(kept.exists());
 
         // 攒着的那几条（邀请卡还挂着）也要能被清掉。
         s.apply_roster("me", &roster("g2", 1, "a", &["a", "me"]), &inviter());
         let buffered = crate::blobs::save_in(s.blobs_root(), "img-2", "图片.png", b"DATA").unwrap();
-        assert!(s.buffer_pending_message("g2", "a", "PC-A", "img-2", crate::blobs::Content::image("图片.png", 4), 100, 1));
+        assert!(s.buffer_pending_message(
+            "g2",
+            "a",
+            "PC-A",
+            "img-2",
+            crate::blobs::Content::image("图片.png", 4),
+            100,
+            1
+        ));
         assert!(buffered.exists());
 
         // 「不加入」→ 攒着的那条跟着丢。
@@ -2772,9 +5090,24 @@ mod tests {
     fn image_ids_cover_the_convo_and_the_buffered_ones() {
         let s = store("image_ids");
         joined(&s, "g1");
-        s.record_outbound("g1", "img-1", "me", crate::blobs::Content::image("图片.png", 4), 100, &[]);
+        s.record_outbound(
+            "g1",
+            "img-1",
+            "me",
+            crate::blobs::Content::image("图片.png", 4),
+            100,
+            &[],
+        );
         s.apply_roster("me", &roster("g2", 1, "a", &["a", "me"]), &inviter());
-        s.buffer_pending_message("g2", "a", "PC-A", "img-2", crate::blobs::Content::image("图片.png", 4), 100, 1);
+        s.buffer_pending_message(
+            "g2",
+            "a",
+            "PC-A",
+            "img-2",
+            crate::blobs::Content::image("图片.png", 4),
+            100,
+            1,
+        );
         let ids = s.image_ids();
         assert!(ids.contains("img-1") && ids.contains("img-2"), "{ids:?}");
     }
@@ -2792,7 +5125,11 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].from, "a");
         assert_eq!(
-            pending[0].members.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            pending[0]
+                .members
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>(),
             vec!["a", "b"],
             "邀请卡里不含本机"
         );
@@ -2802,7 +5139,11 @@ mod tests {
         assert!(g.is_member("me"), "名册的存储含本机");
         assert_eq!(g.rev, 1, "加入时把名册的版本原样带过来");
         assert!(s.pending_views("me").is_empty());
-        assert_eq!(s.view("g1", "me").expect("视图里有").members.len(), 2, "视图不含本机");
+        assert_eq!(
+            s.view("g1", "me").expect("视图里有").members.len(),
+            2,
+            "视图不含本机"
+        );
     }
 
     /// 拒绝过的群之后一律忽略（卡片不会一直弹回来）。
@@ -2900,11 +5241,15 @@ mod tests {
     }
 
     /// 本机发的消息：逐台状态各自独立；回执按**发送者维度**的水位算「已读 n/m」，
-/// 而且回执本身就是"它收到了"的证据（那一份顺带升成「已读」）。
+    /// 而且回执本身就是"它收到了"的证据（那一份顺带升成「已读」）。
     #[test]
     fn per_member_delivery_and_read_counts() {
         let s = store("delivery");
-        let gid = s.create(member("me"), vec![member("a"), member("b"), member("c")], "开会");
+        let gid = s.create(
+            member("me"),
+            vec![member("a"), member("b"), member("c")],
+            "开会",
+        );
         let msg = s.record_outbound(
             &gid,
             "m1",
@@ -2922,13 +5267,21 @@ mod tests {
         assert_eq!(view.messages[0].delivery.get("b"), Some(&Delivery::Queued));
         assert_eq!(view.messages[0].read_count, 0);
 
-        assert!(s.mark_read_by_peer(&gid, "a", 100));
-        assert_eq!(s.view(&gid, "me").unwrap().messages[0].read_count, 1, "a 读了");
-        assert!(!s.mark_read_by_peer(&gid, "a", 50), "水位只增不减");
-        assert!(s.mark_read_by_peer(&gid, "b", 100));
+        assert!(s.mark_read_by_peer(&gid, "a", "me", 100));
+        assert_eq!(
+            s.view(&gid, "me").unwrap().messages[0].read_count,
+            1,
+            "a 读了"
+        );
+        assert!(!s.mark_read_by_peer(&gid, "a", "me", 50), "水位只增不减");
+        assert!(s.mark_read_by_peer(&gid, "b", "me", 100));
         let view = s.view(&gid, "me").unwrap();
         assert_eq!(view.messages[0].read_count, 2);
-        assert_eq!(view.messages[0].delivery.get("b"), Some(&Delivery::Read), "它读过 = 它拿到了");
+        assert_eq!(
+            view.messages[0].delivery.get("b"),
+            Some(&Delivery::Read),
+            "它读过 = 它拿到了"
+        );
 
         // 「排队」那一份能落定；已经定下的（已送达/已读）不再被改写。
         assert!(s.set_deliveries(&gid, &msg.id, &[(String::from("c"), Delivery::Sent)]));
@@ -2940,6 +5293,135 @@ mod tests {
             !s.set_deliveries(&gid, &msg.id, &[(String::from("b"), Delivery::Sent)]),
             "已读不会被落成已送达"
         );
+    }
+
+    /// 非成员/被移出成员的回执不能改任何状态（P1-7 补遗）：已读、已同步、拒收三条都一样。
+    ///
+    /// 群成员**不要求配对**（D6=b），所以这些入口不能只靠 token；知道群 id 的任意主机
+    /// 只要 spoof 一个未配对成员，就能把消息改成「已读/已同步/未送达」。
+    #[test]
+    fn receipts_from_non_members_change_nothing() {
+        let s = store("receipt_gate");
+        let gid = s.create(member("me"), vec![member("a")], "群");
+        s.record_outbound(
+            &gid,
+            "m1",
+            "me",
+            "你好",
+            100,
+            &[
+                (String::from("a"), Delivery::Queued),
+                (String::from("ghost"), Delivery::Queued),
+            ],
+        );
+
+        // 幽灵 id：三条回执都不收，连它那份历史副本也不许改。
+        assert!(!s.mark_read_by_peer(&gid, "ghost", "me", u64::MAX));
+        assert!(!s.mark_synced_by_peer(&gid, "ghost", u64::MAX));
+        assert!(!s.mark_rejected(&gid, "m1", "ghost", true));
+        let view = s.view(&gid, "me").unwrap();
+        assert_eq!(view.messages[0].read_count, 0);
+        assert_eq!(
+            view.messages[0].delivery.get("ghost"),
+            Some(&Delivery::Queued),
+            "非成员的那一份不该被改成已读/已同步/未送达"
+        );
+        assert!(view.declined.is_empty(), "非成员不能被标成拒绝加入");
+        {
+            let guard = s.inner.lock();
+            let read_by = &guard.convos.get(&gid).unwrap().read_by;
+            assert!(!read_by.contains_key("ghost"), "非成员不能撑大 read_by");
+        }
+
+        // 合法成员照旧：读回执推进水位、并把那一份升成已读。
+        assert!(s.mark_read_by_peer(&gid, "a", "me", 100));
+        let view = s.view(&gid, "me").unwrap();
+        assert_eq!(view.messages[0].read_count, 1);
+        assert_eq!(view.messages[0].delivery.get("a"), Some(&Delivery::Read));
+
+        // 被移出成员：名册里没有它了，三条回执同样不收。
+        assert!(s.edit_local(&gid, "me", "", vec![]).is_some());
+        assert!(!s.mark_read_by_peer(&gid, "a", "me", u64::MAX));
+        assert!(!s.mark_synced_by_peer(&gid, "a", u64::MAX));
+        assert!(!s.mark_rejected(&gid, "m1", "a", true));
+        assert!(s.view(&gid, "me").unwrap().declined.is_empty());
+    }
+
+    /// 伪造的 `up_to = u64::MAX` 只能覆盖已经发出的消息，不能把**未来**消息永远算成已读。
+    #[test]
+    fn a_forged_max_watermark_does_not_mark_future_messages_read() {
+        let s = store("read_clamp");
+        let gid = s.create(member("me"), vec![member("a")], "群");
+        s.record_outbound(
+            &gid,
+            "m1",
+            "me",
+            "第一条",
+            100,
+            &[(String::from("a"), Delivery::Sent)],
+        );
+        assert!(s.mark_read_by_peer(&gid, "a", "me", u64::MAX));
+        let view = s.view(&gid, "me").unwrap();
+        assert_eq!(view.messages[0].read_count, 1, "收到回执时这条确实算已读");
+
+        // 回执之后才发出的消息：水位被夹到 100，不能因为 MAX 自动算已读。
+        s.record_outbound(
+            &gid,
+            "m2",
+            "me",
+            "第二条",
+            200,
+            &[(String::from("a"), Delivery::Sent)],
+        );
+        let view = s.view(&gid, "me").unwrap();
+        assert_eq!(view.messages[1].read_count, 0, "未来消息不能被旧水位标已读");
+        assert_eq!(view.messages[1].delivery.get("a"), Some(&Delivery::Sent));
+
+        // 正常的新水位照常推进。
+        assert!(s.mark_read_by_peer(&gid, "a", "me", 200));
+        assert_eq!(s.view(&gid, "me").unwrap().messages[1].read_count, 1);
+    }
+
+    /// 老文件里的脏 `read_by`（幽灵 id / `u64::MAX` / 自己）在加载后会被洗掉。
+    #[test]
+    fn sanitize_read_by_drops_ghosts_and_clamps_old_poison() {
+        let s = store("read_sanitize");
+        let gid = s.create(member("me"), vec![member("a")], "群");
+        s.record_outbound(
+            &gid,
+            "m1",
+            "me",
+            "第一条",
+            100,
+            &[(String::from("a"), Delivery::Sent)],
+        );
+        {
+            let mut guard = s.inner.lock();
+            let convo = guard.convos.get_mut(&gid).unwrap();
+            convo.read_by.insert("ghost".into(), u64::MAX);
+            convo.read_by.insert("a".into(), u64::MAX);
+            convo.read_by.insert("me".into(), 50);
+        }
+        assert!(s.sanitize_read_by("me"));
+        {
+            let guard = s.inner.lock();
+            let read_by = &guard.convos.get(&gid).unwrap().read_by;
+            assert_eq!(read_by.get("a"), Some(&100), "水位夹到本机发出的最大 at");
+            assert!(!read_by.contains_key("ghost"), "幽灵 id 清掉");
+            assert!(!read_by.contains_key("me"), "自己的回执不作数");
+            assert!(read_by.len() <= MAX_MEMBERS);
+        }
+        // 再发一条：旧的 MAX 不能继续把新消息算成已读。
+        s.record_outbound(
+            &gid,
+            "m2",
+            "me",
+            "第二条",
+            200,
+            &[(String::from("a"), Delivery::Sent)],
+        );
+        assert_eq!(s.view(&gid, "me").unwrap().messages[1].read_count, 0);
+        assert!(!s.sanitize_read_by("me"), "洗过之后是幂等的");
     }
 
     /// 回执水位是**逐发送者**的：读位之前、某个人发的最大 at。
@@ -2954,7 +5436,11 @@ mod tests {
         s.mark_read_local("g1", "m3");
         assert_eq!(s.read_up_to_for("g1", "a"), 300, "读到 a 的最后一条");
         assert_eq!(s.read_up_to_for("g1", "b"), 200);
-        assert_eq!(s.read_up_to_for("g1", "c"), 0, "没读过它发的东西 = 0（不替用户标已读）");
+        assert_eq!(
+            s.read_up_to_for("g1", "c"),
+            0,
+            "没读过它发的东西 = 0（不替用户标已读）"
+        );
         assert_eq!(s.read_pos("g1").as_deref(), Some("m3"));
     }
 
@@ -3008,8 +5494,22 @@ mod tests {
     fn queued_group_messages_are_drained_in_group_order() {
         let s = store("queue");
         let gid = s.create(member("me"), vec![member("a")], "");
-        let m1 = s.record_outbound(&gid, "m1", "me", "第一句", 100, &[(String::from("a"), Delivery::Queued)]);
-        s.record_outbound(&gid, "m2", "me", "第二句", 200, &[(String::from("a"), Delivery::Sent)]);
+        let m1 = s.record_outbound(
+            &gid,
+            "m1",
+            "me",
+            "第一句",
+            100,
+            &[(String::from("a"), Delivery::Queued)],
+        );
+        s.record_outbound(
+            &gid,
+            "m2",
+            "me",
+            "第二句",
+            200,
+            &[(String::from("a"), Delivery::Sent)],
+        );
         assert!(s.has_backlog_for("a"));
         assert!(s.has_queued(&gid), "这个群还欠着 → 新消息也要跟着排队");
         assert_eq!(s.peers_with_backlog(), vec!["a".to_string()]);
@@ -3041,7 +5541,14 @@ mod tests {
         // 陌生人 c：自称成员、rev 拉高 → 丢掉，名册一个字不动。
         let attacked = roster("g1", 99, "c", &["c", "a"]);
         assert_eq!(
-            s.apply_roster("me", &attacked, &PeerInfo { id: "c".into(), name: "PC-C".into() }),
+            s.apply_roster(
+                "me",
+                &attacked,
+                &PeerInfo {
+                    id: "c".into(),
+                    name: "PC-C".into()
+                }
+            ),
             RosterOutcome::Ignored,
             "不在名册里的发送者改不动这个群"
         );
@@ -3049,8 +5556,16 @@ mod tests {
         assert_eq!(after.rev, before.rev, "rev 不动");
         assert_eq!(after.name, before.name, "群名不动");
         assert_eq!(
-            after.members.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
-            before.members.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            after
+                .members
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>(),
+            before
+                .members
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>(),
             "成员表不动（既没被踢人，也没被塞进陌生人）"
         );
 
@@ -3075,7 +5590,14 @@ mod tests {
         let s = store("pending_gate");
         let hostile = roster("g9", 1, "c", &["a", "b"]);
         assert_eq!(
-            s.apply_roster("me", &hostile, &PeerInfo { id: "c".into(), name: "PC-C".into() }),
+            s.apply_roster(
+                "me",
+                &hostile,
+                &PeerInfo {
+                    id: "c".into(),
+                    name: "PC-C".into()
+                }
+            ),
             RosterOutcome::Ignored,
             "名册里没有发送者自己 → 连卡片都不该弹出"
         );
@@ -3095,18 +5617,41 @@ mod tests {
         ));
         let own = state.config.lock().device_id.clone();
         assert_eq!(
-            state.groups.apply_roster(&own, &roster("g1", 1, "a", &["a", &own, "b"]), &inviter()),
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 1, "a", &["a", &own, "b"]), &inviter()),
             RosterOutcome::Pending
         );
         assert!(state.groups.accept_pending("g1", &own));
 
         // ① 陌生人问补拉：不给（原来只校验"本机自己是不是成员"，谁问都给 200 条 + 名册）。
         assert!(
-            !on_sync_ask(&state, "c", "g1", "ask-1", 0, Vec::new()),
+            !on_sync_ask(&state, "c", "g1", "ask-1", 0, Vec::new(), 0, "", ""),
             "不在名册里的人问不到历史"
         );
-        // 成员问：照旧答。
-        assert!(on_sync_ask(&state, "a", "g1", "ask-2", 0, Vec::new()));
+        // 未配对、也没有已认证公钥的成员：同样不给（这次补的就是"自报成员 id"）。
+        assert!(
+            !on_sync_ask(&state, "b", "g1", "ask-b", 0, Vec::new(), 0, "", ""),
+            "未证明身份的成员拿不到历史"
+        );
+        // 已配对成员：token 就是证明，照旧答。
+        state.upsert_peer(&crate::config::PeerDevice {
+            id: "a".into(),
+            name: "PC-A".into(),
+            paired: true,
+            ..Default::default()
+        });
+        assert!(on_sync_ask(
+            &state,
+            "a",
+            "g1",
+            "ask-2",
+            0,
+            Vec::new(),
+            0,
+            "",
+            ""
+        ));
 
         // ② 陌生人借一个真实成员的 id 冒名发言：这一帧的**发送者**不是成员 → 丢。
         let forged = GroupTextIn {
@@ -3124,6 +5669,9 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            epoch: 1,
+            pubkey: String::new(),
+            sig: String::new(),
         };
         assert_eq!(
             on_group_text(&state, "c", forged),
@@ -3151,9 +5699,797 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            epoch: 1,
+            pubkey: String::new(),
+            sig: String::new(),
         };
-        assert_eq!(on_group_text(&state, "a", real), GroupTextOutcome::Recorded, "成员发言照旧收下");
+        assert_eq!(
+            on_group_text(&state, "a", real),
+            GroupTextOutcome::Recorded,
+            "成员发言照旧收下"
+        );
+    }
 
+    /// 三条群回执的入口都做成员校验：知道群 id 的陌生主机改不了已读/同步/拒收状态。
+    #[test]
+    fn forged_group_receipts_are_ignored_at_the_entry_points() {
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_group_receipts_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        let own = state.config.lock().device_id.clone();
+        assert_eq!(
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 1, "a", &["a", &own]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.accept_pending("g1", &own));
+        state.groups.record_outbound(
+            "g1",
+            "m1",
+            &own,
+            "你好",
+            100,
+            &[(String::from("a"), Delivery::Queued)],
+        );
+
+        assert!(!on_group_read(&state, "ghost", "g1", u64::MAX));
+        assert!(!on_ack(&state, "ghost", "g1", u64::MAX));
+        on_group_text_rejected(&state, "ghost", "g1", "m1", REASON_DECLINED);
+
+        let view = state.groups.view("g1", &own).unwrap();
+        assert_eq!(view.messages[0].read_count, 0);
+        assert_eq!(view.messages[0].delivery.get("a"), Some(&Delivery::Queued));
+        assert!(view.declined.is_empty(), "陌生人不能把成员标成拒绝加入");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 补拉历史只认**名册里已绑定的成员公钥**：没有公钥不行；绑上之后签名就能补。
+    #[tokio::test]
+    async fn only_a_bound_member_key_can_pull_history() {
+        use base64::Engine as _;
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_group_proof_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        let own = state.config.lock().device_id.clone();
+        assert_eq!(
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 1, "a", &["a", &own]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.accept_pending("g1", &own));
+
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let pubkey = base64::engine::general_purpose::STANDARD.encode(pair.public_key().as_ref());
+        let holes: Vec<SyncHole> = Vec::new();
+        let ask_id = "ask-signed-1";
+        let since_at = 0;
+        let ts = now_ms();
+        let sign = |ask: &str, since: u64, at: u64| {
+            base64::engine::general_purpose::STANDARD.encode(
+                pair.sign(&sync_ask_signing_bytes(
+                    "g1", ask, since, at, "a", &pubkey, &holes,
+                ))
+                .as_ref(),
+            )
+        };
+        let sig = sign(ask_id, since_at, ts);
+
+        // 名册里还没有公钥：拿不出任何证明。
+        assert_eq!(
+            verify_sync_ask(&state, "a", "g1", ask_id, since_at, ts, &holes, &pubkey, &sig),
+            Err(SyncProofError::ProofRequired),
+            "没有绑定公钥的成员不能拉历史"
+        );
+        assert!(!on_sync_ask(
+            &state,
+            "a",
+            "g1",
+            ask_id,
+            since_at,
+            holes.clone(),
+            ts,
+            &pubkey,
+            &sig,
+        ));
+
+        // 直发签名消息/名册把公钥绑上（TOFU）：之后签名 ask 就能补。
+        assert!(state
+            .groups
+            .bind_member_key("g1", &own, "a", &pubkey, false)
+            .is_some());
+        assert_eq!(
+            verify_sync_ask(&state, "a", "g1", ask_id, since_at, ts, &holes, &pubkey, &sig),
+            Ok(())
+        );
+        assert!(on_sync_ask(
+            &state,
+            "a",
+            "g1",
+            ask_id,
+            since_at,
+            holes.clone(),
+            ts,
+            &pubkey,
+            &sig,
+        ));
+
+        // 配对身份认证过：同一枚 ask 照旧放行（并给换钥冲突提供判定依据）。
+        assert!(state
+            .groups
+            .bind_member_key("g1", &own, "a", &pubkey, true)
+            .is_some());
+        assert_eq!(
+            verify_sync_ask(&state, "a", "g1", ask_id, since_at, ts, &holes, &pubkey, &sig),
+            Ok(())
+        );
+
+        // 改一个被签名字段 → 验不过。
+        assert_eq!(
+            verify_sync_ask(
+                &state,
+                "a",
+                "g1",
+                ask_id,
+                since_at + 1,
+                ts,
+                &holes,
+                &pubkey,
+                &sig
+            ),
+            Err(SyncProofError::BadSignature)
+        );
+        // 缺 ts / 过期 → Stale（重放窗口靠它收窄）。
+        assert_eq!(
+            verify_sync_ask(&state, "a", "g1", ask_id, since_at, 0, &holes, &pubkey, &sig),
+            Err(SyncProofError::Stale)
+        );
+        // 自报公钥与已认证那把不一致 → KeyMismatch。
+        let other = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        assert_eq!(
+            verify_sync_ask(&state, "a", "g1", ask_id, since_at, ts, &holes, &other, &sig),
+            Err(SyncProofError::KeyMismatch)
+        );
+        // 重放缓存：同一 (成员, ask_id) 只记一次。
+        assert!(state.groups.note_incoming_ask("a", ask_id));
+        assert!(!state.groups.note_incoming_ask("a", ask_id));
+    }
+
+    /// 名册是共享 LWW 物，任何成员都能改；它不能把**已 attested** 的公钥改掉。
+    #[tokio::test]
+    async fn a_roster_cannot_replace_an_attested_member_key() {
+        use base64::Engine as _;
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_group_rosterkey_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        let own = state.config.lock().device_id.clone();
+        assert_eq!(
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 1, "a", &["a", &own, "b"]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.accept_pending("g1", &own));
+
+        let keypair = || {
+            let rng = SystemRandom::new();
+            let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+            let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+            let pubkey =
+                base64::engine::general_purpose::STANDARD.encode(pair.public_key().as_ref());
+            (pair, pubkey)
+        };
+        let (a_pair, a_key) = keypair();
+        let (b_pair, b_key) = keypair();
+        assert!(state
+            .groups
+            .bind_member_key("g1", &own, "a", &a_key, true)
+            .is_some());
+        // b 的公钥先在本机绑上：这份名册的更新者是 b，它必须能通过本地钥验签；
+        // 否则会被"未绑定更新者不能改群状态"挡在签名之后（这正是下面要区分的两件事）。
+        assert!(state
+            .groups
+            .bind_member_key("g1", &own, "b", &b_key, false)
+            .is_some());
+        let rev = state.groups.group("g1").unwrap().rev + 1;
+
+        // b（名册成员）发一份 rev 更高的名册，把 a 的公钥换成自己的。
+        let mut attacked = RosterPayload {
+            id: "g1".into(),
+            name: "群".into(),
+            rev,
+            updated_by: "b".into(),
+            updated_at: 2,
+            members: vec![
+                Member {
+                    id: "a".into(),
+                    name: "PC-A".into(),
+                    pubkey: b_key.clone(),
+                },
+                Member {
+                    id: "b".into(),
+                    name: "PC-B".into(),
+                    pubkey: b_key.clone(),
+                },
+                Member {
+                    id: own.clone(),
+                    name: "本机".into(),
+                    pubkey: String::new(),
+                },
+            ],
+            epoch: 1,
+            sig: String::new(),
+        };
+        attacked.sig = base64::engine::general_purpose::STANDARD
+            .encode(b_pair.sign(&roster_signing_bytes(&attacked)).as_ref());
+        assert_eq!(
+            state.groups.apply_roster_with_trust(
+                &own,
+                &attacked,
+                &PeerInfo {
+                    id: "b".into(),
+                    name: "PC-B".into()
+                },
+                false,
+            ),
+            RosterOutcome::Updated
+        );
+        assert_eq!(
+            state.groups.member_pubkey("g1", "a").as_deref(),
+            Some(b_key.as_str()),
+            "名册那一格确实被改写了"
+        );
+        assert_eq!(
+            state.groups.effective_member_key("g1", "a").as_deref(),
+            Some(a_key.as_str()),
+            "认证/验签必须继续用本机 attested 的那把钥"
+        );
+        let _ = a_pair;
+    }
+
+    /// 名册也不能改写**未 attested、但已经 TOFU 绑定**的成员公钥。
+    ///
+    /// 复现路径：b（成员）发一份 rev+1 名册，只把 a 的公钥换成 b 的；收方以前会整体
+    /// 替换名册，effective_member_key 回落到那一格，于是 b 可以用自己的钥冒充 a 发言。
+    #[tokio::test]
+    async fn a_roster_cannot_replace_a_bound_member_key() {
+        use base64::Engine as _;
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_group_boundkey_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        let own = state.config.lock().device_id.clone();
+        assert_eq!(
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 1, "a", &["a", &own, "b"]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.accept_pending("g1", &own));
+
+        let keypair = || {
+            let rng = SystemRandom::new();
+            let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+            let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+            let pubkey =
+                base64::engine::general_purpose::STANDARD.encode(pair.public_key().as_ref());
+            (pair, pubkey)
+        };
+        let (a_pair, a_key) = keypair();
+        let (b_pair, b_key) = keypair();
+
+        // a 的钥只走"本人直发"绑上（TOFU，不是 attested）。
+        assert!(state
+            .groups
+            .bind_member_key("g1", &own, "a", &a_key, false)
+            .is_some());
+        assert_eq!(
+            state.groups.effective_member_key("g1", "a").as_deref(),
+            Some(a_key.as_str())
+        );
+
+        // b 发一份只改公钥的名册（群名/成员名保持不变，避免触发"未绑定不能改状态"）。
+        let local = state.groups.group("g1").unwrap();
+        let mut attacked = local.payload();
+        attacked.rev = local.rev + 1;
+        attacked.updated_by = "b".into();
+        attacked.updated_at = 2;
+        attacked.sig.clear();
+        for m in &mut attacked.members {
+            if m.id == "a" || m.id == "b" {
+                m.pubkey = b_key.clone();
+            }
+        }
+        attacked.sig = base64::engine::general_purpose::STANDARD
+            .encode(b_pair.sign(&roster_signing_bytes(&attacked)).as_ref());
+        assert_eq!(
+            state.groups.apply_roster_with_trust(
+                &own,
+                &attacked,
+                &PeerInfo {
+                    id: "b".into(),
+                    name: "PC-B".into()
+                },
+                false,
+            ),
+            RosterOutcome::Updated
+        );
+        assert_eq!(
+            state.groups.member_pubkey("g1", "a").as_deref(),
+            Some(b_key.as_str()),
+            "共享名册那一格确实被改了（只是提示）"
+        );
+        assert_eq!(
+            state.groups.effective_member_key("g1", "a").as_deref(),
+            Some(a_key.as_str()),
+            "验签必须继续用本机 bound 的钥，不能跟着名册走"
+        );
+
+        // b 拿自己的钥冒充 a 直发：必须 BadSignature。
+        let text = "我是 A（其实是 B）";
+        let bytes =
+            group_msg_signing_bytes("g1", 1, "a", "forge-1", 100, 1, text, false, "", 0, "");
+        let sig = base64::engine::general_purpose::STANDARD.encode(b_pair.sign(&bytes).as_ref());
+        let forged = GroupTextIn {
+            group_id: "g1".into(),
+            id: "forge-1".into(),
+            text: text.into(),
+            at: 100,
+            seq: 1,
+            rev: attacked.rev,
+            sender_id: "a".into(),
+            sender_name: "PC-A".into(),
+            hops: 0,
+            reached: Vec::new(),
+            image: false,
+            name: String::new(),
+            size: 0,
+            data: String::new(),
+            epoch: 1,
+            pubkey: b_key.clone(),
+            sig,
+        };
+        assert_eq!(
+            on_group_text(&state, "a", forged),
+            GroupTextOutcome::BadSignature,
+            "b 不能用自己的钥冒充 a"
+        );
+        assert!(
+            !state
+                .groups
+                .view("g1", &own)
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| m.id == "forge-1" && m.from == "a"),
+            "冒名消息不能落进会话"
+        );
+
+        // a 拿自己的钥直发：照常收，并把名册那一格修回本地认定的钥。
+        let text = "真的 A";
+        let bytes = group_msg_signing_bytes("g1", 1, "a", "real-1", 200, 1, text, false, "", 0, "");
+        let sig = base64::engine::general_purpose::STANDARD.encode(a_pair.sign(&bytes).as_ref());
+        let real = GroupTextIn {
+            group_id: "g1".into(),
+            id: "real-1".into(),
+            text: text.into(),
+            at: 200,
+            seq: 1,
+            rev: attacked.rev,
+            sender_id: "a".into(),
+            sender_name: "PC-A".into(),
+            hops: 0,
+            reached: Vec::new(),
+            image: false,
+            name: String::new(),
+            size: 0,
+            data: String::new(),
+            epoch: 1,
+            pubkey: a_key.clone(),
+            sig,
+        };
+        assert_eq!(on_group_text(&state, "a", real), GroupTextOutcome::Recorded);
+        assert_eq!(
+            state.groups.member_pubkey("g1", "a").as_deref(),
+            Some(a_key.as_str()),
+            "本人直发验签后，把名册那一格修回本地钥"
+        );
+    }
+
+    /// 还没绑定公钥的更新者不能改群状态（群名/成员表/别人的显示名）。
+    #[tokio::test]
+    async fn an_unbound_updater_cannot_change_group_state() {
+        use base64::Engine as _;
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_group_state_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        let own = state.config.lock().device_id.clone();
+        assert_eq!(
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 1, "a", &["a", &own, "b"]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.accept_pending("g1", &own));
+
+        let keypair = || {
+            let rng = SystemRandom::new();
+            let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+            let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+            let pubkey =
+                base64::engine::general_purpose::STANDARD.encode(pair.public_key().as_ref());
+            (pair, pubkey)
+        };
+        let (_, a_key) = keypair();
+        let (b_pair, b_key) = keypair();
+        // 先把 a 的钥绑上，让群进入签名模式（`require_sig = true`）；b 仍未绑定。
+        assert!(state
+            .groups
+            .bind_member_key("g1", &own, "a", &a_key, false)
+            .is_some());
+        let before = state.groups.group("g1").unwrap();
+
+        let mut rename = before.payload();
+        rename.rev = before.rev + 1;
+        rename.name = "被改过的群名".into();
+        rename.updated_by = "b".into();
+        rename.updated_at = 2;
+        rename.sig.clear();
+        for m in &mut rename.members {
+            if m.id == "b" {
+                m.pubkey = b_key.clone();
+            }
+        }
+        rename.sig = base64::engine::general_purpose::STANDARD
+            .encode(b_pair.sign(&roster_signing_bytes(&rename)).as_ref());
+        assert_eq!(
+            state.groups.apply_roster_with_trust(
+                &own,
+                &rename,
+                &PeerInfo {
+                    id: "b".into(),
+                    name: "PC-B".into()
+                },
+                false,
+            ),
+            RosterOutcome::Ignored,
+            "未绑定更新者不能改群名"
+        );
+        assert_eq!(
+            state.groups.group("g1").unwrap().name,
+            before.name,
+            "群名保持原样"
+        );
+        assert_eq!(
+            state.groups.effective_member_key("g1", "b"),
+            None,
+            "被拒的名册也不能顺手绑钥"
+        );
+
+        // b 先直发签名消息把钥绑上；同一个改名动作之后就能过。
+        assert!(state
+            .groups
+            .bind_member_key("g1", &own, "b", &b_key, false)
+            .is_some());
+        let local = state.groups.group("g1").unwrap();
+        rename.rev = local.rev + 1;
+        rename.sig.clear();
+        rename.sig = base64::engine::general_purpose::STANDARD
+            .encode(b_pair.sign(&roster_signing_bytes(&rename)).as_ref());
+        assert_eq!(
+            state.groups.apply_roster_with_trust(
+                &own,
+                &rename,
+                &PeerInfo {
+                    id: "b".into(),
+                    name: "PC-B".into()
+                },
+                false,
+            ),
+            RosterOutcome::Updated
+        );
+        assert_eq!(
+            state.groups.group("g1").unwrap().name,
+            "被改过的群名",
+            "绑定之后本人就能改群状态"
+        );
+    }
+
+    /// 邀请卡不能预绑其他成员的公钥：点「加入」时只留 id/名字，公钥等本人发言再绑。
+    #[tokio::test]
+    async fn a_pending_invite_does_not_trust_other_members_keys() {
+        use base64::Engine as _;
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_group_invite_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        let own = state.config.lock().device_id.clone();
+
+        let keypair = || {
+            let rng = SystemRandom::new();
+            let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+            let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+            let pubkey =
+                base64::engine::general_purpose::STANDARD.encode(pair.public_key().as_ref());
+            (pair, pubkey)
+        };
+        let (a_pair, a_key) = keypair();
+        let (_, b_key) = keypair();
+        let mut invite = RosterPayload {
+            id: "g-new".into(),
+            name: "新群".into(),
+            rev: 1,
+            updated_by: "a".into(),
+            updated_at: 1,
+            members: vec![
+                Member {
+                    id: "a".into(),
+                    name: "A".into(),
+                    pubkey: a_key.clone(),
+                },
+                Member {
+                    id: "b".into(),
+                    name: "B".into(),
+                    pubkey: b_key.clone(),
+                },
+                Member {
+                    id: own.clone(),
+                    name: "本机".into(),
+                    pubkey: String::new(),
+                },
+            ],
+            epoch: 1,
+            sig: String::new(),
+        };
+        invite.sig = base64::engine::general_purpose::STANDARD
+            .encode(a_pair.sign(&roster_signing_bytes(&invite)).as_ref());
+        assert_eq!(
+            state.groups.apply_roster_with_trust(
+                &own,
+                &invite,
+                &PeerInfo {
+                    id: "a".into(),
+                    name: "PC-A".into()
+                },
+                false,
+            ),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.accept_pending("g-new", &own));
+        assert_eq!(
+            state.groups.member_pubkey("g-new", "a").as_deref(),
+            Some(a_key.as_str()),
+            "邀请者本人（签名者）的钥要留下"
+        );
+        assert_eq!(
+            state.groups.member_pubkey("g-new", "b"),
+            None,
+            "其他成员的公钥不能预绑"
+        );
+        assert_eq!(
+            state.groups.effective_member_key("g-new", "a").as_deref(),
+            Some(a_key.as_str()),
+            "邀请者的钥要顺手绑上，才能验它之后的同步/消息"
+        );
+        assert_eq!(state.groups.effective_member_key("g-new", "b"), None);
+        assert!(
+            state.groups.effective_member_key("g-new", &own).is_some(),
+            "自己的钥要在加入时绑上"
+        );
+    }
+
+    /// 带签名的陌生名册先验自洽性：签名对不上就不弹邀请卡。
+    #[tokio::test]
+    async fn a_tampered_pending_roster_is_ignored() {
+        use base64::Engine as _;
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_group_invite_sig_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        let own = state.config.lock().device_id.clone();
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let a_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let a_key = base64::engine::general_purpose::STANDARD.encode(a_pair.public_key().as_ref());
+        let mut invite = RosterPayload {
+            id: "g-bad".into(),
+            name: "新群".into(),
+            rev: 1,
+            updated_by: "a".into(),
+            updated_at: 1,
+            members: vec![
+                Member {
+                    id: "a".into(),
+                    name: "A".into(),
+                    pubkey: a_key,
+                },
+                Member {
+                    id: own.clone(),
+                    name: "本机".into(),
+                    pubkey: String::new(),
+                },
+            ],
+            epoch: 1,
+            sig: String::new(),
+        };
+        invite.sig = base64::engine::general_purpose::STANDARD
+            .encode(a_pair.sign(&roster_signing_bytes(&invite)).as_ref());
+        invite.name = "被改过的群名".into();
+        assert_eq!(
+            state.groups.apply_roster_with_trust(
+                &own,
+                &invite,
+                &PeerInfo {
+                    id: "a".into(),
+                    name: "PC-A".into()
+                },
+                false,
+            ),
+            RosterOutcome::Ignored
+        );
+        assert!(state.groups.pending_views(&own).is_empty());
+    }
+
+    /// 已配对成员的签名 ask 把自己的群公钥认证进来（配对后第一次补拉就能顺手完成）。
+    #[tokio::test]
+    async fn a_paired_member_can_attest_its_key_with_a_signed_ask() {
+        use base64::Engine as _;
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_group_attest_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        let own = state.config.lock().device_id.clone();
+        assert_eq!(
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 1, "a", &["a", &own]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.accept_pending("g1", &own));
+        state.upsert_peer(&crate::config::PeerDevice {
+            id: "a".into(),
+            name: "PC-A".into(),
+            ip: "10.0.0.5".into(),
+            port: 4000,
+            paired: true,
+            ..Default::default()
+        });
+
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let pubkey = base64::engine::general_purpose::STANDARD.encode(pair.public_key().as_ref());
+        let holes: Vec<SyncHole> = Vec::new();
+        let ask_id = "ask-attest-1";
+        let ts = now_ms();
+        let sig = base64::engine::general_purpose::STANDARD.encode(
+            pair.sign(&sync_ask_signing_bytes(
+                "g1", ask_id, 0, ts, "a", &pubkey, &holes,
+            ))
+            .as_ref(),
+        );
+        assert!(on_sync_ask(
+            &state, "a", "g1", ask_id, 0, holes, ts, &pubkey, &sig
+        ));
+        assert_eq!(
+            state.groups.attested_key("g1", "a").as_deref(),
+            Some(pubkey.as_str()),
+            "已配对成员的签名 ask 要把自己的公钥认证进名册"
+        );
+    }
+
+    /// 中转消息不能替作者绑钥：搬运工带来的 `pubkey` 不可信。
+    #[tokio::test]
+    async fn a_relayed_message_cannot_bind_the_author_key() {
+        use base64::Engine as _;
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_group_relaybind_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        let own = state.config.lock().device_id.clone();
+        assert_eq!(
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 1, "a", &["a", &own, "b"]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.accept_pending("g1", &own));
+
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let attacker_key =
+            base64::engine::general_purpose::STANDARD.encode(pair.public_key().as_ref());
+        let bytes =
+            group_msg_signing_bytes("g1", 1, "a", "relay-1", 100, 1, "冒充", false, "", 0, "");
+        let sig = base64::engine::general_purpose::STANDARD.encode(pair.sign(&bytes).as_ref());
+        let relayed = GroupTextIn {
+            group_id: "g1".into(),
+            id: "relay-1".into(),
+            text: "冒充".into(),
+            at: 100,
+            seq: 1,
+            rev: 1,
+            sender_id: "a".into(),
+            sender_name: "PC-A".into(),
+            hops: 1,
+            reached: vec!["b".into()],
+            image: false,
+            name: String::new(),
+            size: 0,
+            data: String::new(),
+            epoch: 1,
+            pubkey: attacker_key.clone(),
+            sig,
+        };
+        assert_eq!(
+            on_group_text(&state, "b", relayed),
+            GroupTextOutcome::BadSignature,
+            "搬运工不能替作者绑钥"
+        );
+        assert_eq!(
+            state.groups.member_pubkey("g1", "a"),
+            None,
+            "作者公钥不能被第三方写进名册"
+        );
     }
 
     /// 替别人转发的群消息要**记账**（S-11）：字节进「中转流量」，但不算一条连接。
@@ -3170,7 +6506,9 @@ mod tests {
         let own = state.config.lock().device_id.clone();
         // 群：作者 a、本机、成员 b。`others(own)` 里 a 是作者（不回头转）、b 够得着 → 转一份。
         assert_eq!(
-            state.groups.apply_roster(&own, &roster("g1", 1, "a", &["a", &own, "b"]), &inviter()),
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 1, "a", &["a", &own, "b"]), &inviter()),
             RosterOutcome::Pending
         );
         assert!(state.groups.accept_pending("g1", &own));
@@ -3199,15 +6537,25 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            epoch: 1,
+            pubkey: String::new(),
+            sig: String::new(),
         };
-        assert_eq!(on_group_text(&state, "a", inbound), GroupTextOutcome::Recorded, "成员发的这条要收下");
+        assert_eq!(
+            on_group_text(&state, "a", inbound),
+            GroupTextOutcome::Recorded,
+            "成员发的这条要收下"
+        );
 
         let traffic = state.relay_traffic_json();
         let bytes = traffic["bytes"].as_u64().expect("字节数是数");
         assert!(bytes > 0, "转发出去的消息字节要进「中转流量」");
         assert_eq!(traffic["connections"], 0, "消息中转不是一条连接");
         // 转过去的正是那条线上事件（含正文），所以怎么算都不该小于正文本身。
-        assert!(bytes >= "替别人搬的这条".len() as u64, "至少把正文那几字节算进去");
+        assert!(
+            bytes >= "替别人搬的这条".len() as u64,
+            "至少把正文那几字节算进去"
+        );
     }
 
     /// **普通一问永远不会被"6 轮"锁死**（P1-10）。
@@ -3242,24 +6590,36 @@ mod tests {
                 chased += 1;
             }
         }
-        assert_eq!(chased, MAX_SYNC_ROUNDS, "连续追批封顶 {} 轮", MAX_SYNC_ROUNDS);
+        assert_eq!(
+            chased, MAX_SYNC_ROUNDS,
+            "连续追批封顶 {} 轮",
+            MAX_SYNC_ROUNDS
+        );
         // 对方回一句"没有更多" → 预算复位，能接着追。
         s.sync_gate_note("g1", "peer-live", false);
-        assert!(s.sync_gate_open("g1", "peer-live", true), "回话之后重新开始算");
+        assert!(
+            s.sync_gate_open("g1", "peer-live", true),
+            "回话之后重新开始算"
+        );
         // 普通一问也会把追批串清掉（下一串从头算）。
         s.sync_gate_note("g1", "peer-live", true);
         backdate_for(&s, "g1", "peer-live");
-        assert!(s.sync_gate_open("g1", "peer-live", false), "普通一问照常放行");
-        assert!(s.sync_gate_open("g1", "peer-live", true), "新的一串可以从头追");
+        assert!(
+            s.sync_gate_open("g1", "peer-live", false),
+            "普通一问照常放行"
+        );
+        assert!(
+            s.sync_gate_open("g1", "peer-live", true),
+            "新的一串可以从头追"
+        );
     }
 
     /// 把某个闸门的冷却时间戳往回拨（测试里模拟"又过了一轮"）。
     fn backdate_for(s: &GroupStore, group_id: &str, peer_id: &str) {
         let mut sync = s.sync.lock();
         if let Some(gate) = sync.get_mut(&(group_id.to_string(), peer_id.to_string())) {
-            gate.last = Some(
-                std::time::Instant::now() - SYNC_COOLDOWN - std::time::Duration::from_secs(1),
-            );
+            gate.last =
+                Some(std::time::Instant::now() - SYNC_COOLDOWN - std::time::Duration::from_secs(1));
         }
     }
 
@@ -3290,7 +6650,15 @@ mod tests {
         assert!(!s.has_holes(&gid, "a"));
         // 真的漏了一条（号在裁剪下界之上）照旧认得出来。
         let last_seq = total as u64 + 2;
-        s.record_inbound(&gid, "a", "PC-A", &format!("m{last_seq}"), "字", 0, last_seq);
+        s.record_inbound(
+            &gid,
+            "a",
+            "PC-A",
+            &format!("m{last_seq}"),
+            "字",
+            0,
+            last_seq,
+        );
         assert_eq!(
             s.holes(&gid)[0].seqs,
             vec![total as u64 + 1],
@@ -3301,12 +6669,20 @@ mod tests {
     /// 「在途」在启动时退回「排队」；重启之后同一份文件还能读回来。
     #[test]
     fn inflight_is_requeued_on_startup_and_state_survives_a_restart() {
-        let path = std::env::temp_dir().join(format!("orbdrop_group_restart_{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("orbdrop_group_restart_{}", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_file(&path);
         {
             let s = GroupStore::with_path(path.clone());
             let gid = s.create(member("me"), vec![member("a")], "");
-            s.record_outbound(&gid, "m1", "me", "在途的那条", 100, &[(String::from("a"), Delivery::Sending)]);
+            s.record_outbound(
+                &gid,
+                "m1",
+                "me",
+                "在途的那条",
+                100,
+                &[(String::from("a"), Delivery::Sending)],
+            );
             s.record_inbound(&gid, "a", "PC-A", "m-in", "收到的", 90, 1);
             s.mark_read_local(&gid, "m-in");
         }
@@ -3338,11 +6714,31 @@ mod tests {
     fn my_seq_only_grows_and_views_exclude_self() {
         let s = store("seq");
         let gid = s.create(member("me"), vec![member("a")], "");
-        let m1 = s.record_outbound(&gid, "m1", "me", "一", 10, &[(String::from("a"), Delivery::Sent)]);
-        let m2 = s.record_outbound(&gid, "m2", "me", "二", 20, &[(String::from("a"), Delivery::Sent)]);
+        let m1 = s.record_outbound(
+            &gid,
+            "m1",
+            "me",
+            "一",
+            10,
+            &[(String::from("a"), Delivery::Sent)],
+        );
+        let m2 = s.record_outbound(
+            &gid,
+            "m2",
+            "me",
+            "二",
+            20,
+            &[(String::from("a"), Delivery::Sent)],
+        );
         assert_eq!((m1.seq, m2.seq), (1, 2));
         let view = s.view(&gid, "me").unwrap();
-        assert_eq!(view.members.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(
+            view.members
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
         assert!(view.messages.iter().all(|m| m.from_me));
     }
 
@@ -3379,15 +6775,25 @@ mod tests {
                 name: String::new(),
                 size: 0,
                 data: String::new(),
+                epoch: 1,
+                pubkey: String::new(),
+                sig: String::new(),
             }],
         );
-        assert_eq!(acked, vec![("a".to_string(), 200)], "新增的那条要回执给作者");
+        assert_eq!(
+            acked,
+            vec![("a".to_string(), 200)],
+            "新增的那条要回执给作者"
+        );
         assert_eq!(s.missing_count(&gid), 0, "洞补上了");
         let view = s.view(&gid, "me").unwrap();
         let order: Vec<&str> = view.messages.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(order, vec!["一", "二", "三"], "补进来的插回原位");
         assert!(!s.has_holes(&gid, "a"), "补完就不缺了");
-        assert!(s.apply_sync(&gid, "me", &[]).is_empty(), "空回：没有可回执的");
+        assert!(
+            s.apply_sync(&gid, "me", &[]).is_empty(),
+            "空回：没有可回执的"
+        );
     }
 
     /// 冷启动（本机在这个群里一条都没有）只问一次"从头发一批"；追过之后就不再问。
@@ -3395,7 +6801,11 @@ mod tests {
     fn a_cold_group_is_bootstrapped_exactly_once() {
         let s = store("cold");
         let gid = s.create(member("me"), vec![member("a")], "");
-        assert_eq!(s.ask_payload(&gid, "me"), Some((0, Vec::new())), "冷启动：从头发一批");
+        assert_eq!(
+            s.ask_payload(&gid, "me"),
+            Some((0, Vec::new())),
+            "冷启动：从头发一批"
+        );
         s.apply_sync(
             &gid,
             "me",
@@ -3410,20 +6820,35 @@ mod tests {
                 name: String::new(),
                 size: 0,
                 data: String::new(),
+                epoch: 1,
+                pubkey: String::new(),
+                sig: String::new(),
             }],
         );
-        assert_eq!(s.ask_payload(&gid, "me"), Some((100, Vec::new())), "之后按锚点问");
+        assert_eq!(
+            s.ask_payload(&gid, "me"),
+            Some((100, Vec::new())),
+            "之后按锚点问"
+        );
         let other = store("cold2");
         let gid2 = other.create(member("me"), vec![member("a")], "");
         other.apply_sync(&gid2, "me", &[]);
-        assert_eq!(other.ask_payload(&gid2, "me"), None, "对方没货也是追过了一次");
+        assert_eq!(
+            other.ask_payload(&gid2, "me"),
+            None,
+            "对方没货也是追过了一次"
+        );
     }
 
     /// 「我拿到了」把本机发出去的那几份从「排队/未送达」升成「已同步」；更强的档不动。
     #[test]
     fn an_ack_promotes_unsettled_copies_to_synced() {
         let s = store("ack");
-        let gid = s.create(member("me"), vec![member("a"), member("b"), member("c")], "");
+        let gid = s.create(
+            member("me"),
+            vec![member("a"), member("b"), member("c")],
+            "",
+        );
         s.record_outbound(
             &gid,
             "m1",
@@ -3441,7 +6866,11 @@ mod tests {
         let view = s.view(&gid, "me").unwrap();
         let delivery = &view.messages[0].delivery;
         assert_eq!(delivery.get("a"), Some(&Delivery::Synced));
-        assert_eq!(delivery.get("b"), Some(&Delivery::Synced), "未送达也能被「别人补到了」纠正");
+        assert_eq!(
+            delivery.get("b"),
+            Some(&Delivery::Synced),
+            "未送达也能被「别人补到了」纠正"
+        );
         assert_eq!(delivery.get("c"), Some(&Delivery::Sent), "已送达不受影响");
         assert_eq!(view.messages[0].read_count, 0, "拿到了 ≠ 读过");
     }
@@ -3451,8 +6880,15 @@ mod tests {
     fn a_read_receipt_also_proves_the_copy_arrived() {
         let s = store("readproof");
         let gid = s.create(member("me"), vec![member("a")], "");
-        s.record_outbound(&gid, "m1", "me", "你那边收不到？", 100, &[(String::from("a"), Delivery::Queued)]);
-        assert!(s.mark_read_by_peer(&gid, "a", 100));
+        s.record_outbound(
+            &gid,
+            "m1",
+            "me",
+            "你那边收不到？",
+            100,
+            &[(String::from("a"), Delivery::Queued)],
+        );
+        assert!(s.mark_read_by_peer(&gid, "a", "me", 100));
         let view = s.view(&gid, "me").unwrap();
         assert_eq!(view.messages[0].delivery.get("a"), Some(&Delivery::Read));
         assert_eq!(view.messages[0].read_count, 1);
@@ -3472,7 +6908,11 @@ mod tests {
         let (rest, more) = s.messages_after(&gid, msgs.last().unwrap().at, MAX_SYNC_MESSAGES);
         assert_eq!(rest.len(), 5);
         assert!(!more);
-        assert_eq!(rest[0].seq, MAX_SYNC_MESSAGES as u64 + 1, "接着上一批往下给");
+        assert_eq!(
+            rest[0].seq,
+            MAX_SYNC_MESSAGES as u64 + 1,
+            "接着上一批往下给"
+        );
     }
 
     /// 邀请还挂在卡上时到达的群消息：先攒着，点「加入」那一刻并进会话；点「不加入」跟着丢。
@@ -3514,7 +6954,8 @@ mod tests {
     /// 老文件里多出别的键（别的版本写的）：读进来看不懂就忽略，别把整份群数据读废。
     #[test]
     fn a_file_with_extra_keys_still_loads() {
-        let path = std::env::temp_dir().join(format!("orbdrop_group_legacy_{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("orbdrop_group_legacy_{}", uuid::Uuid::new_v4()));
         std::fs::write(
             &path,
             r#"{"version":1,"groups":[{"id":"g1","name":"老群","rev":2,"createdBy":"a","createdAt":1,"updatedBy":"a","updatedAt":2,"members":[{"id":"a","name":"PC-A"},{"id":"me","name":"PC-ME"}]}],"convos":{"g1":{"messages":[{"id":"m1","from":"a","fromName":"PC-A","text":"你好","at":100,"seq":1}],"readPos":null,"readBy":{}}},"somethingNew":[1,2]}"#,
@@ -3535,9 +6976,9 @@ mod tests {
         let s = GroupStore::with_path(path.clone());
         let gid = s.create(member("me"), vec![member("a")], "名字");
         assert_eq!(s.group(&gid).unwrap().name, "名字");
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = persisted_text(&path);
         assert!(text.contains("\"version\""), "落盘要带版本位：{text}");
-        assert_eq!(FORMAT_VERSION, 1);
+        assert_eq!(FORMAT_VERSION, 4);
         let _ = std::fs::remove_file(path);
     }
 
@@ -3573,7 +7014,10 @@ mod tests {
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["id"], "g-1", "界面读的键就是它");
         assert!(json.get("groupId").is_none(), "别再吐 groupId");
-        assert_eq!(json["buffered"], 2, "攒着几条也要给界面（卡上那句「已有 N 条消息在等你」）");
+        assert_eq!(
+            json["buffered"], 2,
+            "攒着几条也要给界面（卡上那句「已有 N 条消息在等你」）"
+        );
 
         // 老文件（那个键叫 `groupId`）要照样读得进来，不能因为改键丢掉别人挂着的邀请。
         let old = serde_json::json!({
@@ -3595,7 +7039,11 @@ mod tests {
         let first = s.create(me.clone(), vec![member("b"), member("c")], "项目组");
         let again = s.create(me.clone(), vec![member("c"), member("b")], "另一个名字");
         assert_eq!(first, again, "名单一样（顺序不同）就是同一个群");
-        assert_eq!(s.group(&first).unwrap().name, "项目组", "复用不改名：改名走名册编辑那条路");
+        assert_eq!(
+            s.group(&first).unwrap().name,
+            "项目组",
+            "复用不改名：改名走名册编辑那条路"
+        );
         assert_eq!(s.views(&me.id).len(), 1, "只该有一个群");
 
         let other = s.create(me.clone(), vec![member("b"), member("d")], "换个人");
@@ -3616,35 +7064,60 @@ mod tests {
         let s = store("declined");
         let gid = s.create(member("me"), vec![member("a"), member("b")], "");
         // 长连接那条路：写成功就落「已送达」（这正是要被拒收纠正的那种状态）。
-        s.record_outbound(&gid, "m1", "me", "在吗", 100, &[
-            (String::from("a"), Delivery::Sent),
-            (String::from("b"), Delivery::Sent),
-        ]);
+        s.record_outbound(
+            &gid,
+            "m1",
+            "me",
+            "在吗",
+            100,
+            &[
+                (String::from("a"), Delivery::Sent),
+                (String::from("b"), Delivery::Sent),
+            ],
+        );
         assert!(s.mark_rejected(&gid, "m1", "a", true));
         let view = s.view(&gid, "me").unwrap();
-        assert_eq!(view.messages[0].delivery.get("a"), Some(&Delivery::Failed), "被拒的那份改判未送达");
-        assert_eq!(view.messages[0].delivery.get("b"), Some(&Delivery::Sent), "别人不受影响");
+        assert_eq!(
+            view.messages[0].delivery.get("a"),
+            Some(&Delivery::Failed),
+            "被拒的那份改判未送达"
+        );
+        assert_eq!(
+            view.messages[0].delivery.get("b"),
+            Some(&Delivery::Sent),
+            "别人不受影响"
+        );
         assert_eq!(view.declined, vec!["a".to_string()], "界面要能看见是哪一台");
         assert!(
             view.members.iter().any(|m| m.id == "a"),
             "名册不动：拒绝是本机的观察，替所有人改名单要跟 LWW 打架"
         );
         // 同一条又来一次（重复投递）：不重复记、也不重复报改动。
-        assert!(!s.mark_rejected(&gid, "m1", "a", true), "第二次没有新东西可改");
+        assert!(
+            !s.mark_rejected(&gid, "m1", "a", true),
+            "第二次没有新东西可改"
+        );
 
         // 落盘要带着它（重启后那枚胶囊还是红的）。
         let reloaded = GroupStore::with_path(s.path.clone());
-        assert_eq!(reloaded.view(&gid, "me").unwrap().declined, vec!["a".to_string()]);
+        assert_eq!(
+            reloaded.view(&gid, "me").unwrap().declined,
+            vec!["a".to_string()]
+        );
 
         // 把这台移出名单 → 那一格作废（重新加回来 = 一次新的邀请，得重新看它答不答）。
         assert!(s.edit_local(&gid, "me", "", vec![member("b")]).is_some());
-        assert!(s.view(&gid, "me").unwrap().declined.is_empty(), "名单里没有它了就不该再标红");
+        assert!(
+            s.view(&gid, "me").unwrap().declined.is_empty(),
+            "名单里没有它了就不该再标红"
+        );
     }
 
     /// 老文件（没有 `declined` 那一栏）要照样读得进来：那一栏为空，界面不画红。
     #[test]
     fn a_legacy_file_without_the_declined_key_still_loads() {
-        let path = std::env::temp_dir().join(format!("orbdrop_group_legacy_{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("orbdrop_group_legacy_{}", uuid::Uuid::new_v4()));
         std::fs::write(
             &path,
             r#"{"version":1,"groups":[{"id":"g1","name":"老群","rev":1,"createdBy":"a","updatedBy":"a",
@@ -3664,18 +7137,27 @@ mod tests {
     /// 送达，界面上看它一切正常。
     #[tokio::test]
     async fn a_dismissed_invitee_refuses_the_next_group_message() {
-        let dir = std::env::temp_dir().join(format!("orbdrop_group_refuse_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_group_refuse_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let state = Arc::new(crate::state::AppState::new(crate::config::Config::default(), dir.join("config.toml")));
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
         let own = state.config.lock().device_id.clone();
 
         // 收到一份不认识的名册（邀请卡）→ 用户点「不加入」。
         assert_eq!(
-            state.groups.apply_roster(&own, &roster("g1", 1, "a", &["a", &own]), &inviter()),
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 1, "a", &["a", &own]), &inviter()),
             RosterOutcome::Pending
         );
         assert!(state.groups.dismiss_pending("g1"));
-        assert!(state.groups.is_dismissed("g1"), "拒绝过就记着（同一份邀请不会再弹）");
+        assert!(
+            state.groups.is_dismissed("g1"),
+            "拒绝过就记着（同一份邀请不会再弹）"
+        );
 
         let inbound = |gid: &str, id: &str, text: &str| GroupTextIn {
             group_id: gid.into(),
@@ -3692,6 +7174,9 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            epoch: 1,
+            pubkey: String::new(),
+            sig: String::new(),
         };
         assert_eq!(
             on_group_text(&state, "a", inbound("g1", "m1", "进来聊聊")),
@@ -3707,10 +7192,15 @@ mod tests {
 
         // 邀请还挂着（没点加入）时是另一档：**先攒着**，对发送方算送达（它会在点「加入」那一刻出现）。
         assert_eq!(
-            state.groups.apply_roster(&own, &roster("g2", 1, "a", &["a", &own]), &inviter()),
+            state
+                .groups
+                .apply_roster(&own, &roster("g2", 1, "a", &["a", &own]), &inviter()),
             RosterOutcome::Pending
         );
-        assert_eq!(on_group_text(&state, "a", inbound("g2", "m2", "先攒着")), GroupTextOutcome::Buffered);
+        assert_eq!(
+            on_group_text(&state, "a", inbound("g2", "m2", "先攒着")),
+            GroupTextOutcome::Buffered
+        );
         assert!(GroupTextOutcome::Buffered.accepted());
         assert_eq!(state.groups.buffered_count("g2"), 1);
     }
@@ -3719,18 +7209,26 @@ mod tests {
     /// 两档分开才不会把那台设备误标成"已拒绝加入"。
     #[tokio::test]
     async fn a_removed_member_refuses_as_unknown_not_as_declined() {
-        let dir = std::env::temp_dir().join(format!("orbdrop_group_removed_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_group_removed_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let state = Arc::new(crate::state::AppState::new(crate::config::Config::default(), dir.join("config.toml")));
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
         let own = state.config.lock().device_id.clone();
         assert_eq!(
-            state.groups.apply_roster(&own, &roster("g1", 1, "a", &["a", &own, "b"]), &inviter()),
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 1, "a", &["a", &own, "b"]), &inviter()),
             RosterOutcome::Pending
         );
         assert!(state.groups.accept_pending("g1", &own));
         // 名册换了一份**没有本机**的（rev 更大）→ 本机被移出。
         assert_eq!(
-            state.groups.apply_roster(&own, &roster("g1", 2, "a", &["a", "b"]), &inviter()),
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 2, "a", &["a", "b"]), &inviter()),
             RosterOutcome::Updated
         );
         let inbound = GroupTextIn {
@@ -3748,8 +7246,14 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            epoch: 1,
+            pubkey: String::new(),
+            sig: String::new(),
         };
-        assert_eq!(on_group_text(&state, "a", inbound), GroupTextOutcome::Unknown);
+        assert_eq!(
+            on_group_text(&state, "a", inbound),
+            GroupTextOutcome::Unknown
+        );
         assert_eq!(GroupTextOutcome::Unknown.reason(), REASON_UNKNOWN);
         assert_ne!(
             GroupTextOutcome::Unknown.reason(),
@@ -3761,16 +7265,29 @@ mod tests {
     /// 收到拒收回执：那一份落「未送达」，`declined` 记进视图（界面那枚胶囊变红的那条路）。
     #[tokio::test]
     async fn a_rejection_receipt_settles_the_copy_and_marks_the_member() {
-        let dir = std::env::temp_dir().join(format!("orbdrop_group_reject_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_group_reject_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let state = Arc::new(crate::state::AppState::new(crate::config::Config::default(), dir.join("config.toml")));
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
         let own = state.config.lock().device_id.clone();
         assert_eq!(
-            state.groups.apply_roster(&own, &roster("g1", 1, "a", &["a", &own]), &inviter()),
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 1, "a", &["a", &own]), &inviter()),
             RosterOutcome::Pending
         );
         assert!(state.groups.accept_pending("g1", &own));
-        state.groups.record_outbound("g1", "m1", &own, "在吗", 100, &[(String::from("a"), Delivery::Sent)]);
+        state.groups.record_outbound(
+            "g1",
+            "m1",
+            &own,
+            "在吗",
+            100,
+            &[(String::from("a"), Delivery::Sent)],
+        );
 
         on_group_text_rejected(&state, "a", "g1", "m1", REASON_DECLINED);
         let view = state.groups.view("g1", &own).unwrap();
@@ -3778,11 +7295,415 @@ mod tests {
         assert_eq!(view.declined, vec!["a".to_string()]);
 
         // 别的理由（名册没到那种）只落「未送达」，**不许**把对方标成"已拒绝加入"。
-        state.groups.record_outbound("g1", "m2", &own, "再问一句", 200, &[(String::from("a"), Delivery::Sent)]);
+        state.groups.record_outbound(
+            "g1",
+            "m2",
+            &own,
+            "再问一句",
+            200,
+            &[(String::from("a"), Delivery::Sent)],
+        );
         on_group_text_rejected(&state, "a", "g1", "m2", REASON_UNKNOWN);
         let view = state.groups.view("g1", &own).unwrap();
         let m2 = view.messages.iter().find(|m| m.id == "m2").unwrap();
         assert_eq!(m2.delivery.get("a"), Some(&Delivery::Failed));
-        assert_eq!(view.declined, vec!["a".to_string()], "理由不是 declined 就不该多记一个");
+        assert_eq!(
+            view.declined,
+            vec!["a".to_string()],
+            "理由不是 declined 就不该多记一个"
+        );
+    }
+
+    /// 清空记录不退群：名册还在、未读归零、之后的新消息照常收，补拉不会把旧历史拉回来。
+    #[test]
+    fn clearing_history_keeps_the_group_and_accepts_new_messages() {
+        let s = store("clear");
+        let gid = s.create(member("me"), vec![member("a")], "");
+        s.record_inbound(&gid, "a", "PC-A", "m1", "旧消息", 100, 1);
+        assert!(s.view(&gid, "me").is_some());
+
+        assert!(s.clear_history(&gid, "me"));
+        let view = s.view(&gid, "me").unwrap();
+        assert!(view.messages.is_empty(), "记录清空了");
+        assert_eq!(view.unread, 0);
+        assert!(
+            s.ask_payload(&gid, "me").is_some(),
+            "清空后仍要能按清空时刻补拉之后的消息"
+        );
+
+        s.record_inbound(&gid, "a", "PC-A", "m2", "新消息", 200, 2);
+        assert_eq!(
+            s.view(&gid, "me").unwrap().messages.len(),
+            1,
+            "新消息照常收"
+        );
+        assert_eq!(s.view(&gid, "me").unwrap().messages[0].text, "新消息");
+    }
+
+    /// 单条文本上限：超长消息在入口就被拒，不落盘。
+    #[tokio::test]
+    async fn oversized_group_text_is_refused() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_group_long_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        let own = state.config.lock().device_id.clone();
+        assert_eq!(
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 1, "a", &["a", &own]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.accept_pending("g1", &own));
+        let inbound = GroupTextIn {
+            group_id: "g1".into(),
+            id: "long-1".into(),
+            text: "x".repeat(MAX_TEXT_BYTES + 1),
+            at: 100,
+            seq: 1,
+            rev: 1,
+            sender_id: String::new(),
+            sender_name: "PC-A".into(),
+            hops: 0,
+            reached: Vec::new(),
+            image: false,
+            name: String::new(),
+            size: 0,
+            data: String::new(),
+            epoch: 1,
+            pubkey: String::new(),
+            sig: String::new(),
+        };
+        assert_eq!(
+            on_group_text(&state, "a", inbound),
+            GroupTextOutcome::TooLong
+        );
+        assert!(state.groups.view("g1", &own).unwrap().messages.is_empty());
+    }
+
+    /// 群数量上限：达到上限后不再新建（命令层会给出明确错误）。
+    #[test]
+    fn group_count_is_capped() {
+        let s = store("groups_cap");
+        for i in 0..MAX_GROUPS {
+            let gid = s.create(member("me"), vec![member(&format!("p{i}"))], "");
+            assert!(!gid.is_empty(), "第 {i} 个群应该能建");
+        }
+        assert_eq!(s.group_count(), MAX_GROUPS);
+        assert!(s
+            .create(member("me"), vec![member("overflow")], "")
+            .is_empty());
+    }
+
+    /// 群消息签名：第一次带公钥的消息绑定作者；之后同样公钥但内容被改的签名必须拒绝。
+    #[tokio::test]
+    async fn a_group_message_signature_binds_the_author_and_rejects_tampering() {
+        use base64::Engine as _;
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let dir = std::env::temp_dir().join(format!("orbdrop_group_sig_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(crate::state::AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        let own = state.config.lock().device_id.clone();
+        assert_eq!(
+            state
+                .groups
+                .apply_roster(&own, &roster("g1", 1, "a", &["a", &own]), &inviter()),
+            RosterOutcome::Pending
+        );
+        assert!(state.groups.accept_pending("g1", &own));
+
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let pubkey = base64::engine::general_purpose::STANDARD.encode(pair.public_key().as_ref());
+        let sign = |text: &str, id: &str| {
+            let bytes = group_msg_signing_bytes("g1", 1, "a", id, 100, 1, text, false, "", 0, "");
+            base64::engine::general_purpose::STANDARD.encode(pair.sign(&bytes).as_ref())
+        };
+        let make = |id: &str, text: &str, sig: String| GroupTextIn {
+            group_id: "g1".into(),
+            id: id.into(),
+            text: text.into(),
+            at: 100,
+            seq: 1,
+            rev: 1,
+            sender_id: String::new(),
+            sender_name: "PC-A".into(),
+            hops: 0,
+            reached: Vec::new(),
+            image: false,
+            name: String::new(),
+            size: 0,
+            data: String::new(),
+            epoch: 1,
+            pubkey: pubkey.clone(),
+            sig,
+        };
+
+        let first = make("sig-1", "真的", sign("真的", "sig-1"));
+        assert_eq!(
+            on_group_text(&state, "a", first),
+            GroupTextOutcome::Recorded
+        );
+        assert!(state
+            .groups
+            .group("g1")
+            .unwrap()
+            .member_pubkey("a")
+            .is_some_and(|k| k == pubkey));
+
+        // 同样的公钥/签名，但正文被改：必须拒。
+        let tampered = make("sig-2", "被改过的", sign("原来的", "sig-2"));
+        assert_eq!(
+            on_group_text(&state, "a", tampered),
+            GroupTextOutcome::BadSignature
+        );
+    }
+
+    /// 只按条数裁不够：500 条大文本也要被字节上限压住。
+    #[test]
+    fn group_window_is_capped_by_bytes_too() {
+        let s = store("bytes");
+        let gid = s.create(member("me"), vec![member("a")], "");
+        let text = "x".repeat(4096);
+        for i in 1..=MAX_PER_GROUP as u64 {
+            s.record_inbound(&gid, "a", "PC-A", &format!("m{i}"), text.as_str(), i, i);
+        }
+        let view = s.view(&gid, "me").unwrap();
+        assert!(
+            view.messages.len() < MAX_PER_GROUP,
+            "字节超限时要从最老开始裁"
+        );
+        let total: usize = view.messages.iter().map(|m| m.text.len()).sum();
+        assert!(total <= MAX_GROUP_BYTES, "窗口总字节应在上限内：{total}");
+        assert_eq!(view.messages.last().unwrap().seq, MAX_PER_GROUP as u64);
+    }
+
+    /// 压缩编码本身：0 = 不发，1..7 = 七种状态；解回来必须一模一样。
+    #[test]
+    fn delivery_pack_roundtrips_every_state() {
+        let order: Vec<String> = ["a", "b", "c", "d", "e", "f", "g", "h"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut map = HashMap::new();
+        map.insert("a".into(), Delivery::Sending);
+        map.insert("b".into(), Delivery::Sent);
+        map.insert("c".into(), Delivery::Read);
+        map.insert("d".into(), Delivery::Queued);
+        map.insert("e".into(), Delivery::Received);
+        map.insert("f".into(), Delivery::Synced);
+        map.insert("g".into(), Delivery::Failed);
+        // h 缺席（这条消息不投给它）。
+        let packed = encode_delivery(&order, &map).expect("应能压缩");
+        assert_eq!(packed.len(), 8, "8 个成员 = 4 字节 = 8 个 base64 字符");
+        assert_eq!(decode_delivery(&packed, &order).unwrap(), map);
+        assert_eq!(encode_delivery(&order, &HashMap::new()), None);
+    }
+
+    /// 落盘：`delivery` 变空对象 + `deliveryPacked`；重启后 map 原样回来。
+    #[test]
+    fn delivery_is_packed_on_disk_and_restored_on_load() {
+        let s = store("delivery_pack");
+        joined(&s, "g1");
+        let mut deliveries = HashMap::new();
+        deliveries.insert("a".to_string(), Delivery::Sent);
+        deliveries.insert("b".to_string(), Delivery::Queued);
+        deliveries.insert("gone".to_string(), Delivery::Failed);
+        s.record_outbound(
+            "g1",
+            "m1",
+            "me",
+            "你好",
+            100,
+            &deliveries.into_iter().collect::<Vec<_>>(),
+        );
+
+        let text = persisted_text(&s.path);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let msg = &value["convos"]["g1"]["messages"][0];
+        assert_eq!(msg["delivery"], serde_json::json!({}), "map 不再落盘");
+        assert!(
+            msg["deliveryPacked"]
+                .as_str()
+                .is_some_and(|p| !p.is_empty()),
+            "压缩字段应在：{msg}"
+        );
+        assert!(
+            s.group("g1")
+                .unwrap()
+                .member_order
+                .iter()
+                .any(|id| id == "gone"),
+            "不在当前名册里的历史收件人也要保留索引"
+        );
+
+        let reloaded = GroupStore::with_path(s.path.clone());
+        let view = reloaded.view("g1", "me").unwrap();
+        let m = &view.messages[0];
+        assert_eq!(m.delivery.get("a"), Some(&Delivery::Sent));
+        assert_eq!(m.delivery.get("b"), Some(&Delivery::Queued));
+        assert_eq!(m.delivery.get("gone"), Some(&Delivery::Failed));
+    }
+
+    /// 老文件（v1，delivery 是 map）能升级；升级后仍是压缩形状，且历史收件人不丢。
+    #[test]
+    fn legacy_delivery_map_is_migrated_without_losing_removed_members() {
+        let dir = std::env::temp_dir().join(format!(
+            "orbdrop_group_delivery_migrate_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups.json");
+        let legacy = serde_json::json!({
+            "version": 1,
+            "groups": [{
+                "id": "g1", "name": "老群", "rev": 1,
+                "createdBy": "me", "createdAt": 1, "updatedBy": "me", "updatedAt": 1,
+                "members": [{"id": "me", "name": "ME"}, {"id": "a", "name": "A"}]
+            }],
+            "convos": {"g1": {
+                "messages": [{
+                    "id": "m1", "from": "me", "text": "旧消息", "at": 100, "seq": 1,
+                    "delivery": {"a": "sent", "gone": "queued"}
+                }],
+                "readPos": null, "readBy": {}
+            }}
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let s = GroupStore::with_path(path.clone());
+        let view = s.view("g1", "me").unwrap();
+        assert_eq!(view.messages[0].delivery.get("a"), Some(&Delivery::Sent));
+        assert_eq!(
+            view.messages[0].delivery.get("gone"),
+            Some(&Delivery::Queued)
+        );
+        assert!(s
+            .group("g1")
+            .unwrap()
+            .member_order
+            .iter()
+            .any(|id| id == "gone"));
+
+        // 触发一次落盘：map 应变成 packed。
+        assert!(s.mark_read_local("g1", "m1"));
+        let text = persisted_text(&path);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let msg = &value["convos"]["g1"]["messages"][0];
+        assert_eq!(msg["delivery"], serde_json::json!({}));
+        assert!(msg["deliveryPacked"]
+            .as_str()
+            .is_some_and(|p| !p.is_empty()));
+
+        let reloaded = GroupStore::with_path(path);
+        assert_eq!(
+            reloaded.view("g1", "me").unwrap().messages[0]
+                .delivery
+                .get("gone"),
+            Some(&Delivery::Queued),
+            "升级后历史状态还在"
+        );
+    }
+
+    /// 历史索引到上限后不再追加；涉及未入索引成员的消息退回 map，不能丢状态。
+    #[test]
+    fn delivery_index_is_capped_and_overflow_stays_uncompressed() {
+        let s = store("delivery_cap");
+        let gid = s.create(member("me"), vec![member("a")], "上限");
+        {
+            let mut guard = s.inner.lock();
+            let g = guard.groups.iter_mut().find(|g| g.id == gid).unwrap();
+            g.member_order = (0..MAX_MEMBER_ORDER).map(|i| format!("hist-{i}")).collect();
+        }
+        s.record_outbound(
+            &gid,
+            "m1",
+            "me",
+            "你好",
+            100,
+            &[(String::from("a"), Delivery::Sent)],
+        );
+        let text = persisted_text(&s.path);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let msg = &value["convos"][&gid]["messages"][0];
+        assert_eq!(msg["delivery"]["a"], "sent", "溢出的收件人仍保留在 map");
+        assert!(msg.get("deliveryPacked").is_none(), "不压缩，避免索引缺失");
+        let reloaded = GroupStore::with_path(s.path.clone());
+        assert_eq!(
+            reloaded.view(&gid, "me").unwrap().messages[0]
+                .delivery
+                .get("a"),
+            Some(&Delivery::Sent)
+        );
+    }
+
+    /// 模拟旧版本的读取形状：它只认识 `delivery` map，不认识 `deliveryPacked`。
+    /// 新文件必须仍然能解析（消息不丢），只是状态显示退化。
+    #[test]
+    fn an_old_reader_can_still_parse_the_new_file() {
+        #[derive(serde::Deserialize)]
+        struct OldConvo {
+            #[serde(default)]
+            messages: Vec<OldMsg>,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldMsg {
+            id: String,
+            #[serde(default)]
+            delivery: HashMap<String, Delivery>,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldFile {
+            #[serde(default)]
+            convos: HashMap<String, OldConvo>,
+        }
+
+        let s = store("old_reader");
+        joined(&s, "g1");
+        s.record_outbound(
+            "g1",
+            "m1",
+            "me",
+            "你好",
+            100,
+            &[(String::from("a"), Delivery::Sent)],
+        );
+        let text = persisted_text(&s.path);
+        let old: OldFile = serde_json::from_str(&text).expect("旧读取形状应能解析新文件");
+        let m = &old.convos["g1"].messages[0];
+        assert_eq!(m.id, "m1");
+        assert!(m.delivery.is_empty(), "旧版本只看到空 map");
+    }
+
+    /// 新建群的 roster 必须带签名；改动任何字段后原签名失效，接收方拒绝。
+    #[test]
+    fn created_roster_is_signed_and_tampering_is_rejected() {
+        let s = store("rsig");
+        let gid = s.create(member("me"), vec![member("a")], "");
+        let g = s.group(&gid).unwrap();
+        let pubkey = g.member_pubkey("me").expect("创建者公钥").to_string();
+        assert!(!g.sig.is_empty(), "新群名册要签名");
+        assert!(crate::group_identity::verify_b64(
+            &pubkey,
+            &roster_signing_bytes(&g.payload()),
+            &g.sig
+        ));
+        let mut tampered = g.payload();
+        tampered.rev += 1;
+        tampered.name = "被改过的群名".into();
+        // 签名还是旧的那枚：字段变了必须验不过。
+        assert_eq!(
+            s.apply_roster("me", &tampered, &inviter()),
+            RosterOutcome::Ignored
+        );
+        assert_eq!(s.view(&gid, "me").unwrap().name, g.name, "名册没被改写");
     }
 }

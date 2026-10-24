@@ -37,10 +37,8 @@ fn make_state(port: u16, device_id: &str, device_name: &str, save_dir: PathBuf) 
     config.device_name = device_name.to_string();
     config.download_dir = save_dir;
     config.bc_exe_path = None;
-    let config_path = std::env::temp_dir().join(format!(
-        "orbdrop_stream_cfg_{}.toml",
-        uuid::Uuid::new_v4()
-    ));
+    let config_path =
+        std::env::temp_dir().join(format!("orbdrop_stream_cfg_{}.toml", uuid::Uuid::new_v4()));
     Arc::new(AppState::new(config, config_path))
 }
 
@@ -144,7 +142,9 @@ fn assert_landed(dest_root: &std::path::Path, files: &[(String, Vec<u8>)]) {
 }
 
 fn collect_parts(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -169,7 +169,15 @@ fn pair_without_ws(
     port_a: u16,
     port_b: u16,
 ) {
-    pair_without_ws_with_token(state_a, state_b, id_a, id_b, port_a, port_b, &pairing_token());
+    pair_without_ws_with_token(
+        state_a,
+        state_b,
+        id_a,
+        id_b,
+        port_a,
+        port_b,
+        &pairing_token(),
+    );
 }
 
 /// 一次配对用哪枚 token。
@@ -202,7 +210,8 @@ fn pair_without_ws_with_token(
         online: true,
         paired: true,
         auto_connect: false,
-        paused: false, relay: None,
+        paused: false,
+        relay: None,
     });
     state_b.add_peer_book(PeerDevice {
         id: id_a.into(),
@@ -212,15 +221,22 @@ fn pair_without_ws_with_token(
         online: true,
         paired: true,
         auto_connect: false,
-        paused: false, relay: None,
+        paused: false,
+        relay: None,
     });
 }
 
 async fn push_one(state: &Arc<AppState>, src: &std::path::Path, peer: &str) -> String {
-    transfer::push_paths(state.clone(), vec![src.to_string_lossy().to_string()], vec![peer.into()], None, None)
-        .await
-        .expect("邀请应该发得出去")
-        .targets[0]
+    transfer::push_paths(
+        state.clone(),
+        vec![src.to_string_lossy().to_string()],
+        vec![peer.into()],
+        None,
+        None,
+    )
+    .await
+    .expect("邀请应该发得出去")
+    .targets[0]
         .invite_id
         .clone()
 }
@@ -235,8 +251,12 @@ async fn stream_push_transfers_mixed_folder_intact() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-sa", "PC-SA", save.clone());
     let state_b = make_state(port_b, "device-sb", "PC-SB", save.clone());
-    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
-    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
+        .await
+        .unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b)
+        .await
+        .unwrap();
     pair_without_ws(&state_a, &state_b, "device-sa", "device-sb", port_a, port_b);
 
     let invite_id = push_one(&state_a, &src, "device-sb").await;
@@ -253,7 +273,10 @@ async fn stream_push_transfers_mixed_folder_intact() {
         .get(&invite_id)
         .map(|inv| inv.caps.clone())
         .unwrap_or_default();
-    assert!(caps.iter().any(|c| c == CAP_STREAM), "邀请应带 stream1 能力位: {caps:?}");
+    assert!(
+        caps.iter().any(|c| c == CAP_STREAM),
+        "邀请应带 stream1 能力位: {caps:?}"
+    );
 
     let name = src.file_name().unwrap().to_string_lossy().to_string();
     let dest = save.join("PC-SA").join(&name);
@@ -294,8 +317,12 @@ async fn interrupted_push_resumes_from_the_block_record() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-ra", "PC-RA", save.clone());
     let state_b = make_state(port_b, "device-rb", "PC-RB", save.clone());
-    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
-    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
+        .await
+        .unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b)
+        .await
+        .unwrap();
     pair_without_ws(&state_a, &state_b, "device-ra", "device-rb", port_a, port_b);
 
     let name = src.file_name().unwrap().to_string_lossy().to_string();
@@ -364,9 +391,11 @@ async fn interrupted_push_resumes_from_the_block_record() {
 
     // ---- 第二趟：同一份源再推一次，应当接着传 ------------------------------------
     let invite_two = push_one(&state_a, &src, "device-rb").await;
-    wait_until("第二趟收完（发送方拿到完成回执）", 60, || {
-        state_a.push.jobs.lock().get(&invite_two).is_none()
-    })
+    wait_until(
+        "第二趟收完（发送方拿到完成回执）",
+        60,
+        || state_a.push.jobs.lock().get(&invite_two).is_none(),
+    )
     .await;
     assert_eq!(std::fs::read(&dest).unwrap(), big, "续传之后必须逐字节一致");
     assert!(
@@ -412,8 +441,12 @@ async fn a_restarted_receiver_resumes_on_its_own() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-za", "PC-ZA", save.clone());
     let state_b = make_state(port_b, "device-zb", "PC-ZB", blocked);
-    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
-    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
+        .await
+        .unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b)
+        .await
+        .unwrap();
     pair_without_ws(&state_a, &state_b, "device-za", "device-zb", port_a, port_b);
 
     let name = src.file_name().unwrap().to_string_lossy().to_string();
@@ -453,11 +486,17 @@ async fn a_restarted_receiver_resumes_on_its_own() {
     // 启动那一拍（`lib.rs` 里跑的就是这一句）：自己接着收 —— 发送方一次都没重推。
     transfer::resume_pending(&state_b2);
 
-    wait_until("自己接着收完（发送方那一台收到完成回执）", 120, || {
-        state_a.push.jobs.lock().get(&invite).is_none()
-    })
+    wait_until(
+        "自己接着收完（发送方那一台收到完成回执）",
+        120,
+        || state_a.push.jobs.lock().get(&invite).is_none(),
+    )
     .await;
-    assert_eq!(std::fs::read(&dest).unwrap(), big, "接着收之后必须逐字节一致");
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        big,
+        "接着收之后必须逐字节一致"
+    );
     assert!(
         !state_b2.push.resume.pending_ids().contains(&invite),
         "传完要把待续传任务删掉（重启后不该再收一遍）"
@@ -494,8 +533,12 @@ async fn the_same_file_into_two_dirs_keeps_both_records() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-2a", "PC-2A", save.clone());
     let state_b = make_state(port_b, "device-2b", "PC-2B", dir1.clone());
-    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
-    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
+        .await
+        .unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b)
+        .await
+        .unwrap();
     pair_without_ws(&state_a, &state_b, "device-2a", "device-2b", port_a, port_b);
 
     let name = src.file_name().unwrap().to_string_lossy().to_string();
@@ -505,7 +548,13 @@ async fn the_same_file_into_two_dirs_keeps_both_records() {
         orbdrop_lib::transfer::stream::mtime_secs(&meta)
     };
     let land1 = dir1.join("PC-2A").join(&name);
-    let key1 = orbdrop_lib::transfer::stream::resume_key("device-2a", &land1, &rel, big.len() as u64, mtime);
+    let key1 = orbdrop_lib::transfer::stream::resume_key(
+        "device-2a",
+        &land1,
+        &rel,
+        big.len() as u64,
+        mtime,
+    );
 
     // ---- 第一趟：收了一半就取消（留下记录 + 半截 `.part`）------------------------------
     let invite_one = push_one(&state_a, &src, "device-2b").await;
@@ -523,18 +572,28 @@ async fn the_same_file_into_two_dirs_keeps_both_records() {
         .resume
         .file_record(&key1)
         .expect("取消之后记录要留着（下次接着传的全部依据）");
-    assert!(before.part.starts_with(&dir1.to_string_lossy().to_string()), "记录指着第一个目录: {}", before.part);
+    assert!(
+        before.part.starts_with(&dir1.to_string_lossy().to_string()),
+        "记录指着第一个目录: {}",
+        before.part
+    );
 
     // ---- 换到第二个目录再推一次：它必须**另起一份**，别碰第一份 ------------------------
     state_b.config.lock().download_dir = dir2.clone();
     let invite_two = push_one(&state_a, &src, "device-2b").await;
-    wait_until("第二趟收完（发送方拿到完成回执）", 60, || {
-        state_a.push.jobs.lock().get(&invite_two).is_none()
-    })
+    wait_until(
+        "第二趟收完（发送方拿到完成回执）",
+        60,
+        || state_a.push.jobs.lock().get(&invite_two).is_none(),
+    )
     .await;
 
     let land2 = dir2.join("PC-2A").join(&name);
-    assert_eq!(std::fs::read(land2.join("big.bin")).unwrap(), big, "新目录那份必须逐字节一致");
+    assert_eq!(
+        std::fs::read(land2.join("big.bin")).unwrap(),
+        big,
+        "新目录那份必须逐字节一致"
+    );
     assert!(
         state_a
             .push
@@ -556,14 +615,24 @@ async fn the_same_file_into_two_dirs_keeps_both_records() {
         .file_record(&key1)
         .expect("第二个目录那一趟不该覆盖第一份记录");
     assert_eq!(after.part, before.part, "第一份记录的 .part 路径不该被改写");
-    assert_eq!(after.done_bytes(), before.done_bytes(), "第一份记录的进度也不该被改写");
+    assert_eq!(
+        after.done_bytes(),
+        before.done_bytes(),
+        "第一份记录的进度也不该被改写"
+    );
     if before.done_bytes() > 0 {
-        assert!(PathBuf::from(&before.part).exists(), "第一份的 .part 还要在（它是「接着传」的凭据）");
+        assert!(
+            PathBuf::from(&before.part).exists(),
+            "第一份的 .part 还要在（它是「接着传」的凭据）"
+        );
     }
     // 收完的那个目录里不留临时文件（另一个目录里的那份是"下次接着传"的凭据，不算残留）。
     let mut leftovers = Vec::new();
     collect_parts(&dir2, &mut leftovers);
-    assert!(leftovers.is_empty(), "收完的目录不该留 .part: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "收完的目录不该留 .part: {leftovers:?}"
+    );
 
     orbdrop_lib::server::stop_server(&state_a).await;
     orbdrop_lib::server::stop_server(&state_b).await;
@@ -592,8 +661,12 @@ async fn both_sides_restarted_resume() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-ba", "PC-BA", save.clone());
     let state_b = make_state(port_b, "device-bb", "PC-BB", blocked);
-    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
-    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
+        .await
+        .unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b)
+        .await
+        .unwrap();
     pair_without_ws(&state_a, &state_b, "device-ba", "device-bb", port_a, port_b);
 
     let name = src.file_name().unwrap().to_string_lossy().to_string();
@@ -601,13 +674,19 @@ async fn both_sides_restarted_resume() {
 
     // ---- 第一趟：B 自动收下（并把"开始拉了"回报给 A），然后因落盘根写不进去而收手 ---------
     let invite = push_one(&state_a, &src, "device-bb").await;
-    wait_until("接收端接住这条（待续传任务落盘）", 30, || {
-        state_b.push.resume.pending_ids().contains(&invite)
-    })
+    wait_until(
+        "接收端接住这条（待续传任务落盘）",
+        30,
+        || state_b.push.resume.pending_ids().contains(&invite),
+    )
     .await;
     // 发送端要知道"对面真的开始拉了" —— 这一刻它才会把这条落盘（`accepted = true`）。
     wait_until("发送端记下「对面开始拉了」", 30, || {
-        state_a.push.job_status(&invite).as_deref().is_some_and(|s| s != "invited")
+        state_a
+            .push
+            .job_status(&invite)
+            .as_deref()
+            .is_some_and(|s| s != "invited")
     })
     .await;
     wait_until("这一趟收手（邀请摘掉）", 30, || {
@@ -623,7 +702,10 @@ async fn both_sides_restarted_resume() {
         1,
         "发送端那条 job 应该已经落盘"
     );
-    assert!(jobs_on_disk.iter().any(|j| j.id == invite && j.accepted), "而且记着「对面开始拉了」");
+    assert!(
+        jobs_on_disk.iter().any(|j| j.id == invite && j.accepted),
+        "而且记着「对面开始拉了」"
+    );
     assert!(
         batches_on_disk
             .iter()
@@ -636,18 +718,29 @@ async fn both_sides_restarted_resume() {
     orbdrop_lib::server::stop_server(&state_b).await;
     let state_a2 = make_state(port_a, "device-ba", "PC-BA", save.clone());
     let state_b2 = make_state(port_b, "device-bb", "PC-BB", save.clone());
-    let port_a2 = orbdrop_lib::server::start_server_loopback(state_a2.clone(), port_a).await.unwrap();
-    let port_b2 = orbdrop_lib::server::start_server_loopback(state_b2.clone(), port_b).await.unwrap();
+    let port_a2 = orbdrop_lib::server::start_server_loopback(state_a2.clone(), port_a)
+        .await
+        .unwrap();
+    let port_b2 = orbdrop_lib::server::start_server_loopback(state_b2.clone(), port_b)
+        .await
+        .unwrap();
     assert_eq!((port_a, port_b), (port_a2, port_b2));
 
     // A2 启动那一拍：把没走完的发送任务捡回来（`lib.rs` 的启动块调的就是这一句）。
-    assert_eq!(orbdrop_lib::transfer::push_job::restore_outbound(&state_a2), 1);
-    assert!(state_a2.push.jobs.lock().contains_key(&invite), "取文件的凭据回来了");
+    assert_eq!(
+        orbdrop_lib::transfer::push_job::restore_outbound(&state_a2),
+        1
+    );
+    assert!(
+        state_a2.push.jobs.lock().contains_key(&invite),
+        "取文件的凭据回来了"
+    );
     let cards = state_a2.push.all_batch_views();
     assert!(
-        cards
+        cards.iter().any(|c| c
+            .targets
             .iter()
-            .any(|c| c.targets.iter().any(|t| t.invite_id == invite && t.state == "sending")),
+            .any(|t| t.invite_id == invite && t.state == "sending")),
         "卡也回来了，而且那一行写着「传输中」: {:?}",
         cards
     );
@@ -656,18 +749,29 @@ async fn both_sides_restarted_resume() {
     // **按运行时的节拍反复叫**（`lib.rs` 的 5s 探活循环就是这么调的）：一次没成（够不着、
     // 恰好撞上握手的边）下一拍会再试 —— 单叫一次与真实行为不符，而且会把"本会自愈的那一次"
     // 记成失败。真的落终态（例如 410）时，下一拍就找不到待续传任务了，下面的断言照样会失败。
-    wait_until("接收端拿到这一趟的判决（续传收完或收手）", 120, || {
-        if !state_b2.push.resume.pending_ids().contains(&invite) {
-            return true;
-        }
-        transfer::resume_pending(&state_b2);
-        false
-    })
+    wait_until(
+        "接收端拿到这一趟的判决（续传收完或收手）",
+        120,
+        || {
+            if !state_b2.push.resume.pending_ids().contains(&invite) {
+                return true;
+            }
+            transfer::resume_pending(&state_b2);
+            false
+        },
+    )
     .await;
     // ---- 本机能定下来的事实（与任何回执通道无关）------------------------------------------
-    assert_eq!(std::fs::read(&dest).unwrap(), big, "接着收之后必须逐字节一致");
     assert_eq!(
-        state_b2.push.answer_invite_state(&invite, "device-ba").state,
+        std::fs::read(&dest).unwrap(),
+        big,
+        "接着收之后必须逐字节一致"
+    );
+    assert_eq!(
+        state_b2
+            .push
+            .answer_invite_state(&invite, "device-ba")
+            .state,
         "done",
         "接收端那边的结局必须是「完成」"
     );
@@ -697,9 +801,9 @@ async fn both_sides_restarted_resume() {
         // 所以这里断言的是**这一条再也恢复不出一张卡**（照样只看自己那条：文件是整个进程共用的）。
         assert!(
             !batches_left.iter().any(|b| {
-                b.targets
-                    .iter()
-                    .any(|t| t.invite_id == invite && (t.state == "sending" || t.state == "invited"))
+                b.targets.iter().any(|t| {
+                    t.invite_id == invite && (t.state == "sending" || t.state == "invited")
+                })
             }),
             "盘上不该再有这一条「还在等 / 在传」的行: {batches_left:?}"
         );
@@ -738,8 +842,12 @@ async fn without_the_sender_record_the_receiver_is_told_so() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-na", "PC-NA", save.clone());
     let state_b = make_state(port_b, "device-nb", "PC-NB", blocked);
-    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
-    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
+        .await
+        .unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b)
+        .await
+        .unwrap();
     pair_without_ws(&state_a, &state_b, "device-na", "device-nb", port_a, port_b);
 
     let invite = push_one(&state_a, &src, "device-nb").await;
@@ -757,8 +865,12 @@ async fn without_the_sender_record_the_receiver_is_told_so() {
     // A2：**故意不调用 `restore_outbound`** —— 就是"发送端那台没有这条 job 了"。
     let state_a2 = make_state(port_a, "device-na", "PC-NA", save.clone());
     let state_b2 = make_state(port_b, "device-nb", "PC-NB", save.clone());
-    let _port_a2 = orbdrop_lib::server::start_server_loopback(state_a2.clone(), port_a).await.unwrap();
-    let port_b2 = orbdrop_lib::server::start_server_loopback(state_b2.clone(), port_b).await.unwrap();
+    let _port_a2 = orbdrop_lib::server::start_server_loopback(state_a2.clone(), port_a)
+        .await
+        .unwrap();
+    let port_b2 = orbdrop_lib::server::start_server_loopback(state_b2.clone(), port_b)
+        .await
+        .unwrap();
     assert_eq!(port_b, port_b2);
 
     transfer::resume_pending(&state_b2);
@@ -792,8 +904,12 @@ async fn a_changed_source_retracts_the_waiting_push() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-ca", "PC-CA", save.clone());
     let state_b = make_state(port_b, "device-cb", "PC-CB", save.clone());
-    let _port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
-    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    let _port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
+        .await
+        .unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b)
+        .await
+        .unwrap();
 
     // **未绑定**：这条推送要等接收方点同意 —— 正好给了我们一个确定的等待窗口
     // （已配对设备当场开收，那个窗口只有几毫秒，测不出确定性）。
@@ -805,7 +921,8 @@ async fn a_changed_source_retracts_the_waiting_push() {
         online: true,
         paired: false,
         auto_connect: false,
-        paused: false, relay: None,
+        paused: false,
+        relay: None,
     });
 
     let invite_id = push_one(&state_a, &src, "device-cb").await;
@@ -817,12 +934,16 @@ async fn a_changed_source_retracts_the_waiting_push() {
     std::fs::write(src.join("改过的.bin"), vec![9u8; 2 * 1024 * 1024 + 5]).unwrap();
 
     wait_until("发送方那一台落「已取消」", 10, || {
-        state_a.push.target_of_invite(&invite_id).map(|t| t.state)
-            == Some(TargetState::Cancelled)
+        state_a.push.target_of_invite(&invite_id).map(|t| t.state) == Some(TargetState::Cancelled)
     })
     .await;
     assert_eq!(
-        state_a.push.target_of_invite(&invite_id).unwrap().error.as_deref(),
+        state_a
+            .push
+            .target_of_invite(&invite_id)
+            .unwrap()
+            .error
+            .as_deref(),
         Some("源文件已变化，本机已取消"),
         "卡片上要说清是**源变了**，不是用户点了取消"
     );
@@ -878,8 +999,12 @@ async fn device_subdir_off_lands_directly_in_the_download_dir() {
     let state_b = make_state(port_b, "device-fb", "PC-FB", save.clone());
     // 接收方关掉 `<发送方名>/` 那一层（S-12，默认开）。
     state_b.config.lock().device_subdir = false;
-    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
-    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
+        .await
+        .unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b)
+        .await
+        .unwrap();
     pair_without_ws(&state_a, &state_b, "device-fa", "device-fb", port_a, port_b);
 
     let invite_id = push_one(&state_a, &src, "device-fb").await;
@@ -937,8 +1062,12 @@ async fn a_renamed_source_lands_under_the_override_name() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-na", "PC-NA", save.clone());
     let state_b = make_state(port_b, "device-nb", "PC-NB", save.clone());
-    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a).await.unwrap();
-    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b).await.unwrap();
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
+        .await
+        .unwrap();
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b)
+        .await
+        .unwrap();
     pair_without_ws(&state_a, &state_b, "device-na", "device-nb", port_a, port_b);
 
     let view = transfer::push_paths(

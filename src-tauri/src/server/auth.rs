@@ -1,11 +1,11 @@
-use std::sync::Arc;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::http::{HeaderMap, StatusCode};
 use parking_lot::Mutex;
 use tracing::{debug, info};
 
@@ -188,7 +188,10 @@ mod tests {
     #[test]
     fn basic_credentials_split_on_the_first_colon() {
         assert_eq!(split_basic("x:tok"), Some(("x", "tok")));
-        assert_eq!(split_basic("OrbDrop:deadbeef"), Some(("OrbDrop", "deadbeef")));
+        assert_eq!(
+            split_basic("OrbDrop:deadbeef"),
+            Some(("OrbDrop", "deadbeef"))
+        );
         assert_eq!(split_basic("weird:user:tok"), Some(("weird", "user:tok")));
         assert_eq!(split_basic("no-colon"), None, "没有分隔符 = 格式错误");
         assert_eq!(split_basic("OrbDrop:"), None, "空 token 不该拿去查凭据库");

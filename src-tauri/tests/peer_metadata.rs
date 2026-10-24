@@ -23,12 +23,17 @@ fn make_state(port: u16) -> Arc<AppState> {
     config.device_id = "device-metadata-self".into();
     config.device_name = "元数据测试".into();
     config.bc_exe_path = None;
-    let config_path = std::env::temp_dir().join(format!("orbdrop_meta_cfg_{}.toml", uuid::Uuid::new_v4()));
+    let config_path =
+        std::env::temp_dir().join(format!("orbdrop_meta_cfg_{}.toml", uuid::Uuid::new_v4()));
     Arc::new(AppState::new(config, config_path))
 }
 
 /// 搭一个只有共享项、没有内容的实例，并把地址簿里那一行指向 `peer_port`。
-async fn state_with_share(port: u16, root: &std::path::Path, peer_port: u16) -> (Arc<AppState>, String, String, std::path::PathBuf) {
+async fn state_with_share(
+    port: u16,
+    root: &std::path::Path,
+    peer_port: u16,
+) -> (Arc<AppState>, String, String, std::path::PathBuf) {
     let state = make_state(port);
     let share = ShareItem::new(root.to_path_buf());
     let share_id = share.id.clone();
@@ -42,7 +47,8 @@ async fn state_with_share(port: u16, root: &std::path::Path, peer_port: u16) -> 
         online: true,
         paired: true,
         auto_connect: false,
-        paused: false, relay: None,
+        paused: false,
+        relay: None,
     });
     credential::set_peer(&peer, "t").unwrap();
     let cfg = state.config_path.clone();
@@ -76,7 +82,11 @@ impl OldPeer {
                         .split(['?', '&'])
                         .find_map(|kv| kv.strip_prefix("path="))
                         .unwrap_or("");
-                    let dir = if rel.is_empty() { root.clone() } else { root.join(rel) };
+                    let dir = if rel.is_empty() {
+                        root.clone()
+                    } else {
+                        root.join(rel)
+                    };
                     let mut entries = Vec::new();
                     if let Ok(read) = std::fs::read_dir(&dir) {
                         for entry in read.flatten() {
@@ -129,7 +139,9 @@ async fn shares_reports_is_dir_from_real_metadata() {
     let (file_id, dir_id) = (file_share.id.clone(), dir_share.id.clone());
     state.config.lock().shares.push(file_share);
     state.config.lock().shares.push(dir_share);
-    let port = orbdrop_lib::server::start_server_loopback(state.clone(), 3993).await.expect("起服务");
+    let port = orbdrop_lib::server::start_server_loopback(state.clone(), 3993)
+        .await
+        .expect("起服务");
     credential::set_peer(&peer, "t").unwrap();
 
     let body: serde_json::Value = reqwest::Client::new()
@@ -169,10 +181,12 @@ async fn probe_entry_reports_what_the_peer_actually_has() {
     std::fs::write(root.join("一个文件"), b"file-content").unwrap();
 
     let (state, share_id, peer, cfg) = state_with_share(3994, &root, 3994).await;
-    let port = orbdrop_lib::server::start_server_loopback(state.clone(), 3994).await.expect("起服务");
+    let port = orbdrop_lib::server::start_server_loopback(state.clone(), 3994)
+        .await
+        .expect("起服务");
     credential::set_peer(&peer, "t").unwrap();
 
-    let client = peer_fs::client();
+    let client = peer_fs::client_for(&state, &peer).expect("client");
     let base = orbdrop_lib::net::peer_base("127.0.0.1", port);
 
     let dir = peer_fs::probe_entry(&client, &base, "t", &share_id, "子目录")
@@ -190,7 +204,9 @@ async fn probe_entry_reports_what_the_peer_actually_has() {
     assert!(file.mtime.is_some(), "修改时间也要带上");
 
     // 越界路径必须报错，不能"看着成功了"到最后复制才失败
-    assert!(peer_fs::probe_entry(&client, &base, "t", &share_id, "../x").await.is_err());
+    assert!(peer_fs::probe_entry(&client, &base, "t", &share_id, "../x")
+        .await
+        .is_err());
 
     credential::remove_peer(&peer).ok();
     let _ = std::fs::remove_dir_all(&root);
@@ -210,7 +226,7 @@ async fn old_peer_without_stat_falls_back_to_parent_listing() {
     let (state, share_id, peer, cfg) = state_with_share(3992, &root, old.port).await;
 
     let meta = peer_fs::probe_entry(
-        &peer_fs::client(),
+        &peer_fs::client_for(&state, &peer).expect("client"),
         &orbdrop_lib::net::peer_base("127.0.0.1", old.port),
         "t",
         &share_id,
@@ -261,8 +277,16 @@ async fn peer_file_streams_to_disk_in_chunks_and_leaves_no_litter() {
     let written = orbdrop_lib::stream_peer_file(&reqwest::Client::new(), &file, &target)
         .await
         .expect("流式下载应当成功");
-    assert_eq!(written, payload.len() as u64, "返回的字节数应当等于文件大小");
-    assert_eq!(std::fs::read(&target).unwrap(), payload, "内容必须逐字节一致");
+    assert_eq!(
+        written,
+        payload.len() as u64,
+        "返回的字节数应当等于文件大小"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        payload,
+        "内容必须逐字节一致"
+    );
     assert!(
         !out_dir.join("copy.bin.orbdrop-part").exists(),
         "成功之后不该留 .part"
@@ -277,7 +301,10 @@ async fn peer_file_streams_to_disk_in_chunks_and_leaves_no_litter() {
     let err = orbdrop_lib::stream_peer_file(&reqwest::Client::new(), &missing, &target2)
         .await
         .expect_err("对端没有这个文件时应当报错");
-    assert!(err.contains("404") || err.contains("读取对端文件失败"), "错误信息要说清: {err}");
+    assert!(
+        err.contains("404") || err.contains("读取对端文件失败"),
+        "错误信息要说清: {err}"
+    );
     assert!(!target2.exists(), "失败不该留下目标文件");
     assert!(
         !out_dir.join("missing.bin.orbdrop-part").exists(),

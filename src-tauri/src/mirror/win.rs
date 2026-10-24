@@ -42,31 +42,36 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Storage::CloudFilters::*;
 use windows::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
+    FindClose, FindFirstFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
+    WIN32_FIND_DATAW,
 };
 
-use super::{identity, note_closed, note_opened, MirroredItem};
+use super::{identity, note_closed, note_deleted, note_opened, note_placed, MirroredItem};
 use crate::peer_fs::{self, PeerFile, READ_CHUNK};
 use crate::state::AppState;
 
 /// 平台要求的对齐：交付数据的 offset/length 都是 4 KiB 的倍数（结束在文件末尾的那段除外）。
 const ALIGN: u64 = 4096;
 
+/// 同名落点被占用时，等它释放的节拍与上限（3 秒）。
+///
+/// 重试同一项时**绝不换名**：目标目录里的文件名由本地名决定，换名会多出一份 `(2)`。
+const SAME_NAME_RETRIES: usize = 15;
+const SAME_NAME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// OrbDrop 的 provider 身份。同一个 GUID 让平台把不同版本认成同一个提供程序（遥测用）。
 const PROVIDER_ID: GUID = GUID::from_u128(0x7f3c1e9a_2d5b_4a86_9f14_6c8b0a5d2e37);
 
 /// 回调线程要用到的东西：对端访问要 `AppState`，异步要**应用自己的**运行时。
+///
+/// HTTP 客户端不在这里存：它必须**按目标设备**钉住证书（见 `net::DialPin`），而一台
+/// provider 会被同一台机器上的多台对端共用。`peer_fs::client_for` 会按
+/// `(地址, 指纹)` 取缓存里的那一把 —— 每个区间回调都调它也不会重新握手
+/// （真机实测：复用之前每段多几十毫秒，差值全在握手与新建客户端上）。
 struct Provider {
     state: Arc<AppState>,
     /// 连接建立时抓下来的运行时：回调在系统线程池线程上跑，那里问不到"当前运行时"。
     rt: tokio::runtime::Handle,
-    /// 水合用的 HTTP 客户端：**建一次、全程复用**。
-    ///
-    /// 绝不能每个区间回调都 `peer_fs::client()` —— 那等于新建一个 reqwest 客户端，每次都要
-    /// 重新 TLS 握手。真机实测（千兆内网、资源管理器按 1 MiB 一段读）：725 个区间，每段中位
-    /// **41 ms**（≈24 MiB/s），而带宽本身够跑 100 MiB/s —— 差额全在握手与新建客户端上。
-    /// 复用之后每段只剩一个往返。
-    client: reqwest::Client,
 }
 
 /// 进程内唯一的 provider。回调只有函数指针可用，拿不到闭包，所以上下文走全局。
@@ -108,15 +113,22 @@ impl FetchGuard {
     /// 登记一次请求，`[start, end)` 是这次要交付的对齐区间。
     fn begin(file_id: i64, start: u64, end: u64) -> Self {
         let id = NEXT_FETCH_ID.fetch_add(1, Ordering::Relaxed);
-        IN_FLIGHT
-            .lock()
-            .push(InFlight { id, file_id, start, end, cancelled: false });
+        IN_FLIGHT.lock().push(InFlight {
+            id,
+            file_id,
+            start,
+            end,
+            cancelled: false,
+        });
         Self { id }
     }
 
     /// 平台撤销了**这一次**请求？拉取循环每次交付前看一眼，别白拉。
     fn cancelled(&self) -> bool {
-        IN_FLIGHT.lock().iter().any(|f| f.id == self.id && f.cancelled)
+        IN_FLIGHT
+            .lock()
+            .iter()
+            .any(|f| f.id == self.id && f.cancelled)
     }
 }
 
@@ -126,33 +138,44 @@ impl Drop for FetchGuard {
     }
 }
 
-/// 平台撤销了一次读（`CANCEL_FETCH_DATA`）：只标**此刻在飞**、区间重叠的那些请求。
+/// 平台撤销了一次读（`CANCEL_FETCH_DATA`）：**只认领一条**在飞、区间重叠的请求。
 ///
-/// 撤销是"这一次请求"的事，不是"这个偏移永远别拉"。老实现把 `(file_id, 区间)` 永久记进一张
-/// 表、之后每次取数据都拿它挡 —— 实机就是这么卡死的：资源管理器在**落下时**解析 `CF_HDROP`
-/// 给出的路径，读一页文件头就撒手（→ 撤销），紧接着为真正的复制重发**同一页**；我们拿上一张
-/// 旧的撤销单把新请求也吞了，既不交数据也不报复，那个读就一直挂在平台上（官方文档：每个回调
-/// 请求有 60 秒超时，而**任何一次有效操作都会重置全部挂起请求的计时器**）—— 目标进程里的读
-/// 等下去，复制进度不动，`DoDragDrop` 也不返回。所以：**撤销单必须被它撤销的那次请求消费掉**，
-/// 绝不外溢到后来的请求。
+/// 撤销是"这一次请求"的事，不是"这个偏移永远别拉"；而且平台只给 `(file_id, 区间)`，不给
+/// 请求身份 —— 同一区间上**同时**可能有多条请求（资源管理器落下时先读一页解析路径，紧接着
+/// 为真正的复制重发同一页）。老实现把**所有**重叠的请求都标成撤销，等于把那条刚发出的复制
+/// 请求也一起吞掉：它既不交付也不判失败，平台那个读就一直挂着（官方文档：每个回调请求有
+/// 60 秒超时，而**任何一次有效操作都会重置全部挂起请求的计时器**）—— 实机表现是资源管理器
+/// 报"源文件已损坏或不可用"、随后整个拖放都不再响应。
 ///
-/// 撤销回调**比**请求回调先到的那种竞态（两个回调都在平台线程池上跑，顺序没有保证）不在这里
-/// 兜：猜"这张撤销单属于哪一次请求"正是上面那条死路。让那次请求照常交付更安全 —— `CfExecute`
-/// 对已被平台作废的请求会返回错误（我们只当没发生），而猜错就是让一个没人作废的读永远挂着。
+/// 所以：**一次撤销只消费一条请求**，挑编号最小的那条 —— 撤销来自"句柄关闭"，对应的是先
+/// 发起的那条读；后来的请求（真正的复制）一律照常交付。撤销回调比请求回调先到的竞态仍不
+/// 在这里猜：那条请求照常交付，`CfExecute` 对已被平台作废的请求会返回错误（我们只当没发生），
+/// 而猜错会误伤一条没人作废的读。
 fn note_cancel(file_id: i64, start: u64, end: u64) {
     let mut table = IN_FLIGHT.lock();
-    let mut claimed = 0usize;
-    for fetch in table
+    // 编号单调递增 = 发起顺序；只挑最早的那条，绝不连坐。
+    let oldest = table
         .iter_mut()
-        .filter(|f| f.file_id == file_id && overlaps(f.start, f.end, start, end))
-    {
-        fetch.cancelled = true;
-        claimed += 1;
-    }
-    drop(table);
-    if claimed == 0 {
-        // 没有在飞的请求可作废：这次撤销对应的区间我们已经交付完了。记一行就够，不留在表里。
-        info!(file_id, start, end, "撤销到的区间没有在飞的请求（多半已经交付完）");
+        .filter(|f| f.file_id == file_id && !f.cancelled && overlaps(f.start, f.end, start, end))
+        .min_by_key(|f| f.id);
+    match oldest {
+        Some(fetch) => {
+            fetch.cancelled = true;
+            let id = fetch.id;
+            drop(table);
+            info!(
+                file_id,
+                id, start, end, "平台撤销了一次读（只作废这一条在飞请求）"
+            );
+        }
+        None => {
+            drop(table);
+            // 没有在飞的请求可作废：这次撤销对应的区间我们已经交付完了。记一行就够，不留在表里。
+            info!(
+                file_id,
+                start, end, "撤销到的区间没有在飞的请求（多半已经交付完）"
+            );
+        }
     }
 }
 
@@ -166,7 +189,10 @@ fn overlaps(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
 /// 只注册我们确实实现的：**不注册 `NOTIFY_DELETE` / `NOTIFY_RENAME`** —— 镜像只读单向，
 /// 用户/别的程序在镜像里删改东西我们不需要回写对端（见模块头）。
 static CALLBACKS: [CF_CALLBACK_REGISTRATION; 6] = [
-    CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_FETCH_DATA, Callback: Some(fetch_data_cb) },
+    CF_CALLBACK_REGISTRATION {
+        Type: CF_CALLBACK_TYPE_FETCH_DATA,
+        Callback: Some(fetch_data_cb),
+    },
     CF_CALLBACK_REGISTRATION {
         Type: CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS,
         Callback: Some(fetch_placeholders_cb),
@@ -183,7 +209,10 @@ static CALLBACKS: [CF_CALLBACK_REGISTRATION; 6] = [
         Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
         Callback: Some(close_completion_cb),
     },
-    CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_NONE, Callback: None },
+    CF_CALLBACK_REGISTRATION {
+        Type: CF_CALLBACK_TYPE_NONE,
+        Callback: None,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -199,7 +228,8 @@ pub fn ensure_ready(state: Arc<AppState>) -> Result<(), String> {
         return Ok(());
     }
     let root = super::root();
-    std::fs::create_dir_all(&root).map_err(|e| format!("建镜像目录失败（{}）: {e}", root.display()))?;
+    std::fs::create_dir_all(&root)
+        .map_err(|e| format!("建镜像目录失败（{}）: {e}", root.display()))?;
     let wide_root = to_wide(root.as_os_str());
 
     if !is_registered(&wide_root) {
@@ -217,9 +247,8 @@ pub fn ensure_ready(state: Arc<AppState>) -> Result<(), String> {
         // 在 async 上下文里调用时就是当前运行时；启动时（Tauri setup，同步上下文）退回
         // Tauri 的全局运行时 —— 那本来就是应用自己的那一个。
         let rt = tokio::runtime::Handle::try_current().unwrap_or_else(|_| crate::task::handle());
-        let client = peer_fs::client();
-        info!("水合用的 HTTP 客户端已建（后续所有区间复用同一条 TLS 连接）");
-        Box::leak(Box::new(Provider { state, rt, client }))
+        info!("水合用的 HTTP 客户端按对端延迟建立（同一目标复用同一条 TLS 连接）");
+        Box::leak(Box::new(Provider { state, rt }))
     });
     let key = connect(provider, &wide_root)?;
     let _ = CONNECTION.set(key);
@@ -324,14 +353,26 @@ fn register(wide_root: &[u16], already_registered: bool) -> Result<(), String> {
         | CF_REGISTER_FLAG_MARK_IN_SYNC_ON_ROOT;
     if already_registered {
         // 刷新既有注册（策略与标志是持久化的，不刷新就沿用旧的）。
-        unsafe { CfRegisterSyncRoot(PCWSTR(wide_root.as_ptr()), &registration, &policies, flags | CF_REGISTER_FLAG_UPDATE) }
-            .map_err(|e| format!("刷新同步根注册失败: {e:?}"))
+        unsafe {
+            CfRegisterSyncRoot(
+                PCWSTR(wide_root.as_ptr()),
+                &registration,
+                &policies,
+                flags | CF_REGISTER_FLAG_UPDATE,
+            )
+        }
+        .map_err(|e| format!("刷新同步根注册失败: {e:?}"))
     } else {
         unsafe { CfRegisterSyncRoot(PCWSTR(wide_root.as_ptr()), &registration, &policies, flags) }
             .or_else(|first| {
                 warn!(error = ?first, "首次注册同步根失败，改用 UPDATE 重注册");
                 unsafe {
-                    CfRegisterSyncRoot(PCWSTR(wide_root.as_ptr()), &registration, &policies, flags | CF_REGISTER_FLAG_UPDATE)
+                    CfRegisterSyncRoot(
+                        PCWSTR(wide_root.as_ptr()),
+                        &registration,
+                        &policies,
+                        flags | CF_REGISTER_FLAG_UPDATE,
+                    )
                 }
             })
             .map_err(|e| format!("注册同步根失败: {e:?}"))
@@ -359,7 +400,10 @@ fn connect(provider: &'static Provider, wide_root: &[u16]) -> Result<CF_CONNECTI
 
 /// 把一项放进镜像并返回本地路径。
 pub async fn place_item(state: &Arc<AppState>, item: &MirroredItem) -> Result<PathBuf, String> {
-    let dir = identity::share_dir(&super::root(), &item.peer_id, &item.share_id);
+    // 落点先校验（两个 id 都是对端自报的，见 `identity::share_dir`），**再**问本机有没有这枚
+    // token：标识不合法、或不是已配对设备的项，一个目录都不该建出来。
+    let dir = identity::share_dir(&super::root(), &item.peer_id, &item.share_id)?;
+    let (base, token) = peer_fs::coords(state, &item.peer_id)?;
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| format!("建镜像目录失败（{}）: {e}", dir.display()))?;
@@ -367,12 +411,12 @@ pub async fn place_item(state: &Arc<AppState>, item: &MirroredItem) -> Result<Pa
 
     // 占位符必须报**真实大小**，否则目标会拷出 0 字节。顺带把 `is_dir` 校正过来：界面的判断
     // 来自对端 `/shares` 的旧值，可能过时 —— 与旧路径同一条判据（元数据说了算）。
-    let client = peer_fs::client();
-    let (base, token) = peer_fs::coords(state, &item.peer_id)?;
+    let client = peer_fs::client_for(state, &item.peer_id)?;
     let meta = peer_fs::probe_entry(&client, &base, &token, &item.share_id, &item.path).await?;
     let is_dir = meta.map(|m| m.is_dir).unwrap_or(item.is_dir);
     let (size, mtime) = if is_dir {
-        (0, None)
+        // 目录也保留对端 mtime：资源管理器里显示的是真实修改时间，日志/一致性判断也能用。
+        (0, meta.and_then(|m| m.mtime))
     } else {
         let meta = meta.ok_or_else(|| format!("问不到「{}」的大小，这一项不走镜像", item.name))?;
         (meta.size, meta.mtime)
@@ -391,34 +435,242 @@ pub async fn place_item(state: &Arc<AppState>, item: &MirroredItem) -> Result<Pa
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .ok_or_else(|| "镜像落点没有名字".to_string())?;
-    let parent = local.parent().ok_or_else(|| "镜像落点没有父目录".to_string())?.to_path_buf();
+    let parent = local
+        .parent()
+        .ok_or_else(|| "镜像落点没有父目录".to_string())?
+        .to_path_buf();
 
-    create_placeholder(&parent, &name, &blob, size, mtime, is_dir)?;
-    Ok(local)
+    create_placeholder(&parent, &name, &blob, size, mtime, is_dir).await
 }
 
-/// 在 `dir` 下建一个占位符。**幂等**：同名先清掉。
+/// 在 `dir` 下放一个占位符，返回实际落点。
 ///
-/// 为什么必须幂等：我们不注册删除通知，所以"用户在镜像里删过东西""上次拖同一项留下的过期占位符"
-/// 我们都不知道 —— 不先清同名，`CfCreatePlaceholders` 会直接失败。
-fn create_placeholder(
+/// **同一项的重试必须沿用同一个本地名**：拖出去的文件名决定目标目录里的文件名，换名会在
+/// 目标目录里多出一份 `(2)`，与"继续/重试同一项"的语义不符。判定顺序：
+///
+/// 1. 同名落点的身份与本项相同（本进程记账）：
+///    - 正被目标读取 → 复用（绝不能删，删了正在复制的目标会报"源文件不可用"）；
+///    - 文件且对端大小/时间戳没变 → 复用（保留已水合字节，重试只补缺的区间）；
+///    - 否则按**同名**重建（等旧句柄释放，绝不加后缀）。
+/// 2. 同名落点属于**另一项**（清洗后撞名）→ 换名，绝不覆盖别人的项。
+/// 3. 本进程没有记录（上次进程留下的）且当前没人读 → 当作过期缓存按同名重建。
+/// 4. 名字暂时不可用（delete-pending / 临时占用）→ 等它释放后**同名**重试；
+///    超出上限就明确报错，不偷偷换名。
+///
+/// 第 1、3 条的"重建"是**删掉再建**，所以删之前必须确认落点是**本机建的 CFAPI 占位符**：
+/// 普通文件/目录一律不删（交给 [`create_with_suffix`] 换名）。镜像根之外的越界落点
+/// （修复前对端自报 id 能拼出去，见 `identity::share_dir`）与用户手动放进镜像里的东西
+/// 都不归我们处置 —— 而目录那条走的是 `remove_dir_all`，误删不可逆。
+async fn create_placeholder(
     dir: &Path,
     name: &str,
     blob: &[u8],
     size: u64,
     mtime: Option<i64>,
     is_dir: bool,
-) -> Result<(), String> {
-    let target = dir.join(name);
-    if target.exists() {
-        let removed = if target.is_dir() {
-            std::fs::remove_dir_all(&target)
-        } else {
-            std::fs::remove_file(&target)
-        };
-        removed.map_err(|e| format!("清理旧的镜像项失败（{}）: {e}", target.display()))?;
+) -> Result<PathBuf, String> {
+    // 父目录是 `place_item` 建的，但后台 sweep 可能刚好把空目录收掉（并发拖拽时）。
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("建镜像目录失败（{}）: {e}", dir.display()))?;
+
+    let desired = dir.join(name);
+    let known = super::known_identity(&desired);
+    let same = known.as_deref() == Some(blob);
+
+    if desired.exists() {
+        let placeholder = is_placeholder(&desired);
+        let busy = super::is_busy(&desired);
+
+        if same {
+            if placeholder && busy {
+                // 目标还在读：**不能**为了"对齐最新内容"去删/重建，否则正在进行的复制
+                // 当场失败（这正是当初"源文件损坏/不可用"的来源）。这里只做一次便宜的
+                // 元数据比对并记录；占用中的项一律沿用旧占位符，等句柄释放后下次拖拽再刷新。
+                if !is_dir && !metadata_matches(&desired, size, mtime) {
+                    warn!(
+                        path = %desired.display(),
+                        "目标仍在读取，但占位符与对端的大小/时间戳不一致；本次沿用旧占位符以保护进行中的复制"
+                    );
+                }
+                info!(path = %desired.display(), "镜像项正在被目标读取，复用而不重建（同名）");
+                note_placed(&desired, blob);
+                return Ok(desired);
+            }
+            // 文件没变就复用：保留已经水合好的字节，重试只补缺的区间。
+            // 目录一律按同名重建（刷新按需填充出来的子树）。
+            if placeholder && !is_dir && metadata_matches(&desired, size, mtime) {
+                info!(path = %desired.display(), "镜像项与对端一致，复用（保留已水合字节）");
+                note_placed(&desired, blob);
+                return Ok(desired);
+            }
+            // 同一项但需要刷新：按同名重建（`place_same_name` 只在落点确实是本机占位符时才删，
+            // 被外部换成普通文件的那一份会换名，不覆盖）。
+            return place_same_name(dir, name, blob, size, mtime, is_dir).await;
+        }
+
+        // 不是同一项。
+        if known.is_some() {
+            // 确认是另一项（清洗后撞名）：换名，避免覆盖别人的项、也避免目标目录里同名混淆。
+            info!(path = %desired.display(), "同名落点属于另一项（清洗后撞名），改用新名");
+            return create_with_suffix(dir, name, blob, size, mtime, is_dir, 2);
+        }
+        if busy {
+            // 本进程没有身份记录，且落点正被读/被别的进程按住：不猜它是谁，换名最安全。
+            info!(path = %desired.display(), "同名落点正被占用且本进程没有身份记录，改用新名");
+            return create_with_suffix(dir, name, blob, size, mtime, is_dir, 2);
+        }
+        // 过期缓存/普通文件且没人用：同名重建。
+        return place_same_name(dir, name, blob, size, mtime, is_dir).await;
     }
 
+    // 名字现在不存在：同名新建；碰到 delete-pending / 临时占用就等它释放，**绝不换名**。
+    place_same_name(dir, name, blob, size, mtime, is_dir).await
+}
+
+/// 用**同一个本地名**放下这一项；同名暂时不可用就等它释放，绝不换名。
+///
+/// 上一个复制出错/还没撒手时，落点可能是 delete-pending 或被共享占用。这里每 200ms 重试
+/// 一次、最多 3 秒；释放了就用原名继续。超时只报错，不偷偷生成 `(2)` —— 用户重试同一项时
+/// 要的是目标目录里那份文件继续/覆盖，而不是多一份副本。
+async fn place_same_name(
+    dir: &Path,
+    name: &str,
+    blob: &[u8],
+    size: u64,
+    mtime: Option<i64>,
+    is_dir: bool,
+) -> Result<PathBuf, String> {
+    let desired = dir.join(name);
+    let mut last = String::new();
+    for attempt in 0..SAME_NAME_RETRIES {
+        if desired.exists() {
+            // **只删本机建的 CFAPI 占位符**。同名落点可能是普通文件/目录：镜像根之外的
+            // 历史越界落点、用户或别的程序顺手放进镜像里的东西、占位符被外部替换成的真文件
+            // —— 都不归我们处置。目录那条走 `remove_dir_all`，误删不可逆，宁可换名。
+            if !is_placeholder(&desired) {
+                info!(
+                    path = %desired.display(), attempt,
+                    "同名落点不是本机占位符（普通文件/目录），不删，改用新名"
+                );
+                return create_with_suffix(dir, name, blob, size, mtime, is_dir, 2);
+            }
+            let removed = if desired.is_dir() {
+                std::fs::remove_dir_all(&desired)
+            } else {
+                std::fs::remove_file(&desired)
+            };
+            if let Err(e) = removed {
+                last = format!("清理同名镜像项失败（{}）: {e}", desired.display());
+                warn!(
+                    path = %desired.display(), attempt, error = %e,
+                    "同名落点仍被占用，等待后用同一个名字重试"
+                );
+                tokio::time::sleep(SAME_NAME_RETRY_DELAY).await;
+                continue;
+            }
+        }
+        match create_one(dir, name, blob, size, mtime, is_dir) {
+            Ok(()) => {
+                note_placed(&desired, blob);
+                return Ok(desired);
+            }
+            Err(e) if name_unavailable(&e) => {
+                last = format!("建占位符失败（{}）: {e:?}", desired.display());
+                warn!(
+                    path = %desired.display(), attempt, error = ?e,
+                    "同名落点暂不可用，等待后用同一个名字重试"
+                );
+                tokio::time::sleep(SAME_NAME_RETRY_DELAY).await;
+                continue;
+            }
+            Err(e) => return Err(format!("建占位符失败（{}）: {e:?}", desired.display())),
+        }
+    }
+    Err(format!(
+        "{last}；同名落点仍被占用，请等上一项释放后再拖一次（不会改名，以免目标目录出现重复）"
+    ))
+}
+
+/// 同名落点确实是**另一项**时的退路：`name (2)`、`name (3)`… 直到建成为止。
+fn create_with_suffix(
+    dir: &Path,
+    name: &str,
+    blob: &[u8],
+    size: u64,
+    mtime: Option<i64>,
+    is_dir: bool,
+    from: usize,
+) -> Result<PathBuf, String> {
+    for n in from..=100 {
+        let candidate = suffixed_name(name, n);
+        let path = dir.join(&candidate);
+        if path.exists() {
+            // 上一次拖拽留下的同名副本；别覆盖它（可能还有读者），换下一个。
+            continue;
+        }
+        match create_one(dir, &candidate, blob, size, mtime, is_dir) {
+            Ok(()) => {
+                note_placed(&path, blob);
+                info!(path = %path.display(), "镜像项改用不冲突的本地名");
+                return Ok(path);
+            }
+            Err(e) if name_unavailable(&e) => continue,
+            Err(e) => return Err(format!("建占位符失败（{}）: {e:?}", path.display())),
+        }
+    }
+    Err(format!("建占位符失败：找不到可用的本地名（{name}）"))
+}
+
+/// 这个路径现在是不是 CFAPI 占位符（不是普通文件/目录）。
+///
+/// 用 `FindFirstFileW` 取属性与 reparse tag 再问平台，**不打开文件**（不会触发水合）。
+fn is_placeholder(path: &Path) -> bool {
+    let wide = to_wide(path.as_os_str());
+    let mut data = WIN32_FIND_DATAW::default();
+    let Ok(handle) = (unsafe { FindFirstFileW(PCWSTR(wide.as_ptr()), &mut data) }) else {
+        return false;
+    };
+    let _ = unsafe { FindClose(handle) };
+    let state =
+        unsafe { CfGetPlaceholderStateFromAttributeTag(data.dwFileAttributes, data.dwReserved0) };
+    state.contains(CF_PLACEHOLDER_STATE_PLACEHOLDER)
+}
+
+/// 磁盘上的占位符元数据是否与刚问到的对端一致（只用于文件）。
+///
+/// 一致 = 内容没变，可以复用占位符与已经水合好的本地字节；不一致才按同名重建。
+fn metadata_matches(path: &Path, size: u64, mtime: Option<i64>) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.is_dir() || meta.len() != size {
+        return false;
+    }
+    if let Some(want) = mtime {
+        let Ok(modified) = meta.modified() else {
+            return false;
+        };
+        let Ok(age) = modified.duration_since(std::time::UNIX_EPOCH) else {
+            return false;
+        };
+        // 对端时间戳是秒级；占位符也是按秒写入的，留 2 秒余量。
+        if (age.as_secs() as i64 - want).abs() > 2 {
+            return false;
+        }
+    }
+    true
+}
+
+/// 调一次 `CfCreatePlaceholders`（单条）。`Result` 字段必须逐条看：整体 OK 而单条失败是
+/// 踩过的坑（目录不带身份就是那样）。
+fn create_one(
+    dir: &Path,
+    name: &str,
+    blob: &[u8],
+    size: u64,
+    mtime: Option<i64>,
+    is_dir: bool,
+) -> windows::core::Result<()> {
     let dir_w = to_wide(dir.as_os_str());
     let name_w = to_wide(OsStr::new(name));
     let mut info = CF_PLACEHOLDER_CREATE_INFO::default();
@@ -431,13 +683,41 @@ fn create_placeholder(
     info.Flags = CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC;
 
     let mut array = [info];
-    unsafe { CfCreatePlaceholders(PCWSTR(dir_w.as_ptr()), &mut array, CF_CREATE_FLAG_NONE, None) }
-        .map_err(|e| format!("建占位符失败（{}）: {e:?}", target.display()))?;
-    // 逐条结果也要看：整体 OK 而单条失败是踩过的坑（目录不带身份就是那样）。
-    array[0]
-        .Result
-        .ok()
-        .map_err(|e| format!("建占位符失败（{}）: {e:?}", target.display()))
+    unsafe {
+        CfCreatePlaceholders(
+            PCWSTR(dir_w.as_ptr()),
+            &mut array,
+            CF_CREATE_FLAG_NONE,
+            None,
+        )
+    }?;
+    array[0].Result.ok()
+}
+
+/// 这个名字现在是不是"被占住/不可写"，值得换一个名字重试。
+///
+/// 典型：delete-pending（旧占位符还有句柄，Windows 在最后一个句柄关掉前不允许同名新建）、
+/// 两个并发拖拽同时建同名项、杀软临时打开。
+fn name_unavailable(e: &windows::core::Error) -> bool {
+    const RETRYABLE: [u32; 5] = [
+        5,   // ERROR_ACCESS_DENIED
+        32,  // ERROR_SHARING_VIOLATION
+        80,  // ERROR_FILE_EXISTS
+        183, // ERROR_ALREADY_EXISTS
+        303, // ERROR_DELETE_PENDING
+    ];
+    RETRYABLE.contains(&(e.code().0 as u32 & 0xFFFF))
+}
+
+/// 单段文件名加序号：`报告.pdf` → `报告 (2).pdf`；无扩展名 → `报告 (2)`。
+fn suffixed_name(name: &str, n: usize) -> String {
+    let path = Path::new(name);
+    match (path.file_stem(), path.extension()) {
+        (Some(stem), Some(ext)) => {
+            format!("{} ({n}).{}", stem.to_string_lossy(), ext.to_string_lossy())
+        }
+        _ => format!("{name} ({n})"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +727,7 @@ fn create_placeholder(
 /// 回调是 FFI 边界：里面任何 panic 都会让**整个进程**直接退出（C 栈上没有 unwind 保护，
 /// Windows 上表现为"拖到一半应用消失"）。这里是最后一道网：panic 只算这一次回调失败，
 /// 留一行日志，进程继续活着。（`log::record_crash` 的 panic hook 仍会照常记一条 crash.log。）
-fn guarded(what: &str, f: impl FnOnce()) {
+fn guarded(what: &str, f: impl FnOnce()) -> bool {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         let msg = payload
             .downcast_ref::<&str>()
@@ -455,33 +735,42 @@ fn guarded(what: &str, f: impl FnOnce()) {
             .or_else(|| payload.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "未知 panic".into());
         error!(callback = what, panic = %msg, "同步根回调 panic（已拦下，进程继续）");
+        return false;
     }
+    true
 }
 
 unsafe extern "system" fn fetch_data_cb(
     info: *const CF_CALLBACK_INFO,
     params: *const CF_CALLBACK_PARAMETERS,
 ) {
-    guarded("fetch_data", || {
-        if let Some((info, params)) =
-            unsafe { info.as_ref() }.zip(unsafe { params.as_ref() })
-        {
+    let ok = guarded("fetch_data", || {
+        if let Some((info, params)) = unsafe { info.as_ref() }.zip(unsafe { params.as_ref() }) {
             fetch_data(info, params);
         }
     });
+    if !ok {
+        // 回调 panic 也必须给平台一个回音：静默返回 = 那个读一直挂着（见模块头）。
+        if let Some(info) = unsafe { info.as_ref() } {
+            fail_range(info, 0, info.FileSize.max(0) as u64, "provider 回调 panic");
+        }
+    }
 }
 
 unsafe extern "system" fn fetch_placeholders_cb(
     info: *const CF_CALLBACK_INFO,
     params: *const CF_CALLBACK_PARAMETERS,
 ) {
-    guarded("fetch_placeholders", || {
-        if let Some((info, params)) =
-            unsafe { info.as_ref() }.zip(unsafe { params.as_ref() })
-        {
+    let ok = guarded("fetch_placeholders", || {
+        if let Some((info, params)) = unsafe { info.as_ref() }.zip(unsafe { params.as_ref() }) {
             fetch_placeholders(info, params);
         }
     });
+    if !ok {
+        if let Some(info) = unsafe { info.as_ref() } {
+            fail_placeholders(info, "provider 回调 panic");
+        }
+    }
 }
 
 unsafe extern "system" fn cancel_fetch_data_cb(
@@ -489,13 +778,14 @@ unsafe extern "system" fn cancel_fetch_data_cb(
     params: *const CF_CALLBACK_PARAMETERS,
 ) {
     guarded("cancel_fetch_data", || {
-        if let Some((info, params)) =
-            unsafe { info.as_ref() }.zip(unsafe { params.as_ref() })
-        {
+        if let Some((info, params)) = unsafe { info.as_ref() }.zip(unsafe { params.as_ref() }) {
             let range = unsafe { params.Anonymous.Cancel.Anonymous.FetchData };
             let start = range.FileOffset.max(0) as u64;
             let end = start.saturating_add(range.Length.max(0) as u64);
-            info!(file_id = info.FileId, start, end, "平台撤销了这段读（只作废在飞的这次请求）");
+            info!(
+                file_id = info.FileId,
+                start, end, "平台撤销了这段读（只作废在飞的这次请求）"
+            );
             note_cancel(info.FileId, start, end);
         }
     });
@@ -508,7 +798,13 @@ unsafe extern "system" fn open_completion_cb(
     guarded("open_completion", || {
         if let Some(info) = unsafe { info.as_ref() } {
             let path = win_path(info);
-            info!(path = %path, process = %process_name(info), "镜像项被打开");
+            let process = process_name(info);
+            // 我们自己的打开/关闭不算"目标在读"：把这些也记进账，刚被本进程读过的项会在
+            // grace 内被误判为 busy（复用旧元数据），回收判据也会被自己拖着走。
+            if is_self(info) {
+                return;
+            }
+            info!(path = %path, process = %process, "镜像项被打开");
             note_opened(&path);
         }
     });
@@ -519,18 +815,24 @@ unsafe extern "system" fn close_completion_cb(
     params: *const CF_CALLBACK_PARAMETERS,
 ) {
     guarded("close_completion", || {
-        if let Some((info, params)) =
-            unsafe { info.as_ref() }.zip(unsafe { params.as_ref() })
-        {
+        if let Some((info, params)) = unsafe { info.as_ref() }.zip(unsafe { params.as_ref() }) {
             let flags = unsafe { params.Anonymous.CloseCompletion.Flags };
             let path = win_path(info);
+            let process = process_name(info);
             info!(
                 path = %path, deleted = flags.contains(CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED),
-                process = %process_name(info),
+                process = %process,
                 "镜像项已关闭（此后可回收）"
             );
-            // 记账：`mirror::sweep` 会在这之后按 grace 回收。删除型关闭不必记账 —— 文件已经没了。
-            if !flags.contains(CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) {
+            // 自己的探测关闭不参与记账（见 `open_completion_cb`）。
+            if is_self(info) {
+                return;
+            }
+            // 记账：`mirror::sweep` 会在这之后按 grace 回收。删除型关闭不必记空闲 —— 文件已经没了，
+            // 四张表里都要清掉，免得留下永远匹配不上的记录。
+            if flags.contains(CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) {
+                note_deleted(&path);
+            } else {
                 note_closed(&path);
             }
         }
@@ -549,7 +851,11 @@ fn fetch_data(info: &CF_CALLBACK_INFO, params: &CF_CALLBACK_PARAMETERS) {
 
     // 对齐：起点向下、终点向上（可以多给，文档明确允许），但结束在文件末尾的那一段不要求对齐。
     let start = required_start & !(ALIGN - 1);
-    let end = if required_end >= size { size } else { align_up(required_end) };
+    let end = if required_end >= size {
+        size
+    } else {
+        align_up(required_end)
+    };
 
     let Some(provider) = PROVIDER.get() else {
         // 没连上（理论上不会走到这里；连上了才会收到回调）。**必须回一个失败**：什么也不回的话
@@ -566,7 +872,12 @@ fn fetch_data(info: &CF_CALLBACK_INFO, params: &CF_CALLBACK_PARAMETERS) {
         return;
     };
     if end <= start {
-        // 空区间没有可交付的字节；报失败让平台重来，比静默成功安全。
+        // 空文件：平台可能发一条长度为 0 的取数据请求（0 字节没有区间可对齐）。
+        // 回一条 0 长度的成功 —— 判失败会让目标把 0 字节文件报成"已损坏/不可用"。
+        // 如果平台不接受 0 长度，再明确判失败（绝不能静默返回）。
+        if size == 0 && matches!(execute_transfer(info, &[], start, 0), Ok(())) {
+            return;
+        }
         fail_range(info, start, 0, "请求区间为空");
         return;
     }
@@ -576,6 +887,13 @@ fn fetch_data(info: &CF_CALLBACK_INFO, params: &CF_CALLBACK_PARAMETERS) {
     info!(path = %id.path, start, end, size, resume = fetch.Flags.contains(CF_CALLBACK_FETCH_DATA_FLAG_RECOVERY), "开始水合");
     match transfer_range(provider, info, &id, start, end, &fetch_guard) {
         Ok(()) => {}
+        Err(Stop::Cancelled) => {
+            // 我们看到了这次请求的撤销。**必须给平台一个回音**：静默返回会让这个读一直挂着
+            // （其它有效操作还会不断重置它的超时计时器）。平台若早已把请求作废，这次
+            // `CfExecute` 会返回错误，忽略即可。
+            info!(path = %id.path, start, end, "这次读已被平台撤销，明确判失败收尾");
+            fail_range(info, start, end - start, "这次读已被平台撤销");
+        }
         Err(Stop::Dropped) => {
             // 平台自己把这次读收掉了（撤销/作废/超时）：平台那边已经收尾，我们不用再说什么。
             info!(path = %id.path, start, end, "这次读已被平台收掉（撤销/作废），不再交付");
@@ -598,7 +916,7 @@ fn transfer_range(
     fetch: &FetchGuard,
 ) -> Result<(), Stop> {
     let began = std::time::Instant::now();
-    let client = provider.client.clone();
+    let client = peer_fs::client_for(&provider.state, &id.peer_id).map_err(Stop::Failed)?;
     let (base, token) = peer_fs::coords(&provider.state, &id.peer_id).map_err(Stop::Failed)?;
     let file = PeerFile {
         base,
@@ -612,9 +930,9 @@ fn transfer_range(
     while start + delivered < end {
         let offset = start + delivered;
         if fetch.cancelled() {
-            // 平台把**这一次**请求收掉了：停手就行，不用 `CfExecute`。只对"在飞的自己"成立
-            // —— 见 [`note_cancel`]，绝不拿撤销去挡后来的请求。
-            return Err(Stop::Dropped);
+            // 平台把**这一次**请求收掉了：停手。调用方会显式判失败收尾（绝不静默返回），
+            // 见 `note_cancel` —— 一次撤销只认领一条请求，绝不外溢到后来的请求。
+            return Err(Stop::Cancelled);
         }
         let want = READ_CHUNK.min(end - offset);
         // `run_blocking` 要求 future 是 'static：把客户端与坐标移进去（都是廉价的克隆）。
@@ -625,7 +943,10 @@ fn transfer_range(
         .ok_or_else(|| Stop::Failed("取数据任务没能回到运行时".to_string()))?
         .map_err(Stop::Failed)?;
         if bytes.is_empty() {
-            return Err(Stop::Failed(format!("对端「{}」在 {offset} 处读到 0 字节", id.path)));
+            return Err(Stop::Failed(format!(
+                "对端「{}」在 {offset} 处读到 0 字节",
+                id.path
+            )));
         }
         // 平台要求 offset/length 4 KiB 对齐，**除非**这一段结束在文件末尾。对端那边文件变小了
         // （远端被改过）会让这条不成立 —— 那种情况必须报错，不能交一段错位的字节。
@@ -656,8 +977,10 @@ fn transfer_range(
 
 /// 拉取收兵的原因。
 enum Stop {
-    /// 平台已经把这次读自己收掉了（撤销 / 作废 / 超时）：不停手也没用，而且**不用** `CfExecute`
-    /// —— 平台那边的读已经作废，交付只会返回错误。这不是我们的失败。
+    /// 平台撤销了这次读（我们看到了 `CANCEL_FETCH_DATA` 并认领到它）：调用方要明确判失败，
+    /// 不能静默返回（静默 = 平台的读没人交付也没人判失败，可能一直挂着）。
+    Cancelled,
+    /// 平台已经把这次读自己收掉了（`CfExecute` 报撤销/作废/超时）：不用再回音。
     Dropped,
     /// 真失败：必须 `fail_range`，绝不能让平台那个读挂着（见模块头"失败必须用 `STATUS_CLOUD_FILE_*`"）。
     Failed(String),
@@ -724,9 +1047,10 @@ fn fetch_placeholders(info: &CF_CALLBACK_INFO, _params: &CF_CALLBACK_PARAMETERS)
         return;
     };
     let path = id.path.clone();
-    let (peer_id, share_id, remote_path) = (id.peer_id.clone(), id.share_id.clone(), id.path.clone());
+    let (peer_id, share_id, remote_path) =
+        (id.peer_id.clone(), id.share_id.clone(), id.path.clone());
     let entries = crate::task::run_blocking_on(&provider.rt, async move {
-        let client = provider.client.clone();
+        let client = peer_fs::client_for(&provider.state, &peer_id)?;
         let Ok((base, token)) = peer_fs::coords(&provider.state, &peer_id) else {
             return Err("解析对端坐标失败".to_string());
         };
@@ -793,7 +1117,14 @@ fn fetch_placeholders(info: &CF_CALLBACK_INFO, _params: &CF_CALLBACK_PARAMETERS)
     };
     let op_info = operation_info(info, CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS);
     if let Err(e) = unsafe { CfExecute(&op_info, &mut params) } {
-        warn!(path = %path, error = ?e, "交回目录内容失败");
+        // 和取数据那条一样：**每条回调都必须有回音**。平台已经作废这次请求时不用再说什么；
+        // 其它失败要明确判失败，否则目标那边的目录枚举会一直挂在这次请求上。
+        if !platform_dropped(&e) {
+            warn!(path = %path, error = ?e, "交回目录内容失败，把这次枚举判失败");
+            fail_placeholders(info, "交回目录内容失败");
+        } else {
+            info!(path = %path, error = ?e, "这次目录枚举已被平台收掉（撤销/作废）");
+        }
     }
 }
 
@@ -845,7 +1176,10 @@ fn platform_dropped(e: &windows::core::Error) -> bool {
 /// 必须用 `STATUS_CLOUD_FILE_*` 里的状态：这个范围之外的状态会被平台一律折成
 /// `STATUS_CLOUD_FILE_UNSUCCESSFUL`。绝不报成功 —— 那会让目标拷出一份静默残缺的文件。
 fn fail_range(info: &CF_CALLBACK_INFO, offset: u64, length: u64, why: &str) {
-    warn!(file_id = info.FileId, offset, length, why, "把这一段读判失败");
+    warn!(
+        file_id = info.FileId,
+        offset, length, why, "把这一段读判失败"
+    );
     let op_info = operation_info(info, CF_OPERATION_TYPE_TRANSFER_DATA);
     let mut params = CF_OPERATION_PARAMETERS::default();
     params.ParamSize = param_size::<CF_OPERATION_PARAMETERS_0_0>();
@@ -877,7 +1211,8 @@ fn fail_placeholders(info: &CF_CALLBACK_INFO, why: &str) {
 
 fn report_progress(info: &CF_CALLBACK_INFO, total: i64, completed: i64) {
     // 失败不是错误：进度只是给资源管理器的进度条用的。
-    let _ = unsafe { CfReportProviderProgress(info.ConnectionKey, info.TransferKey, total, completed) };
+    let _ =
+        unsafe { CfReportProviderProgress(info.ConnectionKey, info.TransferKey, total, completed) };
 }
 
 fn operation_info(info: &CF_CALLBACK_INFO, op_type: CF_OPERATION_TYPE) -> CF_OPERATION_INFO {
@@ -914,7 +1249,10 @@ fn decode_identity(info: &CF_CALLBACK_INFO) -> Option<identity::Identity> {
         return None;
     }
     let bytes = unsafe {
-        std::slice::from_raw_parts(info.FileIdentity as *const u8, info.FileIdentityLength as usize)
+        std::slice::from_raw_parts(
+            info.FileIdentity as *const u8,
+            info.FileIdentityLength as usize,
+        )
     };
     match identity::Identity::decode(bytes) {
         Ok(id) => Some(id),
@@ -929,13 +1267,56 @@ fn decode_identity(info: &CF_CALLBACK_INFO) -> Option<identity::Identity> {
 ///
 /// 幂等记账（`mirror::note_closed`）与 `mirror::sweep` 都按 Win32 路径比对，所以这一步必须做对。
 fn win_path(info: &CF_CALLBACK_INFO) -> String {
-    let dos = pcwstr(info.VolumeDosName);
-    let normalized = pcwstr(info.NormalizedPath);
-    let rest: Vec<&str> = normalized.split('\\').skip(3).collect(); // 丢掉 `\Device\HarddiskVolumeN`
-    if rest.is_empty() {
-        return normalized;
+    dos_path(&pcwstr(info.VolumeDosName), &pcwstr(info.NormalizedPath))
+}
+
+/// 回调给的绝对路径换成 Win32 形式（`C:\...`）。
+///
+/// `NormalizedPath` 实测有**两种形态**，不能只按其中一种切：
+///
+/// 1. **卷相对**：`\Users\me\AppData\...`（本机 Win11 就是这种）—— 直接拼上 `VolumeDosName`
+///    就是 `C:\Users\me\AppData\...`。
+/// 2. `\Device\HarddiskVolumeN\Users\me\...` —— 去掉 `\Device\HarddiskVolumeN` 再拼。
+///
+/// 旧实现固定按第 2 种切 3 段。在形态 1 上它把 `Users\me` 当成了设备前缀一起切掉，
+/// 得到 `C:\AppData\...` —— 记账键与 `sweep`/`is_busy` 的路径**永远对不上**：
+/// 打开/关闭回调记了个不存在的路径，回收判定只能退回文件 mtime（对端的修改时间，可能几天前），
+/// 于是正在被资源管理器复制的那一项也会被删掉。实机症状就是"源文件已损坏或不可用"、
+/// 之后拖放不再响应。
+///
+/// 幂等记账（`note_closed`）与 `sweep` 都按 Win32 路径比对，所以这一步必须做对。
+fn dos_path(dos: &str, normalized: &str) -> String {
+    if let Some(rest) = strip_device_prefix(normalized) {
+        return if rest.is_empty() {
+            format!("{dos}\\")
+        } else {
+            format!("{dos}\\{rest}")
+        };
     }
-    format!("{dos}\\{}", rest.join("\\"))
+    // 卷相对路径（一个前导 `\`，但不是 UNC `\\server`、也不是 `\??\` 前缀）。
+    if normalized.starts_with('\\')
+        && !normalized.starts_with("\\\\")
+        && !normalized.starts_with("\\??\\")
+    {
+        return format!("{dos}{normalized}");
+    }
+    // 已经是 DOS/UNC/verbatim 形式，原样交回。
+    normalized.to_string()
+}
+
+/// `\Device\HarddiskVolumeN\...` → `...`；不是这个形态返回 `None`。
+fn strip_device_prefix(path: &str) -> Option<&str> {
+    const PREFIX: &str = "\\Device\\";
+    let head = path.get(..PREFIX.len())?;
+    if !head.eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let rest = &path[PREFIX.len()..];
+    let (volume, rest) = rest.split_once('\\').unwrap_or((rest, ""));
+    if !volume.to_ascii_lowercase().starts_with("harddiskvolume") {
+        return None;
+    }
+    Some(rest)
 }
 
 /// 触发这次回调的进程（连接时开了 `REQUIRE_PROCESS_INFO`）—— 验证期靠它分"谁读了镜像"。
@@ -944,7 +1325,29 @@ fn process_name(info: &CF_CALLBACK_INFO) -> String {
         return String::new();
     }
     let image = pcwstr(unsafe { (*info.ProcessInfo).ImagePath });
-    image.rsplit(['\\', '/']).next().unwrap_or_default().to_string()
+    image
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// 这次回调是不是本进程自己发的（本进程自己的读、测试里的读）。
+///
+/// 它们不算"目标在读"：记进账会让刚被本进程读过的项在 grace 内被误判为 busy，
+/// 回收判据也会被自己拖着走。
+fn is_self(info: &CF_CALLBACK_INFO) -> bool {
+    let process = process_name(info);
+    if process.is_empty() {
+        return false; // 判断不了就按"目标"算（宁可少回收，不能删错）
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .is_some_and(|exe| exe.eq_ignore_ascii_case(&process))
 }
 
 fn pcwstr(text: PCWSTR) -> String {
@@ -964,13 +1367,19 @@ fn align_up(value: u64) -> u64 {
 
 fn fs_metadata(size: u64, mtime: Option<i64>, is_dir: bool) -> CF_FS_METADATA {
     // 时间戳拿不到就用"现在"：占位符总要有个值，写 0 会显示成 1601 年。
-    let ticks = mtime.map(unix_to_filetime).unwrap_or_else(now_filetime);
+    //
+    // **CreationTime 必须是本地现在**：它是"这一项什么时候放进本地镜像"的唯一持久记录
+    // （进程重启后 TTL 兜底就靠它）。对端的修改时间只能写进 LastWriteTime（资源管理器里
+    // 显示为"修改日期"）。旧实现把 CreationTime 也写成远端时间，于是几十天前的远端文件
+    // 一放进来就"超龄"，下一次 sweep 直接删掉 —— 正在复制的那一项也一样。
+    let now = now_filetime();
+    let modified = mtime.map(unix_to_filetime).unwrap_or(now);
     CF_FS_METADATA {
         BasicInfo: FILE_BASIC_INFO {
-            CreationTime: ticks,
-            LastAccessTime: ticks,
-            LastWriteTime: ticks,
-            ChangeTime: ticks,
+            CreationTime: now,
+            LastAccessTime: now,
+            LastWriteTime: modified,
+            ChangeTime: now,
             FileAttributes: if is_dir {
                 FILE_ATTRIBUTE_DIRECTORY.0
             } else {
@@ -1036,7 +1445,12 @@ mod tests {
                     .trim_end_matches('\0')
                     .to_string();
                 // 本地名是清洗过的、远端路径是原始的 —— 两者都得是**这一条**自己的。
-                let remote_leaf = decoded.path.rsplit('/').next().unwrap_or_default().to_string();
+                let remote_leaf = decoded
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
                 (format!("{local}|{remote_leaf}"), *size, *is_dir)
             })
             .collect();
@@ -1075,7 +1489,10 @@ mod tests {
 
         // 平台随后重发同一区间（另一处读要它）→ 必须照常拉：旧单子已经被消费掉了。
         let second = FetchGuard::begin(FILE, 4096, 8192);
-        assert!(!second.cancelled(), "新请求不能被上一张已经消费掉的撤销单拦住");
+        assert!(
+            !second.cancelled(),
+            "新请求不能被上一张已经消费掉的撤销单拦住"
+        );
 
         // 撤销只认自己那个 placeholder：别的 file_id 的同区间请求不受影响。
         note_cancel(FILE, 0, 4096);
@@ -1092,6 +1509,65 @@ mod tests {
         note_cancel(FILE, 12288, 16384);
         let after = FetchGuard::begin(FILE, 12288, 16384);
         assert!(!after.cancelled(), "没人认领的撤销单不能留在表里");
+    }
+
+    /// 同一区间上同时有两条在飞请求（落下时解析路径的那一页 + 真正的复制）：撤销只属于
+    /// **先发起**的那条，后来的复制请求绝不能被连坐。
+    ///
+    /// 老实现把区间重叠的**所有**请求都标成撤销：复制请求既不交付也不判失败，平台那个读
+    /// 一直挂着（其它操作还会重置它的超时计时器）—— 实机表现就是"源文件已损坏或不可用"、
+    /// 之后拖放整个不再响应。
+    #[test]
+    fn a_cancel_does_not_kill_an_overlapping_live_request() {
+        const FILE: i64 = 78;
+        let header = FetchGuard::begin(FILE, 0, 4096);
+        let copy = FetchGuard::begin(FILE, 0, 4096);
+        note_cancel(FILE, 0, 4096);
+        assert!(header.cancelled(), "撤销应当认领先发起的那条");
+        assert!(!copy.cancelled(), "后发起的复制请求不能被连坐");
+    }
+
+    /// 重名退路：扩展名要留住，用户一眼还能认出是哪个文件。
+    #[test]
+    fn suffixed_names_keep_the_extension() {
+        assert_eq!(suffixed_name("报告.pdf", 2), "报告 (2).pdf");
+        assert_eq!(suffixed_name(".gitignore", 2), ".gitignore (2)");
+        assert_eq!(suffixed_name("noext", 3), "noext (3)");
+    }
+
+    /// 回调路径的两种形态都要落到同一个 Win32 路径。旧实现只认 `\Device\HarddiskVolumeN\...`，
+    /// 在卷相对形态（实机 Win11 的那个）上把用户目录也切掉了 —— 记账键永远对不上，
+    /// 回收就会删正在被读的项。
+    #[test]
+    fn callback_paths_match_the_sweep_path() {
+        assert_eq!(
+            dos_path("C:", r"\Users\me\AppData\Local\Temp\orbdrop\mirror\a.bin"),
+            r"C:\Users\me\AppData\Local\Temp\orbdrop\mirror\a.bin"
+        );
+        assert_eq!(
+            dos_path("C:", r"\Device\HarddiskVolume3\Users\me\mirror\a.bin"),
+            r"C:\Users\me\mirror\a.bin"
+        );
+        assert_eq!(dos_path("C:", r"\Device\HarddiskVolume3"), r"C:\");
+        assert_eq!(dos_path("D:", r"\\nas\share\a.bin"), r"\\nas\share\a.bin");
+        assert_eq!(
+            dos_path("C:", r"C:\already\dos\a.bin"),
+            r"C:\already\dos\a.bin"
+        );
+    }
+
+    /// 占位符的 LastWriteTime = 对端修改时间，但 CreationTime 必须是**本地现在** ——
+    /// 回收的 TTL 兜底就看它，写远端时间会让刚放好的项当场"超龄"。
+    #[test]
+    fn placeholder_creation_time_is_local_while_mtime_is_remote() {
+        let remote_secs = 1_000_000_000; // 2001 年，肯定比 TTL 老
+        let meta = fs_metadata(10, Some(remote_secs), false);
+        assert_eq!(meta.BasicInfo.LastWriteTime, unix_to_filetime(remote_secs));
+        let now = now_filetime();
+        assert!(
+            (meta.BasicInfo.CreationTime - now).abs() < 5_000_000,
+            "创建时间必须是本地现在（误差 0.5 秒内）"
+        );
     }
 
     #[test]

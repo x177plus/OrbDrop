@@ -53,7 +53,9 @@ pub fn set_rect(window: &WebviewWindow, rect: Rect) -> Result<(), String> {
 pub fn drag_start(window: &WebviewWindow, press_x: f64, press_y: f64) -> Result<(), String> {
     imp::drag_align(window, press_x, press_y)?;
     ensure_foreground(window)?;
-    window.start_dragging().map_err(|e| format!("start_dragging 失败: {e}"))
+    window
+        .start_dragging()
+        .map_err(|e| format!("start_dragging 失败: {e}"))
 }
 
 /// 起拖之前先确保窗口在前台。
@@ -89,7 +91,12 @@ pub fn visible_on_some_monitor(window: &WebviewWindow, x: i32, y: i32) -> bool {
         // 问不出尺寸就没有判据，按「可见」处理：宁可复原到原位，也别把用户记下的位置丢掉
         Err(_) => return true,
     };
-    let rect = Rect { x, y, w: size.width as i32, h: size.height as i32 };
+    let rect = Rect {
+        x,
+        y,
+        w: size.width as i32,
+        h: size.height as i32,
+    };
     let monitors: Vec<Rect> = window
         .available_monitors()
         .unwrap_or_default()
@@ -97,11 +104,16 @@ pub fn visible_on_some_monitor(window: &WebviewWindow, x: i32, y: i32) -> bool {
         .map(|m| {
             let p = m.position();
             let s = m.size();
-            Rect { x: p.x, y: p.y, w: s.width as i32, h: s.height as i32 }
+            Rect {
+                x: p.x,
+                y: p.y,
+                w: s.width as i32,
+                h: s.height as i32,
+            }
         })
         .collect();
     if monitors.is_empty() {
-        return true;   // 拿不到显示器列表（远程会话等）：无据可依，不拦
+        return true; // 拿不到显示器列表（远程会话等）：无据可依，不拦
     }
     overlaps_any(rect, &monitors)
 }
@@ -155,7 +167,15 @@ pub fn on_some_monitor(window: &WebviewWindow) -> bool {
     if areas.is_empty() {
         return true; // 拿不到显示器列表（某些远程会话）：无据可依，不搬
     }
-    overlaps_any(Rect { x: pos.x, y: pos.y, w: size.width as i32, h: size.height as i32 }, &areas)
+    overlaps_any(
+        Rect {
+            x: pos.x,
+            y: pos.y,
+            w: size.width as i32,
+            h: size.height as i32,
+        },
+        &areas,
+    )
 }
 
 /// 把窗口搬回**最近的**那块显示器的工作区里（尺寸不动）。返回是否真搬过。
@@ -168,7 +188,12 @@ pub fn clamp_into_work_area(window: &WebviewWindow) -> Result<bool, String> {
     if areas.is_empty() {
         return Ok(false);
     }
-    let rect = Rect { x: pos.x, y: pos.y, w: size.width as i32, h: size.height as i32 };
+    let rect = Rect {
+        x: pos.x,
+        y: pos.y,
+        w: size.width as i32,
+        h: size.height as i32,
+    };
     if overlaps_any(rect, &areas) {
         return Ok(false);
     }
@@ -263,7 +288,9 @@ pub fn raise(window: &WebviewWindow) -> Result<(), String> {
     let _ = strip_os_frame(window); // 置顶/显示之后 DWM 可能把那条 1px 系统边框画回来
     imp::force_show(window);
     let _ = window.unminimize();
-    window.set_always_on_top(true).map_err(|e| format!("重新置顶失败: {e}"))?;
+    window
+        .set_always_on_top(true)
+        .map_err(|e| format!("重新置顶失败: {e}"))?;
     window.set_focus().map_err(|e| format!("带到前台失败: {e}"))
 }
 
@@ -313,19 +340,24 @@ mod imp {
     use tauri::WebviewWindow;
     use windows::Win32::Foundation::{POINT, RECT};
     use windows::Win32::Graphics::Gdi::{
-        ClientToScreen, GetMonitorInfoW, MonitorFromWindow, RedrawWindow, MONITOR_DEFAULTTONEAREST,
-        MONITORINFO, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
+        ClientToScreen, GetMonitorInfoW, MonitorFromWindow, RedrawWindow, MONITORINFO,
+        MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
     };
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
     use windows::Win32::UI::WindowsAndMessaging::{
         GetCursorPos, GetForegroundWindow, GetWindowRect, IsIconic, IsWindowVisible,
-        SetForegroundWindow, SetWindowPos, ShowWindow, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-        SWP_NOZORDER, SWP_NOSIZE,
+        SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+        SW_SHOWNOACTIVATE,
     };
 
     fn to_rect(r: RECT) -> Rect {
-        Rect { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top }
+        Rect {
+            x: r.left,
+            y: r.top,
+            w: r.right - r.left,
+            h: r.bottom - r.top,
+        }
     }
 
     pub fn mouse_down() -> bool {
@@ -372,8 +404,16 @@ mod imp {
     pub fn set_rect(window: &WebviewWindow, rect: Rect) -> Result<(), String> {
         let hwnd = window.hwnd().map_err(|e| format!("取窗口句柄失败: {e}"))?;
         unsafe {
-            SetWindowPos(hwnd, None, rect.x, rect.y, rect.w, rect.h, SWP_NOACTIVATE | SWP_NOZORDER)
-                .map_err(|e| format!("SetWindowPos 失败: {e}"))
+            SetWindowPos(
+                hwnd,
+                None,
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+            .map_err(|e| format!("SetWindowPos 失败: {e}"))
         }
     }
 
@@ -522,13 +562,29 @@ mod imp {
             .ok_or_else(|| "无法确定悬浮球所在显示器".to_string())?;
         let pos = monitor.position();
         let size = monitor.size();
-        let rect = Rect { x: pos.x, y: pos.y, w: size.width as i32, h: size.height as i32 };
-        Ok(ScreenMetrics { work_area: rect, monitor: rect, scale_factor: monitor.scale_factor() })
+        let rect = Rect {
+            x: pos.x,
+            y: pos.y,
+            w: size.width as i32,
+            h: size.height as i32,
+        };
+        Ok(ScreenMetrics {
+            work_area: rect,
+            monitor: rect,
+            scale_factor: monitor.scale_factor(),
+        })
     }
 
     pub fn set_rect(window: &WebviewWindow, rect: Rect) -> Result<(), String> {
-        window.set_position(PhysicalPosition::new(rect.x, rect.y)).map_err(|e| e.to_string())?;
-        window.set_size(PhysicalSize::new(rect.w.max(1) as u32, rect.h.max(1) as u32)).map_err(|e| e.to_string())
+        window
+            .set_position(PhysicalPosition::new(rect.x, rect.y))
+            .map_err(|e| e.to_string())?;
+        window
+            .set_size(PhysicalSize::new(
+                rect.w.max(1) as u32,
+                rect.h.max(1) as u32,
+            ))
+            .map_err(|e| e.to_string())
     }
 
     /// 把窗口挪到「按下点仍在指针底下」的位置（非 Windows 用 Tauri 的窗口内指针位置）。
@@ -538,7 +594,9 @@ mod imp {
         let cur = window.cursor_position().map_err(|e| e.to_string())?;
         let x = pos.x + (cur.x - press_x * sf).round() as i32;
         let y = pos.y + (cur.y - press_y * sf).round() as i32;
-        window.set_position(PhysicalPosition::new(x, y)).map_err(|e| e.to_string())
+        window
+            .set_position(PhysicalPosition::new(x, y))
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -549,8 +607,18 @@ mod tests {
     /// 一块 1920x1080 主屏 + 它左边一块 1280x1024（负坐标）的副屏。
     fn monitors() -> Vec<Rect> {
         vec![
-            Rect { x: 0, y: 0, w: 1920, h: 1080 },
-            Rect { x: -1280, y: 0, w: 1280, h: 1024 },
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+            Rect {
+                x: -1280,
+                y: 0,
+                w: 1280,
+                h: 1024,
+            },
         ]
     }
 
@@ -559,38 +627,129 @@ mod tests {
     fn overlaps_only_inside_monitors() {
         let ms = monitors();
         // 主屏正中、主屏左下角（贴边收起：窗口贴住工作区边缘，仍在屏内）
-        assert!(overlaps_any(Rect { x: 800, y: 400, w: 90, h: 90 }, &ms));
-        assert!(overlaps_any(Rect { x: 0, y: 990, w: 90, h: 90 }, &ms));
+        assert!(overlaps_any(
+            Rect {
+                x: 800,
+                y: 400,
+                w: 90,
+                h: 90
+            },
+            &ms
+        ));
+        assert!(overlaps_any(
+            Rect {
+                x: 0,
+                y: 990,
+                w: 90,
+                h: 90
+            },
+            &ms
+        ));
         // 左侧副屏（负坐标）
-        assert!(overlaps_any(Rect { x: -1280, y: 100, w: 90, h: 90 }, &ms));
+        assert!(overlaps_any(
+            Rect {
+                x: -1280,
+                y: 100,
+                w: 90,
+                h: 90
+            },
+            &ms
+        ));
         // 跨屏接缝：窗口一半在副屏、一半在主屏
-        assert!(overlaps_any(Rect { x: -45, y: 100, w: 90, h: 90 }, &ms));
+        assert!(overlaps_any(
+            Rect {
+                x: -45,
+                y: 100,
+                w: 90,
+                h: 90
+            },
+            &ms
+        ));
         // 副屏被拔掉之后：原来的落点整块在主屏左侧之外
         assert!(
-            !overlaps_any(Rect { x: -1280, y: 100, w: 90, h: 90 }, &[ms[0]]),
+            !overlaps_any(
+                Rect {
+                    x: -1280,
+                    y: 100,
+                    w: 90,
+                    h: 90
+                },
+                &[ms[0]]
+            ),
             "只剩主屏时，记在副屏上的位置必须判为不可见（否则球复原到屏幕外，用户拖不回来）"
         );
         // 主屏分辨率变小（改成 1600x900）：原来的右下角落点已经出界
-        let small = [Rect { x: 0, y: 0, w: 1600, h: 900 }];
-        assert!(!overlaps_any(Rect { x: 1600, y: 100, w: 90, h: 90 }, &small), "右侧出界");
-        assert!(!overlaps_any(Rect { x: 100, y: 900, w: 90, h: 90 }, &small), "下方出界");
+        let small = [Rect {
+            x: 0,
+            y: 0,
+            w: 1600,
+            h: 900,
+        }];
+        assert!(
+            !overlaps_any(
+                Rect {
+                    x: 1600,
+                    y: 100,
+                    w: 90,
+                    h: 90
+                },
+                &small
+            ),
+            "右侧出界"
+        );
+        assert!(
+            !overlaps_any(
+                Rect {
+                    x: 100,
+                    y: 900,
+                    w: 90,
+                    h: 90
+                },
+                &small
+            ),
+            "下方出界"
+        );
         // 恰好贴边（无正面积交集）也算出界：窗口与显示器边界只相接时球一个像素都看不到
-        assert!(!overlaps_any(Rect { x: 1920, y: 0, w: 90, h: 90 }, &[ms[0]]));
+        assert!(!overlaps_any(
+            Rect {
+                x: 1920,
+                y: 0,
+                w: 90,
+                h: 90
+            },
+            &[ms[0]]
+        ));
     }
 
     /// 默认落位在右上、垂直线 1/3 处，且右边余量大于前端吸附阈值（20 CSS px）——
     /// 否则首启那次落位判定会立刻把球吸到边上，「靠边但不吸附」当场失效。
     #[test]
     fn default_pos_is_upper_right_and_not_dockable() {
-        let work = Rect { x: 0, y: 0, w: 1920, h: 1032 };
+        let work = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1032,
+        };
         let (x, y) = default_pos_in(work, 90, 24);
         assert_eq!(x, 1920 - 90 - 24, "窗口右边贴着工作区右边的内侧");
         assert!(work.x + work.w - (x + 90) > 20, "余量必须超过吸附阈值");
-        assert!(y > work.y && y < work.y + work.h / 2, "垂直落在上半部的 1/3 处");
+        assert!(
+            y > work.y && y < work.y + work.h / 2,
+            "垂直落在上半部的 1/3 处"
+        );
 
         // 工作区左上角不在原点（副屏 / 左侧任务栏）也按绝对坐标算
-        let left = Rect { x: -1280, y: 0, w: 1280, h: 1024 };
-        assert_eq!(default_pos_in(left, 90, 24), (-1280 + 1280 - 90 - 24, 1024 / 3));
+        let left = Rect {
+            x: -1280,
+            y: 0,
+            w: 1280,
+            h: 1024,
+        };
+        assert_eq!(
+            default_pos_in(left, 90, 24),
+            (-1280 + 1280 - 90 - 24, 1024 / 3)
+        );
     }
 
     /// 指纹只判"变没变"：拓扑或缩放动过就必须变（否则界面那份几何不会被重排），
@@ -601,39 +760,105 @@ mod tests {
         let f = fingerprint_of(&base, 1.5);
         assert_eq!(f, fingerprint_of(&base, 1.5), "同一份拓扑两次查询必须一致");
         assert_ne!(f, fingerprint_of(&base, 1.0), "缩放变了要算变");
-        assert_ne!(f, fingerprint_of(&base, 1.25), "缩放变了要算变（非线性缩放也一样）");
+        assert_ne!(
+            f,
+            fingerprint_of(&base, 1.25),
+            "缩放变了要算变（非线性缩放也一样）"
+        );
         // 远控的虚拟屏：多出来一块
         let mut extra = base.clone();
-        extra.push(Rect { x: 1920, y: 0, w: 1080, h: 1920 });
+        extra.push(Rect {
+            x: 1920,
+            y: 0,
+            w: 1080,
+            h: 1920,
+        });
         assert_ne!(f, fingerprint_of(&extra, 1.5), "多了一块屏要算变");
         // 分辨率变小 / 任务栏换边：工作区矩形变了
-        assert_ne!(f, fingerprint_of(&[Rect { x: 0, y: 0, w: 1600, h: 900 }], 1.5), "工作区变了要算变");
+        assert_ne!(
+            f,
+            fingerprint_of(
+                &[Rect {
+                    x: 0,
+                    y: 0,
+                    w: 1600,
+                    h: 900
+                }],
+                1.5
+            ),
+            "工作区变了要算变"
+        );
         // 副屏被拔掉
         assert_ne!(f, fingerprint_of(&base[..1], 1.5), "少了一块屏要算变");
-        assert_eq!(fingerprint_of(&[], 1.0), fingerprint_of(&[], 1.0), "空集合也得稳定");
+        assert_eq!(
+            fingerprint_of(&[], 1.0),
+            fingerprint_of(&[], 1.0),
+            "空集合也得稳定"
+        );
     }
 
     /// 搬回工作区：挑最近的一块、夹进工作区；已经在某块屏上时一动不动。
     #[test]
     fn clamp_targets_the_nearest_work_area() {
-        let main = Rect { x: 0, y: 0, w: 1920, h: 1032 };
-        let left = Rect { x: -1280, y: 0, w: 1280, h: 984 };
+        let main = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1032,
+        };
+        let left = Rect {
+            x: -1280,
+            y: 0,
+            w: 1280,
+            h: 984,
+        };
         let areas = [main, left];
         // 贴右的球（实测落点就在 x≈1783 那一带）：主屏分辨率变成 1600 宽之后它整块出界
-        let shrunk = [Rect { x: 0, y: 0, w: 1600, h: 900 }];
-        let gone = Rect { x: 1830, y: 400, w: 90, h: 90 };
+        let shrunk = [Rect {
+            x: 0,
+            y: 0,
+            w: 1600,
+            h: 900,
+        }];
+        let gone = Rect {
+            x: 1830,
+            y: 400,
+            w: 90,
+            h: 90,
+        };
         assert!(!overlaps_any(gone, &shrunk), "分辨率变小之后它必须判为出界");
         let t = nearest_area(gone, &shrunk);
-        assert_eq!((t.x, t.y), (shrunk[0].x, shrunk[0].y), "目标是剩下那块屏的工作区");
-        assert_eq!(clamp_axis(gone.x, t.x, t.x + t.w - gone.w), 1600 - 90, "夹到工作区右缘内侧");
+        assert_eq!(
+            (t.x, t.y),
+            (shrunk[0].x, shrunk[0].y),
+            "目标是剩下那块屏的工作区"
+        );
+        assert_eq!(
+            clamp_axis(gone.x, t.x, t.x + t.w - gone.w),
+            1600 - 90,
+            "夹到工作区右缘内侧"
+        );
         // 副屏被拔掉：原落点落在主屏左侧之外（负坐标）→ 目标是主屏，夹回主屏左上
-        let gone_left = Rect { x: -1280, y: 100, w: 90, h: 90 };
-        assert!(!overlaps_any(gone_left, &[main]), "只剩主屏时它必须判为出界");
+        let gone_left = Rect {
+            x: -1280,
+            y: 100,
+            w: 90,
+            h: 90,
+        };
+        assert!(
+            !overlaps_any(gone_left, &[main]),
+            "只剩主屏时它必须判为出界"
+        );
         let t2 = nearest_area(gone_left, &[main]);
         assert_eq!((t2.x, t2.y), (main.x, main.y));
         assert_eq!(clamp_axis(gone_left.x, t2.x, t2.x + t2.w - gone_left.w), 0);
         // 离左边那块副屏更近时，目标是副屏
-        let off_left = Rect { x: -1400, y: 100, w: 90, h: 90 };
+        let off_left = Rect {
+            x: -1400,
+            y: 100,
+            w: 90,
+            h: 90,
+        };
         let t3 = nearest_area(off_left, &areas);
         assert_eq!((t3.x, t3.y), (left.x, left.y), "离副屏更近时目标是副屏");
         // 工作区比窗口还小（极小屏/极端缩放）：取 min，不许推到另一侧去

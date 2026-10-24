@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -9,6 +10,7 @@ use axum::Router;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::timeout::RequestBodyTimeoutLayer;
 use tracing::{error, info};
 
 use crate::state::{AppState, LinkIntent};
@@ -19,11 +21,12 @@ pub mod proxy;
 mod routes_chat;
 mod routes_dav;
 mod routes_discover;
-mod routes_link;
-mod routes_relay;
 mod routes_file;
+mod routes_link;
 mod routes_pair;
+mod routes_pake;
 mod routes_push;
+mod routes_relay;
 mod routes_shares;
 mod routes_stat;
 mod routes_tree;
@@ -87,12 +90,33 @@ const MANIFEST_BODY_LIMIT: usize = 64 << 20;
 
 /// 图片消息那条路由的体积上限：`blobs::MAX_IMAGE_BYTES` 的 base64（4/3）再加一点信封余量
 /// （`id`/`name`/`sender`/JSON 那几格）。
-const IMAGE_BODY_LIMIT: usize =
-    (crate::blobs::MAX_IMAGE_BYTES as usize / 3 + 1) * 4 + (64 << 10);
+const IMAGE_BODY_LIMIT: usize = (crate::blobs::MAX_IMAGE_BYTES as usize / 3 + 1) * 4 + (64 << 10);
+
+/// 公开路由读取请求体的**空闲**上限：连续这么久一个字节都没收到就掐掉这条请求。
+///
+/// 公开面（配对/推送/会话/群聊）必须整包读完才能认人 —— 未配对设备没有 token 可带，
+/// 认人规则写在 handler 里（见 `routes_push::authorize`）。hyper 只设了请求头超时
+/// （`net::serve_http` 的 `header_read_timeout`），进入 body 后计时器就停了：一条连接
+/// 发完头后挂在 body 半路，可以**永久**占着 `net` 的并发名额（远程 448 条）。
+///
+/// 30s 的依据：局域网正常清单是 KB 级、图片是 MB 级，块间不会停顿这么久；真碰上
+/// Wi-Fi 漫游/休眠，失败一次由上层重试，比"静默占死名额"好。这是**块间空闲**计时，
+/// 不是整请求超时：慢链路上只要还在持续出字节就不会被砍，handler 里的推送等待与
+/// `/push/stream` 的响应流也不受影响。
+const PUBLIC_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Build the axum Router with all routes, including the WS /events
 /// endpoint (outside the auth layer).
 fn build_router(state: Arc<AppState>) -> Router {
+    build_router_with_body_idle_timeout(state, PUBLIC_BODY_IDLE_TIMEOUT)
+}
+
+/// 装配路由器。`body_idle_timeout` 单独做参数只为测试能换小值把它跑完；
+/// 生产值见 [`PUBLIC_BODY_IDLE_TIMEOUT`]。
+fn build_router_with_body_idle_timeout(
+    state: Arc<AppState>,
+    body_idle_timeout: Duration,
+) -> Router {
     // **只允许本机自己的前端来源**，不再是 `*`。
     //
     // 回环那条路是免认证的（本机 UI 自验用，见 `auth_middleware`），而 `*` 意味着**任何**
@@ -118,6 +142,15 @@ fn build_router(state: Arc<AppState>) -> Router {
         // 自称已配对设备仍要出示 token）。添加方那边 best-effort。
         .route("/pair/hello", axum::routing::post(routes_pair::pair_hello))
         .route("/pair", axum::routing::post(routes_pair::pair_handshake))
+        // PAKE 配对（6 位码只做口令，不上网）。老版本的 `/pair` 仍保留给旧客户端。
+        .route(
+            "/pair/pake/start",
+            axum::routing::post(routes_pake::pake_start_handler),
+        )
+        .route(
+            "/pair/pake/finish",
+            axum::routing::post(routes_pake::pake_finish_handler),
+        )
         .route(
             "/pair/invite",
             axum::routing::post(routes_pair::pair_invite_handler),
@@ -169,10 +202,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         // **挂在公开路由上**（F-107 §12.1）：S-09 的语义放宽成"开着就允许，不限已配对设备"，
         // 而未配对设备本来就没有 token 可带 —— 所以认人规则写在 handler 里：凭据优先，
         // 没有凭据就必须自报身份并被核实（见 `routes_relay::relay_open`）。
-        .route(
-            "/relay/open",
-            axum::routing::post(routes_relay::relay_open),
-        )
+        .route("/relay/open", axum::routing::post(routes_relay::relay_open))
         // 反向路由记录（F-107 §10）：**同样在公开面上**、自己认人 —— 要送达的那一侧
         // （被中转的 B）通常从来没跟锚点配过（见 `routes_relay::relay_route`）。
         .route(
@@ -229,7 +259,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/chat/group-reject",
             axum::routing::post(routes_chat::group_text_reject_handler),
-        );
+        )
+        // 公开面先把 body 读完才认人（未配对设备没有 token 可带），而 hyper 的
+        // `header_read_timeout` 只管请求头。按**块间空闲**计时：连续这么久没有新字节
+        // 就掐掉这条请求，body 停在半路不再能永久占着并发名额。只包请求体，不碰响应流。
+        .layer(RequestBodyTimeoutLayer::new(body_idle_timeout));
 
     // Beyond Compare 的 WebDAV 入口：让 BC 连**本机**（回环），由这里加密转发到对端。
     // 挂在公开路由上是因为它自己校验凭据（它要的挑战/凭据形状必须与对端 DAV 面一致，
@@ -263,10 +297,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/file", axum::routing::get(routes_file::file_handler))
         .route("/shares", axum::routing::get(routes_shares::shares_handler))
         // 跨网段发现（F-10 延伸）：已配对对端来取「本机此刻看得见的设备」（整份视野）。
-        .route(
-            "/discover",
-            axum::routing::get(routes_discover::discover),
-        )
+        .route("/discover", axum::routing::get(routes_discover::discover))
         // 中转（F-106）：已配对对端来请本机替它连另一台设备（端点由本机开、本机盲转）。
         // F-107 起 `/relay/open` 与 `/relay/route` 都移到公开路由（未配对设备也能借 / 也能收到
         // 记录，认人规则在 handler 里），见 `public_routes`。
@@ -320,6 +351,57 @@ fn build_router(state: Arc<AppState>) -> Router {
             presence_middleware,
         ))
         .with_state(state)
+}
+
+/// `/file`、`/tree`、`/stat` 的 `path` 查询参数必须是**共享项内的相对路径**。
+///
+/// 这几条 handler 原来直接 `share_root.join(rel)` 再 `canonicalize`。在 Windows 上，
+/// 绝对路径/UNC 会让 `join` 清空基址，`canonicalize` 于是会真的去打开
+/// `\\attacker\share\...` —— 在本机发起 SMB 认证（NTLM 泄露），然后才被前缀检查拒掉。
+/// 这里先把非法形态挡在 `join` 之前；合法相对路径（含平台本来允许的 `:`/反斜杠名）
+/// 原样放行。
+pub(crate) fn safe_relative_share_path(rel: &str) -> bool {
+    if rel.contains('\0') {
+        return false;
+    }
+    if rel.is_empty() {
+        return true;
+    }
+    let path = std::path::Path::new(rel);
+    if path.is_absolute() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::path::Component;
+        if path
+            .components()
+            .any(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+        {
+            return false;
+        }
+    }
+    for part in rel.split(['/', '\\']) {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            return false;
+        }
+        #[cfg(windows)]
+        {
+            // 冒号 = 盘符或 NTFS ADS；结尾点/空格会被 Win32 吃掉（`".. "` 于是变回 `..`）；
+            // 保留设备名（`CON` / `NUL.txt`）不是普通文件。
+            if part.contains(':')
+                || part.ends_with('.')
+                || part.ends_with(' ')
+                || crate::transfer::resume::is_reserved_device_name(part)
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// 这个 `Origin` 是不是**本机自己的界面**发出来的。
@@ -471,7 +553,9 @@ async fn start_server_at(state: Arc<AppState>, base_port: u16, ip: IpAddr) -> Re
                 });
                 *state.server_task.lock() = Some(task_handle);
 
-                state.server_port.store(port, std::sync::atomic::Ordering::SeqCst);
+                state
+                    .server_port
+                    .store(port, std::sync::atomic::Ordering::SeqCst);
                 info!(port, "HTTP server started");
                 return Ok(port);
             }
@@ -480,9 +564,7 @@ async fn start_server_at(state: Arc<AppState>, base_port: u16, ip: IpAddr) -> Re
                 continue;
             }
             Err(e) => {
-                return Err(format!(
-                    "端口 {base_port}~{last} 均被占用: {e}"
-                ));
+                return Err(format!("端口 {base_port}~{last} 均被占用: {e}"));
             }
         }
     }
@@ -498,7 +580,9 @@ pub async fn stop_server(state: &AppState) {
     if let Some(h) = handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), h).await;
     }
-    state.server_port.store(0, std::sync::atomic::Ordering::SeqCst);
+    state
+        .server_port
+        .store(0, std::sync::atomic::Ordering::SeqCst);
     info!("HTTP server stopped");
 }
 
@@ -506,7 +590,8 @@ pub async fn ensure_server(state: Arc<AppState>) -> Result<u16, String> {
     let current_port = state.server_port.load(std::sync::atomic::Ordering::SeqCst);
     let base_port = state.config.lock().port;
 
-    if current_port == 0 || current_port < base_port || current_port > base_port.saturating_add(10) {
+    if current_port == 0 || current_port < base_port || current_port > base_port.saturating_add(10)
+    {
         if current_port != 0 {
             stop_server(&state).await;
         }
@@ -537,14 +622,17 @@ mod tests {
         let mut config = test_config();
         let share = ShareItem::new(root);
         config.shares.push(share);
-        let config_path = std::env::temp_dir().join(format!("orbdrop_test_config_{}.toml", uuid::Uuid::new_v4()));
+        let config_path =
+            std::env::temp_dir().join(format!("orbdrop_test_config_{}.toml", uuid::Uuid::new_v4()));
         Arc::new(AppState::new(config, config_path))
     }
 
     async fn start_test_server() -> (Arc<AppState>, u16, std::path::PathBuf) {
         let root = temp_share_dir();
         let state = make_state(root.clone());
-        let port = start_server_loopback(state.clone(), 3990).await.expect("server start");
+        let port = start_server_loopback(state.clone(), 3990)
+            .await
+            .expect("server start");
         (state, port, root)
     }
 
@@ -674,7 +762,9 @@ mod tests {
         let state = make_state(root.clone());
 
         let occupied = std::net::TcpListener::bind("127.0.0.1:3995").unwrap();
-        let port = start_server_loopback(state.clone(), 3990).await.expect("server start");
+        let port = start_server_loopback(state.clone(), 3990)
+            .await
+            .expect("server start");
         assert!(
             port >= 3990 && port <= 3995,
             "should probe within range, got {port}"
@@ -682,6 +772,48 @@ mod tests {
         let _ = occupied;
 
         stop_server(&state).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 公开路由的请求体空闲超时：发完头之后挂在 body 半路的请求必须被收尾，不能永久
+    /// 占着连接名额。这里用 150ms 的测试值跑**同一份路由装配**（`build_router_with_body_idle_timeout`），
+    /// 证明 layer 确实挂在公开面上、且错误在提取阶段就回来（400），不会进 handler。
+    #[tokio::test]
+    async fn a_stalled_public_body_is_cut_off() {
+        use axum::body::Body;
+        use futures_util::StreamExt;
+        use tower::ServiceExt;
+
+        let root = temp_share_dir();
+        let state = make_state(root.clone());
+        let app = build_router_with_body_idle_timeout(state, Duration::from_millis(150));
+
+        // 先给一个字节（提取器开始读），之后永远没有下一块 —— 模拟"发完头就挂住"。
+        let stalled = futures_util::stream::once(async {
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{"))
+        })
+        .chain(futures_util::stream::pending());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/pair/hello")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50001,
+            ))))
+            .body(Body::from_stream(stalled))
+            .unwrap();
+
+        let resp = tokio::time::timeout(Duration::from_secs(10), app.oneshot(req))
+            .await
+            .expect("body 停住超过阈值必须收尾，不能永久占着连接")
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "提取器拿到 body 错误 → 400；重点是它回来了"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -737,6 +869,40 @@ mod tests {
 
         stop_server(&state).await;
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn share_relative_paths_reject_absolute_unc_and_parent_segments() {
+        for ok in ["", "a.txt", "sub/a.txt", "sub//a.txt", "./a.txt", "中文 文件.txt"] {
+            assert!(safe_relative_share_path(ok), "正常相对路径不能误伤: {ok:?}");
+        }
+        for bad in ["/etc/passwd", "..", "../a", "a/../../b", "a\0b"] {
+            assert!(!safe_relative_share_path(bad), "必须拒绝: {bad:?}");
+        }
+        #[cfg(windows)]
+        {
+            for bad in [
+                r"C:\Windows\Temp\pwn.exe",
+                r"C:foo",
+                r"\\server\share\pwn.exe",
+                r"\Windows",
+                r"a:b",
+                r"a/.. /b",
+                r"CON",
+                r"sub/NUL.txt",
+            ] {
+                assert!(!safe_relative_share_path(bad), "必须拒绝: {bad:?}");
+            }
+            for ok in [r"sub\a.txt", r"a\b"] {
+                assert!(safe_relative_share_path(ok), "Windows 反斜杠相对路径应允许");
+            }
+        }
+        #[cfg(unix)]
+        {
+            for ok in ["12:30.log", r"a\b", "C:foo"] {
+                assert!(safe_relative_share_path(ok), "Unix 合法名字不能误伤: {ok:?}");
+            }
+        }
     }
 
     #[test]

@@ -31,7 +31,7 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Path as UrlPath, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use tracing::{debug, warn};
 
 use crate::state::AppState;
@@ -117,7 +117,9 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
     };
     // token 取第一个冒号之后的部分：用户名是我们自己写进 profile 的，万一它含冒号，
     // 取第二段就会拿错（同 `server::auth::split_basic`）。
-    text.split_once(':').map(|(_, pass)| pass == token).unwrap_or(false)
+    text.split_once(':')
+        .map(|(_, pass)| pass == token)
+        .unwrap_or(false)
 }
 
 /// BC 只支持 Basic，挑战头必须声明它（缺了挑战头 BC 直接判定连接失败）。
@@ -218,7 +220,7 @@ async fn forward(
 
     let method = req.method().clone();
     let body = reqwest::Body::wrap_stream(req.into_body().into_data_stream());
-    let upstream = match crate::net::client()
+    let upstream = match crate::net::dial_client(peer.dial().0, &peer.dial_pin())
         .request(method.clone(), &url)
         .headers(headers)
         .body(body)
@@ -252,8 +254,8 @@ async fn forward(
     // 那是本机共享项那一面，上面根本没有对端的共享项。表现正是"对端一个条目都看不到、
     // 往里点也进不去"。所以正文要跟 `Destination` 一样改写回本机代理的前缀。
     if content_type.contains("xml") {
-        match upstream.bytes().await {
-            Ok(bytes) if bytes.len() <= MAX_REWRITABLE_BODY => {
+        match read_xml_body(upstream, MAX_REWRITABLE_BODY).await {
+            Ok(XmlBody::Rewrite(bytes)) => {
                 let text = String::from_utf8_lossy(&bytes);
                 let rewritten = rewrite_hrefs(&text, &peer_id);
                 let mut response = Response::new(Body::from(rewritten));
@@ -261,10 +263,10 @@ async fn forward(
                 *response.headers_mut() = headers;
                 return response;
             }
-            // 这个尺寸的列表 BC 本来也打不开；宁可不改前缀，也别把整个响应缓冲进内存。
-            Ok(bytes) => {
-                warn!(peer_id = %peer_id, len = bytes.len(), "WebDAV 响应过大，href 未改写");
-                let mut response = Response::new(Body::from(bytes));
+            // 这个尺寸的列表 BC 本来也打不开：不改前缀，但**绝不**把整个响应缓冲进内存。
+            Ok(XmlBody::Stream(body)) => {
+                warn!(peer_id = %peer_id, "WebDAV 响应过大，href 未改写");
+                let mut response = Response::new(body);
                 *response.status_mut() = status;
                 *response.headers_mut() = headers;
                 return response;
@@ -288,6 +290,54 @@ async fn forward(
 /// 缓冲改写只做 XML 正文（PROPFIND 的列表 / 错误 multistatus），这个上限远高于任何
 /// 能用的目录列表。
 const MAX_REWRITABLE_BODY: usize = 8 * 1024 * 1024;
+
+/// [`read_xml_body`] 的结果：能改写就整份给，超限就交一条**不缓冲**的流。
+enum XmlBody {
+    Rewrite(Vec<u8>),
+    Stream(Body),
+}
+
+/// 按 `max` 读一个 XML 响应体。
+///
+/// 旧写法 `upstream.bytes().await` 是**先读完再比上限**：对端只要一直写，缓冲区就会一直长
+/// （这个尺寸的检查等于没有）。这里分三档：
+/// 1. `Content-Length` 明确超限 → 一个字节都不缓冲，直接流式转发；
+/// 2. 声明值缺失 / 撒谎 → 按块累计，越过 `max` 立刻停手；
+/// 3. 已读部分 + 触发越界的那一块 + 剩余流按原顺序拼回去（BC 拿到的字节不变）。
+async fn read_xml_body(
+    mut upstream: reqwest::Response,
+    max: usize,
+) -> Result<XmlBody, reqwest::Error> {
+    if upstream
+        .content_length()
+        .is_some_and(|len| len > max as u64)
+    {
+        let stream = upstream.bytes_stream().map_err(std::io::Error::other);
+        return Ok(XmlBody::Stream(Body::from_stream(stream)));
+    }
+
+    let mut head: Vec<u8> = Vec::new();
+    let mut over: Option<axum::body::Bytes> = None;
+    while let Some(chunk) = upstream.chunk().await? {
+        if head.len().saturating_add(chunk.len()) > max {
+            over = Some(chunk);
+            break;
+        }
+        head.extend_from_slice(&chunk);
+    }
+    let Some(chunk) = over else {
+        return Ok(XmlBody::Rewrite(head));
+    };
+
+    let prefix = futures_util::stream::once(async move {
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(head))
+    });
+    let first = futures_util::stream::once(async move { Ok::<_, std::io::Error>(chunk) });
+    let rest = upstream.bytes_stream().map_err(std::io::Error::other);
+    Ok(XmlBody::Stream(Body::from_stream(
+        prefix.chain(first).chain(rest),
+    )))
+}
 
 /// 把正文里所有 `…:href>/dav/…` 的前缀换成本机代理的前缀。
 ///
@@ -403,6 +453,93 @@ mod tests {
         );
     }
 
+    /// 一个只答一次的裸 HTTP 服务端；`parts` 之间停顿一下，让客户端分块收到。
+    async fn one_shot_http_parts(parts: Vec<Vec<u8>>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            for part in parts {
+                socket.write_all(&part).await.unwrap();
+                socket.flush().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}/dav/x")
+    }
+
+    /// 声明值超限：一个字节都不缓冲，整条身体照样按原顺序转发。
+    #[tokio::test]
+    async fn oversized_xml_with_a_length_is_streamed() {
+        crate::net::install_crypto_provider();
+        let payload = "x".repeat(4096);
+        let url = one_shot_http_parts(vec![format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        )
+        .into_bytes()])
+        .await;
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let body = match read_xml_body(resp, 1024).await.unwrap() {
+            XmlBody::Rewrite(_) => panic!("超限的响应不该被整份读进内存"),
+            XmlBody::Stream(body) => body,
+        };
+        let collected = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        assert_eq!(collected.as_ref(), payload.as_bytes());
+    }
+
+    /// 声明值撒谎/缺失（chunked）：读到越过上限就停，已读前缀 + 后续流必须原样拼回去。
+    #[tokio::test]
+    async fn oversized_xml_without_a_length_keeps_the_prefix_and_rest() {
+        crate::net::install_crypto_provider();
+        let chunk = "y".repeat(800);
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let framed = format!("{:x}\r\n{chunk}\r\n", chunk.len());
+        let url = one_shot_http_parts(vec![
+            format!("{headers}{framed}").into_bytes(),
+            framed.clone().into_bytes(),
+            format!("{framed}0\r\n\r\n").into_bytes(),
+        ])
+        .await;
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let body = match read_xml_body(resp, 1024).await.unwrap() {
+            XmlBody::Rewrite(_) => panic!("超过上限的响应不该被整份读进内存"),
+            XmlBody::Stream(body) => body,
+        };
+        let collected = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        assert_eq!(
+            collected.len(),
+            2400,
+            "前缀 + 越界块 + 剩余流一个字节都不能丢"
+        );
+        assert!(collected.iter().all(|b| *b == b'y'));
+    }
+
+    /// 上限之内：照常整份读出，交给 href 改写。
+    #[tokio::test]
+    async fn small_xml_is_read_whole() {
+        crate::net::install_crypto_provider();
+        let payload = "<D:multistatus/>";
+        let url = one_shot_http_parts(vec![format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        )
+        .into_bytes()])
+        .await;
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        match read_xml_body(resp, 1024).await.unwrap() {
+            XmlBody::Rewrite(bytes) => assert_eq!(bytes, payload.as_bytes()),
+            XmlBody::Stream(_) => panic!("上限内的响应必须能改写"),
+        }
+    }
+
     /// 端到端：BC 从前到后真正会走的动作，走一遍。
     ///
     /// 两个实例跑在一个进程里：**B 是"对端"**（有共享项、把调用方认成长连接），**A 是本机**
@@ -414,10 +551,11 @@ mod tests {
     /// 3. 按列表里的 href `GET` 一次 → 真的拿到对端那个文件的内容。
     #[tokio::test]
     async fn bc_reaches_the_peer_through_the_loopback_proxy() {
-        let peer_root = std::env::temp_dir().join(format!("orbdrop_proxy_peer_{}", uuid::Uuid::new_v4()));
+        let peer_root =
+            std::env::temp_dir().join(format!("orbdrop_proxy_peer_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(peer_root.join("sub")).unwrap();
         std::fs::write(peer_root.join("hello.txt"), b"hello from the peer").unwrap();
-    // 用户实际踩到的那个形状：文件名带空格与中文（BC 会用列表里那条 href 回去取它）
+        // 用户实际踩到的那个形状：文件名带空格与中文（BC 会用列表里那条 href 回去取它）
         std::fs::write(peer_root.join("新建 文本文档.txt"), b"spaced").unwrap();
 
         // ---- B：对端 ----
@@ -475,7 +613,8 @@ mod tests {
             .starts_with("Basic"));
 
         // 2. 带 profile 里的凭据列一层
-        let creds = |req: reqwest::RequestBuilder| req.basic_auth(crate::bc::DAV_USER, Some(&token));
+        let creds =
+            |req: reqwest::RequestBuilder| req.basic_auth(crate::bc::DAV_USER, Some(&token));
         let listed = creds(client.request(Method::from_bytes(b"PROPFIND").unwrap(), &share_url))
             .header("Depth", "1")
             .send()
@@ -484,41 +623,42 @@ mod tests {
         assert_eq!(listed.status(), StatusCode::MULTI_STATUS);
         let body = listed.text().await.unwrap();
         assert!(body.contains("hello.txt"), "列表里该有对端的文件: {body}");
-// href 是**路径形式**（标准形状，按响应所在的主机解析）—— 所以它必须落在本机代理的
-    // 前缀上；写成 `http://…/dav/…`（对端命名空间）时代它就会指回本机自己的 /dav/。
-    let expect_href = format!("<D:href>{PREFIX}/{caller_id}/{share_id}/hello.txt</D:href>");
-    assert!(
-        body.contains(&expect_href),
-        "href 必须是本机代理的前缀，否则 BC 会去请求本机自己的 /dav/：{body}"
-    );
-    assert!(!body.contains("<D:href>/dav/"), "{body}");
+        // href 是**路径形式**（标准形状，按响应所在的主机解析）—— 所以它必须落在本机代理的
+        // 前缀上；写成 `http://…/dav/…`（对端命名空间）时代它就会指回本机自己的 /dav/。
+        let expect_href = format!("<D:href>{PREFIX}/{caller_id}/{share_id}/hello.txt</D:href>");
+        assert!(
+            body.contains(&expect_href),
+            "href 必须是本机代理的前缀，否则 BC 会去请求本机自己的 /dav/：{body}"
+        );
+        assert!(!body.contains("<D:href>/dav/"), "{body}");
 
-// 3. 按列表里的 href 取内容
-    let file = creds(client.get(format!("{base}{share_id}/hello.txt")))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(file.status(), StatusCode::OK);
-    assert_eq!(file.text().await.unwrap(), "hello from the peer");
+        // 3. 按列表里的 href 取内容
+        let file = creds(client.get(format!("{base}{share_id}/hello.txt")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(file.status(), StatusCode::OK);
+        assert_eq!(file.text().await.unwrap(), "hello from the peer");
 
-    // 4. 带空格与中文的名字：列表里是**百分号编码**的（`href_of` 的 `percent_encode_path`），
-    //    BC 就按那条 href 回来取。
-    let encoded = "%E6%96%B0%E5%BB%BA%20%E6%96%87%E6%9C%AC%E6%96%87%E6%A1%A3.txt";
-    assert!(body.contains(encoded), "列表里该有这条（百分号编码）: {body}");
-    let spaced = creds(client.get(format!("{base}{share_id}/{encoded}")))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(spaced.status(), StatusCode::OK, "带空格的名字也要取得回来");
-    assert_eq!(spaced.text().await.unwrap(), "spaced");
+        // 4. 带空格与中文的名字：列表里是**百分号编码**的（`href_of` 的 `percent_encode_path`），
+        //    BC 就按那条 href 回来取。
+        let encoded = "%E6%96%B0%E5%BB%BA%20%E6%96%87%E6%9C%AC%E6%96%87%E6%A1%A3.txt";
+        assert!(
+            body.contains(encoded),
+            "列表里该有这条（百分号编码）: {body}"
+        );
+        let spaced = creds(client.get(format!("{base}{share_id}/{encoded}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(spaced.status(), StatusCode::OK, "带空格的名字也要取得回来");
+        assert_eq!(spaced.text().await.unwrap(), "spaced");
 
         // 5. 子目录：BC 钻进去时要的就是这一层（用户报的第二个症状）
-        let sub = creds(
-            client.request(
-                Method::from_bytes(b"PROPFIND").unwrap(),
-                format!("{base}{share_id}/sub/"),
-            ),
-        )
+        let sub = creds(client.request(
+            Method::from_bytes(b"PROPFIND").unwrap(),
+            format!("{base}{share_id}/sub/"),
+        ))
         .header("Depth", "1")
         .send()
         .await
@@ -526,7 +666,9 @@ mod tests {
         assert_eq!(sub.status(), StatusCode::MULTI_STATUS);
         let sub_body = sub.text().await.unwrap();
         assert!(
-            sub_body.contains(&format!("<D:href>{PREFIX}/{caller_id}/{share_id}/sub/</D:href>")),
+            sub_body.contains(&format!(
+                "<D:href>{PREFIX}/{caller_id}/{share_id}/sub/</D:href>"
+            )),
             "子目录自己的 href 也要落在代理前缀上: {sub_body}"
         );
 
@@ -534,16 +676,18 @@ mod tests {
         //    WebDAV 位置（看不到就直接加载不了远端目录）。这一条曾经被本机自己的 CORS 层
         //    抢答（返回 200 + `Access-Control-Allow-Methods: *`，一个 `DAV:` 头都没有），
         //    所以它必须**经过**代理一路打到对端的 `/dav` 上。
-        let options = creds(
-            client.request(
-                Method::from_bytes(b"OPTIONS").unwrap(),
-                format!("{base}{share_id}/"),
-            ),
-        )
+        let options = creds(client.request(
+            Method::from_bytes(b"OPTIONS").unwrap(),
+            format!("{base}{share_id}/"),
+        ))
         .send()
         .await
         .unwrap();
-        assert_eq!(options.status(), StatusCode::OK, "OPTIONS 应当由对端的 DAV 面回答");
+        assert_eq!(
+            options.status(),
+            StatusCode::OK,
+            "OPTIONS 应当由对端的 DAV 面回答"
+        );
         assert!(
             options
                 .headers()
@@ -587,7 +731,10 @@ mod tests {
         assert!(authorized(&basic("anyone:tok-a"), token), "用户名只是标记");
         assert!(!authorized(&basic("OrbDrop:wrong"), token));
         assert!(!authorized(&basic("OrbDrop:"), token));
-        assert!(!authorized(&HeaderMap::new(), token), "裸请求必须被拒（BC 会先裸探一次）");
+        assert!(
+            !authorized(&HeaderMap::new(), token),
+            "裸请求必须被拒（BC 会先裸探一次）"
+        );
 
         let mut bearer = HeaderMap::new();
         bearer.insert(

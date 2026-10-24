@@ -70,8 +70,7 @@ static STORE_VERSION: AtomicU64 = AtomicU64::new(0);
 ///
 /// **读失败绝不入缓存**：瞬时读失败（文件被占）不是"本机没有配对"，缓存下来等于把
 /// 一次抖动变成"到下次写凭据之前谁都进不来"。
-static TOKEN_CACHE: Mutex<Option<(PathBuf, u64, Arc<HashMap<String, String>>)>> =
-    Mutex::new(None);
+static TOKEN_CACHE: Mutex<Option<(PathBuf, u64, Arc<HashMap<String, String>>)>> = Mutex::new(None);
 
 fn b64() -> base64::engine::general_purpose::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
@@ -424,6 +423,26 @@ pub fn get_peer_fingerprint(id: &str) -> Result<Option<String>> {
         .filter(|fp| !fp.is_empty()))
 }
 
+/// 带 token 的拨号应当钉住的证书（见 [`crate::net::DialPin`]）。
+///
+/// 与 `state::refresh_trust_from_credentials` 同一套规则：有指纹就钉死；已配对但没有
+/// 指纹就拒绝（`Deny`，不能把 token 发到一条 TOFU 通道上）；只有"确实没有关系"的设备
+/// 才走 TOFU。
+///
+/// **凭据库读失败时也返回 `Deny`**：这时"有没有指纹"是不确定的，而这条通道要带 token
+/// 出去 —— 宁可这一拍连不上（下一拍会重试），也不退回 TOFU。
+pub fn dial_pin(peer_id: &str, paired: bool) -> crate::net::DialPin {
+    match get_peer_fingerprint(peer_id) {
+        Ok(Some(fp)) => crate::net::DialPin::Fingerprint(fp),
+        Ok(None) if paired => crate::net::DialPin::Deny,
+        Ok(None) => crate::net::DialPin::Tofu,
+        Err(e) => {
+            warn!(%peer_id, "凭据库读失败，这一次不在未钉住的通道上发 token: {e}");
+            crate::net::DialPin::Deny
+        }
+    }
+}
+
 /// 钉住（或更新）某台对端的证书指纹。
 ///
 /// **只该在两处调用**：配对成功时（那是这段关系成立的那一刻）、以及老记录第一次连上时
@@ -614,7 +633,10 @@ mod tests {
         let text = render_vault(&peers).unwrap();
 
         for marker in ["ODBF", "177plus", "device-a", "tok-b", "{\""] {
-            assert!(!text.contains(marker), "{marker:?} 不该出现在文件里:\n{text}");
+            assert!(
+                !text.contains(marker),
+                "{marker:?} 不该出现在文件里:\n{text}"
+            );
         }
         // 每行都是 base64 字符、且没有空行：文件里除正文没有别的结构。
         for line in text.lines() {
@@ -658,15 +680,21 @@ mod tests {
         let inner = blob_of("ODBF 2\n{\"device-a\":\"tok-a\",\"device-b\":\"tok-b\"}\n# 177plus\n");
         let (version, peers) = parse_vault_versioned(&inner).unwrap();
         assert_eq!(version, 2);
-        assert_eq!(peers, creds(&[("device-a", "tok-a"), ("device-b", "tok-b")]));
+        assert_eq!(
+            peers,
+            creds(&[("device-a", "tok-a"), ("device-b", "tok-b")])
+        );
         assert!(peers.values().all(|c| c.fingerprint.is_empty()));
     }
 
     /// 新格式的内层头同样按十进制读、同样拒绝更新的版本 —— 换格式不等于绕过版本闸门。
     #[test]
     fn inner_header_version_is_decimal_and_rejects_newer() {
-        let inner =
-            |v: &str| blob_of(&format!("ODBF {v}\n{{\"device-a\":\"tok-a\"}}\n# 177plus\n"));
+        let inner = |v: &str| {
+            blob_of(&format!(
+                "ODBF {v}\n{{\"device-a\":\"tok-a\"}}\n# 177plus\n"
+            ))
+        };
         assert_eq!(
             parse_vault(&inner("2")).unwrap(),
             creds(&[("device-a", "tok-a")])
@@ -713,8 +741,16 @@ mod tests {
 
         // v1（明文遮挡）
         let json = r#"{"device-a":"tok-a","device-b":"tok-b"}"#;
-        std::fs::write(&vault, format!("ODBF 1\n{}\n\n# 177plus\n", b64().encode(json))).unwrap();
-        assert_eq!(upgrade_vault_at(&vault).unwrap(), Some(2), "老格式文件应当被改写");
+        std::fs::write(
+            &vault,
+            format!("ODBF 1\n{}\n\n# 177plus\n", b64().encode(json)),
+        )
+        .unwrap();
+        assert_eq!(
+            upgrade_vault_at(&vault).unwrap(),
+            Some(2),
+            "老格式文件应当被改写"
+        );
         let text = std::fs::read_to_string(&vault).unwrap();
         assert!(
             !text.contains("ODBF") && !text.contains("177plus"),
@@ -724,18 +760,33 @@ mod tests {
             parse_vault(&text).unwrap(),
             creds(&[("device-a", "tok-a"), ("device-b", "tok-b")])
         );
-        assert_eq!(upgrade_vault_at(&vault).unwrap(), None, "已经是最新格式就不再动它");
+        assert_eq!(
+            upgrade_vault_at(&vault).unwrap(),
+            None,
+            "已经是最新格式就不再动它"
+        );
 
         // v2（有 token 没有指纹）
-        std::fs::write(&vault, blob_of("ODBF 2\n{\"device-c\":\"tok-c\"}\n# 177plus\n")).unwrap();
-        assert_eq!(upgrade_vault_at(&vault).unwrap(), Some(1), "v2 也要升到当前格式");
+        std::fs::write(
+            &vault,
+            blob_of("ODBF 2\n{\"device-c\":\"tok-c\"}\n# 177plus\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            upgrade_vault_at(&vault).unwrap(),
+            Some(1),
+            "v2 也要升到当前格式"
+        );
         let upgraded = std::fs::read_to_string(&vault).unwrap();
         assert_eq!(
             parse_vault_versioned(&upgraded).unwrap().0,
             FORMAT_VERSION,
             "改写后文件里的版本号要是当前版本"
         );
-        assert_eq!(parse_vault(&upgraded).unwrap(), creds(&[("device-c", "tok-c")]));
+        assert_eq!(
+            parse_vault(&upgraded).unwrap(),
+            creds(&[("device-c", "tok-c")])
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -763,6 +814,29 @@ mod tests {
         remove_peer("device-a").unwrap();
         assert_eq!(get_peer_fingerprint("device-a").unwrap(), None);
 
+        let _ = std::fs::remove_file(vault_path());
+    }
+
+    /// `dial_pin` 的三种档位：有指纹就钉死；已配对没指纹就拒绝；没有关系才 TOFU。
+    #[test]
+    fn dial_pin_follows_the_stored_fingerprint_and_pairing() {
+        let id = format!("dial-pin-{}", uuid::Uuid::new_v4());
+        assert_eq!(dial_pin(&id, false), crate::net::DialPin::Tofu);
+        assert_eq!(dial_pin(&id, true), crate::net::DialPin::Deny);
+
+        let fp = "a".repeat(64);
+        set_peer_credential(&id, "tok", &fp).unwrap();
+        assert_eq!(
+            dial_pin(&id, true),
+            crate::net::DialPin::Fingerprint(fp.clone())
+        );
+        assert_eq!(
+            dial_pin(&id, false),
+            crate::net::DialPin::Fingerprint(fp),
+            "有指纹时无论关系标记如何都要钉住"
+        );
+
+        remove_peer(&id).unwrap();
         let _ = std::fs::remove_file(vault_path());
     }
 
