@@ -68,8 +68,19 @@ export function updatePrompt(): UpdateState | null {
 }
 
 /**
- * 「更新这件事」该不该在界面上占一格：主动提示的那一档，**外加**已经点过「立即更新」之后的
- * 进度与结果（那时这一格从"提示"变成"进度"，见 [`engaged`]）。
+ * 「有更新待处理」的角标数字：手机底栏「设置」那颗用。
+ *
+ * 与 [`updatePrompt`] 不同，**不看 `silent`、也不看 `dismissed`**：按过「稍后」只是不再
+ * 自动弹底板，更新本身还在那儿；角标是让用户随时找得到它的那条线索。
+ */
+export function updateBadge(): number {
+  return state?.phase === 'available' ? 1 : 0;
+}
+
+/**
+ * 「更新这件事」该不该在界面上占一格：**任何一次**检查发现的可用更新（启动静默检查或
+ * 用户手动检查都算），外加已经点过「立即更新」之后的进度与结果（那时这一格从"提示"变成
+ * "进度"，见 [`engaged`]）。
  *
  * 桌面端那条通知气泡按它决定显不显示；手机那边弹的是底板，弹出去之后就由 [`getUpdateState`]
  * 接着画进度（底板不会因为阶段变了就自己消失）。
@@ -77,7 +88,7 @@ export function updatePrompt(): UpdateState | null {
 export function updateTask(): UpdateState | null {
   const s = state;
   if (!s || dismissed) return null;
-  return engaged ? s : updatePrompt();
+  return engaged || s.phase === 'available' ? s : null;
 }
 
 /** 用户按掉了这次提示（「稍后」/关掉那张底板）。 */
@@ -107,7 +118,10 @@ export async function watchUpdate(): Promise<void> {
 
 /** 检查更新（失败时把后端的报错原样抛给调用方，界面自己决定怎么显示）。 */
 export async function checkUpdate(force = true): Promise<void> {
-  setState(await api.updateCheck(force));
+  const next = await api.updateCheck(force);
+  // 用户主动点的那次是明确想看结论：之前按过「稍后」也重新给一次右下角那格。
+  if (force) dismissed = false;
+  setState(next);
 }
 
 /** 下载并安装。桌面端这条命令返回后进程很快会重启（helper 覆盖 exe）。 */

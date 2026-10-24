@@ -3,6 +3,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { peerTree } from '$lib/api';
   import { getPeerSharesState, loadPeerShares } from '$lib/stores/peers.svelte';
+  import { peerDownloadActive, peerDownloadOf, peerDownloadPct, togglePeerDownloadPause } from '$lib/stores/peerDownloads.svelte';
   import { deviceShortName } from '$lib/stores/devices.svelte';
   import type { PeerDevice, PeerShareItem, TreeEntry } from '$lib/types';
   import { dragOut } from '$lib/dragOut';
@@ -120,13 +121,25 @@
   function openCtx(e: MouseEvent, share: PeerShareItem) {
     e.preventDefault();
     e.stopPropagation();
-    dispatchCtx(e, { shareId: share.id, path: '', isDir: share.isDir, name: share.name });
+    dispatchCtx(e, { shareId: share.id, path: '', isDir: share.isDir, size: share.size ?? 0, name: share.name });
   }
 
-  function dispatchCtx(e: MouseEvent, item: { shareId: string; path: string; isDir: boolean; name: string }) {
+  function dispatchCtx(e: MouseEvent, item: { shareId: string; path: string; isDir: boolean; size: number; name: string }) {
     document.dispatchEvent(new CustomEvent('od:ctx', {
       detail: { x: e.clientX, y: e.clientY, kind: 'peer', peerId: device.id, ...item }
     }));
+  }
+
+  /** 双击共享项根那一行（只对文件）：下载中 → 暂停，已暂停 → 继续。 */
+  async function toggleShareDownload(e: MouseEvent, share: PeerShareItem) {
+    if (share.isDir) return;
+    const dl = peerDownloadOf(device.id, share.id, '');
+    if (!dl || (dl.status !== 'running' && dl.status !== 'paused')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const result = await togglePeerDownloadPause(device.id, share.id, '');
+    if (result === 'missing') onToast('这项已不在下载中');
+    else if (result === 'error') onToast('暂停 / 继续下载失败');
   }
 
   const ICON_CHEVRON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>';
@@ -173,13 +186,28 @@
   <ul class="share-list">
     {#each shares.items as share (share.id)}
       {@const ts = treeState(share.id)}
+      {@const dl = peerDownloadOf(device.id, share.id, '')}
+      {@const dlActive = !share.isDir && peerDownloadActive(dl)}
+      {@const dlPaused = !share.isDir && dl?.status === 'paused'}
+      {@const dlPct = peerDownloadPct(dl)}
       <li
         class="share-item"
         class:folder={share.isDir}
         class:open={ts.expanded}
         oncontextmenu={(e) => openCtx(e, share)}
       >
-        <div class="share-row" use:dragOut={{ source: { peerId: device.id, shareId: share.id, path: '', name: share.name, isDir: share.isDir }, onMessage: onToast }}>
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
+          class="share-row"
+          class:dl-active={dlActive}
+          class:dl-paused={dlPaused}
+          style="--dl-pct: {dlPct / 100}"
+          title={dlPaused
+            ? `已暂停 · 双击继续「${share.name}」`
+            : dl?.status === 'running' ? `双击暂停「${share.name}」` : undefined}
+          ondblclick={(e) => void toggleShareDownload(e, share)}
+          use:dragOut={{ source: { peerId: device.id, shareId: share.id, path: '', name: share.name, isDir: share.isDir }, onMessage: onToast }}
+        >
           {#if share.isDir}
             <button class="chev" onclick={() => toggleShare(share)} aria-label="展开">{@html ICON_CHEVRON}</button>
           {:else}

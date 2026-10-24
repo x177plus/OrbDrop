@@ -315,30 +315,53 @@ export function threadDotState(peerIds: string[]): DeviceDotState {
   return best;
 }
 
-/** 一行设备的状态：点（`dot`）、胶囊档位（`chip`，`unbound` 自己一档）与那句话（`label`）。 */
-export type DeviceState = { dot: DeviceDotState; chip: DeviceDotState | 'unbound' | 'offline'; label: string };
+/**
+ * 多台会话的信任档：**全部成员都验证过**才算 true。
+ *
+ * 群聊/群发的线程级状态点用它决定实心/空心；只要有一台未配对或指纹为空，就是空心
+ * —— 那正是群表里要提醒的事。
+ */
+export function threadTrusted(peerIds: string[]): boolean {
+  return peerIds.length > 0 && peerIds.every((id) => deviceState(deviceById(id)).trusted);
+}
+
+/** 一行设备的状态：点（`dot`）、胶囊档位（`chip`，`unbound` 自己一档）、那句话（`label`）
+ *  与信任档（`trusted`：已配对且指纹已验证；状态点实心/空心就看它）。 */
+export type DeviceState = {
+  dot: DeviceDotState;
+  chip: DeviceDotState | 'unbound' | 'offline';
+  label: string;
+  trusted: boolean;
+};
 
 /**
- * 设备行 / 收件人行那一整套状态（桌面端=`DeviceTab` / `RecipientDialog`，
- * 移动端=设备页 / 收件人表 / 配对表，都画同一枚胶囊）。
+ * 设备行 / 收件人行 / 会话标题那一整套状态（桌面端=`DeviceTab` / `RecipientDialog` /
+ * `ConvoPanel`，移动端=设备页 / 收件人表 / 配对表 / 会话头）。
  *
- * **会话标题旁那枚状态点不在这里**：那里只画点（`deviceDotState`），不挂胶囊 ——
- * 标题旁再挂一枚就是并排两颗点（见 `ConvoPanel.svelte` 标题那一段的注释）。
+ * 状态点两维：
+ * - **颜色 = 链路**：绿=长连接、蓝=在线、灰=离线、琥珀=重连中、红=需配对；
+ * - **填充 = 信任**：实心=已配对且指纹已验证，空心=未配对/未验证。`repair` 永远空心。
  *
- * 胶囊的配色跟**点**走（绿=长连接、蓝=已配对在线、在等=琥珀、要重新配对=红、送不到=灰虚框），
- * 文案说关系与链路 —— 一行里"点"和"胶囊"于是不会互相打架。**绿只给长连接**：自动广播的对象
- * 就是它，而"实心绿 vs 绿环"在 6px 的点上第一眼分不出来（要能扫一眼看出哪几台收得到广播）。
- * **例外是「未绑定」**：那台设备确实能收到东西（点照常给环），但关系还没建立，胶囊保持中性灰，
- * 别让它跟"要你处理"的琥珀抢注意力（见 `visibleDevices` 那条注释：未绑定是局域网设备的常态）。
+ * 长连接另有浅绿光晕（`main.css`），作为颜色之外的第二条线索；未配对是局域网设备的常态，
+ * 胶囊用中性灰，不跟"要你处理"的暖色抢注意力。
+ * 胶囊文案说关系与链路，与点不重复（见 `visibleDevices`）。
  */
 export function deviceState(d: PeerDevice | undefined): DeviceState {
   const dot = deviceDotState(d);
-  if (!d || !d.paired) return { dot, chip: 'unbound', label: '未绑定' };
-  if (dot === 'offline') return { dot, chip: 'offline', label: '离线' };
-  if (dot === 'live') return { dot, chip: 'live', label: '长连接' };
-  if (dot === 'repair') return { dot, chip: 'repair', label: '需配对' };
-  if (dot === 'retrying') return { dot, chip: 'retrying', label: '重连中' };
-  return { dot, chip: 'online', label: '已配对' };
+  if (!d || !d.paired) {
+    // 关系还没建立：点照旧按链路画（蓝环/灰环），但永远是空心。
+    return { dot, chip: 'unbound', label: '未配对', trusted: false };
+  }
+  // 长连接本身已经证明过指纹，是最强的一档。
+  if (d.connected) return { dot: 'live', chip: 'live', label: '长连接', trusted: true };
+  // 已配对但指纹为空（老记录），或链路明确失效：关系需要重建，画空心红。
+  // 提前把这一档露出来，别等下一次拨号失败才告诉用户。
+  if (!d.verified || dot === 'repair') {
+    return { dot: 'repair', chip: 'repair', label: '需配对', trusted: false };
+  }
+  if (dot === 'offline') return { dot, chip: 'offline', label: '离线', trusted: true };
+  if (dot === 'retrying') return { dot, chip: 'retrying', label: '重连中', trusted: true };
+  return { dot, chip: 'online', label: '已配对', trusted: true };
 }
 
 export function addDevice(d: PeerDevice) {

@@ -5,6 +5,7 @@
   import { fetchTree, peerTree } from '$lib/api';
   import { getServerPort } from '$lib/stores/shares.svelte';
   import { dragOut } from '$lib/dragOut';
+  import { peerDownloadActive, peerDownloadOf, peerDownloadPct, togglePeerDownloadPause } from '$lib/stores/peerDownloads.svelte';
   import TreeNode from './TreeNode.svelte';
 
   let {
@@ -42,9 +43,29 @@
   /** 拖出去的那一项（F-46）：整棵树上的每个节点都能拖。 */
   let dragSource = $derived({ peerId, shareId, path: ownPath, name: entry.name, isDir: entry.isDir });
 
+  /** 对端这一项的手动下载（右键「下载到本地」）：行内背景底色按 `received / total` 推进。 */
+  let download = $derived(peerDownloadOf(peerId, shareId, ownPath));
+  let downloading = $derived(peerDownloadActive(download));
+  let downloadPct = $derived(peerDownloadPct(download));
+
   /** 拖拽的准备进度/失败原因冒到 App 的浮层：树节点不知道自己在哪个面板上。 */
   function notify(msg: string) {
     document.dispatchEvent(new CustomEvent('od:toast', { detail: msg }));
+  }
+
+  /**
+   * 双击正在下载的那一行 = 暂停 / 继续。
+   *
+   * 只有对端项、且这条下载真在动（或已暂停）时才接：别的行双击不做事（文件夹展开仍走
+   * 那颗箭头，本机项没有下载）。后端那道闸只停流，不丢 `.orbdrop-part` 与已收字节。
+   */
+  async function toggleDownload(e: MouseEvent) {
+    if (!peerId || !download || (download.status !== 'running' && download.status !== 'paused')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const result = await togglePeerDownloadPause(peerId, shareId, ownPath);
+    if (result === 'missing') notify('这项已不在下载中');
+    else if (result === 'error') notify('暂停 / 继续下载失败');
   }
 
   let expanded = $state(false);
@@ -94,7 +115,7 @@
     e.stopPropagation();
     document.dispatchEvent(new CustomEvent('od:ctx', {
       detail: peerId
-        ? { x: e.clientX, y: e.clientY, kind: 'peer', peerId, shareId, path: ownPath, isDir: entry.isDir, name: entry.name }
+        ? { x: e.clientX, y: e.clientY, kind: 'peer', peerId, shareId, path: ownPath, isDir: entry.isDir, size: entry.size, name: entry.name }
         : { x: e.clientX, y: e.clientY, kind: 'share', shareId, path: ownPath, isDir: entry.isDir, name: entry.name }
     }));
   }
@@ -130,7 +151,19 @@
   {/if}
 {:else}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="node" class:sub={level > 1} oncontextmenu={openCtx} use:dragOut={{ source: dragSource, onMessage: notify }}>
+  <div
+    class="node"
+    class:sub={level > 1}
+    class:dl-active={downloading}
+    class:dl-paused={download?.status === 'paused'}
+    style="--dl-pct: {downloadPct / 100}"
+    title={download?.status === 'paused'
+      ? `已暂停 · 双击继续「${entry.name}」`
+      : download?.status === 'running' ? `双击暂停「${entry.name}」` : undefined}
+    ondblclick={toggleDownload}
+    oncontextmenu={openCtx}
+    use:dragOut={{ source: dragSource, onMessage: notify }}
+  >
     <span class="f-icon">{@html ICON_FILE}</span>
     <span class="n-name">{entry.name}</span>
     <span class="n-meta num">{formatFileSize(entry.size)}</span>

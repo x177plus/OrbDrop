@@ -12,31 +12,41 @@
   import RectOrb from '$lib/components/RectOrb.svelte';
 
   /**
-   * 缩略图里的骨架数据：**只有形状，没有内容** —— 名字 / 地址 / 元信息一律空串，卡片上那些
-   * 位置由预览样式画成灰条（见 main.css 的「悬浮形态缩略图」一节）；项数与角标数字是组件自己
-   * 生成的，也一并隐掉。看的人只需要认出"这是张卡片，里面有图标和文字位，右边有分页点"。
+   * 缩略图里的示例数据：**真组件 + 像样的一段内容**（设备名 / 地址 / 项数 / 条目名与元信息），
+   * 这样缩略图不只说明"这是张卡片"，还说明**卡片上都有什么、怎么排**。数据只是示意，不与本机
+   * 真实设备相关；项数由组件按 `items.length` 自己算，角标数字由 `notifCount` / `deviceCount` 给。
    * 三页是因为**只有一页时分页点整列不画**：要看全分页点，缩略图就得有得翻。
    */
   const PREVIEW_PAGES: RectPage[] = [
     {
-      id: 'preview-1', kind: 'peer', name: '', ip: '', loading: false, error: null, dir: null, up: null,
-      // 前两格当目录、其余当文件：骨架里两种图标（文件夹 / 文件）都能看到
+      id: 'local', kind: 'local', name: '本机', ip: '192.168.1.23:3890',
+      loading: false, error: null, dir: null, up: null,
+      // 目录在前、文件在后：两种图标（文件夹 / 文件）与两档元信息（「N 项」/ 大小）都能看到
       items: [
-        { id: 'preview-1-a', path: '', name: '', isDir: true, meta: '' },
-        { id: 'preview-1-b', path: '', name: '', isDir: true, meta: '' },
-        { id: 'preview-1-c', path: '', name: '', isDir: false, meta: '' },
-        { id: 'preview-1-d', path: '', name: '', isDir: false, meta: '' },
-        { id: 'preview-1-e', path: '', name: '', isDir: false, meta: '' },
+        { id: 'preview-1-a', path: '', name: '项目资料', isDir: true, meta: '18 项' },
+        { id: 'preview-1-b', path: '', name: '设计素材', isDir: true, meta: '7 项' },
+        { id: 'preview-1-c', path: '', name: '报告.pdf', isDir: false, meta: '2.4 MB' },
+        { id: 'preview-1-d', path: '', name: '截图', isDir: true, meta: '32 项' },
+        { id: 'preview-1-e', path: '', name: '安装包.exe', isDir: false, meta: '86 MB' },
       ],
     },
     {
-      id: 'preview-2', kind: 'peer', name: '', ip: '', loading: false, error: null, dir: null, up: null,
+      id: 'preview-2', kind: 'peer', name: '书房·台式机', ip: '192.168.1.42:3890',
+      loading: false, error: null, dir: null, up: null,
       items: [
-        { id: 'preview-2-a', path: '', name: '', isDir: true, meta: '' },
-        { id: 'preview-2-b', path: '', name: '', isDir: false, meta: '' },
+        { id: 'preview-2-a', path: '', name: '资料', isDir: true, meta: '12 项' },
+        { id: 'preview-2-b', path: '', name: '合同.docx', isDir: false, meta: '96 KB' },
+        { id: 'preview-2-c', path: '', name: '备份.zip', isDir: false, meta: '640 MB' },
       ],
     },
-    { id: 'preview-3', kind: 'peer', name: '', ip: '', loading: false, error: null, dir: null, up: null, items: [] },
+    {
+      id: 'preview-3', kind: 'peer', name: 'NAS', ip: '192.168.1.9:3890',
+      loading: false, error: null, dir: null, up: null,
+      items: [
+        { id: 'preview-3-a', path: '', name: '影音库', isDir: true, meta: '240 项' },
+        { id: 'preview-3-b', path: '', name: '照片', isDir: true, meta: '1 280 项' },
+      ],
+    },
   ];
 
   let {
@@ -361,7 +371,7 @@
     <div class="field">
       <label id="orbShapeLabel">悬浮形态<Hint>
         收起后常驻屏幕上的那件东西长什么样。缩略图就是实物外观（角标、分页点都在），
-        里面的名字是示意用的骨架。<br />
+        里面的设备名、地址与角标数字是示意数据。<br />
         <strong>圆球</strong>：62px 的球，贴边会收进屏幕边缘、悬停滑回来。<br />
         <strong>圆角矩形悬浮框</strong>：一张卡片，第一页是本机、其后每台长连接设备一页，
         列出各自对本机可见的共享项；贴边会收起成一条竖条（图标 + 设备名 + ip:port），
@@ -371,25 +381,30 @@
       <div class="shape-picker" role="radiogroup" aria-labelledby="orbShapeLabel">
         <label class="shape-opt" title="圆球：贴边收起半颗，悬停滑回来">
           <input type="radio" name="orbShape" bind:group={orbShape} value="circle" aria-label="圆球" />
-          <!-- 缩略图 = **真组件 + 骨架数据**（同一套 CSS/DOM，件件与实物一致），外面套一层
-               缩放框（`--s`/`--w`/`--h` = 缩放比与含角标出格在内的视觉外框）。
-               圆球那一档放大到与卡片同高（两个缩略图并排，等高才像同一层级的两个选择），
-               卡片那一档缩到 0.78 才装得进半栏。
+          <!-- 缩略图 = **真组件 + 示例数据**（同一套 CSS/DOM，件件与实物一致），外面套一层
+               缩放框（`--s` = 缩放比，`--w`/`--h` = 不含缩放的视觉外框，`--ox`/`--oy` = 组件
+               原点在外框里的落点）。
+               圆球那一档放大到与卡片同高（两个缩略图并排，等高才像同一层级的两个选择）。
+               卡片那一档的外框**以卡片为中心**两侧各留 30px（= 右侧「间距 + 分页点列」那一条的
+               宽度）：分页点收在右格里、卡片正中，不再整块偏左。
+               缩略图永远画**未收起**的卡片：当前悬浮框贴在屏幕边上时，stage 上的 `.docked`
+               一类样式会让真卡片只露竖条；预览里由 main.css 的预览规则逐条还原
+               （设备名 / ip 在头两行，下面两列共享项）。
                整块 `inert`：缩略图不吃指针、不进 Tab 序，也不会被拖出去。
                说明文字不放在图下面（只留两张图）：两档各自是什么，看上方那颗「?」。 -->
-          <span class="so-frame" style="--s:1.5; --w:72px; --h:72px" inert>
+          <span class="so-frame" style="--s:1.56; --w:72px; --h:72px" inert>
             <span class="so-scale">
-              <Orb badgeCount={3} notifCount={3} expanded={false} onToggle={() => {}} onDragStart={() => {}} />
+              <Orb badgeCount={2} notifCount={3} expanded={false} onToggle={() => {}} onDragStart={() => {}} />
             </span>
           </span>
         </label>
         <label class="shape-opt" title="圆角矩形悬浮框：设备分页卡片，贴边收起成竖条，可直接拖出共享项">
           <input type="radio" name="orbShape" bind:group={orbShape} value="rect" aria-label="圆角矩形悬浮框" />
-          <span class="so-frame" style="--s:0.78; --w:211px; --h:139px" inert>
+          <span class="so-frame" style="--s:0.78; --w:236px; --h:144px; --ox:30px; --oy:5px" inert>
             <span class="so-scale">
               <RectOrb
                 pages={PREVIEW_PAGES}
-                deviceCount={PREVIEW_PAGES.length}
+                deviceCount={2}
                 notifCount={3}
                 expanded={false}
                 onToggle={() => {}}

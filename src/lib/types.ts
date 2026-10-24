@@ -42,12 +42,19 @@ export interface PeerDevice {
   /** WS long connection is live (paired only) — this is what "长连接" means. */
   connected: boolean;
   /**
+   * 信任状态：已配对且证书指纹已钉住（长连接本身也算已验证）。
+   * 状态点实心 = true，空心 = 未配对 / 未验证。见 `deviceState`。
+   * `add_peer` 的即时回包是 `PeerDevice` 结构体（没有这个派生字段），按 false 读；
+   * 下一次 `listDevices` 就会带上。
+   */
+  verified?: boolean;
+  /**
    * 此刻**看得见**这台设备吗：收到过它的 mDNS 记录、且记录还没被撤。
    *
    * 与 `online` 不是一回事（`online` = 探活成功 = 真连得上）。这一位**只干两件事**：
    * ① 离线且未绑定的那一行照旧列出来（否则"刚才还看到它、现在没了"）；② 发起连接时
    * 说不说那句「直连不通」的 tip（`unicastBlocked` / `unicastBlockedTip`）。
-   * **它不再是一个状态档**：那一行的胶囊就是「未绑定」/「离线」，点照旧按 `offline` 画。
+   * **它不再是一个状态档**：那一行的胶囊就是「未配对」/「离线」，点照旧按 `offline` 画。
    */
   seen: boolean;
   /**
@@ -254,7 +261,7 @@ export interface OpenedPage {
  *
  * `messageChannelImportance` 是 `NotificationManager.IMPORTANCE_*`（2=低 3=默认 4=高 5=紧急）；
  * **`-1` = 渠道还没建**。横幅的判据是"重要程度 ≥ 高 **且** 这条通知真的会响/震" —— ROM 自己
- * 那层（华为「静默通知」/「横幅」开关）不在这两个字段里，读不到，只能引导用户去看。
+ * 那层（部分厂商的「静默通知」/「横幅」开关）不在这两个字段里，读不到，只能引导用户去看。
  */
 export interface NotifyState {
   enabled: boolean;
@@ -483,7 +490,7 @@ export interface ChatMessage {
   /** 图片的字节数（界面上写"多大"）。 */
   size?: number;
   /**
-   * 本机上这份图片内容的绝对路径（**后端在快照里现算**，不进 `chat.json`：那是"这台机器上
+   * 本机上这份图片内容的绝对路径（**后端在快照里现算**，不进 `chat.dat`：那是"这台机器上
    * 它在哪"，换台机器就错了）。内容不在盘上时是空串 —— 那条气泡退回"图片读不出来"那一档。
    */
   path?: string;
@@ -508,7 +515,7 @@ export interface ChatPeerConvo {
   peerId: string;
   messages: ChatMessage[];
   /**
-   * 这台设备会话里的**文件消息**（会话里那条文件气泡）。后端 `chat.json` 里存着，
+   * 这台设备会话里的**文件消息**（会话里那条文件气泡）。后端 `chat.dat` 里存着，
    * 重启后还在 —— 见 [`ChatFileMsg`]。
    *
    * 快照里这一份是**记录**，不是实时视图：传输中的进度由前端掌握（每 200ms 一跳，不值得
@@ -522,7 +529,7 @@ export interface ChatPeerConvo {
 }
 
 /**
- * 会话里那条**文件（推送）消息** —— 后端 `chat.json` 里的 `ChatFileMsg`（逐字段对应）。
+ * 会话里那条**文件（推送）消息** —— 后端 `chat.dat` 里的 `ChatFileMsg`（逐字段对应）。
  *
  * 发送侧：`batchId` 指向右下角那张推送卡（进度、成败都从它抄过来）；接收侧：`inviteState`
  * 是那条邀请走到哪一步了，`received`/`bytes` 是接收进度。
@@ -553,13 +560,13 @@ export interface ChatFileMsg {
   /** 发送侧：这条文件消息属于哪个**群**（空 = 不是发到群里的）；群那条视图按它筛。 */
   groupId: string;
   /** 发送侧：逐台的推送状态（等待同意 / 传输中 / 已送达 / 未送达…），群发视图按它逐台写。 */
-  perTargets: { peerId: string; state: PushTargetState }[];
+  perTargets: { peerId: string; inviteId: string; state: PushTargetState }[];
   /** 接收侧：那条推送邀请。 */
   inviteId: string;
   /**
    * 接收侧走到哪一步了：`pending` = 等用户点头；`accepted` = 接收中（含"断了、正在自己重试"）；
-   * `received` / `rejected` / `failed` / `cancelled` = 终态（`cancelled` = 有人按了停止：本机
-   * 那颗停止按钮，或发送方撤销 —— 都不是"出错"，所以不并进 `failed`）。
+   * `received` / `rejected` / `failed` / `cancelled` = 终态（`cancelled` = 有人点了取消：本机
+   * 在通知卡上按了「取消」，或发送方撤销 —— 都不是"出错"，所以不并进 `failed`）。
    */
   inviteState: 'pending' | 'accepted' | 'received' | 'rejected' | 'failed' | 'cancelled' | '';
   /** 接收侧：已收字节 / 总字节（进度条）。 */
@@ -580,6 +587,8 @@ export interface ChatFileMsg {
 /** 群成员（名册里的一行）。 */
 export interface ChatGroupMember {
   id: string;
+  /** 群签名公钥（后端新版本才有；老名册/未绑定时为空）。 */
+  pubkey?: string;
   /**
    * 名册带来的名字。**可能是设备 id 本身**：后端写名册时（`resolve_members`）拿不到名字
    * 就拿 id 顶着 —— 群成员不需要配对，本机可能压根没发现过那一台。界面因此是"设备表优先
@@ -682,6 +691,14 @@ export interface PendingGroup {
 
 /** 整份会话状态：`chat_snapshot` 命令的返回，也是 `chat://changed` 事件的载荷。 */
 export interface ChatSnapshot {
+  /**
+   * 这份快照的版本号（后端进程内单调递增）。
+   *
+   * 命令返回与 `chat://changed` 事件走的是两条独立通道，到达顺序没有保证 —— 必须按它
+   * 丢掉旧的那一份（见 `stores/chat.svelte.ts` 的 `replace`），否则「发送中」那一份可能
+   * 盖掉后到的「已送达」。
+   */
+  rev: number;
   convos: ChatPeerConvo[];
   /** 群发名单（会话列表里「群发 · 名字」那些行就是它）。 */
   batches: ChatBatch[];
