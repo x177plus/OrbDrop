@@ -1,6 +1,6 @@
 {
   "name": "orbdrop",
-  "version": "0.0.3",
+  "version": "0.1.0",
   "description": "OrbDrop — LAN file sharing tool",
   "type": "module",
   "scripts": {

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "OrbDrop",
-  "version": "0.0.3",
+  "version": "0.1.0",
   "identifier": "com.x177plus.orbdrop",
   "build": {
     "beforeDevCommand": "npm run dev",
