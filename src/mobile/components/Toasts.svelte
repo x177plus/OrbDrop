@@ -9,9 +9,9 @@
 
 <div class="toasts" role="status" aria-live="polite">
   {#each items as t (t.id)}
-    <div class="toast" class:leaving={t.leaving}>
+    <div class="toast" class:leaving={t.leaving} title={t.text}>
       {#if t.icon}<Icon name={t.icon} />{/if}
-      <span>{t.text}</span>
+      <span class="toast-msg">{t.text}</span>
     </div>
   {/each}
 </div>

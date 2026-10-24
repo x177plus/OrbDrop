@@ -17,6 +17,7 @@
   } from "$lib/composer";
   import ImagePreview from "$lib/components/ImagePreview.svelte";
   import ImageViewer from "$lib/components/ImageViewer.svelte";
+  import TransferRing from "$lib/components/TransferRing.svelte";
   import { untrack } from "svelte";
 
   let { convoKey }: { convoKey: string } = $props();
@@ -28,6 +29,11 @@
   const participants = $derived(thread?.participants ?? []);
   const title = $derived(thread?.title ?? "");
   const items = $derived(chat.itemsOf(convoKey));
+  /**
+   * 最后一条的 id。吸底只认它：`items` 每次快照都是新数组，读 `.length` 看着像“只在条数变了
+   * 才跑”，实际依赖的是数组身份 —— 文件进度、图片路径这些同长度更新也会把滚动拽回底部。
+   */
+  const tail = $derived(items.length ? items[items.length - 1].id : "");
   /**
    * 别的会话上还等着几条（当前这条不算，见 `chat.unreadElsewhere`）：正停在这条会话里、
    * 别处来了消息时，返回箭头右边那颗角标记的就是它 —— 不开着这条会话时那个数是看不见的
@@ -46,6 +52,8 @@
   const canSend = $derived(chat.draftHasContent(convoKey));
 
   const dot = $derived(devices.threadDotState(participants));
+  /** 这条会话里的设备是否都验证过：决定标题那颗点实心/空心。 */
+  const trusted = $derived(devices.threadTrusted(participants));
   // 这一份查**两份表**（`deviceById`）：设备页列不出来的那几台（离线 + 未绑定 + 没被 mDNS
   // 看见，可会话还在）也得算进来 —— 只查可见那份时这里会变成空表，于是"0 台在线 / 离线 · 消息
   // 不会送达"顶在一台其实刚发过消息的设备上（同一行那颗点已经按后端真实状态画了，两句自相矛盾）。
@@ -242,28 +250,53 @@
   }
 
   /**
-   * 点那条**正在接收**的文件气泡右端那颗停止：撤掉这条接收（`cancel_receive`）。
-   *
-   * 后端把那条邀请取走、告诉发送方，并把"待续传任务"一并删掉 —— **用户喊停就是喊停**，
-   * 重启之后不会再自己接着收（只有"关掉应用"才有那一条，见 `transfer::resume_pending`）。
-   * 界面不用自己改这条消息：随后那条 `push://done{cancelled}` 会把它落成「已停止接收」。
+   * 点自己发出去那条文件气泡右侧的停止圆环：取消这条推送（`store.stopOutgoingFile`）。
+   * 界面不用自己改这条消息：随后那条 `push://batch` 会把这一台落成「已取消」。
    */
-  async function stopReceive(item: ChatItem): Promise<void> {
-    if (item.kind !== "file" || !item.inviteId) return;
-    try {
-      await api.cancelReceive(item.inviteId);
-    } catch (e) {
-      store.failed("停止接收", e);
-    }
+  async function stopSend(item: ChatItem): Promise<void> {
+    if (item.kind !== "file") return;
+    await store.stopOutgoingFile(item);
   }
 
-  // 来了新消息就贴到底（读 `items.length` 而不是 `items`：那条文件消息的进度每秒都在变，
-  // 每变一次就把滚动位置拽走会让人没法往上翻）。`convoKey` 也要读 —— 换一条会话时哪怕条数一样，
-  // 也得先贴到底；`logEl` 从 null 变成节点那一下同理。
+  /**
+   * 用户此刻是不是贴着底（阈值 2px 给像素取整留余量）。
+   *
+   * 图片的缩略图要等 `ImagePreview` 把 `<img>` 挂上才有最终高度 —— 那一下晚于吸底，
+   * 只有当时确实在底部才该跟着再贴一次；用户已经翻上去看历史时不许把他拽走。
+   */
+  let pinned = true;
+
+  /** 滚到最底下。**没吸住之前不许动 `pinned`**：吸底本身触发的那次 `scroll` 会把它算回 true。 */
+  function pinBottom(): void {
+    const el = logEl;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    pinned = true;
+  }
+
+  /** 用户滚过：只有仍在底部附近才算“还贴着底”。 */
+  function onLogScroll(): void {
+    const el = logEl;
+    if (!el) return;
+    pinned = el.scrollHeight - el.clientHeight - el.scrollTop <= 2;
+  }
+
+  /** 图片缩略图挂上来了：高度差是这一刻才出现的，当时在底部就补一次吸底。 */
+  function onImageLayout(): void {
+    if (!pinned) return;
+    requestAnimationFrame(() => {
+      if (pinned) pinBottom();
+    });
+  }
+
+  // 来了新消息就贴到底。依赖的是**最后一条的 id**，不是数组长度/数组身份：文件进度、
+  // 图片路径这些同长度更新不该把正在翻历史的滚动位置拽走（见 `tail` 的说明）。
+  // `convoKey` 也要读 —— 换一条会话时哪怕最后一条一样，也得先贴到底；`logEl` 从 null 变成
+  // 节点那一下同理。
   $effect(() => {
     void convoKey;
-    void items.length;
-    if (logEl) logEl.scrollTop = logEl.scrollHeight;
+    void tail;
+    if (logEl) pinBottom();
   });
 
   /**
@@ -310,8 +343,8 @@
 </script>
 
 <!-- 一条文件气泡的内容（图标 / 名字 / 大小 / 状态行）：外面套不套那颗按钮由调用处定
-     （有落盘路径才点得开）。状态那一行在点得开时补一句"点一下打开" —— 手机上这是唯一的
-     提示，没有悬停可看。 -->
+     （有落盘路径才点得开），右侧那颗暂停/停止圆环由调用处另摆 —— 它不能嵌在打开按钮里。
+     状态那一行在点得开时补一句"点一下打开" —— 手机上这是唯一的提示，没有悬停可看。 -->
 {#snippet fileBub(item: ChatItem & { kind: "file" })}
   <span class="fio"><Icon name="file" /></span>
   <span class="fmain">
@@ -319,7 +352,6 @@
     <span class="fsize num">{item.size || "文件"}</span>
     {#if item.sending}
       <span class="fstat">传输中 {Math.round(item.pct)}%</span>
-      <span class="fbar"><i style="width:{Math.round(item.pct)}%"></i></span>
     {:else if fileStatus(item)}
       <span class="fstat">{fileStatus(item)}{item.path ? " · 点一下打开" : ""}</span>
     {/if}
@@ -350,7 +382,7 @@
   </span>
   <div class="cb-main">
     <span class="cb-title">{title}</span>
-    <span class="cb-sub"><i class="cv-dot {dot}"></i>{sub}</span>
+    <span class="cb-sub"><i class="cv-dot {dot} {trusted ? 'solid' : 'hollow'}"></i>{sub}</span>
   </div>
   <!-- 左边那格槽的**镜像**：会话名是在「左右两格之间的剩余空间」里居中的，左边多出 34u 的话
        名的中心就会比屏幕中心偏右 21u（393 宽下实测）。右边补上同样宽的空格，名的中心才落在
@@ -378,7 +410,7 @@
   </div>
 {/if}
 
-<div class="chatlog" bind:this={logEl} role="log" aria-label="会话记录">
+<div class="chatlog" bind:this={logEl} role="log" aria-label="会话记录" onscroll={onLogScroll}>
   {#if !items.length}
     <div class="empty">
       <Icon name="chat" />
@@ -420,35 +452,72 @@
             <span class="who-nm">{speakerName(item)}</span>
           </div>
         {/if}
-        <div class="bubble">
+        <div
+          class="bubble"
+          class:media={!!item.path && (item.kind === "file" ? isImageMsg(item) : !!item.image)}
+        >
           {#if item.kind === "file"}
+            {@const stoppable = item.fromMe && chat.outgoingStoppable(item, mode === "direct" ? participants[0] : "")}
             {#if item.path && isImageMsg(item)}
-              <!-- 一张图：气泡里摊开看它一眼（点开是大图）。读不出来退回原来那条文件行。 -->
-              <ImagePreview path={item.path} label={item.name} onopen={() => (viewing = item)}>
-                <button class="fbub is-open" type="button" onclick={() => void openFile(item)}>
-                  {@render fileBub(item)}
-                </button>
-              </ImagePreview>
+              <!-- 一张图：气泡里摊开看它一眼（点开是大图）。读不出来退回原来那条文件行；
+                   还在发送时右侧那颗停止圆环留在图外面。 -->
+              <span class="fbub-row">
+                <ImagePreview
+                  path={item.path}
+                  label={item.name}
+                  flush
+                  onopen={() => (viewing = item)}
+                  onlayout={onImageLayout}
+                >
+                  <button class="fbub is-open" type="button" onclick={() => void openFile(item)}>
+                    {@render fileBub(item)}
+                  </button>
+                </ImagePreview>
+                {#if stoppable}
+                  <span class="fring">
+                    <TransferRing
+                      mode="send"
+                      pct={item.pct}
+                      name={item.name}
+                      onclick={() => void stopSend(item)}
+                    />
+                  </span>
+                {/if}
+              </span>
             {:else if item.path}
               <!-- 收完的那条：整块是一颗按钮，点它交给系统打开（`openFile`）。状态那一行顺带
                    说一句"点一下打开"（手机上只有这一处文字提示 —— 没有悬停可看）。 -->
-              <button class="fbub is-open" type="button" onclick={() => void openFile(item)}>
-                {@render fileBub(item)}
-              </button>
+              <span class="fbub-row">
+                <button class="fbub is-open" type="button" onclick={() => void openFile(item)}>
+                  {@render fileBub(item)}
+                </button>
+                {#if stoppable}
+                  <span class="fring">
+                    <TransferRing
+                      mode="send"
+                      pct={item.pct}
+                      name={item.name}
+                      onclick={() => void stopSend(item)}
+                    />
+                  </span>
+                {/if}
+              </span>
             {:else}
-              <!-- 还没有落盘路径 = 还在传（或已经被拒/失败）。**正在接收**时这一行右端多一颗
-                   停止：撤掉这条接收，点了就不会再自动接着收（见 `stopReceive`）。 -->
+              <!-- 还没有落盘路径 = 还在传（或已经被拒/失败）。**正在接收**时这一行右端那颗圆环
+                   与「浏览」里下载同一套：进行中 = 暂停键，已暂停 = 继续键（点它走
+                   `store.toggleReceivePause`）。暂停不丢已收字节与临时文件；暂停之后右端
+                   仍然只有这颗圆环，不再多出一颗停止。 -->
               <span class="fbub">
                 {@render fileBub(item)}
                 {#if item.inviteState === "accepted"}
-                  <button
-                    class="fstop"
-                    type="button"
-                    aria-label="停止接收「{item.name}」"
-                    onclick={() => void stopReceive(item)}
-                  >
-                    <Icon name="stop" />
-                  </button>
+                  {@const paused = chat.invitePaused(item.inviteId)}
+                  <TransferRing
+                    mode="receive"
+                    status={paused ? "paused" : "running"}
+                    pct={item.pct}
+                    name={item.name}
+                    onclick={() => void store.toggleReceivePause(item)}
+                  />
                 {/if}
               </span>
             {/if}
@@ -457,7 +526,13 @@
               <!-- **图片消息**：图片是消息内容，不是文件 —— 对端直接就能看（没有"接收 / 同意"
                    那一步），气泡里就是那张图，点开看大图。内容不在盘上就退回一行名字。 -->
               {#if item.path}
-                <ImagePreview path={item.path} label={item.name ?? "图片"} onopen={() => (viewing = item)}>
+                <ImagePreview
+                  path={item.path}
+                  label={item.name ?? "图片"}
+                  flush
+                  onopen={() => (viewing = item)}
+                  onlayout={onImageLayout}
+                >
                   <span class="fbub"><span class="fname">{item.name ?? "图片"}</span></span>
                 </ImagePreview>
               {:else}

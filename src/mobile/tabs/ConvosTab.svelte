@@ -88,7 +88,7 @@
                 {:else if row.mode === "group"}
                   <span class="cv-mode grp"><Icon name="group" />群聊</span>
                 {/if}
-                <span class="cv-dot {row.dot}"></span>
+                <span class="cv-dot {row.dot} {row.trusted ? 'solid' : 'hollow'}"></span>
                 <span class="cv-time num">{row.time}</span>
               </span>
               <span class="cv-prev">{row.sub}</span>

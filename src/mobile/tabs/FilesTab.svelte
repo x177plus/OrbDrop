@@ -1,17 +1,21 @@
 <script lang="ts">
   import Icon from "../Icon.svelte";
   import FileTile from "../components/FileTile.svelte";
+  import DownloadRing from "../components/DownloadRing.svelte";
   import * as store from "../store.svelte";
   import * as chat from "$lib/stores/chat.svelte";
   import * as devices from "$lib/stores/devices.svelte";
   import { fileIcon } from "../util";
-  import type { FilesSeg } from "../store.svelte";
+  import type { BrowseDownload, FilesSeg } from "../store.svelte";
   import type { InboxEntry, PeerShareItem } from "$lib/types";
 
   const seg = $derived(store.currentSeg());
   const inbox = $derived(store.getInbox());
   const invites = $derived(store.pendingInvites());
   const transfers = $derived(store.activeTransfers());
+  const activeDownloads = $derived(store.activeBrowseDownloads());
+  /** 「传输」页签数的是**两路**：会话里的推送 + 浏览里正在下的对端文件。 */
+  const transferCount = $derived(transfers.length + activeDownloads.length);
   const inboxState = $derived(store.inboxState());
 
   const SEGS: { id: FilesSeg; label: string }[] = [
@@ -23,7 +27,7 @@
   /** 段角标：收件把「待接收」一起数（它们也是没处理完的文件）；浏览恒 0（原型就是 0）。 */
   function segCount(id: FilesSeg): number {
     if (id === "inbox") return inbox.length + invites.length;
-    if (id === "transfer") return transfers.length;
+    if (id === "transfer") return transferCount;
     return 0;
   }
 
@@ -63,6 +67,11 @@
   /** 进度条宽度：后端给的是 0–100 的百分数，夹一道免得越界把条画穿。 */
   function pctOf(pct: number): number {
     return Math.min(100, Math.max(0, Math.round(pct)));
+  }
+
+  /** 浏览下载的百分比：对端没报大小时不编数字（那一档只显示已收字节 / 「下载中」）。 */
+  function downloadPct(d: BrowseDownload): number {
+    return d.total > 0 ? pctOf((d.received / d.total) * 100) : 0;
   }
 
   // ── 浏览段 ────────────────────────────────────────────────────────────────
@@ -226,9 +235,9 @@
 {:else if seg === "transfer"}
   <div class="body">
     <div class="sec">
-      <div class="sec-label"><span>进行中</span><span class="num">{transfers.length} 个</span></div>
+      <div class="sec-label"><span>进行中</span><span class="num">{transferCount} 个</span></div>
       <div class="card list">
-        {#if transfers.length}
+        {#if transferCount}
           {#each transfers as t (t.id)}
             <div class="trow">
               <div class="t-top">
@@ -245,6 +254,28 @@
               </div>
             </div>
           {/each}
+          <!-- 「浏览」里点下来的对端文件也在这张表里：它们不在会话的消息里，进度由
+               `browse://download` 事件推来（`activeBrowseDownloads`）。 -->
+          {#each activeDownloads as d (d.key)}
+            <div class="trow">
+              <div class="t-top">
+                <FileTile name={d.name} isDir={false} />
+                <span class="t-name">{d.name}</span>
+                <span class="t-pct num">{d.total > 0 ? `${downloadPct(d)}%` : ""}</span>
+              </div>
+              <div class="t-bar" class:indet={d.total <= 0} class:paused={d.status === "paused"}>
+                <i style="width:{d.total > 0 ? downloadPct(d) : 35}%"></i>
+              </div>
+              <div class="t-meta">
+                <span>下载自 {devices.peerShortName(d.peerId)}</span>
+                <span class="num">
+                  {d.status === "paused" ? "已暂停 · " : ""}{d.total > 0
+                    ? `${fmtBytes(d.received)} / ${fmtBytes(d.total)}`
+                    : fmtBytes(d.received)}
+                </span>
+              </div>
+            </div>
+          {/each}
         {:else}
           <div class="empty">
             <Icon name="files" />
@@ -254,7 +285,8 @@
         {/if}
       </div>
     </div>
-    <!-- 原型的「最近完成」分组不画：`activeTransfers()` 只给还在动的行，做完的那些这里列不出来。 -->
+    <!-- 原型的「最近完成」分组不画：`activeTransfers()` / `activeBrowseDownloads()` 都只给
+         还在动的行，做完的那些这里列不出来。 -->
   </div>
 {:else if !browseDevices.length}
   <div class="body">
@@ -299,48 +331,76 @@
         {#each shares as s (s.id)}
           {@const kids = store.browseChildrenOf(s.id)}
           {@const open = !!kids && kids.length > 0}
-          <button
-            class="node"
-            class:open
-            type="button"
-            style={indent(0)}
-            aria-expanded={s.isDir ? open : undefined}
-            onclick={() => (s.isDir ? toggleShare(s) : void store.downloadEntry(s.id, "", s.name))}
-          >
-            <span class="ntile" class:folder={s.isDir}>
-              <Icon name={s.isDir ? "folder" : fileIcon(s.name, false)} />
-            </span>
-            <span class="fmain">
-              <span class="fname2">{s.name}</span>
-              <span class="fmeta">{shareMeta(s)}</span>
-            </span>
-            {#if s.isDir}
-              <span class="chev" aria-hidden="true"><Icon name="chev" /></span>
-            {:else}
-              <span class="fgo" aria-hidden="true"><Icon name="download" /></span>
+          {@const dl = store.browseDownloadOf(s.id, "")}
+          <div class="noderow" class:has-dl={!s.isDir}>
+            <button
+              class="node"
+              class:open
+              type="button"
+              style={indent(0)}
+              aria-expanded={s.isDir ? open : undefined}
+              onclick={() =>
+                s.isDir
+                  ? toggleShare(s)
+                  : void store.activateBrowseEntry(s.id, "", s.name, s.size)}
+            >
+              <span class="ntile" class:folder={s.isDir}>
+                <Icon name={s.isDir ? "folder" : fileIcon(s.name, false)} />
+              </span>
+              <span class="fmain">
+                <span class="fname2">{s.name}</span>
+                <span class="fmeta">{shareMeta(s)}</span>
+              </span>
+              {#if s.isDir}
+                <span class="chev" aria-hidden="true"><Icon name="chev" /></span>
+              {/if}
+            </button>
+            {#if !s.isDir}
+              <DownloadRing
+                status={dl?.status ?? "idle"}
+                received={dl?.received ?? 0}
+                total={dl?.total ?? 0}
+                error={dl?.error ?? null}
+                name={s.name}
+                onToggle={() => void store.toggleBrowseDownload(s.id, "", s.name, s.size)}
+              />
             {/if}
-          </button>
+          </div>
           {#if kids && kids.length > 0}
             {#each kids as c (c.name)}
-              <button
-                class="node"
-                type="button"
-                style={indent(1)}
-                onclick={() => (c.isDir ? nestedNoop() : void store.downloadEntry(s.id, c.name, c.name))}
-              >
-                <span class="ntile" class:folder={c.isDir}>
-                  <Icon name={c.isDir ? "folder" : fileIcon(c.name, false)} />
-                </span>
-                <span class="fmain">
-                  <span class="fname2">{c.name}</span>
-                  <span class="fmeta">{c.isDir ? "" : fmtBytes(c.size)}</span>
-                </span>
-                {#if c.isDir}
-                  <span class="chev" aria-hidden="true"><Icon name="chev" /></span>
-                {:else}
-                  <span class="fgo" aria-hidden="true"><Icon name="download" /></span>
+              {@const cdl = store.browseDownloadOf(s.id, c.name)}
+              <div class="noderow" class:has-dl={!c.isDir}>
+                <button
+                  class="node"
+                  type="button"
+                  style={indent(1)}
+                  onclick={() =>
+                    c.isDir
+                      ? nestedNoop()
+                      : void store.activateBrowseEntry(s.id, c.name, c.name, c.size)}
+                >
+                  <span class="ntile" class:folder={c.isDir}>
+                    <Icon name={c.isDir ? "folder" : fileIcon(c.name, false)} />
+                  </span>
+                  <span class="fmain">
+                    <span class="fname2">{c.name}</span>
+                    <span class="fmeta">{c.isDir ? "" : fmtBytes(c.size)}</span>
+                  </span>
+                  {#if c.isDir}
+                    <span class="chev" aria-hidden="true"><Icon name="chev" /></span>
+                  {/if}
+                </button>
+                {#if !c.isDir}
+                  <DownloadRing
+                    status={cdl?.status ?? "idle"}
+                    received={cdl?.received ?? 0}
+                    total={cdl?.total ?? 0}
+                    error={cdl?.error ?? null}
+                    name={c.name}
+                    onToggle={() => void store.toggleBrowseDownload(s.id, c.name, c.name, c.size)}
+                  />
                 {/if}
-              </button>
+              </div>
             {/each}
           {/if}
         {/each}

@@ -141,6 +141,9 @@ export async function loadInbox(): Promise<void> {
 
 export async function deleteInboxEntry(path: string): Promise<void> {
   await api.deleteInboxFile(path);
+  // 收件里删掉的这份副本，浏览页可能还记着「已下载」：把指向它的那些状态一并收掉，
+  // 否则那一行还打着勾，点一下只会得到一句"文件不存在"。
+  forgetBrowseDownloadsAt(path);
   await loadInbox();
 }
 
@@ -233,7 +236,66 @@ export async function answerInvite(msg: ChatFileMsg, accept: boolean): Promise<v
   }
 }
 
-// ── 会话里的那颗「＋」：选图片 / 选文件 / 选应用（F-118、F-119）──────────────────
+/**
+ * 点会话里那条**正在接收**的文件气泡右侧的圆环：进行中 → 暂停，已暂停 → 继续。
+ *
+ * 后端那道闸与「浏览」下载共用一套（`DownloadControl`）：只让接收循环在下一块之前停住，
+ * 已收字节与 `.orbdrop-part` 都留着，继续就是同一条任务接着拉。暂停状态只在内存里
+ * （`chat.invitePaused`），与浏览下载同一档 —— 重启后接收自己按续传记录接着跑。
+ *
+ * 先翻界面再发命令：圆环要在按下的那一帧就变；后端回 `false`（这条接收这一轮已经收尾，
+ * 或者正处在两轮重试之间）时**安静地翻回去** —— 终局/重试各有自己的事件，这里再报一句
+ * "已不在接收中"只会和"接收中"那张卡自相矛盾。
+ */
+export async function toggleReceivePause(msg: ChatFileMsg): Promise<void> {
+  if (!msg.inviteId || msg.inviteState !== "accepted") return;
+  const before = chat.invitePaused(msg.inviteId);
+  const want = !before;
+  chat.setInvitePaused(msg.inviteId, want);
+  try {
+    const ok = await api.setPushReceivePaused(msg.inviteId, want);
+    if (!ok) {
+      // 闸门已经没了（这一轮收尾，或正处在两轮重试之间）：**一律退回"未暂停"**。
+      // 退回 `before` 的话，"暂停中点继续却碰上重试空档"会把界面永久留在「已暂停」，
+      // 而下一轮重试其实会自己接着收。
+      chat.setInvitePaused(msg.inviteId, false);
+      return;
+    }
+    // 命令往返途中这条可能已经收完（`push://done` 先到）：那时不再补一句"已暂停"。
+    if (chat.inviteReceiving(msg.inviteId)) {
+      toast(want ? "已暂停接收" : "已继续接收", want ? "stop" : "download");
+    }
+  } catch (e) {
+    chat.setInvitePaused(msg.inviteId, before);
+    failed(want ? "暂停接收" : "继续接收", e);
+  }
+}
+
+/**
+ * 点自己发出去那条文件气泡右侧的停止圆环：取消这条推送。
+ *
+ * 与桌面端同一个判据：一对一（含群发副本躺在 1:1 里那一档）只撤**这一台**；群发 / 群聊
+ * 那条气泡代表整批，走 `cancel_push_batch`（后端逐台撤、只动还在等 / 在传的）。界面不用
+ * 自己改状态：`push://batch` 随后会把这条落成「已取消」/ 整批里少一台。
+ */
+export async function stopOutgoingFile(msg: ChatFileMsg): Promise<void> {
+  if (!msg.fromMe) return;
+  const t = chat.activeThread();
+  const peerId = t?.mode === "direct" ? t.participants[0] : "";
+  const invites = chat.outgoingWaitingInvites(msg, peerId);
+  if (invites.length === 0) return;
+  try {
+    if (!peerId && msg.batchId) {
+      await api.cancelPushBatch(msg.batchId);
+      return;
+    }
+    for (const inviteId of invites) await api.cancelPush(inviteId);
+  } catch (e) {
+    failed("停止发送", e);
+  }
+}
+
+// ── 会话里的那颗「＋」：选图片 / 选文件 / 选应用（F-118、F-119）────────────────────
 
 /**
  * 刚选好、等着落进输入区的那几张图（`null` = 没有）。
@@ -482,21 +544,253 @@ export async function toggleShare(shareId: string): Promise<void> {
   }
 }
 
+// ── 浏览段的下载状态 ────────────────────────────────────────────────────────
+//
+// 后端 `download_from_peer` 阻塞到落盘才回话，中途的字节数由 `browse://download` 事件送来。
+// 这里按 `peerId + shareId + path` 记住每一行（`path` 为空 = 共享项根就是一个文件）：
+// 「浏览」那行右侧的圆环按它画进度、点它暂停/继续；「传输」页签数正在下几项；
+// 下载完成后点这一行直接打开。
+
+export interface BrowseDownload {
+  /** `peerId\0shareId\0path`。 */
+  key: string;
+  peerId: string;
+  shareId: string;
+  /** 共享项内相对路径；共享项根是文件时为空串。 */
+  path: string;
+  name: string;
+  /** 对端报的大小；0 = 不知道（老版本对端 / 共享项根文件），进度只报已收字节。 */
+  total: number;
+  received: number;
+  status: "running" | "paused" | "done" | "failed";
+  /** 落盘路径（`done` 才有）。 */
+  dest: string | null;
+  error: string | null;
+}
+
+let browseDownloads = $state<Record<string, BrowseDownload>>({});
+
+function browseKey(peerId: string, shareId: string, path: string): string {
+  return `${peerId}\u0000${shareId}\u0000${path}`;
+}
+
+/** 当前浏览的这台设备上，某个共享项（根或它的直接子项）的下载状态。 */
+export function browseDownloadOf(shareId: string, path: string): BrowseDownload | undefined {
+  const peerId = browsePeer;
+  if (!peerId) return undefined;
+  return browseDownloads[browseKey(peerId, shareId, path)];
+}
+
+/** 还在传输的行（进行中 + 已暂停；「传输」页签的角标与「进行中」表都读它）。 */
+export function activeBrowseDownloads(): BrowseDownload[] {
+  return Object.values(browseDownloads).filter(
+    (d) => d.status === "running" || d.status === "paused",
+  );
+}
+
+/** 收件里删掉了一条副本：把浏览页那些指向同一落盘路径的「已下载」状态一并作废。 */
+function forgetBrowseDownloadsAt(dest: string): void {
+  const next: Record<string, BrowseDownload> = {};
+  let changed = false;
+  for (const [key, d] of Object.entries(browseDownloads)) {
+    if (d.dest === dest) {
+      changed = true;
+      continue;
+    }
+    next[key] = d;
+  }
+  if (changed) browseDownloads = next;
+}
+
+function putBrowseDownload(key: string, next: BrowseDownload): void {
+  browseDownloads = { ...browseDownloads, [key]: next };
+}
+
+/** 落盘成功：只收一次尾（事件与命令返回谁先到都行），顺带把收件页签的数补上。 */
+function finishBrowseDownload(key: string, received: number, dest: string): void {
+  const cur = browseDownloads[key];
+  if (!cur || cur.status === "done") return;
+  putBrowseDownload(key, { ...cur, received, status: "done", dest, error: null });
+  toast("已下载", "download");
+  // 收件页签那颗数就是收件目录的长度（`list_inbox`）：不重拉，下载完它不会 +1。
+  void loadInbox();
+}
+
+/** 后端 `browse://download` 事件：进度 / 落盘 / 失败。 */
+export function noteBrowseDownload(ev: {
+  peerId: string;
+  shareId: string;
+  path: string;
+  name: string;
+  status: "progress" | "done" | "error";
+  received: number;
+  dest?: string | null;
+  error?: string | null;
+}): void {
+  const key = browseKey(ev.peerId, ev.shareId, ev.path);
+  const cur = browseDownloads[key];
+  if (ev.status === "progress") {
+    // 终局之后的迟到进度（事件与命令返回有先后）不再把已完成翻回「下载中」；暂停期间
+    // 已经发出的一块也照收字节数，但状态保持「已暂停」，等界面点继续再变回 running。
+    if (cur?.status === "done" || cur?.status === "failed") return;
+    putBrowseDownload(key, {
+      key,
+      peerId: ev.peerId,
+      shareId: ev.shareId,
+      path: ev.path,
+      name: ev.name || cur?.name || "文件",
+      total: cur?.total ?? 0,
+      received: Math.max(0, ev.received),
+      status: cur?.status === "paused" ? "paused" : "running",
+      dest: null,
+      error: null,
+    });
+    return;
+  }
+  if (ev.status === "done") {
+    if (ev.dest && cur) finishBrowseDownload(key, ev.received, ev.dest);
+    return;
+  }
+  // 失败：圆环退回下载键，点它可以重试（`activateBrowseEntry` 把状态改回 running）。
+  if (cur) putBrowseDownload(key, { ...cur, status: "failed", error: ev.error ?? "下载失败" });
+}
+
 /**
- * 下载对端的一项到本机收件目录（后端自己决定落盘位置与命名）。
+ * 暂停 / 继续一次浏览下载（后端那道闸只停流、不丢临时文件与 offset）。
  *
- * 后端在「每次询问」下会弹保存框；用户在框里取消时返回 `null` —— 那什么都没发生，
- * 不能报"已开始下载"、更不能把人送到传输页。
+ * 返回 `false`（命令已经结束）时不改状态：完成 / 失败由终局事件自己收尾，
+ * 这里只补一句提示 —— 否则界面会停在「已暂停」，其实文件早就下完了。
  */
-export async function downloadEntry(shareId: string, path: string, name: string): Promise<void> {
+async function setBrowsePaused(
+  shareId: string,
+  path: string,
+  paused: boolean,
+): Promise<void> {
   const peerId = browsePeer;
   if (!peerId) return;
+  const key = browseKey(peerId, shareId, path);
+  const cur = browseDownloads[key];
+  if (!cur || (cur.status !== "running" && cur.status !== "paused")) return;
+  const before = cur.status;
+  const want = paused ? "paused" : "running";
+  // 先改界面：圆环要在按下的那一帧就变（等 IPC 回来再变，手快的人会以为没点上）。
+  // 后端没找到这条命令（已经完成/失败）时再退回去，终局事件本来也会随后收尾。
+  putBrowseDownload(key, { ...cur, status: want });
   try {
-    const saved = await api.downloadFromPeer(peerId, shareId, path);
-    if (!saved) return;
-    toast(`已开始下载「${name}」`, "download");
-    filesSeg = "transfer";
+    const ok = await api.setBrowseDownloadPaused(peerId, shareId, path, paused);
+    if (!ok) {
+      const now = browseDownloads[key];
+      if (now && now.status === want) putBrowseDownload(key, { ...now, status: before });
+      // 终局事件如果已经先到（下完了 / 失败了），那句"已不在下载中"就是多余的。
+      if (!now || (now.status !== "done" && now.status !== "failed")) {
+        toast("这项已不在下载中");
+      }
+      return;
+    }
+    const now = browseDownloads[key];
+    if (now && now.status === want) {
+      toast(paused ? "已暂停下载" : "已继续下载", paused ? "stop" : "download");
+    }
   } catch (e) {
+    const now = browseDownloads[key];
+    if (now && now.status === want) putBrowseDownload(key, { ...now, status: before });
+    failed(paused ? "暂停下载" : "继续下载", e);
+  }
+}
+
+/**
+ * 点浏览里文件行右侧那一圈进度环：进行中 → 暂停，已暂停 → 继续，其余 → 开始下载
+ * （已完成的环是勾，不响应这个动作；行本身仍然负责打开）。
+ */
+export async function toggleBrowseDownload(
+  shareId: string,
+  path: string,
+  name: string,
+  size?: number | null,
+): Promise<void> {
+  const dl = browseDownloadOf(shareId, path);
+  if (dl?.status === "running") {
+    await setBrowsePaused(shareId, path, true);
+    return;
+  }
+  if (dl?.status === "paused") {
+    await setBrowsePaused(shareId, path, false);
+    return;
+  }
+  await activateBrowseEntry(shareId, path, name, size);
+}
+
+/**
+ * 点浏览里的一项：没下载过就开下，暂停中就从暂停处继续，正在下就只说一声，已经下好就
+ * 直接用系统应用打开。
+ *
+ * 后端自己决定落盘位置与命名；「每次询问」里用户在保存框点取消时返回 `null` —— 那什么都
+ * 没发生，不能报「已开始下载」，也不能把人送到传输页。
+ */
+export async function activateBrowseEntry(
+  shareId: string,
+  path: string,
+  name: string,
+  size?: number | null,
+): Promise<void> {
+  const peerId = browsePeer;
+  if (!peerId) return;
+  const key = browseKey(peerId, shareId, path);
+  const cur = browseDownloads[key];
+  if (cur?.status === "running") {
+    toast("正在下载");
+    return;
+  }
+  if (cur?.status === "paused") {
+    await setBrowsePaused(shareId, path, false);
+    return;
+  }
+  if (cur?.status === "done" && cur.dest) {
+    try {
+      await api.openPath(cur.dest);
+      toast("已打开文件", "file");
+    } catch (e) {
+      // 文件被删 / 被移走：这一行退回「可下载」，否则它永远指着不存在的路径。
+      const next = { ...browseDownloads };
+      delete next[key];
+      browseDownloads = next;
+      failed("打开", e);
+    }
+    return;
+  }
+  // 先落一行 running：命令返回前那一行就要显示 0%，失败重试也走这里。
+  putBrowseDownload(key, {
+    key,
+    peerId,
+    shareId,
+    path,
+    name,
+    total: size ?? 0,
+    received: 0,
+    status: "running",
+    dest: null,
+    error: null,
+  });
+  try {
+    const saved = await api.downloadFromPeer(peerId, shareId, path, name);
+    if (!saved) {
+      // 保存框里取消：什么都没发生，把那一行收掉（不 toast、不切页）。
+      const next = { ...browseDownloads };
+      delete next[key];
+      browseDownloads = next;
+      return;
+    }
+    // 正常情况 `done` 事件已经先到；这一条是兜底（事件通道丢了也能收尾）。
+    finishBrowseDownload(key, browseDownloads[key]?.received ?? 0, saved);
+  } catch (e) {
+    const now = browseDownloads[key];
+    if (now && now.status !== "failed") {
+      putBrowseDownload(key, {
+        ...now,
+        status: "failed",
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
     failed("下载", e);
   }
 }
@@ -539,7 +833,13 @@ export async function toggleConnection(peerId: string, connected: boolean): Prom
  * 返回"真的解除了"：在问一句那里被用户取消时，调用方（设备的操作底板）不该跟着关表。
  */
 export async function unpair(peerId: string, name: string): Promise<boolean> {
-  if (!confirm(`解除与「${name}」的配对？对端将不再认得本机，需要重新配对。`)) return false;
+  const ok = await confirmAction({
+    title: "解除配对",
+    desc: `解除与「${name}」的配对？对端将不再认得本机，需要重新配对。`,
+    confirmLabel: "解除配对",
+    danger: true,
+  });
+  if (!ok) return false;
   try {
     await api.removePeer(peerId);
     toast(`已解除与「${name}」的配对`);
@@ -610,8 +910,30 @@ export function editForm(patch: Partial<SettingsForm>): void {
 // inset:0）。所以槽位放在这里由外壳统一渲染，各 tab 只说"要开哪一张" —— 免得每个 tab 自己
 // 造一层定位祖先，最后叠出两张同时打开的底板。
 
+/**
+ * 应用内确认框的内容。
+ *
+ * **为什么不用 `window.confirm`**：Android WebView 会把它交给 Tauri 生成的
+ * `RustWebChromeClient`，弹的是系统 `AlertDialog`（Material 外观、按钮写死英文 OK/Cancel），
+ * 与移动端这套 `.sheet` 设计完全不是一回事。确认框因此也走 `Sheet` —— 同一套圆角、字号、
+ * 按钮与遮罩，用户看不出这是"另一个系统"。
+ */
+export type ConfirmPrompt = {
+  /** 动作名（「删除本地副本」「解除配对」）。 */
+  title: string;
+  /** 一句把后果说清楚的话；换行交给 CSS。 */
+  desc: string;
+  /** 确认按钮文案（「删除」「清空」「解除配对」）。 */
+  confirmLabel: string;
+  /** 取消按钮文案，缺省「取消」。 */
+  cancelLabel?: string;
+  /** true = 红色危险按钮；缺省普通主按钮。 */
+  danger?: boolean;
+};
+
 export type Sheet =
-  | { kind: "pair" }
+  /** `peerId` = 从某台设备的行/底板点进来：配对只针对这一台，不列全部候选。 */
+  | { kind: "pair"; peerId?: string }
   | { kind: "pairInvite" }
   | { kind: "linkRequest" }
   | { kind: "addDevice" }
@@ -624,20 +946,68 @@ export type Sheet =
   | { kind: "convo" }
   | { kind: "editRecipients"; key: string }
   | { kind: "keepAlive" }
-  | { kind: "update" };
+  | { kind: "update" }
+  /** 只由 `confirmAction` 创建：直接 `openSheet` 一个 confirm 不会有人结算 Promise。 */
+  | { kind: "confirm"; prompt: ConfirmPrompt };
 
 let sheet = $state<Sheet | null>(null);
 
+/**
+ * 当前确认框的 Promise 结算函数。**不放 `$state`**：它只是回调，不是要渲染的数据。
+ * 打开确认框时替换掉当前这张 sheet（来源的操作表随之下架），取消/确定后再回到页面 ——
+ * 与"操作表里点危险项 → 弹确认"的系统惯例一致。
+ */
+let confirmResolver: ((ok: boolean) => void) | null = null;
+
 export function openSheet(next: Sheet): void {
+  // 确认框被别的底板顶掉时按"取消"结算，别让调用方的 await 永远悬着。
+  if (sheet?.kind === "confirm") {
+    const resolve = confirmResolver;
+    confirmResolver = null;
+    resolve?.(false);
+  }
   sheet = next;
 }
 
 export function closeSheet(): void {
+  if (sheet?.kind === "confirm") {
+    resolveConfirm(false);
+    return;
+  }
   sheet = null;
 }
 
 export function currentSheet(): Sheet | null {
   return sheet;
+}
+
+/**
+ * 应用内确认框：打开一张与其它底板同款的 Sheet，返回用户的选择。
+ *
+ * 调用方通常是从某张操作表里点出来的（删除收件、退出群聊、解除配对…），所以这里直接替换
+ * 当前 sheet —— 取消后回到页面，而不是回到那张已经点过的操作表。
+ */
+export function confirmAction(prompt: ConfirmPrompt): Promise<boolean> {
+  // 同时只允许一个：旧的按"取消"结算，免得上一个调用方永远等下去。
+  if (confirmResolver) {
+    const previous = confirmResolver;
+    confirmResolver = null;
+    previous(false);
+  }
+  // 不用 `Promise.withResolvers`：它是 Chrome 119 才有的，而移动端下限是 Chrome 81
+  //（`scripts/check-compat.mjs` 的 FLOOR）。这里只能走 executor 形式。
+  return new Promise((resolve) => {
+    confirmResolver = resolve;
+    sheet = { kind: "confirm", prompt };
+  });
+}
+
+/** 结算当前确认框（true = 确定；false = 取消、返回键、遮罩或被别的底板顶掉）。 */
+export function resolveConfirm(ok: boolean): void {
+  const resolve = confirmResolver;
+  confirmResolver = null;
+  if (sheet?.kind === "confirm") sheet = null;
+  resolve?.(ok);
 }
 
 /**
@@ -680,10 +1050,12 @@ export type IncomingPairInvite = {
   peerName: string;
   /** 自称是本机已配对的设备却没带凭据：卡片上要把这件事说明白。 */
   unproven: boolean;
+  /** 8 位 SAS：两端应显示同一串；空 = 对端版本过旧，无法核对。 */
+  sas?: string;
 };
 
 let pairInvite = $state<IncomingPairInvite | null>(null);
-let pairWait = $state<{ inviteId: string; peerName: string } | null>(null);
+let pairWait = $state<{ inviteId: string; peerName: string; sas: string } | null>(null);
 
 export function incomingPairInvite(): IncomingPairInvite | null {
   return pairInvite;
@@ -721,12 +1093,12 @@ export async function answerPairInvite(accept: boolean): Promise<void> {
 }
 
 /** 本机发出去、还在等对方确认的邀请（空 = 没有）。 */
-export function pendingPairInvite(): { inviteId: string; peerName: string } | null {
+export function pendingPairInvite(): { inviteId: string; peerName: string; sas: string } | null {
   return pairWait;
 }
 
-export function setPendingPairInvite(inviteId: string, peerName: string): void {
-  pairWait = { inviteId, peerName };
+export function setPendingPairInvite(inviteId: string, peerName: string, sas: string): void {
+  pairWait = { inviteId, peerName, sas };
 }
 
 export function clearPendingPairInvite(inviteId?: string): void {

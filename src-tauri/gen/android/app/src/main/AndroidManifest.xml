@@ -78,6 +78,8 @@
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:theme="@style/Theme.orbdrop"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
         android:usesCleartextTraffic="${usesCleartextTraffic}">
         <!-- 竖屏锁定：移动端界面是竖屏布局，而设备（模拟器/平板）开机时的显示方向可能是横的 ——
              不锁的话应用一启动就跟着横过来（`mCurrentAppOrientation=UNSPECIFIED` 就是没锁的样子）。

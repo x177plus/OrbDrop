@@ -62,8 +62,8 @@
 
   /**
    * 「后台与通知」那一行要显示的状态：**只有电池优化白名单能读到**（Google 官方 API），
-   * ROM 的「应用启动管理」那三个开关读不到 —— 所以这一行只报这一样，其余交给引导底板去说
-   * （见 `sheets/KeepAliveSheet.svelte` 与 `docs/p1-implementation.md` §22）。
+   * ROM 的「应用启动管理 / 自启动」与「后台耗电管理」读不到 —— 所以这一行只报这一样，
+   * 其余交给引导底板去说（见 `sheets/KeepAliveSheet.svelte` 与 `docs/p1-implementation.md` §22）。
    */
   let keepAlive = $state<KeepAliveState | null>(null);
 
