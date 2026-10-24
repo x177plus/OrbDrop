@@ -135,7 +135,18 @@ const DEFAULTS = {
   // github.com/x177plus/OrbDrop/releases/latest/download/update.json 与 gitee.com/x177plus/OrbDrop/raw/master/update.json），
   // 否则清单与资产 URL 会指到别的仓库，客户端读不到。配置里显式写了就以配置为准（写空字符串也能覆盖默认值）。
   github: { owner: "x177plus", repo: "OrbDrop", remote: "github", tokenEnv: "GITHUB_TOKEN" },
-  gitee: { owner: "x177plus", repo: "OrbDrop", remote: "gitee", tokenEnv: "GITEE_TOKEN", manifestBranch: "master" },
+  gitee: {
+    owner: "x177plus",
+    repo: "OrbDrop",
+    remote: "gitee",
+    tokenEnv: "GITEE_TOKEN",
+    manifestBranch: "master",
+    // Gitee 不承载开发历史：master 由本地 mirrorBranch 的整树快照推上去（见 docs/update.md §19）。
+    // 快照提交统一用这个身份创建，避免把本机全局的 liujunjie 带进 Gitee。
+    mirrorBranch: "gitee-mirror",
+    mirrorAuthorName: "x177plus",
+    mirrorAuthorEmail: "x177plus@users.noreply.github.com",
+  },
   tagPrefix: "v",
   signingKeyPath: "",
   signingKeyPassword: "",

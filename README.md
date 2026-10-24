@@ -129,7 +129,7 @@ npm run android:build:arm64  # Android release APK for arm64 only
 
 Packaging: `npm run tauri build` (desktop), `npm run android:release` (arm64 APK, installed to the device), `npm run release` (bump version, build, publish to both release remotes). `npm run mirror` runs the local mirror harness used to test the updater.
 
-Running several instances on one machine (useful for testing against yourself) needs a distinct data directory and port per instance: set `ORBDROP_ALLOW_MULTI=1` and `ORBDROP_DATA_DIR` accordingly.
+Running several instances on one machine (useful for testing against yourself) needs a distinct data directory and port per instance: set `ORBDROP_ALLOW_MULTI=1` and `ORBDROP_DATA_DIR` accordingly. In this mode mDNS is loopback-only by default, so the extra instances are invisible to other machines on the LAN (the release app on the same machine won't see them either). Set `ORBDROP_MDNS_SCOPE=lan` on an instance to expose it deliberately, or `off` to disable mDNS entirely (manual add still works).
 
 Release artifacts and the update manifest live in the [releases](https://github.com/x177plus/OrbDrop/releases/latest) of this repository.
 

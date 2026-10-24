@@ -24,16 +24,18 @@
 | **源码** | 全部源码，含 `scripts/release.mjs`（发布流程） |
 | **发布** | `README.md` / `LICENSE` / `CHANGELOG.md` / `update.json` + 每个 Release 的附件 |
 
-**单仓**：发布与源码是**同一个仓库**（GitHub / Gitee 两个远端同址），发布脚本直接在**本仓** `master`
-上追加提交、打 tag、push。清单地址是编译期常量里的那两条（GitHub 走 Release 附件 `update.json`，
+**单仓**：发布与源码是**同一个仓库**（GitHub / Gitee 两个远端同址）。GitHub 的 `master` 是唯一的
+开发历史，发布脚本在它上面追加提交、打 tag、push；Gitee 的 `master` 是一条**发布快照链**（见 §19），
+不承载逐条开发提交。清单地址是编译期常量里的那两条（GitHub 走 Release 附件 `update.json`，
 Gitee 走仓库根 `raw/master/update.json`）—— 所以**发布必须落在 `master` 分支**，`update.json` 必须
 在仓库根。tag 分两套：发布的 `vX.Y.Z` 指向那次发布提交、Release 挂在它上面；源码侧的对应关系用
-`src-vX.Y.Z`（0.0.1 / 0.0.2 的源码提交是 `0f4a760` / `8b4582a`），两套不撞名。
+`src-vX.Y.Z`（0.0.1 / 0.0.2 的源码提交是 `0f4a760` / `8b4582a`），两套不撞名。Gitee 侧只保留
+`vX.Y.Z`，`src-vX.Y.Z` 只在 GitHub。
 
-> **口径变更（2026-10-14）**：本节原写「发布仓（公开）+ 源码仓（私有）」与「源码将来要公开时，把源码
-> 推同一个仓（`main`）即可」，后来一版写「源码在 `main`、产物与清单在 `master`」。现在只有**一个仓、
-> 一个分支 `master`**：源码与发布文件都在上面，本机不再有 `../OrbDrop-releases` 这个目录。本文下方
-> 发布记录里的「发布仓 / 源码仓（私有）」字样是当时的事实，不回改。
+> **口径变更（2026-10-14 / 2026-10-20）**：本节原写「发布仓（公开）+ 源码仓（私有）」与「源码将来要
+> 公开时，把源码推同一个仓（`main`）即可」，后来一版写「源码在 `main`、产物与清单在 `master`」。
+> 现在只有一个仓：GitHub 的 `master` 是开发历史，Gitee 的 `master` 是发布快照链（§19）；本机不再有
+> `../OrbDrop-releases` 这个目录。本文下方发布记录里的「发布仓 / 源码仓（私有）」字样是当时的事实，不回改。
 
 产物三件：`orbdrop.exe`（Windows 单文件）、`app-universal-release.apk`、`app-arm64-release.apk`。
 安卓两个包是因为 arm64 单包更小（14.6MB vs 50.7MB），而通用包兜住老机型与模拟器；客户端按本机架构
@@ -156,11 +158,15 @@ Windows 上**运行中的 exe 不能被写**（进程映像还映射着它，是
   **整份快照**（进度是高频事件，增量事件会让前端自己攒状态、迟早对不上）。
 - 启动后有**一次静默检查**（延迟 8 秒，30 分钟内复用结论）：它失败不打扰用户（没网、被墙都是常态），
   只有用户手动点的那次才弹错误。
-- **它查到新版本时会主动弹一格**（2026-10-12 加的，见 §16）：桌面是右下角那组通知里的一条气泡
-  （与"等你确认"的通知同一个形状、同一个铃铛与角标 —— 面板收着时，悬浮球左上角那颗黄标就是唯一
-  还看得见的提示），安卓是一张「发现新版本」底板（移动端没有那组气泡，底板就是它的通知位）。
+- **它查到新版本时会主动弹一格**（2026-10-12 加的，见 §16；2026-10-19 补了应用内触发，见 §18）：
+  桌面是右下角那组通知里的一条气泡 —— **启动静默检查与用户手动检查都算**，检测到就自动把那组
+  通知展开（用户之前收着铃铛也一样）。安卓是一张「发现新版本」底板（自动弹只限静默检查），
+  底栏「设置」上另挂一颗数字角标 `1`，按过「稍后」也照挂 —— 底板不自动弹了，角标仍是指路的
+  那条线索。桌面那条气泡与"等你确认"的通知同一个形状、同一个铃铛与角标。
   点下「立即更新」之后**同一格就地变成进度**，失败也留在那一格里（带「重试」）。按掉（「稍后」/
   关掉）= 本次运行内不再自动弹 —— 下次启动是另一个进程，会重新查、重新弹。
+- **不发系统通知**（Windows toast / 安卓通知栏）：更新不是急事，应用自己那组通知位足够；
+  用户没看着应用时，多一条系统级弹窗只是干扰。应用内提示在用户回到界面时才出现。
 - 区分"后台自己查到的"与"用户要看的结果"靠快照里的 `silent`（`check(force = false)` 就是启动那趟）：
   用户自己点的那次已经有设置面板在显示，再弹一遍就是把同一件事说两次。
 - 那一格的标题走 `types.ts` 的 `updateTitleText`（有新版本 / 正在更新到 / 更新失败），正文与状态行
@@ -254,9 +260,12 @@ Gitee 的公开仓需人工审核，审核期仓库"仅限成员访问"——所
    设备上确认能起来（旧的 versionCode 更大时要先卸载）；清单地址与仓库建好后，在手机上点一次
    「检查更新 → 下载并安装」，确认走到系统安装器。
 7. `node scripts/release.mjs --verify-only --version <版本>`：随时复核已发布的那一版（只读远端）。
-8. 主动提示那一格（§16）：清单版本**高于**本机时，桌面右下角要自己多出一条「有新版本」气泡、悬浮球
-   角标 +1（手机是一张「发现新版本」底板）；清单版本**等于**本机时一格都不该出现。点「立即更新」
-   之后同一格要变成进度、失败要留在那一格里（打桩包的 sha256 必然对不上，正好当失败那一档的反例）。
+8. 主动提示那一格（§16 / §18）：清单版本**高于**本机时，桌面右下角要自己多出一条「有新版本」气泡
+   （启动静默检查与手动「检查更新」两条路都要出现；铃铛收着时要自动展开）、悬浮球角标 +1；手机
+   前台静默检查弹「发现新版本」底板，底栏「设置」上挂数字角标 `1`（按掉「稍后」后角标仍在）。
+   清单版本**等于**本机时一格都不该出现。点「立即更新」之后同一格要变成进度、失败要留在那一格
+   里（打桩包的 sha256 必然对不上，正好当失败那一档的反例）。整套流程**不应触发系统通知**
+   （Windows toast / 安卓通知栏），也不新增系统通知渠道。
 
 ## 12. 首次真实发布（2026-10-10）
 
@@ -399,7 +408,8 @@ commit/tag/push → 建 Release 传附件 → 回读校验）。两个平台都�
   `updateTask()`（那一格此刻该不该占位：提示，或点过「立即更新」之后的进度/失败）、
   `dismissUpdatePrompt()`（按掉了，本次运行不再自动弹；下次启动是另一个进程，重新查、重新弹）。
 - 桌面：那一格就是右下角通知组里的一条气泡（排在"等你确认"那一档，见 `src/App.svelte`），并进
-  同一个铃铛与悬浮球角标 —— 面板收着时那颗黄标是唯一还看得见的提示。
+  同一个铃铛与悬浮球角标 —— 面板收着时那颗黄标是当时唯一还看得见的提示（2026-10-19 起手动检查
+  也会进这一格、并自动展开通知组，见 §18；仍然不发系统通知）。
 - 安卓：启动起就订阅 `update://state`（原先只有设置页挂载才订阅），`updatePrompt()` 一非空就开一张
   「发现新版本」底板（`src/mobile/sheets/UpdateSheet.svelte`）；**只在没有别的底板时弹** ——
   配对邀请只有 60 秒，它优先，等它关掉这张会自己补上。
@@ -445,3 +455,95 @@ releases/master`；冲突只有 `README.md` 与 `.gitignore`，都取本仓版�
 - **本机网络如实记一条**：这台机器到 `github.com` 的**下载**路径（`releases/latest/download/*` 与附件
   CDN）会 connect timeout，而走 `api.github.com` 的**上传**是通的 —— 所以 `--verify-only` 里 GitHub 那
   几条"够不着"只是本机出口的问题；客户端在这台机器上会按设计退到 Gitee 那条清单。
+
+## 18. 发现新版本时的应用内提示（2026-10-19）
+
+原话是"检测到新版本的时候有通知提示"。§16 的主动提示在**应用界面里**（桌面右下角气泡 /
+安卓底板），这一节把触发条件放宽，并补上手机底栏的角标；**刻意不发系统通知** —— 更新不是急事，
+Windows toast / 安卓通知栏只会在用户做别的事时多打断一次，应用自己的通知位已经够用。
+
+改法：
+
+- **桌面**：右下角那格（`updateTask()`）不再要求 `silent` —— 启动静默检查与用户手动检查发现的
+  `available` 都进通知组；`checkUpdate(force = true)` 会清掉之前的「稍后」（用户明确想看结果），
+  `App.svelte` 的 effect 在 `available` 一出现时把铃铛那组通知展开。
+- **手机**：底栏「设置」新增数字角标（`updateBadge()`）：只看 `phase === 'available'`，
+  **不看 `silent`、也不看 `dismissed`** —— 按过「稍后」只是不再自动弹底板，角标照样指路。
+  「发现新版本」底板仍只由启动静默检查自动弹；手动检查的结论就在设置页「版本与更新」里。
+- **不做**：不注册 `tauri-plugin-notification`，不在 Kotlin 侧新增更新渠道 / `notifyUpdate`，
+  也不在 `update::check` 里发任何系统级通知。原先试用过的那一层已完整撤掉。
+
+验证：
+
+- `cargo check --all-targets`：通过；`cargo test --lib update::`：9 通过 / 1 忽略（联网那条；
+  系统通知的正文测试随那一层一起删掉了）。
+- `npm run check`：150 文件 0 错；`npm run build` 与 `npm run build:mobile`：通过。
+- Android Kotlin：`gradlew :app:compileUniversalDebugKotlin` 通过（渠道/命令撤掉之后）。
+- **桌面真 WebView（CDP）**：`ORBDROP_UPDATE_MANIFEST` 指向本机打桩清单（9.9.9 > 本机 0.0.3）→
+  启动 8 秒后右下角出现「有新版本 v9.9.9」气泡、铃铛角标 `1`；点「稍后」气泡消失；再点设置里的
+  「检查更新」→ 气泡重新出现（`dismissed` 被清掉）。全程没有系统通知。
+- **手机界面（真 Chromium + Tauri IPC 打桩）**：`silent:true` + `available` → 底栏「设置」角标
+  `1`，同时弹「发现新版本」底板；点「稍后」底板关闭，角标仍为 `1`。没有系统通知渠道。
+
+## 19. Gitee 快照镜像（2026-10-20）
+
+Gitee 的 `master` 不再承载逐条开发提交，只保留**每个发布版本的整树快照**。GitHub 的 `master`
+仍是唯一开发历史；两边是两条互不相干的历史，永不 merge、永不互推。
+
+- 本地快照分支：`gitee-mirror`。它的每个提交都是一整棵树：`C1` = v0.0.1 的树、`C2` = v0.0.2、
+  `C3` = v0.0.3、`C4` = 当前 `HEAD`。所有提交的 author/committer 都是
+  `x177plus <x177plus@users.noreply.github.com>`，不继承本机全局身份。
+- Gitee `master` = `gitee-mirror` 的 tip；`raw/master/update.json` 仍然由这条分支的树提供，
+  所以客户端编译期常量不用改。
+- Gitee 的 `vX.Y.Z` tag 指向对应的快照提交（`C1`/`C2`/`C3`），Release 附件挂同名 tag；
+  `src-vX.Y.Z` 只在 GitHub 保留。
+- 发布脚本里 Gitee 侧改为：`commit-tree HEAD^{tree} -p gitee-mirror` → 推
+  `gitee-mirror:master` → 打镜像 tag `gitee-vX.Y.Z` 并推到 Gitee 的 `vX.Y.Z`。GitHub 侧完全不变。
+
+**不要**再往 Gitee 推本仓 `master`。一次 `git push gitee master` 就会把旧历史带回来；建议装
+`.git/hooks/pre-push` 拦住（见下）。
+
+一次性建立（只需一次，在 Git Bash 里）：
+
+```bash
+C1=$(git -c user.name=x177plus -c user.email=x177plus@users.noreply.github.com \
+       commit-tree 'v0.0.1^{tree}' -m 'OrbDrop v0.0.1 snapshot')
+C2=$(git -c user.name=x177plus -c user.email=x177plus@users.noreply.github.com \
+       commit-tree 'v0.0.2^{tree}' -p "$C1" -m 'OrbDrop v0.0.2 snapshot')
+C3=$(git -c user.name=x177plus -c user.email=x177plus@users.noreply.github.com \
+       commit-tree 'v0.0.3^{tree}' -p "$C2" -m 'OrbDrop v0.0.3 snapshot')
+C4=$(git -c user.name=x177plus -c user.email=x177plus@users.noreply.github.com \
+       commit-tree 'HEAD^{tree}' -p "$C3" -m 'OrbDrop v0.0.3 snapshot (docs update)')
+git branch gitee-mirror "$C4"
+git tag -a gitee-v0.0.1 -m 'OrbDrop v0.0.1 (Gitee mirror)' "$C1"
+git tag -a gitee-v0.0.2 -m 'OrbDrop v0.0.2 (Gitee mirror)' "$C2"
+git tag -a gitee-v0.0.3 -m 'OrbDrop v0.0.3 (Gitee mirror)' "$C3"
+git push --force gitee gitee-mirror:master
+git push --force gitee refs/tags/gitee-v0.0.1:refs/tags/v0.0.1
+git push --force gitee refs/tags/gitee-v0.0.2:refs/tags/v0.0.2
+git push --force gitee refs/tags/gitee-v0.0.3:refs/tags/v0.0.3
+```
+
+2026-10-20 的迁移已完成上述历史：旧 Release 的附件先备份、核对 sha256，再按同名 tag 重建，资产逐字节
+一致。旧提交在 Gitee 上不再有任何 ref，但平台 GC 前仍可能按完整 SHA 直链访问 —— 这是 Gitee 侧的行为，
+不是仓库里还有引用。
+
+防呆 hook（`.git/hooks/pre-push`，`chmod +x`）：
+
+```sh
+#!/bin/sh
+remote="$1"
+while read local_ref local_sha remote_ref remote_sha; do
+  case "$remote" in
+    gitee|*gitee.com*)
+      if [ "$remote_ref" = "refs/heads/master" ] && [ "$local_ref" != "refs/heads/gitee-mirror" ]; then
+        echo "blocked: push gitee-mirror → gitee/master, not master → gitee/master" >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
+exit 0
+```
+
+日常开发只推 GitHub；发版仍是一条 `node scripts/release.mjs ...`，Gitee 侧由脚本自动生成快照提交。
