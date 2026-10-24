@@ -4,8 +4,9 @@
 //! 这一层不碰网络，只管"谁跟谁说过什么、哪条到没到、哪条已被对方读过"。
 //!
 //! **为什么落盘**：会话记录是用户数据（跟共享项、地址簿同一档），放在 `config.toml`
-//! 旁边的 `chat.json` 里，重启后还在。不塞进 `config.toml`：那是"配置"，不该被聊天
-//! 记录撑大，也不该因为手改一次配置被连带丢掉。
+//! 旁边的 `chat-vault/chat.dat` 里，重启后还在。不塞进 `config.toml`：那是"配置"，不该被
+//! 聊天记录撑大，也不该因为手改一次配置被连带丢掉。文件是封装格式（`envelope`，
+//! **不是加密**）：双击看不到明文。
 //!
 //! **落盘的两种消息**：文本（`ChatMessage`，这一层的线上协议产生）与**文件消息**
 //! （`ChatFileMsg`，会话里那条"发了/收到了一个文件"的气泡）。文件消息的实时状态由前端
@@ -39,11 +40,17 @@ use tracing::{debug, warn};
 
 use crate::blobs;
 use crate::config::{data_dir, write_atomic};
+use crate::envelope;
 use crate::state::AppState;
 
 /// 每台设备最多留多少条：文本消息很小，但"会话"不该无限长下去。
 /// 超了从头砍 —— 会话列表与详情都是看最近的，砍掉的是最够不着的那一头。
 const MAX_PER_PEER: usize = 500;
+
+/// 最多保留多少个一对一会话。未配对来源可以凭自报 id 无限新建会话，而每条消息都会
+/// 整份重写 `chat.dat` —— 没有总数上限时，一个随机 id 循环就能把磁盘/CPU 打满。
+/// 4096 远高于正常设备数；超出后新来源的消息被忽略（已有会话不受影响）。
+const MAX_CONVOS: usize = 4096;
 
 /// 一条消息在一台设备上的状态（本机视角）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,7 +77,7 @@ pub enum Delivery {
     /// 重试不会变好，所以只试这一次，不等它上线。
     ///
     /// 顺带兼作**未知状态的兜底**（serde 要求它挂在最后一个变体上）：以后再加状态时，
-    /// 老版本读到不认识的词就当「未送达」，而不是把整份 `chat.json` 解析废掉
+    /// 老版本读到不认识的词就当「未送达」，而不是把整份 `chat.dat` 解析废掉
     /// （一个词不认识 → 解析失败 → 整份历史回落成空）。
     #[serde(other)]
     Failed,
@@ -126,7 +133,7 @@ pub struct ChatBatch {
 
 /// 会话里那条**文件（推送）消息**的落盘形状 —— 与前端 `ChatFileMsg` 逐字段对应。
 ///
-/// **为什么它也在 `chat.json` 里**：以前这条气泡只活在前端内存里，重启即丢 —— 而"会话列表
+/// **为什么它也在 `chat.dat` 里**：以前这条气泡只活在前端内存里，重启即丢 —— 而"会话列表
 /// 只列有内容的会话"，于是只发过文件、没说过话的那台设备整条从列表里消失；重发一条文本把它
 /// 拉回来时，文件那几条也永远回不来了。文件消息与文本一样是用户数据，所以与文本同处落盘。
 ///
@@ -199,6 +206,9 @@ pub struct ChatFileMsg {
 pub struct ChatFileTarget {
     #[serde(default)]
     pub peer_id: String,
+    /// 这一台那条推送邀请的 id（前端在气泡上按停止时用它逐台取消；空 = 老记录 / 已不可取消）。
+    #[serde(default)]
+    pub invite_id: String,
     /// `PushTargetState` 的取值（`invited` / `sending` / `done` / `cancelled` / `rejected` / `failed`），
     /// 前端透传，后端只在进程重启时把它落成 `failed`。
     #[serde(default)]
@@ -240,7 +250,7 @@ pub struct PeerConvoView {
 
 /// 一条消息给界面看的样子：落盘那份（[`ChatMessage`]）加一个**本机此刻**的内容路径。
 ///
-/// `path` 不进 `chat.json`：那串是"这台机器上这个文件在哪"，换台机器、换个数据目录
+/// `path` 不进 `chat.dat`：那串是"这台机器上这个文件在哪"，换台机器、换个数据目录
 /// （便携部署、`ORBDROP_DATA_DIR`）就全错了。所以它只在快照这一层现算（`flatten` 之后
 /// 界面上读到的还是那一堆平字段）。
 ///
@@ -265,8 +275,7 @@ impl ChatMessageView {
     /// 一条落盘的消息 → 界面那一份（图片消息顺手把内容路径算出来）。
     fn of(msg: ChatMessage, root: &std::path::Path) -> Self {
         let path = if msg.image {
-            crate::blobs::path_in(root, &msg.id, &msg.name)
-                .filter(|p| p.is_file())
+            crate::blobs::existing_path(root, &msg.id, &msg.name)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default()
         } else {
@@ -289,8 +298,8 @@ pub struct Snapshot {
 
 pub struct ChatStore {
     path: PathBuf,
-    /// 图片消息的**内容**目录（见 `blobs`）：由 `path` 推出来 —— `chat.json` 旁边那个
-    /// `chat-blobs/`。测试因此自动落到自己的临时目录（与 `with_path` 同一个道理）。
+    /// 图片消息的**内容**目录（见 `blobs`）：生产上是 `chat-vault/blobs/`；测试由
+    /// `with_path` 推到临时目录旁边（与账本同一个家）。
     blobs_root: PathBuf,
     inner: Mutex<ChatFile>,
     /// 正在补发的设备（`flush_queued` 的闸门）：一台设备同一时刻只跑一条补发。
@@ -300,19 +309,63 @@ pub struct ChatStore {
 
 impl ChatStore {
     pub fn new() -> Self {
-        Self::with_path(data_dir().join("chat.json"))
+        let root = data_dir();
+        Self::with_blobs(envelope::chat_path(&root), envelope::blobs_dir(&root))
     }
 
     /// 指定文件的构造（单测用：不碰真实数据目录）。
     pub fn with_path(path: PathBuf) -> Self {
-        let inner = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<ChatFile>(&s).ok())
-            .unwrap_or_default();
         let blobs_root = path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
-            .join("chat-blobs");
+            .join("blobs");
+        Self::with_blobs(path, blobs_root)
+    }
+
+    /// 指定账本文件与图片目录的构造（迁移回退时两者可能不在同一个目录）。
+    pub fn with_blobs(path: PathBuf, blobs_root: PathBuf) -> Self {
+        let inner = match std::fs::read(&path) {
+            Ok(raw) => {
+                let decoded = match envelope::decode_if(&raw) {
+                    Ok(Some((_, bytes))) => Some(bytes),
+                    // 老版本的明文：迁移还没跑到/回退时仍要能读。
+                    Ok(None) => Some(raw),
+                    Err(e) => {
+                        // 损坏的记录不是"没有记录"：先留一份 `.bad`，再从空库启动。
+                        // 备份也写成封装格式，避免老明文借 `.bad` 漏出去。
+                        match envelope::backup_bad(&path, &raw) {
+                            Some(backup) => warn!("会话记录损坏（{e}）：已备份到 {backup:?}"),
+                            None => warn!(
+                                "会话记录损坏（{e}），且无法备份 {:?}：本次从空库启动，但不会主动覆盖原文件",
+                                path
+                            ),
+                        }
+                        None
+                    }
+                };
+                match decoded {
+                    Some(bytes) => match serde_json::from_slice::<ChatFile>(&bytes) {
+                        Ok(file) => file,
+                        Err(e) => {
+                            match envelope::backup_bad(&path, &bytes) {
+                                Some(backup) => warn!("会话记录损坏（{e}）：已备份到 {backup:?}"),
+                                None => warn!(
+                                    "会话记录损坏（{e}），且无法备份 {:?}：本次从空库启动，但不会主动覆盖原文件",
+                                    path
+                                ),
+                            }
+                            ChatFile::default()
+                        }
+                    },
+                    None => ChatFile::default(),
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ChatFile::default(),
+            Err(e) => {
+                warn!("会话记录读取失败（{e}）：本次从空库启动");
+                ChatFile::default()
+            }
+        };
         Self {
             path,
             blobs_root,
@@ -335,7 +388,12 @@ impl ChatStore {
             .iter()
             .map(|(peer_id, c)| PeerConvoView {
                 peer_id: peer_id.clone(),
-                messages: c.messages.iter().cloned().map(|m| ChatMessageView::of(m, &root)).collect(),
+                messages: c
+                    .messages
+                    .iter()
+                    .cloned()
+                    .map(|m| ChatMessageView::of(m, &root))
+                    .collect(),
                 files: c.files.clone(),
                 read_at: c.read_at,
                 unread: unread_of(c),
@@ -344,7 +402,11 @@ impl ChatStore {
         // 稳定顺序：界面上"哪台有未读"不该随机跳动（会话列表自己按最近一条排）。
         views.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
         let unread = views.iter().map(|v| v.unread).sum();
-        Snapshot { convos: views, batches: guard.batches.clone(), unread }
+        Snapshot {
+            convos: views,
+            batches: guard.batches.clone(),
+            unread,
+        }
     }
 
     /// 每台设备**最后一个非空的、对端自己报过的名字**（`设备 id → 名字`）。
@@ -419,7 +481,14 @@ impl ChatStore {
     ///
     /// 返回值第一格是"这一条**确实新记下**"（重复投递 = `false`）：手机通知栏响不响看它
     /// （见 `notify`）—— 同一条消息因为重投响第二遍，比不响更烦人。
-    pub fn record_inbound(&self, peer_id: &str, from_name: &str, id: &str, text: &str, at: u64) -> (bool, Snapshot) {
+    pub fn record_inbound(
+        &self,
+        peer_id: &str,
+        from_name: &str,
+        id: &str,
+        text: &str,
+        at: u64,
+    ) -> (bool, Snapshot) {
         self.record_inbound_msg(peer_id, from_name, id, blobs::Content::text(text), at)
     }
 
@@ -436,11 +505,24 @@ impl ChatStore {
         size: u64,
         at: u64,
     ) -> (bool, Snapshot) {
-        self.record_inbound_msg(peer_id, from_name, id, blobs::Content::image(name, size), at)
+        self.record_inbound_msg(
+            peer_id,
+            from_name,
+            id,
+            blobs::Content::image(name, size),
+            at,
+        )
     }
 
     /// 收到一条消息的公共那一半（文字与图片只差内容那几格）。
-    fn record_inbound_msg(&self, peer_id: &str, from_name: &str, id: &str, content: blobs::Content, at: u64) -> (bool, Snapshot) {
+    fn record_inbound_msg(
+        &self,
+        peer_id: &str,
+        from_name: &str,
+        id: &str,
+        content: blobs::Content,
+        at: u64,
+    ) -> (bool, Snapshot) {
         let duplicate = {
             let guard = self.inner.lock();
             guard
@@ -455,6 +537,11 @@ impl ChatStore {
         let image = content.image.clone();
         {
             let mut guard = self.inner.lock();
+            if !guard.convos.contains_key(peer_id) && guard.convos.len() >= MAX_CONVOS {
+                drop(guard);
+                warn!(%peer_id, limit = MAX_CONVOS, "收到新会话但会话数已达上限，丢弃这条消息");
+                return (false, self.snapshot());
+            }
             let convo = guard.convos.entry(peer_id.to_string()).or_default();
             convo.messages.push(ChatMessage {
                 id: id.to_string(),
@@ -484,7 +571,11 @@ impl ChatStore {
         {
             let mut guard = self.inner.lock();
             if let Some(convo) = guard.convos.get_mut(peer_id) {
-                if let Some(m) = convo.messages.iter_mut().find(|m| m.from_me && m.id == msg_id) {
+                if let Some(m) = convo
+                    .messages
+                    .iter_mut()
+                    .find(|m| m.from_me && m.id == msg_id)
+                {
                     if matches!(m.delivery, Delivery::Sending | Delivery::Queued) {
                         m.delivery = delivery;
                         persist(&self.path, &guard);
@@ -537,13 +628,25 @@ impl ChatStore {
             .lock()
             .convos
             .get(peer_id)
-            .map(|c| c.messages.iter().filter(|m| !m.from_me).map(|m| m.at).max().unwrap_or(0))
+            .map(|c| {
+                c.messages
+                    .iter()
+                    .filter(|m| !m.from_me)
+                    .map(|m| m.at)
+                    .max()
+                    .unwrap_or(0)
+            })
             .unwrap_or(0)
     }
 
     /// 本机在这台设备的会话上读到哪了（已读水位）。
     pub fn read_watermark(&self, peer_id: &str) -> u64 {
-        self.inner.lock().convos.get(peer_id).map(|c| c.read_at).unwrap_or(0)
+        self.inner
+            .lock()
+            .convos
+            .get(peer_id)
+            .map(|c| c.read_at)
+            .unwrap_or(0)
     }
 
     /// 这台设备是不是还欠着消息：有排队等它上线的副本（`Queued`）。
@@ -553,11 +656,11 @@ impl ChatStore {
     /// 否则后发的那条从长连接抢到前面去，对端看到的顺序就乱了 —— 而已读水位是"按发送方的
     /// 时钟比大小"（`at <= up_to`），乱序之后老的那条会被新回执一并算成"对方读过"。
     pub fn has_backlog(&self, peer_id: &str) -> bool {
-        self.inner
-            .lock()
-            .convos
-            .get(peer_id)
-            .is_some_and(|c| c.messages.iter().any(|m| m.from_me && m.delivery == Delivery::Queued))
+        self.inner.lock().convos.get(peer_id).is_some_and(|c| {
+            c.messages
+                .iter()
+                .any(|m| m.from_me && m.delivery == Delivery::Queued)
+        })
     }
 
     /// 还欠着消息的设备（启动时一次扫完，见 `flush_all_queued`）。
@@ -566,7 +669,11 @@ impl ChatStore {
         let mut ids: Vec<String> = guard
             .convos
             .iter()
-            .filter(|(_, c)| c.messages.iter().any(|m| m.from_me && m.delivery == Delivery::Queued))
+            .filter(|(_, c)| {
+                c.messages
+                    .iter()
+                    .any(|m| m.from_me && m.delivery == Delivery::Queued)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         ids.sort();
@@ -683,7 +790,11 @@ impl ChatStore {
         if let Some(found) = guard.batches.iter().find(|b| batch_sig(&b.members) == sig) {
             return found.id.clone();
         }
-        let fresh = ChatBatch { id: uuid::Uuid::new_v4().to_string(), name: String::new(), members: ids };
+        let fresh = ChatBatch {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: String::new(),
+            members: ids,
+        };
         let id = fresh.id.clone();
         guard.batches.push(fresh);
         persist(&self.path, &guard);
@@ -833,7 +944,9 @@ fn persist(path: &PathBuf, file: &ChatFile) {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if let Err(e) = write_atomic(path, &bytes) {
+            // 落盘的是封装格式（`envelope`，**不是加密**）：双击打开看不到聊天明文。
+            let wrapped = envelope::encode("", &bytes);
+            if let Err(e) = write_atomic(path, &wrapped) {
                 warn!(path = %path.display(), %e, "chat store persist failed");
             }
         }
@@ -884,7 +997,11 @@ impl Outcome {
 /// 为什么要有兜底：会话消息不该以"先配对 + 点连接"为前提 —— 推送早就是"未绑定也能推"，
 /// 消息同理。长连接在就写它（快、即时），不在就 POST 到对端的 `/chat/message`（200 = 已送达）。
 /// 两条都走不通也不是终点：够不着的排队等对端上线（`flush_queued`），被明确拒绝的才落「未送达」。
-pub async fn deliver(state: &Arc<AppState>, peer_id: &str, event: &crate::ws::events::WsEvent) -> Outcome {
+pub async fn deliver(
+    state: &Arc<AppState>,
+    peer_id: &str,
+    event: &crate::ws::events::WsEvent,
+) -> Outcome {
     if state.ws.has_connection(peer_id) && state.ws.send(peer_id, event.clone()) {
         return Outcome::Delivered;
     }
@@ -892,8 +1009,14 @@ pub async fn deliver(state: &Arc<AppState>, peer_id: &str, event: &crate::ws::ev
 }
 
 /// HTTP 那一跳：地址、token、钉过指纹的 TLS 客户端都与推送共用同一套。
-async fn deliver_http(state: &Arc<AppState>, peer_id: &str, event: &crate::ws::events::WsEvent) -> Outcome {
-    let Some(peer) = state.get_peer(peer_id) else { return Outcome::Unreachable };
+async fn deliver_http(
+    state: &Arc<AppState>,
+    peer_id: &str,
+    event: &crate::ws::events::WsEvent,
+) -> Outcome {
+    let Some(peer) = state.get_peer(peer_id) else {
+        return Outcome::Unreachable;
+    };
     // 判据是"此刻**拨得动**它吗"，不是"有没有它自己的地址"：只有一条借来的中转链、
     // 而直连地址从没学到过的那类对端（AP 隔离下被中转的那一侧）照样得送得到 ——
     // `dial()` 已经把手里那条路（直连地址，或中转端点）选好了。
@@ -932,7 +1055,12 @@ async fn deliver_http(state: &Arc<AppState>, peer_id: &str, event: &crate::ws::e
     body["sender"] = serde_json::json!({ "id": own_id, "name": own_name });
 
     let url = format!("{}{}", crate::net::peer_base(host, port), path);
-    let mut req = crate::net::client().post(&url).timeout(HTTP_TIMEOUT).json(&body);
+    // 带 token 的拨号必须按**这台目标**建信任表：全局表按 IP 聚合指纹，同一地址上
+    // 另一台已配对设备的证书也能通过校验，随后 token 就发给了它（见 `net::DialPin`）。
+    let mut req = crate::net::dial_client(host, &peer.dial_pin())
+        .post(&url)
+        .timeout(HTTP_TIMEOUT)
+        .json(&body);
     // 已配对的对端要出示那枚 token（对端据此确认"是本机那个老搭档"）；未配对的没有 token。
     if peer.paired {
         if let Ok(Some(token)) = crate::credential::get_peer_token(peer_id) {
@@ -1017,9 +1145,15 @@ pub fn send_text(
         (None, true) => Some(state.chat.resolve_batch(None, targets)),
         (None, false) => None,
     };
-    let snapshot = state.chat.record_outbound(&id, text, at, &deliveries, batch.as_deref());
+    let snapshot = state
+        .chat
+        .record_outbound(&id, text, at, &deliveries, batch.as_deref());
     follow_up_http(state, &id, event, inflight);
-    SendResult { id, batch_id: batch, snapshot }
+    SendResult {
+        id,
+        batch_id: batch,
+        snapshot,
+    }
 }
 
 /// 发一张**图片消息**：与文字同一个口径（同一台设备的会话、同一套排队补发、同一条 HTTP 兜底），
@@ -1072,13 +1206,21 @@ pub fn send_image(
         batch.as_deref(),
     );
     follow_up_http(state, &id, event, inflight);
-    Ok(SendResult { id, batch_id: batch, snapshot })
+    Ok(SendResult {
+        id,
+        batch_id: batch,
+        snapshot,
+    })
 }
 
 /// 一条消息往各台设备的**初态**：长连接在就当场写进去（即时、状态就是「已送达」）；不在的
 /// 落「在途」，由后台那一跳走 HTTP 兜底（见 [`follow_up_http`]）；还欠着更早消息的那几台
 /// 跟着排队（顺序见 `ChatStore::has_backlog`）。文字与图片共用这一份。
-fn dispatch(state: &Arc<AppState>, targets: &[String], event: &crate::ws::events::WsEvent) -> (Vec<(String, Delivery)>, Vec<String>) {
+fn dispatch(
+    state: &Arc<AppState>,
+    targets: &[String],
+    event: &crate::ws::events::WsEvent,
+) -> (Vec<(String, Delivery)>, Vec<String>) {
     let mut deliveries: Vec<(String, Delivery)> = Vec::new();
     let mut inflight: Vec<String> = Vec::new();
     for peer_id in targets {
@@ -1100,7 +1242,12 @@ fn dispatch(state: &Arc<AppState>, targets: &[String], event: &crate::ws::events
 }
 
 /// 「在途」的那几台：后台走 HTTP 兜底那一跳，回来把状态落定（文字与图片共用）。
-fn follow_up_http(state: &Arc<AppState>, id: &str, event: crate::ws::events::WsEvent, inflight: Vec<String>) {
+fn follow_up_http(
+    state: &Arc<AppState>,
+    id: &str,
+    event: crate::ws::events::WsEvent,
+    inflight: Vec<String>,
+) {
     for peer_id in inflight {
         let state = state.clone();
         let msg_id = id.to_string();
@@ -1258,7 +1405,9 @@ pub fn flush_queued(state: &Arc<AppState>, peer_id: &str) {
             }
             // 群：同一条闸门、同一个循环。够不着就停手（剩下的等下一次触发）。
             while let Some((group_id, msg)) = state.groups.next_queued_for(&peer) {
-                let Some(group) = state.groups.group(&group_id) else { break };
+                let Some(group) = state.groups.group(&group_id) else {
+                    break;
+                };
                 if let crate::group::FlushStep::Blocked =
                     crate::group::flush_one(&state, &peer, &group_id, &msg, &group).await
                 {
@@ -1291,13 +1440,23 @@ pub fn requeue_inflight(state: &Arc<AppState>) {
 /// 启动时清掉**没人引用**的图片内容（见 `blobs`）：账本里已经不在的消息、写了一半进程就
 /// 没了的、以及旧版本留下的。
 ///
-/// 引用表来自**所有**账本：1:1 与群发在 `chat.json`（`ChatStore::image_ids`）、群聊在
-/// `groups.json`（`GroupStore::image_ids`，含还攒在邀请卡后面的那几条）—— 漏一份就会把
+/// 引用表来自**所有**账本：1:1 与群发在 `chat.dat`（`ChatStore::image_ids`）、群聊在
+/// `groups.dat`（`GroupStore::image_ids`，含还攒在邀请卡后面的那几条）—— 漏一份就会把
 /// 另一份还在引用的图删掉。
+///
+/// 两个 store 正常共用 `chat-vault/blobs`；迁移失败回退时可能一个在 vault、一个在旧
+/// `chat-blobs`，所以两边都扫一遍（同一个目录扫两次也无害）。
 pub fn sweep_blobs(state: &AppState) {
     let mut keep = state.chat.image_ids();
     keep.extend(state.groups.image_ids());
-    let removed = crate::blobs::sweep_in(state.chat.blobs_root(), &keep);
+    let mut roots = vec![state.chat.blobs_root()];
+    if state.groups.blobs_root() != state.chat.blobs_root() {
+        roots.push(state.groups.blobs_root());
+    }
+    let mut removed = 0;
+    for root in roots {
+        removed += crate::blobs::sweep_in(root, &keep);
+    }
     if removed > 0 {
         tracing::info!(removed, "清掉没人引用的图片内容");
     }
@@ -1349,7 +1508,12 @@ pub fn send_receipt(state: &Arc<AppState>, peer_id: &str, up_to: u64) {
     let state = state.clone();
     let peer_id = peer_id.to_string();
     crate::task::spawn("chat read receipt", async move {
-        deliver(&state, &peer_id, &crate::ws::events::WsEvent::ChatRead { up_to }).await;
+        deliver(
+            &state,
+            &peer_id,
+            &crate::ws::events::WsEvent::ChatRead { up_to },
+        )
+        .await;
     });
 }
 
@@ -1373,15 +1537,18 @@ mod tests {
     use super::*;
 
     fn store(name: &str) -> ChatStore {
-        // 每个用例自己**一个目录**（不只是自己一份文件）：图片消息的内容目录是从 `chat.json`
+        // 每个用例自己**一个目录**（不只是自己一份文件）：图片消息的内容目录是从账本
         // 的位置推出来的（见 `with_path`），共用一个临时目录的话，并行跑的几条会互相删对方的图。
-        let dir = std::env::temp_dir().join(format!("orbdrop_chat_{name}_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_chat_{name}_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        ChatStore::with_path(dir.join("chat.json"))
+        ChatStore::with_path(dir.join("chat.dat"))
     }
 
     fn peers(ids: &[&str]) -> Vec<(String, Delivery)> {
-        ids.iter().map(|id| (id.to_string(), Delivery::Sent)).collect()
+        ids.iter()
+            .map(|id| (id.to_string(), Delivery::Sent))
+            .collect()
     }
 
     /// 图片消息那一套：内容落在**自己的**目录里（`store()` 给的临时目录旁边），
@@ -1402,12 +1569,21 @@ mod tests {
         assert!(a.messages[0].image, "这条是图片消息");
         assert_eq!(a.messages[0].name, "图片-1.png");
         assert_eq!(a.messages[0].size, 7);
-        assert_eq!(a.messages[0].path, written.to_string_lossy(), "快照里给的是本机那份内容文件");
+        assert_eq!(
+            a.messages[0].path,
+            written.to_string_lossy(),
+            "快照里给的是本机那份内容文件"
+        );
         assert!(a.messages[0].text.is_empty(), "图片消息的 text 是空串");
 
-        // 重启：同一份 chat.json 重新打开 → 路径照旧算得出来。
+        // 重启：同一份 chat.dat 重新打开 → 路径照旧算得出来。
         let reopened = ChatStore::with_path(s.path.clone());
-        let a = reopened.snapshot().convos.into_iter().find(|c| c.peer_id == "a").unwrap();
+        let a = reopened
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == "a")
+            .unwrap();
         assert_eq!(a.messages[0].path, written.to_string_lossy());
     }
 
@@ -1418,7 +1594,8 @@ mod tests {
         let (fresh, snap) = s.record_inbound_image("a", "PC-A", "img-1", "图片-1.png", 3, 100);
         assert!(fresh);
         assert!(snap.convos[0].messages[0].image);
-        let (fresh_again, snap) = s.record_inbound_image("a", "PC-A", "img-1", "图片-1.png", 3, 100);
+        let (fresh_again, snap) =
+            s.record_inbound_image("a", "PC-A", "img-1", "图片-1.png", 3, 100);
         assert!(!fresh_again, "重投不算新的");
         assert_eq!(snap.convos[0].messages.len(), 1, "不能变成两条");
     }
@@ -1430,7 +1607,13 @@ mod tests {
         let root = s.blobs_root().to_path_buf();
         // 第 1 条会被裁掉（上限 500），最后一条留着。
         let first = crate::blobs::save_in(&root, "img-0", "图片.png", b"OLD").unwrap();
-        s.record_outbound("img-0", blobs::Content::image("图片.png", 3), 1, &peers(&["a"]), None);
+        s.record_outbound(
+            "img-0",
+            blobs::Content::image("图片.png", 3),
+            1,
+            &peers(&["a"]),
+            None,
+        );
         for i in 1..MAX_PER_PEER {
             let id = format!("img-{i}");
             crate::blobs::save_in(&root, &id, "图片.png", b"NEW").unwrap();
@@ -1442,7 +1625,10 @@ mod tests {
         let snap = s.snapshot();
         let a = snap.convos.iter().find(|c| c.peer_id == "a").unwrap();
         assert_eq!(a.messages.len(), MAX_PER_PEER, "上限就是上限");
-        assert!(!a.messages.iter().any(|m| m.id == "img-0"), "最老的那条被砍了");
+        assert!(
+            !a.messages.iter().any(|m| m.id == "img-0"),
+            "最老的那条被砍了"
+        );
         assert!(!first.exists(), "被砍那条的内容也要删掉");
         assert!(last.exists(), "还引用着的内容一个不动");
         assert!(a.messages.iter().any(|m| m.path == last.to_string_lossy()));
@@ -1454,7 +1640,13 @@ mod tests {
         let s = store("image_clear");
         let root = s.blobs_root().to_path_buf();
         let written = crate::blobs::save_in(&root, "img-1", "图片.png", b"DATA").unwrap();
-        s.record_outbound("img-1", blobs::Content::image("图片.png", 4), 100, &peers(&["a"]), None);
+        s.record_outbound(
+            "img-1",
+            blobs::Content::image("图片.png", 4),
+            100,
+            &peers(&["a"]),
+            None,
+        );
         assert!(written.exists());
         s.clear_peer("a");
         assert!(!written.exists(), "清空记录要连内容一起清");
@@ -1477,7 +1669,13 @@ mod tests {
         );
         let msg = s.next_queued("a").expect("排队了就该取得到");
         match queued_event(&msg, &root, "PC-ME") {
-            Ok(crate::ws::events::WsEvent::ChatImage { name, data, size, from_name, .. }) => {
+            Ok(crate::ws::events::WsEvent::ChatImage {
+                name,
+                data,
+                size,
+                from_name,
+                ..
+            }) => {
                 assert_eq!(name, "图片.png");
                 assert_eq!(size, 4);
                 assert_eq!(data, "REFUQQ==", "base64(DATA)");
@@ -1499,10 +1697,34 @@ mod tests {
     fn settle_only_ever_moves_an_unsettled_copy() {
         let s = store("settle");
         // m1 比回执水位晚（这条回执覆盖不到它），专门用来看"在途 → 已送达"那一跳。
-        s.record_outbound("m1", "没有长连接也要到", 300, &[(String::from("a"), Delivery::Sending)], None);
-        s.record_outbound("m2", "已经读过的", 100, &[(String::from("a"), Delivery::Sent)], None);
-        s.record_outbound("m3", "没送出去的", 200, &[(String::from("a"), Delivery::Failed)], None);
-        s.record_outbound("m4", "排队等它上线的", 400, &[(String::from("a"), Delivery::Queued)], None);
+        s.record_outbound(
+            "m1",
+            "没有长连接也要到",
+            300,
+            &[(String::from("a"), Delivery::Sending)],
+            None,
+        );
+        s.record_outbound(
+            "m2",
+            "已经读过的",
+            100,
+            &[(String::from("a"), Delivery::Sent)],
+            None,
+        );
+        s.record_outbound(
+            "m3",
+            "没送出去的",
+            200,
+            &[(String::from("a"), Delivery::Failed)],
+            None,
+        );
+        s.record_outbound(
+            "m4",
+            "排队等它上线的",
+            400,
+            &[(String::from("a"), Delivery::Queued)],
+            None,
+        );
         s.mark_read_by_peer("a", 100); // 只覆盖 m2 → 已读
 
         let snap = s.set_delivery("a", "m1", Delivery::Sent);
@@ -1527,16 +1749,35 @@ mod tests {
     #[test]
     fn queued_copies_are_retried_in_send_order() {
         let s = store("queue");
-        s.record_outbound("m1", "第一句", 100, &[(String::from("a"), Delivery::Queued)], None);
-        s.record_outbound("m2", "第二句", 200, &[(String::from("a"), Delivery::Sending)], None);
+        s.record_outbound(
+            "m1",
+            "第一句",
+            100,
+            &[(String::from("a"), Delivery::Queued)],
+            None,
+        );
+        s.record_outbound(
+            "m2",
+            "第二句",
+            200,
+            &[(String::from("a"), Delivery::Sending)],
+            None,
+        );
         assert!(s.has_backlog("a"), "欠着 a 一条");
         assert!(!s.has_backlog("b"), "没跟 b 说过话 = 不欠它");
         assert_eq!(s.peers_with_backlog(), vec!["a".to_string()]);
-        assert_eq!(s.next_queued("a").expect("有排队的").id, "m1", "补发从最早那条开始");
+        assert_eq!(
+            s.next_queued("a").expect("有排队的").id,
+            "m1",
+            "补发从最早那条开始"
+        );
         // 补发**不**把它挪出「排队」：这几秒里新消息才会跟着排（顺序不许乱）。
         assert!(s.has_backlog("a"));
         s.set_delivery("a", "m1", Delivery::Sent);
-        assert!(!s.has_backlog("a"), "发出去就不欠了（m2 是另一条路在途的，不算积压）");
+        assert!(
+            !s.has_backlog("a"),
+            "发出去就不欠了（m2 是另一条路在途的，不算积压）"
+        );
         assert!(s.next_queued("a").is_none());
     }
 
@@ -1544,14 +1785,45 @@ mod tests {
     #[test]
     fn a_restart_requeues_inflight_copies_only() {
         let s = store("requeue");
-        s.record_outbound("m1", "在途", 100, &[(String::from("a"), Delivery::Sending)], None);
-        s.record_outbound("m2", "被拒的", 200, &[(String::from("a"), Delivery::Failed)], None);
-        s.record_outbound("m3", "已送达", 300, &[(String::from("a"), Delivery::Sent)], None);
+        s.record_outbound(
+            "m1",
+            "在途",
+            100,
+            &[(String::from("a"), Delivery::Sending)],
+            None,
+        );
+        s.record_outbound(
+            "m2",
+            "被拒的",
+            200,
+            &[(String::from("a"), Delivery::Failed)],
+            None,
+        );
+        s.record_outbound(
+            "m3",
+            "已送达",
+            300,
+            &[(String::from("a"), Delivery::Sent)],
+            None,
+        );
         s.requeue_inflight(&Default::default());
 
-        let convo = s.snapshot().convos.into_iter().find(|c| c.peer_id == "a").unwrap();
-        assert_eq!(convo.messages[0].delivery, Delivery::Queued, "在途 → 排队（重投一次）");
-        assert_eq!(convo.messages[1].delivery, Delivery::Failed, "明确拒绝的不重来");
+        let convo = s
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == "a")
+            .unwrap();
+        assert_eq!(
+            convo.messages[0].delivery,
+            Delivery::Queued,
+            "在途 → 排队（重投一次）"
+        );
+        assert_eq!(
+            convo.messages[1].delivery,
+            Delivery::Failed,
+            "明确拒绝的不重来"
+        );
         assert_eq!(convo.messages[2].delivery, Delivery::Sent, "到了的不动");
         assert_eq!(s.peers_with_backlog(), vec!["a".to_string()]);
     }
@@ -1574,8 +1846,16 @@ mod tests {
             chat_batch_id: String::new(),
             group_id: String::new(),
             per_targets: vec![
-                ChatFileTarget { peer_id: "a".to_string(), state: "done".to_string() },
-                ChatFileTarget { peer_id: "b".to_string(), state: "sending".to_string() },
+                ChatFileTarget {
+                    peer_id: "a".to_string(),
+                    invite_id: "i-a".to_string(),
+                    state: "done".to_string(),
+                },
+                ChatFileTarget {
+                    peer_id: "b".to_string(),
+                    invite_id: "i-b".to_string(),
+                    state: "sending".to_string(),
+                },
             ],
             invite_id: String::new(),
             invite_state: String::new(),
@@ -1590,14 +1870,20 @@ mod tests {
     /// 才不会整条从会话列表里消失（列表按"有没有内容"画）。
     #[test]
     fn file_messages_survive_a_restart() {
-        let path = std::env::temp_dir().join(format!("orbdrop_chat_files_{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("orbdrop_chat_files_{}", uuid::Uuid::new_v4()));
         let s = ChatStore::with_path(path.clone());
         s.set_files("a", vec![sending_file("f1", 100)]);
         assert_eq!(s.snapshot().convos[0].files.len(), 1);
 
         // 重开一份（同一个文件）：内容逐字段读得回来。
         let reopened = ChatStore::with_path(path.clone());
-        let convo = reopened.snapshot().convos.into_iter().find(|c| c.peer_id == "a").unwrap();
+        let convo = reopened
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == "a")
+            .unwrap();
         assert_eq!(convo.files.len(), 1);
         assert_eq!(convo.files[0].name, "报告.pdf");
         assert_eq!(convo.files[0].path, "C:/tmp/报告.pdf");
@@ -1605,7 +1891,10 @@ mod tests {
         // 界面收到的那份快照里带着它（会话列表"有没有内容"、详情里那条气泡都读这里）。
         let json = serde_json::to_value(reopened.snapshot()).expect("快照要能序列化");
         assert_eq!(json["convos"][0]["files"][0]["name"], "报告.pdf");
-        assert_eq!(json["convos"][0]["files"][0]["fromMe"], true, "键名是 camelCase");
+        assert_eq!(
+            json["convos"][0]["files"][0]["fromMe"], true,
+            "键名是 camelCase"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -1627,14 +1916,25 @@ mod tests {
         s.set_files("a", vec![done, sending_file("f1", 100), inbound]);
         s.requeue_inflight(&Default::default());
 
-        let convo = s.snapshot().convos.into_iter().find(|c| c.peer_id == "a").unwrap();
-        assert!(!convo.files[0].sending && convo.files[0].pct == 100, "已送达的不动");
+        let convo = s
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == "a")
+            .unwrap();
+        assert!(
+            !convo.files[0].sending && convo.files[0].pct == 100,
+            "已送达的不动"
+        );
         let stopped = &convo.files[1];
         assert!(!stopped.sending, "还在传的那条落成终态");
         assert_eq!(stopped.failed, stopped.targets, "发送侧落成「未送达」");
         assert_eq!(stopped.pct, 0);
         assert!(stopped.per_targets.iter().all(|t| t.state == "failed"));
-        assert_eq!(convo.files[2].invite_state, "failed", "接收侧落成「接收失败」");
+        assert_eq!(
+            convo.files[2].invite_state, "failed",
+            "接收侧落成「接收失败」"
+        );
     }
 
     /// 「清空聊天记录」清的是这台设备的**全部**记录：文件消息跟着走（只清一半的话，
@@ -1671,8 +1971,16 @@ mod tests {
             std::iter::once("inv-keep".to_string()).collect();
         s.requeue_inflight(&resumable);
 
-        let convo = s.snapshot().convos.into_iter().find(|c| c.peer_id == "a").unwrap();
-        assert_eq!(convo.files[0].invite_state, "accepted", "马上要接着收的保住「接收中」");
+        let convo = s
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == "a")
+            .unwrap();
+        assert_eq!(
+            convo.files[0].invite_state, "accepted",
+            "马上要接着收的保住「接收中」"
+        );
         assert_eq!(convo.files[1].invite_state, "failed", "没人接手的落终态");
     }
 
@@ -1697,8 +2005,8 @@ mod tests {
             "chatBatchId": "bc1",
             "groupId": "",
             "perTargets": [
-                { "peerId": "a", "state": "done" },
-                { "peerId": "b", "state": "failed" }
+                { "peerId": "a", "inviteId": "i-a", "state": "done" },
+                { "peerId": "b", "inviteId": "i-b", "state": "failed" }
             ],
             "inviteId": "",
             "inviteState": "",
@@ -1707,7 +2015,8 @@ mod tests {
             "path": "C:/tmp/报告.pdf",
             "count": 3
         }]);
-        let files: Vec<ChatFileMsg> = serde_json::from_value(payload).expect("前端那份形状要能解析");
+        let files: Vec<ChatFileMsg> =
+            serde_json::from_value(payload).expect("前端那份形状要能解析");
         let f = &files[0];
         assert_eq!(f.id, "file:pb1:0");
         assert_eq!(f.at, 1_791_864_416_780);
@@ -1723,6 +2032,7 @@ mod tests {
         assert_eq!(f.count, 3);
         assert_eq!(f.per_targets.len(), 2);
         assert_eq!(f.per_targets[0].peer_id, "a");
+        assert_eq!(f.per_targets[0].invite_id, "i-a");
         assert_eq!(f.per_targets[1].state, "failed");
     }
 
@@ -1732,7 +2042,10 @@ mod tests {
     fn only_one_flush_runs_per_peer_at_a_time() {
         let s = store("gate");
         assert!(s.begin_flush("a"));
-        assert!(!s.begin_flush("a"), "已经在跑的那条不会被叠第二条（记下再跑一轮）");
+        assert!(
+            !s.begin_flush("a"),
+            "已经在跑的那条不会被叠第二条（记下再跑一轮）"
+        );
         assert!(s.begin_flush("b"), "别的设备各有一条");
         assert!(s.end_flush("a"), "期间有人又叫过 → 再跑一轮");
         assert!(!s.end_flush("a"), "这一轮没人叫 → 收工");
@@ -1782,7 +2095,10 @@ mod tests {
         let s = store("batch_reuse");
         let b = s.resolve_batch(None, &["a".to_string(), "b".to_string()]);
         // 同一批人换个顺序 → 还是那一份。
-        assert_eq!(s.resolve_batch(None, &["b".to_string(), "a".to_string()]), b);
+        assert_eq!(
+            s.resolve_batch(None, &["b".to_string(), "a".to_string()]),
+            b
+        );
         // 多一台 → 另起一份（老的还在）。
         let c = s.resolve_batch(None, &["a".to_string(), "b".to_string(), "c".to_string()]);
         assert_ne!(c, b);
@@ -1845,24 +2161,52 @@ mod tests {
     #[test]
     fn peer_read_receipt_marks_only_sent_copies() {
         let s = store("receipt");
-        s.record_outbound("m1", "早", 100, &[(String::from("a"), Delivery::Sent)], None);
-        s.record_outbound("m2", "没送出去的", 200, &[(String::from("a"), Delivery::Failed)], None);
+        s.record_outbound(
+            "m1",
+            "早",
+            100,
+            &[(String::from("a"), Delivery::Sent)],
+            None,
+        );
+        s.record_outbound(
+            "m2",
+            "没送出去的",
+            200,
+            &[(String::from("a"), Delivery::Failed)],
+            None,
+        );
         // 排队等对端上线的那条：**对端根本没收到过**，回执更不可能覆盖它。
-        s.record_outbound("m3", "还排着队的", 300, &[(String::from("a"), Delivery::Queued)], None);
+        s.record_outbound(
+            "m3",
+            "还排着队的",
+            300,
+            &[(String::from("a"), Delivery::Queued)],
+            None,
+        );
         s.mark_read_by_peer("a", 300);
 
-        let convo = s.snapshot().convos.into_iter().find(|c| c.peer_id == "a").unwrap();
+        let convo = s
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == "a")
+            .unwrap();
         assert_eq!(convo.messages[0].delivery, Delivery::Read);
         // Failed 不会被回执洗白。
         assert_eq!(convo.messages[1].delivery, Delivery::Failed);
-        assert_eq!(convo.messages[2].delivery, Delivery::Queued, "排队的也不算读过");
+        assert_eq!(
+            convo.messages[2].delivery,
+            Delivery::Queued,
+            "排队的也不算读过"
+        );
     }
 
     /// 老版本（群里那套）写下的 `chat.json` 里多出来一个 `groups` 字段：读进来看不懂就忽略，
     /// 别因为一个多余的键让整份历史读不出来。
     #[test]
     fn a_legacy_file_with_a_groups_key_still_loads() {
-        let path = std::env::temp_dir().join(format!("orbdrop_chat_legacy_{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("orbdrop_chat_legacy_{}", uuid::Uuid::new_v4()));
         std::fs::write(
             &path,
             r#"{"convos":{"a":{"messages":[{"id":"m1","fromMe":false,"fromName":"PC-A","text":"你好","at":100,"delivery":"received","targets":["a"]}],"readAt":0}},"groups":[["a","b"]]}"#,
@@ -1893,9 +2237,35 @@ mod tests {
         assert_eq!(b.messages.len(), 1);
     }
 
+    /// 落盘不是明文：双击 `chat.dat` 看不到聊天内容；解封装后仍是完整 JSON。
+    #[test]
+    fn persisted_chat_is_enveloped_and_still_reloads() {
+        let path = std::env::temp_dir().join(format!("orbdrop_chat_env_{}", uuid::Uuid::new_v4()));
+        {
+            let s = ChatStore::with_path(path.clone());
+            s.record_inbound("a", "PC-A", "m1", "你好，这是明文不该出现", 100);
+        }
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            !raw.windows("你好，这是明文不该出现".len())
+                .any(|w| w == "你好，这是明文不该出现".as_bytes()),
+            "账本不该以明文落盘"
+        );
+        let (ext, json) = envelope::decode_if(&raw).unwrap().unwrap();
+        assert!(ext.is_empty());
+        assert!(std::str::from_utf8(&json).unwrap().contains("\"convos\""));
+        let reopened = ChatStore::with_path(path.clone());
+        assert_eq!(
+            reopened.snapshot().convos[0].messages[0].text,
+            "你好，这是明文不该出现"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn survives_a_restart() {
-        let path = std::env::temp_dir().join(format!("orbdrop_chat_restart_{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("orbdrop_chat_restart_{}", uuid::Uuid::new_v4()));
         {
             let s = ChatStore::with_path(path.clone());
             s.record_inbound("a", "PC-A", "m1", "你好", 100);
@@ -1917,7 +2287,12 @@ mod tests {
         for i in 0..(MAX_PER_PEER as u64 + 10) {
             s.record_inbound("a", "PC-A", &format!("m{i}"), "x", i + 1);
         }
-        let convo = s.snapshot().convos.into_iter().find(|c| c.peer_id == "a").unwrap();
+        let convo = s
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == "a")
+            .unwrap();
         assert_eq!(convo.messages.len(), MAX_PER_PEER);
         // 砍掉的是最早的，留下的是最新的。
         assert_eq!(convo.messages.last().unwrap().at, MAX_PER_PEER as u64 + 10);

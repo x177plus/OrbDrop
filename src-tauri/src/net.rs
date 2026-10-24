@@ -11,9 +11,14 @@
 //!   所有对端都会看到指纹变了，抽象上等同于重装）；
 //! - 每个已配对对端的证书指纹存在凭据库（`credential`，与 token 同一条记录、同生命周期）；
 //! - 拨号时比对指纹：一致才继续，不一致直接拒绝；
-//! - 首次见到某地址（没有钉住的指纹）时按 **TOFU** 接受并记住 —— 这是"零点击"的代价，
-//!   首次配对若正好有人在中间，本机认下的就是中间人的证书。要堵这个缝只能靠配对码那条
-//!   带外信道（PAKE），那是另一件事。
+//! - 首次见到某地址（没有钉住的指纹）时按 **TOFU** 接受并记住 —— 这是"零点击"的代价。
+//!   配对码那条路现在用 SPAKE2（`pake` 模块）把 6 位码当口令：码不上网、不能离线枚举，
+//!   确认值里还绑了双方证书指纹，中间人转发报文也过不了；**配对邀请**那条路仍只有
+//!   用户「接收」+ TLS，这个缝还在（下一步用 SAS 比对）。
+//! - 出站连接会同时出示本机证书（服务端只**请求**、不强制），配对路由据此核对请求体里
+//!   自报的指纹就是这条连接出示的那一枚。它保证"谁说的就是谁出示的"，**不**单独阻止
+//!   中间人（中间人用自己的证书终止两端时，两边仍会各自钉住它）—— PAKE 的 AAD 才是
+//!   配对码那条路上的那一半。
 //!
 //! ## 不做主机名校验，只比指纹
 //!
@@ -39,7 +44,8 @@ use axum::Router;
 use parking_lot::Mutex;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -91,6 +97,19 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 超限时**丢弃新连接**（`try_acquire`，不排队）：本机已经满了，把新连接排队只是把
 /// "占内存"换个地方继续涨。
 const MAX_CONNECTIONS: usize = 512;
+
+/// 回环连接单独留一份名额。UI/BC/本机自验都走回环；如果不留，局域网里任意主机
+/// 用 512 条空闲连接就能把本机界面和 BC 一起饿死。
+const LOOPBACK_CONNECTIONS: usize = 64;
+
+/// 单个来源 IP 的并发连接上限（远程）。全局名额防"总量无界"，这一条防"单点占满"。
+///
+/// 正常用量的一本账：一台已配对设备 = 1 条入站长连接 + 传输期间至多 8 个并发 worker
+/// （`config::clamp_transfer_workers` 的上限）+ 几条毫秒级的探活，合计十几条。
+/// 64 留了数倍余量，同时保证一台主机占不满 [`MAX_CONNECTIONS`] 的远程名额 ——
+/// 公开路由读请求体时没有"整条连接"的时限（body 可以停在半路），少了这道闸门，
+/// 局域网里任意一台机器开 448 条连接就能让所有设备都连不进来。
+const MAX_CONNECTIONS_PER_REMOTE_IP: usize = 64;
 
 // ---------------------------------------------------------------------------
 // 指纹
@@ -163,15 +182,33 @@ pub fn load_or_create_identity() -> Result<Identity, String> {
     // 漏装一次，之后随手 new 的一个 client 就会在 build 时 panic。
     install_crypto_provider();
     let path = identity_path();
-    if let Ok(pem) = std::fs::read_to_string(&path) {
-        match identity_from_pem(&pem) {
+    match std::fs::read_to_string(&path) {
+        Ok(pem) => match identity_from_pem(&pem) {
             Ok(id) => {
                 debug!(fingerprint = %short_fingerprint(&id.fingerprint), "本机身份已加载");
                 return Ok(id);
             }
-            Err(e) => warn!(
-                "身份文件读不出来（{e}）：将重新生成一把，所有对端都会看到指纹变化并要求重新配对"
-            ),
+            Err(e) => {
+                // 损坏 ≠ 不存在：先把旧文件留成 `.pem.bad`，再生成新的。绝不静默覆盖
+                // —— 旧私钥是用户唯一能手工恢复身份的东西。
+                let backup = path.with_extension("pem.bad");
+                std::fs::rename(&path, &backup).map_err(|rename_err| {
+                    format!(
+                        "身份文件损坏（{e}），且无法备份到 {backup:?}（{rename_err}）；拒绝覆盖，请手工处理"
+                    )
+                })?;
+                warn!(
+                    "身份文件损坏（{e}）：已备份到 {backup:?}，将重新生成一把 —— 所有对端都会看到指纹变化并要求重新配对"
+                );
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // 首次运行：正常生成。
+        }
+        Err(e) => {
+            // 读失败（被占用/权限/IO）不是"没有身份"：静默重新生成会覆盖掉一个可能
+            // 还能恢复的身份。把选择权交给用户/运维。
+            return Err(format!("身份文件读取失败（{path:?}）：{e}"));
         }
     }
     let id = generate_identity()?;
@@ -180,7 +217,8 @@ pub fn load_or_create_identity() -> Result<Identity, String> {
         to_pem(id.cert_der.as_ref(), "CERTIFICATE"),
         to_pem(id.key_der.secret_der(), "PRIVATE KEY")
     );
-    config::write_atomic(&path, pem.as_bytes()).map_err(|e| format!("身份文件写入失败: {e}"))?;
+    config::write_atomic_private(&path, pem.as_bytes())
+        .map_err(|e| format!("身份文件写入失败: {e}"))?;
     info!(
         path = %path.display(),
         fingerprint = %short_fingerprint(&id.fingerprint),
@@ -248,27 +286,58 @@ fn generate_identity() -> Result<Identity, String> {
 // 钉住的指纹（Trust）
 // ---------------------------------------------------------------------------
 
+/// 空指纹的已配对记录用这枚"不可能匹配"的哨兵占位：TLS 校验必然拒绝，
+/// 从而在重新配对/补指纹之前阻止任何出站连接把 token 发出去。
+pub const DENY_FINGERPRINT: &str = "__orbdrop_unpinned__";
+
+/// 一次拨号应当接受的证书指纹。
+///
+/// 全局 [`Trust`] 按 **IP** 聚合多枚指纹（共享中转端点、同机多实例都会出现），校验器
+/// 命中集合里任意一枚就放行 —— 它无法知道"这次拨号本来要找哪一台设备"，因为 TLS 校验
+/// 发生在任何应用层数据之前。所以**带 token 的拨号必须按目标设备建一张只含它那枚指纹的
+/// 临时表**（[`dial_client`] / [`Trust::scoped`]）：否则同一 IP 键下的另一台已配对设备
+/// 出示自己的证书也能通过校验，随后目标设备的 token 就发给了它。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DialPin {
+    /// 钉死这一枚：证书必须是它。
+    Fingerprint(String),
+    /// 没有可钉的指纹（未配对 / 没有关系）：按 TOFU 接受。
+    ///
+    /// 只用于确实没有建立关系的设备（含不带 token 的发现/学习）；已配对设备绝不走
+    /// 这一档（见 `credential::dial_pin`）。
+    Tofu,
+    /// 已配对但凭据里没有指纹：拒绝一切 TLS，直到重新配对。哨兵见 [`DENY_FINGERPRINT`]。
+    Deny,
+}
+
 /// 已知对端的证书指纹，按**地址**索引。
 ///
 /// 为什么按地址而不是按设备 id：TLS 校验发生在拿到任何应用层数据**之前**，此刻手上只有
-/// 一个 IP。一台机器一份身份（同机多实例共用同一个数据目录，也就共用同一把身份），
-/// 所以"一个地址一把指纹"是准的；真正的身份归属由握手之后的 token 认证负责。
+/// 一个 IP。一个地址可能对应多台设备（中转端点、同机多实例），所以每格是**一组**指纹；
+/// 真正的身份归属仍由握手之后的 token 认证负责。
 #[derive(Debug, Default)]
 pub struct Trust {
-    pinned: Mutex<HashMap<StdIpAddr, String>>,
+    /// 一个地址可以对应**多枚**指纹：中转端点就是这种形状（同一台中转机的地址上，
+    /// 呈现的是不同目标的证书）。全部保留并逐一放行；任何一枚都不匹配才拒绝。
+    /// 空指纹的已配对记录会放入 `DENY_FINGERPRINT`（只对非回环地址），从而在指纹
+    /// 迁移完成前**拒绝一切出站 TLS**，避免 token 被 TOFU 发出去。
+    pinned: Mutex<HashMap<StdIpAddr, Vec<String>>>,
     /// 这次进程里实际见到过的指纹。TOFU 靠它把"刚认下的那枚"交回给调用方落库——
     /// 校验器只负责放行/拒绝，**不写凭据库**（它在握手线程里，不该碰磁盘）。
     ///
     /// **故意不按 `pinned` 集合 prune**（别在这里"顺手清理"）：它的读取点只有两个，两个
     /// 都只在"这个地址**还没有**钉住的指纹"时才读 —— `state::remember_peer_fingerprint`
-    /// （库里已有指纹就早退）与 `pair::commit_pairing`（那个地址的 pin 刚被
-    /// `forget_stale_pin` 清掉，接着要把这次见到的写回去，而 `forget_stale_pin` 自己就调了
-    /// `refresh_trust`）。按 `pinned` 去 prune，删掉的正好是**还有读者的那些**（未钉住的
+    /// （库里已有指纹就早退）与 `pair::commit_pairing`（未钉住的地址靠这次 TLS 握手
+    /// 见到的证书落库，而那次拨号正需要 TOFU）。
+    /// 按 `pinned` 去 prune，删掉的正好是**还有读者的那些**（未钉住的
     /// 地址），留下的没人读；后果是"配对码那条路本机拨过去、明明见了对端证书，却把指纹写成
     /// 空"，退回 TOFU。另外 `refresh_trust` 会被任意别的设备（配对/解除配对/指纹落库）在
     /// 任意时刻调用，prune 还会把刚握手完、**还没被读走**的那条观察删掉 —— 那正是
     /// `remember_peer_fingerprint` 唯一工作的窗口。
-    observed: Mutex<HashMap<StdIpAddr, String>>,
+    ///
+    /// 是 `Arc` 而不是裸 `Mutex`：按目标建的临时表（[`Trust::scoped`]）与全局表**共享**
+    /// 这一份观察值，于是 `remember_peer_fingerprint` 在两条路上读到的是同一份记录。
+    observed: Arc<Mutex<HashMap<StdIpAddr, String>>>,
 }
 
 impl Trust {
@@ -276,45 +345,72 @@ impl Trust {
         Self::default()
     }
 
+    /// 只认**一台目标**的临时信任表：带 token 的拨号专用。
+    ///
+    /// `host` 是这次实际拨的地址字面量（直连 IP，或中转端点的 `[::ffff:…]`）。表里只放
+    /// 目标设备那一枚指纹，于是校验器的"任意一枚命中"退化成"必须是它"。
+    ///
+    /// - 回环沿用既有豁免（本机 UI / 测试 / 同机多实例）：不钉，按 TOFU；
+    /// - `Tofu`：空表（带 token 的路径只在"确实没有关系"时才会走到这里）；
+    /// - `Deny`：放哨兵，校验必然失败（已配对却没有指纹 = 先重新配对）。
+    ///
+    /// `observed` 与全局表共享：这条拨号见到的证书仍会被
+    /// `state::remember_peer_fingerprint` / `pair::commit_pairing` 读到（TOFU 落库）。
+    pub fn scoped(host: &str, pin: &DialPin) -> Arc<Trust> {
+        let mut scoped = Trust::new();
+        scoped.observed = trust().observed.clone();
+        let Some(ip) = parse_host(host) else {
+            return Arc::new(scoped);
+        };
+        if ip.is_loopback() {
+            return Arc::new(scoped);
+        }
+        match pin {
+            DialPin::Fingerprint(fp) => {
+                scoped.seed(std::iter::once((host.to_string(), fp.clone())));
+            }
+            DialPin::Tofu => {}
+            DialPin::Deny => {
+                scoped.seed(std::iter::once((
+                    host.to_string(),
+                    DENY_FINGERPRINT.to_string(),
+                )));
+            }
+        }
+        Arc::new(scoped)
+    }
+
     /// 用「地址 → 指纹」重建这份表（启动时、配对成功/解除配对后各调一次）。
     ///
     /// 整份替换而不是增量合并：地址簿与凭据库才是真相，这里只是一份供握手线程只读的快照。
     ///
-    /// **同一个地址上出现两枚不同指纹 = 不钉**（并留一行 warn）。这种事只可能来自"本机台账
-    /// 里有两台已配对设备共用一个地址"（对端重装换了 id、地址被另一台机器接手、上次配对
-    /// 留下的残影）。随便挑一个钉住，另一台就永远被"指纹不一致"挡在门外，而且那条错误
-    /// 只在日志里 —— 表现就是"这台设备怎么都连不上，重新配对也没用"。不钉 = 退到 TOFU，
-    /// 下一次成功连线会把真正的那枚认下来（同时 `remember_peer_fingerprint` 落库）。
+    /// 同一地址上的多枚指纹**全部保留**（中转端点、同机多实例都会出现），校验时任一匹配
+    /// 即放行。不能再"冲突就整条不钉"——那会让中转 TLS 退回 TOFU。空指纹的已配对记录
+    /// 会放 `DENY_FINGERPRINT`（见 `state::refresh_trust_from_credentials`），确保迁移前
+    /// 不会把 token 发给任何 TOFU 证书。
     pub fn seed(&self, entries: impl IntoIterator<Item = (String, String)>) {
-        let mut map: HashMap<StdIpAddr, String> = HashMap::new();
-        let mut conflicted: Vec<StdIpAddr> = Vec::new();
+        let mut map: HashMap<StdIpAddr, Vec<String>> = HashMap::new();
         for (ip, fp) in entries {
             let Some(ip) = parse_host(&ip) else { continue };
-            match map.get(&ip) {
-                Some(existing) if *existing != fp => {
-                    if !conflicted.contains(&ip) {
-                        warn!(
-                            %ip,
-                            pinned = %short_fingerprint(existing),
-                            seen = %short_fingerprint(&fp),
-                            "同一地址上钉着两枚不同指纹：这一轮不钉它（退到 TOFU，下次连上重新认）"
-                        );
-                        conflicted.push(ip);
-                    }
-                }
-                _ => {
-                    map.insert(ip, fp);
-                }
+            let list = map.entry(ip).or_default();
+            if !list.iter().any(|x| x == &fp) {
+                list.push(fp);
             }
-        }
-        for ip in conflicted {
-            map.remove(&ip);
         }
         *self.pinned.lock() = map;
     }
 
-    pub fn get(&self, ip: StdIpAddr) -> Option<String> {
-        self.pinned.lock().get(&ip).cloned()
+    /// 这个地址上钉住的所有指纹（空 = 没钉）。
+    pub fn get(&self, ip: StdIpAddr) -> Vec<String> {
+        self.pinned.lock().get(&ip).cloned().unwrap_or_default()
+    }
+
+    /// 这个地址上是否钉着某一枚指纹。
+    pub fn accepts(&self, ip: StdIpAddr, fingerprint: &str) -> bool {
+        self.pinned
+            .lock()
+            .get(&ip)
+            .is_some_and(|list| list.iter().any(|fp| fp == fingerprint))
     }
 
     /// 记下这次见到的指纹（不落库）。
@@ -327,7 +423,19 @@ impl Trust {
         parse_host(ip).and_then(|ip| self.observed.lock().get(&ip).cloned())
     }
 
-    /// 忘掉某个地址的指纹（解除配对时用；地址换了主人也一样）。
+    /// 忘掉某个地址上的**某一枚**指纹（解除配对/重新配对用）。地址上还有别的
+    /// 指纹时保留它们（中转端点/同机多实例）。
+    pub fn unpin_fingerprint(&self, ip: StdIpAddr, fingerprint: &str) {
+        let mut pinned = self.pinned.lock();
+        if let Some(list) = pinned.get_mut(&ip) {
+            list.retain(|fp| fp != fingerprint);
+            if list.is_empty() {
+                pinned.remove(&ip);
+            }
+        }
+    }
+
+    /// 忘掉某个地址的**全部**指纹（地址换了主人、或解除配对时用）。
     pub fn unpin(&self, ip: StdIpAddr) {
         self.pinned.lock().remove(&ip);
     }
@@ -389,36 +497,33 @@ impl ServerCertVerifier for PinnedVerifier {
         let ip = StdIpAddr::from(*ip);
         let seen = fingerprint_of(end_entity.as_ref());
 
-        match self.trust.get(ip) {
-            Some(expected) if expected == seen => {}
-            Some(expected) => {
-                warn!(
+        let pinned = self.trust.get(ip);
+        if pinned.is_empty() {
+            // 只在"这个地址上见到的证书变了"（含第一次）时说一句 —— 与 `state::remember_peer_fingerprint`
+            // 那条刷屏同一个毛病，同一种修法：**未配对**的设备永远进不了 `pinned`（那张表只从
+            // 凭据库来，见 `seed`），于是它的**每一次握手**都落在这一支。按 `info` 记就等于
+            // "每次连接一条"，而重复同一枚证书不是新闻 —— 这一跳上"换了"才是。
+            if self.trust.observed.lock().get(&ip) != Some(&seen) {
+                info!(
                     %ip,
-                    expected = %short_fingerprint(&expected),
                     seen = %short_fingerprint(&seen),
-                    "对端证书指纹与钉住的不一致，拒绝连接"
+                    "首次见到该地址的证书，按 TOFU 认下并记住"
                 );
-                return Err(rejected());
+            } else {
+                debug!(
+                    %ip,
+                    seen = %short_fingerprint(&seen),
+                    "这一跳仍是那枚没钉住的证书（这个地址上已经见过）"
+                );
             }
-            None => {
-                // 只在"这个地址上见到的证书变了"（含第一次）时说一句 —— 与 `state::remember_peer_fingerprint`
-                // 那条刷屏同一个毛病，同一种修法：**未配对**的设备永远进不了 `pinned`（那张表只从
-                // 凭据库来，见 `seed`），于是它的**每一次握手**都落在这一支。按 `info` 记就等于
-                // "每次连接一条"，而重复同一枚证书不是新闻 —— 这一跳上"换了"才是。
-                if self.trust.observed.lock().get(&ip) != Some(&seen) {
-                    info!(
-                        %ip,
-                        seen = %short_fingerprint(&seen),
-                        "首次见到该地址的证书，按 TOFU 认下并记住"
-                    );
-                } else {
-                    debug!(
-                        %ip,
-                        seen = %short_fingerprint(&seen),
-                        "这一跳仍是那枚没钉住的证书（这个地址上已经见过）"
-                    );
-                }
-            }
+        } else if !self.trust.accepts(ip, &seen) {
+            warn!(
+                %ip,
+                pinned = ?pinned.iter().map(|fp| short_fingerprint(fp)).collect::<Vec<_>>(),
+                seen = %short_fingerprint(&seen),
+                "对端证书指纹与钉住的不一致，拒绝连接"
+            );
+            return Err(rejected());
         }
         self.trust.observe(ip, seen);
         Ok(ServerCertVerified::assertion())
@@ -460,23 +565,137 @@ impl ServerCertVerifier for PinnedVerifier {
     }
 }
 
+/// 这条 TLS 连接上出示的客户端证书指纹（没有出示 = `None`）。
+///
+/// 由 `dispatch_conn` 在握手完成后塞进每个请求的 extensions：配对那一跳用它核对
+/// 请求体里自报的指纹（见 `server::routes_pair::bound_peer_fingerprint`）。
+///
+/// **它不是身份认证**：证书是任意自签证书，本机只认"这条连接确实持有这把私钥"。
+/// 真正的身份锚仍是凭据库里钉住的指纹；把自报指纹绑到连接上只保证"谁说的就是谁出示的"，
+/// **不解决**配对那一刻有人在中间（两端各看到中间人的证书时，两边仍会各自钉住它 ——
+/// 那需要配对码带外核对，见模块头）。
+#[derive(Debug, Clone, Default)]
+pub struct ClientCertFingerprint(pub Option<String>);
+
+/// 接受任意客户端证书的校验器：本机不用证书链判断身份，只把证书交给应用层。
+///
+/// 自签证书没有 CA 可验，放行任意证书是刻意的；但握手签名仍按标准验 —— 证书是谁不重要，
+/// "它确实持有这把私钥"很重要。`offer_client_auth` 打开、`client_auth_mandatory` 关掉：
+/// 新客户端会带证书，老客户端不带也照常握手（配对那一跳再决定要不要信它）。
+#[derive(Debug)]
+struct AnyClientCert;
+
+impl ClientCertVerifier for AnyClientCert {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// 拨号方向（我们是对端）用的 TLS 配置。
+///
+/// **同时出示本机证书**：对端在配对那一跳据此看到本机真实的证书指纹，不必再相信
+/// 请求体里自报的那一句。对端不请求客户端证书时（老版本）rustls 不会发，握手照旧。
 pub fn client_config(trust: Arc<Trust>) -> Arc<rustls::ClientConfig> {
-    let config = rustls::ClientConfig::builder_with_provider(provider())
+    let config = match load_or_create_identity() {
+        Ok(identity) => {
+            let builder = rustls::ClientConfig::builder_with_provider(provider())
+                .with_safe_default_protocol_versions()
+                .expect("ring provider 支持默认协议版本")
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(PinnedVerifier {
+                    trust: trust.clone(),
+                }));
+            match builder.with_client_auth_cert(
+                vec![identity.cert_der.clone()],
+                identity.key_der.clone_key(),
+            ) {
+                Ok(config) => config,
+                Err(e) => {
+                    // 证书与私钥不配套（身份文件被手改过）：不带证书继续，配对那一跳会
+                    // 因为"自报了指纹却拿不出证书"被拒，日志里能对上。
+                    warn!(%e, "本机证书与私钥不配套，出站连接不带客户端证书");
+                    client_config_without_cert(trust)
+                }
+            }
+        }
+        Err(e) => {
+            warn!(%e, "本机身份读取失败，出站连接不带客户端证书");
+            client_config_without_cert(trust)
+        }
+    };
+    Arc::new(config)
+}
+
+/// 读不出身份时的退路：与改动前的客户端配置一字不差（不带客户端证书）。
+fn client_config_without_cert(trust: Arc<Trust>) -> rustls::ClientConfig {
+    rustls::ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .expect("ring provider 支持默认协议版本")
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedVerifier { trust }))
-        .with_no_client_auth();
-    Arc::new(config)
+        .with_no_client_auth()
 }
 
 /// 监听方向（对端拨我们）用的 TLS 配置。
+///
+/// 请求客户端证书但不强制：新客户端带、老客户端不带。握手完成后
+/// `dispatch_conn` 把出示的证书指纹塞进请求 extensions，配对路由据此核对自报值。
 pub fn server_config(identity: &Identity) -> Arc<rustls::ServerConfig> {
     let config = rustls::ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .expect("ring provider 支持默认协议版本")
-        .with_no_client_auth()
+        .with_client_cert_verifier(Arc::new(AnyClientCert))
         .with_single_cert(
             vec![identity.cert_der.clone()],
             identity.key_der.clone_key(),
@@ -513,6 +732,12 @@ pub fn trust() -> Arc<Trust> {
     TRUST.clone()
 }
 
+/// 本机证书指纹。配对请求/回执带上它，双方可以在**配对完成时**就钉住对方，
+/// 不必等下一次 TLS 连接再按 TOFU 认（那样会留下一个空指纹窗口）。
+pub fn local_fingerprint() -> Result<String, String> {
+    Ok(load_or_create_identity()?.fingerprint)
+}
+
 /// 流式响应一帧多大（`ReaderStream::with_capacity` 的容量）。
 ///
 /// `ReaderStream::new` 用的是 tokio-util 的默认值 **4096**：每 4KB 就要过一次
@@ -526,9 +751,19 @@ pub const STREAM_CHUNK: usize = 256 * 1024;
 /// 各处超时不同（探活 1.5s、配对邀请 75s、拖拽 30s），所以给的是 builder 而不是
 /// 一个成品客户端；`client()` 是"没有特殊超时需求"时的那一个。
 pub fn client_builder() -> reqwest::ClientBuilder {
+    client_builder_with_trust(trust())
+}
+
+/// 用一份**指定的**信任表建 client（配对那一跳、以及按目标钉住的带 token 拨号）。
+///
+/// 配对要从"这一次握手实际看到的证书"算出 AAD，而进程级 `Trust` 的 `observed`
+/// 是"每个地址一格"——并发的探活/别的配对会把它覆盖掉。给配对一把只属于这次流程的
+/// 空表（`Trust::new()`）：TOFU 照常接受，`observed_at` 只记录这条 client 看到的证书，
+/// 互不打架。带 token 的拨号则用 [`Trust::scoped`]：只钉目标那一枚。
+pub fn client_builder_with_trust(trust: Arc<Trust>) -> reqwest::ClientBuilder {
     install_crypto_provider();
     reqwest::Client::builder()
-        .use_preconfigured_tls((*client_config(trust())).clone())
+        .use_preconfigured_tls((*client_config(trust)).clone())
         // 数据面全是小写入（256KB 帧、4MB 块），默认的 Nagle 会和延迟 ACK 互相等：
         // 关掉它，写多少发多少。对端那一侧另有 `set_nodelay`（见 `dispatch_conn`）。
         .tcp_nodelay(true)
@@ -536,6 +771,172 @@ pub fn client_builder() -> reqwest::ClientBuilder {
 
 pub fn client() -> reqwest::Client {
     CLIENT.clone()
+}
+
+/// `/pair/info` 回话的体积上限：正常只有 id/name/port 几百字节。
+pub const PAIR_INFO_BODY_MAX: usize = 64 * 1024;
+
+/// 控制面回话（`/discover`、`/relay/open`、路由回执）的体积上限：形状是设备列表，
+/// 正常只有几 KB；1MB 已能装下几千台设备。
+pub const CONTROL_BODY_MAX: usize = 1024 * 1024;
+
+/// 在上限内读完一个响应体。
+///
+/// **别用 `Response::bytes()` / `.json()`**：它们先把整个身体读进内存再解析，而对端与
+/// 镜像都是不可信的——对方只要不停写（或者不给 `Content-Length`、一点点地滴），进程就会
+/// 被撑爆。这里先看声明值尽早拒绝，再按块累计，越过上限立刻放弃（声明值可以是假的）。
+///
+/// 调用方负责总超时：本函数只保证内存有界，不保证时间有界。
+pub async fn read_body_capped(
+    mut resp: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, String> {
+    if let Some(len) = resp.content_length() {
+        if len > max as u64 {
+            return Err(format!("响应太大（{len} 字节，上限 {max} 字节）"));
+        }
+    }
+    let hint = resp.content_length().unwrap_or(0).min(max as u64) as usize;
+    let mut body = Vec::with_capacity(hint);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("读响应失败：{e}"))?
+    {
+        if body.len().saturating_add(chunk.len()) > max {
+            return Err(format!("响应超过上限（{max} 字节）"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// [`read_body_capped`] + 文本（对端拒绝时的错误正文）：正文只用于显示原因，不能被
+/// 对端用一个无限长的字符串撑爆内存。
+pub async fn read_text_capped(resp: reqwest::Response, max: usize) -> Result<String, String> {
+    let body = read_body_capped(resp, max).await?;
+    Ok(String::from_utf8_lossy(&body).to_string())
+}
+
+/// [`read_body_capped`] + JSON 解析（`/pair/info` 这类对端回话）。
+pub async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    max: usize,
+) -> Result<T, String> {
+    let body = read_body_capped(resp, max).await?;
+    serde_json::from_slice(&body).map_err(|e| format!("响应不是合法 JSON：{e}"))
+}
+
+/// 按 `(地址, 期望指纹, 超时)` 缓存的、**按目标钉住**的客户端。
+///
+/// 缓存而不是每次新建：探活是 5s 一拍、镜像水合是每个区间一次 —— 每次都建客户端等于
+/// 每次重新握手（真机实测每段多几十毫秒）。键里带指纹，所以凭据一变自然换一把 client，
+/// 旧连接池不会被新的期望复用。
+static DIAL_CLIENTS: LazyLock<Mutex<HashMap<(String, String, u64, u64, u64), reqwest::Client>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 缓存上限：正常机器上一台设备一条（地址/指纹变了会多留一条旧键）。满了整表清掉 ——
+/// 重建一次握手而已，比维护 LRU 简单。
+const DIAL_CLIENT_CACHE_MAX: usize = 128;
+
+/// 到**这一台目标设备**的客户端（见 [`DialPin`] 与 [`Trust::scoped`]）。
+///
+/// 所有**带 token** 的对端拨号都必须用它，不能复用全局 [`client`]：全局表的键只有 IP，
+/// 同一地址上有另一台已配对设备的指纹时，那张证书也会被放行 —— 目标设备的 token 就
+/// 发给了它。这里按 `host + 目标指纹` 建表，那个地址上只认目标这一枚。
+///
+/// 不设默认超时：调用点一律在请求上写自己的 `.timeout(…)`（探活 1.5s、邀请 75s、
+/// 中转控制面 6s…）；需要默认超时的用 [`dial_client_timeout`]。
+pub fn dial_client(host: &str, pin: &DialPin) -> reqwest::Client {
+    dial_client_inner(host, pin, None, None, None)
+}
+
+/// [`dial_client`] 的带默认总超时版本（同一套缓存，超时参与键）。
+pub fn dial_client_timeout(host: &str, pin: &DialPin, timeout: Duration) -> reqwest::Client {
+    dial_client_inner(host, pin, None, Some(timeout), None)
+}
+
+/// [`dial_client`] 的"连接 + 总时长"版本（文件的元数据/分块请求要短连接超时、宽总超时）。
+pub fn dial_client_with_timeouts(
+    host: &str,
+    pin: &DialPin,
+    connect_timeout: Duration,
+    timeout: Duration,
+) -> reqwest::Client {
+    dial_client_inner(host, pin, Some(connect_timeout), Some(timeout), None)
+}
+
+/// 流式下载用的客户端：**不设总时长**（一个几十 GB 的传输本来就要跑很久），但给底层
+/// socket 每次读加一个空闲上限。对端收下请求后不再发字节时，`req.send()` / 响应流读取
+/// 会在 `read_timeout` 后失败，而不是永久挂住 worker（P1：接收数据面无限等待）。
+pub fn dial_client_streaming(
+    host: &str,
+    pin: &DialPin,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> reqwest::Client {
+    dial_client_inner(
+        host,
+        pin,
+        Some(connect_timeout),
+        None,
+        Some(read_timeout),
+    )
+}
+
+fn dial_client_inner(
+    host: &str,
+    pin: &DialPin,
+    connect_timeout: Option<Duration>,
+    timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+) -> reqwest::Client {
+    // 回环沿用既有豁免：本机测试 / 同机多实例没有"局域网地址被投毒"这一层。
+    let pin = if parse_host(host).is_some_and(|ip| ip.is_loopback()) {
+        DialPin::Tofu
+    } else {
+        pin.clone()
+    };
+    let pin_key = match &pin {
+        DialPin::Fingerprint(fp) => format!("fp:{fp}"),
+        DialPin::Tofu => "tofu".to_string(),
+        DialPin::Deny => "deny".to_string(),
+    };
+    let key = (
+        host.to_string(),
+        pin_key,
+        connect_timeout.map(|t| t.as_millis() as u64).unwrap_or(0),
+        timeout.map(|t| t.as_millis() as u64).unwrap_or(0),
+        read_timeout.map(|t| t.as_millis() as u64).unwrap_or(0),
+    );
+    if let Some(client) = DIAL_CLIENTS.lock().get(&key) {
+        return client.clone();
+    }
+    let mut builder = client_builder_with_trust(Trust::scoped(host, &pin));
+    if let Some(connect_timeout) = connect_timeout {
+        builder = builder.connect_timeout(connect_timeout);
+    }
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
+    if let Some(read_timeout) = read_timeout {
+        builder = builder.read_timeout(read_timeout);
+    }
+    let client = match builder.build() {
+        Ok(client) => client,
+        Err(e) => {
+            // 退回默认客户端（只信公共根证书）：自签对端本来就连不上，最多是这一跳失败；
+            // 绝不退回"不校验"，那等于把 token 发给任何出示证书的一方。
+            warn!(%host, "按目标钉住的 HTTP 客户端建不起来: {e}");
+            reqwest::Client::new()
+        }
+    };
+    let mut clients = DIAL_CLIENTS.lock();
+    if clients.len() >= DIAL_CLIENT_CACHE_MAX {
+        clients.clear();
+    }
+    clients.insert(key, client.clone());
+    client
 }
 
 /// 对端的入口：`https://ip:port`。
@@ -589,7 +990,12 @@ pub fn observed_dial_target(
     reported_port: u16,
     listening: u16,
 ) -> Option<(String, u16)> {
-    if is_own_endpoint(source, reported_port, listening, &crate::server::interface_addresses()) {
+    if is_own_endpoint(
+        source,
+        reported_port,
+        listening,
+        &crate::server::interface_addresses(),
+    ) {
         return None;
     }
     Some((source.to_string(), reported_port))
@@ -634,7 +1040,11 @@ pub async fn serve(
     // 同时驻留的连接上限（[`MAX_CONNECTIONS`]）：每个监听循环一份。重启（`stop_server` +
     // `start_server`）会换一份新的，而上一代已经在跑的任务本来就不归这里管 —— 两代合起来
     // 也仍是 2×N 的有界值，不是无界。
-    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let remote_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS - LOOPBACK_CONNECTIONS));
+    let loopback_slots = Arc::new(Semaphore::new(LOOPBACK_CONNECTIONS));
+    // 每个远程来源单独记账：先过这道闸门，再过全局名额。反过来的话，一台机器占满
+    // 448 个名额之后，别的设备连"被按 IP 记账"这一步都走不到。
+    let per_ip_slots = Arc::new(IpConnLimit::new(MAX_CONNECTIONS_PER_REMOTE_IP));
     loop {
         let accepted = tokio::select! {
             _ = &mut shutdown => {
@@ -650,8 +1060,32 @@ pub async fn serve(
                 continue;
             }
         };
+        // 先过"单 IP"这道闸门：回环不记（UI/BC 单独有名额），远程一台主机最多
+        // `MAX_CONNECTIONS_PER_REMOTE_IP` 条。到顶就把这条连接丢掉（`stream` 在这里
+        // drop = 关掉它），不排队。
+        let ip_guard = if addr.ip().is_loopback() {
+            None
+        } else {
+            match per_ip_slots.try_acquire(addr.ip()) {
+                Some(guard) => Some(guard),
+                None => {
+                    debug!(
+                        %addr,
+                        limit = MAX_CONNECTIONS_PER_REMOTE_IP,
+                        "该来源的并发连接已达上限，丢弃这条新连接"
+                    );
+                    continue;
+                }
+            }
+        };
+
         // 名额拿到才建任务；拿不到就把这条连接丢掉（`stream` 在这里 drop = 关掉它）。
-        let Some(permit) = acquire_slot(&slots) else {
+        let slots = if addr.ip().is_loopback() {
+            &loopback_slots
+        } else {
+            &remote_slots
+        };
+        let Some(permit) = acquire_slot(slots) else {
             // 用 debug 而不是 warn：上限被打满时这里是**每连接一条**日志，而这条日志要防的
             // 正是"无界增长"—— 攻击期间别把内存的账挪到磁盘上。排障要看它时把日志级别调下来。
             debug!(%addr, limit = MAX_CONNECTIONS, "并发连接已达上限，丢弃这条新连接");
@@ -662,6 +1096,7 @@ pub async fn serve(
         tokio::spawn(async move {
             // 名额跟着这条连接走到头：任务收尾（正常/出错/握手超时）就自动还回去。
             let _permit = permit;
+            let _ip_guard = ip_guard;
             if let Err(e) = dispatch_conn(stream, addr, router, tls).await {
                 debug!(%addr, %e, "连接结束");
             }
@@ -674,6 +1109,57 @@ pub async fn serve(
 /// 单独成函数是为了能被单测直接钉住"只判能不能，不等"这个语义（见 `net.rs` 的测试）。
 fn acquire_slot(slots: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
     slots.clone().try_acquire_owned().ok()
+}
+
+/// 按来源 IP 记账的并发连接数（远程）。到顶同样**不排队**：丢新连接，名额跟着
+/// [`IpConnGuard`] 走到连接收尾自动还回去。
+///
+/// 单独一层是因为全局名额与这里防的不是一回事：一个防总量无界，一个防单点占满。
+#[derive(Debug)]
+struct IpConnLimit {
+    limit: usize,
+    counts: Mutex<HashMap<StdIpAddr, usize>>,
+}
+
+impl IpConnLimit {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            counts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 拿到 = 这条连接可以继续；`None` = 该 IP 已到上限，调用方丢弃这条连接。
+    fn try_acquire(self: &Arc<Self>, ip: StdIpAddr) -> Option<IpConnGuard> {
+        let mut counts = self.counts.lock();
+        let count = counts.entry(ip).or_insert(0);
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        Some(IpConnGuard {
+            ip,
+            slots: Arc::clone(self),
+        })
+    }
+}
+
+/// 一条远程连接占着的 IP 名额。drop = 还账；计数归零时顺手删表项，表不随历史 IP 长大。
+struct IpConnGuard {
+    ip: StdIpAddr,
+    slots: Arc<IpConnLimit>,
+}
+
+impl Drop for IpConnGuard {
+    fn drop(&mut self) {
+        let mut counts = self.slots.counts.lock();
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
 }
 
 async fn dispatch_conn(
@@ -704,7 +1190,16 @@ async fn dispatch_conn(
             .await
             .map_err(|_| "TLS 握手超时".to_string())?
             .map_err(|e| e.to_string())?;
-        return serve_http(stream, addr, router).await;
+        // 握手已经完成：把对端出示的客户端证书（如果有）摘出来，交给请求处理层。
+        // 新客户端一定会带（`client_config` 里配了 `with_client_auth_cert`）；老版本不带。
+        let client_cert = stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|cert| ClientCertFingerprint(Some(fingerprint_of(cert.as_ref()))))
+            .unwrap_or_default();
+        return serve_http(stream, addr, router, client_cert).await;
     }
 
     // 明文只服务回环：本机 UI 的自验路径、以及 Beyond Compare 那条 WebDAV 入口
@@ -714,27 +1209,39 @@ async fn dispatch_conn(
         warn!(%addr, "非回环地址以明文 HTTP 连接，已拒绝");
         return Ok(());
     }
-    serve_http(stream, addr, router).await
+    serve_http(stream, addr, router, ClientCertFingerprint(None)).await
 }
 
-async fn serve_http<I>(io: I, addr: SocketAddr, router: Router) -> Result<(), String>
+async fn serve_http<I>(
+    io: I,
+    addr: SocketAddr,
+    router: Router,
+    client_cert: ClientCertFingerprint,
+) -> Result<(), String>
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let mut router = router.clone();
+        let client_cert = client_cert.clone();
         async move {
             let (mut parts, body) = req.into_parts();
             // `ConnectInfo` 是 `auth_middleware` 认"回环 = 本机"的依据，也是代理路由
             // 挡非回环的依据 —— 手写 accept 循环就得自己把它塞回去（`axum::serve` 是
             // 靠 `into_make_service_with_connect_info` 做的同一件事）。
             parts.extensions.insert(axum::extract::ConnectInfo(addr));
+            // 配对路由要核对"请求体里自报的指纹"是不是这条连接出示的那一枚。
+            parts.extensions.insert(client_cert);
             let req = hyper::Request::from_parts(parts, axum::body::Body::new(body));
             router.call(req).await
         }
     });
 
     hyper::server::conn::http1::Builder::new()
+        // 未认证连接可以先建 TCP 再慢慢发（或不发）请求头。没有这一条，512 个空闲
+        // 连接就能把整个监听占死；15 秒足够正常的慢网络完成请求头。
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(15))
         .serve_connection(hyper_util::rt::TokioIo::new(io), service)
         .with_upgrades()
         .await
@@ -774,8 +1281,7 @@ impl std::fmt::Display for DialError {
 /// io/超时错误，类型化判断只能这么找回来。判据是我们自己那个校验器返回的
 /// `ApplicationVerificationFailure`（见 `PinnedVerifier`）。
 pub fn is_identity_rejected(err: &(dyn std::error::Error + 'static)) -> bool {
-    let mut current = Some(err);
-    while let Some(err) = current {
+    fn visit(err: &(dyn std::error::Error + 'static)) -> bool {
         if let Some(rustls_err) = err.downcast_ref::<rustls::Error>() {
             return matches!(
                 rustls_err,
@@ -784,9 +1290,19 @@ pub fn is_identity_rejected(err: &(dyn std::error::Error + 'static)) -> bool {
                 )
             );
         }
-        current = err.source();
+        // `io::Error` 的 `source()` 对自定义错误返回的是**它包着那个错误的 source**，
+        // 不是它本身 —— reqwest/hyper 把 rustls 的错误包在 `io::Error::new(kind, rustls)`
+        // 里时，`source()` 链会静默跳过 rustls。`get_ref()` 能把它捞回来。
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if let Some(inner) = io.get_ref() {
+                if visit(inner) {
+                    return true;
+                }
+            }
+        }
+        err.source().is_some_and(visit)
     }
-    false
+    visit(err)
 }
 
 /// 拨一条到对端的加密 WS，并把 URL 里的 `wss://` 兑现成真的 TLS 连接。
@@ -798,6 +1314,7 @@ pub async fn connect_ws(
     url: &str,
     ip: &str,
     port: u16,
+    pin: &DialPin,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
     DialError,
@@ -807,13 +1324,15 @@ pub async fn connect_ws(
     let request = url
         .into_client_request()
         .map_err(|e| DialError::Unreachable(format!("WS 地址无效: {e}")))?;
-    let ip: StdIpAddr = parse_host(ip)
-        .ok_or_else(|| DialError::Unreachable(format!("地址无效: {ip}")))?;
+    let host = ip;
+    let ip: StdIpAddr =
+        parse_host(host).ok_or_else(|| DialError::Unreachable(format!("地址无效: {host}")))?;
 
     let tcp = TcpStream::connect(SocketAddr::new(ip, port))
         .await
         .map_err(|e| DialError::Unreachable(e.to_string()))?;
-    let connector = tokio_rustls::TlsConnector::from(client_config(trust()));
+    // 带 token 的链路必须按目标建表：全局表在共享地址上会接受别的设备的证书。
+    let connector = tokio_rustls::TlsConnector::from(client_config(Trust::scoped(host, pin)));
     let tls = connector
         .connect(ServerName::IpAddress(ip.into()), tcp)
         .await
@@ -850,22 +1369,87 @@ mod tests {
     /// 同一地址两枚不同指纹：**一枚都不钉**（挑一枚就会把另一台永远挡在门外）；
     /// 只有一枚时照旧钉住。
     #[test]
-    fn seed_refuses_an_ambiguous_address() {
+    fn seed_keeps_all_fingerprints_for_a_shared_relay_address() {
         let trust = Trust::new();
         trust.seed([
             ("10.0.0.9".to_string(), "aa".to_string()),
             ("10.0.0.9".to_string(), "bb".to_string()),
             ("10.0.0.8".to_string(), "cc".to_string()),
         ]);
-        assert_eq!(trust.get("10.0.0.9".parse().unwrap()), None, "有歧义的地址不钉");
-        assert_eq!(
-            trust.get("10.0.0.8".parse().unwrap()).as_deref(),
-            Some("cc"),
-            "没歧义的照旧钉"
+        let shared = "10.0.0.9".parse().unwrap();
+        assert!(
+            trust.accepts(shared, "aa"),
+            "中转地址上两枚目标指纹都要保留"
         );
-        // 歧义消失（比如那台旧的被解除配对了）→ 下一轮 seed 就正常钉上。
+        assert!(trust.accepts(shared, "bb"));
+        assert!(!trust.accepts(shared, "cc"));
+        assert!(trust.accepts("10.0.0.8".parse().unwrap(), "cc"));
+        // 只剩一台目标时，旧的那枚不应再被接受。
         trust.seed([("10.0.0.9".to_string(), "bb".to_string())]);
-        assert_eq!(trust.get("10.0.0.9".parse().unwrap()).as_deref(), Some("bb"));
+        assert!(!trust.accepts(shared, "aa"));
+        assert!(trust.accepts(shared, "bb"));
+    }
+
+    /// 共享地址上两枚指纹：**按目标建的临时表只认它自己那一枚**。
+    ///
+    /// 这是"带 token 的拨号不能复用全局表"的核心：全局表任一命中即放行，于是同一 IP
+    /// 上另一台已配对设备出示自己的证书也能过校验，随后目标设备的 token 就发给了它。
+    #[test]
+    fn scoped_trust_rejects_the_other_device_on_a_shared_address() {
+        let ip = "10.0.0.9".parse().unwrap();
+        let scoped = Trust::scoped("10.0.0.9", &DialPin::Fingerprint("aa".to_string()));
+        assert!(scoped.accepts(ip, "aa"), "目标自己的证书必须放行");
+        assert!(
+            !scoped.accepts(ip, "bb"),
+            "同一地址上另一台设备的证书必须拒绝 —— 否则 token 会发给它"
+        );
+
+        // 已配对但没有指纹：哨兵，任何证书都过不了。
+        let denied = Trust::scoped("10.0.0.9", &DialPin::Deny);
+        assert!(!denied.accepts(ip, "aa"));
+        assert!(!denied.accepts(ip, "bb"));
+
+        // 未配对：空表 = TOFU（沿用既有语义；`accepts` 只回答"是不是钉住的那枚"，
+        // 空表由校验器走 `pinned.is_empty()` 那一支放行）。
+        let tofu = Trust::scoped("10.0.0.9", &DialPin::Tofu);
+        assert!(tofu.get(ip).is_empty());
+    }
+
+    /// reqwest/hyper 把 rustls 的错误包进两层 `io::Error`，而 `io::Error::source()` 会跳过
+    /// 自定义错误的**内层本体**。这条链必须还能认出来，否则界面会把"指纹不符"画成"离线"。
+    #[test]
+    fn identity_rejection_is_found_through_nested_io_errors() {
+        let rejected = rustls::Error::InvalidCertificate(
+            rustls::CertificateError::ApplicationVerificationFailure,
+        );
+        let outer = std::io::Error::new(
+            std::io::ErrorKind::Other,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, rejected),
+        );
+        assert!(is_identity_rejected(&outer));
+
+        let other = std::io::Error::new(
+            std::io::ErrorKind::Other,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+            ),
+        );
+        assert!(
+            !is_identity_rejected(&other),
+            "别把过期/其它证书错误当成身份不符"
+        );
+    }
+
+    /// 回环豁免不能被"按目标钉住"顺手收紧：本机测试 / 同机多实例一直靠它。
+    #[test]
+    fn scoped_trust_keeps_the_loopback_exemption() {
+        let ip = "127.0.0.1".parse().unwrap();
+        let scoped = Trust::scoped("127.0.0.1", &DialPin::Deny);
+        assert!(
+            scoped.get(ip).is_empty(),
+            "回环不钉指纹：空表让校验器走 TOFU 那一支"
+        );
     }
 
     #[test]
@@ -891,15 +1475,26 @@ mod tests {
         let _ = std::fs::remove_file(identity_path());
     }
 
+    /// 空指纹的已配对记录用哨兵占位：任何真实证书都不匹配，出站 TLS 直接被拒。
+    #[test]
+    fn deny_fingerprint_rejects_every_real_certificate() {
+        let trust = Trust::new();
+        let ip: StdIpAddr = "10.0.0.9".parse().unwrap();
+        trust.seed([(ip.to_string(), DENY_FINGERPRINT.to_string())]);
+        assert!(!trust.accepts(ip, "aa"), "哨兵不能匹配任何真实指纹");
+        assert_eq!(trust.get(ip), vec![DENY_FINGERPRINT.to_string()]);
+    }
+
     #[test]
     fn trust_only_matches_the_pinned_fingerprint() {
         let trust = Trust::new();
         trust.seed([("10.0.0.5".to_string(), "aa".to_string())]);
         let ip: StdIpAddr = "10.0.0.5".parse().unwrap();
-        assert_eq!(trust.get(ip).as_deref(), Some("aa"));
-        assert_eq!(trust.get("10.0.0.6".parse().unwrap()), None);
+        assert!(trust.accepts(ip, "aa"));
+        assert!(!trust.accepts(ip, "bb"));
+        assert!(trust.get("10.0.0.6".parse().unwrap()).is_empty());
         trust.unpin(ip);
-        assert_eq!(trust.get(ip), None);
+        assert!(trust.get(ip).is_empty());
     }
 
     /// 来源地址什么时候**不能**当对端的拨号地址：它指的就是本机在听的那个端点。
@@ -998,12 +1593,61 @@ mod tests {
         let slots = Arc::new(Semaphore::new(2));
         let first = acquire_slot(&slots).expect("第一个名额");
         let second = acquire_slot(&slots).expect("第二个名额");
-        assert!(acquire_slot(&slots).is_none(), "满了就是没有名额，不是等一个出来");
+        assert!(
+            acquire_slot(&slots).is_none(),
+            "满了就是没有名额，不是等一个出来"
+        );
         drop(first);
         assert!(acquire_slot(&slots).is_some(), "连接收尾要把名额还回来");
         drop(second);
         // 上限本身是"远大于正常用量"的：正常同时打开在几十条（见 `MAX_CONNECTIONS`）。
-        assert!(MAX_CONNECTIONS >= 256, "上限不能小到正常用量就撞上：{MAX_CONNECTIONS}");
+        assert!(
+            MAX_CONNECTIONS >= 256,
+            "上限不能小到正常用量就撞上：{MAX_CONNECTIONS}"
+        );
+    }
+
+    /// 一台主机不能把所有远程名额都占掉：按 IP 记账，到顶就丢新连接（不排队），
+    /// 别的地址不受影响，连接收尾还账、表项随计数归零删掉。
+    #[test]
+    fn one_source_ip_cannot_take_every_remote_slot() {
+        let slots = Arc::new(IpConnLimit::new(2));
+        let a: StdIpAddr = "192.168.1.10".parse().unwrap();
+        let b: StdIpAddr = "192.168.1.11".parse().unwrap();
+
+        let first = slots.try_acquire(a).expect("第一条");
+        let second = slots.try_acquire(a).expect("第二条");
+        assert!(
+            slots.try_acquire(a).is_none(),
+            "同一 IP 到顶就是拒绝，不是等一个出来"
+        );
+        let other = slots.try_acquire(b).expect("别的设备不能被牵连");
+        assert_eq!(slots.counts.lock().get(&b).copied(), Some(1));
+
+        drop(first);
+        let third = slots.try_acquire(a).expect("连接收尾要把名额还回来");
+
+        drop(second);
+        assert_eq!(
+            slots.counts.lock().get(&a).copied(),
+            Some(1),
+            "还回来一条之后仍有一条在占着"
+        );
+        drop(third);
+        assert!(
+            slots.counts.lock().get(&a).is_none(),
+            "计数归零要删表项，表不能随历史 IP 长大"
+        );
+        drop(other);
+        assert!(slots.counts.lock().is_empty());
+
+        // 常量本身：一台主机的上限必须明显小于全局远程名额，否则这道闸门没有意义；
+        // 同时要盖住正常用量（长连接 + 至多 8 个传输 worker + 探活 ≈ 十几条）。
+        assert!(MAX_CONNECTIONS_PER_REMOTE_IP < MAX_CONNECTIONS - LOOPBACK_CONNECTIONS);
+        assert!(
+            MAX_CONNECTIONS_PER_REMOTE_IP >= 32,
+            "上限不能小到正常并发就撞上：{MAX_CONNECTIONS_PER_REMOTE_IP}"
+        );
     }
 
     /// TLS 握手没有下文时**必须**放手：连上、发一个 `0x16`（握手记录类型）就挂住 ——
@@ -1030,5 +1674,116 @@ mod tests {
             .expect("握手谈不完也必须收尾，不能永远挂着")
             .expect("任务不该 panic");
         assert_eq!(result.unwrap_err(), "TLS 握手超时");
+    }
+
+    /// 一个只答一次的裸 HTTP 服务端（`/pair/info` 的上限测试用）。
+    async fn one_shot_http(response: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}/pair/info")
+    }
+
+    /// 声明值超限：**不读身体**就该失败（响应头到了、正文一个字节都没发）。
+    ///
+    /// 旧写法 `Response::json()` 会先把身体读进内存再解析：这里它会读到 EOF、报"不是 JSON"，
+    /// 而在真机上对方只要继续写，读到的就是一个任意大的 `Vec`。
+    #[tokio::test]
+    async fn capped_json_rejects_a_declared_oversize_body() {
+        install_crypto_provider();
+        let url = one_shot_http(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1048576\r\n\r\n"
+                .to_string(),
+        )
+        .await;
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let err = read_json_capped::<serde_json::Value>(resp, 1024)
+            .await
+            .unwrap_err();
+        assert!(err.contains("太大"), "报错要指到体积上，实际：{err}");
+    }
+
+    /// 不给 `Content-Length`（chunked）时，按块累计也必须在上限处停下。
+    #[tokio::test]
+    async fn capped_json_stops_at_the_limit_without_a_length() {
+        install_crypto_provider();
+        let chunk = "x".repeat(4096);
+        let url = one_shot_http(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{chunk}\r\n0\r\n\r\n",
+            chunk.len()
+        ))
+        .await;
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let err = read_json_capped::<serde_json::Value>(resp, 1024)
+            .await
+            .unwrap_err();
+        assert!(err.contains("上限"), "报错要指到上限上，实际：{err}");
+    }
+
+    /// 正常的 `/pair/info` 回话照常解析（上限不能误伤）。
+    #[tokio::test]
+    async fn capped_json_reads_a_normal_pair_info() {
+        install_crypto_provider();
+        let body = r#"{"id":"abc","name":"小明"}"#;
+        let url = one_shot_http(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let value = read_json_capped::<serde_json::Value>(resp, PAIR_INFO_BODY_MAX)
+            .await
+            .unwrap();
+        assert_eq!(value["id"], "abc");
+        assert_eq!(value["name"], "小明");
+    }
+
+    /// 流式下载客户端：对端收下请求、发完响应头后停住，读取必须在上限内失败。
+    /// 这是 P1“接收数据面无限等待”的回归；正常持续出字节的传输不受影响。
+    #[tokio::test]
+    async fn streaming_client_times_out_a_stalled_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        install_crypto_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n")
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+
+        let client = dial_client_streaming(
+            "127.0.0.1",
+            &DialPin::Tofu,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        );
+        let resp = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(2), resp.bytes())
+            .await
+            .expect("读取必须在上限内返回")
+            .unwrap_err();
+        assert!(
+            err.is_timeout() || err.to_string().to_lowercase().contains("timed out"),
+            "应当是读超时，实际：{err}"
+        );
     }
 }

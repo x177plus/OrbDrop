@@ -1,4 +1,3 @@
-
 use std::sync::Arc;
 
 use axum::extract::{Extension, State};
@@ -29,7 +28,11 @@ pub async fn shares_handler(
         let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
         // 目录的大小要递归遍历，这里不给（对端设备页只是列清单）；文件的大小是现成的。
         let size = meta.as_ref().filter(|m| !m.is_dir()).map(|m| m.len());
-        let item_count = if is_dir { count_children(&s.path).await } else { None };
+        let item_count = if is_dir {
+            count_children(&s.path).await
+        } else {
+            None
+        };
         items.push(json!({
             "id": s.id,
             "name": s.name,

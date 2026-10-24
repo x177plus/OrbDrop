@@ -30,8 +30,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, info, warn};
 
-use super::stream::{self, StreamRequest, SKIP_NOT_IN_MANIFEST};
 use super::push_job::DownloadTarget;
+use super::stream::{self, StreamRequest, SKIP_NOT_IN_MANIFEST};
 
 /// 一次读取多大再发（与帧容量同量级；再大也换不来什么，只会多占内存）。
 const READ_CHUNK: usize = crate::net::STREAM_CHUNK;
@@ -117,7 +117,9 @@ pub async fn serve(
         let Some((offset, len)) = stream::block_range(size, req.block_size, task.index) else {
             // 对端按旧的大小算出来的块，现在这个文件已经没有那么长了。
             header.clear();
-            if stream::write_source_changed(&mut header, &task.path).await.is_err()
+            if stream::write_source_changed(&mut header, &task.path)
+                .await
+                .is_err()
                 || tx.send(std::mem::take(&mut header)).await.is_err()
             {
                 return;
@@ -211,5 +213,3 @@ async fn send_err(
     }
     tx.send(std::mem::take(header)).await.map_err(|_| ())
 }
-
-

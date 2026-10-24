@@ -43,6 +43,7 @@ fn remote_share_dir() -> PathBuf {
     std::fs::write(dir.join("big.bin"), big_payload()).unwrap();
     std::fs::write(dir.join("cancel.bin"), cancel_payload()).unwrap();
     std::fs::write(dir.join("small.txt"), SMALL).unwrap();
+    std::fs::write(dir.join("empty.bin"), b"").unwrap();
     std::fs::write(dir.join("sub").join("a.txt"), SUB_A).unwrap();
     std::fs::write(dir.join("sub").join("b.bin"), SUB_B).unwrap();
     dir
@@ -58,10 +59,7 @@ fn make_state(data_dir: &std::path::Path, port: u16) -> Arc<AppState> {
     config.bc_exe_path = None;
     config.download_dir = data_dir.join("downloads");
     let _ = std::fs::create_dir_all(&config.download_dir);
-    Arc::new(AppState::new(
-        config,
-        data_dir.join("config.toml"),
-    ))
+    Arc::new(AppState::new(config, data_dir.join("config.toml")))
 }
 
 /// 一个"当下没人监听"的端口：内核分配后立刻放掉（`start_server` 拿 0 当代号会返回 0）。
@@ -85,6 +83,51 @@ fn on_disk_bytes(path: &std::path::Path) -> u64 {
 
 use std::os::windows::ffi::OsStrExt;
 
+/// 把文件 mtime 拨到 `secs` 秒之前。模拟"对端文件很久没改过"——镜像占位符会继承这个 mtime。
+fn set_mtime_secs_ago(path: &std::path::Path, secs: u64) {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("打开远端源文件改 mtime");
+    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+        .expect("改 mtime");
+}
+
+/// 起一个子进程把文件打开并按住不放。`share` 是 `FileShare` 位掩码：
+/// 7 = 读写 + 删除共享（4.8 用它把"目标正在读"这件事变成 `is_busy` 为真）。
+///
+/// 它会先写一个 marker 文件，测试等 marker 出现再继续 —— 否则"打开"和"下一步删/放"
+/// 之间会有竞态，测不到想测的东西。
+fn spawn_file_holder(
+    path: &std::path::Path,
+    marker: &std::path::Path,
+    share: u32,
+    seconds: u32,
+) -> std::process::Child {
+    let path = path.to_string_lossy().replace('\'', "''");
+    let marker = marker.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "$fs=[IO.File]::Open('{path}','Open','Read',[IO.FileShare]{share}); \
+         New-Item -ItemType File -Path '{marker}' -Force | Out-Null; \
+         Start-Sleep -Seconds {seconds}; $fs.Close()"
+    );
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .spawn()
+        .expect("起一个按住文件的子进程")
+}
+
+async fn wait_for_marker(marker: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "子进程没打开占位符（marker 没出现）"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
     // 这条链路是"平台回调 → 我们"的，出问题时日志是唯一的线索（测试里默认不初始化 tracing，
@@ -92,12 +135,15 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
     // 平台回调那几句的 target 是 `orbdrop_lib::mirror::win`（`orbdrop=…` 只按 `::` 前缀匹配，
     // 盖不到它），所以两个都要放进来。
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("orbdrop=debug,orbdrop_lib=debug"))
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "orbdrop=debug,orbdrop_lib=debug",
+        ))
         .with_writer(std::io::stdout)
         .try_init();
 
     // 数据目录整包搬走：凭据、身份证书、镜像根全落在这个临时目录里，不碰真实数据。
-    let data_dir = std::env::temp_dir().join(format!("orbdrop_mirror_data_{}", uuid::Uuid::new_v4()));
+    let data_dir =
+        std::env::temp_dir().join(format!("orbdrop_mirror_data_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&data_dir).unwrap();
     std::env::set_var("ORBDROP_DATA_DIR", &data_dir);
 
@@ -105,7 +151,10 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
     let data_dir_cleanup = data_dir.clone();
     let share_root_cleanup = share_root.clone();
     // 从这一刻起，无论测试怎么结束（包括 panic）都会把镜像与临时目录收干净。
-    let _cleanup = Cleanup { data_dir: data_dir_cleanup, share_root: share_root_cleanup };
+    let _cleanup = Cleanup {
+        data_dir: data_dir_cleanup,
+        share_root: share_root_cleanup,
+    };
     let state = make_state(&data_dir, free_port());
     let share = ShareItem::new(share_root.clone());
     let share_id = share.id.clone();
@@ -126,7 +175,8 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
         online: true,
         paired: true,
         auto_connect: false,
-        paused: false, relay: None,
+        paused: false,
+        relay: None,
     });
     credential::set_peer(&peer, "mirror-test-token").unwrap();
 
@@ -141,7 +191,11 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
     let local = mirror::place(&state, &item).await.expect("放镜像");
 
     let meta = std::fs::metadata(&local).expect("占位符应当存在");
-    assert_eq!(meta.len() as usize, BIG_LEN, "占位符要报真实大小，否则目标会拷出 0 字节");
+    assert_eq!(
+        meta.len() as usize,
+        BIG_LEN,
+        "占位符要报真实大小，否则目标会拷出 0 字节"
+    );
     assert_eq!(
         on_disk_bytes(&local),
         0,
@@ -173,8 +227,16 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
     })
     .await
     .unwrap();
-    assert_eq!(got, big_payload(), "水合出来的字节必须与对端逐字节相同（含不对齐的末尾）");
-    println!("按 1 MiB 分段读（首次访问 = 边走网络边水合）：{} 段，耗时 {:?} ms", spans.len(), spans);
+    assert_eq!(
+        got,
+        big_payload(),
+        "水合出来的字节必须与对端逐字节相同（含不对齐的末尾）"
+    );
+    println!(
+        "按 1 MiB 分段读（首次访问 = 边走网络边水合）：{} 段，耗时 {:?} ms",
+        spans.len(),
+        spans
+    );
 
     // 再整份读一次：这次应当全在本地（不该再有水合回调）。
     let again_path = local.clone();
@@ -204,7 +266,9 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
         name: "cancel.bin".into(),
         is_dir: false,
     };
-    let cancel_local = mirror::place(&state, &cancel_item).await.expect("放镜像（撤销场景）");
+    let cancel_local = mirror::place(&state, &cancel_item)
+        .await
+        .expect("放镜像（撤销场景）");
     let probe = cancel_local.to_string_lossy().replace('\'', "''");
     let status = std::process::Command::new("powershell")
         .args([
@@ -231,7 +295,11 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("撤销之后平台重发的读没被交付：平台的请求一直挂着（= 实机上的卡死）")
         .expect("读回被撤销过的占位符");
-    assert_eq!(got, cancel_payload(), "撤销只该作废那次请求，不该影响后来重发的同一段");
+    assert_eq!(
+        got,
+        cancel_payload(),
+        "撤销只该作废那次请求，不该影响后来重发的同一段"
+    );
 
     // ---- 3. 目录镜像：目录占位符是"未填充"的，枚举它才长出子树 ----
     let dir_item = MirroredItem {
@@ -244,7 +312,9 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
     let dir_local = mirror::place(&state, &dir_item).await.expect("放目录镜像");
     {
         use std::os::windows::fs::MetadataExt;
-        let attrs = std::fs::symlink_metadata(&dir_local).expect("目录占位符").file_attributes();
+        let attrs = std::fs::symlink_metadata(&dir_local)
+            .expect("目录占位符")
+            .file_attributes();
         println!("目录占位符属性 = 0x{attrs:08X}（0x00400010 = RECALL_ON_DATA_ACCESS|DIRECTORY = 未填充）");
     }
     let dir_path = dir_local.clone();
@@ -271,7 +341,11 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert_eq!(names, vec!["a.txt".to_string(), "b.bin".to_string()], "子树应当按需长出来");
+    assert_eq!(
+        names,
+        vec!["a.txt".to_string(), "b.bin".to_string()],
+        "子树应当按需长出来"
+    );
 
     // 子项的字节也要能读出来（子占位符的身份 blob 指向的是**原始**远端路径）
     let child = dir_local.join("a.txt");
@@ -283,8 +357,247 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
     assert_eq!(child_bytes, SUB_A);
 
     // ---- 4. 幂等：同一项再放一次（镜像里已有同名占位符）不能失败 ----
-    let again = mirror::place(&state, &item).await.expect("重复放同一项应当幂等");
+    let again = mirror::place(&state, &item)
+        .await
+        .expect("重复放同一项应当幂等");
     assert_eq!(again, local);
+
+    // ---- 4.5 远端 mtime 很老的项，刚放进镜像也不能被 sweep 回收 ----
+    //
+    // 占位符的 mtime = 对端修改时间（这里拨到 7 小时前）。旧实现的 TTL 拿它当"放了多久"，
+    // 下一次 sweep（旧实现挂在每次拖拽前）会当场删掉刚放好的项 —— 实机上资源管理器复制到
+    // 一半，目标侧报"源文件已损坏或不可用、是否跳过"。回收年龄必须看本地放入时刻。
+    let old_remote = share_root.join("old.bin");
+    std::fs::write(
+        &old_remote,
+        b"remote mtime is ancient, mirror item is fresh",
+    )
+    .unwrap();
+    set_mtime_secs_ago(&old_remote, 7 * 60 * 60);
+    let old_item = MirroredItem {
+        peer_id: peer.clone(),
+        share_id: share_id.clone(),
+        path: "old.bin".into(),
+        name: "old.bin".into(),
+        is_dir: false,
+    };
+    let old_local = mirror::place(&state, &old_item)
+        .await
+        .expect("放一个远端 mtime 很老的项");
+    assert!(old_local.exists());
+    mirror::sweep();
+    assert!(
+        old_local.exists(),
+        "刚放入镜像的项不能因为占位符 mtime（对端修改时间）老而被回收"
+    );
+
+    // ---- 4.6 同名落点被换成普通文件：绝不删，改用不冲突的名字 ----
+    //
+    // 修复前这里是"删掉同名再建"：镜像根之外的越界落点（对端自报的 id 能拼出去）、用户
+    // 或别的程序放进镜像里的文件，都会被无声删掉（目录走 `remove_dir_all`，不可逆）。
+    // 现在只删**确认是本机 CFAPI 占位符**的项；普通文件一个字节都不能动，落点另起一个名字。
+    //
+    // "同一项重试沿用原名"没有变：占位符还在时走上面的复用 / 同名重建（4.65 与 4.8 各盯一半）。
+    // 这一条只覆盖"落点已经不归我们"的那一种 —— 安全优先于名字好看。
+    std::fs::write(
+        share_root.join("pending.bin"),
+        b"plain file holding the name",
+    )
+    .unwrap();
+    let pending_item = MirroredItem {
+        peer_id: peer.clone(),
+        share_id: share_id.clone(),
+        path: "pending.bin".into(),
+        name: "pending.bin".into(),
+        is_dir: false,
+    };
+    let pending_local = mirror::place(&state, &pending_item)
+        .await
+        .expect("放 pending 项");
+    // 把占位符换成**普通文件**：模拟"落点被外部接管"（修复前的越界落点就是这种形状）。
+    std::fs::remove_file(&pending_local).expect("删掉占位符");
+    std::fs::write(&pending_local, b"a file we did not create").expect("放一个普通文件占位");
+    let retried = mirror::place(&state, &pending_item)
+        .await
+        .expect("同名落点不归我们时，仍要能把这一项放进去");
+    assert_ne!(
+        retried, pending_local,
+        "普通文件不归我们处置：必须换名，不能删"
+    );
+    assert_eq!(
+        std::fs::read(&pending_local).unwrap(),
+        b"a file we did not create",
+        "那份普通文件必须原样还在"
+    );
+    assert!(
+        retried
+            .file_name()
+            .map(|n| n.to_string_lossy().contains("(2)"))
+            .unwrap_or(false),
+        "换名要可辨认，实际落点: {}",
+        retried.display()
+    );
+    assert!(retried.exists(), "换名后的占位符要真的存在");
+
+    // ---- 4.65 对端内容变了：同名重建，绝不换名 ----
+    //
+    // 同一项的重试/再拖必须落在同一个名字上（目标目录里那份文件继续/覆盖），即使远端
+    // 内容变了也只能刷新同名占位符，不能生成 `(2)`。
+    let change_remote = share_root.join("change.bin");
+    std::fs::write(&change_remote, b"first version").unwrap();
+    let change_item = MirroredItem {
+        peer_id: peer.clone(),
+        share_id: share_id.clone(),
+        path: "change.bin".into(),
+        name: "change.bin".into(),
+        is_dir: false,
+    };
+    let change_local = mirror::place(&state, &change_item)
+        .await
+        .expect("放 change 项");
+    let hydrate_path = change_local.clone();
+    let first = tokio::task::spawn_blocking(move || std::fs::read(&hydrate_path))
+        .await
+        .unwrap()
+        .expect("先读一遍原内容");
+    assert_eq!(first, b"first version");
+    std::fs::write(&change_remote, b"second version, longer").unwrap();
+    let rebuilt = mirror::place(&state, &change_item)
+        .await
+        .expect("对端内容变化后仍要能放（同名重建）");
+    assert_eq!(rebuilt, change_local, "同一项内容变化也只能沿用原名");
+    let rebuilt_path = rebuilt.clone();
+    let second = tokio::task::spawn_blocking(move || std::fs::read(&rebuilt_path))
+        .await
+        .unwrap()
+        .expect("读重建后的内容");
+    assert_eq!(second, b"second version, longer", "同名重建必须拿到新内容");
+
+    // ---- 4.7 空文件也必须能复制：0 字节不该被当成"空区间请求"判失败 ----
+    //
+    // 占位符的大小是 0 时，平台可能发一条长度为 0 的取数据请求。旧实现把 `end <= start`
+    // 一律判失败 —— 目标侧看到的就是"这个文件已损坏或不可用"。
+    let empty_item = MirroredItem {
+        peer_id: peer.clone(),
+        share_id: share_id.clone(),
+        path: "empty.bin".into(),
+        name: "empty.bin".into(),
+        is_dir: false,
+    };
+    let empty_local = mirror::place(&state, &empty_item).await.expect("放空文件");
+    let empty_copy = data_dir.join("empty-copy.bin");
+    let script = format!(
+        "Copy-Item -LiteralPath '{}' -Destination '{}' -Force",
+        empty_local.to_string_lossy().replace('\'', "''"),
+        empty_copy.to_string_lossy().replace('\'', "''")
+    );
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status()
+        .expect("起子进程复制空文件");
+    assert!(status.success(), "空文件也应当能复制出来");
+    assert_eq!(
+        std::fs::metadata(&empty_copy)
+            .expect("复制出来的空文件")
+            .len(),
+        0,
+        "空文件复制出来还是 0 字节"
+    );
+
+    // ---- 4.8 目标正在读同一项时，再拖一次必须复用原路径 ----
+    //
+    // 资源管理器还在复制时用户又拖了同一项：旧实现会先删同名再建 —— 正在复制的源
+    // 当场消失（目标报"源文件已损坏或不可用"），还可能留下 delete-pending。现在同名
+    // 同身份且 `is_busy` 为真时直接复用，绝不删。
+    std::fs::write(share_root.join("busy.bin"), b"busy source").unwrap();
+    let busy_item = MirroredItem {
+        peer_id: peer.clone(),
+        share_id: share_id.clone(),
+        path: "busy.bin".into(),
+        name: "busy.bin".into(),
+        is_dir: false,
+    };
+    let busy_local = mirror::place(&state, &busy_item).await.expect("放 busy 项");
+    let busy_marker = data_dir.join("busy-holder-ready");
+    let mut busy_holder = spawn_file_holder(&busy_local, &busy_marker, 7, 30);
+    wait_for_marker(&busy_marker).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !mirror::is_busy(&busy_local) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "打开回调没有记到这一项（is_busy 一直为假）"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let reused = mirror::place(&state, &busy_item)
+        .await
+        .expect("目标正在读时再放同一项");
+    assert_eq!(reused, busy_local, "同名同身份且正在被读：必须复用原路径");
+    assert!(busy_local.exists(), "正在被读的占位符不能被删掉");
+    let _ = busy_holder.kill();
+    let _ = busy_holder.wait();
+
+    // ---- 4.9 真实 shell 递归复制目录（资源管理器那条路的代理）----
+    //
+    // 目录占位符本身不下载字节；复制时平台枚举它（`FETCH_PLACEHOLDERS`）、为子项建占位符，
+    // 再由复制引擎逐个读。这里用 PowerShell 的递归复制把整棵树走一遍，确保子占位符的
+    // 元数据/身份/水合在真实目标进程里都能用。
+    let copy_dir = data_dir.join("copied-sub");
+    let script = format!(
+        "Copy-Item -LiteralPath '{}' -Destination '{}' -Recurse -Force",
+        dir_local.to_string_lossy().replace('\'', "''"),
+        copy_dir.to_string_lossy().replace('\'', "''")
+    );
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status()
+        .expect("起子进程递归复制目录");
+    assert!(status.success(), "递归复制目录应当成功");
+    assert_eq!(
+        std::fs::read(copy_dir.join("a.txt")).expect("复制出来的 a.txt"),
+        SUB_A,
+        "递归复制出来的子文件字节要一致"
+    );
+    assert_eq!(
+        std::fs::read(copy_dir.join("b.bin")).expect("复制出来的 b.bin"),
+        SUB_B,
+        "递归复制出来的子文件字节要一致"
+    );
+
+    // ---- 4.95 目录重拖：也必须沿用原名，子树要能重新枚举出来 ----
+    //
+    // 用户多半拖的是共享目录。重试同一目录时不能生成 `sub (2)`；复制刚结束/出错后重试，
+    // 同名复用或同名重建都行，但落点名字必须不变。
+    let dir_again = mirror::place(&state, &dir_item).await.expect("目录重拖");
+    assert_eq!(dir_again, dir_local, "目录重拖也必须沿用原名");
+    let mut names_again: Vec<String> = Vec::new();
+    for attempt in 0..50 {
+        let target = dir_again.to_string_lossy().to_string();
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "dir", "/b", &target])
+            .output()
+            .expect("起子进程重新枚举目录");
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        names_again = text
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        names_again.sort();
+        if !names_again.is_empty() {
+            println!(
+                "目录重拖后第 {attempt} 次枚举拿到 {}",
+                names_again.join(", ")
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        names_again,
+        vec!["a.txt".to_string(), "b.bin".to_string()],
+        "目录重拖后子树仍要能枚举出来"
+    );
 
     // ---- 5. 父目录链：平台会问"我们自己建出来的普通目录"的填充（实测踩过）----
     //
@@ -366,7 +679,11 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
     let paths = wait_payload(&state, &ticket.ticket).await;
     let stale = paths[0].clone();
     let meta = std::fs::metadata(&stale).expect("占位符");
-    assert!(meta.is_file(), "元数据说是文件，落点就必须是文件：{}", stale.display());
+    assert!(
+        meta.is_file(),
+        "元数据说是文件，落点就必须是文件：{}",
+        stale.display()
+    );
     assert_eq!(meta.len(), SMALL.len() as u64, "而且报的是真实大小");
 
     // ---- 8. 退出清干净：镜像树与同步根注册都不留 ----
@@ -374,7 +691,10 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
     assert!(mirror_root.exists(), "跑的时候镜像根应当在");
     mirror::shutdown();
     assert!(!mirror_root.exists(), "退出后镜像树应当被清掉");
-    assert!(!sync_root_registered(&mirror_root), "退出后不该还挂着同步根注册");
+    assert!(
+        !sync_root_registered(&mirror_root),
+        "退出后不该还挂着同步根注册"
+    );
 
     orbdrop_lib::server::stop_server(&state).await;
     credential::remove_peer(&peer).ok();
@@ -403,9 +723,7 @@ impl Drop for Cleanup {
 /// 缓冲区给小了会返回 `ERROR_MORE_DATA`，被读成"没注册"（实现里踩过这个坑）。
 fn sync_root_registered(path: &std::path::Path) -> bool {
     use windows::core::PCWSTR;
-    use windows::Win32::Storage::CloudFilters::{
-        CfGetSyncRootInfoByPath, CF_SYNC_ROOT_INFO_BASIC,
-    };
+    use windows::Win32::Storage::CloudFilters::{CfGetSyncRootInfoByPath, CF_SYNC_ROOT_INFO_BASIC};
     if !path.exists() {
         return false;
     }

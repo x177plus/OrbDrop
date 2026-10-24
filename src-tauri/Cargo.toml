@@ -25,12 +25,13 @@ serde_json = "1"
 toml = "0.8"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6", features = ["cors", "timeout"] }
 mdns-sd = "0.13"
 # 本机网卡地址枚举（mdns-sd 本来就带着它，这里直接用同一份，不额外多编一份）：左下角
 # 「端口 · 本机 IP」要显示内网地址，多网卡时还得把其余几个列出来。
 if-addrs = "0.13"
 sha2 = "0.10"
+ring = "0.17"
 notify = "7"
 quick-xml = "0.37"
 chrono = { version = "0.4", features = ["serde"] }
@@ -82,6 +83,17 @@ minisign-verify = "0.2"
 # 清单里的下载地址要做协议/主机判定（只放行 https 与环回 http），所以直接依赖 `url`
 # （reqwest 里那份就是它，不会重复编）。
 url = "2"
+# 配对码的 PAKE（`pake` 模块）：SPAKE2/P-256，6 位码只做口令、不上网。选 P-256 是为了
+# 与现有曲线/依赖量级一致；`pakery-*` 实现 RFC 9382（含双方确认值），省得自己写密码学。
+# `rand_core 0.10` / `getrandom 0.4` 是它要求的 RNG 版本，与业务侧的 `rand 0.8` 并存
+# （两套互不影响）。注意：这套实现没有第三方审计记录，升级时先看它的变更。
+pakery-spake2 = "0.6"
+pakery-crypto = { version = "0.6", default-features = false, features = ["std", "spake2", "p256"] }
+rand_core = "0.10"
+getrandom = { version = "0.4", features = ["sys_rng"] }
+pakery-core = "0.6"
+hkdf = "0.12"
+zeroize = "1"
 
 [dev-dependencies]
 # 集成测试里那个"老版本对端"桩要自己起一个 **TLS** 服务端（对端那一跳已经全是 TLS，

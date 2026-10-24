@@ -3,18 +3,24 @@ pub mod autostart;
 // bc 不能门控：pair.rs / server::proxy / routes_pair.rs 这些共享协议路径也用它的
 // DAV_USER 常量与 profile 预写（后者在非 Win/mac 上因 locate_exe 返回 None 而自然空转）。
 pub mod bc;
-/// 会话里图片消息的**内容**（`<数据目录>/chat-blobs/`）：消息本体只留元数据，字节单独一份文件。
+/// 会话里图片消息的**内容**（`<数据目录>/chat-vault/blobs/`）：消息本体只留元数据，
+/// 字节单独一份文件；文件本身是封装格式（见 `envelope`）。
 pub mod blobs;
 pub mod chat;
 pub mod config;
 pub mod credential;
 pub mod discover;
 pub mod drag;
+/// 会话数据的防随手查看封装（**不是加密**，见模块注释）。
+pub mod envelope;
 #[cfg(desktop)]
 pub mod fs_browse;
 pub mod group;
+pub mod group_identity;
 #[cfg(desktop)]
 pub mod hit_region;
+/// 对端自报标识符（设备 id / 共享项 id）的形态校验：它们会被当成本地路径段与 URL 路径段用。
+pub mod ids;
 pub mod link;
 pub mod log;
 pub mod mirror;
@@ -28,10 +34,12 @@ pub mod notify;
 #[cfg(desktop)]
 pub mod orb_window;
 pub mod pair;
+pub mod pake;
 /// 粘贴进来的图片：字节 → 暂存文件（会话里"发图片"走推送那条路，只认本机真实路径）。
 pub mod paste;
 pub mod peer_fs;
 pub mod relay;
+pub mod sas;
 pub mod server;
 pub mod share;
 pub mod state;
@@ -39,9 +47,9 @@ pub mod state;
 pub mod subnet;
 pub mod system_settings;
 pub mod task;
+pub mod transfer;
 #[cfg(desktop)]
 pub mod tray;
-pub mod transfer;
 pub mod unsendable;
 pub mod update;
 pub mod ws;
@@ -52,9 +60,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(desktop)]
 use tauri::WebviewWindow;
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -98,12 +106,24 @@ struct ShareProbe {
 fn probe_share(path: &Path) -> ShareProbe {
     let Ok(meta) = std::fs::metadata(path) else {
         // 被删 / 无权限：连类型都不猜，两个数都给 `None`，界面退回「文件」这种中性说法。
-        return ShareProbe { is_dir: false, size: None, item_count: None };
+        return ShareProbe {
+            is_dir: false,
+            size: None,
+            item_count: None,
+        };
     };
     if meta.is_dir() {
-        ShareProbe { is_dir: true, size: None, item_count: count_children(path) }
+        ShareProbe {
+            is_dir: true,
+            size: None,
+            item_count: count_children(path),
+        }
     } else {
-        ShareProbe { is_dir: false, size: Some(meta.len()), item_count: None }
+        ShareProbe {
+            is_dir: false,
+            size: Some(meta.len()),
+            item_count: None,
+        }
     }
 }
 
@@ -293,7 +313,10 @@ async fn list_shares(state: State<'_, Arc<AppState>>) -> Result<Vec<ShareItemDto
     // 先锁一下配置把清单抄出来就放锁：`MutexGuard` 不是 `Send`，抱着它进不了阻塞线程。
     let shares = state.config.lock().shares.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        shares.iter().map(|s| ShareItemDto::new(s, probe_share(&s.path))).collect()
+        shares
+            .iter()
+            .map(|s| ShareItemDto::new(s, probe_share(&s.path)))
+            .collect()
     })
     .await
     .map_err(|e| format!("读取共享项失败：{e}"))
@@ -315,9 +338,16 @@ fn remove_share(share_id: String, state: State<'_, Arc<AppState>>) -> Result<(),
 }
 
 #[tauri::command]
-fn rename_share(share_id: String, name: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+fn rename_share(
+    share_id: String,
+    name: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
     let mut config = state.config.lock();
-    let share = config.shares.iter_mut().find(|s| s.id == share_id)
+    let share = config
+        .shares
+        .iter_mut()
+        .find(|s| s.id == share_id)
         .ok_or_else(|| format!("共享项不存在: {share_id}"))?;
     share.name = name;
     config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
@@ -340,13 +370,20 @@ fn toggle_broadcast(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     let mut config = state.config.lock();
-    let share = config.shares.iter_mut().find(|s| s.id == req.share_id)
+    let share = config
+        .shares
+        .iter_mut()
+        .find(|s| s.id == req.share_id)
         .ok_or_else(|| format!("共享项不存在: {}", req.share_id))?;
     share.broadcast_enabled = req.enabled;
     config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
     drop(config);
     notify_shares_changed(state.inner());
-    info!(share_id = req.share_id, enabled = req.enabled, "broadcast toggled");
+    info!(
+        share_id = req.share_id,
+        enabled = req.enabled,
+        "broadcast toggled"
+    );
     Ok(())
 }
 
@@ -384,8 +421,8 @@ async fn update_settings(
         config.device_subdir = req.device_subdir;
         config.device_name = req.device_name.clone();
         config.auto_start = req.auto_start;
-        config.bc_exe_path = Some(PathBuf::from(req.bc_exe_path.trim()))
-            .filter(|p| !p.as_os_str().is_empty());
+        config.bc_exe_path =
+            Some(PathBuf::from(req.bc_exe_path.trim())).filter(|p| !p.as_os_str().is_empty());
         config.orb_shape = req.orb_shape;
         config.auto_broadcast_new = req.auto_broadcast_new;
         config.group_relay = req.group_relay;
@@ -469,10 +506,7 @@ async fn update_settings(
 /// 没有上下文（启动、设置面板）时传 `null`。
 #[cfg(desktop)]
 #[tauri::command]
-fn bc_status(
-    slot_for: Option<String>,
-    state: State<'_, Arc<AppState>>,
-) -> bc::BcStatusDto {
+fn bc_status(slot_for: Option<String>, state: State<'_, Arc<AppState>>) -> bc::BcStatusDto {
     let prefer = match slot_for.as_deref() {
         Some("file") => Some(bc::ShellSlot::File),
         Some("folder") => Some(bc::ShellSlot::Folder),
@@ -496,10 +530,7 @@ fn bc_set_left(
 /// 对端共享项给 `profile:<ip:port>?<shareId>/<路径>`（顺手写好 WebDAV profile）。
 #[cfg(desktop)]
 #[tauri::command]
-fn bc_compare_with_left(
-    target: BcTarget,
-    state: State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+fn bc_compare_with_left(target: BcTarget, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     bc::compare_with_left(state.inner(), &target)
 }
 
@@ -538,32 +569,49 @@ fn list_devices(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
     // 死锁面（两处顺序不同就够）。设备表本身很小（一屏设备数），拷一份不值一提。
     let peers = state.peers.lock().clone();
     let remarks = state.config.lock().device_remarks.clone();
-    peers.iter().map(|p| {
-    serde_json::json!({
-        "id": p.id,
-        "name": p.name,
-        "ip": p.ip,
-        "port": p.port,
-        "online": p.online,
-        "paired": p.paired,
-        // 「看得见但连不上」（F-106）：记录还在（对端在喊），但探活没成 —— 界面据此把这一行
-        // 留在列表里，并在用户**发起连接**时补一句"这张网可能把单播隔开了"；**不是**一个状态档
-        // （那一行照常画「未绑定」/「离线」）。`online` 的定义不动（探活成功 = 真连得上）。
-        "seen": state.is_seen(&p.id),
-        // 此刻是不是经别人中转（F-106）：**不上界面**（用户要求，两端都不写「经 X 中转」），
-        // 只留给前端 `unicastBlocked` 那条判据 —— 它区分"拨的是借来的中转端点"与"直连不通"。
-        "relayVia": p.relay_via(),
-        // Real WS link state — "长连接" in the UI follows this, not `online`
-        // (a peer can answer HTTP push invites without any WS session).
-        "connected": state.ws.has_connection(&p.id),
-        // 没连着的时候"为什么"：重连中 / 等对端上线 / 已停止（对端断开过、token 失效…）。
-        // 界面把它显示成人话，用户才知道该等、该点「连接」、还是该重新配对。
-        "linkState": state.ws.link_state(&p.id),
-        // 本机给这台设备起的备注（F-101）：只存在本机，**不参与任何对外报文** ——
-        // 界面把它拼成显示名「备注(设备名)」（前端 `deviceDisplayName`）。
-        "remark": remarks.get(&p.id),
-    })
-    }).collect()
+    // 读一次凭据库就够：`verified` 是"已配对且指纹已钉住"，界面用它决定状态点实心/空心。
+    // 读失败时不要把已配对设备全画成"未验证"——退回 `paired`，避免一次瞬时抖动让满屏变空心。
+    let credentials = crate::credential::load_credentials();
+    peers
+        .iter()
+        .map(|p| {
+            let connected = state.ws.has_connection(&p.id);
+            let verified = connected
+                || match &credentials {
+                    Ok(map) => {
+                        p.paired && map.get(&p.id).is_some_and(|c| !c.fingerprint.is_empty())
+                    }
+                    Err(_) => p.paired,
+                };
+            serde_json::json!({
+                "id": p.id,
+                "name": p.name,
+                "ip": p.ip,
+                "port": p.port,
+                "online": p.online,
+                "paired": p.paired,
+                // 「看得见但连不上」（F-106）：记录还在（对端在喊），但探活没成 —— 界面据此把这一行
+                // 留在列表里，并在用户**发起连接**时补一句"这张网可能把单播隔开了"；**不是**一个状态档
+                // （那一行照常画「未绑定」/「离线」）。`online` 的定义不动（探活成功 = 真连得上）。
+                "seen": state.is_seen(&p.id),
+                // 此刻是不是经别人中转（F-106）：**不上界面**（用户要求，两端都不写「经 X 中转」），
+                // 只留给前端 `unicastBlocked` 那条判据 —— 它区分"拨的是借来的中转端点"与"直连不通"。
+                "relayVia": p.relay_via(),
+                // Real WS link state — "长连接" in the UI follows this, not `online`
+                // (a peer can answer HTTP push invites without any WS session).
+                "connected": connected,
+                // 已配对且证书指纹已钉住（或这条长连接已经证明过）：界面用它决定状态点的
+                // 实心/空心。未配对、已配对但指纹为空的老记录都是 false。
+                "verified": verified,
+                // 没连着的时候"为什么"：重连中 / 等对端上线 / 已停止（对端断开过、token 失效…）。
+                // 界面把它显示成人话，用户才知道该等、该点「连接」、还是该重新配对。
+                "linkState": state.ws.link_state(&p.id),
+                // 本机给这台设备起的备注（F-101）：只存在本机，**不参与任何对外报文** ——
+                // 界面把它拼成显示名「备注(设备名)」（前端 `deviceDisplayName`）。
+                "remark": remarks.get(&p.id),
+            })
+        })
+        .collect()
 }
 
 /// F-107：本机的中转记忆（网段级策略 + 各自的池 + 设备级链路）。
@@ -578,10 +626,7 @@ fn relay_memory(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
 /// F-107：清掉中转记忆。`target_cidr` 给了就只清那一条网段级策略（连同挂在它上面的设备级
 /// 链路），不给就全清。返回清掉的条数。
 #[tauri::command]
-fn clear_relay_memory(
-    target_cidr: Option<String>,
-    state: State<'_, Arc<AppState>>,
-) -> usize {
+fn clear_relay_memory(target_cidr: Option<String>, state: State<'_, Arc<AppState>>) -> usize {
     state.clear_relay_memory(target_cidr.as_deref())
 }
 
@@ -653,7 +698,9 @@ fn set_device_remark(
 /// 设备名而不是备注）。备注是**本机的用户数据**（`config.toml` 的 `deviceRemarks`，键是设备 id），
 /// 与"此刻有没有那一行"无关，所以按 id 单独给一份。
 #[tauri::command]
-fn list_device_remarks(state: State<'_, Arc<AppState>>) -> std::collections::HashMap<String, String> {
+fn list_device_remarks(
+    state: State<'_, Arc<AppState>>,
+) -> std::collections::HashMap<String, String> {
     state.config.lock().device_remarks.clone()
 }
 
@@ -713,16 +760,25 @@ pub fn apply_offline(arc: &Arc<AppState>) {
 ///
 /// 注册的记录里带着端口与设备名，所以每次都是"丢掉旧 daemon、按新参数再注册一个"。
 fn register_mdns(state: &Arc<AppState>, port: u16) {
+    register_mdns_scoped(state, port, discover::Scope::current());
+}
+
+/// `register_mdns` 的可指定作用域版本（单测要固定用 LAN，不能受 `ORBDROP_ALLOW_MULTI` 影响）。
+fn register_mdns_scoped(state: &Arc<AppState>, port: u16, scope: discover::Scope) {
     // 旧的那一份**先撤下来**：改名/换端口都是"替换"，不是"再加一条"。而且必须
     // 注销 + 关掉 daemon（`discover::release`），只丢句柄的话旧记录会一直挂在网上 ——
     // 对端每次解析到它，就把旧名字写回设备行一次。
     release_mdns(state);
     let (device_name, device_id, allow_relay) = {
         let cfg = state.config.lock();
-        (cfg.device_name.clone(), cfg.device_id.clone(), cfg.allow_relay)
+        (
+            cfg.device_name.clone(),
+            cfg.device_id.clone(),
+            cfg.allow_relay,
+        )
     };
     // 注册失败时保持"没有注册"（`None`）：留着一个空的注册等于以为自己在网上。
-    *state.mdns_reg.lock() = discover::register(port, &device_name, &device_id, allow_relay);
+    *state.mdns_reg.lock() = discover::register(port, &device_name, &device_id, allow_relay, scope);
 }
 
 /// 撤下当前 mDNS 注册（换注册、切「离线」共用）。
@@ -788,7 +844,11 @@ pub(crate) fn apply_online(
 }
 
 #[tauri::command]
-fn set_online(online: bool, state: State<'_, Arc<AppState>>, app: AppHandle) -> Result<bool, String> {
+fn set_online(
+    online: bool,
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> Result<bool, String> {
     apply_online(state.inner(), &app, online)
 }
 
@@ -910,16 +970,34 @@ const MANUAL_PORT_SCAN: u16 = 10;
 ///
 /// `port == 0` = 用户没填端口：从默认端口起探 `MANUAL_PORT_SCAN` 个（见 `manual_peer`）。
 #[tauri::command]
-async fn add_peer(ip: String, port: u16, state: State<'_, Arc<AppState>>) -> Result<PeerDevice, String> {
+async fn add_peer(
+    ip: String,
+    port: u16,
+    state: State<'_, Arc<AppState>>,
+) -> Result<PeerDevice, String> {
     let own_id = state.config.lock().device_id.clone();
     let (port, info) = manual_peer(&ip, port, &own_id).await?;
     let id = info["id"].as_str().unwrap_or("").to_string();
     let name = info["name"].as_str().unwrap_or(&ip).to_string();
-    let peer = PeerDevice { id, name, ip, port, online: true, paired: false, ..Default::default() };
+    let peer = PeerDevice {
+        id,
+        name,
+        ip,
+        port,
+        online: true,
+        paired: false,
+        ..Default::default()
+    };
     state.add_peer_book(peer.clone());
+    // 手动添加这一跳刚做过 TLS 握手：把对端证书指纹记成未配对设备的身份锚。
+    // 换 IP 时靠它判断“回来的还是不是那一台”。
+    crate::state::remember_peer_fingerprint(state.inner(), &peer.id, &peer.ip);
     // 另一半（F-11）：到对方那个地址上自报一次，让它也建一行（见 `notify_manual_add`）。
     // 甩到后台：最坏要等满 1.5s 超时，而"添加"在本机已经成立，不该被它拖住。
-    crate::task::spawn("manual add hello", notify_manual_add(state.inner().clone(), peer.clone()));
+    crate::task::spawn(
+        "manual add hello",
+        notify_manual_add(state.inner().clone(), peer.clone()),
+    );
     Ok(peer)
 }
 
@@ -942,16 +1020,11 @@ async fn notify_manual_add(state: Arc<AppState>, peer: PeerDevice) {
         (config.device_id.clone(), config.device_name.clone())
     };
     let url = format!("{}/pair/hello", net::peer_base(&peer.ip, peer.port));
-    let client = match net::client_builder()
-        .timeout(std::time::Duration::from_millis(1500))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(peer = %peer.id, "failed to build a client for the manual-add hello: {e}");
-            return;
-        }
-    };
+    let client = net::dial_client_timeout(
+        &peer.ip,
+        &peer.dial_pin(),
+        std::time::Duration::from_millis(1500),
+    );
     let mut req = client.post(&url).json(&serde_json::json!({
         "peerId": own_id,
         "peerName": own_name,
@@ -965,7 +1038,9 @@ async fn notify_manual_add(state: Arc<AppState>, peer: PeerDevice) {
             info!(peer = %peer.id, "peer told about the manual add")
         }
         // 404 = 对端还是老版本（没有这条路由）；503 = 它此刻隐身。都不是错误。
-        Ok(resp) => info!(peer = %peer.id, status = %resp.status(), "peer did not register this device"),
+        Ok(resp) => {
+            info!(peer = %peer.id, status = %resp.status(), "peer did not register this device")
+        }
         Err(e) => info!(peer = %peer.id, "peer unreachable for the manual-add hello: {e}"),
     }
 }
@@ -982,7 +1057,11 @@ async fn notify_manual_add(state: Arc<AppState>, peer: PeerDevice) {
 /// **本机自己那一台要跳过**（`own_id`）：跨网段手动添加时用户完全可能把自己那台的 IP 粘进来
 /// （从 footer 复制 `IP:端口` 那条路就是这么用的），而扫描时本机在默认端口上一定答话 ——
 /// 不跳过就会"添加了自己"，设备列表里多一行自己，后面所有关系判定都跟着乱。
-async fn manual_peer(ip: &str, port: u16, own_id: &str) -> Result<(u16, serde_json::Value), String> {
+async fn manual_peer(
+    ip: &str,
+    port: u16,
+    own_id: &str,
+) -> Result<(u16, serde_json::Value), String> {
     manual_peer_from(ip, port, crate::config::default_port(), own_id).await
 }
 
@@ -999,10 +1078,9 @@ async fn manual_peer_from(
         .timeout(std::time::Duration::from_millis(1500))
         .build()
         .map_err(|e| format!("HTTP 客户端建不起来: {e}"))?;
-    let answers = futures_util::future::join_all(
-        ports.iter().map(|p| probe_pair_info(&client, ip, *p)),
-    )
-    .await;
+    let answers =
+        futures_util::future::join_all(ports.iter().map(|p| probe_pair_info(&client, ip, *p)))
+            .await;
     let mut self_only = false;
     for (p, answer) in ports.iter().zip(answers) {
         let Some(info) = answer else { continue };
@@ -1032,7 +1110,9 @@ fn manual_scan_ports(port: u16, base: u16) -> Vec<u16> {
     if port != 0 {
         return vec![port];
     }
-    (0..MANUAL_PORT_SCAN).map(|i| base.saturating_add(i)).collect()
+    (0..MANUAL_PORT_SCAN)
+        .map(|i| base.saturating_add(i))
+        .collect()
 }
 
 /// 问一次 `ip:port` 的 `/pair/info`：**HTTP 200 + 合法 JSON** 才算"有人答话"。
@@ -1045,8 +1125,15 @@ async fn probe_pair_info(
     port: u16,
 ) -> Option<serde_json::Value> {
     let url = format!("{}/pair/info", net::peer_base(ip, port));
-    let resp = client.get(&url).send().await.ok()?.error_for_status().ok()?;
-    resp.json::<serde_json::Value>().await.ok()
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    // 这一段里可能开着任何服务（不一定是 OrbDrop）：回话体积按 `/pair/info` 的上限截断。
+    net::read_json_capped(resp, net::PAIR_INFO_BODY_MAX).await.ok()
 }
 
 /// 解除配对（F-14）：**先清本机**（这是本机动作，对端在不在网上都不该挡在这里），
@@ -1063,12 +1150,17 @@ async fn probe_pair_info(
 /// 本机只清 token 与配对标记、**保留设备行**：对方还在网络上看得见，就该继续
 /// 以"未绑定"出现在列表里（离线时前端自然不显示）。
 pub async fn unpair_peer(state: &Arc<AppState>, peer_id: &str) -> Result<(), String> {
-    let peer = state.get_peer(peer_id).ok_or_else(|| "设备不存在".to_string())?;
+    let peer = state
+        .get_peer(peer_id)
+        .ok_or_else(|| "设备不存在".to_string())?;
 
     // 通知对端要用的三样东西（token 必须在本机删除之前读出来）。
     // body 里的 peerId 是**本机自己的 id**：对端要解除的是"调用方这台设备"
     // （与 WS 事件 `Unpair { peer_id: 本机 id }` 的语义一致）。远端调用时身份
     // 由 token 反解、这个字段只是冗余；同机回环调用没有 token 可解，就靠它。
+    // 指纹要在删除凭据**之前**读出来：删完就只剩"没有关系"了，而这条通知要带着
+    // 旧 token 走，必须按旧指纹钉住（未见过的通道不发 token）。
+    let old_fingerprint = credential::get_peer_fingerprint(peer_id).ok().flatten();
     let notice = if peer.ip.is_empty() || peer.port == 0 {
         None
     } else {
@@ -1078,10 +1170,14 @@ pub async fn unpair_peer(state: &Arc<AppState>, peer_id: &str) -> Result<(), Str
             .map(|token| {
                 let url = format!("{}/unpair", net::peer_base(peer.dial().0, peer.dial().1));
                 let own_id = state.config.lock().device_id.clone();
-                (url, token, own_id)
+                let pin = match old_fingerprint.as_deref() {
+                    Some(fp) if !fp.is_empty() => net::DialPin::Fingerprint(fp.to_string()),
+                    _ if peer.paired => net::DialPin::Deny,
+                    _ => net::DialPin::Tofu,
+                };
+                (url, token, own_id, peer.dial().0.to_string(), pin)
             })
     };
-
     credential::remove_peer(peer_id).map_err(|e| e.to_string())?;
     state.ws.drop_peer(peer_id);
     state.unpair(peer_id);
@@ -1093,15 +1189,21 @@ pub async fn unpair_peer(state: &Arc<AppState>, peer_id: &str) -> Result<(), Str
     // 指纹也一起忘掉：这一段关系结束了，地址再被别人拿到时不该还拿着旧指纹去比对
     // （那条地址现在是"没见过的对端"，走 TOFU 重新认）。
     if let Ok(ip) = peer.ip.parse() {
-        net::trust().unpin(ip);
+        match old_fingerprint.as_deref() {
+            Some(fp) if !fp.is_empty() => net::trust().unpin_fingerprint(ip, fp),
+            _ => net::trust().unpin(ip),
+        }
     }
     state::refresh_trust(state);
 
     // 本机这一侧已经解除完毕（上面全是本地动作），通知对端是**尽力而为**的后话：
     // 谁也不能保证它此刻在网上，最坏要等满 3s 超时 —— 所以在这里甩出去，不让它
     // 拖住用户看到的"已解除"。
-    if let Some((url, token, own_id)) = notice {
-        crate::task::spawn("unpair notice", notify_unpair(peer_id.to_string(), url, token, own_id));
+    if let Some((url, token, own_id, host, pin)) = notice {
+        crate::task::spawn(
+            "unpair notice",
+            notify_unpair(peer_id.to_string(), url, token, own_id, host, pin),
+        );
     }
     Ok(())
 }
@@ -1110,17 +1212,15 @@ pub async fn unpair_peer(state: &Arc<AppState>, peer_id: &str) -> Result<(), Str
 ///
 /// 与 `unpair_peer` 分开放，是因为调用方**不**等它（见那里的注释）。发不出去不等于
 /// 白做：对端下次拿旧 token 来拨号/请求时会吃 401，界面上就是「需重新配对」。
-async fn notify_unpair(peer_id: String, url: String, token: String, own_id: String) {
-    let client = match net::client_builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(%peer_id, "failed to build a client for the unpair notice: {e}");
-            return;
-        }
-    };
+async fn notify_unpair(
+    peer_id: String,
+    url: String,
+    token: String,
+    own_id: String,
+    host: String,
+    pin: net::DialPin,
+) {
+    let client = net::dial_client_timeout(&host, &pin, std::time::Duration::from_secs(3));
     match client
         .post(&url)
         .bearer_auth(&token)
@@ -1162,6 +1262,8 @@ pub fn wipe_all_credentials(state: &Arc<AppState>) -> Result<usize, String> {
         state.ws.drop_peer(id);
         state.unpair(id);
     }
+    // 观察指纹也是"认识过谁"的一部分：全清之后不该还留着旧身份的锚。
+    state.clear_observed_fingerprints();
     #[cfg(desktop)]
     bc::provision_profiles(state);
     // 凭据全清了，钉住的指纹也就没有归属了：Trust 表跟着清空，地址上的对端从此按
@@ -1193,58 +1295,82 @@ fn pair_start(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<String
     Ok(state.pair.create_code())
 }
 
-/// Confirm pairing with a code shown on the peer's screen. The peer verifies it
-/// and hands back the token we store for it.
+/// Confirm pairing with a code shown on the peer's screen.
+///
+/// 6 位码只作为 **SPAKE2 口令**参与交换，不上网、不能离线枚举；两端确认值一致才落库。
+/// 失败时对端不会拿到 token，本机也不会钉任何指纹。
 #[tauri::command]
-async fn pair_confirm(peer_id: String, code: String, state: State<'_, Arc<AppState>>) -> Result<String, String> {
+async fn pair_confirm(
+    peer_id: String,
+    code: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
     ensure_online(&state)?;
-    let peer = state.get_peer(&peer_id).ok_or_else(|| "设备不存在".to_string())?;
+    let code = code.trim().to_string();
+    if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+        return Err("请输入 6 位数字配对码".to_string());
+    }
+    let peer = state
+        .get_peer(&peer_id)
+        .ok_or_else(|| "设备不存在".to_string())?;
     let own_id = state.config.lock().device_id.clone();
     let own_name = state.config.lock().device_name.clone();
 
-    // 用户点了「配对」= 明确要（重新）建立关系：这个地址上钉着的旧指纹先让位，
-    // 否则这次拨号会在 TLS 那一跳被"指纹不一致"直接拒掉（见 `pair::forget_stale_pin`）。
-    pair::forget_stale_pin(&state, &peer_id);
-    let url = format!("{}/pair", net::peer_base(peer.dial().0, peer.dial().1));
+    // 配对成功之前**不动**旧指纹/旧凭据：失败（输错码、网络断、PAKE 不通过）不能把
+    // 一段好好的关系弄成"已配对但没有指纹"的 Deny 状态。下面这次探测与 PAKE 用的是
+    // 专用信任表（`Trust::new()`），旧 pin 本来也挡不住它们；成功时
+    // `commit_pairing_with_fingerprint` 会写回权威指纹并 `refresh_trust`。
+    let (host, port) = peer.dial();
+    let base = net::peer_base(host, port);
+
+    // 专用 client + 专用信任表：第一次请求（`/pair/info`）必然是新握手，`observed_at`
+    // 只记录这条 client 看到的证书。**不要**用全局 `net::client()` / 全局 `Trust`：
+    // 池里的旧连接不会再握手，`observed` 也可能被并发的探活/别的配对覆盖。
+    let probe_trust = Arc::new(net::Trust::new());
+    let client = net::client_builder_with_trust(probe_trust.clone())
+        .build()
+        .map_err(|e| format!("创建连接失败: {e}"))?;
+    let probe = client
+        .get(format!("{base}/pair/info"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| format!("联系不上「{}」：{e}", peer.name))?;
+    if !probe.status().is_success() {
+        return Err(format!("「{}」此刻不在线", peer.name));
+    }
+    let peer_fp = probe_trust
+        .observed_at(host)
+        .filter(|fp| !fp.is_empty())
+        .ok_or_else(|| "没有取得对端证书指纹（这条连接不是 TLS？）".to_string())?;
+    let own_fp = net::local_fingerprint()?;
+    let session = uuid::Uuid::new_v4().to_string();
+
     // Our own HTTP port: the peer we post to may be the side that dials the WS
     // link (smaller device id) and it has no other way to learn our address.
     let own_port = bound_port(&state);
-    let client = net::client();
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({
-            "peerId": own_id,
-            "peerName": own_name,
-            "peerPort": own_port,
-            "code": code,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("配对确认失败: {e}"))?;
-
-    if !resp.status().is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("配对失败: {text}"));
-    }
-
-    let result: serde_json::Value = resp.json().await.map_err(|e| format!("响应解析失败: {e}"))?;
-    let token = result["token"].as_str().ok_or_else(|| "未收到 token".to_string())?.to_string();
-    let remote_id = result["peerId"].as_str().unwrap_or(&peer_id).to_string();
-    let remote_name = result["peerName"].as_str().unwrap_or(&peer.name).to_string();
+    let payload = crate::pake::run_client(
+        &client, &base, &session, &own_id, &own_name, own_port, &peer_id, &code, &own_fp, &peer_fp,
+    )
+    .await?;
 
     // Store token under the peer's actual id + mark paired （与邀请那条路共用同一段落库：
     // 凭据、地址簿、BC profile 预写、界面事件）。
-    let peer_name = remote_name.clone();
-    pair::commit_pairing(
+    let peer_name = payload.peer_name.clone();
+    pair::commit_pairing_with_fingerprint(
         state.inner(),
         pair::PairedPeer {
-            id: remote_id,
-            name: remote_name,
+            id: payload.peer_id,
+            name: payload.peer_name,
             ip: peer.ip.clone(),
             port: peer.port,
+            // 这条连接实际看到的证书，不是回执里那句自报。
+            fingerprint: peer_fp.clone(),
         },
-        &token,
+        &payload.token,
         None,
+        // PAKE 的 AAD 已经把它绑进确认值；直接钉，不再让全局 observed 覆盖。
+        &peer_fp,
     )?;
 
     // 配对只确立"已配对"关系：长连接等用户自己点「连接」再建（不再自动拨号）。
@@ -1258,14 +1384,20 @@ async fn pair_confirm(peer_id: String, code: String, state: State<'_, Arc<AppSta
 /// 发起配对邀请：对端在它自己的通知里点「接收」即可完成配对，不需要任何人输入配对码。
 /// 返回邀请 id；对方接受与否走 `pair://completed` / `pair://invite_failed` 事件回来。
 #[tauri::command]
-async fn pair_invite(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<String, String> {
+async fn pair_invite(
+    peer_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<pair::PairInviteStart, String> {
     ensure_online(&state)?;
     pair::invite_peer(state.inner().clone(), &peer_id).await
 }
 
 /// 撤回一条还没被处理的配对邀请（用户点了「取消」）：对端界面上那条通知跟着撤掉。
 #[tauri::command]
-async fn cancel_pair_invite(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+async fn cancel_pair_invite(
+    invite_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
     pair::withdraw_invite_remote(state.inner().clone(), &invite_id).await
 }
 
@@ -1273,7 +1405,10 @@ async fn cancel_pair_invite(invite_id: String, state: State<'_, Arc<AppState>>) 
 ///
 /// **同步命令是安全的**：它只做内存/文件写（凭据、地址簿、BC profile），不起后台任务。
 #[tauri::command]
-fn accept_pair_invite(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<String, String> {
+fn accept_pair_invite(
+    invite_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
     pair::accept_invite(state.inner(), &invite_id)
 }
 
@@ -1340,7 +1475,10 @@ fn read_image_data_url(path: String) -> Result<String, String> {
 
 /// 发送方取消一整批推送：逐台走 `cancel_push`（两个阶段为什么都要通知对端，见那里）。
 #[tauri::command]
-async fn cancel_push_batch(batch_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+async fn cancel_push_batch(
+    batch_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
     transfer::cancel_push_batch(&state, &batch_id)
 }
 
@@ -1379,6 +1517,28 @@ async fn cancel_push(invite_id: String, state: State<'_, Arc<AppState>>) -> Resu
 async fn cancel_receive(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     transfer::cancel_receive(&state, &invite_id);
     Ok(())
+}
+
+/// 暂停 / 继续一次**会话里正在接收**的推送（界面点那条文件气泡右侧的圆环）。
+///
+/// 与 `set_browse_download_paused` 同一个闸门、同一套语义：`true` = 找到了正在跑的那条接收
+/// 并改了闸门；`false` = 它已经收尾（完成 / 失败 / 取消），界面据此把那圈退回。暂停只让接收
+/// 循环在下一块之前停住，**不删 `.orbdrop-part`、不重置已落盘的内容**；继续就是同一条任务
+/// 接着拉。闸门只活在内存里（`AppState::receive_downloads`），进程重启后接收按续传记录自己跑。
+#[tauri::command]
+fn set_push_receive_paused(
+    invite_id: String,
+    paused: bool,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let control = state.receive_downloads.lock().get(&invite_id).cloned();
+    match control {
+        Some(control) => {
+            control.set_paused(paused);
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1427,6 +1587,12 @@ fn chat_send(
     let text = text.trim().to_string();
     if text.is_empty() {
         return Err("消息为空".to_string());
+    }
+    if text.len() > group::MAX_TEXT_BYTES {
+        return Err(format!(
+            "消息过长（上限 {} KB）",
+            group::MAX_TEXT_BYTES / 1024
+        ));
     }
     // 去重 + 只认本机设备表里有的 id（设备刚被移除时界面可能还捏着它）。
     let mut targets: Vec<String> = Vec::new();
@@ -1520,10 +1686,17 @@ pub struct BatchRef {
 /// 两条路都走它：**新建群发**（不点名 → 复用/新建）与会话里的**「编辑收件人」**（点名 →
 /// 成员当场落定，不必等到下次发送）。`id` 已经不在名单里（另一边删掉了）时按"没点名"走。
 #[tauri::command]
-fn chat_batch_ensure(members: Vec<String>, id: Option<String>, state: State<'_, Arc<AppState>>) -> BatchRef {
+fn chat_batch_ensure(
+    members: Vec<String>,
+    id: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> BatchRef {
     let id = state.chat.resolve_batch(id.as_deref(), &members);
     group::emit(&state);
-    BatchRef { id, snapshot: group::snapshot(&state) }
+    BatchRef {
+        id,
+        snapshot: group::snapshot(&state),
+    }
 }
 
 /// 改群发的名字（新建时命名 / 会话里的「编辑收件人与群发名称」）。名字留空 = 「群发 · 未命名群发」。
@@ -1585,15 +1758,34 @@ pub struct GroupRef {
 ///
 /// 对方收到名册 = 界面上一张**邀请卡**，点了「加入」才算进群（未知群的第一份名册要人确认）。
 #[tauri::command]
-fn group_create(members: Vec<String>, name: String, state: State<'_, Arc<AppState>>) -> Result<GroupRef, String> {
-    let id = group::create(&state, &members, &name).ok_or_else(|| "至少要选一台设备".to_string())?;
+fn group_create(
+    members: Vec<String>,
+    name: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<GroupRef, String> {
+    if state.groups.group_count() >= group::MAX_GROUPS {
+        return Err(format!(
+            "群数量已达上限（{} 个），请先退出一个群",
+            group::MAX_GROUPS
+        ));
+    }
+    let id =
+        group::create(&state, &members, &name).ok_or_else(|| "至少要选一台设备".to_string())?;
     group::emit(&state);
-    Ok(GroupRef { id, snapshot: group::snapshot(&state) })
+    Ok(GroupRef {
+        id,
+        snapshot: group::snapshot(&state),
+    })
 }
 
 /// 改群名 / 加减成员：名册版本 +1 后广播（对等的 LWW：任何成员都能改，冲突留一个胜者）。
 #[tauri::command]
-fn group_edit(id: String, members: Vec<String>, name: String, state: State<'_, Arc<AppState>>) -> Result<group::Snapshot, String> {
+fn group_edit(
+    id: String,
+    members: Vec<String>,
+    name: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<group::Snapshot, String> {
     if !group::edit(&state, &id, &members, &name) {
         return Err("群聊不存在".to_string());
     }
@@ -1605,14 +1797,23 @@ fn group_edit(id: String, members: Vec<String>, name: String, state: State<'_, A
 ///
 /// `at` = 点名这条消息在时间线上的位置（输入区"图文混排"的每一段会点名，见 `chat_send`）。
 #[tauri::command]
-fn group_send(id: String, text: String, at: Option<u64>, state: State<'_, Arc<AppState>>) -> Result<GroupRef, String> {
+fn group_send(
+    id: String,
+    text: String,
+    at: Option<u64>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<GroupRef, String> {
     ensure_online(&state)?;
     let text = text.trim().to_string();
     if text.is_empty() {
         return Err("消息为空".to_string());
     }
-    let msg_id = group::send_text(&state, &id, &text, at).ok_or_else(|| "本机不在这个群里".to_string())?;
-    Ok(GroupRef { id: msg_id, snapshot: group::snapshot(&state) })
+    let msg_id =
+        group::send_text(&state, &id, &text, at).ok_or_else(|| "本机不在这个群里".to_string())?;
+    Ok(GroupRef {
+        id: msg_id,
+        snapshot: group::snapshot(&state),
+    })
 }
 
 /// 在群里发一张**图片消息**（输入框里粘一张图就是走这一条）。
@@ -1634,7 +1835,10 @@ fn group_send_image(
     let bytes = std::fs::read(&path).map_err(|e| format!("读不到那张图（{path}）：{e}"))?;
     let msg_id = group::send_image(&state, &id, &name, &bytes, at)?
         .ok_or_else(|| "本机不在这个群里".to_string())?;
-    Ok(GroupRef { id: msg_id, snapshot: group::snapshot(&state) })
+    Ok(GroupRef {
+        id: msg_id,
+        snapshot: group::snapshot(&state),
+    })
 }
 
 /// 界面读过这个群：推进本地读位，并给每个成员回一条**逐发送者水位**的已读回执。
@@ -1657,6 +1861,12 @@ fn group_sync(id: String, state: State<'_, Arc<AppState>>) -> group::Snapshot {
 /// 用户点了邀请卡上的「加入」。
 #[tauri::command]
 fn group_join(id: String, state: State<'_, Arc<AppState>>) -> Result<group::Snapshot, String> {
+    if state.groups.group_count() >= group::MAX_GROUPS {
+        return Err(format!(
+            "群数量已达上限（{} 个），请先退出一个群",
+            group::MAX_GROUPS
+        ));
+    }
     if !group::accept(&state, &id) {
         return Err("邀请已经不在列表里了".to_string());
     }
@@ -1682,6 +1892,20 @@ fn group_leave(id: String, state: State<'_, Arc<AppState>>) -> Result<group::Sna
     Ok(group::snapshot(&state))
 }
 
+/// 清空这个群的本地聊天记录（**不退群**）：名册/成员关系不动，之后的新消息照常收。
+#[tauri::command]
+fn group_clear_history(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<group::Snapshot, String> {
+    let own_id = state.config.lock().device_id.clone();
+    if !state.groups.clear_history(&id, &own_id) {
+        return Err("群聊不存在".to_string());
+    }
+    group::emit(&state);
+    Ok(group::snapshot(&state))
+}
+
 // ---------------------------------------------------------------------------
 // 对端浏览（前端不再直连对端）
 // ---------------------------------------------------------------------------
@@ -1692,10 +1916,19 @@ fn group_leave(id: String, state: State<'_, Arc<AppState>>) -> Result<group::Sna
 ///
 /// 一处拼地址 = 一处改协议：到对端的那一跳是 TLS + 自签证书，而 WebView 既不会认我们的
 /// 证书、也不该让它认。所以对端浏览整体挪进后端（认证、指纹校验、token 只有一份实现）。
-fn peer_endpoint(state: &AppState, peer_id: &str, path: &str) -> Result<(String, String, String), String> {
-    let peer = state.get_peer(peer_id).ok_or_else(|| "设备不在列表中".to_string())?;
+fn peer_endpoint(
+    state: &AppState,
+    peer_id: &str,
+    path: &str,
+) -> Result<(String, String, String), String> {
+    let peer = state
+        .get_peer(peer_id)
+        .ok_or_else(|| "设备不在列表中".to_string())?;
     if peer.ip.is_empty() || peer.port == 0 {
-        return Err(format!("「{}」的地址未知（还没被发现或还没上线）", peer.name));
+        return Err(format!(
+            "「{}」的地址未知（还没被发现或还没上线）",
+            peer.name
+        ));
     }
     let token = credential::get_peer_token(peer_id)
         .map_err(|e| e.to_string())?
@@ -1725,7 +1958,11 @@ async fn peer_shares(
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
     let (url, token, ip) = peer_endpoint(state.inner(), &peer_id, "/shares")?;
-    let response = net::client()
+    let pin = state
+        .get_peer(&peer_id)
+        .map(|p| p.dial_pin())
+        .unwrap_or(net::DialPin::Tofu);
+    let response = net::dial_client(&ip, &pin)
         .get(&url)
         .bearer_auth(&token)
         .send()
@@ -1734,10 +1971,25 @@ async fn peer_shares(
     if !response.status().is_success() {
         return Err(format!("读取失败: HTTP {}", response.status().as_u16()));
     }
-    let body = response
-        .json()
-        .await
-        .map_err(|e| format!("响应异常: {e}"))?;
+    let mut body: serde_json::Value =
+        net::read_json_capped(response, peer_fs::PEER_JSON_BODY_MAX)
+            .await
+            .map_err(|e| format!("响应异常: {e}"))?;
+    // 对端 `/shares` 里的 id 是对端自报的，本机会拿它当**镜像目录名**与 BC 的路径段用；
+    // 形态不合法的项在这里就丢掉（只丢那一行，不整份失败）：拖拽与比较里它本来也不可能
+    // 正常工作，留在列表里只会让用户拖一次、报一次错。
+    if let Some(items) = body.get_mut("shares").and_then(|v| v.as_array_mut()) {
+        let before = items.len();
+        items.retain(|item| {
+            item.get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(crate::ids::is_segment)
+        });
+        let dropped = before - items.len();
+        if dropped > 0 {
+            warn!(%peer_id, dropped, "对端共享项清单里有标识不合法的项，已忽略");
+        }
+    }
     state::remember_peer_fingerprint(state.inner(), &peer_id, &ip);
     Ok(body)
 }
@@ -1756,7 +2008,11 @@ async fn peer_tree(
         urlencode(&path)
     );
     let (url, token, ip) = peer_endpoint(state.inner(), &peer_id, &query)?;
-    let response = net::client()
+    let pin = state
+        .get_peer(&peer_id)
+        .map(|p| p.dial_pin())
+        .unwrap_or(net::DialPin::Tofu);
+    let response = net::dial_client(&ip, &pin)
         .get(&url)
         .bearer_auth(&token)
         .send()
@@ -1765,10 +2021,10 @@ async fn peer_tree(
     if !response.status().is_success() {
         return Err(format!("读取失败: HTTP {}", response.status().as_u16()));
     }
-    let body = response
-        .json()
-        .await
-        .map_err(|e| format!("响应异常: {e}"))?;
+    let body: serde_json::Value =
+        net::read_json_capped(response, peer_fs::PEER_JSON_BODY_MAX)
+            .await
+            .map_err(|e| format!("响应异常: {e}"))?;
     state::remember_peer_fingerprint(state.inner(), &peer_id, &ip);
     Ok(body)
 }
@@ -1792,6 +2048,68 @@ fn peer_file_of(
     }
 }
 
+/// 对端给的文件名必须能直接落成 `<下载目录>/<这个名字>`。
+///
+/// **只校验、不改名**：合法名字（含中文、空格、开头点）原样保留；绝对路径、UNC、盘符、
+/// ADS 冒号、`..`、结尾点/空格、Windows 保留设备名一律拒绝。这个名字来自对端 `/shares`
+/// 的显示名或 `/tree` 的文件名，绝不能直接交给 `Path::join` —— 带盘符/绝对路径的
+/// `join` 会清空下载目录这个基址（P0：任意路径写入）。
+fn safe_download_name(raw: &str) -> Result<String, String> {
+    if raw.is_empty() || raw == "." || raw == ".." || raw.contains('\0') {
+        return Err("对端给的文件名不合法".to_string());
+    }
+    // 单段普通名字：`/`、`\`（Windows）、绝对路径、盘符、UNC 前缀都会在这里被拆出
+    // 不止一个组件或前缀组件。Unix 上的反斜杠只是普通字符，不受影响。
+    let mut components = Path::new(raw).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => {}
+        _ => return Err(format!("对端给的文件名不合法：{raw}")),
+    }
+    #[cfg(windows)]
+    {
+        // `Path` 的组件解析在不同 Windows 版本/写法上不完全一致，这里再把 Windows 自己的
+        // 非法字符与保留名钉一遍（`foo:bar`、`CON`、`x. `）。
+        if raw.contains(':')
+            || raw.ends_with('.')
+            || raw.ends_with(' ')
+            || crate::transfer::resume::is_reserved_device_name(raw)
+        {
+            return Err(format!("对端给的文件名本机无法落盘：{raw}"));
+        }
+    }
+    Ok(raw.to_string())
+}
+
+/// 浏览下载的一次进度 / 终局事件（移动端「浏览」那一行下面的进度条读它）。
+///
+/// **只发不管**：事件发不出去（窗口全关了、没人监听）不该影响下载本身，所以返回值一律丢掉；
+/// 命令自己的 `Result` 才是失败出口。
+fn emit_browse_download(
+    app: &AppHandle,
+    peer_id: &str,
+    share_id: &str,
+    path: &str,
+    name: &str,
+    status: &str,
+    received: u64,
+    dest: Option<&str>,
+    error: Option<&str>,
+) {
+    let _ = app.emit(
+        ws::events::ui::BROWSE_DOWNLOAD,
+        serde_json::json!({
+            "peerId": peer_id,
+            "shareId": share_id,
+            "path": path,
+            "name": name,
+            "status": status,
+            "received": received,
+            "dest": dest,
+            "error": error,
+        }),
+    );
+}
+
 /// Download a file from a remote peer (P1 remote browsing download).
 ///
 /// 返回落盘路径；**用户在保存框里取消时返回 `None`**（「每次询问」那一档）——
@@ -1810,20 +2128,28 @@ async fn download_from_peer(
         let cfg = state.config.lock();
         (cfg.download_dir.clone(), cfg.download_mode)
     };
-    let peer = state.get_peer(&peer_id).ok_or_else(|| "设备不在列表中".to_string())?;
+    let peer = state
+        .get_peer(&peer_id)
+        .ok_or_else(|| "设备不在列表中".to_string())?;
     let token = credential::get_peer_token(&peer_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "未配对".to_string())?;
-    let file_name = Path::new(&path_in_share)
-        .file_name().map(|s| s.to_string_lossy().to_string())
+    let raw_name = Path::new(&path_in_share)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
         .or(file_name)
         .unwrap_or_else(|| "download".into());
+    let file_name = safe_download_name(&raw_name)?;
     // 落盘位置遵循 S-02 下载模式，与「本机共享项下载」同一套规则。
     let target_dir = match mode {
         DownloadMode::AskEachTime => {
             use tauri_plugin_dialog::DialogExt;
-            match app.dialog().file().set_file_name(&file_name)
-                .blocking_save_file().map(|p| PathBuf::from(p.to_string()))
+            match app
+                .dialog()
+                .file()
+                .set_file_name(&file_name)
+                .blocking_save_file()
+                .map(|p| PathBuf::from(p.to_string()))
             {
                 Some(p) => p,
                 // 取消 = 不落盘（从前是"退回下载目录照下"：用户点了取消却还是拿到一份副本）。
@@ -1832,10 +2158,120 @@ async fn download_from_peer(
         }
         DownloadMode::Direct => config::unique_path(&download_dir, &file_name),
     };
+    // 最后一道闸：Direct 档的落点必须就是下载目录的直接子项。`safe_download_name` 已经
+    // 保证名字是单段，这里再防一次未来调用点把 `unique_path` 换掉。
+    if mode == DownloadMode::Direct && target_dir.parent() != Some(download_dir.as_path()) {
+        return Err("下载落点不在下载目录内".to_string());
+    }
     let file_ref = peer_file_of(&peer, &share_id, &path_in_share, &token);
-    let bytes = stream_peer_file(&peer_fs::client(), &file_ref, &target_dir).await?;
+    let client = peer_fs::client_for(state.inner(), &peer_id)?;
+    let dest = target_dir.to_string_lossy().to_string();
+    // 暂停闸在第一条事件之前登记：界面看到「下载中」时，点圆环必须能立刻找到它。
+    // 同一个文件只允许一条在跑（键与 `browse://download` 同一套坐标）；重复的那条
+    // 说清楚而不是悄悄叠一份 `.orbdrop-part`。
+    let control_key = crate::transfer::browse_dl::key(&peer_id, &share_id, &path_in_share);
+    let control = Arc::new(crate::transfer::browse_dl::DownloadControl::default());
+    {
+        let mut running = state.browse_downloads.lock();
+        if running.contains_key(&control_key) {
+            return Err("这个文件正在下载".to_string());
+        }
+        running.insert(control_key.clone(), control.clone());
+    }
+    // 保存框那一档在用户点「保存」之后才发第一条：取消时界面不该先跳出一行"下载中"。
+    emit_browse_download(
+        &app,
+        &peer_id,
+        &share_id,
+        &path_in_share,
+        &file_name,
+        "progress",
+        0,
+        None,
+        None,
+    );
+    let progress_app = app.clone();
+    let progress_peer = peer_id.clone();
+    let progress_share = share_id.clone();
+    let progress_path = path_in_share.clone();
+    let progress_name = file_name.clone();
+    let bytes = stream_peer_file_with_progress(
+        &client,
+        &file_ref,
+        &target_dir,
+        Some(control.as_ref()),
+        move |received| {
+            emit_browse_download(
+                &progress_app,
+                &progress_peer,
+                &progress_share,
+                &progress_path,
+                &progress_name,
+                "progress",
+                received,
+                None,
+                None,
+            );
+        },
+    )
+    .await;
+    // 命令结束（成功或失败）就把闸门摘掉：暂停中的那条也是命令自己还在等，不存在
+    // "人走了、表里留一个永远不醒的控制块"。
+    state.browse_downloads.lock().remove(&control_key);
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            emit_browse_download(
+                &app,
+                &peer_id,
+                &share_id,
+                &path_in_share,
+                &file_name,
+                "error",
+                0,
+                None,
+                Some(&e),
+            );
+            return Err(e);
+        }
+    };
     info!(target = %target_dir.display(), bytes, "file downloaded");
-    Ok(Some(target_dir.to_string_lossy().to_string()))
+    emit_browse_download(
+        &app,
+        &peer_id,
+        &share_id,
+        &path_in_share,
+        &file_name,
+        "done",
+        bytes,
+        Some(&dest),
+        None,
+    );
+    Ok(Some(dest))
+}
+
+/// 暂停 / 继续一次「浏览」下载（界面点那一圈进度环）。
+///
+/// `true` = 找到了正在跑的那条命令并改了闸门；`false` = 它已经结束（完成 / 失败 / 界面
+/// 丢过状态再点）。暂停只让流在下一块之后停住，**不删除 `.orbdrop-part`、不重置 offset**，
+/// 继续就是同一条命令往下跑。
+#[tauri::command]
+async fn set_browse_download_paused(
+    peer_id: String,
+    share_id: String,
+    path_in_share: String,
+    paused: bool,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let key = crate::transfer::browse_dl::key(&peer_id, &share_id, &path_in_share);
+    let control = state.browse_downloads.lock().get(&key).cloned();
+    match control {
+        Some(control) => {
+            control.set_paused(paused);
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// 把对端共享项里的一个文件**流式**写到 `target`：先写 `<name>.orbdrop-part`、写完再原子改名。
@@ -1853,6 +2289,27 @@ pub async fn stream_peer_file(
     file: &peer_fs::PeerFile,
     target: &std::path::Path,
 ) -> Result<u64, String> {
+    stream_peer_file_with_progress(client, file, target, None, |_| {}).await
+}
+
+/// 浏览下载的进度节流：与推送那条路同一个 200ms（`REPORT_INTERVAL`）—— 一个 GB 级
+/// 文件按 4MB 一块会到每秒上千块，不节流的话事件会把 WebView 压满，界面反而卡。
+const DOWNLOAD_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// 与 [`stream_peer_file`] 同一条流，只是每收一段把**已落盘字节数**交给 `on_progress`。
+///
+/// 回调只拿到字节数，不认识设备/共享项：调用方（`download_from_peer`）把它拼成
+/// `browse://download` 事件。这样这条流本身仍可被测试直接调，不依赖 Tauri。
+async fn stream_peer_file_with_progress<F>(
+    client: &reqwest::Client,
+    file: &peer_fs::PeerFile,
+    target: &std::path::Path,
+    control: Option<&crate::transfer::browse_dl::DownloadControl>,
+    on_progress: F,
+) -> Result<u64, String>
+where
+    F: Fn(u64) + Send,
+{
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -1877,10 +2334,16 @@ pub async fn stream_peer_file(
     };
 
     let mut offset: u64 = 0;
+    let mut last_report: Option<std::time::Instant> = None;
     let mut result: Result<(), String> = Ok(());
     {
         use tokio::io::AsyncWriteExt as _;
         loop {
+            // 界面点了暂停就停在这里：不丢 `.orbdrop-part`、也不动已写字节，继续后
+            // 从当前 `offset` 接着要下一块。
+            if let Some(control) = control {
+                control.wait_if_paused().await;
+            }
             let want = peer_fs::READ_CHUNK;
             match peer_fs::fetch_file_range(client, file, offset, want).await {
                 Ok(bytes) => {
@@ -1892,6 +2355,15 @@ pub async fn stream_peer_file(
                         break;
                     }
                     offset += bytes.len() as u64;
+                    // 进度按时间节流；第一条（`last_report == None`）一定发，界面点下去马上
+                    // 能看到那一行在动。终局的字节数由调用方在落盘/改名之后单独发。
+                    let now = std::time::Instant::now();
+                    if last_report.map_or(true, |t| {
+                        now.duration_since(t) >= DOWNLOAD_PROGRESS_INTERVAL
+                    }) {
+                        last_report = Some(now);
+                        on_progress(offset);
+                    }
                     // 短读 = 到文件末尾（服务端按 `len` 截断，见 `peer_fs::fetch_file_range`）。
                     if (bytes.len() as u64) < want {
                         break;
@@ -1938,24 +2410,33 @@ async fn download_file(
 ) -> Result<Option<String>, String> {
     let (share, download_dir, mode) = {
         let config = state.config.lock();
-        let share = config.shares.iter().find(|s| s.id == share_id)
-            .ok_or_else(|| format!("共享项不存在: {share_id}"))?.clone();
+        let share = config
+            .shares
+            .iter()
+            .find(|s| s.id == share_id)
+            .ok_or_else(|| format!("共享项不存在: {share_id}"))?
+            .clone();
         (share, config.download_dir.clone(), config.download_mode)
     };
 
     // 空路径（或只有目录）时退成**共享项自己的名字**：那正是"共享项根就是一个文件"那一档，
     // 旧写法退成 "download" —— 扩展名都没了，用户拿到一个打不开的文件。
-    let file_name = Path::new(&path_in_share)
+    let raw_name = Path::new(&path_in_share)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| share.name.clone());
+    let file_name = safe_download_name(&raw_name)?;
 
     let target_dir = match mode {
         DownloadMode::AskEachTime => {
             use tauri_plugin_dialog::DialogExt;
-            match app.dialog().file().set_file_name(&file_name)
-                .blocking_save_file().map(|p| PathBuf::from(p.to_string()))
+            match app
+                .dialog()
+                .file()
+                .set_file_name(&file_name)
+                .blocking_save_file()
+                .map(|p| PathBuf::from(p.to_string()))
             {
                 Some(p) => p,
                 // 取消 = 不落盘（见 `download_from_peer`：同一个口径）。
@@ -1964,14 +2445,19 @@ async fn download_file(
         }
         DownloadMode::Direct => config::unique_path(&download_dir, &file_name),
     };
+    if mode == DownloadMode::Direct && target_dir.parent() != Some(download_dir.as_path()) {
+        return Err("下载落点不在下载目录内".to_string());
+    }
 
     let port = state.server_port.load(std::sync::atomic::Ordering::SeqCst);
     if port == 0 {
         return Err("HTTP 服务未运行".into());
     }
 
-    let url = format!("http://127.0.0.1:{port}/file?share={share_id}&path={}",
-        urlencode(&path_in_share));
+    let url = format!(
+        "http://127.0.0.1:{port}/file?share={share_id}&path={}",
+        urlencode(&path_in_share)
+    );
 
     let resp = reqwest::get(&url).await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
@@ -1979,9 +2465,13 @@ async fn download_file(
     }
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
     if let Some(parent) = target_dir.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
     }
-    tokio::fs::write(&target_dir, &bytes).await.map_err(|e| e.to_string())?;
+    tokio::fs::write(&target_dir, &bytes)
+        .await
+        .map_err(|e| e.to_string())?;
     info!(target = %target_dir.display(), "file downloaded");
     Ok(Some(target_dir.to_string_lossy().to_string()))
 }
@@ -2126,8 +2616,12 @@ fn urlencode(s: &str) -> String {
 #[tauri::command]
 fn get_app_state(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let s = state.config.lock();
-    Ok(format!("device_id={}, peers={}, port={}",
-        s.device_id, s.peers.len(), s.port))
+    Ok(format!(
+        "device_id={}, peers={}, port={}",
+        s.device_id,
+        s.peers.len(),
+        s.port
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2172,7 +2666,10 @@ fn orb_mouse_down() -> bool {
 /// 指针的是哪几个盒子」，后端按指针位置开关整窗的 `WS_EX_TRANSPARENT`（见 `hit_region`）。
 #[cfg(desktop)]
 #[tauri::command]
-fn orb_set_hit_region(window: WebviewWindow, rects: Vec<hit_region::RegionRect>) -> Result<(), String> {
+fn orb_set_hit_region(
+    window: WebviewWindow,
+    rects: Vec<hit_region::RegionRect>,
+) -> Result<(), String> {
     hit_region::set_region(&window, rects)
 }
 
@@ -2238,13 +2735,20 @@ fn place_orb_on_startup(app: &AppHandle) {
         // 上次那块显示器没了 / 分辨率变小：留在居中，否则球落到屏幕外、用户拖不回来
         // （透明无边框窗口没有标题栏）
         Some(pos) if !orb_window::visible_on_some_monitor(&win, pos.x, pos.y) => {
-            warn!(x = pos.x, y = pos.y, "上次的悬浮球位置已不在任何显示器上，保持居中");
+            warn!(
+                x = pos.x,
+                y = pos.y,
+                "上次的悬浮球位置已不在任何显示器上，保持居中"
+            );
             return;
         }
         Some(center) => {
             let sf = win.scale_factor().unwrap_or(1.0);
             let (ix, iy) = config::collapsed_center_inset(shape);
-            (center.x - (ix * sf).round() as i32, center.y - (iy * sf).round() as i32)
+            (
+                center.x - (ix * sf).round() as i32,
+                center.y - (iy * sf).round() as i32,
+            )
         }
         None => match orb_window::default_pos(&win, width) {
             Ok(p) => p,
@@ -2290,64 +2794,72 @@ fn start_orb_watchdog(app: tauri::AppHandle) {
     use std::sync::atomic::Ordering;
 
     let gen = ORB_WATCHDOG_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    let spawned = std::thread::Builder::new().name("orb-watchdog".into()).spawn(move || {
-        // 拓扑指纹的初值在第一次拍里取（那一刻窗口一定已经在，`setup` 里排在落位之后）
-        let mut last: Option<u64> = None;
-        loop {
-            std::thread::sleep(orb_window::WATCHDOG_TICK);
-            if ORB_WATCHDOG_GEN.load(Ordering::SeqCst) != gen {
-                return; // 退出（或又起了一份）：自己退场
-            }
-            let Some(win) = app.get_webview_window("main") else {
-                continue; // 窗口还没建好 / 正在退出：下一拍再看
-            };
-
-            let mut rescue = false;
-
-            // 1) OS 眼里的真实状态：不可见或被最小化 → 叫回台面
-            let (visible, minimized) = orb_window::os_state(&win);
-            if !visible || minimized {
-                warn!(visible, minimized, "看门狗：悬浮球窗口被藏起或最小化，叫回台面");
-                if let Err(e) = orb_window::raise(&win) {
-                    warn!("看门狗叫回窗口失败: {e}");
+    let spawned = std::thread::Builder::new()
+        .name("orb-watchdog".into())
+        .spawn(move || {
+            // 拓扑指纹的初值在第一次拍里取（那一刻窗口一定已经在，`setup` 里排在落位之后）
+            let mut last: Option<u64> = None;
+            loop {
+                std::thread::sleep(orb_window::WATCHDOG_TICK);
+                if ORB_WATCHDOG_GEN.load(Ordering::SeqCst) != gen {
+                    return; // 退出（或又起了一份）：自己退场
                 }
-                rescue = true;
-            }
+                let Some(win) = app.get_webview_window("main") else {
+                    continue; // 窗口还没建好 / 正在退出：下一拍再看
+                };
 
-            // 2) 落在所有显示器之外 → 搬回最近的工作区
-            match orb_window::clamp_into_work_area(&win) {
-                Ok(true) => {
-                    warn!("看门狗：悬浮球窗口已不在任何显示器上，搬回最近的工作区");
+                let mut rescue = false;
+
+                // 1) OS 眼里的真实状态：不可见或被最小化 → 叫回台面
+                let (visible, minimized) = orb_window::os_state(&win);
+                if !visible || minimized {
+                    warn!(
+                        visible,
+                        minimized, "看门狗：悬浮球窗口被藏起或最小化，叫回台面"
+                    );
+                    if let Err(e) = orb_window::raise(&win) {
+                        warn!("看门狗叫回窗口失败: {e}");
+                    }
                     rescue = true;
                 }
-                Ok(false) => {}
-                Err(e) => warn!("看门狗查询窗口位置失败: {e}"),
-            }
 
-            // 3) 拓扑/缩放变了 → 界面那份几何过时了，要它重排一次
-            let fp = orb_window::topology_fingerprint(&win);
-            match last {
-                Some(prev) if prev == fp => {}
-                Some(_) => {
-                    info!("看门狗：显示器拓扑或缩放变了，要求界面重排几何");
-                    rescue = true;
+                // 2) 落在所有显示器之外 → 搬回最近的工作区
+                match orb_window::clamp_into_work_area(&win) {
+                    Ok(true) => {
+                        warn!("看门狗：悬浮球窗口已不在任何显示器上，搬回最近的工作区");
+                        rescue = true;
+                    }
+                    Ok(false) => {}
+                    Err(e) => warn!("看门狗查询窗口位置失败: {e}"),
                 }
-                None => {}
-            }
-            last = Some(fp);
 
-            // 救过就顺手逼一次重画：透明窗口"什么都没画"时 OS 侧一切正常，
-            // 没有任何状态可以判据 —— 这一下是唯一不看运气就能把它逼回来的手段。
-            if rescue {
-                orb_window::force_repaint(&win);
-                if let Err(e) = app.emit(ws::events::ui::ORB_RECOVER, ()) {
-                    warn!("看门狗：通知界面重排几何失败: {e}");
+                // 3) 拓扑/缩放变了 → 界面那份几何过时了，要它重排一次
+                let fp = orb_window::topology_fingerprint(&win);
+                match last {
+                    Some(prev) if prev == fp => {}
+                    Some(_) => {
+                        info!("看门狗：显示器拓扑或缩放变了，要求界面重排几何");
+                        rescue = true;
+                    }
+                    None => {}
+                }
+                last = Some(fp);
+
+                // 救过就顺手逼一次重画：透明窗口"什么都没画"时 OS 侧一切正常，
+                // 没有任何状态可以判据 —— 这一下是唯一不看运气就能把它逼回来的手段。
+                if rescue {
+                    orb_window::force_repaint(&win);
+                    if let Err(e) = app.emit(ws::events::ui::ORB_RECOVER, ()) {
+                        warn!("看门狗：通知界面重排几何失败: {e}");
+                    }
                 }
             }
-        }
-    });
+        });
     match spawned {
-        Ok(_) => info!("悬浮球看门狗已启动（每 {:.0}s 一拍）", orb_window::WATCHDOG_TICK.as_secs_f64()),
+        Ok(_) => info!(
+            "悬浮球看门狗已启动（每 {:.0}s 一拍）",
+            orb_window::WATCHDOG_TICK.as_secs_f64()
+        ),
         Err(e) => warn!("悬浮球看门狗线程起不来: {e}"),
     }
 }
@@ -2364,7 +2876,10 @@ fn collapsed_logical(config: &tauri::Config, shape: OrbShape) -> (f64, f64) {
         OrbShape::Rect => (236.0, 162.0),
         OrbShape::Circle => {
             let win = config.app.windows.iter().find(|w| w.label == "main");
-            (win.map(|w| w.width).unwrap_or(90.0), win.map(|w| w.height).unwrap_or(90.0))
+            (
+                win.map(|w| w.width).unwrap_or(90.0),
+                win.map(|w| w.height).unwrap_or(90.0),
+            )
         }
     }
 }
@@ -2378,8 +2893,7 @@ fn setup_server_task(app: &AppHandle) {
     let state_arc = handle.state::<Arc<AppState>>().inner().clone();
 
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new()
-            .expect("Failed to create server tokio runtime");
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create server tokio runtime");
         rt.block_on(async move {
             let arc_state = state_arc.clone();
             match server::ensure_server(arc_state.clone()).await {
@@ -2398,7 +2912,7 @@ fn setup_server_task(app: &AppHandle) {
                     // Spawn mDNS scanner.
                     let (mdns_tx, mut mdns_rx) = mpsc::channel::<discover::PeerEvent>(64);
                     let own_id = arc_state.config.lock().device_id.clone();
-                    tokio::spawn(discover::scan(mdns_tx, own_id));
+                    tokio::spawn(discover::scan(mdns_tx, own_id, discover::Scope::current()));
 
                     // 推送批次走完之后要在宽限期到了才真丢（留给"回执还在路上 / 链路回来才对账"
                     // 的纠正，见 `push_job::SETTLED_GRACE`）—— 这里负责到点收掉。
@@ -2425,7 +2939,14 @@ fn setup_server_task(app: &AppHandle) {
                                 continue;
                             }
                             match event {
-                                PeerEvent::Online { id, name, ip, port, nets, relay } => {
+                                PeerEvent::Online {
+                                    id,
+                                    name,
+                                    ip,
+                                    port,
+                                    nets,
+                                    relay,
+                                } => {
                                     // 「它在喊」这件事先记下（F-106）：探活成不成是另一回事 ——
                                     // 列表要靠这一档把"在同一网段、但被 AP 隔开"的设备显示出来。
                                     // 「第一次看见它」（下面那个接回/flush 的触发判据）。
@@ -2708,6 +3229,9 @@ pub fn run() {
             }))
         } else {
             warn!("ORBDROP_ALLOW_MULTI 已设置：跳过单实例约束（本机多开，各自的数据目录/端口必须分开）");
+            // 同机多开的实例默认只在回环上广播（`discover::Scope::current`）：它们彼此
+            // 看得见，但不会出现在局域网其他用户的设备列表里。需要跨机发现时显式设
+            // `ORBDROP_MDNS_SCOPE=lan`。
             builder
         }
     };
@@ -2830,6 +3354,7 @@ pub fn run() {
             reject_push,
             cancel_push,
             cancel_receive,
+            set_push_receive_paused,
             chat_snapshot,
             chat_send,
             chat_send_image,
@@ -2848,7 +3373,9 @@ pub fn run() {
             group_join,
             group_dismiss,
             group_leave,
+            group_clear_history,
             download_from_peer,
+            set_browse_download_paused,
             download_file,
             #[cfg(mobile)]
             mobile::list_inbox,
@@ -2863,7 +3390,7 @@ pub fn run() {
             #[cfg(mobile)]
             app_icon,
             // 「让应用在后台活着」所需的系统那一层（F-87）：读回电池优化白名单在不在、把用户送到
-            // ROM 的自启动页；外加通知这一层的自查与跳转（F-108 的横幅那一半）。
+            // ROM 的自启动页与「后台耗电管理」页；外加通知这一层的自查与跳转（F-108 的横幅那一半）。
             // 全是"读状态 + 跳系统页"，没有业务逻辑 —— 只有安卓有实体，见 `system_settings`。
             #[cfg(mobile)]
             system_settings::keepalive_state,
@@ -2871,6 +3398,8 @@ pub fn run() {
             system_settings::request_ignore_battery_optimizations,
             #[cfg(mobile)]
             system_settings::open_autostart_settings,
+            #[cfg(mobile)]
+            system_settings::open_background_power_settings,
             #[cfg(mobile)]
             system_settings::keepalive_guided,
             #[cfg(mobile)]
@@ -2987,6 +3516,7 @@ pub fn run() {
             {
                 mirror::sweep();
                 mirror::ensure_ready(state_arc.inner().clone());
+                mirror::start_sweeper();
             }
 
             setup_server_task(app.handle());
@@ -3002,10 +3532,15 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app, event| {
+        .run(|app, event| {
             // 退出时松开镜像连接。**注册留着**：注册一次长期存在（注销是 O(N)，实测 10,100 个
             // 占位符 1.9 s），下次启动 `mirror::ensure_ready` 只做连接；注销属于卸载路径。
             if let tauri::RunEvent::Exit = event {
+                // 退出前发 mDNS 告别包（TTL=0）：不注销的话对端要把这台设备当"还在网上"
+                // 一直留到 PTR TTL（4500s）。调试/联调实例尤其明显 —— 它们用的是临时数据
+                // 目录，下次启动就换 id，旧行只会越积越多。
+                let state = app.state::<Arc<AppState>>();
+                release_mdns(state.inner());
                 // 看门狗跟着退场（它每一拍都会查窗口，退出后那些查询没有意义）
                 #[cfg(desktop)]
                 ORB_WATCHDOG_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3024,13 +3559,63 @@ mod tests {
     /// **每个调用各拿一个目录**：只按 pid 取名字的话，同进程里两个用它的用例并行跑会互相
     /// `remove_dir_all`（实测：`probe_share` 那两个用例会偶发少看到文件）。
     fn fixture_dir() -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("orbdrop_probe_{}_{}", std::process::id(), uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "orbdrop_probe_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("a.txt"), b"hello world").unwrap(); // 11 字节
         std::fs::write(dir.join(".hidden"), b"x").unwrap();
         dir
+    }
+
+    /// 对端给的文件名只接受**单个普通组件**：合法名字原样保留，绝对/UNC/盘符/`..`/ADS/
+    /// Windows 保留名一律拒绝。这条是 P0 下载落盘路径逃逸的回归。
+    #[test]
+    fn peer_download_names_cannot_escape_the_download_dir() {
+        for good in ["report.txt", "中文 文件.pdf", ".hidden", "a.b.c", "v1.2"] {
+            assert_eq!(safe_download_name(good), Ok(good.to_string()));
+        }
+        for bad in ["", ".", "..", "a/b", "/etc/passwd", "a\0b"] {
+            assert!(
+                safe_download_name(bad).is_err(),
+                "必须拒绝越界文件名: {bad:?}"
+            );
+        }
+        #[cfg(windows)]
+        for bad in [
+            "a\\b",
+            "C:\\Windows\\Temp\\pwn.exe",
+            "..\\..\\Users\\Public\\pwn.exe",
+            "\\\\server\\share\\pwn.exe",
+            "a:b",
+            "CON",
+            "NUL.txt",
+            "COM1",
+            "x. ",
+            "x.",
+        ] {
+            assert!(
+                safe_download_name(bad).is_err(),
+                "Windows 越界/保留名/结尾点空格必须拒绝: {bad:?}"
+            );
+        }
+        #[cfg(unix)]
+        for ok in [
+            "12:30.log",
+            "C:foo",
+            "a\\b",
+            "C:\\Windows\\Temp\\pwn.exe",
+            "\\\\server\\share\\pwn.exe",
+        ] {
+            assert_eq!(
+                safe_download_name(ok),
+                Ok(ok.to_string()),
+                "Unix 上这些是合法文件名，不能被误伤"
+            );
+        }
     }
 
     /// 卡片副标题的那两个数：目录给**直接**子项数（跳过 `.` 开头的项，与 `/tree` 展开后
@@ -3066,7 +3651,8 @@ mod tests {
     fn share_item_dto_keeps_its_wire_field_names() {
         let dir = fixture_dir();
         let share = ShareItem::new(dir.clone());
-        let json = serde_json::to_value(ShareItemDto::new(&share, probe_share(&share.path))).unwrap();
+        let json =
+            serde_json::to_value(ShareItemDto::new(&share, probe_share(&share.path))).unwrap();
         assert_eq!(json["isDir"], true);
         assert_eq!(json["itemCount"], 2);
         assert!(json["size"].is_null(), "目录的大小是 null，不是 0");
@@ -3092,8 +3678,10 @@ mod tests {
             return;
         };
         let lan = lan.to_string();
-        let own_dir = std::env::temp_dir().join(format!("orbdrop_add_own_{}", uuid::Uuid::new_v4()));
-        let peer_dir = std::env::temp_dir().join(format!("orbdrop_add_peer_{}", uuid::Uuid::new_v4()));
+        let own_dir =
+            std::env::temp_dir().join(format!("orbdrop_add_own_{}", uuid::Uuid::new_v4()));
+        let peer_dir =
+            std::env::temp_dir().join(format!("orbdrop_add_peer_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&own_dir).unwrap();
         std::fs::create_dir_all(&peer_dir).unwrap();
         // 身份用 `test_config`：这一条**故意绑 0.0.0.0**（它要拨本机的内网地址，见上面那段
@@ -3110,9 +3698,13 @@ mod tests {
         let own_id = own.config.lock().device_id.clone();
         let peer_id = peer.config.lock().device_id.clone();
 
-        let own_port = crate::server::start_server(own.clone(), BASE).await.unwrap();
+        let own_port = crate::server::start_server(own.clone(), BASE)
+            .await
+            .unwrap();
         assert_eq!(own_port, BASE, "本机占住起点");
-        let peer_port = crate::server::start_server(peer.clone(), BASE).await.unwrap();
+        let peer_port = crate::server::start_server(peer.clone(), BASE)
+            .await
+            .unwrap();
         assert_eq!(peer_port, BASE + 1, "对端起在起点上：按 S-06 顺延到 +1");
 
         // 两个服务器都要**真的答话**了再扫：扫描每一步只等 1.5s（真机上够，满载的测试进程里
@@ -3136,16 +3728,39 @@ mod tests {
         }
 
         let (found, info) = manual_peer_from(&lan, 0, BASE, &own_id).await.unwrap();
-        assert_eq!(found, BASE + 1, "留空端口要扫到真正答话的那一台（自己的那一个跳过）");
-        assert_eq!(info["id"].as_str(), Some(peer_id.as_str()), "找到的是对端，不是本机");
-        assert_eq!(info["port"].as_u64(), Some(u64::from(BASE + 1)), "回话里是它实际的端口");
+        assert_eq!(
+            found,
+            BASE + 1,
+            "留空端口要扫到真正答话的那一台（自己的那一个跳过）"
+        );
+        assert_eq!(
+            info["id"].as_str(),
+            Some(peer_id.as_str()),
+            "找到的是对端，不是本机"
+        );
+        assert_eq!(
+            info["port"].as_u64(),
+            Some(u64::from(BASE + 1)),
+            "回话里是它实际的端口"
+        );
 
         // 明确指到自己头上：报错要说清"是本机自己"，而不是"连不上"（用户才知道错在哪）。
-        let self_err = manual_peer_from(&lan, BASE, BASE, &own_id).await.unwrap_err();
-        assert!(self_err.contains("本机自己"), "是把本机自己填进来的：{self_err}");
+        let self_err = manual_peer_from(&lan, BASE, BASE, &own_id)
+            .await
+            .unwrap_err();
+        assert!(
+            self_err.contains("本机自己"),
+            "是把本机自己填进来的：{self_err}"
+        );
 
         // 明确给了对端端口就只问那一个。
-        assert_eq!(manual_peer_from(&lan, BASE + 1, BASE, &own_id).await.unwrap().0, BASE + 1);
+        assert_eq!(
+            manual_peer_from(&lan, BASE + 1, BASE, &own_id)
+                .await
+                .unwrap()
+                .0,
+            BASE + 1
+        );
 
         crate::server::stop_server(&own).await;
         crate::server::stop_server(&peer).await;
@@ -3168,8 +3783,10 @@ mod tests {
             return;
         };
         let lan = lan.to_string();
-        let own_dir = std::env::temp_dir().join(format!("orbdrop_hello_own_{}", uuid::Uuid::new_v4()));
-        let peer_dir = std::env::temp_dir().join(format!("orbdrop_hello_peer_{}", uuid::Uuid::new_v4()));
+        let own_dir =
+            std::env::temp_dir().join(format!("orbdrop_hello_own_{}", uuid::Uuid::new_v4()));
+        let peer_dir =
+            std::env::temp_dir().join(format!("orbdrop_hello_peer_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&own_dir).unwrap();
         std::fs::create_dir_all(&peer_dir).unwrap();
         let own = Arc::new(AppState::new(
@@ -3183,8 +3800,12 @@ mod tests {
         let own_id = own.config.lock().device_id.clone();
         let peer_id = peer.config.lock().device_id.clone();
 
-        let own_port = crate::server::start_server(own.clone(), BASE).await.unwrap();
-        let peer_port = crate::server::start_server(peer.clone(), BASE + 1).await.unwrap();
+        let own_port = crate::server::start_server(own.clone(), BASE)
+            .await
+            .unwrap();
+        let peer_port = crate::server::start_server(peer.clone(), BASE + 1)
+            .await
+            .unwrap();
         let client = crate::net::client();
         for port in [own_port, peer_port] {
             let url = format!("{}/pair/info", crate::net::peer_base(&lan, port));
@@ -3302,8 +3923,7 @@ mod tests {
     /// 的串已经指不到线上那一条了）。
     #[tokio::test]
     async fn renaming_releases_the_previous_mdns_registration() {
-        let dir = std::env::temp_dir()
-            .join(format!("orbdrop_mdns_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("orbdrop_mdns_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let state = Arc::new(AppState::new(
             crate::config::Config::default(),
@@ -3314,7 +3934,7 @@ mod tests {
         let new = format!("mdns-new-{tag}");
 
         state.config.lock().device_name = old.clone();
-        register_mdns(&state, 3611);
+        register_mdns_scoped(&state, 3611, discover::Scope::Lan);
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         let before = browse_fullnames(5).await;
         if !before.iter().any(|f| f.contains(&old)) {
@@ -3327,7 +3947,7 @@ mod tests {
 
         // 改名 → 重注册（`update_settings` 走的就是这两句）。
         state.config.lock().device_name = new.clone();
-        register_mdns(&state, 3611);
+        register_mdns_scoped(&state, 3611, discover::Scope::Lan);
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let after = browse_fullnames(5).await;
@@ -3359,11 +3979,13 @@ mod tests {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 4096];
             let _ = sock.read(&mut buf).await; // 桩不看请求内容
-            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello").await.unwrap();
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .await
+                .unwrap();
         });
 
-        let dir = std::env::temp_dir()
-            .join(format!("orbdrop_stream_part_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_stream_part_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("occupied")).unwrap();
         let file = crate::peer_fs::PeerFile {
             base: format!("http://127.0.0.1:{port}"),
@@ -3372,6 +3994,9 @@ mod tests {
             path: "a.bin".into(),
         };
 
+        // `reqwest::Client::new()` 会急切建默认 TLS 配置；没有进程级 provider 就直接 panic
+        // （"No provider set"）。生产入口都装过，单元测试要自己装一次。
+        crate::net::install_crypto_provider();
         let err = stream_peer_file(&reqwest::Client::new(), &file, &dir.join("occupied"))
             .await
             .expect_err("目标是个目录时改名必须失败");
@@ -3387,5 +4012,114 @@ mod tests {
         stub.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
 
+    /// 浏览下载的进度回调要拿到**已落盘字节数**（移动端「浏览」那一行下面的进度条靠它）。
+    /// 桩只回 5 字节（短读即 EOF）：至少回调一次，最后一次就是落盘的字节数。
+    #[tokio::test]
+    async fn stream_peer_file_reports_progress() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        crate::net::install_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stub = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .await
+                .unwrap();
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_stream_progress_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = crate::peer_fs::PeerFile {
+            base: format!("http://127.0.0.1:{port}"),
+            token: "t".into(),
+            share_id: "s".into(),
+            path: "a.bin".into(),
+        };
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let sink = seen.clone();
+        let bytes = stream_peer_file_with_progress(
+            &reqwest::Client::new(),
+            &file,
+            &dir.join("a.bin"),
+            None,
+            move |received| sink.lock().unwrap().push(received),
+        )
+        .await
+        .expect("进度回调这条路应当能落盘");
+        assert_eq!(bytes, 5);
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.last().copied(),
+            Some(5),
+            "最后一次进度应当是落盘字节数：{seen:?}"
+        );
+
+        stub.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 暂停闸：还没继续之前**一个字节都不向对端要**，继续之后才发请求并落盘。
+    ///
+    /// 这正是界面圆环的语义：暂停不是取消（临时文件与 offset 都留着），只是把流停住。
+    #[tokio::test]
+    async fn stream_peer_file_waits_while_paused() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        crate::net::install_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (hit_tx, mut hit_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let stub = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = hit_tx.send(()).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .await
+                .unwrap();
+        });
+
+        let dir = std::env::temp_dir().join(format!("orbdrop_pause_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("a.bin");
+        let task_target = target.clone();
+        let file = crate::peer_fs::PeerFile {
+            base: format!("http://127.0.0.1:{port}"),
+            token: "t".into(),
+            share_id: "s".into(),
+            path: "a.bin".into(),
+        };
+        let control = Arc::new(crate::transfer::browse_dl::DownloadControl::default());
+        control.set_paused(true);
+        let task_control = control.clone();
+        let task = tokio::spawn(async move {
+            stream_peer_file_with_progress(
+                &reqwest::Client::new(),
+                &file,
+                &task_target,
+                Some(task_control.as_ref()),
+                |_| {},
+            )
+            .await
+        });
+
+        // 给任务一点时间走到闸门前：它这时已经建好 `.orbdrop-part`，但还没连对端。
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(hit_rx.try_recv().is_err(), "暂停中不应向对端要任何字节");
+
+        control.set_paused(false);
+        let bytes = task.await.unwrap().expect("继续之后应当接着落盘");
+        assert_eq!(bytes, 5);
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello");
+        assert!(hit_rx.try_recv().is_ok(), "继续之后应当真的发出 /file 请求");
+
+        stub.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

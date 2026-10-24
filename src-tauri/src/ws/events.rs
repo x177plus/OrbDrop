@@ -40,13 +40,9 @@ fn one_item() -> usize {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsEvent {
     /// A device came online (mDNS discovery) — relayed to local UI.
-    PeerOnline {
-        peer: PeerInfo,
-    },
+    PeerOnline { peer: PeerInfo },
     /// A device went offline — relayed to local UI.
-    PeerOffline {
-        peer_id: String,
-    },
+    PeerOffline { peer_id: String },
     /// Sender → Receiver: a push invitation (F-50).
     PushInvite {
         invite_id: String,
@@ -140,9 +136,7 @@ pub enum WsEvent {
     /// 载荷为空——对端收到后重新拉一次 `/shares` 即可。
     SharesChanged,
     /// One side unpairs; the other clears the token too (F-14).
-    Unpair {
-        peer_id: String,
-    },
+    Unpair { peer_id: String },
     /// 会话：Sender → Receiver 的一条文本消息。
     ///
     /// `id` 由发送方生成，接收方原样存下来 —— 接收方的回执（`ChatRead`）按 `at` 比水位，
@@ -173,7 +167,7 @@ pub enum WsEvent {
     /// "传输中"那本账（与 `transfer` 那条推送路是两件事）。所以字节**跟着消息一起走**：
     /// `data` 是 base64（上限见 `blobs::MAX_IMAGE_BYTES`，超了发送方当场拒绝）。
     ///
-    /// - `id` = 消息 id，同时是内容文件的名字（`<数据目录>/chat-blobs/<id>.<扩展名>`）——
+    /// - `id` = 消息 id，同时是内容文件的名字（`<数据目录>/chat-vault/blobs/<id>.bin`）——
     ///   两端**同一个 id**，重投幂等（同一条再来一次不重写内容）；
     /// - `name` 只用来取扩展名与显示（"图片-20261013-153012.png"）；
     /// - `size` 是发送方报的字节数（收方以自己解出来的长度为准）。
@@ -191,9 +185,7 @@ pub enum WsEvent {
     /// 会话：Receiver → Sender 的已读回执。`up_to` 是接收方**见到过的、你发来的最大 `at`**。
     ///
     /// 一条回执覆盖一批消息（不是逐条 ack）：人是一屏一屏读的，回执也该一屏一次。
-    ChatRead {
-        up_to: u64,
-    },
+    ChatRead { up_to: u64 },
     /// 群聊：Sender → Receiver 的一条**群消息**。
     ///
     /// 与 `ChatText` 分开而不是给它加可选字段：群消息属于"这个群"，一对一属于"与这台设备的
@@ -241,15 +233,19 @@ pub enum WsEvent {
         size: u64,
         #[serde(default)]
         data: String,
+        /// 作者名册纪元 + 群签名公钥/签名（老对端不带；新群/升级后的群必须带）。
+        #[serde(default)]
+        epoch: u64,
+        #[serde(default)]
+        pubkey: String,
+        #[serde(default)]
+        sig: String,
     },
     /// 群聊：Receiver → Sender 的已读回执。`up_to` = 读到的、**你在这个群里发的**最大 `at`。
     ///
     /// 与 `ChatRead` 同一个语义，只是多一个群维度：群里有多个人，水位必须逐发送者算
     /// （对方的时钟只有它自己那一条可比）。
-    GroupRead {
-        group_id: String,
-        up_to: u64,
-    },
+    GroupRead { group_id: String, up_to: u64 },
     /// 群聊：名册（建群邀请 / 成员变更 / 补发时补的那一份）。
     ///
     /// 收到不认识的名册**不等于**加入：它先落成一张邀请卡，用户点了「加入」才算群
@@ -274,6 +270,16 @@ pub enum WsEvent {
         ask_id: String,
         since_at: u64,
         holes: Vec<crate::group::SyncHole>,
+        /// 发送方墙钟毫秒：签名的新鲜度窗口（见 `group::SYNC_PROOF_SKEW_MS`）。
+        #[serde(default)]
+        ts: u64,
+        /// 发送方的群身份公钥（base64）。未配对来源不能用它来绑钥；已配对来源
+        /// 可以用它把公钥认证进本机名册（见 `group::attest_sync_ask`）。
+        #[serde(default)]
+        pubkey: String,
+        /// `sync_ask_signing_bytes` 的 Ed25519 签名（base64）。
+        #[serde(default)]
+        sig: String,
     },
     /// 群聊：补拉的回答（有货就回，没货回空）。
     GroupSyncPost {
@@ -284,6 +290,11 @@ pub enum WsEvent {
         /// 我手上还有更多（对方按这个继续要下一批）。
         has_more: bool,
         messages: Vec<crate::group::GroupMsgWire>,
+        /// 回答方墙钟毫秒 + 整份回答的签名（未配对来源必须验）。
+        #[serde(default)]
+        ts: u64,
+        #[serde(default)]
+        sig: String,
     },
     /// 群聊：**"我手上有你发的这些"** —— 补拉拿到的消息回执给原发送方。
     ///
@@ -369,6 +380,13 @@ pub mod ui {
     pub const PUSH_RESPONSE: &str = "push://response";
     pub const PUSH_PROGRESS: &str = "push://progress";
     pub const PUSH_DONE: &str = "push://done";
+    /// 浏览对端共享项时的一次下载（移动端「文件 → 浏览」用来在该文件那一行下面画进度）。
+    ///
+    /// 载荷是**一条快照式更新**（`status` = `progress` / `done` / `error`），键为
+    /// `peerId + shareId + path`：文件和共享项都可能在别的设备/目录里重名，只按名字对不上。
+    /// 下载命令本身仍是阻塞到落盘的（界面 `await` 它拿落盘路径），这条事件只负责中途的字节数
+    /// 与终局 —— 与 `PUSH_PROGRESS` / `UPDATE_STATE` 同一个取舍。
+    pub const BROWSE_DOWNLOAD: &str = "browse://download";
     /// 一条消息**暂时送不出去**（直连不通、也没有可用的中转方，F-106）：界面挂一句提示。
     ///
     /// 排队本身是既有语义（F-95：等它上线再发），这条事件补的是**为什么现在送不出去** ——

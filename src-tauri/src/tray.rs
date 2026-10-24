@@ -38,6 +38,10 @@
 //!
 //! 那个布尔与**悬浮球左上角那颗角标是同一个数**（界面 `orbNotifCount`）：球上有数 ⇔ 托盘上
 //! 有红点。事情处理完（读过消息、点掉通知）角标掉回 0，红点与闪动自己就停了。
+//!
+//! **交互日志只记 `debug`**：点击、红点开/关默认（`info` 过滤）不写进日志文件 —— 默认日志
+//! 要能当"故障时间线"看，不该被"用户点了几下托盘"填满；调用失败仍记 `warn`。只有进程级
+//! 的那两条（菜单就绪 / 用户从菜单退出）留在 `info`：后者是"谁把进程关掉的"唯一线索。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -47,7 +51,7 @@ use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Listener, Manager};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::log;
 use crate::state::AppState;
@@ -163,8 +167,9 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
 
     let online = CheckMenuItem::with_id(app, MENU_ONLINE, "在线", true, online_now, None::<&str>)
         .map_err(|e| format!("建「在线」菜单项失败: {e}"))?;
-    let offline = CheckMenuItem::with_id(app, MENU_OFFLINE, "离线", true, !online_now, None::<&str>)
-        .map_err(|e| format!("建「离线」菜单项失败: {e}"))?;
+    let offline =
+        CheckMenuItem::with_id(app, MENU_OFFLINE, "离线", true, !online_now, None::<&str>)
+            .map_err(|e| format!("建「离线」菜单项失败: {e}"))?;
     presence
         .append_items(&[&online, &offline])
         .map_err(|e| format!("状态子菜单装配失败: {e}"))?;
@@ -189,7 +194,12 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
     // 左键抬起 → 单击 / 双击（自己按时间差判，见 `on_left_up`）。菜单事件另有一个监听器，
     // 两者互不影响：菜单只在右键弹、也从右键里来。
     tray.on_tray_icon_event(|tray, event| {
-        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } = event
+        {
             on_left_up(tray.app_handle());
         }
     });
@@ -228,7 +238,12 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
     let _ = app.listen(LOCAL_ONLINE, move |_| refresh(&listen_app));
 
     if let Ok(mut slot) = HANDLES.lock() {
-        *slot = Some(TrayHandles { tray, presence, online, offline });
+        *slot = Some(TrayHandles {
+            tray,
+            presence,
+            online,
+            offline,
+        });
     }
     // 初次落位：图标/tooltip/勾选按真值刷一遍。离线是**落盘状态**，重启后如果仍是离线，
     // 托盘在启动那一刻就该是灰的 —— 不能等用户第一次切换。
@@ -264,7 +279,7 @@ fn on_left_up(app: &AppHandle) {
     if double {
         // 与"第二份进程被启动"同一条路（`lib.rs` 的单实例分支）：界面收到就展开面板；
         // 面板已经开着时那次展开是空操作（`expand` 一进门就早退）。
-        info!("托盘：左键双击 → 展开面板");
+        debug!("托盘：左键双击 → 展开面板");
         bring_orb_back(app);
         if let Err(e) = app.emit(ORB_SHOW, ()) {
             warn!("托盘双击的展开事件发不出去: {e}");
@@ -275,7 +290,7 @@ fn on_left_up(app: &AppHandle) {
     // 单击：有事才动。没有事的时候什么都不做 —— "打开主界面"是双击那一档的事
     // （这正是这次改动要的：左键从"弹菜单"变成"单击看事、双击开面板"）。
     if ALERT.load(Ordering::SeqCst) {
-        info!("托盘：左键单击 → 界面落到该看的那件事上");
+        debug!("托盘：左键单击 → 界面落到该看的那件事上");
         bring_orb_back(app);
         if let Err(e) = app.emit(TRAY_ALERT, ()) {
             warn!("托盘单击的事件发不出去: {e}");
@@ -340,10 +355,10 @@ pub fn tray_set_alert(app: AppHandle, active: bool) -> Result<(), String> {
     LIT.store(active, Ordering::SeqCst);
     paint_tray_icon(&app);
     if active {
-        info!("托盘：有事等处理 → 图标挂红点并开始闪动");
+        debug!("托盘：有事等处理 → 图标挂红点并开始闪动");
         spawn_blink(app, gen);
     } else {
-        info!("托盘：事情处理完了 → 图标回到常亮（红点收掉）");
+        debug!("托盘：事情处理完了 → 图标回到常亮（红点收掉）");
     }
     Ok(())
 }
@@ -354,16 +369,18 @@ pub fn tray_set_alert(app: AppHandle, active: bool) -> Result<(), String> {
 /// 主线程 = 主线程反过来等这把锁就死锁，见 `handles` 那段）；也不缓存任何状态 ——
 /// 每一拍都按当前真值重画。
 fn spawn_blink(app: AppHandle, gen: u64) {
-    let spawned = std::thread::Builder::new().name("tray-blink".into()).spawn(move || {
-        // 起点是"灭"那一拍：指挥官（`tray_set_alert`）刚画过"亮"，接着就该灭。
-        let mut lit = false;
-        while ALERT.load(Ordering::SeqCst) && GEN.load(Ordering::SeqCst) == gen {
-            LIT.store(lit, Ordering::SeqCst);
-            paint_tray_icon(&app);
-            lit = !lit;
-            std::thread::sleep(Duration::from_millis(BLINK_MS));
-        }
-    });
+    let spawned = std::thread::Builder::new()
+        .name("tray-blink".into())
+        .spawn(move || {
+            // 起点是"灭"那一拍：指挥官（`tray_set_alert`）刚画过"亮"，接着就该灭。
+            let mut lit = false;
+            while ALERT.load(Ordering::SeqCst) && GEN.load(Ordering::SeqCst) == gen {
+                LIT.store(lit, Ordering::SeqCst);
+                paint_tray_icon(&app);
+                lit = !lit;
+                std::thread::sleep(Duration::from_millis(BLINK_MS));
+            }
+        });
     if let Err(e) = spawned {
         // 线程起不来只是不闪，红点还在（当前那一拍是"亮"）—— 别把这一档整个丢掉。
         warn!("托盘闪动线程起不来（图标停在当前那一拍）: {e}");
@@ -494,7 +511,8 @@ fn blank_rgba(w: u32, h: u32) -> Vec<u8> {
 /// 为什么非得过静态格：`Image::rgba` 的签名是 `fn rgba(&'a self) -> &'a [u8]`
 /// （`impl<'a> Image<'a>`），对 `Image<'static>` 来说它要一个 `&'static self`
 /// —— 临时值上根本调不出来。
-static ICON_ONLINE: LazyLock<Image<'static>> = LazyLock::new(|| tauri::include_image!("icons/32x32.png"));
+static ICON_ONLINE: LazyLock<Image<'static>> =
+    LazyLock::new(|| tauri::include_image!("icons/32x32.png"));
 static ICON_OFFLINE: LazyLock<Image<'static>> =
     LazyLock::new(|| tauri::include_image!("icons/32x32-offline.png"));
 
@@ -555,7 +573,8 @@ fn over_into(dst: &mut [u8], cw: u32, dx: u32, dy: u32, src: &[u8], side: u32) {
             let da = u32::from(dst[d + 3]) * (255 - sa) / 255;
             let out_a = sa + da;
             for c in 0..3 {
-                dst[d + c] = ((u32::from(src[s + c]) * sa + u32::from(dst[d + c]) * da) / out_a) as u8;
+                dst[d + c] =
+                    ((u32::from(src[s + c]) * sa + u32::from(dst[d + c]) * da) / out_a) as u8;
             }
             dst[d + 3] = out_a as u8;
         }
@@ -635,11 +654,18 @@ mod tests {
     fn dot_is_centred_opaque_and_leaves_the_corners_empty() {
         let slot = 16;
         let buf = dot_rgba(DOT_ONLINE, slot);
-        assert_eq!(buf.len(), (slot * slot * 4) as usize, "必须是 slot² 的 RGBA");
+        assert_eq!(
+            buf.len(),
+            (slot * slot * 4) as usize,
+            "必须是 slot² 的 RGBA"
+        );
 
         let mid = slot / 2;
         assert_eq!(alpha_at(&buf, slot, mid, mid), 255, "圆心应完全不透明");
-        assert_eq!(&buf[((mid * slot + mid) * 4) as usize..][..3], &[DOT_ONLINE.0, DOT_ONLINE.1, DOT_ONLINE.2]);
+        assert_eq!(
+            &buf[((mid * slot + mid) * 4) as usize..][..3],
+            &[DOT_ONLINE.0, DOT_ONLINE.1, DOT_ONLINE.2]
+        );
         for (x, y) in [(0, 0), (slot - 1, 0), (0, slot - 1), (slot - 1, slot - 1)] {
             assert_eq!(alpha_at(&buf, slot, x, y), 0, "四角在圆外");
         }
@@ -652,7 +678,9 @@ mod tests {
     fn dot_edge_is_antialiased_and_area_matches_its_diameter() {
         let slot = 16;
         let buf = dot_rgba(DOT_OFFLINE, slot);
-        let alphas: Vec<u8> = (0..slot * slot).map(|i| buf[(i * 4 + 3) as usize]).collect();
+        let alphas: Vec<u8> = (0..slot * slot)
+            .map(|i| buf[(i * 4 + 3) as usize])
+            .collect();
         assert!(
             alphas.iter().any(|&a| a > 0 && a < 255),
             "边缘应有半透明像素（否则就是硬边）"
@@ -734,13 +762,19 @@ mod tests {
     fn double_click_window_is_a_timing_question() {
         let t0 = Instant::now();
 
-        assert!(!take_double_click(&Mutex::new(None), t0), "第一下永远是单击");
+        assert!(
+            !take_double_click(&Mutex::new(None), t0),
+            "第一下永远是单击"
+        );
         assert!(
             take_double_click(&Mutex::new(Some(t0)), t0 + DOUBLE_CLICK_WINDOW),
             "间隔正好等于窗口也算双击（边界含在内）"
         );
         assert!(
-            !take_double_click(&Mutex::new(Some(t0)), t0 + DOUBLE_CLICK_WINDOW + Duration::from_millis(1)),
+            !take_double_click(
+                &Mutex::new(Some(t0)),
+                t0 + DOUBLE_CLICK_WINDOW + Duration::from_millis(1)
+            ),
             "越过窗口一格就是单击"
         );
     }
@@ -753,9 +787,18 @@ mod tests {
         let t0 = Instant::now();
 
         assert!(!take_double_click(&slot, t0), "1: 单击");
-        assert!(take_double_click(&slot, t0 + Duration::from_millis(100)), "2: 双击（基准清零）");
-        assert!(!take_double_click(&slot, t0 + Duration::from_millis(200)), "3: 新的第一下 = 单击");
-        assert!(take_double_click(&slot, t0 + Duration::from_millis(250)), "4: 又成对 = 双击");
+        assert!(
+            take_double_click(&slot, t0 + Duration::from_millis(100)),
+            "2: 双击（基准清零）"
+        );
+        assert!(
+            !take_double_click(&slot, t0 + Duration::from_millis(200)),
+            "3: 新的第一下 = 单击"
+        );
+        assert!(
+            take_double_click(&slot, t0 + Duration::from_millis(250)),
+            "4: 又成对 = 双击"
+        );
     }
 
     /// 没事的时候那张图就是底图本身；有事那一档才动笔（亮拍合成、灭拍看不见）。
@@ -763,14 +806,23 @@ mod tests {
     /// 读字节要一个 `&'static self`（见 `base_icon`），所以这几张放进静态格，而不是本地变量。
     #[test]
     fn plain_icon_is_the_base_untouched() {
-        static PLAIN_ONLINE: LazyLock<Image<'static>> = LazyLock::new(|| tray_icon(true, TrayFrame::Base));
+        static PLAIN_ONLINE: LazyLock<Image<'static>> =
+            LazyLock::new(|| tray_icon(true, TrayFrame::Base));
         static PLAIN_OFFLINE: LazyLock<Image<'static>> =
             LazyLock::new(|| tray_icon(false, TrayFrame::Base));
         static BADGED_ONLINE: LazyLock<Image<'static>> =
             LazyLock::new(|| tray_icon(true, TrayFrame::Badged));
 
-        assert_eq!(PLAIN_ONLINE.rgba(), base_icon(true).rgba(), "没事那一档不该被改过");
-        assert_eq!(PLAIN_OFFLINE.rgba(), base_icon(false).rgba(), "离线那张同理");
+        assert_eq!(
+            PLAIN_ONLINE.rgba(),
+            base_icon(true).rgba(),
+            "没事那一档不该被改过"
+        );
+        assert_eq!(
+            PLAIN_OFFLINE.rgba(),
+            base_icon(false).rgba(),
+            "离线那张同理"
+        );
         assert_ne!(
             BADGED_ONLINE.rgba(),
             base_icon(true).rgba(),
@@ -782,15 +834,24 @@ mod tests {
     /// 的点（那一个点是给 Explorer 看的，见 `blank_rgba`；渲染上等于看不见）。
     #[test]
     fn blank_frame_is_invisible_and_keeps_the_canvas() {
-        static BLANK: LazyLock<Image<'static>> = LazyLock::new(|| tray_icon(true, TrayFrame::Blank));
+        static BLANK: LazyLock<Image<'static>> =
+            LazyLock::new(|| tray_icon(true, TrayFrame::Blank));
         let base = base_icon(true);
 
-        assert_eq!((BLANK.width(), BLANK.height()), (base.width(), base.height()), "尺寸不能变");
+        assert_eq!(
+            (BLANK.width(), BLANK.height()),
+            (base.width(), base.height()),
+            "尺寸不能变"
+        );
 
         let alphas: Vec<u8> = BLANK.rgba().iter().skip(3).step_by(4).copied().collect();
         let kept = alphas.iter().filter(|&&a| a > 0).count();
         assert_eq!(kept, 1, "只该留一个非透明像素（否则 Explorer 画占位黑块）");
-        assert_eq!(alphas.iter().copied().max(), Some(1), "留的那个点也必须是 α=1（看不见）");
+        assert_eq!(
+            alphas.iter().copied().max(),
+            Some(1),
+            "留的那个点也必须是 α=1（看不见）"
+        );
         assert!(
             BLANK.rgba().iter().step_by(4).all(|&r| r == 0),
             "空白帧不该有任何 RGB 墨迹"
@@ -801,7 +862,11 @@ mod tests {
     #[test]
     fn frames_follow_the_two_flags() {
         assert_eq!(tray_frame(false, false), TrayFrame::Base);
-        assert_eq!(tray_frame(false, true), TrayFrame::Base, "没事时亮灭都画底图");
+        assert_eq!(
+            tray_frame(false, true),
+            TrayFrame::Base,
+            "没事时亮灭都画底图"
+        );
         assert_eq!(tray_frame(true, true), TrayFrame::Badged);
         assert_eq!(tray_frame(true, false), TrayFrame::Blank);
     }

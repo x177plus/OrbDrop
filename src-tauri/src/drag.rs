@@ -103,7 +103,11 @@ impl DragStore {
     ///
     /// 本机共享项当场可拖；对端项先在后台建占位符（问一次元数据 + `CfCreatePlaceholders`），
     /// **不下载任何字节**。
-    pub fn prepare(&self, state: &Arc<AppState>, req: &DragOutRequest) -> Result<DragTicket, String> {
+    pub fn prepare(
+        &self,
+        state: &Arc<AppState>,
+        req: &DragOutRequest,
+    ) -> Result<DragTicket, String> {
         let req = req.clone();
         let name = req.name.clone();
         {
@@ -121,9 +125,13 @@ impl DragStore {
         match req.peer_id.clone() {
             Some(peer_id) => {
                 let ticket = Uuid::new_v4().to_string();
-                self.entries
-                    .lock()
-                    .insert(ticket.clone(), Entry { at: Instant::now(), staged: Staged::Preparing });
+                self.entries.lock().insert(
+                    ticket.clone(),
+                    Entry {
+                        at: Instant::now(),
+                        staged: Staged::Preparing,
+                    },
+                );
                 let (task_state, task_req, task_peer, id) =
                     (state.clone(), req.clone(), peer_id.clone(), ticket.clone());
                 task::spawn("drag prepare", async move {
@@ -134,16 +142,27 @@ impl DragStore {
                     }
                     task_state.drag.finish(&id, result);
                 });
-                Ok(DragTicket { ticket, name: req.name, ready: false })
+                Ok(DragTicket {
+                    ticket,
+                    name: req.name,
+                    ready: false,
+                })
             }
             None => {
                 let path = local_share_path(state, &req.share_id, &req.path)?;
                 let ticket = Uuid::new_v4().to_string();
                 self.entries.lock().insert(
                     ticket.clone(),
-                    Entry { at: Instant::now(), staged: Staged::Ready(vec![path]) },
+                    Entry {
+                        at: Instant::now(),
+                        staged: Staged::Ready(vec![path]),
+                    },
                 );
-                Ok(DragTicket { ticket, name, ready: true })
+                Ok(DragTicket {
+                    ticket,
+                    name,
+                    ready: true,
+                })
             }
         }
     }
@@ -151,8 +170,14 @@ impl DragStore {
     /// 票据此刻的内容：`Ok(Some)` 可以起拖了，`Ok(None)` 还在准备，`Err` 不用等了。
     pub fn payload(&self, ticket: &str) -> Result<Option<Payload>, String> {
         match self.entries.lock().get(ticket) {
-            Some(Entry { staged: Staged::Ready(payload), .. }) => Ok(Some(payload.clone())),
-            Some(Entry { staged: Staged::Failed(msg), .. }) => Err(msg.clone()),
+            Some(Entry {
+                staged: Staged::Ready(payload),
+                ..
+            }) => Ok(Some(payload.clone())),
+            Some(Entry {
+                staged: Staged::Failed(msg),
+                ..
+            }) => Err(msg.clone()),
             Some(_) => Ok(None),
             None => Err("这次拖拽已失效，请重新拖一次".into()),
         }
@@ -233,7 +258,11 @@ async fn wait_ready(state: &Arc<AppState>, ticket: &str) -> Result<Payload, Stri
 }
 
 /// 本机共享项的相对路径 → 磁盘上的绝对路径（越界防护与 HTTP 那侧同一套判据）。
-fn local_share_path(state: &Arc<AppState>, share_id: &str, path_in_share: &str) -> Result<PathBuf, String> {
+fn local_share_path(
+    state: &Arc<AppState>,
+    share_id: &str,
+    path_in_share: &str,
+) -> Result<PathBuf, String> {
     let root = {
         let cfg = state.config.lock();
         cfg.shares
@@ -247,8 +276,12 @@ fn local_share_path(state: &Arc<AppState>, share_id: &str, path_in_share: &str) 
     } else {
         root.join(path_in_share.replace('/', std::path::MAIN_SEPARATOR_STR))
     };
-    let canonical = joined.canonicalize().map_err(|e| format!("路径不可访问: {e}"))?;
-    let canonical_root = root.canonicalize().map_err(|e| format!("共享项已不可访问: {e}"))?;
+    let canonical = joined
+        .canonicalize()
+        .map_err(|e| format!("路径不可访问: {e}"))?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| format!("共享项已不可访问: {e}"))?;
     if !canonical.starts_with(&canonical_root) {
         return Err("路径越界".into());
     }
@@ -268,8 +301,9 @@ async fn prepare_peer_payload(
     req: &DragOutRequest,
     peer_id: &str,
 ) -> Result<Payload, String> {
-    // 顺手按龄回收上次留下的镜像项（与旧的 sweep_staging 同一个时机：每次拖拽 + 启动）。
-    crate::mirror::sweep();
+    // 这里**不要**跑 `mirror::sweep()`：拖拽路径上做扫描会与刚放好的项抢同一路径 ——
+    // 并发拖两项时，后一项的扫描可能把前一项正在被资源管理器复制的占位符删掉，目标侧
+    // 报"源文件已损坏或不可用"。回收只在启动时与后台周期任务里做（见 `mirror::start_sweeper`）。
     let item = crate::mirror::MirroredItem {
         peer_id: peer_id.to_string(),
         share_id: req.share_id.clone(),
@@ -329,11 +363,11 @@ mod imp {
     use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering};
     use std::sync::LazyLock;
 
-    use windows::core::{implement, w, Error, HRESULT, Result as WinResult, BOOL};
+    use std::path::PathBuf;
+    use windows::core::{implement, w, Error, Result as WinResult, BOOL, HRESULT};
     use windows::Win32::Foundation::{
-        CloseHandle, DV_E_FORMATETC, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP,
-        DRAGDROP_S_USEDEFAULTCURSORS, E_NOTIMPL, E_OUTOFMEMORY,
-        OLE_E_ADVISENOTSUPPORTED, POINT, S_OK,
+        CloseHandle, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
+        DV_E_FORMATETC, E_NOTIMPL, E_OUTOFMEMORY, OLE_E_ADVISENOTSUPPORTED, POINT, S_OK,
     };
     use windows::Win32::System::Com::{
         IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumFORMATETC_Impl,
@@ -356,7 +390,6 @@ mod imp {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetCursorPos, GetWindowThreadProcessId, WindowFromPoint,
     };
-    use std::path::PathBuf;
 
     use super::{hdrop_bytes, PROBE};
 
@@ -466,7 +499,11 @@ mod imp {
             let _ = OleInitialize(None);
         }
         log_advertised(paths);
-        let data: IDataObject = DragDataObject { paths: paths.to_vec(), seen: Default::default() }.into();
+        let data: IDataObject = DragDataObject {
+            paths: paths.to_vec(),
+            seen: Default::default(),
+        }
+        .into();
         let source: IDropSource = CopyDropSource {
             last_target: AtomicIsize::new(0),
             last_effect: AtomicU32::new(u32::MAX),
@@ -547,7 +584,11 @@ mod imp {
             let Some(f) = (unsafe { pformatetc.as_ref() }) else {
                 return;
             };
-            if !self.seen.lock().insert((f.cfFormat, f.dwAspect, f.lindex, f.tymed, call)) {
+            if !self
+                .seen
+                .lock()
+                .insert((f.cfFormat, f.dwAspect, f.lindex, f.tymed, call))
+            {
                 return;
             }
             tracing::info!(
@@ -574,12 +615,18 @@ mod imp {
             };
             Ok(STGMEDIUM {
                 tymed: TYMED_HGLOBAL.0 as u32,
-                u: STGMEDIUM_0 { hGlobal: hglobal(&bytes)? },
+                u: STGMEDIUM_0 {
+                    hGlobal: hglobal(&bytes)?,
+                },
                 pUnkForRelease: std::mem::ManuallyDrop::new(None),
             })
         }
 
-        fn GetDataHere(&self, pformatetc: *const FORMATETC, _pmedium: *mut STGMEDIUM) -> WinResult<()> {
+        fn GetDataHere(
+            &self,
+            pformatetc: *const FORMATETC,
+            _pmedium: *mut STGMEDIUM,
+        ) -> WinResult<()> {
             self.log_query("GetDataHere", pformatetc);
             Err(error(DV_E_FORMATETC))
         }
@@ -625,7 +672,11 @@ mod imp {
                 formatetc(CF_HDROP.0, TYMED_HGLOBAL, -1),
                 formatetc(*PREFERRED_DROP_EFFECT, TYMED_HGLOBAL, -1),
             ];
-            Ok(FormatEnumerator { formats, next: AtomicU64::new(0) }.into())
+            Ok(FormatEnumerator {
+                formats,
+                next: AtomicU64::new(0),
+            }
+            .into())
         }
 
         fn DAdvise(
@@ -684,7 +735,8 @@ mod imp {
         }
 
         fn Skip(&self, celt: u32) -> WinResult<()> {
-            let index = (self.next.load(Ordering::Relaxed) as usize + celt as usize).min(self.formats.len());
+            let index = (self.next.load(Ordering::Relaxed) as usize + celt as usize)
+                .min(self.formats.len());
             self.next.store(index as u64, Ordering::Relaxed);
             Ok(())
         }
@@ -718,7 +770,11 @@ mod imp {
         ///
         /// `grfKeyState` 是**本线程消息队列**里的键状态，按下没被处理过就会报 `0x0`
         /// （自测脚本合成输入时踩过这个坑：一进去就被判成"已经松手"，拖放当场结束）。
-        fn QueryContinueDrag(&self, fescapepressed: BOOL, grfkeystate: MODIFIERKEYS_FLAGS) -> HRESULT {
+        fn QueryContinueDrag(
+            &self,
+            fescapepressed: BOOL,
+            grfkeystate: MODIFIERKEYS_FLAGS,
+        ) -> HRESULT {
             note_target_under_cursor(&self.last_target);
             if fescapepressed.as_bool() {
                 DRAGDROP_S_CANCEL
@@ -754,7 +810,11 @@ mod imp {
             unsafe {
                 let _ = OleInitialize(None);
             }
-            DragDataObject { paths, seen: Default::default() }.into()
+            DragDataObject {
+                paths,
+                seen: Default::default(),
+            }
+            .into()
         }
 
         fn read_medium(medium: &STGMEDIUM) -> Vec<u8> {
@@ -772,17 +832,29 @@ mod imp {
         /// 只给 `CF_HDROP`（本机真文件与镜像占位符对目标来说没区别），外加"只复制"那道保险。
         #[tokio::test]
         async fn object_offers_cf_hdrop_and_nothing_else() {
-            let paths = vec![PathBuf::from(r"C:\tmp\a.txt"), PathBuf::from(r"C:\tmp\中文 目录")];
+            let paths = vec![
+                PathBuf::from(r"C:\tmp\a.txt"),
+                PathBuf::from(r"C:\tmp\中文 目录"),
+            ];
             let object = object(paths.clone());
 
-            let enumerator = unsafe { object.EnumFormatEtc(DATADIR_GET.0 as u32) }.expect("EnumFormatEtc");
+            let enumerator =
+                unsafe { object.EnumFormatEtc(DATADIR_GET.0 as u32) }.expect("EnumFormatEtc");
             let mut formats = [FORMATETC::default(); 2];
-            assert_eq!(unsafe { enumerator.Next(&mut formats, None) }, S_OK, "正好两种格式");
+            assert_eq!(
+                unsafe { enumerator.Next(&mut formats, None) },
+                S_OK,
+                "正好两种格式"
+            );
             assert_eq!(formats[0].cfFormat, CF_HDROP.0);
             assert_eq!(formats[1].cfFormat, *PREFERRED_DROP_EFFECT);
 
-            assert_eq!(unsafe { object.QueryGetData(&formatetc(CF_HDROP.0, TYMED_HGLOBAL, -1)) }, S_OK);
-            let mut medium = unsafe { object.GetData(&formatetc(CF_HDROP.0, TYMED_HGLOBAL, -1)) }.expect("GetData");
+            assert_eq!(
+                unsafe { object.QueryGetData(&formatetc(CF_HDROP.0, TYMED_HGLOBAL, -1)) },
+                S_OK
+            );
+            let mut medium = unsafe { object.GetData(&formatetc(CF_HDROP.0, TYMED_HGLOBAL, -1)) }
+                .expect("GetData");
             assert_eq!(read_medium(&medium), hdrop_bytes(&paths));
             unsafe { ReleaseStgMedium(&mut medium) };
         }
@@ -824,22 +896,44 @@ mod tests {
     /// CF_HDROP 的字节布局：头 20 字节、路径 UTF-16、单 `\0` 分隔、双 `\0` 收尾。
     #[test]
     fn hdrop_layout_is_wide_paths_with_double_nul() {
-        let paths = vec![PathBuf::from(r"C:\tmp\a.txt"), PathBuf::from(r"C:\tmp\中文 名")];
+        let paths = vec![
+            PathBuf::from(r"C:\tmp\a.txt"),
+            PathBuf::from(r"C:\tmp\中文 名"),
+        ];
         let bytes = hdrop_bytes(&paths);
 
-        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 20, "pFiles 指向路径区");
+        assert_eq!(
+            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            20,
+            "pFiles 指向路径区"
+        );
         assert_eq!(&bytes[4..12], &[0u8; 8], "pt 归零");
-        assert_eq!(i32::from_le_bytes(bytes[12..16].try_into().unwrap()), 0, "fNC");
-        assert_eq!(i32::from_le_bytes(bytes[16..20].try_into().unwrap()), 1, "fWide");
+        assert_eq!(
+            i32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            0,
+            "fNC"
+        );
+        assert_eq!(
+            i32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            1,
+            "fWide"
+        );
 
         let units: Vec<u16> = bytes[20..]
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(units[units.len() - 1], 0, "末尾一个 \\0 收尾");
-        assert_eq!(units[units.len() - 2], 0, "紧挨着的是最后一条路径自己的 \\0");
+        assert_eq!(
+            units[units.len() - 2],
+            0,
+            "紧挨着的是最后一条路径自己的 \\0"
+        );
         let text: String = String::from_utf16_lossy(&units[..units.len() - 2]);
-        assert_eq!(text.split('\0').collect::<Vec<_>>(), vec![r"C:\tmp\a.txt", r"C:\tmp\中文 名"]);
+        assert_eq!(
+            text.split('\0').collect::<Vec<_>>(),
+            vec![r"C:\tmp\a.txt", r"C:\tmp\中文 名"]
+        );
     }
 
     /// 名字清洗：本机不收的字符替掉（对端可能是 macOS），结构性的名字直接不要。
@@ -847,9 +941,18 @@ mod tests {
     /// 交给 shell 的路径不能带 `\\?\`：那种写法在部分 shell API 里认不出来。
     #[test]
     fn plain_path_strips_verbatim_prefix() {
-        assert_eq!(plain_path(Path::new(r"\\?\C:\Users\me\跟 目")), PathBuf::from(r"C:\Users\me\跟 目"));
-        assert_eq!(plain_path(Path::new(r"\\?\UNC\nas\share\a")), PathBuf::from(r"\\nas\share\a"));
-        assert_eq!(plain_path(Path::new(r"D:\普通\路径")), PathBuf::from(r"D:\普通\路径"));
+        assert_eq!(
+            plain_path(Path::new(r"\\?\C:\Users\me\跟 目")),
+            PathBuf::from(r"C:\Users\me\跟 目")
+        );
+        assert_eq!(
+            plain_path(Path::new(r"\\?\UNC\nas\share\a")),
+            PathBuf::from(r"\\nas\share\a")
+        );
+        assert_eq!(
+            plain_path(Path::new(r"D:\普通\路径")),
+            PathBuf::from(r"D:\普通\路径")
+        );
     }
 
     /// 时间戳：描述符里的 FILETIME 是 1601 起的 100ns。
@@ -874,21 +977,35 @@ mod tests {
             name: "a.txt".into(),
             is_dir: false,
         };
-        let ticket = state.drag.prepare(&state, &req).expect("本机共享项当场可拖");
+        let ticket = state
+            .drag
+            .prepare(&state, &req)
+            .expect("本机共享项当场可拖");
         assert!(ticket.ready, "本机路径不需要先走目录");
         let expect = plain_path(&root.join("子目录").join("a.txt").canonicalize().unwrap());
         let paths = state.drag.payload(&ticket.ticket).unwrap().unwrap();
         assert_eq!(paths, vec![expect], "本机项给的就是磁盘上的真实路径");
 
         // 共享项根（''）也要能拖
-        let root_req = DragOutRequest { path: String::new(), name: "根".into(), is_dir: true, ..req.clone() };
+        let root_req = DragOutRequest {
+            path: String::new(),
+            name: "根".into(),
+            is_dir: true,
+            ..req.clone()
+        };
         let root_ticket = state.drag.prepare(&state, &root_req).unwrap();
         let paths = state.drag.payload(&root_ticket.ticket).unwrap().unwrap();
         assert_eq!(paths, vec![plain_path(&root.canonicalize().unwrap())]);
 
         // 越界：共享项之外的东西不给拖
-        let escape = DragOutRequest { path: "../secret.txt".into(), ..req.clone() };
-        assert!(state.drag.prepare(&state, &escape).is_err(), "共享项之外的路径必须拒绝");
+        let escape = DragOutRequest {
+            path: "../secret.txt".into(),
+            ..req.clone()
+        };
+        assert!(
+            state.drag.prepare(&state, &escape).is_err(),
+            "共享项之外的路径必须拒绝"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -918,7 +1035,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             match state.drag.payload(&ticket.ticket) {
-                Ok(None) => {}                     // 还在建占位符：正常
+                Ok(None) => {} // 还在建占位符：正常
                 Ok(Some(_)) => panic!("对端地址是编的，不可能备好"),
                 Err(msg) => {
                     assert!(!msg.is_empty(), "失败要带一句能看懂的原因");

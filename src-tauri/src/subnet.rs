@@ -28,7 +28,10 @@ impl Cidr {
     /// `(网络号, 掩码)`：网络号按掩码规整（多给的位清掉），所以 `10.0.1.7/24` 与
     /// `10.0.1.0/24` 相等 —— 对端把"我自己的地址"当网段报过来时也不会建出两条。
     pub fn new(net: u32, mask: u32) -> Cidr {
-        Cidr { net: net & mask, mask }
+        Cidr {
+            net: net & mask,
+            mask,
+        }
     }
 
     /// 一个地址 + 掩码 → 它所在的那一段。
@@ -176,7 +179,10 @@ mod tests {
 
     #[test]
     fn parses_and_normalizes() {
-        assert_eq!(cidr("192.168.1.0/24"), Cidr::new(u32::from(ip("192.168.1.0")), u32::from(ip("255.255.255.0"))));
+        assert_eq!(
+            cidr("192.168.1.0/24"),
+            Cidr::new(u32::from(ip("192.168.1.0")), u32::from(ip("255.255.255.0")))
+        );
         // 给的是主机地址：按掩码规整，不建出第二条。
         assert_eq!(cidr("192.168.1.7/24"), cidr("192.168.1.0/24"));
         assert_eq!(cidr("10.1.2.3/8"), cidr("10.0.0.0/8"));
@@ -186,7 +192,15 @@ mod tests {
 
     #[test]
     fn rejects_junk_without_panicking() {
-        for bad in ["", "192.168.1.0", "192.168.1.0/33", "192.168.1.0/", "example.com/24", "::1/128", "192.168.1.0/x"] {
+        for bad in [
+            "",
+            "192.168.1.0",
+            "192.168.1.0/33",
+            "192.168.1.0/",
+            "example.com/24",
+            "::1/128",
+            "192.168.1.0/x",
+        ] {
             assert!(parse(bad).is_none(), "{bad:?} 不该被解析成网段");
         }
     }
@@ -214,7 +228,10 @@ mod tests {
     fn host_nets_exclude_loopback_and_dedupe() {
         let nets = host_nets();
         assert!(
-            !nets.iter().any(|c| c.contains(ip("127.0.0.1")) && c.mask() == Cidr::mask_for_prefix(8).unwrap()),
+            !nets
+                .iter()
+                .any(|c| c.contains(ip("127.0.0.1"))
+                    && c.mask() == Cidr::mask_for_prefix(8).unwrap()),
             "127.0.0.0/8 不该出现在本机网段表里: {nets:?}"
         );
         let mut keys: Vec<(u32, u32)> = nets.iter().map(|c| (c.network(), c.mask())).collect();

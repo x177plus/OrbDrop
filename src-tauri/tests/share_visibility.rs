@@ -42,7 +42,8 @@ fn make_state(root: std::path::PathBuf, peer_connected: bool) -> Arc<AppState> {
     let mut config = orbdrop_lib::config::test_config();
     config.shares.push(ShareItem::new(root));
     config.bc_exe_path = Some(hermetic_bc_exe());
-    let config_path = std::env::temp_dir().join(format!("orbdrop_vis_cfg_{}.toml", uuid::Uuid::new_v4()));
+    let config_path =
+        std::env::temp_dir().join(format!("orbdrop_vis_cfg_{}.toml", uuid::Uuid::new_v4()));
     let state = Arc::new(AppState::new(config, config_path));
     if peer_connected {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
@@ -88,11 +89,16 @@ async fn peer_sees_only_broadcast_shares_while_connected() {
     let seen = shares_seen_by(&state, peer_a()).await;
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0]["id"], share_id.as_str());
-    assert_eq!(seen[0]["isDir"], true, "目录共享项要带 isDir，对端才知道能不能展开");
+    assert_eq!(
+        seen[0]["isDir"], true,
+        "目录共享项要带 isDir，对端才知道能不能展开"
+    );
     assert!(seen[0].get("path").is_none(), "本机绝对路径不该发给对端");
 
     // 开播，但对方此刻没有长连接：看不见
-    assert!(shares_seen_by(&state, Caller::Peer("peer-b".into())).await.is_empty());
+    assert!(shares_seen_by(&state, Caller::Peer("peer-b".into()))
+        .await
+        .is_empty());
 
     // 本机（回环）永远全量
     assert_eq!(shares_seen_by(&state, Caller::Local).await.len(), 1);
@@ -111,9 +117,19 @@ async fn peer_cannot_read_an_unbroadcast_share() {
     let share_id = state.config.lock().shares[0].id.clone();
 
     // 长连接但没开播：/tree、/file 都不可读
-    let denied = tree_handler(State(state.clone()), Extension(peer_a()), tree_params(&share_id)).await;
+    let denied = tree_handler(
+        State(state.clone()),
+        Extension(peer_a()),
+        tree_params(&share_id),
+    )
+    .await;
     assert_eq!(denied.unwrap_err().0, axum::http::StatusCode::NOT_FOUND);
-    let denied = file_handler(State(state.clone()), Extension(peer_a()), file_params(&share_id)).await;
+    let denied = file_handler(
+        State(state.clone()),
+        Extension(peer_a()),
+        file_params(&share_id),
+    )
+    .await;
     let status = match denied {
         Err((status, _)) => status,
         Ok(_) => panic!("没开播就不该读到文件"),
@@ -122,18 +138,38 @@ async fn peer_cannot_read_an_unbroadcast_share() {
 
     // 开播后能列目录、能读文件
     state.config.lock().shares[0].broadcast_enabled = true;
-    let listed = tree_handler(State(state.clone()), Extension(peer_a()), tree_params(&share_id)).await;
+    let listed = tree_handler(
+        State(state.clone()),
+        Extension(peer_a()),
+        tree_params(&share_id),
+    )
+    .await;
     assert!(listed.is_ok(), "开播且长连接时对端应当能列出目录");
-    let read = file_handler(State(state.clone()), Extension(peer_a()), file_params(&share_id)).await;
+    let read = file_handler(
+        State(state.clone()),
+        Extension(peer_a()),
+        file_params(&share_id),
+    )
+    .await;
     assert!(read.is_ok(), "开播且长连接时对端应当能读文件");
 
     // 再关播 → 立刻又不可读（关播撤销可见性，F-22）
     state.config.lock().shares[0].broadcast_enabled = false;
-    let denied = tree_handler(State(state.clone()), Extension(peer_a()), tree_params(&share_id)).await;
+    let denied = tree_handler(
+        State(state.clone()),
+        Extension(peer_a()),
+        tree_params(&share_id),
+    )
+    .await;
     assert_eq!(denied.unwrap_err().0, axum::http::StatusCode::NOT_FOUND);
 
     // 本机自己的共享项不受开播开关影响
-    let listed = tree_handler(State(state.clone()), Extension(Caller::Local), tree_params(&share_id)).await;
+    let listed = tree_handler(
+        State(state.clone()),
+        Extension(Caller::Local),
+        tree_params(&share_id),
+    )
+    .await;
     assert!(listed.is_ok());
 
     let _ = std::fs::remove_dir_all(root);
@@ -160,7 +196,9 @@ async fn unpaired_source_is_rejected() {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     // 回环（本机 UI）仍然畅通
-    let resp = reqwest::get(format!("http://127.0.0.1:{port}/shares")).await.unwrap();
+    let resp = reqwest::get(format!("http://127.0.0.1:{port}/shares"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     // 已被删掉的 peer 可改共享项权限的端点不该复活
@@ -192,12 +230,12 @@ async fn peer_identity_from_token_scopes_the_share_list() {
     let state = make_state(shared.clone(), false);
     {
         let mut config = state.config.lock();
-        config.shares[0].broadcast_enabled = true;                 // 开播
-        config.shares.push(ShareItem::new(hidden.clone()));        // 未开播
+        config.shares[0].broadcast_enabled = true; // 开播
+        config.shares.push(ShareItem::new(hidden.clone())); // 未开播
     }
     let hidden_id = state.config.lock().shares[1].id.clone();
     let (tx, _rx) = tokio::sync::mpsc::channel(16);
-    state.ws.register(PEER_ID, tx);                                // 对方处于长连接
+    state.ws.register(PEER_ID, tx); // 对方处于长连接
     orbdrop_lib::credential::set_peer(PEER_ID, TOKEN).unwrap();
 
     let port = orbdrop_lib::server::start_server(state.clone(), 4060)
@@ -210,7 +248,9 @@ async fn peer_identity_from_token_scopes_the_share_list() {
     let resp = client
         .get(format!("https://{ip}:{port}/shares"))
         .bearer_auth(TOKEN)
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let json: serde_json::Value = resp.json().await.unwrap();
     let items = json["shares"].as_array().unwrap();
@@ -221,11 +261,17 @@ async fn peer_identity_from_token_scopes_the_share_list() {
     let resp = client
         .get(format!("https://{ip}:{port}/tree?share={hidden_id}&path="))
         .bearer_auth(TOKEN)
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 
     // 不带 token：连列表都拿不到
-    let resp = client.get(format!("https://{ip}:{port}/shares")).send().await.unwrap();
+    let resp = client
+        .get(format!("https://{ip}:{port}/shares"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     // 对方断开长连接：可见性立刻消失
@@ -233,7 +279,9 @@ async fn peer_identity_from_token_scopes_the_share_list() {
     let resp = client
         .get(format!("https://{ip}:{port}/shares"))
         .bearer_auth(TOKEN)
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     let json: serde_json::Value = resp.json().await.unwrap();
     assert!(json["shares"].as_array().unwrap().is_empty());
 
@@ -278,23 +326,39 @@ async fn new_share_inherits_auto_broadcast_setting() {
     // 默认关 → 新加的目录不共享，对端看不到
     let added = root.join("added");
     std::fs::create_dir_all(&added).unwrap();
-    let dto = add_share_impl(&state, added.to_string_lossy().to_string()).await.unwrap();
-    assert!(!dto.broadcast_enabled, "默认关：新登记的共享项就是不开播状态");
-    assert!(shares_seen_by(&state, peer_a()).await.is_empty(), "默认关：对端看不到新加的那条");
+    let dto = add_share_impl(&state, added.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    assert!(
+        !dto.broadcast_enabled,
+        "默认关：新登记的共享项就是不开播状态"
+    );
+    assert!(
+        shares_seen_by(&state, peer_a()).await.is_empty(),
+        "默认关：对端看不到新加的那条"
+    );
 
     // 打开设置 → 新加的当场开播；早先那条**不受影响**
     state.config.lock().auto_broadcast_new = true;
     let added2 = root.join("added2");
     std::fs::create_dir_all(&added2).unwrap();
-    let dto2 = add_share_impl(&state, added2.to_string_lossy().to_string()).await.unwrap();
+    let dto2 = add_share_impl(&state, added2.to_string_lossy().to_string())
+        .await
+        .unwrap();
     assert!(dto2.broadcast_enabled, "打开之后新加的自动开播");
     let seen = shares_seen_by(&state, peer_a()).await;
-    assert_eq!(seen.len(), 1, "对端当场看得见新加的那条；设置改动不回头动已经加好的");
+    assert_eq!(
+        seen.len(),
+        1,
+        "对端当场看得见新加的那条；设置改动不回头动已经加好的"
+    );
     assert_eq!(seen[0]["id"], dto2.id.as_str());
 
     // 同一条路径再登记一次：回来的还是库里那条，手动关掉的开关不被设置翻回来
     state.config.lock().auto_broadcast_new = false;
-    let again = add_share_impl(&state, added2.to_string_lossy().to_string()).await.unwrap();
+    let again = add_share_impl(&state, added2.to_string_lossy().to_string())
+        .await
+        .unwrap();
     assert_eq!(again.id, dto2.id, "同一条路径不新增");
     assert!(again.broadcast_enabled, "已登记项的开关不被设置改动翻动");
 

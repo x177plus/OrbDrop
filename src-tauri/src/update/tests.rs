@@ -16,7 +16,10 @@
 use super::*;
 
 /// 夹具所在的目录（`src-tauri/tests/fixtures/`）。
-const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/update-payload.json");
+const FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/update-payload.json"
+);
 
 fn fixture_bytes() -> Vec<u8> {
     std::fs::read(FIXTURE).expect("夹具文件不在")
@@ -65,13 +68,28 @@ fn verify_file_checks_hash_size_and_signature() {
     };
     verify_file(&path, &good, true).expect("完全对得上就得过");
 
-    let wrong_hash = Artifact { sha256: "00".repeat(32), ..good.clone() };
-    assert!(verify_file(&path, &wrong_hash, true).is_err(), "sha256 不符要拒");
+    let wrong_hash = Artifact {
+        sha256: "00".repeat(32),
+        ..good.clone()
+    };
+    assert!(
+        verify_file(&path, &wrong_hash, true).is_err(),
+        "sha256 不符要拒"
+    );
 
-    let wrong_size = Artifact { size: good.size + 1, ..good.clone() };
-    assert!(verify_file(&path, &wrong_size, true).is_err(), "体积不符要拒");
+    let wrong_size = Artifact {
+        size: good.size + 1,
+        ..good.clone()
+    };
+    assert!(
+        verify_file(&path, &wrong_size, true).is_err(),
+        "体积不符要拒"
+    );
 
-    let no_sig = Artifact { sig: None, ..good.clone() };
+    let no_sig = Artifact {
+        sig: None,
+        ..good.clone()
+    };
     assert!(verify_file(&path, &no_sig, true).is_err(), "缺签名要拒");
     // 安卓端不要求签名（安装时的把关在系统的证书校验上），缺签名照样能过。
     verify_file(&path, &no_sig, false).expect("不要求签名时不该因此失败");
@@ -97,10 +115,15 @@ fn release_script_manifest_parses() {
     parse_version(&m.version).expect("版本号要能被客户端解析");
     assert!(m.version_code > 0, "安卓的安装门槛必须在清单里");
 
-    let art = m.artifact_for_this_platform().expect("清单里要有本平台的产物");
+    let art = m
+        .artifact_for_this_platform()
+        .expect("清单里要有本平台的产物");
     assert!(art.size > 0, "产物体积要写上");
     assert_eq!(art.sha256.len(), 64, "sha256 要写全");
-    assert!(art.sig.is_some(), "桌面端产物必须带签名（没有签名客户端会拒装）");
+    assert!(
+        art.sig.is_some(),
+        "桌面端产物必须带签名（没有签名客户端会拒装）"
+    );
     assert_eq!(art.mirrors.len(), 2, "两条镜像：GitHub 在前、Gitee 在后");
     for u in &art.mirrors {
         ensure_url_ok(u).expect("清单里的地址必须过地址策略（https 或环回 http）");
@@ -131,7 +154,10 @@ fn url_policy_only_allows_https_and_loopback_http() {
 
 #[test]
 fn version_parsing_tolerates_leading_v() {
-    assert_eq!(parse_version("0.0.2").unwrap(), parse_version("v0.0.2").unwrap());
+    assert_eq!(
+        parse_version("0.0.2").unwrap(),
+        parse_version("v0.0.2").unwrap()
+    );
     assert_eq!(parse_version(" v0.0.2 ").unwrap().to_string(), "0.0.2");
     assert!(parse_version("最新版").is_err());
 }
@@ -197,4 +223,79 @@ fn pref_reorder_is_a_stable_partition() {
     first.extend(urls.iter().filter(|u| host_of(u) != "gitee.com").cloned());
     assert_eq!(first[0], "https://gitee.com/o/r/a.exe");
     assert_eq!(first.len(), urls.len());
+}
+
+// ---------------------------------------------------------------------------
+// 上限：清单与安装包都不能让"对面随便说个大数"变成进程内存
+// ---------------------------------------------------------------------------
+
+/// 一个只答一次的裸 HTTP 服务端。
+async fn one_shot_http(response: String) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = socket.read(&mut buf).await;
+        socket.write_all(response.as_bytes()).await.unwrap();
+        let _ = socket.shutdown().await;
+    });
+    format!("http://{addr}/update.json")
+}
+
+/// 清单回话超过 `MANIFEST_MAX_BYTES`：在 `Content-Length` 这一关就拒，不读身体。
+#[tokio::test]
+async fn manifest_response_is_capped() {
+    crate::net::install_crypto_provider();
+    let url = one_shot_http(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2097152\r\n\r\n"
+            .to_string(),
+    )
+    .await;
+    let err = fetch_manifest_at(&url)
+        .await
+        .expect_err("超过上限的清单必须拒绝");
+    assert!(err.contains("太大"), "报错要指到体积上，实际：{err}");
+}
+
+/// 镜像声明 `Content-Length` 大于清单里写的 `size`：在落盘前就换下一条。
+#[tokio::test]
+async fn download_rejects_a_declared_oversize_body() {
+    crate::net::install_crypto_provider();
+    let url = one_shot_http(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2097152\r\n\r\n".to_string(),
+    )
+    .await;
+    let res = http_client().unwrap().get(&url).send().await.unwrap();
+    let dest = std::env::temp_dir().join("orbdrop-download-declared-cap-test.bin");
+    let err = stream_to_file(res, &dest, 1024, |_, _| {})
+        .await
+        .expect_err("比清单大的响应必须中止");
+    assert!(err.contains("比清单说的大"), "实际：{err}");
+    let _ = std::fs::remove_file(&dest);
+}
+
+/// 镜像撒谎（不给 `Content-Length`、用 chunked 发更大的身体）：写盘同样按 `size` 截断。
+#[tokio::test]
+async fn download_stops_when_the_body_exceeds_the_declared_size() {
+    crate::net::install_crypto_provider();
+    let chunk = "x".repeat(4096);
+    let url = one_shot_http(format!(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{chunk}\r\n0\r\n\r\n",
+        chunk.len()
+    ))
+    .await;
+    let res = http_client().unwrap().get(&url).send().await.unwrap();
+    let dest = std::env::temp_dir().join("orbdrop-download-stream-cap-test.bin");
+    let err = stream_to_file(res, &dest, 1024, |_, _| {})
+        .await
+        .expect_err("超过清单声明的身体必须中止");
+    assert!(err.contains("超过清单"), "实际：{err}");
+    let len = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+    assert!(len <= 1024, "落盘不能超过清单声明的大小（实际 {len}）");
+    let _ = std::fs::remove_file(&dest);
 }

@@ -139,7 +139,10 @@ fn collect_events(
             path: rel.to_string_lossy().replace('\\', "/"),
             kind: kind.to_string(),
         };
-        if pending.iter().any(|p| p.path == ev.path && p.kind == ev.kind) {
+        if pending
+            .iter()
+            .any(|p| p.path == ev.path && p.kind == ev.kind)
+        {
             continue; // 同一批里重复的（一次复制会疯狂重复报同一个文件）
         }
         pending.push(ev);
@@ -211,7 +214,11 @@ pub fn unwatch_share(state: &Arc<AppState>, share_id: &str) {
 pub fn watch_all_shares(state: &Arc<AppState>) {
     let shares: Vec<(String, std::path::PathBuf)> = {
         let config = state.config.lock();
-        config.shares.iter().map(|s| (s.id.clone(), s.path.clone())).collect()
+        config
+            .shares
+            .iter()
+            .map(|s| (s.id.clone(), s.path.clone()))
+            .collect()
     };
     for (id, path) in shares {
         watch_share(state, &id, path);
@@ -360,7 +367,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let count = batches.lock().unwrap().len();
-        assert!(count >= 2, "持续变更期间应当按期发批（实际发了 {count} 批）");
+        assert!(
+            count >= 2,
+            "持续变更期间应当按期发批（实际发了 {count} 批）"
+        );
         drop(tx);
         tokio::time::timeout(Duration::from_secs(5), handle)
             .await

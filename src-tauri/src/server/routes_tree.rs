@@ -33,7 +33,10 @@ pub async fn tree_handler(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<TreeResponse>, (StatusCode, String)> {
     let share_id = params.get("share").ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "Missing 'share' query parameter".into())
+        (
+            StatusCode::BAD_REQUEST,
+            "Missing 'share' query parameter".into(),
+        )
     })?;
     let rel_path = params.get("path").map(|s| s.as_str()).unwrap_or("");
 
@@ -45,9 +48,18 @@ pub async fn tree_handler(
             .iter()
             .find(|s| s.id == *share_id && caller.sees_share(&state, s))
             .cloned()
-            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Share '{}' not found", share_id)))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Share '{}' not found", share_id),
+                )
+            })?
     };
     let share_root = share.path;
+
+    if !crate::server::safe_relative_share_path(rel_path) {
+        return Err((StatusCode::FORBIDDEN, "Path access denied".into()));
+    }
 
     let target = if rel_path.is_empty() {
         share_root.clone()
@@ -63,7 +75,10 @@ pub async fn tree_handler(
 
     let canonical_root = share_root.canonicalize().map_err(|e| {
         error!("Failed to canonicalize root {share_root:?}: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to resolve share root".into())
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to resolve share root".into(),
+        )
     })?;
 
     if !canonical_target.starts_with(&canonical_root) {
@@ -75,12 +90,15 @@ pub async fn tree_handler(
     }
 
     let mut entries = Vec::new();
-    let mut read_dir = tokio::fs::read_dir(&canonical_target).await.map_err(|e| {
-        (StatusCode::FORBIDDEN, format!("无权访问: {e}"))
-    })?;
+    let mut read_dir = tokio::fs::read_dir(&canonical_target)
+        .await
+        .map_err(|e| (StatusCode::FORBIDDEN, format!("无权访问: {e}")))?;
 
     while let Some(entry) = read_dir.next_entry().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("Read error: {e}"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Read error: {e}"),
+        )
     })? {
         if let Ok(metadata) = entry.metadata().await {
             let is_dir = metadata.is_dir();
@@ -95,9 +113,7 @@ pub async fn tree_handler(
                 .modified()
                 .ok()
                 .and_then(|t| {
-                    let duration = t
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()?;
+                    let duration = t.duration_since(std::time::UNIX_EPOCH).ok()?;
                     let secs = duration.as_secs() as i64;
                     Some(chrono::DateTime::from_timestamp(secs, 0)?.to_rfc3339())
                 })

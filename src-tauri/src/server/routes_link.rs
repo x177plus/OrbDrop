@@ -64,11 +64,15 @@ pub async fn link_request_handler(
         .unwrap_or(req.peer_name);
 
     info!(%peer_id, request_id = %req.request_id, "inbound link request");
-    ws::emit_ui(&state, ui::LINK_REQUEST, &serde_json::json!({
-        "requestId": req.request_id,
-        "peerId": peer_id,
-        "peerName": peer_name,
-    }));
+    ws::emit_ui(
+        &state,
+        ui::LINK_REQUEST,
+        &serde_json::json!({
+            "requestId": req.request_id,
+            "peerId": peer_id,
+            "peerName": peer_name,
+        }),
+    );
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     link::note_incoming(

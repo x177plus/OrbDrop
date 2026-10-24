@@ -184,7 +184,11 @@ pub fn is_mirror_path(path: &Path, mirror: &Path) -> bool {
 }
 
 /// `path` 等于 `root`，或者落在 `root` 下面。
-fn is_equal_or_under(path: &Path, root: &Path) -> bool {
+///
+/// 词法比较（不 `canonicalize`）：调用方拿到的 `root` 可能是**还不存在**的目录，而
+/// `%LOCALAPPDATA%` 被组策略重定向、`mirror` 是 junction 时，解析后的真实路径会与配置里的
+/// 写法不一致 —— 那种"解析失败/对不上"不该被当成越界。
+pub(crate) fn is_equal_or_under(path: &Path, root: &Path) -> bool {
     #[cfg(windows)]
     {
         // 大小写不敏感（与 `same_path` 同一套判据）。只比字节前缀，所以再确认一次边界是分隔符 ——
@@ -192,7 +196,8 @@ fn is_equal_or_under(path: &Path, root: &Path) -> bool {
         let p = path.to_string_lossy();
         let r = root.to_string_lossy();
         let r = r.trim_end_matches(['\\', '/']);
-        p.get(..r.len()).is_some_and(|head| head.eq_ignore_ascii_case(r))
+        p.get(..r.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(r))
             && matches!(p.as_bytes().get(r.len()), None | Some(b'\\') | Some(b'/'))
     }
     #[cfg(not(windows))]
@@ -204,7 +209,8 @@ fn is_equal_or_under(path: &Path, root: &Path) -> bool {
 /// Windows 的路径大小写不敏感：用户从 `c:\users\…` 那一侧进来时，逐字节比较认不出来。
 #[cfg(windows)]
 fn same_path(a: &Path, b: &Path) -> bool {
-    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
 #[cfg(not(windows))]
@@ -241,7 +247,12 @@ mod tests {
     /// （`D:\backup\Recovery` 是很常见的目录名）。
     #[test]
     fn root_only_names_are_not_filtered_elsewhere() {
-        for name in ["System Volume Information", "$RECYCLE.BIN", "Recovery", "lost+found"] {
+        for name in [
+            "System Volume Information",
+            "$RECYCLE.BIN",
+            "Recovery",
+            "lost+found",
+        ] {
             assert!(!is_system_name(name, false), "{name} 在非卷根不该被滤");
         }
     }
@@ -271,7 +282,9 @@ mod tests {
             assert!(sits_in_volume_root(Path::new("/Volumes/优盘/素材")));
             assert!(!sits_in_volume_root(Path::new("/Volumes/优盘/素材/子目录")));
             // 只是名字里有个 Volumes 的普通目录，不算卷根。
-            assert!(!sits_in_volume_root(Path::new("/Users/x/Volumes/优盘/.Trashes")));
+            assert!(!sits_in_volume_root(Path::new(
+                "/Users/x/Volumes/优盘/.Trashes"
+            )));
         }
     }
 
@@ -288,7 +301,15 @@ mod tests {
         assert!(is_system_name("$WinREAgent", true));
         assert!(is_system_name("found.000", true));
         // 用户真的会有的名字：不能滤。
-        for name in ["Windows", "Users", "ProgramData", "Program Files", "AppData", ".git", "素材"] {
+        for name in [
+            "Windows",
+            "Users",
+            "ProgramData",
+            "Program Files",
+            "AppData",
+            ".git",
+            "素材",
+        ] {
             assert!(!is_system_name(name, true), "{name} 不该被滤");
         }
     }
@@ -299,14 +320,20 @@ mod tests {
         assert!(is_system_name(".Spotlight-V100", true));
         assert!(is_system_name(".fseventsd", true));
         assert!(is_system_name(".Trashes", true));
-        assert!(is_system_name(".DS_Store", false), "Finder 的状态文件在任何一层都是垃圾");
+        assert!(
+            is_system_name(".DS_Store", false),
+            "Finder 的状态文件在任何一层都是垃圾"
+        );
         assert!(is_system_name("._报告.pdf", false), "AppleDouble 影子文件");
         assert!(is_system_name(".localized", false));
         // 用户的真实目录：不能滤。
         for name in ["Users", "Applications", "Library", "System", "Documents"] {
             assert!(!is_system_name(name, true), "{name} 不该被滤");
         }
-        assert!(!is_system_name(".Spotlight-V100", false), "只有卷根那个是真的");
+        assert!(
+            !is_system_name(".Spotlight-V100", false),
+            "只有卷根那个是真的"
+        );
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -323,7 +350,10 @@ mod tests {
     fn our_own_data_dir_is_refused() {
         let own = crate::config::data_dir();
         assert!(is_own_data_dir(&own, &own));
-        assert!(!is_own_data_dir(&own.join("logs"), &own), "只挡数据目录本身，别挡它外面的世界");
+        assert!(
+            !is_own_data_dir(&own.join("logs"), &own),
+            "只挡数据目录本身，别挡它外面的世界"
+        );
         assert!(!is_own_data_dir(Path::new("/definitely/not/orbdrop"), &own));
     }
 
@@ -334,10 +364,19 @@ mod tests {
         // 这条是真正的靶子：`credentials.dat` 里是全部设备的 token，它既不是数据目录本身、
         // 也不在镜像里 —— 只查那两条会把它放过去。
         assert!(is_own_data_path(&own.join("credentials.dat"), &own));
-        assert!(is_own_data_path(&own.join("logs").join("orbdrop.log"), &own));
-        assert!(is_own_data_path(&own.join("mirror").join("p").join("s"), &own), "镜像也在里面");
+        assert!(is_own_data_path(
+            &own.join("logs").join("orbdrop.log"),
+            &own
+        ));
+        assert!(
+            is_own_data_path(&own.join("mirror").join("p").join("s"), &own),
+            "镜像也在里面"
+        );
         // 别误伤数据目录外面的东西（包括同名的另一棵树）
-        assert!(!is_own_data_path(Path::new("/definitely/not/orbdrop"), &own));
+        assert!(!is_own_data_path(
+            Path::new("/definitely/not/orbdrop"),
+            &own
+        ));
         assert!(!is_own_data_path(&own.with_extension("old"), &own));
     }
 
@@ -350,15 +389,24 @@ mod tests {
             "镜像里放的东西（这才是实机踩到的那一下：把镜像里的文件拖回面板当共享项）"
         );
         // 相邻目录不能被误伤
-        assert!(!is_mirror_path(&crate::config::data_dir().join("logs"), &mirror));
+        assert!(!is_mirror_path(
+            &crate::config::data_dir().join("logs"),
+            &mirror
+        ));
         assert!(!is_mirror_path(&crate::config::data_dir(), &mirror));
-        assert!(!is_mirror_path(Path::new("/definitely/not/orbdrop"), &mirror));
+        assert!(!is_mirror_path(
+            Path::new("/definitely/not/orbdrop"),
+            &mirror
+        ));
     }
 
     #[test]
     fn mirror_prefix_must_end_on_a_separator() {
         let mirror = Path::new(r"C:\data\mirror");
-        assert!(!is_mirror_path(Path::new(r"C:\data\mirror-x\a.bin"), mirror), "同前缀不同目录");
+        assert!(
+            !is_mirror_path(Path::new(r"C:\data\mirror-x\a.bin"), mirror),
+            "同前缀不同目录"
+        );
         assert!(!is_mirror_path(Path::new(r"C:\data\mirror2"), mirror));
     }
 
@@ -366,6 +414,9 @@ mod tests {
     #[test]
     fn mirror_match_ignores_case() {
         let mirror = Path::new(r"C:\Data\Mirror");
-        assert!(is_mirror_path(Path::new(r"c:\data\mirror\p\s\a.bin"), mirror));
+        assert!(is_mirror_path(
+            Path::new(r"c:\data\mirror\p\s\a.bin"),
+            mirror
+        ));
     }
 }

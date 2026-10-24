@@ -51,7 +51,8 @@ fn peer(id: &str, ip: &str, port: u16) -> PeerDevice {
         online: true,
         paired: true,
         auto_connect: false,
-        paused: false, relay: None,
+        paused: false,
+        relay: None,
     }
 }
 
@@ -99,7 +100,9 @@ fn wipe_clears_vault_address_book_and_our_bc_profiles_only() {
         "抹掉 = 回到「还没钉住」（下一次成功连线按 TOFU 重新认）"
     );
     assert_eq!(
-        credential::get_peer_token("device-dirty").unwrap().as_deref(),
+        credential::get_peer_token("device-dirty")
+            .unwrap()
+            .as_deref(),
         Some("tok-dirty"),
         "清的是指纹那一项，token（这段关系本身）不动"
     );
@@ -145,14 +148,20 @@ fn wipe_clears_vault_address_book_and_our_bc_profiles_only() {
 
     assert!(!credential::vault_path().exists(), "vault 文件应当被删掉");
     assert!(!credential::has_peer("device-a") && !credential::has_peer("device-b"));
-    assert!(state.config.lock().peers.is_empty(), "地址簿里的配对行应当清掉");
+    assert!(
+        state.config.lock().peers.is_empty(),
+        "地址簿里的配对行应当清掉"
+    );
 
     let text = std::fs::read_to_string(bc_dir.join("BCProfiles.xml")).unwrap();
     assert!(
         !text.contains(bc::DAV_USER),
         "我们写下的 profile 应当被剪掉:\n{text}"
     );
-    assert!(text.contains("alice"), "用户手建的 profile 一个都不能动:\n{text}");
+    assert!(
+        text.contains("alice"),
+        "用户手建的 profile 一个都不能动:\n{text}"
+    );
 
     let _ = std::fs::remove_dir_all(&data_dir);
 }

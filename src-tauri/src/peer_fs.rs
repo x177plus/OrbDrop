@@ -28,20 +28,37 @@ pub struct PeerFile {
 /// 所以切成小块，内存不会被文件大小牵着走；提前转存与镜像水合都按这个粒度拉。
 pub const READ_CHUNK: u64 = 4 * 1024 * 1024;
 
-/// 问对端用的 HTTP 客户端（元数据与内容共用）。
-pub fn client() -> reqwest::Client {
-    crate::net::client_builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .unwrap_or_default()
+/// 对端元数据 JSON 的体积极限（`/tree` / `/stat` / `/shares`）。
+///
+/// 取 64 MiB：正常目录远小于它，但"一个几万项的目录"也不该因为这次上限而被拒；对端想回
+/// 一个无限长的 JSON 时，`read_json_capped` 仍会在分配前拒掉。`/shares` 与 `/stat` 的
+/// 正常回话只有几百字节。
+pub const PEER_JSON_BODY_MAX: usize = 64 * 1024 * 1024;
+
+/// 问**某一台对端**用的 HTTP 客户端（元数据与内容共用）。
+///
+/// 必须按目标设备建信任表（`net::DialPin`）：全局表按 IP 聚合指纹，同一地址上另一台
+/// 已配对设备的证书也能通过校验，随后这枚 token 就发给了它。同一个 `(地址, 指纹)`
+/// 在 `net` 那边有缓存，所以每个区间回调都调它也不会重新握手。
+pub fn client_for(state: &AppState, peer_id: &str) -> Result<reqwest::Client, String> {
+    let peer = state
+        .get_peer(peer_id)
+        .ok_or_else(|| "设备不在列表中".to_string())?;
+    Ok(crate::net::dial_client_with_timeouts(
+        peer.dial().0,
+        &peer.dial_pin(),
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+    ))
 }
 
 /// 解析某个对端的基地址与 token（"能不能问它"这一步）。
 ///
 /// 拖放与镜像两条路都要它；失败信息是给用户看的，所以要分得清"设备不在列表"与"未配对"。
 pub fn coords(state: &Arc<AppState>, peer_id: &str) -> Result<(String, String), String> {
-    let peer = state.get_peer(peer_id).ok_or_else(|| "设备不在列表中".to_string())?;
+    let peer = state
+        .get_peer(peer_id)
+        .ok_or_else(|| "设备不在列表中".to_string())?;
     let token = crate::credential::get_peer_token(peer_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "未配对，无法读取对方的共享项".to_string())?;
@@ -75,14 +92,21 @@ pub async fn fetch_file_range(
         .bearer_auth(&file.token)
         .send()
         .await
-        .map_err(|e| format!("读取对端文件失败（share={} path={:?}）: {e}", file.share_id, file.path))?;
+        .map_err(|e| {
+            format!(
+                "读取对端文件失败（share={} path={:?}）: {e}",
+                file.share_id, file.path
+            )
+        })?;
     if !resp.status().is_success() {
         let status = resp.status();
         // 把 share/path 与**响应体**都带上：403 只有两种来源，体里分得清清楚楚 ——
         // "Path access denied" = 路径解析不了（对端旧版本拖着"共享项根是文件"那一档时，
         // path 是空串、对端 `share_root.join("")` 多一个结尾分隔符）；
         // "Path traversal denied" = 越界。光看状态码没法区分是谁的错。
-        let body = resp.text().await.unwrap_or_default();
+        let body = crate::net::read_text_capped(resp, crate::net::CONTROL_BODY_MAX)
+            .await
+            .unwrap_or_default();
         return Err(format!(
             "读取对端文件失败: HTTP {status}（share={} path={:?}）: {}",
             file.share_id,
@@ -90,7 +114,12 @@ pub async fn fetch_file_range(
             body.trim()
         ));
     }
-    Ok(resp.bytes().await.map_err(|e| format!("读取对端文件中断: {e}"))?.to_vec())
+    // 服务端按 `len` 截断，但这条客户端不能信它：对端可以回任意长度。只读 `want` 字节，
+    // 超出立刻失败（否则一次 4 MiB 请求能被回成几 GB，`bytes()` 直接吃内存）。
+    let max = want.min(usize::MAX as u64) as usize;
+    crate::net::read_body_capped(resp, max)
+        .await
+        .map_err(|e| format!("读取对端文件中断: {e}"))
 }
 
 /// 对端一条目录项。
@@ -129,9 +158,15 @@ pub async fn fetch_tree(
         if resp.status() == reqwest::StatusCode::BAD_REQUEST {
             return Err(format!("读取对端目录失败: {NOT_A_DIRECTORY}（{path}）"));
         }
-        return Err(format!("读取对端目录失败: HTTP {}（{path}）", resp.status()));
+        return Err(format!(
+            "读取对端目录失败: HTTP {}（{path}）",
+            resp.status()
+        ));
     }
-    let body: serde_json::Value = resp.json().await.map_err(|e| format!("解析目录失败: {e}"))?;
+    let body: serde_json::Value =
+        crate::net::read_json_capped(resp, PEER_JSON_BODY_MAX)
+            .await
+            .map_err(|e| format!("解析目录失败: {e}"))?;
     let entries = body
         .get("entries")
         .and_then(|v| v.as_array())
@@ -139,10 +174,21 @@ pub async fn fetch_tree(
     Ok(entries
         .iter()
         .map(|entry| TreeEntry {
-            name: entry.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            is_dir: entry.get("isDir").and_then(|v| v.as_bool()).unwrap_or(false),
+            name: entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            is_dir: entry
+                .get("isDir")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             size: entry.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
-            modified: entry.get("modified").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            modified: entry
+                .get("modified")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
         })
         .collect())
 }
@@ -165,11 +211,21 @@ pub async fn fetch_stat(
     if !resp.status().is_success() {
         return Err(format!("读取对端文件信息失败: HTTP {}", resp.status()));
     }
-    let value: serde_json::Value = resp.json().await.map_err(|e| format!("解析文件信息失败: {e}"))?;
+    let value: serde_json::Value =
+        crate::net::read_json_capped(resp, PEER_JSON_BODY_MAX)
+            .await
+            .map_err(|e| format!("解析文件信息失败: {e}"))?;
     Ok(Stat {
-        is_dir: value.get("isDir").and_then(|v| v.as_bool()).unwrap_or(false),
+        is_dir: value
+            .get("isDir")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         size: value.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
-        modified: value.get("modified").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        modified: value
+            .get("modified")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
     })
 }
 
@@ -237,7 +293,9 @@ pub fn join_slash(base: &str, name: &str) -> String {
 }
 
 pub fn parse_rfc3339_secs(text: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(text).ok().map(|t| t.timestamp())
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|t| t.timestamp())
 }
 
 /// 一段路径名：剔掉本机不接受的字符与结尾的空格/点（对端可能是 macOS，名字里会有 `:`）。
@@ -268,7 +326,11 @@ mod tests {
     fn plain_component_cleans_and_rejects() {
         assert_eq!(plain_component("12:30.log"), Some("12_30.log".to_string()));
         assert_eq!(plain_component("尾 点. "), Some("尾 点".to_string()));
-        assert_eq!(plain_component("a\\b"), Some("a_b".to_string()), "反斜杠是分隔符，不能当名字");
+        assert_eq!(
+            plain_component("a\\b"),
+            Some("a_b".to_string()),
+            "反斜杠是分隔符，不能当名字"
+        );
         assert_eq!(plain_component(""), None);
         assert_eq!(plain_component("."), None);
         assert_eq!(plain_component(".."), None);
@@ -277,7 +339,10 @@ mod tests {
 
     #[test]
     fn rfc3339_round_trip_to_secs() {
-        assert_eq!(parse_rfc3339_secs("2026-09-16T12:00:00+00:00"), Some(1_789_560_000));
+        assert_eq!(
+            parse_rfc3339_secs("2026-09-16T12:00:00+00:00"),
+            Some(1_789_560_000)
+        );
         assert_eq!(parse_rfc3339_secs(""), None);
     }
 

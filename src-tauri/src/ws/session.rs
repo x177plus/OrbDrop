@@ -8,8 +8,8 @@ use tracing::{debug, error, info, warn};
 use crate::credential;
 use crate::state::{AppState, LinkIntent};
 use crate::transfer;
-use crate::ws::events::{ui, PeerInfo, WsEvent};
 use crate::ws::emit_ui;
+use crate::ws::events::{ui, PeerInfo, WsEvent};
 
 /// Inbound WebSocket session — a paired peer connected to our /events.
 ///
@@ -27,7 +27,9 @@ pub async fn run_inbound_session(state: Arc<AppState>, peer_id: String, ws: WebS
     // 被拨号的一端同样是"处于长连接"（F-16）：重启后这一侧也要能自动接回来。
     // 同一次写入清掉「断开」的暂停 —— 能走到这里，就说明本机不是暂停态（闸门放行了）。
     state.set_link_intent(&peer_id, LinkIntent::Wanted);
-    state.ws.set_link_state(&peer_id, crate::ws::LinkState::Connected);
+    state
+        .ws
+        .set_link_state(&peer_id, crate::ws::LinkState::Connected);
 
     let (mut sink, mut stream) = ws.split();
     // 队列**有界**（容量与理由见 `crate::ws::EVENT_QUEUE_CAPACITY`）：对端不再读时，
@@ -104,7 +106,10 @@ pub async fn run_inbound_session(state: Arc<AppState>, peer_id: String, ws: WebS
     // 这一条同样要看"刚听到过它"：链路断掉那一刻它可能刚发来一条消息（那正是它这一侧
     // 还活着的证据，见 `AppState::heard`），那就等探活在 `HEARD_TTL` 之后如实落回来，
     // 而不是断链这一下就把它画成离线。
-    if state.get_peer(&peer_id).is_some_and(|p| p.ip.is_empty() || p.port == 0) {
+    if state
+        .get_peer(&peer_id)
+        .is_some_and(|p| p.ip.is_empty() || p.port == 0)
+    {
         state.set_peer_offline_unless_heard(&peer_id);
     }
     state.emit_devices_changed();
@@ -158,22 +163,37 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
     state.note_heard_online(peer_id);
     match event {
         WsEvent::PeerOnline { peer } => {
-            // mDNS-driven; accept as an upsert for completeness.
-            state.upsert_peer(&crate::config::PeerDevice {
-                id: peer.id,
-                name: peer.name,
-                ip: String::new(),
-                port: 0,
-                online: true,
-                paired: true,
-                auto_connect: false, paused: false, relay: None,
-            });
-            emit_ui(state, ui::DEVICES_CHANGED, &serde_json::json!({}));
+            // mDNS 上线的转述（旧协议残留，现在没有发送方）。**身份只认这条会话**：
+            // `peer_id` 是 token 换来的，而报文里的 `peer.id` 只是对端自己填的字符串。
+            //
+            // 旧实现直接照 `peer.id` 做 upsert 并写 `paired: true`：任一已配对设备发一帧，
+            // 就能把地址簿里任意一台未配对设备（手动添加 / 刚建行还没配对的那类）永久标成
+            // 「已配对」并落盘。此后那台设备走 HTTP 兜底会被判 401（「自称已配对但拿不出
+            // token」，见 `routes_chat::accept_with`），本机拨它也会按 `DialPin::Deny` 拒绝
+            // （见 `credential::dial_pin`）—— 一条越权的状态投毒，和 `Unpair` 那条同型。
+            if peer.id != peer_id {
+                warn!(%peer_id, claimed = %peer.id, "WS peer_online 的自称 id 与连接身份不一致，忽略");
+                return InboundResult::Accepted;
+            }
+            // 在线证据已由上面的 `note_heard_online(peer_id)` 落账；`paired` 只由本机记录
+            // 决定（这一帧换不来一段关系，凭据库才是关系的依据）。名字算核实过：这条
+            // 连接是 token 换来的（`note_peer_name` 会顺带 emit 设备表变更）。
+            state.note_peer_name(peer_id, &peer.name);
         }
         WsEvent::PeerOffline { peer_id: _ } => {
             // WS drop itself drives offline; nothing to do here.
         }
-        WsEvent::PushInvite { invite_id, sender, name, size, is_dir, count, files, caps, at } => {
+        WsEvent::PushInvite {
+            invite_id,
+            sender,
+            name,
+            size,
+            is_dir,
+            count,
+            files,
+            caps,
+            at,
+        } => {
             // 身份以**这条会话**为准，不用载荷里自称的那个：长连接是 token 换来的，
             // 而载荷里的 sender.id 只是对端自己填的字符串。
             //
@@ -199,9 +219,12 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             let callback = known
                 .as_ref()
                 .and_then(|p| (!p.ip.is_empty() && p.port != 0).then(|| (p.ip.clone(), p.port)));
-            state.push.insert_invite(transfer::push_job::InboundInvite {
+            let invite = transfer::push_job::InboundInvite {
                 invite_id: invite_id.clone(),
-                sender: PeerInfo { id: peer_id.to_string(), name: display_name.clone() },
+                sender: PeerInfo {
+                    id: peer_id.to_string(),
+                    name: display_name.clone(),
+                },
                 name: name.clone(),
                 size,
                 is_dir,
@@ -212,18 +235,35 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 root: None,
                 callback,
                 responder: None,
-            });
-            emit_ui(state, ui::PUSH_INVITE, &serde_json::json!({
-                "inviteId": invite_id,
-                "sender": { "id": peer_id, "name": display_name },
-                "name": name,
-                "size": total,
-                "isDir": is_dir,
-                "count": count,
-                "auto": paired,
-                // 这条文件消息在会话时间线上的位置（发送方点的，见 `WsEvent::PushInvite::at`）。
-                "at": at,
-            }));
+            };
+            if let Err(reason) = transfer::push_job::validate_invite(&invite) {
+                warn!(%invite_id, %reason, "WS 推送邀请被拒：清单超出上限");
+                let _ = state.ws.send(
+                    peer_id,
+                    WsEvent::PushResponse {
+                        invite_id: invite_id.clone(),
+                        accepted: false,
+                        reason: Some(reason),
+                    },
+                );
+                return InboundResult::Accepted;
+            }
+            state.push.insert_invite(invite);
+            emit_ui(
+                state,
+                ui::PUSH_INVITE,
+                &serde_json::json!({
+                    "inviteId": invite_id,
+                    "sender": { "id": peer_id, "name": display_name },
+                    "name": name,
+                    "size": total,
+                    "isDir": is_dir,
+                    "count": count,
+                    "auto": paired,
+                    // 这条文件消息在会话时间线上的位置（发送方点的，见 `WsEvent::PushInvite::at`）。
+                    "at": at,
+                }),
+            );
             // 已配对的设备推送**不需要接收方同意**（token 就是那份信任）：直接开收 —
             // 界面那条通知是"正在接收"而不是"要不要收"。未绑定的才挂卡片等用户点。
             if paired {
@@ -239,7 +279,11 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             // 它等的是"报告"，两边都没有时钟。
             transfer::schedule_invite_timeout(state.clone(), invite_id);
         }
-        WsEvent::PushResponse { invite_id, accepted, reason } => {
+        WsEvent::PushResponse {
+            invite_id,
+            accepted,
+            reason,
+        } => {
             info!(%invite_id, accepted, "push response");
             use transfer::push_job::{batch_set, PushStatus, TargetState};
             // 对端给了原因就用它的：「对方拒绝」与「本机收不下（地址未知之类）」是两件事，
@@ -250,33 +294,69 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             } else {
                 // 拒绝：发送方不能再等下去 —— 清掉 job，并让界面把"等待对方同意"那张卡收掉。
                 state.push.remove_job(&invite_id);
-                batch_set(state, &invite_id, TargetState::Rejected, None, Some(why.clone()), true);
+                batch_set(
+                    state,
+                    &invite_id,
+                    TargetState::Rejected,
+                    None,
+                    Some(why.clone()),
+                    true,
+                );
             }
-            emit_ui(state, ui::PUSH_RESPONSE, &serde_json::json!({
-                "inviteId": invite_id,
-                "accepted": accepted,
-                "reason": why,
-            }));
-            if !accepted {
-                emit_ui(state, ui::PUSH_DONE, &serde_json::json!({
+            emit_ui(
+                state,
+                ui::PUSH_RESPONSE,
+                &serde_json::json!({
                     "inviteId": invite_id,
-                    "status": "failed",
+                    "accepted": accepted,
                     "reason": why,
-                }));
+                }),
+            );
+            if !accepted {
+                emit_ui(
+                    state,
+                    ui::PUSH_DONE,
+                    &serde_json::json!({
+                        "inviteId": invite_id,
+                        "status": "failed",
+                        "reason": why,
+                    }),
+                );
             }
         }
-        WsEvent::PushProgress { invite_id, received, total } => {
+        WsEvent::PushProgress {
+            invite_id,
+            received,
+            total,
+        } => {
             use transfer::push_job::{batch_set, PushStatus, TargetState};
-            state.push.update_status(&invite_id, PushStatus::Downloading { received, total });
+            state
+                .push
+                .update_status(&invite_id, PushStatus::Downloading { received, total });
             // 纯进度：按 REPORT_INTERVAL 合并（状态跃迁才立刻发，见 `batch_set`）。
-            batch_set(state, &invite_id, TargetState::Sending, Some(received), None, false);
-            emit_ui(state, ui::PUSH_PROGRESS, &serde_json::json!({
-                "inviteId": invite_id,
-                "received": received,
-                "total": total,
-            }));
+            batch_set(
+                state,
+                &invite_id,
+                TargetState::Sending,
+                Some(received),
+                None,
+                false,
+            );
+            emit_ui(
+                state,
+                ui::PUSH_PROGRESS,
+                &serde_json::json!({
+                    "inviteId": invite_id,
+                    "received": received,
+                    "total": total,
+                }),
+            );
         }
-        WsEvent::PushDone { invite_id, status, reason } => {
+        WsEvent::PushDone {
+            invite_id,
+            status,
+            reason,
+        } => {
             info!(%invite_id, %status, "push done");
             use transfer::push_job::{batch_set, PushStatus, TargetState};
             // 发送方撤销时这条邀请可能还挂在通知列表里（对方还没点同意）：
@@ -285,11 +365,14 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             // 发送方说这条结束了 → 接收端那份"待续传任务"一并作废（重启后不该再自己开始收）。
             // 发送方这边没有这一份，这行是个空操作。
             state.push.resume.drop_pending(&invite_id);
-            state.push.update_status(&invite_id, if status == "completed" {
-                PushStatus::Completed
-            } else {
-                PushStatus::Failed(reason.clone().unwrap_or_default())
-            });
+            state.push.update_status(
+                &invite_id,
+                if status == "completed" {
+                    PushStatus::Completed
+                } else {
+                    PushStatus::Failed(reason.clone().unwrap_or_default())
+                },
+            );
             // 批次那一格的终态先落定，再清 job（`batch_set` 只认批次自己那份状态）。
             let target_state = match status.as_str() {
                 "completed" => TargetState::Done,
@@ -298,13 +381,21 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             };
             batch_set(state, &invite_id, target_state, None, reason.clone(), true);
             state.push.remove_job(&invite_id);
-            emit_ui(state, ui::PUSH_DONE, &serde_json::json!({
-                "inviteId": invite_id,
-                "status": status,
-                "reason": reason,
-            }));
+            emit_ui(
+                state,
+                ui::PUSH_DONE,
+                &serde_json::json!({
+                    "inviteId": invite_id,
+                    "status": status,
+                    "reason": reason,
+                }),
+            );
         }
-        WsEvent::ShareChanged { share_id, path, kind } => {
+        WsEvent::ShareChanged {
+            share_id,
+            path,
+            kind,
+        } => {
             // **这条是流量，不是新闻**：对端一次构建能在 300ms 的窗口里发来几百条逐文件事件
             // （实测 1300 条/秒），每一条都记一条日志、发一次 Tauri 事件，前端就每一条重拉一次
             // 整层树。按共享项**前缘节流**（见 `AppState::share_changed_due`）：窗口内第一条
@@ -315,15 +406,23 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 return InboundResult::Accepted;
             }
             debug!(%share_id, %path, %kind, "share changed");
-            emit_ui(state, ui::SHARE_CHANGED, &serde_json::json!({
-                "shareId": share_id,
-                "path": path,
-                "kind": kind,
-            }));
+            emit_ui(
+                state,
+                ui::SHARE_CHANGED,
+                &serde_json::json!({
+                    "shareId": share_id,
+                    "path": path,
+                    "kind": kind,
+                }),
+            );
         }
         WsEvent::SharesChanged => {
             // 对端共享项清单变了：让前端重新拉该设备的 /shares。
-            emit_ui(state, ui::SHARES_CHANGED, &serde_json::json!({ "peerId": peer_id }));
+            emit_ui(
+                state,
+                ui::SHARES_CHANGED,
+                &serde_json::json!({ "peerId": peer_id }),
+            );
         }
         WsEvent::Unpair { peer_id: who } => {
             // 兼容旧版本对端（新版本走 POST /unpair，不依赖长连接）。
@@ -341,7 +440,12 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             state.unpair(peer_id);
             emit_ui(state, ui::DEVICES_CHANGED, &serde_json::json!({}));
         }
-        WsEvent::ChatText { id, text, at, from_name } => {
+        WsEvent::ChatText {
+            id,
+            text,
+            at,
+            from_name,
+        } => {
             // 名字：载荷里那个自报的名字算**核实过**的（这条连接是 token 换来的身份）→
             // 直接更新设备行（`note_peer_name`：对端改名跟着走），再从表里取。表里那份是权威
             // （本机备注 F-101 走的是另一个字段）。以前这里没有 `from_name`，取到的一直是
@@ -358,18 +462,31 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             // 手机上人没看着屏幕时，这条通知才是他知道"有人在说话"的唯一途径（进程活着、
             // 界面可能早就没了）—— 见 `notify` 的说明。重复投递不再响一遍。
             if fresh {
-                crate::notify::message(&crate::notify::Convo::Direct(peer_id.to_string()), &name, &text).await;
+                crate::notify::message(
+                    &crate::notify::Convo::Direct(peer_id.to_string()),
+                    &name,
+                    &text,
+                )
+                .await;
             }
             // 界面是不是**正开着**这个会话，只有界面知道（它自己会来 `chat_mark_read`）；
             // 这里不回已读回执 —— 收到 ≠ 读过。
         }
-        WsEvent::ChatImage { id, at, name, size: _, data, from_name } => {
+        WsEvent::ChatImage {
+            id,
+            at,
+            name,
+            size: _,
+            data,
+            from_name,
+        } => {
             // 与 `ChatText` 同一个口径：载荷里的名字算核实过的（token 换来的身份）→ 直接更新。
             state.note_peer_name(peer_id, &from_name);
             let sender = crate::group::display_name(state, peer_id, &from_name);
             debug!(%id, %peer_id, name = %name, "inbound chat image");
             // 内容先落盘再记账（见 `chat::accept_inbound_image`）：落不下来就不记。
-            match crate::chat::accept_inbound_image(state, peer_id, &sender, &id, &name, &data, at) {
+            match crate::chat::accept_inbound_image(state, peer_id, &sender, &id, &name, &data, at)
+            {
                 Ok(fresh) => {
                     crate::group::emit(state);
                     if fresh {
@@ -399,7 +516,24 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
         }
         // 群聊三条：落账那一段在 `group.rs`（WS 与 HTTP 兜底两条路共用同一个 dispatcher，
         // 所以这里只有转发）。
-        WsEvent::GroupText { group_id, id, text, at, seq, rev, author, hops, reached, image, name, size, data } => {
+        WsEvent::GroupText {
+            group_id,
+            id,
+            text,
+            at,
+            seq,
+            rev,
+            author,
+            hops,
+            reached,
+            image,
+            name,
+            size,
+            data,
+            epoch,
+            pubkey,
+            sig,
+        } => {
             debug!(%group_id, %id, %peer_id, hops, image, "inbound group text");
             // 通知里要"哪个群、谁说的"，这两样都得在 `author` 被搬进事件里之前留一份
             // （发言人那半截用 `group::display_name`：与落账写进消息里的**同一个名字**）。
@@ -425,6 +559,9 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                     name,
                     size,
                     data,
+                    epoch,
+                    pubkey,
+                    sig,
                 },
             );
             match outcome {
@@ -440,7 +577,11 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                     let who = crate::group::display_name(state, &notify_author, &notify_claimed);
                     // 图片消息在通知里写「[图片]」（手机那条通知只有一行字的位置，
                     // 而这里的 `text` 对图片来说是空串）。
-                    let body = if image { "[图片]".to_string() } else { text.clone() };
+                    let body = if image {
+                        "[图片]".to_string()
+                    } else {
+                        text.clone()
+                    };
                     crate::notify::message(
                         &crate::notify::Convo::Group(group_id),
                         &title,
@@ -454,7 +595,13 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 // 收不下：**当场明说**（长连接这条路的"写成功"不能当真），并把理由交给
                 // HTTP 那一跳（见 `routes_chat`：同一件事回 409，发送方那边两条路都落得下）。
                 refused => {
-                    crate::group::reject_text(state, peer_id, &nack_group, &nack_msg, refused.reason());
+                    crate::group::reject_text(
+                        state,
+                        peer_id,
+                        &nack_group,
+                        &nack_msg,
+                        refused.reason(),
+                    );
                     return InboundResult::GroupRefused(refused.reason());
                 }
             }
@@ -467,20 +614,44 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             debug!(group = %roster.id, rev = roster.rev, %peer_id, "inbound group roster");
             crate::group::on_roster(state, peer_id, roster, &sender.name);
         }
-        WsEvent::GroupSyncAsk { group_id, ask_id, since_at, holes } => {
+        WsEvent::GroupSyncAsk {
+            group_id,
+            ask_id,
+            since_at,
+            holes,
+            ts,
+            pubkey,
+            sig,
+        } => {
             debug!(%group_id, %ask_id, %peer_id, since_at, "inbound group sync ask");
-            crate::group::on_sync_ask(state, peer_id, &group_id, &ask_id, since_at, holes);
+            crate::group::on_sync_ask(
+                state, peer_id, &group_id, &ask_id, since_at, holes, ts, &pubkey, &sig,
+            );
         }
-        WsEvent::GroupSyncPost { group_id, ask_id, roster, has_more, messages } => {
+        WsEvent::GroupSyncPost {
+            group_id,
+            ask_id,
+            roster,
+            has_more,
+            messages,
+            ts,
+            sig,
+        } => {
             debug!(%group_id, %ask_id, %peer_id, count = messages.len(), has_more, "inbound group sync post");
-            crate::group::on_sync_post(state, peer_id, &group_id, roster, has_more, messages);
+            crate::group::on_sync_post(
+                state, peer_id, &group_id, &ask_id, roster, has_more, messages, ts, &sig,
+            );
         }
         WsEvent::GroupAck { group_id, up_to } => {
             debug!(%group_id, %peer_id, up_to, "inbound group ack");
             crate::group::on_ack(state, peer_id, &group_id, up_to);
         }
         // 群聊：对端说"这一条我收不下"（长连接那条路的"写成功 = 已送达"要由它来纠正）。
-        WsEvent::GroupTextRejected { group_id, id, reason } => {
+        WsEvent::GroupTextRejected {
+            group_id,
+            id,
+            reason,
+        } => {
             debug!(%group_id, %id, %peer_id, %reason, "inbound group text rejected");
             crate::group::on_group_text_rejected(state, peer_id, &group_id, &id, &reason);
         }
@@ -506,7 +677,8 @@ mod tests {
     use std::sync::Arc;
 
     fn state(tag: &str) -> Arc<AppState> {
-        let path = std::env::temp_dir().join(format!("orbdrop_ws_{tag}_{}.toml", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("orbdrop_ws_{tag}_{}.toml", uuid::Uuid::new_v4()));
         Arc::new(AppState::new(crate::config::Config::default(), path))
     }
 
@@ -517,7 +689,8 @@ mod tests {
     #[tokio::test]
     async fn unpair_over_ws_only_acts_on_the_session_identity() {
         let st = state("unpair");
-        crate::credential::set_peer_credential("device-attacker", "tok-a", &"a".repeat(64)).unwrap();
+        crate::credential::set_peer_credential("device-attacker", "tok-a", &"a".repeat(64))
+            .unwrap();
         crate::credential::set_peer_credential("device-victim", "tok-v", &"b".repeat(64)).unwrap();
         let victim_seen = st.get_peer("device-victim").is_some();
 
@@ -525,11 +698,15 @@ mod tests {
         let _ = handle_inbound(
             &st,
             "device-attacker",
-            WsEvent::Unpair { peer_id: "device-victim".into() },
+            WsEvent::Unpair {
+                peer_id: "device-victim".into(),
+            },
         )
         .await;
         assert!(
-            crate::credential::get_peer_token("device-victim").unwrap().is_some(),
+            crate::credential::get_peer_token("device-victim")
+                .unwrap()
+                .is_some(),
             "第三方的凭据不许被别人的一帧解掉"
         );
         assert_eq!(
@@ -542,15 +719,73 @@ mod tests {
         let _ = handle_inbound(
             &st,
             "device-attacker",
-            WsEvent::Unpair { peer_id: "device-attacker".into() },
+            WsEvent::Unpair {
+                peer_id: "device-attacker".into(),
+            },
         )
         .await;
         assert!(
-            crate::credential::get_peer_token("device-attacker").unwrap().is_none(),
+            crate::credential::get_peer_token("device-attacker")
+                .unwrap()
+                .is_none(),
             "自称与连接身份一致时按旧语义解掉"
         );
 
         crate::credential::remove_peer("device-victim").ok();
+    }
+
+    /// WS 上的 `PeerOnline` 也只认**连接自己的身份**：报文里那个 `peer.id` 一律不采信，
+    /// `paired` 更不能由报文写。
+    ///
+    /// 旧实现拿载荷里的 id 直接 upsert 并写 `paired: true`：任一已配对设备发一帧就能把
+    /// 地址簿里任意一台未配对设备标成「已配对」（还会落盘）—— 此后那台设备的 HTTP 兜底
+    /// 因"自称已配对但拿不出 token"被判 401，本机拨它也按 `DialPin::Deny` 拒绝。
+    #[tokio::test]
+    async fn peer_online_over_ws_only_acts_on_the_session_identity() {
+        let st = state("peer_online");
+        for (id, name) in [("device-attacker", "Attacker"), ("device-victim", "Victim")] {
+            st.add_peer_book(crate::config::PeerDevice {
+                id: id.into(),
+                name: name.into(),
+                ip: "10.0.0.1".into(),
+                port: 3890,
+                online: true,
+                ..Default::default()
+            });
+        }
+        assert!(!st.get_peer("device-victim").unwrap().paired);
+
+        // 攻击者借自己的连接，把"受害者"报成上线。
+        let _ = handle_inbound(
+            &st,
+            "device-attacker",
+            WsEvent::PeerOnline {
+                peer: PeerInfo {
+                    id: "device-victim".into(),
+                    name: "Renamed".into(),
+                },
+            },
+        )
+        .await;
+        let victim = st.get_peer("device-victim").unwrap();
+        assert!(!victim.paired, "第三方不许被别人的一帧标成已配对");
+        assert_eq!(victim.name, "Victim", "第三方的名字也不许被别人的一帧改写");
+
+        // 自己的 id：名字跟着走（token 会话上的自报算核实过），但 paired 仍只由本机记录决定。
+        let _ = handle_inbound(
+            &st,
+            "device-attacker",
+            WsEvent::PeerOnline {
+                peer: PeerInfo {
+                    id: "device-attacker".into(),
+                    name: "Attacker 2".into(),
+                },
+            },
+        )
+        .await;
+        let attacker = st.get_peer("device-attacker").unwrap();
+        assert_eq!(attacker.name, "Attacker 2");
+        assert!(!attacker.paired, "报文不能把本机记录里的 paired 打开");
     }
 
     /// 入站一条会话消息要做两件事：把**占位名**换成它自报的真名（那是"先显示一串 deviceid"
@@ -570,13 +805,13 @@ mod tests {
                 id: "m1".into(),
                 text: "你好".into(),
                 at: 42,
-                from_name: "小米 15".into(),
+                from_name: "示例设备".into(),
             },
         )
         .await;
 
         let peer = st.get_peer("dev-hw").unwrap();
-        assert_eq!(peer.name, "小米 15", "占位名要被载荷里那个真名填上");
+        assert_eq!(peer.name, "示例设备", "占位名要被载荷里那个真名填上");
         assert!(peer.online, "刚听到过它 = 它在网上（哪怕本机拨不动它）");
         let convo = st
             .chat
@@ -586,7 +821,7 @@ mod tests {
             .find(|c| c.peer_id == "dev-hw")
             .expect("这条消息该被记下来");
         assert_eq!(
-            convo.messages[0].msg.from_name, "小米 15",
+            convo.messages[0].msg.from_name, "示例设备",
             "会话记录里那条也要是真名（以前写进去的是那串 deviceid）"
         );
 
@@ -600,10 +835,10 @@ mod tests {
                 id: "m2".into(),
                 text: "再一句".into(),
                 at: 43,
-                from_name: "小米 15 Pro".into(),
+                from_name: "示例设备 Pro".into(),
             },
         )
         .await;
-        assert_eq!(st.get_peer("dev-hw").unwrap().name, "小米 15 Pro");
+        assert_eq!(st.get_peer("dev-hw").unwrap().name, "示例设备 Pro");
     }
 }

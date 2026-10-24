@@ -109,10 +109,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "orbdrop_watch_{tag}_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_watch_{tag}_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -173,7 +171,10 @@ mod tests {
                 assert_eq!(target.error.as_deref(), Some("源文件已变化，本机已取消"));
                 break;
             }
-            assert!(Instant::now() < deadline, "源变了之后这批该当场作废，实际还停在等待");
+            assert!(
+                Instant::now() < deadline,
+                "源变了之后这批该当场作废，实际还停在等待"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 

@@ -177,7 +177,9 @@ fn helper_main(target: &Path, pid: u32, me: &Path) -> i32 {
 
     // 3) 拉新版本。**先起再删备份**：备份删早了，这一步失败就真没退路了。
     if let Err(e) = spawn_detached(target) {
-        log_line(&format!("新版本拉不起来：{e}（文件已就位，手动开一下即可）"));
+        log_line(&format!(
+            "新版本拉不起来：{e}（文件已就位，手动开一下即可）"
+        ));
         cleanup(me);
         return 1;
     }
@@ -194,7 +196,9 @@ fn helper_main(target: &Path, pid: u32, me: &Path) -> i32 {
 #[cfg(windows)]
 fn wait_exit(pid: u32, max: Duration) {
     use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    use windows::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
     unsafe {
         match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
             Ok(handle) => {
@@ -291,6 +295,10 @@ fn log_line(msg: &str) {
         .append(true)
         .open(dir.join("update.log"))
     {
-        let _ = writeln!(f, "[{}] {msg}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+        let _ = writeln!(
+            f,
+            "[{}] {msg}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
     }
 }

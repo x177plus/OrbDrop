@@ -31,7 +31,10 @@ pub async fn stat_handler(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<StatResponse>, (StatusCode, String)> {
     let share_id = params.get("share").ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "Missing 'share' query parameter".into())
+        (
+            StatusCode::BAD_REQUEST,
+            "Missing 'share' query parameter".into(),
+        )
     })?;
     let rel_path = params.get("path").map(|s| s.as_str()).unwrap_or("");
 
@@ -43,23 +46,39 @@ pub async fn stat_handler(
             .iter()
             .find(|s| s.id == *share_id && caller.sees_share(&state, s))
             .map(|s| s.path.clone())
-            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Share '{share_id}' not found")))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Share '{share_id}' not found"),
+                )
+            })?
     };
 
-    let target = if rel_path.is_empty() { share_root.clone() } else { share_root.join(rel_path) };
-    let canonical = target.canonicalize().map_err(|_| {
-        (StatusCode::NOT_FOUND, "路径不存在".to_string())
-    })?;
+    if !crate::server::safe_relative_share_path(rel_path) {
+        return Err((StatusCode::FORBIDDEN, "Path access denied".into()));
+    }
+
+    let target = if rel_path.is_empty() {
+        share_root.clone()
+    } else {
+        share_root.join(rel_path)
+    };
+    let canonical = target
+        .canonicalize()
+        .map_err(|_| (StatusCode::NOT_FOUND, "路径不存在".to_string()))?;
     let canonical_root = share_root.canonicalize().map_err(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "无法解析共享项根目录".to_string())
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "无法解析共享项根目录".to_string(),
+        )
     })?;
     if !canonical.starts_with(&canonical_root) {
         return Err((StatusCode::FORBIDDEN, "路径越界".into()));
     }
 
-    let metadata = tokio::fs::metadata(&canonical).await.map_err(|e| {
-        (StatusCode::NOT_FOUND, format!("读取元数据失败: {e}"))
-    })?;
+    let metadata = tokio::fs::metadata(&canonical)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("读取元数据失败: {e}")))?;
 
     let modified = metadata
         .modified()

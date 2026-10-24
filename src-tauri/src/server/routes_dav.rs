@@ -72,11 +72,24 @@ async fn dispatch(
 
     let method = req.method().clone();
     let headers = req.headers().clone();
+    // `.`/`./`/空串都指向共享项根；`resolve_within` 会把 `.` 直接跳过。只按字符串是否为空
+    // 判断会漏掉 `.`，而 `DELETE /dav/<id>/.` 会在 `remove_dir_all` 里删掉整个共享根。
+    let root_request = is_share_root_path(&rel_path);
     let result = match method.as_str() {
         "OPTIONS" => Ok(options_response()),
         "PROPFIND" => propfind_response(&share_id, &rel_path, &target, &headers).await,
         "GET" | "HEAD" => read_response(&target, &headers, method == Method::HEAD).await,
+        "PUT" if root_request => Err((
+            StatusCode::FORBIDDEN,
+            "不能对共享项根执行该操作".to_string(),
+        )),
         "PUT" => write_response(&target, req).await,
+        // 共享项根是用户磁盘上的真实目录：删掉/移走/整树复制都会造成不可恢复的
+        // 数据丢失。根级操作只能由本机界面（`remove_share` 等）发起，DAV 面一律拒绝。
+        "DELETE" | "MOVE" | "COPY" if root_request => Err((
+            StatusCode::FORBIDDEN,
+            "不能对共享项根执行该操作".to_string(),
+        )),
         "DELETE" => delete_response(&target).await,
         "MKCOL" => mkcol_response(&target).await,
         "MOVE" => move_response(&share_id, &share.path, &target, &headers, false).await,
@@ -123,6 +136,15 @@ const PUT_BODY_LIMIT: u64 = 64 << 20;
 // ---------------------------------------------------------------------------
 // 路径解析（共享项根目录内的相对路径 → 绝对路径，且不可逃逸）
 // ---------------------------------------------------------------------------
+
+/// 这条 URL 路径是不是共享项根本身：空串、`/`、`.`、`./` 这类归一后没有实际组件。
+///
+/// `..` 本身是非法的（`resolve_within` 会拒），不在这里归一；这里只把 `.` 与空段归掉。
+/// 不能用 `trim_matches('/')` 代替，`.` 会原样留下。
+fn is_share_root_path(rel: &str) -> bool {
+    rel.split(['/', '\\'])
+        .all(|part| part.is_empty() || part == ".")
+}
 
 /// 把 URL 里的相对路径解析到共享项根目录下。
 ///
@@ -259,7 +281,11 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-fn response_element(share_id: &str, rel: &str, path: &Path) -> Result<String, (StatusCode, String)> {
+fn response_element(
+    share_id: &str,
+    rel: &str,
+    path: &Path,
+) -> Result<String, (StatusCode, String)> {
     let meta = std::fs::metadata(path)
         .map_err(|e| (StatusCode::NOT_FOUND, format!("读取元数据失败: {e}")))?;
     let name = path
@@ -321,11 +347,12 @@ async fn propfind_response(
         let mut entries = tokio::fs::read_dir(target)
             .await
             .map_err(|e| (StatusCode::FORBIDDEN, format!("无权访问: {e}")))?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("读取目录失败: {e}")))?
-        {
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("读取目录失败: {e}"),
+            )
+        })? {
             let name = entry.file_name().to_string_lossy().to_string();
             let child_rel = if rel.is_empty() {
                 name
@@ -374,19 +401,20 @@ async fn read_response(
     headers: &HeaderMap,
     head_only: bool,
 ) -> Result<Response, (StatusCode, String)> {
-    let meta = std::fs::metadata(target)
-        .map_err(|_| (StatusCode::NOT_FOUND, "Not found".to_string()))?;
+    let meta =
+        std::fs::metadata(target).map_err(|_| (StatusCode::NOT_FOUND, "Not found".to_string()))?;
 
     if meta.is_dir() {
         let mut names: Vec<String> = Vec::new();
         let mut entries = tokio::fs::read_dir(target)
             .await
             .map_err(|e| (StatusCode::FORBIDDEN, format!("无权访问: {e}")))?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("读取目录失败: {e}")))?
-        {
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("读取目录失败: {e}"),
+            )
+        })? {
             names.push(entry.file_name().to_string_lossy().to_string());
         }
         names.sort();
@@ -414,7 +442,10 @@ async fn read_response(
             "text/html; charset=utf-8".parse().unwrap(),
         );
         h.insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
-        h.insert(header::HeaderName::from_static("dav"), "1,2".parse().unwrap());
+        h.insert(
+            header::HeaderName::from_static("dav"),
+            "1,2".parse().unwrap(),
+        );
         return Ok(resp);
     }
 
@@ -617,8 +648,8 @@ async fn mkcol_response(target: &Path) -> Result<Response, (StatusCode, String)>
 }
 
 async fn delete_response(target: &Path) -> Result<Response, (StatusCode, String)> {
-    let meta = std::fs::metadata(target)
-        .map_err(|_| (StatusCode::NOT_FOUND, "Not found".to_string()))?;
+    let meta =
+        std::fs::metadata(target).map_err(|_| (StatusCode::NOT_FOUND, "Not found".to_string()))?;
     let result = if meta.is_dir() {
         tokio::fs::remove_dir_all(target).await
     } else {
@@ -643,19 +674,74 @@ async fn move_response(
         .get("destination")
         .and_then(|v| v.to_str().ok())
         .ok_or((StatusCode::BAD_REQUEST, "缺少 Destination 头".to_string()))?;
-    let dest_rel = destination_relative(share_id, dest_header)
-        .ok_or((StatusCode::BAD_GATEWAY, "Destination 不在本共享项内".to_string()))?;
-    let dest = resolve_within(root, &dest_rel)
-        .map_err(|status| (status, "目标路径不可用".to_string()))?;
-
+    let dest_rel = destination_relative(share_id, dest_header).ok_or((
+        StatusCode::BAD_GATEWAY,
+        "Destination 不在本共享项内".to_string(),
+    ))?;
+    if dest_rel.trim_matches(|c| c == '/' || c == '\\').is_empty() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "不能对共享项根执行该操作".to_string(),
+        ));
+    }
+    let dest =
+        resolve_within(root, &dest_rel).map_err(|status| (status, "目标路径不可用".to_string()))?;
     let overwrite = !matches!(
         headers.get("overwrite").and_then(|v| v.to_str().ok()),
         Some("F")
     );
-    if dest.exists() && !overwrite {
+    let existed = dest.exists();
+    if existed && !overwrite {
         return Err((StatusCode::PRECONDITION_FAILED, "目标已存在".into()));
     }
-    let existed = dest.exists();
+
+    // 源与目标指向同一个文件（Windows 上大小写不同的同名路径就是这一档）：
+    // 旧实现会先删目标再 rename，等于把唯一的源删掉。这里改为直接 rename；
+    // COPY 到自身没有意义，按已完成处理。
+    let same_file = existed
+        && std::fs::canonicalize(target).ok().is_some()
+        && std::fs::canonicalize(target).ok() == std::fs::canonicalize(&dest).ok();
+    if same_file {
+        if copy || target == dest {
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+        return match tokio::fs::rename(target, &dest).await {
+            Ok(()) => Ok(StatusCode::NO_CONTENT.into_response()),
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("重命名失败: {e}"),
+            )),
+        };
+    }
+
+    // 源与目标互为祖先时，任何“先删目标/边复制边递归”的做法都会毁掉源或无限递归。
+    let target_abs = canonical_for_compare(target);
+    let dest_abs = canonical_for_compare(&dest);
+    if dest_abs == target_abs
+        || target_abs.starts_with(&dest_abs)
+        || dest_abs.starts_with(&target_abs)
+    {
+        return Err((StatusCode::CONFLICT, "源与目标路径重叠".to_string()));
+    }
+
+    if existed {
+        let dest_meta = std::fs::metadata(&dest).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("读取目标失败: {e}"),
+            )
+        })?;
+        let src_meta = std::fs::metadata(target).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("读取源失败: {e}"),
+            )
+        })?;
+        if dest_meta.is_dir() != src_meta.is_dir() {
+            return Err((StatusCode::CONFLICT, "文件与目录类型冲突".to_string()));
+        }
+    }
+
     if let Some(parent) = dest.parent() {
         if !parent.exists() {
             tokio::fs::create_dir_all(parent)
@@ -663,34 +749,108 @@ async fn move_response(
                 .map_err(|e| (StatusCode::CONFLICT, format!("创建父目录失败: {e}")))?;
         }
     }
-    if existed {
-        let meta = std::fs::metadata(&dest)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("读取目标失败: {e}")))?;
-        let _ = if meta.is_dir() {
-            tokio::fs::remove_dir_all(&dest).await
-        } else {
-            tokio::fs::remove_file(&dest).await
-        };
+
+    // 覆盖时不先摧毁目标：先把它挪到同目录备份位，操作成功后再删；失败则还原。
+    let backup = existed.then(|| replace_backup_path(&dest));
+    if let Some(backup) = &backup {
+        tokio::fs::rename(&dest, backup).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("备份目标失败: {e}"),
+            )
+        })?;
     }
 
-    if copy {
-        copy_recursive(target, &dest).await?;
+    let result = if copy {
+        copy_recursive(target, &dest).await
     } else {
         tokio::fs::rename(target, &dest)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("移动失败: {e}")))?;
-    }
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("移动失败: {e}")))
+    };
 
-    Ok(if existed {
-        StatusCode::NO_CONTENT.into_response()
+    match result {
+        Ok(()) => {
+            if let Some(backup) = &backup {
+                remove_any(backup).await;
+            }
+            Ok(if existed {
+                StatusCode::NO_CONTENT.into_response()
+            } else {
+                StatusCode::CREATED.into_response()
+            })
+        }
+        Err(e) => {
+            if let Some(backup) = &backup {
+                remove_any(&dest).await;
+                let _ = tokio::fs::rename(backup, &dest).await;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// 把路径规范成可比较的形式：存在的部分走 `canonicalize`，不存在的尾巴原样拼回去。
+///
+/// **不能只用 `std::path::absolute`**：在 Windows 上 `resolve_within` 返回的是
+/// `\\?\C:\...`（canonicalize 的前缀），而 `absolute(普通路径)` 是 `C:\...`；两者
+/// `starts_with` 互不匹配，COPY 到自己子目录的检查会漏掉 → 递归复制到栈溢出。
+fn canonical_for_compare(path: &Path) -> PathBuf {
+    if let Ok(p) = std::fs::canonicalize(path) {
+        return p;
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path;
+    loop {
+        let Some(parent) = cur.parent() else {
+            return path.to_path_buf();
+        };
+        if let Some(name) = cur.file_name() {
+            tail.push(name.to_os_string());
+        }
+        cur = parent;
+        if cur.exists() {
+            break;
+        }
+    }
+    let mut out = std::fs::canonicalize(cur).unwrap_or_else(|_| cur.to_path_buf());
+    for name in tail.iter().rev() {
+        out.push(name);
+    }
+    out
+}
+
+/// 覆盖替换时的同目录备份名。必须唯一，避免并发请求互相踩。
+fn replace_backup_path(dest: &Path) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "target".into());
+    dest.with_file_name(format!(
+        ".{name}.orbdrop-replace-{}-{stamp}",
+        std::process::id()
+    ))
+}
+
+async fn remove_any(path: &Path) {
+    let _ = if tokio::fs::metadata(path)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        tokio::fs::remove_dir_all(path).await
     } else {
-        StatusCode::CREATED.into_response()
-    })
+        tokio::fs::remove_file(path).await
+    };
 }
 
 async fn copy_recursive(src: &Path, dest: &Path) -> Result<(), (StatusCode, String)> {
-    let meta = std::fs::metadata(src)
-        .map_err(|e| (StatusCode::NOT_FOUND, format!("读取源失败: {e}")))?;
+    let meta =
+        std::fs::metadata(src).map_err(|e| (StatusCode::NOT_FOUND, format!("读取源失败: {e}")))?;
     if meta.is_dir() {
         tokio::fs::create_dir_all(dest)
             .await
@@ -698,11 +858,12 @@ async fn copy_recursive(src: &Path, dest: &Path) -> Result<(), (StatusCode, Stri
         let mut entries = tokio::fs::read_dir(src)
             .await
             .map_err(|e| (StatusCode::FORBIDDEN, format!("读取源目录失败: {e}")))?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("读取源目录失败: {e}")))?
-        {
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("读取源目录失败: {e}"),
+            )
+        })? {
             let child_dest = dest.join(entry.file_name());
             Box::pin(copy_recursive(&entry.path(), &child_dest)).await?;
         }
@@ -774,9 +935,15 @@ async fn dispatch_for_test(
         .uri(format!("/dav/{share_id}/{rel_path}"))
         .body(Body::empty())
         .unwrap();
-    dispatch(state, caller, share_id.to_string(), rel_path.to_string(), req)
-        .await
-        .status()
+    dispatch(
+        state,
+        caller,
+        share_id.to_string(),
+        rel_path.to_string(),
+        req,
+    )
+    .await
+    .status()
 }
 
 #[cfg(test)]
@@ -791,6 +958,66 @@ mod tests {
         std::fs::write(dir.join("hello.txt"), b"hello world").unwrap();
         std::fs::write(dir.join("sub").join("nested.txt"), b"nested content").unwrap();
         dir
+    }
+
+    fn local_state_with_share(path: PathBuf) -> (Arc<AppState>, String) {
+        let mut config = crate::config::test_config();
+        let share = ShareItem::new(path);
+        let share_id = share.id.clone();
+        config.shares.push(share);
+        let config_path =
+            std::env::temp_dir().join(format!("orbdrop_dav_cfg_{}.toml", uuid::Uuid::new_v4()));
+        (Arc::new(AppState::new(config, config_path)), share_id)
+    }
+
+    /// `.`/`./` 归一后就是共享项根：不能借 `DELETE` 删掉整个共享根，也不能借 `PUT`
+    /// 覆盖“共享项根就是一个文件”的那一份。
+    #[tokio::test]
+    async fn dot_path_cannot_delete_or_overwrite_the_share_root() {
+        let root = fixture_root();
+        let (state, share_id) = local_state_with_share(root.clone());
+
+        for rel in [".", "./", ".//"] {
+            let status = dispatch_for_test(
+                state.clone(),
+                Caller::Local,
+                &share_id,
+                rel,
+                Method::DELETE,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "DELETE {rel:?} 必须拒绝");
+            assert!(root.join("hello.txt").exists(), "共享根必须还在");
+        }
+
+        // 共享项根是文件时，`PUT /.` 旧实现会覆盖它。
+        let file = root.join("shared.txt");
+        std::fs::write(&file, b"original").unwrap();
+        let (file_state, file_share_id) = local_state_with_share(file.clone());
+        for rel in [".", "./"] {
+            let status = dispatch_for_test(
+                file_state.clone(),
+                Caller::Local,
+                &file_share_id,
+                rel,
+                Method::PUT,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "PUT {rel:?} 必须拒绝");
+            assert_eq!(std::fs::read(&file).unwrap(), b"original");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dot_and_empty_segments_are_the_share_root() {
+        for yes in ["", "/", ".", "./", ".//", "/./"] {
+            assert!(is_share_root_path(yes), "{yes:?} 应视为根");
+        }
+        for no in ["a", "a/", "sub/.", "..", "a/..", "a/b"] {
+            assert!(!is_share_root_path(no), "{no:?} 不是根");
+        }
     }
 
     /// 每个测试用自己的端口段：并行跑时若都从同一个基址往上探，会互相抢端口，
@@ -815,6 +1042,63 @@ mod tests {
 
     fn propfind() -> HttpMethod {
         HttpMethod::from_bytes(b"PROPFIND").unwrap()
+    }
+
+    fn destination(path: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HeaderName::from_static("destination"),
+            header::HeaderValue::from_str(&format!("/dav/s{path}")).unwrap(),
+        );
+        headers
+    }
+
+    /// MOVE/COPY 的源与目标重叠时必须拒绝，且**不能先删目标**（旧实现会把源/兄弟文件
+    /// 一起删掉）。这是 P0-4 的核心回归用例。
+    #[tokio::test]
+    async fn move_and_copy_refuse_overlapping_paths_without_deleting_data() {
+        let root = fixture_root();
+        let hello = root.join("hello.txt");
+
+        // 自身 MOVE：无操作，文件必须还在。
+        let status = Box::pin(async {
+            move_response("s", &root, &hello, &destination("/hello.txt"), false).await
+        })
+        .await
+        .unwrap()
+        .status();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(std::fs::read(&hello).unwrap(), b"hello world");
+
+        // 文件移到它的祖先目录：拒绝，源与子目录都还在。
+        let nested = root.join("sub").join("nested.txt");
+        let status = Box::pin(async {
+            move_response("s", &root, &nested, &destination("/sub"), false).await
+        })
+        .await
+        .unwrap_err()
+        .0;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(nested.exists() && root.join("sub").exists());
+
+        // COPY 到自己的子目录：拒绝，且不产生递归副本。
+        let status = Box::pin(async {
+            move_response(
+                "s",
+                &root,
+                &root.join("sub"),
+                &destination("/sub/copy"),
+                true,
+            )
+            .await
+        })
+        .await
+        .unwrap_err()
+        .0;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!root.join("sub").join("copy").exists());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// 本机在局域网上的地址：用一次不发包的 UDP connect 让内核挑出出口网卡。
@@ -849,7 +1133,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), HttpStatus::UNAUTHORIZED, "非回环必须要求认证");
+        assert_eq!(
+            resp.status(),
+            HttpStatus::UNAUTHORIZED,
+            "非回环必须要求认证"
+        );
         let challenge = resp
             .headers()
             .get("www-authenticate")
@@ -933,7 +1221,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(bad.status(), HttpStatus::UNAUTHORIZED, "token 对不上就得 401");
+        assert_eq!(
+            bad.status(),
+            HttpStatus::UNAUTHORIZED,
+            "token 对不上就得 401"
+        );
 
         crate::credential::remove_peer("dav-peer").ok();
         crate::server::stop_server(&state).await;
@@ -989,7 +1281,10 @@ mod tests {
 
         // Depth: 0 只报自己：BC 靠它（且路径不带尾斜杠）判断这一层是文件还是目录。
         let resp = client
-            .request(propfind(), format!("http://127.0.0.1:{port}/dav/{share_id}/sub"))
+            .request(
+                propfind(),
+                format!("http://127.0.0.1:{port}/dav/{share_id}/sub"),
+            )
             .header("Depth", "0")
             .send()
             .await
@@ -1033,7 +1328,12 @@ mod tests {
         assert_eq!(resp.text().await.unwrap(), "wri");
 
         // 覆盖写回：文件已存在 → 204，内容换新。
-        let resp = client.put(&file_url).body("rewritten").send().await.unwrap();
+        let resp = client
+            .put(&file_url)
+            .body("rewritten")
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
         assert_eq!(
             std::fs::read_to_string(root.join("newdir/a.txt")).unwrap(),
@@ -1070,7 +1370,8 @@ mod tests {
         let get = client.get(&url).send().await.unwrap();
         assert_eq!(get.status(), HttpStatus::OK);
         assert_eq!(
-            get.headers()["content-length"], "0",
+            get.headers()["content-length"],
+            "0",
             "声明 1 字节就是错的：正文只有 0 字节，客户端会当传输提前结束"
         );
         assert_eq!(get.text().await.unwrap(), "");
@@ -1097,10 +1398,18 @@ mod tests {
         let mkcol = HttpMethod::from_bytes(b"MKCOL").unwrap();
         let dir_url = format!("http://127.0.0.1:{port}/dav/{share_id}/mk");
 
-        let resp = client.request(mkcol.clone(), &dir_url).send().await.unwrap();
+        let resp = client
+            .request(mkcol.clone(), &dir_url)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), HttpStatus::CREATED);
         let resp = client.request(mkcol, &dir_url).send().await.unwrap();
-        assert_eq!(resp.status(), HttpStatus::METHOD_NOT_ALLOWED, "重复 MKCOL 要报错");
+        assert_eq!(
+            resp.status(),
+            HttpStatus::METHOD_NOT_ALLOWED,
+            "重复 MKCOL 要报错"
+        );
 
         let src = format!("http://127.0.0.1:{port}/dav/{share_id}/mk/src.txt");
         client.put(&src).body("payload").send().await.unwrap();
@@ -1202,7 +1511,11 @@ mod tests {
             "拒绝原因要说清为什么、上限是多少: {}",
             err.1
         );
-        assert_eq!(std::fs::read(&target).unwrap(), before, "原文件必须逐字不变");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            before,
+            "原文件必须逐字不变"
+        );
         assert!(!part_path(&target).exists(), "被拒的写回不该留下临时文件");
 
         // 边界：正好等于上限的声明要放行（判据是 `>`，别把"等于"也一起拒了）。
@@ -1227,8 +1540,8 @@ mod tests {
         let target = root.join("streamed.bin");
 
         // 懒生成：一次只有一块（1MiB）在内存里，总量 65MiB > 上限。
-        let chunks = (0..65)
-            .map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; 1 << 20])));
+        let chunks =
+            (0..65).map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; 1 << 20])));
         let body = Body::from_stream(futures_util::stream::iter(chunks));
 
         let err = write_response(&target, put_request(body, None))
@@ -1263,7 +1576,11 @@ mod tests {
             .unwrap_err();
         // 与旧写法同一个状态码与文案（这条不是本次要改的行为）。
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(std::fs::read(&target).unwrap(), before, "原文件必须逐字不变");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            before,
+            "原文件必须逐字不变"
+        );
 
         let leftovers: Vec<String> = std::fs::read_dir(&root)
             .unwrap()
@@ -1280,12 +1597,9 @@ mod tests {
     #[tokio::test]
     async fn a_put_onto_a_directory_is_still_method_not_allowed() {
         let root = fixture_root();
-        let err = write_response(
-            &root.join("sub"),
-            put_request(Body::from("x"), Some(1)),
-        )
-        .await
-        .unwrap_err();
+        let err = write_response(&root.join("sub"), put_request(Body::from("x"), Some(1)))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::METHOD_NOT_ALLOWED);
         assert!(root.join("sub").is_dir(), "目录必须原样还在");
 

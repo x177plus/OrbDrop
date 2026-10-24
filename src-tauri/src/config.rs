@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -152,6 +152,17 @@ pub struct RelayRoute {
     /// 池最后一次刷新的时刻（锚点的 `/discover` 回话）。太旧 = stale，选路时不参与。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seen_at: Option<String>,
+    /// 这条策略是不是**未认证来源**推来的临时提示（F-107 §10.3）。
+    ///
+    /// 只活在本进程里：`save_config_at` 序列化前会把这一档整条滤掉，`sweep_relay_memory`
+    /// 按 [`crate::state::EPHEMERAL_ROUTE_TTL`] 收走。真机上它对应"只经中转方送达的那一侧
+    /// 推回来的记录" —— 本机没法认证发送方，只能把它当提示；而提示不该变成持久记忆
+    /// （否则局域网里任何一台机器都能往 `config.toml` 里写路由）。
+    #[serde(skip)]
+    pub ephemeral: bool,
+    /// 这条临时提示最后一次被刷新/创建的时刻（TTL 用；`ephemeral` 为 `false` 时无意义）。
+    #[serde(skip)]
+    pub ephemeral_at: Option<std::time::Instant>,
 }
 
 /// 「以前见过这台设备」：名字 + 最后一次地址 + 最后见到的时刻（RFC3339）。
@@ -192,6 +203,13 @@ pub struct KnownPeer {
 /// 那几台"算，64 足够；超了按 `seen_at` 最旧的淘汰（那台再开口又会记回来）。
 pub const MAX_KNOWN_PEERS: usize = 64;
 
+/// 未配对设备观察指纹的条数上限（[`Config::observed_fingerprints`]）。
+///
+/// 与 [`MAX_KNOWN_PEERS`] 同一个量级：它只给"本机真的拨到过/收到过"的设备各存一枚，
+/// 不是关系表。超了先丢地址簿与观察记忆里都没有的 id，再丢任意多余的；真设备下次
+/// 探活/开口会重新学回来。没有上限时，一台换着 id 发报文的机器能靠每次建行把配置撑大。
+pub const MAX_OBSERVED_FINGERPRINTS: usize = 512;
+
 /// 这一档的寿命：太久没见过的就不记了（14 天）。
 ///
 /// 为什么要有 TTL（而不是只留上限）：每一条启动时都会补一行、每 5s 被探活敲一次
@@ -212,7 +230,8 @@ impl RelayRoute {
     /// 刷地址），单看哪一份都会漏一台 —— 漏掉的那台就"拨不动"（真机反馈第五轮与第七轮
     /// 都是这一格：记忆里有它、手里却没有它的地址）。
     pub fn pool_ids(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::with_capacity(self.via_devices.len() + self.via_addrs.len());
+        let mut out: Vec<String> =
+            Vec::with_capacity(self.via_devices.len() + self.via_addrs.len());
         for id in &self.via_devices {
             if !id.is_empty() && !out.contains(id) {
                 out.push(id.clone());
@@ -307,6 +326,11 @@ impl PeerDevice {
     /// 这台设备此刻是不是经别人中转（界面文案「经 X 中转」用）。
     pub fn relay_via(&self) -> Option<&str> {
         self.relay.as_ref().map(|r| r.via_name.as_str())
+    }
+
+    /// 带 token 的拨号应当钉住的证书（见 [`crate::net::DialPin`]）。
+    pub fn dial_pin(&self) -> crate::net::DialPin {
+        crate::credential::dial_pin(&self.id, self.paired)
     }
 }
 
@@ -566,7 +590,7 @@ pub struct Config {
     ///
     /// 为什么在配置文件里而不是 webview 的 localStorage（与 `picker_favorites` 同一个理由）：
     /// 它是**跨重启要有效**的一件事，该和其余状态躺在同一个数据目录；而且卸载重装之后它必须
-    /// **重新问一次** —— 装完那三个开关（华为「应用启动管理」…）又回到默认档了，重装等于回到
+    /// **重新问一次** —— 装完那些权限开关（自启动 / 后台耗电管理等）又回到默认档了，重装等于回到
     /// 同一个坑里（重装会清数据目录，于是这个标记也跟着没了，正好）。
     #[serde(default)]
     pub keepalive_guided: bool,
@@ -636,6 +660,18 @@ pub struct Config {
     /// 第一拍探活有东西可拨。它是观察记忆，可以随便淘汰（上限 + TTL），关系丢了才是大事。
     #[serde(default)]
     pub known_peers: HashMap<String, KnownPeer>,
+    /// 未配对设备的**已观察 TLS 身份指纹**：`设备 id → 证书指纹`。
+    ///
+    /// 与凭据库里的指纹是两档：那里是"配对关系"的一部分（token 与指纹同生共死），
+    /// 这里是"见过它、但还没建立关系"时的身份连续性锚。只用于**地址变更**：真设备换
+    /// IP 时证书不变，允许跟着改；冒充者拿不出同一把私钥，指纹对不上，地址不动。
+    /// 见 [`crate::state::AppState::observed_fingerprint_matches`] 与
+    /// [`crate::state::AppState::note_probe_source`]。
+    ///
+    /// 只装未配对设备的：配对之后由凭据库接管，这里不再写。它是观察值，可以淘汰；
+    /// 上限见 [`MAX_OBSERVED_FINGERPRINTS`]。
+    #[serde(default)]
+    pub observed_fingerprints: HashMap<String, String>,
     /// 接收推送时的并发数（同一个邀请同时几路在拉）。
     ///
     /// 为什么要有这个旋钮：小文件多的时候，时间几乎全花在"每个文件的往返"上，几路并行
@@ -751,7 +787,11 @@ impl Config {
                 continue;
             }
             kept.push(PickerFavorite {
-                name: if name.is_empty() { path.to_string() } else { name.to_string() },
+                name: if name.is_empty() {
+                    path.to_string()
+                } else {
+                    name.to_string()
+                },
                 path: path.to_string(),
             });
         }
@@ -771,7 +811,8 @@ impl Config {
             return None;
         }
         let remark: String = remark.chars().take(REMARK_MAX_CHARS).collect();
-        self.device_remarks.insert(peer_id.to_string(), remark.clone());
+        self.device_remarks
+            .insert(peer_id.to_string(), remark.clone());
         Some(remark)
     }
 
@@ -831,7 +872,10 @@ impl Config {
                 .map(|(id, k)| (id.clone(), k.seen_at.clone()))
                 .collect();
             by_age.sort_by(|a, b| a.1.cmp(&b.1));
-            for (id, _) in by_age.into_iter().take(self.known_peers.len() - MAX_KNOWN_PEERS) {
+            for (id, _) in by_age
+                .into_iter()
+                .take(self.known_peers.len() - MAX_KNOWN_PEERS)
+            {
                 self.known_peers.remove(&id);
             }
         }
@@ -843,13 +887,64 @@ impl Config {
         self.known_peers.get(peer_id)
     }
 
+    /// 记下/刷新一台**未配对**设备的观察指纹。值没变返回 `false`（不触发落盘）。
+    ///
+    /// 大小写不敏感：指纹是十六进制，`set` 与 `get` 两侧都按这个口径比。
+    pub fn set_observed_fingerprint(&mut self, peer_id: &str, fingerprint: &str) -> bool {
+        if peer_id.is_empty() || fingerprint.is_empty() {
+            return false;
+        }
+        if self
+            .observed_fingerprints
+            .get(peer_id)
+            .is_some_and(|fp| fp.eq_ignore_ascii_case(fingerprint))
+        {
+            return false;
+        }
+        self.observed_fingerprints
+            .insert(peer_id.to_string(), fingerprint.to_string());
+        self.prune_observed_fingerprints();
+        true
+    }
+
+    /// 收一遍观察指纹：先保留地址簿/观察记忆里还有 id 的那些，再按上限丢多余的。
+    ///
+    /// 顺序有意义：被行预算淘汰、又不在任何记忆里的 id 最先出局；有归宿的设备哪怕
+    /// 暂时超过上限也先留着。真丢了也只是下次探活重新学，不是用户数据。
+    pub fn prune_observed_fingerprints(&mut self) {
+        if self.observed_fingerprints.len() <= MAX_OBSERVED_FINGERPRINTS {
+            return;
+        }
+        let keep: HashSet<String> = self
+            .peers
+            .iter()
+            .map(|p| p.id.clone())
+            .chain(self.known_peers.keys().cloned())
+            .collect();
+        self.observed_fingerprints.retain(|id, _| keep.contains(id));
+        if self.observed_fingerprints.len() > MAX_OBSERVED_FINGERPRINTS {
+            let excess = self.observed_fingerprints.len() - MAX_OBSERVED_FINGERPRINTS;
+            let drop: Vec<String> = self
+                .observed_fingerprints
+                .keys()
+                .take(excess)
+                .cloned()
+                .collect();
+            for id in drop {
+                self.observed_fingerprints.remove(&id);
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // 中转记忆（F-107）：设备级链路 + 网段级策略
     // ------------------------------------------------------------------
 
     /// 这台设备上一次是怎么够着的（设备级链路记忆）。
     pub fn relay_link(&self, peer_id: &str) -> Option<&RelayLink> {
-        self.relay_links.get(peer_id).filter(|l| !l.via_id.is_empty())
+        self.relay_links
+            .get(peer_id)
+            .filter(|l| !l.via_id.is_empty())
     }
 
     /// 记下（或刷新）一条设备级链路。`at` 是成功时刻（RFC3339）。
@@ -874,7 +969,10 @@ impl Config {
     /// 满了（[`MAX_RELAY_ROUTES`]）就先淘汰"最久没成功过"的那一条 —— 没有上限时，一个乱
     /// 报网段的对端能靠反向记录把配置文件撑大。
     pub fn relay_route_mut(&mut self, target_cidr: &str) -> &mut RelayRoute {
-        if !self.relay_routes.iter().any(|r| r.target_cidr == target_cidr)
+        if !self
+            .relay_routes
+            .iter()
+            .any(|r| r.target_cidr == target_cidr)
             && self.relay_routes.len() >= MAX_RELAY_ROUTES
         {
             // 排序：先淘汰没有 `last_ok_at` 的，其次淘汰最旧的那个。
@@ -888,21 +986,25 @@ impl Config {
                 self.relay_routes.remove(idx);
             }
         }
-        if let Some(idx) = self.relay_routes.iter().position(|r| r.target_cidr == target_cidr) {
+        if let Some(idx) = self
+            .relay_routes
+            .iter()
+            .position(|r| r.target_cidr == target_cidr)
+        {
             return &mut self.relay_routes[idx];
         }
         self.relay_routes.push(RelayRoute {
             target_cidr: target_cidr.to_string(),
             ..RelayRoute::default()
         });
-        self.relay_routes
-            .last_mut()
-            .expect("刚 push 过，必然存在")
+        self.relay_routes.last_mut().expect("刚 push 过，必然存在")
     }
 
     /// 按主键找一条策略（只读）。
     pub fn relay_route(&self, target_cidr: &str) -> Option<&RelayRoute> {
-        self.relay_routes.iter().find(|r| r.target_cidr == target_cidr)
+        self.relay_routes
+            .iter()
+            .find(|r| r.target_cidr == target_cidr)
     }
 
     /// 退休一条策略（该段直连恢复、或锚点长期不再担保）。返回"之前确实有"。
@@ -945,6 +1047,7 @@ impl Default for Config {
             relay_conns_total: 0,
             device_remarks: HashMap::new(),
             known_peers: HashMap::new(),
+            observed_fingerprints: HashMap::new(),
             transfer_workers: default_transfer_workers(),
             transfer_block_mb: default_transfer_block_mb(),
             update_mirror: None,
@@ -985,6 +1088,20 @@ pub fn data_dir() -> PathBuf {
 /// 先完成的那次 `rename` 会把临时文件搬走，后一次 `rename` 就报 ENOENT
 /// （"系统找不到指定的文件"）—— 保存偶发失败、还看不出原因（测试里就撞上了）。
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_impl(path, bytes, false)
+}
+
+/// 同 [`write_atomic`]，但 Unix 上临时文件从创建那一刻就是 `0600`。
+///
+/// 用于 `identity.pem`：私钥在 rename 之前也不该是同组/其他用户可读的；只改最终文件权限
+/// 会把一个短暂的 0644 窗口留在数据目录里（崩溃时还会永久留下）。
+pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_impl(path, bytes, true)
+}
+
+fn write_atomic_impl(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = private;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let name = path
@@ -996,7 +1113,25 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    let written = {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        if private {
+            options.mode(0o600);
+        }
+        options
+            .open(&tmp)
+            .and_then(|mut file| file.write_all(bytes))
+    };
+    #[cfg(not(unix))]
+    let written = std::fs::write(&tmp, bytes);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -1072,18 +1207,17 @@ pub fn test_config() -> Config {
 
 /// 厂商放出来的"市场名"属性，按可信度从高到低排。
 ///
-/// 为什么非要这些键：`ro.product.model` 在国行 ROM 上多是**型号代码** —— 小米 `24129PN74C`、
-/// vivo `V2502A`、三星 `SM-S928B`，一屏设备名里谁也认不出这是哪台机器；用户要的是
-/// `Xiaomi 15 Pro` / `vivo X300` 这种一眼认得出的名字，而它只在厂商自己放的那条属性里：
+/// 为什么非要这些键：国行 ROM 的 `ro.product.model` 多是**型号代码**（`ABCD-1234` 这类），
+/// 一屏设备名里谁也认不出这是哪台机器；用户要的是厂商放出来的市场名（一个可读的名字），
+/// 而它只在厂商自己放的那条属性里。不同厂商各有一套键（键名本身带厂商名，是系统属性的事实）：
 ///
-/// - 小米 / 红米（HyperOS、MIUI）：`ro.product.marketname`，分区的变体（`odm` / `vendor` /
-///   `system` / `product` / `bootimage`）各有机器在用；
-/// - OPPO / OnePlus / realme（ColorOS）：`ro.vendor.oplus.market.name`；
-/// - vivo / iQOO：`ro.vivo.market.name`。
+/// - `ro.product.marketname` 及分区变体（`odm` / `vendor` / `system` / `product` / `bootimage`）；
+/// - `ro.vendor.oplus.market.name`；
+/// - `ro.vivo.market.name`。
 ///
 /// 这些键**厂商私有、没有文档保证**，某个 ROM 上不存在很正常 —— 属性不存在时
 /// `__system_property_get` 返回 0（一次进程内的属性表查表，没有代价），所以整串探一遍划算。
-/// 三星、华为这类不放市场名的机器就落回"品牌 + 型号"（见 `pick_android_device_name`）。
+/// 没有市场名的机器就落回"品牌 + 型号"（见 `pick_android_device_name`）。
 const ANDROID_MARKET_NAME_KEYS: [&str; 8] = [
     "ro.product.marketname",
     "ro.product.odm.marketname",
@@ -1098,14 +1232,17 @@ const ANDROID_MARKET_NAME_KEYS: [&str; 8] = [
 /// 从一串系统属性里挑一个设备名；`None` = 一条可用属性都没有（调用方去用平台兜底）。
 ///
 /// 顺序：**厂商市场名 → 品牌 + 型号 → 型号 → 品牌 → 厂商**。第二档是给"只有型号代码"的机器
-/// 兜的：`V2502A` 认不出是谁，`vivo V2502A` 至少认得出牌子。型号本身已经像个人话
-/// （`Pixel 7`、`Xiaomi 15`）或已经以品牌开头时不再叠品牌 —— 否则会长成 `Xiaomi Xiaomi 15`。
+/// 兜的：`ABCD-1234` 认不出是谁，`Brand ABCD-1234` 至少认得出牌子。型号本身已经像个人话
+/// （带空格）或已经以品牌开头时不再叠品牌 —— 否则会长成 `Brand Brand Model`。
 ///
 /// **刻意不 `#[cfg(target_os = "android")]`**：它只跟"属性表"打交道（拿的是闭包），
 /// 桌面测试塞一份假表就能把挑选规则钉死 —— 真机上的属性值在 CI 里造不出来。
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn pick_android_device_name(get: impl Fn(&str) -> Option<String>) -> Option<String> {
-    if let Some(market) = ANDROID_MARKET_NAME_KEYS.iter().find_map(|key| usable_property(get(key))) {
+    if let Some(market) = ANDROID_MARKET_NAME_KEYS
+        .iter()
+        .find_map(|key| usable_property(get(key)))
+    {
         return Some(market);
     }
     let brand = usable_property(get("ro.product.brand"));
@@ -1182,7 +1319,11 @@ fn android_property(name: &str) -> Option<String> {
     if len <= 0 {
         return None;
     }
-    let value = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().ok()?.trim().to_string();
+    let value = unsafe { CStr::from_ptr(buf.as_ptr()) }
+        .to_str()
+        .ok()?
+        .trim()
+        .to_string();
     (!value.is_empty()).then_some(value)
 }
 
@@ -1208,34 +1349,93 @@ pub fn load_config_at(path: &Path) -> Config {
         if let Err(e) = save_config_at(path, &config) {
             eprintln!("Failed to persist initial config: {e}");
         }
+        persist_device_id(path, &config.device_id);
         return config;
     }
     let mut config = match std::fs::read_to_string(path) {
-        Ok(content) => toml::from_str(&content).unwrap_or_else(|e| {
-            eprintln!("Failed to parse config, using defaults: {e}");
-            // Keep our identity across a corrupt file instead of minting a new
-            // device id on each launch — but never silently drop the old file.
-            let backup = path.with_extension("toml.bad");
-            if let Err(e) = std::fs::rename(path, &backup) {
-                eprintln!("Failed to back up config to {backup:?}: {e}");
+        Ok(content) => match toml::from_str(&content) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("Failed to parse config, using defaults: {e}");
+                // Keep our identity across a corrupt file instead of minting a
+                // new device id on each launch — but never silently drop the
+                // old file. If the backup cannot be made, do not overwrite the
+                // original: the next start can try again.
+                let backup = path.with_extension("toml.bad");
+                match std::fs::rename(path, &backup) {
+                    Ok(()) => {
+                        let config = Config::default();
+                        if let Err(e) = save_config_at(path, &config) {
+                            eprintln!("Failed to rewrite config: {e}");
+                        }
+                        config
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to back up config to {backup:?}: {e}");
+                        Config::default()
+                    }
+                }
             }
-            let config = Config::default();
-            if let Err(e) = save_config_at(path, &config) {
-                eprintln!("Failed to rewrite config: {e}");
-            }
-            config
-        }),
+        },
         Err(e) => {
             eprintln!("Failed to read config, using defaults: {e}");
             Config::default()
         }
     };
-    if dedupe_shares(&mut config.shares) {
+    // The sidecar is the identity of record. `config.toml` is rewritten often
+    // and can be truncated/corrupted; losing the device id means every paired
+    // peer sees a new device and all tokens stop matching. On the first run
+    // after this field is introduced, the sidecar is created from the config.
+    if let Some(id) = read_device_id(path) {
+        if config.device_id != id {
+            config.device_id = id;
+            // 配置里那份可能来自一次损坏回退；把文件同步成 sidecar 的真值。
+            if let Err(e) = save_config_at(path, &config) {
+                eprintln!("Failed to persist recovered device id: {e}");
+            }
+        }
+    } else {
+        persist_device_id(path, &config.device_id);
+    }
+    // 两处收口：地址簿里 id 不合法的行（对端自报的，见 `crate::ids`）与按路径重复的共享项。
+    // 都只在**真的动了**才写回，不然每次启动都把配置重写一遍。
+    let mut scrubbed = drop_invalid_peer_ids(&mut config.peers);
+    scrubbed |= dedupe_shares(&mut config.shares);
+    if scrubbed {
         if let Err(e) = save_config_at(path, &config) {
-            eprintln!("Failed to persist config without duplicate shares: {e}");
+            eprintln!("Failed to persist scrubbed config: {e}");
         }
     }
     config
+}
+
+/// 设备身份的另一份存储：与 `config.toml` 同目录的 `device.id`。
+///
+/// 为什么单独放一份：`config.toml` 是高频整份重写的文件，损坏/被占用时如果退回
+/// `Config::default()`，`device_id` 会变成新 UUID —— 对端看到的是"换了一台设备"，
+/// 所有配对和指纹都对不上。这个文件只在首次运行写入，之后只读。
+fn device_id_path(path: &Path) -> PathBuf {
+    path.with_file_name("device.id")
+}
+
+fn read_device_id(path: &Path) -> Option<String> {
+    let id = std::fs::read_to_string(device_id_path(path)).ok()?;
+    let id = id.trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+fn persist_device_id(path: &Path, id: &str) {
+    let id_path = device_id_path(path);
+    if id_path.exists() || id.is_empty() {
+        return;
+    }
+    if let Err(e) = write_atomic(&id_path, id.as_bytes()) {
+        eprintln!("Failed to persist device id to {id_path:?}: {e}");
+    }
 }
 
 /// Write a config to an arbitrary path. Used by production code and tests.
@@ -1243,8 +1443,18 @@ pub fn save_config_at(path: &Path, config: &Config) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("Failed to create config directory")?;
     }
-    let content = toml::to_string_pretty(config).context("Failed to serialize config")?;
-    std::fs::write(path, content).context("Failed to write config file")?;
+    // **未认证来源的反向记录只活在本进程里**（`RelayRoute::ephemeral`）：不管这一次保存是
+    // 谁触发的（设置、配对、经中转成功……），都不许把这份提示写进盘。否则一条局域网里
+    // 谁都能发的报文会变成重启后还在的路由记忆。
+    //
+    // 克隆一次的代价只在"真的要写盘"这一刻；相比之下，让每个调用点自己记得先滤一遍
+    // 才是那个迟早会漏的做法。
+    let mut snapshot = config.clone();
+    snapshot.relay_routes.retain(|r| !r.ephemeral);
+    let content = toml::to_string_pretty(&snapshot).context("Failed to serialize config")?;
+    // Atomic replace: a crash/lock during a full rewrite must not leave a
+    // truncated config behind (that used to mint a new device id on restart).
+    write_atomic(path, content.as_bytes()).context("Failed to write config file")?;
     Ok(())
 }
 
@@ -1260,17 +1470,23 @@ pub fn save_config_at(path: &Path, config: &Config) -> Result<()> {
 /// 字符串比较：宁可宽松，也不在一个"要不要插一条"的判断上抛错。
 pub fn find_share_by_path<'a>(shares: &'a [ShareItem], path: &Path) -> Option<&'a ShareItem> {
     let want = path.canonicalize().ok();
-    shares.iter().find(|s| match (&want, s.path.canonicalize()) {
-        (Some(a), Ok(b)) => *a == b,
-        _ => normalize_path(&s.path) == normalize_path(path),
-    })
+    shares
+        .iter()
+        .find(|s| match (&want, s.path.canonicalize()) {
+            (Some(a), Ok(b)) => *a == b,
+            _ => normalize_path(&s.path) == normalize_path(path),
+        })
 }
 
 /// 上面那条兜底比较用的形式：`/` 统一成 `\`、去掉尾分隔符；大小写**只在大小写不敏感的文件系统上**
 /// 折叠（Windows / macOS）—— 在 Linux 上 `/tmp/A` 与 `/tmp/a` 是两个目录，折了会把用户的共享项
 /// 误合成一条（真实存在的路径根本走不到这一步：那时按 `canonicalize` 的结果比）。
 fn normalize_path(p: &Path) -> String {
-    let s = p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_string();
+    let s = p
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_string();
     if cfg!(any(windows, target_os = "macos")) {
         s.to_lowercase()
     } else {
@@ -1291,6 +1507,26 @@ pub fn register_share(shares: &mut Vec<ShareItem>, item: ShareItem) -> (bool, Sh
             (true, item)
         }
     }
+}
+
+/// 丢掉设备 id 不合法（不是单一安全路径段）的地址簿行。
+///
+/// 这些 id 全是对端自报的（配对请求 / 邀请 / mDNS 公告）；合法值只有本机生成的 UUID 一种
+/// 形状。留在地址簿里的坏 id 只会在镜像目录与 BC 的 URL 那两条路上被拒（见 [`crate::ids`]），
+/// 不如在入口就收掉 —— 但**只丢这一行**，绝不让整份配置读不出来。
+///
+/// 同一件事也在写入侧做（`AppState::upsert_peer` / `pair::commit_pairing_with_fingerprint`）；
+/// 这里兜的是"手改过 `config.toml`"与"旧版本写进去的数据"。
+fn drop_invalid_peer_ids(peers: &mut Vec<PeerDevice>) -> bool {
+    let before = peers.len();
+    peers.retain(|p| crate::ids::is_segment(&p.id));
+    if peers.len() != before {
+        eprintln!(
+            "Dropped {} device row(s) with an invalid id",
+            before - peers.len()
+        );
+    }
+    peers.len() != before
 }
 
 /// 把共享项里**同一路径的重复**整条丢掉（读配置时收一次）：早先版本允许重复登记，重复那些是
@@ -1321,12 +1557,15 @@ pub fn unique_path(dir: &PathBuf, name: &str) -> PathBuf {
     }
     let stem = match target.extension() {
         Some(ext) => {
-            let s = name.strip_suffix(&format!(".{}", ext.to_string_lossy())).unwrap_or(name);
+            let s = name
+                .strip_suffix(&format!(".{}", ext.to_string_lossy()))
+                .unwrap_or(name);
             s.to_string()
         }
         None => name.to_string(),
     };
-    let ext = target.extension()
+    let ext = target
+        .extension()
         .map(|e| format!(".{}", e.to_string_lossy()))
         .unwrap_or_default();
 
@@ -1364,6 +1603,22 @@ impl ShareItem {
 mod tests {
     use super::*;
 
+    /// 私钥文件从临时文件那一刻就是 0600（rename 之后也是）；普通 write_atomic 不改
+    /// 既有行为。
+    #[cfg(unix)]
+    #[test]
+    fn private_atomic_write_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("orbdrop_priv_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity.pem");
+        write_atomic_private(&path, b"secret").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "私钥必须是 0600，实际 {mode:o}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 共享项按路径去重（F-21）：同一条路径换个写法（结尾 `\`、中间夹 `.`、Windows 上的大小写）
     /// 仍算**同一条** —— 否则拖回卡片、选择框里重复挑就会在列表里堆出第二份。
     /// 而父目录与子目录是两条不同的共享项，不能误判成重复。
@@ -1381,7 +1636,10 @@ mod tests {
         }];
 
         assert!(find_share_by_path(&shares, &inner).is_some(), "同一条路径");
-        assert!(find_share_by_path(&shares, &&inner).is_some(), "多写一个 & 也还是它");
+        assert!(
+            find_share_by_path(&shares, &&inner).is_some(),
+            "多写一个 & 也还是它"
+        );
         assert!(
             find_share_by_path(&shares, &inner.join(".")).is_some(),
             "路径中间带 `.`：canonicalize 之后是同一条"
@@ -1390,8 +1648,14 @@ mod tests {
             find_share_by_path(&shares, &inner.join("child").join("..")).is_some(),
             "绕一圈回来还是它"
         );
-        assert!(find_share_by_path(&shares, &dir).is_none(), "父目录是另一条共享项");
-        assert!(find_share_by_path(&shares, &dir.join("other")).is_none(), "不存在的别的路径");
+        assert!(
+            find_share_by_path(&shares, &dir).is_none(),
+            "父目录是另一条共享项"
+        );
+        assert!(
+            find_share_by_path(&shares, &dir.join("other")).is_none(),
+            "不存在的别的路径"
+        );
         #[cfg(windows)]
         assert!(
             find_share_by_path(&shares, &dir.join("INNER")).is_some(),
@@ -1407,7 +1671,10 @@ mod tests {
             created_at: Utc::now(),
             broadcast_enabled: false,
         }];
-        assert!(find_share_by_path(&stale, &gone).is_some(), "取不到 canonicalize 也要认出来");
+        assert!(
+            find_share_by_path(&stale, &gone).is_some(),
+            "取不到 canonicalize 也要认出来"
+        );
         assert!(find_share_by_path(&stale, &dir.join("other")).is_none());
         assert!(
             find_share_by_path(&stale, &PathBuf::from(format!("{}\\", gone.display()))).is_some(),
@@ -1418,8 +1685,8 @@ mod tests {
     }
 
     /// 老配置里躺着同一条路径的两份（早先版本允许重复登记）：**读进来只留最先那一条**，
-/// 名字（用户可能改过）与广播开关都保持原样，并且**当场写回** —— `config.toml` 里也不会
-/// 再留着那几条重复。
+    /// 名字（用户可能改过）与广播开关都保持原样，并且**当场写回** —— `config.toml` 里也不会
+    /// 再留着那几条重复。
     #[test]
     fn load_config_drops_duplicate_share_paths() {
         let dir = std::env::temp_dir().join(format!("orbdrop_dupshares_{}", Uuid::new_v4()));
@@ -1462,7 +1729,10 @@ mod tests {
 
         // 写回了：再读一次文件本身，里面也不该有那两条重复
         let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert!(!on_disk.contains("dup-trailing-sep"), "重复项已经从文件里消失");
+        assert!(
+            !on_disk.contains("dup-trailing-sep"),
+            "重复项已经从文件里消失"
+        );
         assert!(on_disk.contains("id = \"first\"") && on_disk.contains("id = \"other\""));
         let reread: Config = toml::from_str(&on_disk).unwrap();
         assert_eq!(reread.shares.len(), 2);
@@ -1482,8 +1752,46 @@ mod tests {
 
         let config = load_config_at(&path);
         assert_eq!(config.shares.len(), 1);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "文件一个字节都没动");
-        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "文件一个字节都没动"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 地址簿里 id 不合法的行在读配置时就丢掉：这对 id 会被镜像目录（`share_dir`）与 BC 的
+    /// URL 路径段用，坏值等于让对端决定本机往哪写。只丢那一行，别的行与整份配置都不受影响。
+    #[test]
+    fn load_config_drops_rows_with_an_invalid_device_id() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_badid_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "deviceId = \"device-1\"\n\
+             \n\
+             [[peers]]\n\
+             id = \"device-ok\"\nname = \"ok\"\nip = \"10.0.0.2\"\nport = 3890\nonline = false\npaired = true\n\
+             \n\
+             [[peers]]\n\
+             id = \"bad/../victim\"\nname = \"evil\"\nip = \"10.0.0.3\"\nport = 3890\nonline = false\npaired = true\n",
+        )
+        .unwrap();
+
+        let config = load_config_at(&path);
+        assert_eq!(config.peers.len(), 1, "坏行丢掉，好行照旧");
+        assert_eq!(config.peers[0].id, "device-ok");
+        assert_eq!(config.device_id, "device-1", "配置的其余部分不受影响");
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("victim"), "坏行已经从文件里消失");
+        assert!(on_disk.contains("device-ok"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1596,27 +1904,38 @@ mod tests {
                 last_ok_at: Some("2026-09-30T12:00:00Z".into()),
                 ok_count: 3,
                 seen_at: Some("2026-09-30T12:05:00Z".into()),
+                ..RelayRoute::default()
             }],
             relay_memory: false,
             relay_bytes_total: 12_345,
             relay_conns_total: 7,
             picker_favorites: vec![
-                PickerFavorite { name: "桌面".into(), path: "C:/Users/t/Desktop".into() },
-                PickerFavorite { name: "项目".into(), path: "D:/项目".into() },
+                PickerFavorite {
+                    name: "桌面".into(),
+                    path: "C:/Users/t/Desktop".into(),
+                },
+                PickerFavorite {
+                    name: "项目".into(),
+                    path: "D:/项目".into(),
+                },
             ],
             device_remarks: HashMap::from([("peer-1".to_string(), "客厅台式机".to_string())]),
             known_peers: HashMap::from([(
                 "peer-2".to_string(),
                 KnownPeer {
-                    name: "小米 15".into(),
+                    name: "示例设备".into(),
                     ip: "10.0.0.7".into(),
                     port: 3890,
                     seen_at: "2026-09-30T12:00:00Z".into(),
                 },
             )]),
+            observed_fingerprints: HashMap::from([("peer-2".to_string(), "ab".repeat(32))]),
             // 镜像记忆必须能落盘：它就是靠"重启后还记得上次哪条路走得通"来免掉
             // 国内每次检查都白等一遍 GitHub 超时的（见 `update::read_pref`）。
-            update_mirror: Some(UpdateMirror { host: "gitee.com".into(), at: 1_791_000_000_000 }),
+            update_mirror: Some(UpdateMirror {
+                host: "gitee.com".into(),
+                at: 1_791_000_000_000,
+            }),
             shares: vec![ShareItem {
                 id: "share-1".into(),
                 name: "Projects".into(),
@@ -1631,7 +1950,8 @@ mod tests {
         let tmp_file = dir.join("config.toml");
 
         std::fs::write(&tmp_file, toml::to_string_pretty(&config).unwrap()).unwrap();
-        let loaded: Config = toml::from_str(&std::fs::read_to_string(&tmp_file).unwrap().as_str()).unwrap();
+        let loaded: Config =
+            toml::from_str(&std::fs::read_to_string(&tmp_file).unwrap().as_str()).unwrap();
 
         assert_eq!(loaded.port, 3895);
         assert_eq!(loaded.download_dir, PathBuf::from("C:/test/downloads"));
@@ -1647,8 +1967,14 @@ mod tests {
         assert_eq!(
             loaded.picker_favorites,
             vec![
-                PickerFavorite { name: "桌面".into(), path: "C:/Users/t/Desktop".into() },
-                PickerFavorite { name: "项目".into(), path: "D:/项目".into() },
+                PickerFavorite {
+                    name: "桌面".into(),
+                    path: "C:/Users/t/Desktop".into()
+                },
+                PickerFavorite {
+                    name: "项目".into(),
+                    path: "D:/项目".into()
+                },
             ],
             "选择框「常用」要跨重启保留（用户攒的那几条）"
         );
@@ -1691,14 +2017,19 @@ mod tests {
             "池里那些设备的地址也要落盘 —— 锚点离散后 id 是拨不动的（真机就卡在这里）"
         );
         assert_eq!(loaded.relay_routes[0].ok_count, 3);
-        assert_eq!(loaded.online, false, "「离线」要跨重启保留（用户选了就一直离线）");
+        assert_eq!(
+            loaded.online, false,
+            "「离线」要跨重启保留（用户选了就一直离线）"
+        );
         assert_eq!(
             loaded.orb_center,
             Some(OrbPos { x: -1280, y: 40 }),
             "悬浮球位置要跨重启保留（F-74）：负坐标是左边那块显示器"
         );
         assert!(
-            !std::fs::read_to_string(&tmp_file).unwrap().contains("orbPos"),
+            !std::fs::read_to_string(&tmp_file)
+                .unwrap()
+                .contains("orbPos"),
             "老字段（窗口左上角）不再写出：位置只有 `orbCenter` 这一个真相"
         );
         assert_eq!(
@@ -1716,9 +2047,17 @@ mod tests {
             "设备备注要跨重启保留（F-101：只在本机，重启后还在）"
         );
         assert_eq!(
-            loaded.known_peer("peer-2").map(|k| (k.name.clone(), k.ip.clone(), k.port)),
-            Some(("小米 15".into(), "10.0.0.7".into(), 3890)),
+            loaded
+                .known_peer("peer-2")
+                .map(|k| (k.name.clone(), k.ip.clone(), k.port)),
+            Some(("示例设备".into(), "10.0.0.7".into(), 3890)),
             "「以前见过」那一档也要跨重启保留（启动时靠它补一行：名字才不用等）"
+        );
+        let expected_fp = "ab".repeat(32);
+        assert_eq!(
+            loaded.observed_fingerprints.get("peer-2"),
+            Some(&expected_fp),
+            "未配对设备的观察指纹要落盘（地址连续性校验靠它跨重启生效）"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1775,8 +2114,7 @@ mod tests {
         assert!(Config::default().allow_relay);
         assert!(Config::default().group_relay);
         // 用户在设置里关掉之后，落盘的是显式 `false` —— 照读，不被缺省翻回来。
-        let cfg: Config =
-            toml::from_str("groupRelay = false\nallowRelay = false\n").unwrap();
+        let cfg: Config = toml::from_str("groupRelay = false\nallowRelay = false\n").unwrap();
         assert!(!cfg.group_relay);
         assert!(!cfg.allow_relay);
         // 界面拿到的整份设置也带着这两颗位（按它画那颗「允许中转」开关）。
@@ -1788,12 +2126,44 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         let fresh = load_config_at(&path);
-        assert!(fresh.allow_relay && fresh.group_relay, "首次启动（还没有配置文件）就是开着的");
+        assert!(
+            fresh.allow_relay && fresh.group_relay,
+            "首次启动（还没有配置文件）就是开着的"
+        );
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(
             written.contains("allowRelay = true") && written.contains("groupRelay = true"),
             "落盘的那一份也是开（之后一直按它读）：{written}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 配置损坏时设备 id 必须从 `device.id` 里救回来：换了 id，所有对端都会把本机
+    /// 当成新设备，token/指纹全部对不上。
+    #[test]
+    fn corrupt_config_keeps_the_device_id_sidecar() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_cfgid_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let first = load_config_at(&path);
+        let id = first.device_id.clone();
+        assert_eq!(
+            std::fs::read_to_string(device_id_path(&path))
+                .unwrap()
+                .trim(),
+            id,
+            "首次运行要落一份 device.id"
+        );
+
+        std::fs::write(&path, "this is not valid toml [[[").unwrap();
+        let recovered = load_config_at(&path);
+        assert_eq!(recovered.device_id, id, "损坏后仍必须是原来的设备 id");
+        assert!(
+            dir.join("config.toml.bad").exists(),
+            "损坏的配置要留一份备份"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1842,9 +2212,10 @@ mod tests {
     /// 不这么换的话，升级后悬浮球会跳（球 45px、卡片 102/77px）—— 用户的"窗口位置记忆"就白存了。
     #[test]
     fn legacy_orb_pos_migrates_to_body_center() {
-        let legacy: Config =
-            toml::from_str("deviceId = \"device-1\"\norbShape = \"rect\"\n[orbPos]\nx = -1280\ny = 40\n")
-                .unwrap();
+        let legacy: Config = toml::from_str(
+            "deviceId = \"device-1\"\norbShape = \"rect\"\n[orbPos]\nx = -1280\ny = 40\n",
+        )
+        .unwrap();
         assert_eq!(legacy.orb_center, None);
         assert_eq!(legacy.orb_pos, Some(OrbPos { x: -1280, y: 40 }));
         assert_eq!(
@@ -1854,12 +2225,19 @@ mod tests {
         );
         assert_eq!(
             orb_center_from_legacy(OrbPos { x: 100, y: 200 }, OrbShape::Circle, 1.25),
-            OrbPos { x: 100 + 56, y: 200 + 56 },
+            OrbPos {
+                x: 100 + 56,
+                y: 200 + 56
+            },
             "圆球本体中心 = 窗口左上角 + 45×DPI（125% 下是 56）"
         );
 
         // 老字段不再写出：迁移之后配置里只剩 `orbCenter`。
-        let migrated = Config { orb_center: Some(OrbPos { x: -1178, y: 117 }), orb_pos: None, ..legacy };
+        let migrated = Config {
+            orb_center: Some(OrbPos { x: -1178, y: 117 }),
+            orb_pos: None,
+            ..legacy
+        };
         let text = toml::to_string_pretty(&migrated).unwrap();
         assert!(text.contains("orbCenter"), "{text}");
         assert!(!text.contains("orbPos"), "{text}");
@@ -1878,17 +2256,35 @@ mod tests {
     fn set_picker_favorites_dedupes_and_drops_blanks() {
         let mut config = Config::default();
         let stored = config.set_picker_favorites(vec![
-            PickerFavorite { name: "桌面".into(), path: "C:/Users/t/Desktop".into() },
-            PickerFavorite { name: "桌面（重复）".into(), path: "C:/Users/t/Desktop".into() },
-            PickerFavorite { name: "空的".into(), path: "   ".into() },
-            PickerFavorite { name: "  ".into(), path: "D:/项目".into() },
+            PickerFavorite {
+                name: "桌面".into(),
+                path: "C:/Users/t/Desktop".into(),
+            },
+            PickerFavorite {
+                name: "桌面（重复）".into(),
+                path: "C:/Users/t/Desktop".into(),
+            },
+            PickerFavorite {
+                name: "空的".into(),
+                path: "   ".into(),
+            },
+            PickerFavorite {
+                name: "  ".into(),
+                path: "D:/项目".into(),
+            },
         ]);
 
         assert_eq!(
             stored,
             vec![
-                PickerFavorite { name: "桌面".into(), path: "C:/Users/t/Desktop".into() },
-                PickerFavorite { name: "D:/项目".into(), path: "D:/项目".into() },
+                PickerFavorite {
+                    name: "桌面".into(),
+                    path: "C:/Users/t/Desktop".into()
+                },
+                PickerFavorite {
+                    name: "D:/项目".into(),
+                    path: "D:/项目".into()
+                },
             ]
         );
         // 存下去的就是返回的那份：界面以后端为准，两边不会分叉
@@ -1902,8 +2298,14 @@ mod tests {
     #[test]
     fn online_round_trips_and_defaults_to_true() {
         let old: Config = toml::from_str("deviceId = \"device-1\"\n").unwrap();
-        assert!(old.online, "老配置没有 online：默认在线，不能默认把用户静默拉黑");
-        assert!(old.settings().online, "AppSettings（get_settings 的返回）要带上它");
+        assert!(
+            old.online,
+            "老配置没有 online：默认在线，不能默认把用户静默拉黑"
+        );
+        assert!(
+            old.settings().online,
+            "AppSettings（get_settings 的返回）要带上它"
+        );
 
         let offline: Config = toml::from_str("deviceId = \"device-1\"\nonline = false\n").unwrap();
         assert!(!offline.online);
@@ -1936,13 +2338,25 @@ mod tests {
     #[test]
     fn orb_shape_round_trips_and_defaults_to_circle() {
         let old: Config = toml::from_str("deviceId = \"device-1\"\n").unwrap();
-        assert_eq!(old.orb_shape, OrbShape::Circle, "老配置没有 orbShape：默认圆球");
-        assert_eq!(old.settings().orb_shape, OrbShape::Circle, "AppSettings 要带上它");
+        assert_eq!(
+            old.orb_shape,
+            OrbShape::Circle,
+            "老配置没有 orbShape：默认圆球"
+        );
+        assert_eq!(
+            old.settings().orb_shape,
+            OrbShape::Circle,
+            "AppSettings 要带上它"
+        );
 
-        let rect: Config = toml::from_str("deviceId = \"device-1\"\norbShape = \"rect\"\n").unwrap();
+        let rect: Config =
+            toml::from_str("deviceId = \"device-1\"\norbShape = \"rect\"\n").unwrap();
         assert_eq!(rect.orb_shape, OrbShape::Rect);
 
-        assert_eq!(serde_json::to_string(&OrbShape::Circle).unwrap(), "\"circle\"");
+        assert_eq!(
+            serde_json::to_string(&OrbShape::Circle).unwrap(),
+            "\"circle\""
+        );
         assert_eq!(serde_json::to_string(&OrbShape::Rect).unwrap(), "\"rect\"");
     }
 
@@ -2007,7 +2421,10 @@ mod tests {
         assert!(old.device_remarks.is_empty(), "老配置没有这一节：没有备注");
 
         let mut config = Config::default();
-        assert_eq!(config.set_device_remark("peer-a", "  客厅台式机 "), Some("客厅台式机".into()));
+        assert_eq!(
+            config.set_device_remark("peer-a", "  客厅台式机 "),
+            Some("客厅台式机".into())
+        );
         assert_eq!(config.set_device_remark("peer-a", ""), None, "空串 = 清除");
         assert!(!config.device_remarks.contains_key("peer-a"));
 
@@ -2015,8 +2432,14 @@ mod tests {
         config.set_device_remark("peer-b", "会议室");
         let text = toml::to_string_pretty(&config).unwrap();
         let loaded: Config = toml::from_str(&text).unwrap();
-        assert_eq!(loaded.device_remarks.get("peer-a").map(String::as_str), Some("客厅台式机"));
-        assert_eq!(loaded.device_remarks.get("peer-b").map(String::as_str), Some("会议室"));
+        assert_eq!(
+            loaded.device_remarks.get("peer-a").map(String::as_str),
+            Some("客厅台式机")
+        );
+        assert_eq!(
+            loaded.device_remarks.get("peer-b").map(String::as_str),
+            Some("会议室")
+        );
 
         // 超长的按字符截断（中文一个字算一个，不能按字节切 —— 那会切出半个字）
         let long = "备".repeat(REMARK_MAX_CHARS + 5);
@@ -2029,26 +2452,40 @@ mod tests {
     #[test]
     fn known_peers_round_trip_prune_and_forget() {
         let mut config = Config::default();
-        assert!(config.known_peer("dev-1").is_none(), "老配置没有这一节：没有记忆");
-
-        assert!(config.note_known_peer("dev-1", "小米 15", "10.0.0.7", 3890));
         assert!(
-            !config.note_known_peer("dev-1", "小米 15", "10.0.0.7", 3890),
+            config.known_peer("dev-1").is_none(),
+            "老配置没有这一节：没有记忆"
+        );
+
+        assert!(config.note_known_peer("dev-1", "示例设备", "10.0.0.7", 3890));
+        assert!(
+            !config.note_known_peer("dev-1", "示例设备", "10.0.0.7", 3890),
             "值没变就不算写（调用方据此不落盘）"
         );
-        assert!(config.note_known_peer("dev-1", "小米 15 Pro", "10.0.0.7", 3890), "名字变了：写");
-        assert!(!config.note_known_peer("dev-2", "", "", 0), "空名不写：那不是名字");
+        assert!(
+            config.note_known_peer("dev-1", "示例设备 Pro", "10.0.0.7", 3890),
+            "名字变了：写"
+        );
+        assert!(
+            !config.note_known_peer("dev-2", "", "", 0),
+            "空名不写：那不是名字"
+        );
         assert!(
             !config.note_known_peer("dev-2", "dev-2", "10.0.0.8", 3890),
             "等于设备 id 的占位名不写"
         );
-        assert!(!config.note_known_peer("", "谁", "10.0.0.8", 3890), "没有 id 不写");
+        assert!(
+            !config.note_known_peer("", "谁", "10.0.0.8", 3890),
+            "没有 id 不写"
+        );
 
         let text = toml::to_string(&config).unwrap();
         let loaded: Config = toml::from_str(&text).unwrap();
         assert_eq!(
-            loaded.known_peer("dev-1").map(|k| (k.name.clone(), k.ip.clone(), k.port)),
-            Some(("小米 15 Pro".into(), "10.0.0.7".into(), 3890)),
+            loaded
+                .known_peer("dev-1")
+                .map(|k| (k.name.clone(), k.ip.clone(), k.port)),
+            Some(("示例设备 Pro".into(), "10.0.0.7".into(), 3890)),
             "要跨重启保留（它就是靠这个在启动时补一行）"
         );
 
@@ -2070,7 +2507,9 @@ mod tests {
         assert_eq!(config.known_peers.len(), MAX_KNOWN_PEERS);
         assert!(config.known_peer("dev-new").is_some());
         assert!(
-            config.known_peer(&format!("old-{:03}", MAX_KNOWN_PEERS - 1)).is_none(),
+            config
+                .known_peer(&format!("old-{:03}", MAX_KNOWN_PEERS - 1))
+                .is_none(),
             "满了就淘汰最旧的那一台（它再开口又会记回来）"
         );
 
@@ -2079,11 +2518,21 @@ mod tests {
         let stale = (Utc::now() - chrono::Duration::days(KNOWN_PEER_TTL_DAYS + 1)).to_rfc3339();
         config.known_peers.insert(
             "old".into(),
-            KnownPeer { name: "旧".into(), ip: String::new(), port: 0, seen_at: stale },
+            KnownPeer {
+                name: "旧".into(),
+                ip: String::new(),
+                port: 0,
+                seen_at: stale,
+            },
         );
         config.known_peers.insert(
             "no-clock".into(),
-            KnownPeer { name: "没时刻".into(), ip: String::new(), port: 0, seen_at: String::new() },
+            KnownPeer {
+                name: "没时刻".into(),
+                ip: String::new(),
+                port: 0,
+                seen_at: String::new(),
+            },
         );
         assert!(config.note_known_peer("fresh", "新", "10.0.0.11", 3890));
         assert_eq!(config.known_peers.len(), 1, "过期的与没有时刻的一起清掉");
@@ -2101,64 +2550,67 @@ mod tests {
     /// 安卓机器），只钉规则本身。
     #[test]
     fn android_device_name_prefers_vendor_market_name() {
-        // 小米：市场名在，型号与品牌都不再参与
-        let xiaomi = fake_props(&[
-            ("ro.product.marketname", "Xiaomi 15 Pro"),
-            ("ro.product.model", "24129PN74C"),
-            ("ro.product.brand", "Xiaomi"),
+        // 市场名在，型号与品牌都不再参与
+        let market = fake_props(&[
+            ("ro.product.marketname", "Example 15 Pro"),
+            ("ro.product.model", "ABCD-1234"),
+            ("ro.product.brand", "example"),
         ]);
-        assert_eq!(pick_android_device_name(xiaomi), Some("Xiaomi 15 Pro".into()));
+        assert_eq!(
+            pick_android_device_name(market),
+            Some("Example 15 Pro".into())
+        );
 
-        // 市场名只落在分区变体里 / OPPO 系 / vivo 系各探一条：属性不存在时返回 None，
+        // 市场名只落在分区变体里 / 其他厂商键各探一条：属性不存在时返回 None，
         // 所以整串探一遍不亏（`ro.product.marketname` 缺席时下面的键才是答案）。
         assert_eq!(
             pick_android_device_name(fake_props(&[
-                ("ro.product.vendor.marketname", "Redmi Note 13 Pro+ 5G"),
-                ("ro.product.model", "2312DRAABC"),
+                ("ro.product.vendor.marketname", "Example Note 13 Pro+ 5G"),
+                ("ro.product.model", "EFGH-5678"),
             ])),
-            Some("Redmi Note 13 Pro+ 5G".into())
+            Some("Example Note 13 Pro+ 5G".into())
         );
         assert_eq!(
             pick_android_device_name(fake_props(&[
-                ("ro.vendor.oplus.market.name", "OnePlus 12"),
-                ("ro.product.model", "PJD110"),
+                ("ro.vendor.oplus.market.name", "Example 12"),
+                ("ro.product.model", "IJKL-9012"),
             ])),
-            Some("OnePlus 12".into())
+            Some("Example 12".into())
         );
         assert_eq!(
             pick_android_device_name(fake_props(&[
-                ("ro.vivo.market.name", "vivo X300"),
-                ("ro.product.model", "V2502A"),
+                ("ro.vivo.market.name", "Example X300"),
+                ("ro.product.model", "MNOP-3456"),
             ])),
-            Some("vivo X300".into())
+            Some("Example X300".into())
         );
     }
 
-    /// 没有市场名的机器（三星、华为这类）落回"品牌 + 型号"：型号是代码时加品牌当路标，
-    /// 型号本身就是人话、或已经以品牌开头时不再叠加 —— 名字不该长成 `Xiaomi Xiaomi 15`。
+    /// 没有市场名的机器落回"品牌 + 型号"：型号是代码时加品牌当路标，
+    /// 型号本身就是人话、或已经以品牌开头时不再叠加 —— 名字不该长成 `Brand Brand Model`。
     #[test]
     fn android_device_name_falls_back_to_brand_plus_model() {
         assert_eq!(
             pick_android_device_name(fake_props(&[
-                ("ro.product.brand", "samsung"),
-                ("ro.product.model", "SM-S928B"),
+                ("ro.product.brand", "examplebrand"),
+                ("ro.product.model", "QRST-7890"),
             ])),
-            Some("samsung SM-S928B".into())
+            Some("examplebrand QRST-7890".into())
         );
         assert_eq!(
             pick_android_device_name(fake_props(&[
-                ("ro.product.brand", "google"),
-                ("ro.product.model", "Pixel 7"),
+                ("ro.product.brand", "otherbrand"),
+                ("ro.product.model", "Readable 7"),
             ])),
-            Some("Pixel 7".into()),
+            Some("Readable 7".into()),
             "型号本身就是名字（有空格），不再叠品牌"
         );
         assert_eq!(
             pick_android_device_name(fake_props(&[
-                ("ro.product.brand", "Xiaomi"),
-                ("ro.product.model", "Xiaomi 15"),
+                ("ro.product.brand", "example"),
+                ("ro.product.model", "Example 15"),
             ])),
-            Some("Xiaomi 15".into()),
+            Some("Example 15".into()),
             "型号已经以品牌开头，不重复叠"
         );
 
@@ -2177,21 +2629,26 @@ mod tests {
     /// `repair_device_name` 的判据：只换"我们自己自动取名写下的值"，用户起过的名字一个字不动。
     #[test]
     fn only_auto_picked_names_get_replaced() {
-        assert!(should_replace_auto_name("OrbDrop-Mac", "Pixel 7"), "平台兜底串要换");
+        assert!(
+            should_replace_auto_name("OrbDrop-Mac", "Readable 7"),
+            "平台兜底串要换"
+        );
         assert!(
             !should_replace_auto_name("OrbDrop-Mac", "OrbDrop-Mac"),
             "换不出更好的就别写盘（否则每次启动都白落一次盘）"
         );
         assert!(
-            !should_replace_auto_name("小明的手机", "Pixel 7"),
+            !should_replace_auto_name("小明的手机", "Readable 7"),
             "用户自己起的名字不动 —— 哪怕它更好看"
         );
     }
 
     /// 一张假的"系统属性表"，冒充 `__system_property_get`。
     fn fake_props(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> =
-            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         move |key: &str| map.get(key).cloned()
     }
 
@@ -2215,8 +2672,16 @@ mod tests {
             via: "relay-node".into(),
             via_name: "书房的台式机".into(),
         });
-        assert_eq!(peer.dial(), ("[::ffff:198.51.100.6]", 41000), "挂了中转就走中转端点");
-        assert_eq!(peer.relay_via(), Some("书房的台式机"), "界面文案用中转方的名字");
+        assert_eq!(
+            peer.dial(),
+            ("[::ffff:198.51.100.6]", 41000),
+            "挂了中转就走中转端点"
+        );
+        assert_eq!(
+            peer.relay_via(),
+            Some("书房的台式机"),
+            "界面文案用中转方的名字"
+        );
     }
 
     /// F-107：记忆能落盘读回，而且**绝不**变成拨号地址 —— `dial()` 只认"此刻这条路"
@@ -2236,10 +2701,19 @@ mod tests {
             paused: false,
             relay: None,
         };
-        assert_eq!(peer.dial(), ("192.168.1.6", 3890), "没有端点时 dial 用直连地址");
+        assert_eq!(
+            peer.dial(),
+            ("192.168.1.6", 3890),
+            "没有端点时 dial 用直连地址"
+        );
 
         let mut config = Config::default();
-        config.set_relay_link("peer-b", "peer-c", "192.168.50.0/24", "2026-09-30T12:00:00Z");
+        config.set_relay_link(
+            "peer-b",
+            "peer-c",
+            "192.168.50.0/24",
+            "2026-09-30T12:00:00Z",
+        );
         {
             let route = config.relay_route_mut("192.168.1.0/24");
             route.via_cidr = "192.168.50.0/24".into();
@@ -2255,7 +2729,11 @@ mod tests {
             back.relay_links.get("peer-b").map(|l| l.via_id.as_str()),
             Some("peer-c")
         );
-        assert_eq!(back.relay_route("192.168.1.0/24").map(|r| r.via_cidr.clone()), Some("192.168.50.0/24".into()));
+        assert_eq!(
+            back.relay_route("192.168.1.0/24")
+                .map(|r| r.via_cidr.clone()),
+            Some("192.168.50.0/24".into())
+        );
         assert!(back.relay_memory, "默认开：S-10 是选路优化，不替别人做事");
         assert_ne!(peer.dial(), ("[::ffff:192.168.50.7]", 1234), "记忆不是地址");
         peer.relay = Some(RelayAddr {

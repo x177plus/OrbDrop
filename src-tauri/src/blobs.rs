@@ -1,6 +1,6 @@
-//! 会话里**图片消息的内容**：`<数据目录>/chat-blobs/<消息 id>.<扩展名>`。
+//! 会话里**图片消息的内容**：`<数据目录>/chat-vault/blobs/<消息 id>.bin`。
 //!
-//! 为什么图片不塞进 `chat.json`：那份文件是**每改一条消息就整份重写**的（见 `chat.rs::persist`），
+//! 为什么图片不塞进 `chat.dat`：那份文件是**每改一条消息就整份重写**的（见 `chat.rs::persist`），
 //! 一张几 MB 的图进去之后，之后每说一句话都要重写一遍它。所以消息本体里只留元数据
 //! （是不是图片、名字、字节数），字节单独躺在一份文件里。
 //!
@@ -32,7 +32,7 @@ pub const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// 消息内容（图片）的目录。
 pub fn dir() -> PathBuf {
-    data_dir().join("chat-blobs")
+    crate::envelope::blobs_dir(&data_dir())
 }
 
 /// 这个 id 能不能拿来当文件名。
@@ -42,7 +42,9 @@ pub fn dir() -> PathBuf {
 fn safe_id(id: &str) -> Option<&str> {
     let ok = !id.is_empty()
         && id.len() <= 64
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
     ok.then_some(id)
 }
 
@@ -61,12 +63,18 @@ pub struct Content {
 impl Content {
     /// 一段文字。
     pub fn text(text: impl Into<String>) -> Self {
-        Self { text: text.into(), image: None }
+        Self {
+            text: text.into(),
+            image: None,
+        }
     }
 
     /// 一张图（内容已经落进 [`dir`] 了）。
     pub fn image(name: impl Into<String>, size: u64) -> Self {
-        Self { text: String::new(), image: Some((name.into(), size)) }
+        Self {
+            text: String::new(),
+            image: Some((name.into(), size)),
+        }
     }
 
     /// 这条是不是图片消息。
@@ -75,7 +83,7 @@ impl Content {
     }
 }
 
-/// 一份账本（`chat.json` / `groups.json`）旁边那个内容目录：`<它的目录>/chat-blobs`。
+/// 一份账本（`chat.dat` / `groups.dat`）旁边那个内容目录：`<它的目录>/blobs`。
 ///
 /// 两份账本在同一个数据目录里，所以推出来的是**同一个**目录（见 `GroupStore` 的类型说明）；
 /// 测试用各自临时目录里的账本 → 内容也跟着落到各自的临时目录（不碰真实数据）。
@@ -83,7 +91,7 @@ pub fn root_of(ledger: &Path) -> PathBuf {
     ledger
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join("chat-blobs")
+        .join("blobs")
 }
 
 /// 一段 base64 的内容 → 落成这条消息的内容文件。
@@ -111,10 +119,10 @@ pub fn save_base64(root: &Path, id: &str, name: &str, data: &str) -> Result<Path
 pub fn remove_many<'a>(root: &Path, items: impl IntoIterator<Item = (&'a str, &'a str)>) -> usize {
     let mut removed = 0usize;
     for (id, name) in items {
-        if let Some(path) = path_in(root, id, name) {
-            if std::fs::remove_file(path).is_ok() {
-                removed += 1;
-            }
+        let before = existing_path(root, id, name);
+        if before.is_some() {
+            remove_in(root, id, name);
+            removed += 1;
         }
     }
     removed
@@ -134,39 +142,71 @@ impl From<String> for Content {
 
 /// 一条图片消息的内容文件路径（`id` 不可用、或名字里判不出图片扩展名时 = `None`）。
 ///
-/// 扩展名取自消息带过来的**显示名**，所以同样要过一遍名单 —— 它是唯一进文件名的那部分。
+/// 文件名统一是 `<id>.bin`：内容本身是封装格式（见 `envelope`），真正的图片扩展名在文件
+/// 头里。`name` 仍然要过一遍图片名单 —— 它是唯一进文件头的那部分，也是界面显示名。
 pub fn path_in(root: &Path, id: &str, name: &str) -> Option<PathBuf> {
+    let id = safe_id(id)?;
+    crate::paste::image_ext_of(name)?;
+    Some(root.join(format!("{id}.bin")))
+}
+
+/// 老版本留下的 `<id>.<扩展名>` 明文图片路径（迁移失败回退时还要能读）。
+fn legacy_path_in(root: &Path, id: &str, name: &str) -> Option<PathBuf> {
     let id = safe_id(id)?;
     let ext = crate::paste::image_ext_of(name)?;
     Some(root.join(format!("{id}.{ext}")))
 }
 
+/// 这条内容**此刻**实际在盘上的路径：优先封装后的 `<id>.bin`，没有再看老版本的
+/// `<id>.<扩展名>`。界面快照与预览走它，迁移回退时才不会把老图片显示成"读不出来"。
+pub fn existing_path(root: &Path, id: &str, name: &str) -> Option<PathBuf> {
+    let wrapped = path_in(root, id, name)?;
+    if wrapped.is_file() {
+        return Some(wrapped);
+    }
+    legacy_path_in(root, id, name).filter(|p| p.is_file())
+}
+
 /// 把字节落成这条消息的内容（发送方与接收方都走它）。
 pub fn save_in(root: &Path, id: &str, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-    let path = path_in(root, id, name).ok_or_else(|| format!("这条图片消息的名字不可用：{name}"))?;
+    let ext = crate::paste::image_ext_of(name)
+        .ok_or_else(|| format!("这条图片消息的名字不可用：{name}"))?;
+    let path =
+        path_in(root, id, name).ok_or_else(|| format!("这条图片消息的名字不可用：{name}"))?;
     if bytes.is_empty() {
         return Err("图片内容为空".into());
     }
     std::fs::create_dir_all(root).map_err(|e| format!("建图片内容目录失败：{e}"))?;
-    // **原子写**（先写同目录的临时名，再 rename）：重投一条已经在界面上的消息时，正在渲染
+    // **原子写**（先写同目录的临时名，再 `rename`）：重投一条已经在界面上的消息时，正在渲染
     // 那张图的那一帧不该看见一份写了一半的文件（`config::write_atomic` 就是为这个备的）。
-    crate::config::write_atomic(&path, bytes).map_err(|e| format!("写图片内容失败：{e}"))?;
+    let wrapped = crate::envelope::encode(&ext, bytes);
+    crate::config::write_atomic(&path, &wrapped).map_err(|e| format!("写图片内容失败：{e}"))?;
     Ok(path)
 }
 
 /// 读回一条图片消息的内容（补发、群里给别人补拉时用）。
+///
+/// 兼容老版本留下的明文图片（迁移失败/回退时还要能读），但新写入的一律是封装格式。
 pub fn read_in(root: &Path, id: &str, name: &str) -> Option<Vec<u8>> {
-    std::fs::read(path_in(root, id, name)?).ok()
+    let raw = std::fs::read(existing_path(root, id, name)?).ok()?;
+    match crate::envelope::decode_if(&raw) {
+        Ok(Some((_, bytes))) => Some(bytes),
+        Ok(None) => Some(raw),
+        Err(_) => None,
+    }
 }
 
 /// 那条内容此刻在不在盘上。
 pub fn exists_in(root: &Path, id: &str, name: &str) -> bool {
-    path_in(root, id, name).is_some_and(|p| p.is_file())
+    existing_path(root, id, name).is_some()
 }
 
-/// 丢掉一条消息的内容（裁剪 / 清空记录）。
+/// 丢掉一条消息的内容（裁剪 / 清空记录）。两种命名都删，别给回退路径留孤儿。
 pub fn remove_in(root: &Path, id: &str, name: &str) {
     if let Some(path) = path_in(root, id, name) {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Some(path) = legacy_path_in(root, id, name) {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -174,7 +214,7 @@ pub fn remove_in(root: &Path, id: &str, name: &str) {
 /// 清掉**没有任何消息引用**的内容文件。
 ///
 /// 会留下的孤儿有三种：写了一半进程就没了、裁剪时正好没删干净、以及旧版本留下的。
-/// `keep` = 两份账本（`chat.json` 的 1:1 与 `groups.json` 的群聊）里还引用着的那些 id。
+/// `keep` = 两份账本（`chat.dat` 的 1:1 与 `groups.dat` 的群聊）里还引用着的那些 id。
 pub fn sweep_in(root: &Path, keep: &HashSet<String>) -> usize {
     let Ok(rd) = std::fs::read_dir(root) else {
         return 0;
@@ -205,7 +245,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("orbdrop_blobs_{tag}_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_blobs_{tag}_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -229,7 +270,7 @@ mod tests {
         let root = Path::new("C:/blobs");
         let p = path_in(root, "abc", "..\\..\\x.PNG").unwrap();
         assert_eq!(p.parent(), Some(root));
-        assert_eq!(p.file_name().unwrap().to_string_lossy(), "abc.png");
+        assert_eq!(p.file_name().unwrap().to_string_lossy(), "abc.bin");
     }
 
     // 落盘 / 读回 / 删掉一圈。
@@ -239,9 +280,34 @@ mod tests {
         let path = save_in(&root, "m1", "图片-1.png", b"hello").unwrap();
         assert!(exists_in(&root, "m1", "图片-1.png"));
         assert_eq!(read_in(&root, "m1", "图片-1.png").unwrap(), b"hello");
+        // 盘上不是明文，头里带着真正的扩展名。
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!raw.windows(5).any(|w| w == b"hello"), "内容不该以明文落盘");
+        let (ext, data) = crate::envelope::decode_if(&raw).unwrap().unwrap();
+        assert_eq!(ext, "png");
+        assert_eq!(data, b"hello");
         remove_in(&root, "m1", "图片-1.png");
         assert!(!exists_in(&root, "m1", "图片-1.png"));
         assert!(!path.exists());
+    }
+
+    // 迁移失败回退时，老版本的 `<id>.<扩展名>` 明文图片仍要能读、能定位。
+    #[test]
+    fn a_legacy_plaintext_image_still_resolves() {
+        let root = temp_dir("legacy");
+        std::fs::write(root.join("m1.png"), b"OLD").unwrap();
+        assert_eq!(read_in(&root, "m1", "图片.png").unwrap(), b"OLD");
+        assert!(exists_in(&root, "m1", "图片.png"));
+        assert_eq!(
+            existing_path(&root, "m1", "图片.png")
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            "m1.png"
+        );
+        remove_in(&root, "m1", "图片.png");
+        assert!(!exists_in(&root, "m1", "图片.png"));
     }
 
     // 空字节要当场拒（不然会留下一条零字节的"图片"）。

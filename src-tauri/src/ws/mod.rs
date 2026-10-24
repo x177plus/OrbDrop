@@ -166,7 +166,10 @@ impl WsManager {
     /// "对端上线"这类证据触发要用它去重：已经在跑的循环自己会动手，不该再叠一个
     /// （两个循环会互相 `abort_dial`、界面就是"连-断"狂闪）。
     pub fn has_dial_task(&self, peer_id: &str) -> bool {
-        self.tasks.lock().get(peer_id).is_some_and(|h| !h.is_finished())
+        self.tasks
+            .lock()
+            .get(peer_id)
+            .is_some_and(|h| !h.is_finished())
     }
 
     /// Send an event to a connected peer; returns false if not connected.
@@ -182,7 +185,9 @@ impl WsManager {
     /// 的消息消失），而掐线至少是"这段链路不成立"，两边都会在界面上如实说出来。
     pub fn send(&self, peer_id: &str, event: WsEvent) -> bool {
         let mut senders = self.senders.lock();
-        let Some(sessions) = senders.get_mut(peer_id) else { return false };
+        let Some(sessions) = senders.get_mut(peer_id) else {
+            return false;
+        };
         // 新会话优先；它刚死掉时（还没注销）退回旧会话。
         while let Some(session) = sessions.last() {
             // `gen` 先取出来（日志要用），投递结果单独接住：`session` 的借用到此为止，
@@ -214,7 +219,10 @@ impl WsManager {
 
     /// True if a channel is registered for the peer (connection exists).
     pub fn has_connection(&self, peer_id: &str) -> bool {
-        self.senders.lock().get(peer_id).is_some_and(|s| !s.is_empty())
+        self.senders
+            .lock()
+            .get(peer_id)
+            .is_some_and(|s| !s.is_empty())
     }
 
     /// 此刻处于长连接的对端 id 集合。共享项可见性与变更广播都按这个集合算，
@@ -250,7 +258,9 @@ impl WsManager {
     /// stays connected while any other session is still alive.
     pub fn unregister(&self, peer_id: &str, gen: u64) {
         let mut senders = self.senders.lock();
-        let Some(slot) = senders.get_mut(peer_id) else { return };
+        let Some(slot) = senders.get_mut(peer_id) else {
+            return;
+        };
         let before = slot.len();
         slot.retain(|s| s.gen != gen);
         let emptied = slot.is_empty();
@@ -309,7 +319,9 @@ impl WsManager {
         self.teardown(peer_id);
         self.set_link_state(
             peer_id,
-            LinkState::Stopped { reason: StopReason::LocalDisconnected },
+            LinkState::Stopped {
+                reason: StopReason::LocalDisconnected,
+            },
         );
     }
 
@@ -350,14 +362,18 @@ impl WsManager {
         for peer_id in paused {
             self.set_link_state(
                 &peer_id,
-                LinkState::Stopped { reason: StopReason::LocalDisconnected },
+                LinkState::Stopped {
+                    reason: StopReason::LocalDisconnected,
+                },
             );
         }
     }
 }
 
 impl Default for WsManager {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -586,7 +602,9 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
                     warn!(%peer_id, "no token for this peer, outbound link stopped");
                     state.ws.set_link_state(
                         &peer_id,
-                        LinkState::Stopped { reason: StopReason::TokenRejected },
+                        LinkState::Stopped {
+                            reason: StopReason::TokenRejected,
+                        },
                     );
                     state.emit_devices_changed();
                     return;
@@ -611,20 +629,23 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
             state.ws.set_link_state(&peer_id, LinkState::Retrying);
             // 到对端要过 TLS，而"指纹对不上"发生在 WS 握手**之前** —— `stop_reason_for`
             // 只看得到 WS 层的错误，身份这一条只能在这里单独拦下来。
-            let dialed = match crate::net::connect_ws(&url, peer.dial().0, peer.dial().1).await {
-                Err(crate::net::DialError::IdentityRejected) => {
-                    warn!(%peer_id, "对端证书指纹与钉住的不一致：停手，需重新配对");
-                    state.ws.set_link_state(
-                        &peer_id,
-                        LinkState::Stopped {
-                            reason: StopReason::IdentityChanged,
-                        },
-                    );
-                    state.emit_devices_changed();
-                    return;
-                }
-                other => other,
-            };
+            let dialed =
+                match crate::net::connect_ws(&url, peer.dial().0, peer.dial().1, &peer.dial_pin())
+                    .await
+                {
+                    Err(crate::net::DialError::IdentityRejected) => {
+                        warn!(%peer_id, "对端证书指纹与钉住的不一致：停手，需重新配对");
+                        state.ws.set_link_state(
+                            &peer_id,
+                            LinkState::Stopped {
+                                reason: StopReason::IdentityChanged,
+                            },
+                        );
+                        state.emit_devices_changed();
+                        return;
+                    }
+                    other => other,
+                };
             match dialed {
                 Ok(ws_stream) => {
                     info!(%peer_id, "outbound WS linked");
@@ -724,7 +745,9 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
                     };
                     if let Some(reason) = stop {
                         info!(%peer_id, error = %e, "link refused, giving up until the situation changes");
-                        state.ws.set_link_state(&peer_id, LinkState::Stopped { reason });
+                        state
+                            .ws
+                            .set_link_state(&peer_id, LinkState::Stopped { reason });
                         // 停手理由要当场送到界面：不然这一行会一直停在「杂项」上，用户根本
                         // 看不出"为什么要重新配对"（`set_link_state` 自己不广播）。
                         state.emit_devices_changed();
@@ -793,8 +816,14 @@ mod tests {
     /// 把它们也当成停手，就等于把网络抖动升级成"再也连不回来"。
     #[test]
     fn only_explicit_refusals_stop_the_loop() {
-        assert_eq!(stop_reason_for(&http_err(403)), Some(StopReason::PeerDisconnected));
-        assert_eq!(stop_reason_for(&http_err(401)), Some(StopReason::TokenRejected));
+        assert_eq!(
+            stop_reason_for(&http_err(403)),
+            Some(StopReason::PeerDisconnected)
+        );
+        assert_eq!(
+            stop_reason_for(&http_err(401)),
+            Some(StopReason::TokenRejected)
+        );
         assert_eq!(stop_reason_for(&http_err(503)), None, "服务端打嗝不算停手");
         assert_eq!(
             stop_reason_for(&tokio_tungstenite::tungstenite::Error::ConnectionClosed),
@@ -825,19 +854,34 @@ mod tests {
     #[test]
     fn link_state_serializes_for_the_ui() {
         let value = |s: LinkState| serde_json::to_value(s).unwrap();
-        assert_eq!(value(LinkState::Connected), serde_json::json!({ "kind": "connected" }));
-        assert_eq!(value(LinkState::Retrying), serde_json::json!({ "kind": "retrying" }));
-        assert_eq!(value(LinkState::Waiting), serde_json::json!({ "kind": "waiting" }));
         assert_eq!(
-            value(LinkState::Stopped { reason: StopReason::PeerDisconnected }),
+            value(LinkState::Connected),
+            serde_json::json!({ "kind": "connected" })
+        );
+        assert_eq!(
+            value(LinkState::Retrying),
+            serde_json::json!({ "kind": "retrying" })
+        );
+        assert_eq!(
+            value(LinkState::Waiting),
+            serde_json::json!({ "kind": "waiting" })
+        );
+        assert_eq!(
+            value(LinkState::Stopped {
+                reason: StopReason::PeerDisconnected
+            }),
             serde_json::json!({ "kind": "stopped", "reason": "peerDisconnected" })
         );
         assert_eq!(
-            value(LinkState::Stopped { reason: StopReason::TokenRejected }),
+            value(LinkState::Stopped {
+                reason: StopReason::TokenRejected
+            }),
             serde_json::json!({ "kind": "stopped", "reason": "tokenRejected" })
         );
         assert_eq!(
-            value(LinkState::Stopped { reason: StopReason::LocalDisconnected }),
+            value(LinkState::Stopped {
+                reason: StopReason::LocalDisconnected
+            }),
             serde_json::json!({ "kind": "stopped", "reason": "localDisconnected" })
         );
     }
@@ -848,7 +892,10 @@ mod tests {
     #[test]
     fn needs_repair_only_for_dead_relationships() {
         let ws = WsManager::new();
-        assert!(!ws.needs_repair("peer-a"), "没有拨号状态 = 没有拨号意图，不算需配对");
+        assert!(
+            !ws.needs_repair("peer-a"),
+            "没有拨号状态 = 没有拨号意图，不算需配对"
+        );
         ws.set_link_state("peer-a", LinkState::Retrying);
         assert!(!ws.needs_repair("peer-a"));
         ws.set_link_state("peer-a", LinkState::Connected);
@@ -856,7 +903,10 @@ mod tests {
 
         for reason in [StopReason::LocalDisconnected, StopReason::PeerDisconnected] {
             ws.set_link_state("peer-a", LinkState::Stopped { reason });
-            assert!(!ws.needs_repair("peer-a"), "{reason:?} 是主动断开，不是关系失效");
+            assert!(
+                !ws.needs_repair("peer-a"),
+                "{reason:?} 是主动断开，不是关系失效"
+            );
         }
         for reason in [StopReason::TokenRejected, StopReason::IdentityChanged] {
             ws.set_link_state("peer-a", LinkState::Stopped { reason });
@@ -874,10 +924,15 @@ mod tests {
         let ws = WsManager::new();
         let (tx, rx) = mpsc::channel::<WsEvent>(EVENT_QUEUE_CAPACITY);
         ws.register("peer-a", tx);
-        let event = WsEvent::PeerOffline { peer_id: "peer-a".into() };
+        let event = WsEvent::PeerOffline {
+            peer_id: "peer-a".into(),
+        };
 
         for i in 0..EVENT_QUEUE_CAPACITY {
-            assert!(ws.send("peer-a", event.clone()), "容量之内第 {i} 条不该失败");
+            assert!(
+                ws.send("peer-a", event.clone()),
+                "容量之内第 {i} 条不该失败"
+            );
         }
         assert_eq!(rx.len(), EVENT_QUEUE_CAPACITY, "容量之内一条都不该丢");
         assert!(ws.has_connection("peer-a"), "还没满，链路照旧算在册");
@@ -886,7 +941,10 @@ mod tests {
             !ws.send("peer-a", event),
             "满了必须掐线（返回 false = 既有语义里的「此刻没有长连接」）"
         );
-        assert!(!ws.has_connection("peer-a"), "掐线 = 注销这条会话（调用方据此退回 HTTP）");
+        assert!(
+            !ws.has_connection("peer-a"),
+            "掐线 = 注销这条会话（调用方据此退回 HTTP）"
+        );
         assert_eq!(rx.len(), EVENT_QUEUE_CAPACITY, "队列自己不再长");
     }
 }

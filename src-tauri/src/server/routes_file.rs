@@ -22,12 +22,12 @@ pub async fn file_handler(
     Extension(caller): Extension<Caller>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let share_id = params.get("share").ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "Missing 'share' parameter".into())
-    })?;
-    let rel_path = params.get("path").ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "Missing 'path' parameter".into())
-    })?;
+    let share_id = params
+        .get("share")
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'share' parameter".into()))?;
+    let rel_path = params
+        .get("path")
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'path' parameter".into()))?;
 
     let offset = params
         .get("offset")
@@ -43,15 +43,30 @@ pub async fn file_handler(
             .iter()
             // 不可见与不存在都回 404：不向对端泄露「本机有这么个共享项」。
             .find(|s| s.id == *share_id && caller.sees_share(&state, s))
-            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Share '{}' not found", share_id)))?;
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Share '{}' not found", share_id),
+                )
+            })?;
         share.path.clone()
     };
+
+    // 先校验再 `join`：Windows 上绝对/UNC 路径会让 `join` 清空共享项基址，`canonicalize`
+    // 会真的去打开那个网络路径（SMB 认证），然后才轮到前缀检查。
+    if !crate::server::safe_relative_share_path(rel_path) {
+        return Err((StatusCode::FORBIDDEN, "Path access denied".into()));
+    }
 
     // 空 `path` = 共享项根自身。**不能**写成 `share_root.join("")`：那样会带上结尾分隔符
     // （`F:\x\a.txt\`），`canonicalize` 对文件立刻报 `ERROR_INVALID_NAME`(os 267) → 本 handler
     // 回 403，对端看到的就是"起拖成功、落下报未指定的错误、文件始终不出现"（拖的正是
     // "共享项根就是一个文件"这一类）。`/stat`、`/tree` 都有这条空路径判断，只有这里漏了。
-    let target = if rel_path.is_empty() { share_root.clone() } else { share_root.join(rel_path) };
+    let target = if rel_path.is_empty() {
+        share_root.clone()
+    } else {
+        share_root.join(rel_path)
+    };
 
     // Path traversal guard: canonicalize and ensure it stays under the share root.
     let canonical_target = target.canonicalize().map_err(|e| {
@@ -59,7 +74,10 @@ pub async fn file_handler(
         (StatusCode::FORBIDDEN, "Path access denied".into())
     })?;
     let canonical_root = share_root.canonicalize().map_err(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to resolve share root".into())
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to resolve share root".into(),
+        )
     })?;
 
     if !canonical_target.starts_with(&canonical_root) {
@@ -70,17 +88,28 @@ pub async fn file_handler(
         return Err((StatusCode::BAD_REQUEST, "Path is not a file".into()));
     }
 
-    let mut file = tokio::fs::File::open(&canonical_target).await.map_err(|e| {
-        (StatusCode::NOT_FOUND, format!("File not found: {e}"))
-    })?;
+    let mut file = tokio::fs::File::open(&canonical_target)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("File not found: {e}")))?;
 
-    let file_size = file.metadata().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read metadata: {e}")))?
+    let file_size = file
+        .metadata()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read metadata: {e}"),
+            )
+        })?
         .len();
 
     if offset > 0 {
-        file.seek(SeekFrom::Start(offset)).await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Seek failed: {e}")))?;
+        file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Seek failed: {e}"),
+            )
+        })?;
     }
 
     let remaining = file_size.saturating_sub(offset);
@@ -118,7 +147,9 @@ mod tests {
         let config_path =
             std::env::temp_dir().join(format!("orbdrop_file_cfg_{}.toml", uuid::Uuid::new_v4()));
         let state = Arc::new(AppState::new(config, config_path));
-        let port = crate::server::start_server_loopback(state.clone(), 4070).await.expect("起服务");
+        let port = crate::server::start_server_loopback(state.clone(), 4070)
+            .await
+            .expect("起服务");
 
         let resp = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{port}/file"))
@@ -131,7 +162,10 @@ mod tests {
             reqwest::StatusCode::OK,
             "空 path 要落到共享项根自身，不能 403"
         );
-        assert_eq!(resp.bytes().await.unwrap().as_ref(), b"hello from a file share");
+        assert_eq!(
+            resp.bytes().await.unwrap().as_ref(),
+            b"hello from a file share"
+        );
 
         crate::server::stop_server(&state).await;
         let _ = std::fs::remove_dir_all(&dir);

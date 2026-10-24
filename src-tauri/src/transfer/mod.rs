@@ -1,3 +1,4 @@
+pub mod browse_dl;
 pub mod download;
 pub mod push_job;
 pub mod push_out;
@@ -92,7 +93,9 @@ pub struct PushSource {
 ///
 /// 覆盖名一律先过 [`resume::sanitize_file_name`]：它是**别的应用给的字符串**，而对端落盘
 /// 那关遇到非法字符是整次接收判失败（理由见那个函数自己）。净化后为空则退回源自己的名字。
-pub async fn manifest_for_named_paths(items: &[(PathBuf, Option<String>)]) -> Result<PushSource, String> {
+pub async fn manifest_for_named_paths(
+    items: &[(PathBuf, Option<String>)],
+) -> Result<PushSource, String> {
     if items.is_empty() {
         return Err("没有可推送的文件".into());
     }
@@ -180,7 +183,11 @@ pub async fn manifest_for_named_paths(items: &[(PathBuf, Option<String>)]) -> Re
             for f in sub {
                 let rel = format!("{prefix}/{}", f.path);
                 sources.insert(rel.clone(), root.join(&f.path));
-                files.push(FileEntry { path: rel, size: f.size, mtime: f.mtime });
+                files.push(FileEntry {
+                    path: rel,
+                    size: f.size,
+                    mtime: f.mtime,
+                });
             }
             total += sub_total;
         }
@@ -202,8 +209,7 @@ pub async fn manifest_for_named_paths(items: &[(PathBuf, Option<String>)]) -> Re
 /// 没有覆盖名的那条路（桌面端选择框、拖进会话、镜像……语义见
 /// [`manifest_for_named_paths`]）。
 pub async fn manifest_for_paths(paths: &[PathBuf]) -> Result<PushSource, String> {
-    let items: Vec<(PathBuf, Option<String>)> =
-        paths.iter().map(|p| (p.clone(), None)).collect();
+    let items: Vec<(PathBuf, Option<String>)> = paths.iter().map(|p| (p.clone(), None)).collect();
     manifest_for_named_paths(&items).await
 }
 
@@ -300,7 +306,10 @@ async fn collect_dir_manifest(dir: &Path) -> Result<(Vec<FileEntry>, u64, usize)
                 skipped += 1;
                 continue;
             }
-            if crate::unsendable::is_system_name(&name, crate::unsendable::sits_in_volume_root(&path)) {
+            if crate::unsendable::is_system_name(
+                &name,
+                crate::unsendable::sits_in_volume_root(&path),
+            ) {
                 continue;
             }
             if ft.is_dir() {
@@ -478,7 +487,10 @@ pub async fn push_paths(
         return Err(if ids.len() == 1 {
             first_reason.unwrap_or_else(|| "推送未发送".into())
         } else {
-            format!("所选 {} 台设备都收不了（不在网上或设备不存在），推送未发送", ids.len())
+            format!(
+                "所选 {} 台设备都收不了（不在网上或设备不存在），推送未发送",
+                ids.len()
+            )
         });
     }
 
@@ -492,7 +504,10 @@ pub async fn push_paths(
         last_emit: Instant::now(),
     };
     // 卡片也落一份（含**用户这次点的那几项** `roots`：重启后要按它把源监视挂回去）。
-    state.push.out.save_batch(push_job::out_batch_of(&batch, &roots));
+    state
+        .push
+        .out
+        .save_batch(push_job::out_batch_of(&batch, &roots));
     let view = state.push.insert_batch(batch);
     if let Ok(value) = serde_json::to_value(&view) {
         ws::emit_ui(&state, ws::events::ui::PUSH_BATCH, &value);
@@ -501,13 +516,19 @@ pub async fn push_paths(
     for (peer, invite_id) in pending {
         let event = WsEvent::PushInvite {
             invite_id: invite_id.clone(),
-            sender: PeerInfo { id: device_id.clone(), name: self_name.clone() },
+            sender: PeerInfo {
+                id: device_id.clone(),
+                name: self_name.clone(),
+            },
             name: source.name.clone(),
             size: source.total,
             is_dir: source.is_dir,
             count: source.count,
             files: source.files.clone(),
-            caps: vec![push_job::CAP_STREAM.to_string(), push_job::CAP_AWAIT.to_string()],
+            caps: vec![
+                push_job::CAP_STREAM.to_string(),
+                push_job::CAP_AWAIT.to_string(),
+            ],
             at,
         };
         spawn_invite_delivery(state.clone(), peer, invite_id, event, server_port);
@@ -558,10 +579,14 @@ fn spawn_invite_delivery(
             Ok(d) if d.accepted => {
                 info!(%invite_id, %peer_id, "invite auto-accepted by a paired peer");
                 state.push.update_status(&invite_id, PushStatus::Accepted);
-                ws::emit_ui(&state, ws::events::ui::PUSH_RESPONSE, &serde_json::json!({
-                    "inviteId": invite_id,
-                    "accepted": true,
-                }));
+                ws::emit_ui(
+                    &state,
+                    ws::events::ui::PUSH_RESPONSE,
+                    &serde_json::json!({
+                        "inviteId": invite_id,
+                        "accepted": true,
+                    }),
+                );
             }
             Ok(d) => {
                 let why = refusal_reason(&peer_name, &d);
@@ -575,16 +600,24 @@ fn spawn_invite_delivery(
                     Some(why.clone()),
                     true,
                 );
-                ws::emit_ui(&state, ws::events::ui::PUSH_RESPONSE, &serde_json::json!({
-                    "inviteId": invite_id,
-                    "accepted": false,
-                    "reason": why,
-                }));
-                ws::emit_ui(&state, ws::events::ui::PUSH_DONE, &serde_json::json!({
-                    "inviteId": invite_id,
-                    "status": "failed",
-                    "reason": why,
-                }));
+                ws::emit_ui(
+                    &state,
+                    ws::events::ui::PUSH_RESPONSE,
+                    &serde_json::json!({
+                        "inviteId": invite_id,
+                        "accepted": false,
+                        "reason": why,
+                    }),
+                );
+                ws::emit_ui(
+                    &state,
+                    ws::events::ui::PUSH_DONE,
+                    &serde_json::json!({
+                        "inviteId": invite_id,
+                        "status": "failed",
+                        "reason": why,
+                    }),
+                );
             }
             Err(reason) => fail_invite(&state, &invite_id, &reason),
         }
@@ -602,11 +635,15 @@ fn fail_invite(state: &AppState, invite_id: &str, reason: &str) {
         Some(reason.to_string()),
         true,
     );
-    ws::emit_ui(state, ws::events::ui::PUSH_DONE, &serde_json::json!({
-        "inviteId": invite_id,
-        "status": "failed",
-        "reason": reason,
-    }));
+    ws::emit_ui(
+        state,
+        ws::events::ui::PUSH_DONE,
+        &serde_json::json!({
+            "inviteId": invite_id,
+            "status": "failed",
+            "reason": reason,
+        }),
+    );
 }
 
 /// 一条邀请在远端是什么结局（`POST /push/invite` 的响应体）。
@@ -662,10 +699,13 @@ async fn deliver_invite_http(
         "{}/push/invite",
         crate::net::peer_base(peer.dial().0, peer.dial().1)
     );
-    let mut req = crate::net::client()
-        .post(&url)
-        .timeout(HTTP_INVITE_TIMEOUT)
-        .json(&body);
+    let mut req = crate::net::dial_client(
+        peer.dial().0,
+        &crate::credential::dial_pin(&peer.id, paired),
+    )
+    .post(&url)
+    .timeout(HTTP_INVITE_TIMEOUT)
+    .json(&body);
     if paired {
         if let Ok(Some(token)) = credential::get_peer_token(&peer.id) {
             req = req.bearer_auth(token);
@@ -683,10 +723,10 @@ async fn deliver_invite_http(
             resp.status().as_u16()
         ));
     }
-    let decision: InviteDecision = resp
-        .json()
-        .await
-        .map_err(|e| format!("「{}」的回应无法解析：{e}", peer.name))?;
+    let decision: InviteDecision =
+        crate::net::read_json_capped(resp, crate::net::CONTROL_BODY_MAX)
+            .await
+            .map_err(|e| format!("「{}」的回应无法解析：{e}", peer.name))?;
     Ok(decision)
 }
 
@@ -721,15 +761,23 @@ fn cancel_push_with(
         Some(card.to_string()),
         true,
     );
-    notify_peer(state, &job.peer_id, WsEvent::PushDone {
-        invite_id: invite_id.to_string(),
-        status: "cancelled".into(),
-        reason: Some(wire.to_string()),
-    });
-    ws::emit_ui(state, ws::events::ui::PUSH_DONE, &serde_json::json!({
-        "inviteId": invite_id,
-        "status": "cancelled",
-    }));
+    notify_peer(
+        state,
+        &job.peer_id,
+        WsEvent::PushDone {
+            invite_id: invite_id.to_string(),
+            status: "cancelled".into(),
+            reason: Some(wire.to_string()),
+        },
+    );
+    ws::emit_ui(
+        state,
+        ws::events::ui::PUSH_DONE,
+        &serde_json::json!({
+            "inviteId": invite_id,
+            "status": "cancelled",
+        }),
+    );
     Ok(())
 }
 
@@ -900,11 +948,15 @@ fn reject_shared(state: &AppState, invite: InboundInvite, reason: &str) {
         // 老对端：长连接上照旧回一条（HTTP 那条路的决定是它自己那条同步响应）。
         ws::send_to_peer(state, &invite.sender.id, response);
     }
-    ws::emit_ui(state, ws::events::ui::PUSH_RESPONSE, &serde_json::json!({
-        "inviteId": invite.invite_id,
-        "accepted": false,
-        "reason": reason,
-    }));
+    ws::emit_ui(
+        state,
+        ws::events::ui::PUSH_RESPONSE,
+        &serde_json::json!({
+            "inviteId": invite.invite_id,
+            "accepted": false,
+            "reason": reason,
+        }),
+    );
     // 拒绝也是个结局：发送方那边可能还是靠对账（`PushAsk`）补上的，这里把真话说出去。
     state.push.record_outcome(
         &invite.invite_id,
@@ -951,13 +1003,24 @@ fn discard_legacy_receive(
 /// 而这里正是用户喊停的那一下 —— 关掉应用是"可能想停"，点这颗按钮是"就是要停"。
 pub fn cancel_receive(state: &AppState, invite_id: &str) {
     state.push.resume.drop_pending(invite_id);
+    // 暂停中的那条：先摘表、再放开闸门 —— worker 正等在 `wait_for` 上，不放它就永远醒不过来
+    // （表摘了、任务还在，比留着更难查）。醒来后它会看到邀请已被取走，照常走清理。
+    if let Some(control) = state.receive_downloads.lock().remove(invite_id) {
+        control.set_paused(false);
+    }
     let Some(invite) = state.push.take_invite(invite_id) else {
         return;
     };
     // 老协议那条路的收尾清理（邀请此刻已经在手里，落盘根与清单都从它推）。
     let manifest = invite.manifest();
     let sizes: Vec<(&str, u64)> = manifest.iter().map(|f| (f.path.as_str(), f.size)).collect();
-    discard_legacy_receive(state, invite_id, &invite.sender.name, invite.root.as_deref(), &sizes);
+    discard_legacy_receive(
+        state,
+        invite_id,
+        &invite.sender.name,
+        invite.root.as_deref(),
+        &sizes,
+    );
     // 下载循环发现邀请没了就会收手；这里替它把话带到发送方 ——
     // 否则对面永远停在"正在传输"，那条 job 没有超时兜底。
     push_job::report_to_sender(
@@ -970,10 +1033,14 @@ pub fn cancel_receive(state: &AppState, invite_id: &str) {
             reason: Some("接收方已取消".into()),
         },
     );
-    ws::emit_ui(state, ws::events::ui::PUSH_DONE, &serde_json::json!({
-        "inviteId": invite.invite_id,
-        "status": "cancelled",
-    }));
+    ws::emit_ui(
+        state,
+        ws::events::ui::PUSH_DONE,
+        &serde_json::json!({
+            "inviteId": invite.invite_id,
+            "status": "cancelled",
+        }),
+    );
     // 这条 `PushDone` 走的是"尽力而为"的回执路（链路断了就没了），对账时也要答得出来。
     state.push.record_outcome(
         &invite.invite_id,
@@ -1018,8 +1085,11 @@ pub fn resume_pending(state: &Arc<AppState>) {
             // `inbound` 里了（这条任务一直在退避重试、没跑起来），所以落盘根与清单得从这条任务
             // 自己推 —— 输入与下载循环用的是同一套（那次邀请的根 + 对端名 + 设置），
             // 见 `discard_legacy_receive`。不这么做，这对记录 + 最终路径上的半截文件就没人清了。
-            let files: Vec<(&str, u64)> =
-                rec.files.iter().map(|f| (f.path.as_str(), f.size)).collect();
+            let files: Vec<(&str, u64)> = rec
+                .files
+                .iter()
+                .map(|f| (f.path.as_str(), f.size))
+                .collect();
             discard_legacy_receive(
                 state,
                 &rec.invite_id,
@@ -1074,7 +1144,10 @@ pub fn reconcile(state: &Arc<AppState>, peer_id: &str) {
     }
     let ask_id = uuid::Uuid::new_v4().to_string();
     debug!(%peer_id, count = invite_ids.len(), %ask_id, "推送对账：问对端这些邀请的结果");
-    if !state.ws.send(peer_id, WsEvent::PushAsk { ask_id, invite_ids }) {
+    if !state
+        .ws
+        .send(peer_id, WsEvent::PushAsk { ask_id, invite_ids })
+    {
         debug!(%peer_id, "推送对账：问不出去（会话刚断），等下一拍");
     }
 }
@@ -1163,7 +1236,14 @@ pub fn apply_push_states(
                 // 就开收了 —— 那就是"传输中"，卡片该从「等待开始」挪到进度那一档。
                 state.push.update_status(&s.invite_id, PushStatus::Accepted);
                 if target.paired {
-                    batch_set(state, &s.invite_id, TargetState::Sending, Some(s.received), None, false);
+                    batch_set(
+                        state,
+                        &s.invite_id,
+                        TargetState::Sending,
+                        Some(s.received),
+                        None,
+                        false,
+                    );
                 }
             }
             // 对端没有这条邀请（本机没见过 / 记录已过期）：它根本没送到 —— 当场收手，
@@ -1196,7 +1276,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("orbdrop_manifest_{tag}_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_manifest_{tag}_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1221,7 +1302,11 @@ mod tests {
         let (files, total, skipped) = collect_dir_manifest(&dir).await.unwrap();
         let mut names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         names.sort();
-        assert_eq!(names, vec!["散.txt", "真/深/a.txt"], "只该有真实文件，没有回环翻出来的副本");
+        assert_eq!(
+            names,
+            vec!["散.txt", "真/深/a.txt"],
+            "只该有真实文件，没有回环翻出来的副本"
+        );
         assert_eq!(total, 4);
         assert_eq!(skipped, 1, "跳过的是那个链接本身");
 
@@ -1412,9 +1497,16 @@ mod tests {
     /// 该往哪边走（升级对端）。对端**给了**原因就原话用它。
     #[test]
     fn a_synchronous_refusal_names_an_old_peer() {
-        let legacy = InviteDecision { accepted: false, pending: false, reason: None };
+        let legacy = InviteDecision {
+            accepted: false,
+            pending: false,
+            reason: None,
+        };
         let why = refusal_reason("PC-UB", &legacy);
-        assert!(why.contains("老版本"), "老对端要说清是老版本，别写死「对方拒绝」：{why}");
+        assert!(
+            why.contains("老版本"),
+            "老对端要说清是老版本，别写死「对方拒绝」：{why}"
+        );
         assert!(why.contains("PC-UB"), "卡片上要认得出是哪一台：{why}");
 
         let with_reason = InviteDecision {
@@ -1433,12 +1525,13 @@ mod tests {
 
     /// 一台临时状态：对账的落账要真的批次与真的 store。
     fn reconcile_state() -> Arc<AppState> {
-        let dir = std::env::temp_dir().join(format!(
-            "orbdrop_push_reconcile_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_push_reconcile_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        Arc::new(AppState::new(crate::config::Config::default(), dir.join("config.toml")))
+        Arc::new(AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ))
     }
 
     fn batch_with(targets: Vec<push_job::BatchTarget>) -> push_job::PushBatch {
@@ -1471,7 +1564,11 @@ mod tests {
     async fn reconcile_round_trip_lands_the_receivers_answer() {
         // 发送方：一条还没落终态的邀请（回执丢了，界面还停在「等待」）
         let sender = reconcile_state();
-        sender.push.insert_batch(batch_with(vec![target_of("p1", "i1", push_job::TargetState::Invited)]));
+        sender.push.insert_batch(batch_with(vec![target_of(
+            "p1",
+            "i1",
+            push_job::TargetState::Invited,
+        )]));
         let ids = sender.push.waiting_invites_of("p1");
         assert_eq!(ids, vec!["i1".to_string()], "要问的就是它");
 
@@ -1493,7 +1590,10 @@ mod tests {
         apply_push_states(&sender, "p1", "ask-1", &states);
         let target = sender.push.target_of_invite("i1").unwrap();
         assert_eq!(target.state, push_job::TargetState::Done);
-        assert!(sender.push.batch_snapshot("b1").is_some(), "卡片还在（宽限期）");
+        assert!(
+            sender.push.batch_snapshot("b1").is_some(),
+            "卡片还在（宽限期）"
+        );
     }
 
     /// 本机判的"失败"（超时/送不出去）是**推测**，对账拿到 `done` 就该改口 ——
@@ -1501,10 +1601,24 @@ mod tests {
     #[tokio::test]
     async fn reconcile_corrects_a_speculative_failure() {
         let state = reconcile_state();
-        state.push.insert_batch(batch_with(vec![target_of("p1", "i1", push_job::TargetState::Invited)]));
+        state.push.insert_batch(batch_with(vec![target_of(
+            "p1",
+            "i1",
+            push_job::TargetState::Invited,
+        )]));
         // 本机先把这一台**推测**成失败（邀请送不出去 / 对账答 `unknown` 都落这一档）
-        push_job::batch_set(&state, "i1", push_job::TargetState::Failed, None, Some("对方未响应".into()), true);
-        assert_eq!(state.push.target_of_invite("i1").unwrap().state, push_job::TargetState::Failed);
+        push_job::batch_set(
+            &state,
+            "i1",
+            push_job::TargetState::Failed,
+            None,
+            Some("对方未响应".into()),
+            true,
+        );
+        assert_eq!(
+            state.push.target_of_invite("i1").unwrap().state,
+            push_job::TargetState::Failed
+        );
 
         // 对端其实收完了：对账答案（正常情况下这条是回执，丢了才需要问）
         apply_push_states(
@@ -1520,7 +1634,11 @@ mod tests {
         );
 
         let target = state.push.target_of_invite("i1").unwrap();
-        assert_eq!(target.state, push_job::TargetState::Done, "推测的失败被对端的成功改写");
+        assert_eq!(
+            target.state,
+            push_job::TargetState::Done,
+            "推测的失败被对端的成功改写"
+        );
         assert!(target.error.is_none(), "改口时要把上一次的原因抹掉");
     }
 
@@ -1529,8 +1647,19 @@ mod tests {
     #[tokio::test]
     async fn reconcile_never_overwrites_an_explicit_rejection() {
         let state = reconcile_state();
-        state.push.insert_batch(batch_with(vec![target_of("p1", "i1", push_job::TargetState::Invited)]));
-        push_job::batch_set(&state, "i1", push_job::TargetState::Rejected, None, Some("对方拒绝".into()), true);
+        state.push.insert_batch(batch_with(vec![target_of(
+            "p1",
+            "i1",
+            push_job::TargetState::Invited,
+        )]));
+        push_job::batch_set(
+            &state,
+            "i1",
+            push_job::TargetState::Rejected,
+            None,
+            Some("对方拒绝".into()),
+            true,
+        );
 
         apply_push_states(
             &state,
@@ -1554,7 +1683,11 @@ mod tests {
     #[tokio::test]
     async fn reconcile_fails_an_invite_the_peer_never_saw() {
         let state = reconcile_state();
-        state.push.insert_batch(batch_with(vec![target_of("p1", "i1", push_job::TargetState::Invited)]));
+        state.push.insert_batch(batch_with(vec![target_of(
+            "p1",
+            "i1",
+            push_job::TargetState::Invited,
+        )]));
         apply_push_states(
             &state,
             "p1",
@@ -1575,7 +1708,11 @@ mod tests {
     #[tokio::test]
     async fn reconcile_ignores_invites_of_other_peers() {
         let state = reconcile_state();
-        state.push.insert_batch(batch_with(vec![target_of("p2", "i1", push_job::TargetState::Invited)]));
+        state.push.insert_batch(batch_with(vec![target_of(
+            "p2",
+            "i1",
+            push_job::TargetState::Invited,
+        )]));
         apply_push_states(
             &state,
             "p1",
@@ -1610,7 +1747,11 @@ mod tests {
         let event = rx.try_recv().expect("问出去了一条 PushAsk");
         match event {
             WsEvent::PushAsk { invite_ids, .. } => {
-                assert_eq!(invite_ids, vec!["waiting".to_string()], "只问还没落终态的那条");
+                assert_eq!(
+                    invite_ids,
+                    vec!["waiting".to_string()],
+                    "只问还没落终态的那条"
+                );
             }
             other => panic!("期望 PushAsk，得到 {}", other.type_name()),
         }
@@ -1623,7 +1764,11 @@ mod tests {
     #[tokio::test]
     async fn reconcile_does_nothing_without_a_link() {
         let state = reconcile_state();
-        state.push.insert_batch(batch_with(vec![target_of("p1", "i1", push_job::TargetState::Invited)]));
+        state.push.insert_batch(batch_with(vec![target_of(
+            "p1",
+            "i1",
+            push_job::TargetState::Invited,
+        )]));
         reconcile(&state, "p1"); // 没注册会话 → 早退，不发也不占闸门
         assert!(state.push.ask_due("p1"), "没问过就不该占掉闸门");
     }
@@ -1646,7 +1791,9 @@ mod tests {
         let seen = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 5];
-            let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await.unwrap();
+            let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                .await
+                .unwrap();
             buf[..n].to_vec()
         });
 
@@ -1654,14 +1801,22 @@ mod tests {
             &state,
             "p1",
             &Some(("127.0.0.1".into(), port)),
-            WsEvent::PushDone { invite_id: "i1".into(), status: "completed".into(), reason: None },
+            WsEvent::PushDone {
+                invite_id: "i1".into(),
+                status: "completed".into(),
+                reason: None,
+            },
         );
 
         let head = tokio::time::timeout(Duration::from_secs(5), seen)
             .await
             .expect("5 秒内该向回调地址发出回执")
             .unwrap();
-        assert_eq!(head.first(), Some(&0x16), "TLS 握手：确实拨到了那个地址，head={head:?}");
+        assert_eq!(
+            head.first(),
+            Some(&0x16),
+            "TLS 握手：确实拨到了那个地址，head={head:?}"
+        );
 
         // 有活儿干的会话不该走这条路：回执进的是 WS 队列。
         let (tx2, mut rx2) = mpsc::channel(crate::ws::EVENT_QUEUE_CAPACITY);
@@ -1670,8 +1825,15 @@ mod tests {
             &state,
             "p2",
             &Some(("127.0.0.1".into(), 1)), // 故意指向一个没人听的端口：走了 HTTP 就会连不上
-            WsEvent::PushDone { invite_id: "i2".into(), status: "completed".into(), reason: None },
+            WsEvent::PushDone {
+                invite_id: "i2".into(),
+                status: "completed".into(),
+                reason: None,
+            },
         );
-        assert!(matches!(rx2.try_recv(), Ok(WsEvent::PushDone { .. })), "有会话就走 WS");
+        assert!(
+            matches!(rx2.try_recv(), Ok(WsEvent::PushDone { .. })),
+            "有会话就走 WS"
+        );
     }
 }

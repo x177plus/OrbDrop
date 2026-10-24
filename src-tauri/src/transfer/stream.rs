@@ -484,17 +484,36 @@ mod tests {
         for i in 0..count {
             crate::transfer::resume::bitmap_set(&mut bits, i);
         }
-        assert!(missing_blocks(size, DEFAULT_BLOCK_SIZE, &bits).is_empty(), "全齐了就不再排队");
+        assert!(
+            missing_blocks(size, DEFAULT_BLOCK_SIZE, &bits).is_empty(),
+            "全齐了就不再排队"
+        );
     }
 
     #[test]
     fn resume_key_is_stable_and_identity_sensitive() {
         let dir = Path::new("C:/Users/u/Downloads/PC-A");
         let a = resume_key("peer", dir, "D/x.txt", 10, 5);
-        assert_eq!(a, resume_key("peer", dir, "D/x.txt", 10, 5), "同一身份 → 同一个键");
-        assert_ne!(a, resume_key("peer", dir, "D/x.txt", 11, 5), "大小变了 → 换键");
-        assert_ne!(a, resume_key("peer", dir, "D/x.txt", 10, 6), "时间戳变了 → 换键");
-        assert_ne!(a, resume_key("other", dir, "D/x.txt", 10, 5), "换了一台对端 → 换键");
+        assert_eq!(
+            a,
+            resume_key("peer", dir, "D/x.txt", 10, 5),
+            "同一身份 → 同一个键"
+        );
+        assert_ne!(
+            a,
+            resume_key("peer", dir, "D/x.txt", 11, 5),
+            "大小变了 → 换键"
+        );
+        assert_ne!(
+            a,
+            resume_key("peer", dir, "D/x.txt", 10, 6),
+            "时间戳变了 → 换键"
+        );
+        assert_ne!(
+            a,
+            resume_key("other", dir, "D/x.txt", 10, 5),
+            "换了一台对端 → 换键"
+        );
         // 落盘目录也是身份的一半：同一个文件收在两个目录下，两份记录各算各的
         // （共用的话，按着 A 的位图去 B 找 `.part` 只会从零，还顺手砸掉 A 的记录）。
         assert_ne!(
@@ -503,16 +522,37 @@ mod tests {
             "落盘目录变了 → 换键"
         );
         // 同一个目录的几种说法必须认成同一个 —— 说法一变就白传（见 `identity_dir`）。
-        assert_eq!(a, resume_key("peer", Path::new("C:/Users/u/Downloads/PC-A/"), "D/x.txt", 10, 5));
         assert_eq!(
             a,
-            resume_key("peer", Path::new("C:\\Users\\u\\Downloads\\PC-A"), "D/x.txt", 10, 5),
+            resume_key(
+                "peer",
+                Path::new("C:/Users/u/Downloads/PC-A/"),
+                "D/x.txt",
+                10,
+                5
+            )
+        );
+        assert_eq!(
+            a,
+            resume_key(
+                "peer",
+                Path::new("C:\\Users\\u\\Downloads\\PC-A"),
+                "D/x.txt",
+                10,
+                5
+            ),
             "反斜杠/正斜杠是同一个目录"
         );
         if cfg!(windows) {
             assert_eq!(
                 a,
-                resume_key("peer", Path::new("c:/users/u/downloads/pc-a"), "D/x.txt", 10, 5),
+                resume_key(
+                    "peer",
+                    Path::new("c:/users/u/downloads/pc-a"),
+                    "D/x.txt",
+                    10,
+                    5
+                ),
                 "Windows 上大小写不同是同一个目录"
             );
         }
@@ -587,14 +627,20 @@ mod tests {
     #[tokio::test]
     async fn truncated_stream_is_unexpected_eof_not_end() {
         let mut wire: Vec<u8> = Vec::new();
-        write_block_header(&mut wire, "x.txt", 0, 0, 8).await.unwrap();
+        write_block_header(&mut wire, "x.txt", 0, 0, 8)
+            .await
+            .unwrap();
         // 载荷没写全就断了。
         wire.extend_from_slice(&[1, 2, 3]);
         let mut r = RecordReader::new(&wire[..]);
         r.next().await.unwrap();
         let mut payload = vec![0u8; 8];
         let err = r.read_exact(&mut payload).await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "断在中间 = 重试，不是传完");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::UnexpectedEof,
+            "断在中间 = 重试，不是传完"
+        );
     }
 
     #[tokio::test]

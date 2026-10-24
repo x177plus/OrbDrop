@@ -93,8 +93,7 @@ pub async fn push_invite_handler(
     let paired = state.get_peer(&body.sender.id).is_some_and(|p| p.paired);
     // 冒充已配对设备：拿不出 token 就拒 —— 走得过这一关的 paired = 身份确认过的老搭档。
     if paired {
-        let claimed = bearer_token(&headers)
-            .and_then(|t| peer_id_from_token(&state, &t));
+        let claimed = bearer_token(&headers).and_then(|t| peer_id_from_token(&state, &t));
         if claimed.as_deref() != Some(body.sender.id.as_str()) {
             info!(sender = %body.sender.id, "推送邀请被拒：自称已配对设备但 token 不认");
             return Err((StatusCode::UNAUTHORIZED, "身份校验失败".into()));
@@ -108,23 +107,30 @@ pub async fn push_invite_handler(
     state.note_heard_online(&body.sender.id);
     // `await1` = 发送方是"投递即回"那一版（见 `push_job::CAP_AWAIT`）。哪一端老，看这一行
     // 最快：**没有**这个位就是对面老 —— 那这条邀请只能按老规矩（60 秒没人处理就作废）办。
-    let await_capable = body.caps.iter().any(|c| c == crate::transfer::push_job::CAP_AWAIT);
+    let await_capable = body
+        .caps
+        .iter()
+        .any(|c| c == crate::transfer::push_job::CAP_AWAIT);
     info!(
         %invite_id, sender = %body.sender.name, name = %body.name, paired, await1 = await_capable,
         "inbound push invite (http)"
     );
 
-    crate::ws::emit_ui(&state, crate::ws::events::ui::PUSH_INVITE, &serde_json::json!({
-        "inviteId": invite_id,
-        "sender": { "id": body.sender.id, "name": body.sender.name },
-        "name": body.name,
-        "size": body.size,
-        "isDir": body.is_dir,
-        "count": body.count,
-        "auto": paired,
-        // 这条文件消息在会话时间线上的位置（发送方点的）。
-        "at": body.at,
-    }));
+    crate::ws::emit_ui(
+        &state,
+        crate::ws::events::ui::PUSH_INVITE,
+        &serde_json::json!({
+            "inviteId": invite_id,
+            "sender": { "id": body.sender.id, "name": body.sender.name },
+            "name": body.name,
+            "size": body.size,
+            "isDir": body.is_dir,
+            "count": body.count,
+            "auto": paired,
+            // 这条文件消息在会话时间线上的位置（发送方点的）。
+            "at": body.at,
+        }),
+    );
 
     let mut invite = InboundInvite {
         invite_id: invite_id.clone(),
@@ -147,6 +153,13 @@ pub async fn push_invite_handler(
         responder: None,
     };
 
+    // 清单数值先过闸：`download::run` 会按 size 分配块位图/任务队列，不能让远端
+    // 用一个伪造的巨大 size 在真正传输前把接收端内存打满。
+    if let Err(reason) = crate::transfer::push_job::validate_invite(&invite) {
+        warn!(%invite_id, %reason, "推送邀请被拒：清单超出上限");
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, reason));
+    }
+
     // 已绑定的设备推送**不需要接收方同意**：直接开收，并用这次同步响应告诉发送方
     // "收下了"。未绑定仍然走同意制（挂一张卡片等用户点）—— 那是"不配对也能推"的
     // 唯一安全兜底，不能一起取消。
@@ -159,7 +172,11 @@ pub async fn push_invite_handler(
             reject_invite_with(&state, &invite_id, &reason);
             return Err((StatusCode::BAD_REQUEST, reason));
         }
-        return Ok(Json(InviteResponse { accepted: true, pending: false, reason: None }));
+        return Ok(Json(InviteResponse {
+            accepted: true,
+            pending: false,
+            reason: None,
+        }));
     }
 
     // 带 `await1` 的对端（新版本）：**投递即算送达**，不在这儿等用户 ——
@@ -168,7 +185,11 @@ pub async fn push_invite_handler(
     // （`/push/report` 或长连接 `push_response`，见 `transfer::reject_shared`）。
     if invite.supports_await() {
         state.push.insert_invite(invite);
-        return Ok(Json(InviteResponse { accepted: false, pending: true, reason: None }));
+        return Ok(Json(InviteResponse {
+            accepted: false,
+            pending: true,
+            reason: None,
+        }));
     }
 
     // 老对端：那条邀请请求挂着等本机用户的决定，同步响应就是回执（到点自动作废，
@@ -180,11 +201,16 @@ pub async fn push_invite_handler(
     schedule_invite_timeout(state.clone(), invite_id.clone());
 
     // 等用户在通知卡片上做决定（对方自己的超时到点会先填上 false）。
-    let accepted = match tokio::time::timeout(INVITE_TTL + std::time::Duration::from_secs(10), rx).await {
-        Ok(Ok(v)) => v,
-        _ => false,
-    };
-    Ok(Json(InviteResponse { accepted, pending: false, reason: None }))
+    let accepted =
+        match tokio::time::timeout(INVITE_TTL + std::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(v)) => v,
+            _ => false,
+        };
+    Ok(Json(InviteResponse {
+        accepted,
+        pending: false,
+        reason: None,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -263,31 +289,41 @@ pub async fn push_download_handler(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let id = params
-        .get("id")
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'id' parameter".to_string()))?;
-    let file_path = params
-        .get("path")
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'path' parameter".to_string()))?;
+    let id = params.get("id").ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Missing 'id' parameter".to_string(),
+        )
+    })?;
+    let file_path = params.get("path").ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Missing 'path' parameter".to_string(),
+        )
+    })?;
     let offset = params
         .get("offset")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
 
-    let (source_path, peer_paired, peer_id, cancel) = match state.push.download_target(id, file_path) {
-        // 这条推送已经被发送方取消 / 传完了。
-        DownloadTarget::Missing => {
-            return Err((StatusCode::GONE, "推送不存在或已取消".into()));
-        }
-        // `path` 是清单里的相对路径：清单里没有的取不到 —— 越界路径（`../` 之类）
-        // 自然也不在表里，因为这张表是发送方按自己选中的那些源建的。
-        DownloadTarget::NotInManifest => {
-            return Err((StatusCode::NOT_FOUND, "文件不在这次推送里".into()));
-        }
-        DownloadTarget::Found { path, peer_paired, peer_id, cancel } => {
-            (path, peer_paired, peer_id, cancel)
-        }
-    };
+    let (source_path, peer_paired, peer_id, cancel) =
+        match state.push.download_target(id, file_path) {
+            // 这条推送已经被发送方取消 / 传完了。
+            DownloadTarget::Missing => {
+                return Err((StatusCode::GONE, "推送不存在或已取消".into()));
+            }
+            // `path` 是清单里的相对路径：清单里没有的取不到 —— 越界路径（`../` 之类）
+            // 自然也不在表里，因为这张表是发送方按自己选中的那些源建的。
+            DownloadTarget::NotInManifest => {
+                return Err((StatusCode::NOT_FOUND, "文件不在这次推送里".into()));
+            }
+            DownloadTarget::Found {
+                path,
+                peer_paired,
+                peer_id,
+                cancel,
+            } => (path, peer_paired, peer_id, cancel),
+        };
     authorize(&state, &headers, peer_paired, &peer_id)?;
 
     // 清单里存的**已经是解析过的绝对路径**（见 `manifest_for_paths`）：这里不再
@@ -297,10 +333,12 @@ pub async fn push_download_handler(
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("文件打开失败: {e}")))?;
 
-    let meta = file
-        .metadata()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("元数据读取失败: {e}")))?;
+    let meta = file.metadata().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("元数据读取失败: {e}"),
+        )
+    })?;
     // 打开之后再看一次类型：源目录被换成一个同名目录时，`open` 在 Windows 上可能成功。
     if !meta.is_file() {
         return Err((StatusCode::NOT_FOUND, "文件不存在".into()));
@@ -326,7 +364,10 @@ pub async fn push_download_handler(
     use tokio::io::AsyncReadExt;
     let remaining = file_size.saturating_sub(offset);
     let limited = file.take(remaining);
-    let reader = CancelAwareReader { inner: limited, cancel };
+    let reader = CancelAwareReader {
+        inner: limited,
+        cancel,
+    };
     Ok(Body::from_stream(ReaderStream::with_capacity(
         reader,
         crate::net::STREAM_CHUNK,
@@ -355,7 +396,11 @@ pub async fn push_stream_handler(
         DownloadTarget::NotInManifest => {
             return Err((StatusCode::NOT_FOUND, "文件不在这次推送里".into()));
         }
-        DownloadTarget::Found { peer_paired, peer_id, .. } => (peer_paired, peer_id),
+        DownloadTarget::Found {
+            peer_paired,
+            peer_id,
+            ..
+        } => (peer_paired, peer_id),
     };
     authorize(&state, &headers, peer_paired, &peer_id)?;
 
@@ -449,13 +494,19 @@ mod tests {
     fn state() -> Arc<AppState> {
         let dir = std::env::temp_dir().join(format!("orbdrop_push_rep_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        Arc::new(AppState::new(crate::config::test_config(), dir.join("config.toml")))
+        Arc::new(AppState::new(
+            crate::config::test_config(),
+            dir.join("config.toml"),
+        ))
     }
 
     fn inbound_invite(id: &str, sender: &str) -> crate::transfer::push_job::InboundInvite {
         crate::transfer::push_job::InboundInvite {
             invite_id: id.into(),
-            sender: PeerInfo { id: sender.into(), name: "PC-B".into() },
+            sender: PeerInfo {
+                id: sender.into(),
+                name: "PC-B".into(),
+            },
             name: "a.txt".into(),
             size: 3,
             is_dir: false,
@@ -489,8 +540,10 @@ mod tests {
             paired: true,
             ..Default::default()
         });
-        st.push.insert_invite(inbound_invite("inv-paired", "peer-paired"));
-        st.push.insert_invite(inbound_invite("inv-unpaired", "peer-new"));
+        st.push
+            .insert_invite(inbound_invite("inv-paired", "peer-paired"));
+        st.push
+            .insert_invite(inbound_invite("inv-unpaired", "peer-new"));
 
         let url = format!("http://127.0.0.1:{port}/push/report");
         let body = |invite: &str| {
@@ -502,7 +555,12 @@ mod tests {
         let client = reqwest::Client::new();
 
         // 已配对 + 无凭据 → 401（原来这里只要 invite_id 对就能改结果）
-        let bare = client.post(&url).json(&body("inv-paired")).send().await.unwrap();
+        let bare = client
+            .post(&url)
+            .json(&body("inv-paired"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(bare.status(), StatusCode::UNAUTHORIZED);
         // 已配对 + 别人的 token → 401
         let wrong = client
@@ -524,11 +582,15 @@ mod tests {
         assert_eq!(ok.status(), StatusCode::NO_CONTENT);
 
         // 未绑定：没有 token 可带，仍按 invite_id 收下（否则"未绑定也能推"就断了）
-        let unpaired = client.post(&url).json(&body("inv-unpaired")).send().await.unwrap();
+        let unpaired = client
+            .post(&url)
+            .json(&body("inv-unpaired"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(unpaired.status(), StatusCode::NO_CONTENT);
 
         crate::server::stop_server(&st).await;
         crate::credential::remove_peer("peer-paired").ok();
     }
 }
-

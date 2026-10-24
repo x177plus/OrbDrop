@@ -56,7 +56,10 @@ fn mime_of(ext: &str) -> Option<&'static str> {
 /// 所以"什么算图片"这件事只有这一处判据。名字是**对端给的**，所以这里只管取的**扩展名**
 /// 那一小段：路径片段（`..\\..\\x.PNG`）到不了文件名里，落点仍由调用方那个目录说了算。
 pub(crate) fn image_ext_of(name: &str) -> Option<String> {
-    let ext = std::path::Path::new(name).extension()?.to_string_lossy().to_ascii_lowercase();
+    let ext = std::path::Path::new(name)
+        .extension()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
     mime_of(&ext).map(|_| ext)
 }
 
@@ -95,9 +98,14 @@ pub fn save(bytes: &[u8], ext: &str) -> Result<String, String> {
             _ => format!("{base}-{n}.{ext}"),
         };
         let path = dir.join(name);
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(mut file) => {
-                file.write_all(bytes).map_err(|e| format!("暂存粘贴的图片失败：{e}"))?;
+                file.write_all(bytes)
+                    .map_err(|e| format!("暂存粘贴的图片失败：{e}"))?;
                 return Ok(path.to_string_lossy().to_string());
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -126,24 +134,39 @@ pub fn read_data_url(path: &str, max_bytes: u64) -> Result<String, String> {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string());
-    let ext = p
-        .extension()
-        .map(|e| e.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let Some(mime) = mime_of(&ext) else {
-        return Err(format!("「{name}」不是能预览的图片"));
-    };
     let meta = std::fs::metadata(p).map_err(|e| format!("读不到「{name}」：{e}"))?;
     if !meta.is_file() {
         return Err(format!("「{name}」不是文件"));
     }
-    if meta.len() > max_bytes {
+    // 会话图片的文件名统一是 `<id>.bin`，真正的扩展名在封装头里；暂存图片仍是普通
+    // `*.png`。所以上限要按"文件可能带封装头"放宽一点，解码后再按真实字节数判一次。
+    if meta.len() > max_bytes.saturating_add(crate::envelope::MAX_OVERHEAD) {
         return Err(format!(
             "「{name}」（{}）太大，不在会话里预览；点「用系统程序打开」看",
             human_size(meta.len())
         ));
     }
-    let bytes = std::fs::read(p).map_err(|e| format!("读不到「{name}」：{e}"))?;
+    let raw = std::fs::read(p).map_err(|e| format!("读不到「{name}」：{e}"))?;
+    let (ext, bytes) = match crate::envelope::decode_if(&raw) {
+        Ok(Some((ext, bytes))) => (ext, bytes),
+        Ok(None) => {
+            let ext = p
+                .extension()
+                .map(|e| e.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (ext, raw)
+        }
+        Err(e) => return Err(format!("「{name}」内容损坏：{e}")),
+    };
+    let Some(mime) = mime_of(&ext) else {
+        return Err(format!("「{name}」不是能预览的图片"));
+    };
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "「{name}」（{}）太大，不在会话里预览；点「用系统程序打开」看",
+            human_size(bytes.len() as u64)
+        ));
+    }
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:{mime};base64,{b64}"))
 }
@@ -191,7 +214,10 @@ fn sweep_dir(dir: &Path, max_age: std::time::Duration, now: std::time::SystemTim
         if !meta.is_file() {
             continue;
         }
-        let age = meta.modified().ok().and_then(|m| now.duration_since(m).ok());
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok());
         if age.map(|a| a > max_age).unwrap_or(false) && std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
@@ -204,7 +230,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("orbdrop_paste_{tag}_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_paste_{tag}_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -268,6 +295,21 @@ mod tests {
         std::fs::write(&txt, b"hello").unwrap();
         assert!(read_data_url(&txt.to_string_lossy(), 1024).is_err());
         assert!(read_data_url(&dir.join("nope.png").to_string_lossy(), 1024).is_err());
+    }
+
+    // 会话图片落盘是封装格式、文件名是 `<id>.bin`：预览要能识别头里的扩展名并解出原始字节。
+    #[test]
+    fn read_data_url_decodes_a_chat_blob() {
+        let dir = temp_dir("enveloped");
+        let blob = dir.join("m1.bin");
+        std::fs::write(&blob, crate::envelope::encode("png", b"hello")).unwrap();
+        let url = read_data_url(&blob.to_string_lossy(), 1024).unwrap();
+        assert_eq!(url, "data:image/png;base64,aGVsbG8=");
+
+        // 封装头不是图片：不能靠它预览。
+        let bad = dir.join("m2.bin");
+        std::fs::write(&bad, crate::envelope::encode("", b"hello")).unwrap();
+        assert!(read_data_url(&bad.to_string_lossy(), 1024).is_err());
     }
 
     #[test]

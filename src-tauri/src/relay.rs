@@ -54,6 +54,49 @@ pub const MAX_RELAYS: usize = 8;
 /// 同一位请求方两次开中转之间的最小间隔（控制面上的闸门，防"每 5s 探活各开一条"）。
 const CALLER_COOLDOWN: Duration = Duration::from_secs(3);
 
+/// 中转目标不能是本机的**回环/未指定/组播/链路本地**地址：中转是裸 TCP，连到回环之后
+/// 目标监听会把这条连接当成"本机进程"（`net::dispatch_conn` 只对回环放行明文，
+/// `auth_middleware` 又对回环给 `Caller::Local`）。一旦请求方能指定
+/// `127.0.0.1:<本机端口>`，就能借中转拿到本机 UI 的免认证权限 —— 必须堵死。
+///
+/// 本机**普通 LAN 地址**不在这里拒：中转过去时目标看到的来源是 LAN 地址（不是回环），
+/// 仍要 token 才能进；同机多实例/集成测试也靠它模拟"另一台设备"。
+///
+/// IPv4 映射的 IPv6 地址先折回 IPv4 再判：`[::ffff:127.0.0.1]` 的 `is_loopback()` 是
+/// false，但实际连的就是回环。
+fn canonical_relay_ip(ip: StdIpAddr) -> StdIpAddr {
+    match ip {
+        StdIpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(StdIpAddr::V4)
+            .unwrap_or(StdIpAddr::V6(v6)),
+        other => other,
+    }
+}
+
+fn forbidden_relay_target(ip: StdIpAddr) -> bool {
+    let ip = canonical_relay_ip(ip);
+    if ip.is_loopback() && loopback_relay_targets_allowed_for_tests() {
+        return false;
+    }
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return true;
+    }
+    match ip {
+        StdIpAddr::V4(v4) => v4.is_link_local() || v4.is_broadcast(),
+        StdIpAddr::V6(v6) => v6.is_unicast_link_local(),
+    }
+}
+
+/// 测试专用：多个 `AppState` 跑在同一个进程里时，目标只能写 `127.0.0.1`。
+///
+/// **只在 debug 构建里生效**，而且必须显式设置环境变量；release 构建永远返回 false。
+/// 集成测试的夹具会设置它。正常运行时这个分支不可达，不会放宽回环目标的拒绝。
+fn loopback_relay_targets_allowed_for_tests() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("ORBDROP_TEST_ALLOW_LOOPBACK_RELAY").is_some()
+}
+
 /// 中转端点的空闲回收：**没有活着的连接**且这么久没有新连接，就把它收掉。
 ///
 /// 只在"一条连接都没有"时计时：中转的典型用途是一条长连接（`/events` 的 WS）+ 若干短
@@ -237,7 +280,19 @@ pub async fn open(
         return Err(OpenError::Disabled);
     }
     if requester == target {
-        return Err(OpenError::NotEligible("不能把请求方自己作为中转目标".into()));
+        return Err(OpenError::NotEligible(
+            "不能把请求方自己作为中转目标".into(),
+        ));
+    }
+    // 本机自己不能当中转目标：本机不在地址簿里，请求方却可以拿 `/pair/info` 问出本机 id
+    // 再把 `addr` 填成 `127.0.0.1:<本机端口>`。那会让裸 TCP 中转连回自己的回环监听，
+    // 目标端于是把这条连接当成本机 UI（免认证）—— 见 `forbidden_relay_target` 的说明。
+    let own_id = state.config.lock().device_id.clone();
+    if target == own_id {
+        debug!(%target, "中转请求被拒：不能把本机自己作为中转目标");
+        return Err(OpenError::NotEligible(
+            "不能把本机自己作为中转目标".into(),
+        ));
     }
 
     // 目标优先取本机地址簿里**此刻在线**的那一台（本机的 5s 探活刚验证过它够得着）；
@@ -267,8 +322,20 @@ pub async fn open(
     let (target_name, target_addr, target_in_book, verified_name) = match known {
         Some(peer) if peer.online && !peer.ip.is_empty() && peer.port != 0 => {
             let Some(addr) = socket_addr(&peer.ip, peer.port) else {
-                return Err(OpenError::NotEligible(format!("设备 {} 的地址不可用", peer.name)));
+                return Err(OpenError::NotEligible(format!(
+                    "设备 {} 的地址不可用",
+                    peer.name
+                )));
             };
+            // 地址簿被投毒、或配置里手写了回环/链路本地地址时，同样不能开这一跳。
+            // 本机 LAN 地址不拒：中转过去时目标看到的来源是 LAN 地址（不是 127.0.0.1），
+            // 仍要 token 才能进；拒掉它反而会误伤同机多实例/测试。
+            if forbidden_relay_target(addr.ip()) {
+                debug!(%target, addr = %addr, "中转请求被拒：目标地址是本机回环/特殊地址");
+                return Err(OpenError::NotEligible(
+                    "目标地址不可用：中转目标不能是本机回环".into(),
+                ));
+            }
             (peer.name.clone(), addr, true, None)
         }
         _ => {
@@ -280,6 +347,14 @@ pub async fn open(
             let Some(addr) = socket_addr(host, *port) else {
                 return Err(OpenError::NotEligible(format!("地址 {host}:{port} 不合法")));
             };
+            // **先于 `verify_identity_at`**：回环地址本身就能答出本机 id，先问再判等于
+            // 已经让本机朝自己的回环监听发了一次请求；这里直接拒，连问都不问。
+            if forbidden_relay_target(addr.ip()) {
+                debug!(%target, addr = %addr, "中转目标地址是本机回环/特殊地址，已拒绝");
+                return Err(OpenError::NotEligible(
+                    "目标地址不可用：中转目标不能是本机回环".into(),
+                ));
+            }
             let observed = match verify_identity_at(addr, target).await {
                 Ok(observed) => observed,
                 Err(why) => {
@@ -323,7 +398,9 @@ pub async fn open(
 
     // 端点地址：本机在**请求方那个网段**上的地址（请求方能直连本机，靠的就是它）。
     let Some(own_ip) = pick_own_ipv4(from) else {
-        return Err(OpenError::Unavailable("本机没有可用的局域网 IPv4 地址".into()));
+        return Err(OpenError::Unavailable(
+            "本机没有可用的局域网 IPv4 地址".into(),
+        ));
     };
     let Some(host) = crate::net::relay_host(&own_ip) else {
         return Err(OpenError::Unavailable(format!("地址 {own_ip} 不是 IPv4")));
@@ -431,9 +508,19 @@ pub(crate) async fn verify_identity_at(
         Err(e) => return Err(format!("地址 {addr} 连不上：{e}")),
     };
     if !response.status().is_success() {
-        return Err(format!("地址 {addr} 回的是 {}（不是 OrbDrop 对端？）", response.status()));
+        return Err(format!(
+            "地址 {addr} 回的是 {}（不是 OrbDrop 对端？）",
+            response.status()
+        ));
     }
-    match response.json::<serde_json::Value>().await {
+    // 这个地址是**调用方给的声明**，上面跑的不一定是 OrbDrop：TOFU 会接受它的自签证书，
+    // 所以回话体积必须自己卡死（`.json()` 会先把整个身体读进内存）。
+    match crate::net::read_json_capped::<serde_json::Value>(
+        response,
+        crate::net::PAIR_INFO_BODY_MAX,
+    )
+    .await
+    {
         Ok(body) if body["id"].as_str() == Some(expected) => Ok(body["name"]
             .as_str()
             .map(str::to_string)
@@ -442,7 +529,7 @@ pub(crate) async fn verify_identity_at(
             "地址 {addr} 上是另一台设备（{}）",
             body["id"].as_str().unwrap_or("问不出身份")
         )),
-        Err(e) => Err(format!("地址 {addr} 的回话读不出来：{e}")),
+        Err(e) => Err(format!("地址 {addr}：{e}")),
     }
 }
 
@@ -531,8 +618,8 @@ async fn serve(
         }
 
         // 目标离线了就别再开新连接（老连接照跑，它们是既成事实的那条路）。只对本机**地址簿里**
-// 的那一台问这件事：请求方给地址、本机核验过身份的那种目标，本机压根不认识它，
-// 没有"它离线了"这回事（它的可达性由每条连接自己证明）。
+        // 的那一台问这件事：请求方给地址、本机核验过身份的那种目标，本机压根不认识它，
+        // 没有"它离线了"这回事（它的可达性由每条连接自己证明）。
         let target_online = !target_in_book
             || state
                 .peers
@@ -593,23 +680,30 @@ async fn pump(
     mut stop: watch::Receiver<bool>,
     state: Arc<AppState>,
 ) {
-    let outbound = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target_addr)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            warn!(target = %target_addr, "中转连目标失败: {e}");
-            return;
-        }
-        Err(_) => {
-            warn!(target = %target_addr, "中转连目标超时");
-            return;
-        }
-    };
+    let outbound =
+        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target_addr)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                warn!(target = %target_addr, "中转连目标失败: {e}");
+                return;
+            }
+            Err(_) => {
+                warn!(target = %target_addr, "中转连目标超时");
+                return;
+            }
+        };
     let _ = outbound.set_nodelay(true);
     // 两个方向共用一个计数器：`copy_bidirectional` 对每个方向都是"读这边、写那边"，
     // 读侧合计就是这条连接搬过的总字节（见 [`CountingStream`]）。
     let bytes = Arc::new(AtomicU64::new(0));
-    let mut inbound = CountingStream { inner: inbound, bytes: Arc::clone(&bytes) };
-    let mut outbound = CountingStream { inner: outbound, bytes: Arc::clone(&bytes) };
+    let mut inbound = CountingStream {
+        inner: inbound,
+        bytes: Arc::clone(&bytes),
+    };
+    let mut outbound = CountingStream {
+        inner: outbound,
+        bytes: Arc::clone(&bytes),
+    };
     tokio::select! {
         _ = stop.changed() => {}
         r = copy_bidirectional(&mut inbound, &mut outbound) => {
@@ -782,7 +876,11 @@ fn relay_candidates(state: &AppState, target: &str, target_cidrs: &[String]) -> 
         };
 
         // 1) 设备级链路：上次实际经手的那一台（只在本机开了记忆时有意义）。
-        let device_via = state.config.lock().relay_link(target).map(|l| l.via_id.clone());
+        let device_via = state
+            .config
+            .lock()
+            .relay_link(target)
+            .map(|l| l.via_id.clone());
         if let Some(via) = device_via {
             add(0, &via, &mut tiers);
         }
@@ -815,7 +913,8 @@ fn relay_candidates(state: &AppState, target: &str, target_cidrs: &[String]) -> 
 
     tiers.sort_by(|a, b| {
         a.0.cmp(&b.0).then_with(|| {
-            (&a.1.id, &a.1.name, &a.1.host, a.1.port).cmp(&(&b.1.id, &b.1.name, &b.1.host, b.1.port))
+            (&a.1.id, &a.1.name, &a.1.host, a.1.port)
+                .cmp(&(&b.1.id, &b.1.name, &b.1.host, b.1.port))
         })
     });
     let mut out: Vec<Candidate> = Vec::new();
@@ -905,7 +1004,11 @@ pub async fn ensure_for(state: &Arc<AppState>, target: &str) -> Option<RelayAddr
     };
     let (memory_on, own_id, own_name) = {
         let config = state.config.lock();
-        (config.relay_memory, config.device_id.clone(), config.device_name.clone())
+        (
+            config.relay_memory,
+            config.device_id.clone(),
+            config.device_name.clone(),
+        )
     };
     // 池的键是**目标段**。地址未知时退回"含本机地址的那几条策略段"：`apply_relay_routes`
     // 只收这种段，而"要够着与本机同段的一台设备"正是那几条策略要说的事（同段的对端地址
@@ -949,7 +1052,14 @@ pub async fn ensure_for(state: &Arc<AppState>, target: &str) -> Option<RelayAddr
             // 拿到真名的地方 —— 以前这条只带 id，对面于是显示一串 deviceid）。
             "requester": { "id": own_id, "port": own_port, "name": own_name },
         });
-        let mut request = OPEN_CLIENT.post(&url).json(&body);
+        // 带 token 的控制面也按目标建表：请求方与中转方可能同地址，不能让另一台
+        // 已配对设备的证书把 token 收走。
+        let client = crate::net::dial_client_timeout(
+            &c.host,
+            &crate::credential::dial_pin(&c.id, c.paired),
+            OPEN_TIMEOUT,
+        );
+        let mut request = client.post(&url).json(&body);
         if let Some(t) = &token {
             request = request.bearer_auth(t);
         }
@@ -962,15 +1072,15 @@ pub async fn ensure_for(state: &Arc<AppState>, target: &str) -> Option<RelayAddr
         };
         if !response.status().is_success() {
             let status = response.status();
-            debug!(
-                peer_id = %c.id,
-                status = %status,
-                "请中转被拒：{}",
-                response.text().await.unwrap_or_default()
-            );
+            let reason = crate::net::read_text_capped(response, crate::net::CONTROL_BODY_MAX)
+                .await
+                .unwrap_or_default();
+            debug!(peer_id = %c.id, status = %status, "请中转被拒：{reason}");
             continue;
         }
-        let Ok(opened) = response.json::<Opened>().await else {
+        let Ok(opened) =
+            crate::net::read_json_capped::<Opened>(response, crate::net::CONTROL_BODY_MAX).await
+        else {
             continue;
         };
         let relay = RelayAddr {
@@ -994,9 +1104,11 @@ pub async fn ensure_for(state: &Arc<AppState>, target: &str) -> Option<RelayAddr
         );
         // 中转方在回话里带回了**目标此刻的地址**（它刚核实过）：只经由中转见过一面的那一侧
         // 手里从来没有这个地址 —— 补上它，设备行才说得清"它在哪"，下一次借中转也才有 `addr` 提示。
-        if let Some((ip, port)) = opened.target_addr.rsplit_once(':').and_then(|(ip, port)| {
-            Some((ip.to_string(), port.parse::<u16>().ok()?))
-        }) {
+        if let Some((ip, port)) = opened
+            .target_addr
+            .rsplit_once(':')
+            .and_then(|(ip, port)| Some((ip.to_string(), port.parse::<u16>().ok()?)))
+        {
             state.observe_verified_addr(target, &ip, port);
         }
         state.set_relay(target, relay.clone());
@@ -1009,6 +1121,13 @@ pub async fn ensure_for(state: &Arc<AppState>, target: &str) -> Option<RelayAddr
 ///
 /// 一条策略的池本来就只该是"那一段里愿意中转的几台"；不设限时，一次大请求体就能把设备表灌满。
 pub const MAX_ROUTE_DEVICES: usize = 16;
+
+/// 一次 `/relay/route` 最多带多少条记录（按**目标段**计）。
+///
+/// 一台设备的本机网段是"几块网卡"量级；64 已经给了多网卡/虚拟网卡足够的余量。
+/// 设上限是为了让公开面上的这条路由在"请求体很大、记录成千条"时不至于先解析、再逐条
+/// 做归属判断（未认证来源的那一档尤其如此）。
+pub const MAX_ROUTE_RECORDS: usize = 64;
 
 /// 反向路由记录里的一台中转设备（F-107 §10.2）：接收方要拨它，所以要地址。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
@@ -1072,7 +1191,9 @@ fn routes_where(state: &AppState, keep: impl Fn(&crate::subnet::Cidr) -> bool) -
     let mut out: Vec<RouteRecord> = config
         .relay_routes
         .iter()
-        .filter(|r| crate::subnet::parse(&r.target_cidr).is_some_and(|c| keep(&c)))
+        // **未认证来源的临时提示不往对端推**：本机都还没核实这条记录的出处，
+        // 不能再把它转述给第三方（否则一条局域网报文会沿着拓扑自己传播）。
+        .filter(|r| !r.ephemeral && crate::subnet::parse(&r.target_cidr).is_some_and(|c| keep(&c)))
         .map(|r| {
             // 池的成员 = `via_devices`（id 列表）与 `via_addrs`（最后已知地址）的**并集**，
             // 与选路（`relay_candidates`）同一套读法。地址优先取设备表里那一行（它反映
@@ -1149,11 +1270,16 @@ pub fn maybe_send_route(state: &Arc<AppState>, peer_id: &str) {
     let token = crate::credential::get_peer_token(peer_id).ok().flatten();
     let (own_id, own_name, own_port) = {
         let config = state.config.lock();
-        (config.device_id.clone(), config.device_name.clone(), state.listening_port())
+        (
+            config.device_id.clone(),
+            config.device_name.clone(),
+            state.listening_port(),
+        )
     };
     let Some((host, port)) = state.dial_endpoint(peer_id, None) else {
         return;
     };
+    let client = crate::net::dial_client_timeout(&host, &peer.dial_pin(), OPEN_TIMEOUT);
     let st = Arc::clone(state);
     let pid = peer_id.to_string();
     crate::task::spawn("relay route record", async move {
@@ -1165,18 +1291,20 @@ pub fn maybe_send_route(state: &Arc<AppState>, peer_id: &str) {
             "routes": routes,
             "requester": { "id": own_id, "port": own_port, "name": own_name },
         });
-        let mut request = OPEN_CLIENT.post(&url).json(&body);
+        let mut request = client.post(&url).json(&body);
         if let Some(t) = &token {
             request = request.bearer_auth(t);
         }
         match request.send().await {
             Ok(r) if r.status().is_success() => {
-                let accepted = r
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-                    .and_then(|v| v["accepted"].as_array().map(|a| a.len()))
-                    .unwrap_or(0);
+                let accepted = crate::net::read_json_capped::<serde_json::Value>(
+                    r,
+                    crate::net::CONTROL_BODY_MAX,
+                )
+                .await
+                .ok()
+                .and_then(|v| v["accepted"].as_array().map(|a| a.len()))
+                .unwrap_or(0);
                 st.route_push_result(&pid, accepted > 0);
                 debug!(peer_id = %pid, accepted, "中转路由记录已送达");
             }
@@ -1210,7 +1338,10 @@ mod tests {
         // 本机地址由网卡决定，测试只验证"挑不出来时不 panic、挑得出来时是同网段优先"。
         let picked = pick_own_ipv4(StdIpAddr::V4(std::net::Ipv4Addr::new(10, 198, 71, 9)));
         if let Some(host) = picked {
-            assert!(crate::net::relay_host(&host).is_some(), "挑出来的必须是 IPv4");
+            assert!(
+                crate::net::relay_host(&host).is_some(),
+                "挑出来的必须是 IPv4"
+            );
         }
     }
 
@@ -1250,5 +1381,79 @@ mod tests {
         assert!(registry.caller_allowed("a"));
         assert!(!registry.caller_allowed("a"), "冷却期内同一位请求方要挡住");
         assert!(registry.caller_allowed("b"), "另一位请求方互不影响");
+    }
+
+    /// 中转是裸 TCP：目标地址一旦落在本机回环/本机网卡上，目标监听就会把连接当成本机
+    /// 进程（`Caller::Local`）。这条测试钉住"本机地址永不作为中转目标"。
+    #[test]
+    fn relay_targets_never_include_local_or_link_local_addresses() {
+        for bad in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "::1",
+            "::ffff:127.0.0.1",
+            "0.0.0.0",
+            "::",
+            "224.0.0.1",
+            "ff02::1",
+            "169.254.10.20",
+            "fe80::1",
+            "255.255.255.255",
+        ] {
+            let ip: StdIpAddr = bad.parse().expect(bad);
+            assert!(forbidden_relay_target(ip), "必须拒绝: {bad}");
+        }
+        for ok in ["192.0.2.10", "10.0.0.5", "2001:db8::10"] {
+            let ip: StdIpAddr = ok.parse().expect(ok);
+            assert!(!forbidden_relay_target(ip), "不该误伤: {ok}");
+        }
+    }
+
+    /// `open` 在**发任何网络请求之前**就拒绝"目标是本机自己"与"目标是回环地址"。
+    /// 这条是 P0 回归：旧实现会先去回环问 `/pair/info`，问通了就开出中转端点。
+    #[tokio::test]
+    async fn open_refuses_to_target_ourselves_or_loopback() {
+        let config = crate::config::test_config();
+        let own_id = config.device_id.clone();
+        let config_path =
+            std::env::temp_dir().join(format!("orbdrop_relay_cfg_{}.toml", uuid::Uuid::new_v4()));
+        let state = Arc::new(AppState::new(config, config_path));
+        let from: StdIpAddr = "192.0.2.10".parse().unwrap();
+
+        let err = match open(&state, "attacker", from, &own_id, None, false).await {
+            Err(e) => e,
+            Ok(_) => panic!("本机自己不能当中转目标"),
+        };
+        assert!(matches!(err, OpenError::NotEligible(_)));
+
+        let err = match open(
+            &state,
+            "attacker",
+            from,
+            "some-other-device",
+            Some(("127.0.0.1".to_string(), 3890)),
+            false,
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("回环地址不能当中转目标"),
+        };
+        assert!(matches!(err, OpenError::NotEligible(_)));
+
+        let err = match open(
+            &state,
+            "attacker",
+            from,
+            "some-other-device",
+            Some(("[::ffff:127.0.0.1]".to_string(), 3890)),
+            false,
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("IPv4 映射的回环地址同样不能当中转目标"),
+        };
+        assert!(matches!(err, OpenError::NotEligible(_)));
     }
 }

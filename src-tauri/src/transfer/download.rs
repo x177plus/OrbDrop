@@ -38,14 +38,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::TryStreamExt;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::time::sleep;
-use futures_util::TryStreamExt;
 use tokio_util::io::StreamReader;
 use tracing::{debug, error, info, warn};
 
+use super::browse_dl::DownloadControl;
 use super::push_job::{self, InboundInvite};
 use super::resume::{bitmap_has, bitmap_set, now_secs, safe_join, FileResume};
 use super::stream::{
@@ -57,6 +58,11 @@ use crate::ws::events::WsEvent;
 
 /// 进度/回执的上报节流（与老循环同一个值：界面看 5 次/秒已经够平滑）。
 const REPORT_INTERVAL: Duration = Duration::from_millis(200);
+
+/// 接收流每次读的**空闲**上限：对端收下请求后不再发字节，这里 30s 就会失败并走重试/
+/// 收尾，而不是让 worker 永久挂在 `reader.next().await` 上。正常传输只要还有字节进来
+/// 就不会触发；它与服务端公开路由的 30s body idle 同一档。
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 一次请求最多重试几次（连接级失败；文件级失败不走这里）。
 const MAX_ATTEMPTS: u32 = 3;
@@ -129,6 +135,8 @@ struct Session {
     invite_id: String,
     callback: Option<(String, u16)>,
     base_url: String,
+    /// 实际拨号的主机字面量（`base_url` 里的那个）：按它建目标信任表。
+    dial_host: String,
     token: Option<String>,
     block_size: u32,
     workers: usize,
@@ -145,6 +153,10 @@ struct Session {
     total: u64,
     /// 停止一切：邀请被撤（本机取消）、对端取消、收尾。
     cancel: Arc<AtomicBool>,
+    /// 取消的**即时**信号：`run_request` 在等网络时也能立刻收手，不用等 read timeout。
+    /// `AtomicBool` 仍是真相源，watch 只负责把等待中的 future 叫醒。
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
     /// 本机用户取消了（邀请没了）—— 收尾时**不**再回报（`cancel_receive` 已经报过）。
     local_cancel: AtomicBool,
     /// 对端取消了（410）。
@@ -161,6 +173,9 @@ struct Session {
     /// 收尾复核用的读写缓冲池（见 `take_buf`）：几千个小文件时，"每个文件都新分配一个
     /// 256KB 缓冲"会平白清零几百 MB 内存，白白吃掉吞吐。
     bufs: Mutex<Vec<Vec<u8>>>,
+    /// 用户在这一轮里按下的暂停闸（界面那条文件气泡右侧的圆环）。worker 在**接下一批任务
+    /// 之前**等它：在飞的那一块照常收完落盘，之后停住 —— 不向对端要新字节，也不动已收内容。
+    control: Arc<DownloadControl>,
 }
 
 impl Session {
@@ -187,7 +202,10 @@ impl Session {
 
     fn summarize_failure(&self) -> String {
         let failed = self.failed.lock();
-        let first = failed.first().map(|(p, r)| format!("{p}: {r}")).unwrap_or_default();
+        let first = failed
+            .first()
+            .map(|(p, r)| format!("{p}: {r}"))
+            .unwrap_or_default();
         format!("{} 个文件失败，第一个是 {first}", failed.len())
     }
 
@@ -267,6 +285,13 @@ impl Session {
         if fw.finalized.swap(true, Ordering::SeqCst) {
             return Ok(()); // 已经收尾过（幂等）
         }
+        // 已经判失败的文件**绝不改名到最终路径**。块收全之后仍可能收到同一文件的
+        // `SourceChanged`（`mark_failed` 会把 `failed` 置位，但那时它可能已经在
+        // `to_finalize` 里了）—— 这里再挡一次，最终路径上只出现"完整且没被判失败"的文件。
+        if fw.failed.load(Ordering::SeqCst) {
+            debug!(path = %fw.rel, "文件已判失败，不做收尾改名");
+            return Ok(());
+        }
         // 空文件（0 字节）没有任何块要传，也就没人建过 `.part`：这里补建一个，
         // 之后走同一条"长度核对 → fsync → 原子改名"的路（空文件同样要出现在最终路径上）。
         if fw.size == 0 && !fw.part.exists() {
@@ -294,7 +319,9 @@ impl Session {
                 .open(&fw.part)
                 .await
                 .map_err(|e| format!("打开临时文件失败: {e}"))?;
-            f.set_len(fw.size).await.map_err(|e| format!("截断失败: {e}"))?;
+            f.set_len(fw.size)
+                .await
+                .map_err(|e| format!("截断失败: {e}"))?;
         }
 
         // **复核接手来的块**（本次会话现场收到的块已经在到达时逐块比对过）。
@@ -374,7 +401,8 @@ impl Session {
             if !bitmap_has(&fw.adopted, index) {
                 continue; // 本次会话收的块：到达时已经比对过
             }
-            let Some((offset, blk_len)) = stream::block_range(fw.size, self.block_size, index) else {
+            let Some((offset, blk_len)) = stream::block_range(fw.size, self.block_size, index)
+            else {
                 return Err(format!("第 {index} 块的区间算不出来"));
             };
             let Some(expect) = rec.block_hash(index) else {
@@ -414,7 +442,31 @@ impl Session {
         tasks: &[StreamTask],
         buf: &mut Vec<u8>,
     ) -> Result<Vec<Arc<FileWork>>, String> {
-        let client = crate::net::client();
+        // 先看原子真相；再看 watch。watch 会把"已经置位"也记在值里，不会丢掉
+        // "置位发生在检查之后、等待之前"这一瞬间（`Notify::notify_waiters` 会丢）。
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err("已取消".into());
+        }
+        let mut cancel = self.cancel_rx.clone();
+        tokio::select! {
+            _ = cancel.changed() => Err("已取消".into()),
+            result = self.run_request_inner(tasks, buf) => result,
+        }
+    }
+
+    async fn run_request_inner(
+        &self,
+        tasks: &[StreamTask],
+        buf: &mut Vec<u8>,
+    ) -> Result<Vec<Arc<FileWork>>, String> {
+        // 带 token 的拨号按目标建表（同一地址上另一台已配对设备的证书不能顶替它）。
+        let paired = self.state.get_peer(&self.peer_id).is_some_and(|p| p.paired);
+        let client = crate::net::dial_client_streaming(
+            &self.dial_host,
+            &crate::credential::dial_pin(&self.peer_id, paired),
+            std::time::Duration::from_secs(5),
+            READ_IDLE_TIMEOUT,
+        );
         let url = format!("{}/push/stream", self.base_url);
         let body = StreamRequest {
             id: self.invite_id.clone(),
@@ -555,7 +607,10 @@ impl Session {
                             warn!(path = %path, index, "块哈希不符，重排这一块");
                             self.requeue(Task::Block(fw.clone(), index));
                         } else {
-                            self.mark_failed(&path, format!("第 {index} 块校验不符（重试后仍不符）"));
+                            self.mark_failed(
+                                &path,
+                                format!("第 {index} 块校验不符（重试后仍不符）"),
+                            );
                         }
                         continue;
                     }
@@ -650,12 +705,21 @@ impl Session {
 }
 
 /// 开始一次新协议的接收（由 `push_job::spawn_download` 按能力位分派）。
-pub fn spawn(state: Arc<AppState>, invite: InboundInvite, peer_id: String, token: Option<String>) {
+pub(crate) fn spawn(
+    state: Arc<AppState>,
+    invite: InboundInvite,
+    peer_id: String,
+    token: Option<String>,
+    control: Arc<DownloadControl>,
+    gate: push_job::ReceiveGate,
+) {
     // `InboundInvite` 里有一个 oneshot 发送端（不是 `Clone`），所以失败收尾要用的东西
     // 先取出来，再把邀请整体移进任务。
     let invite_id = invite.invite_id.clone();
     crate::task::spawn("push download (stream)", async move {
-        if let Err(e) = run(state.clone(), invite, peer_id.clone(), token).await {
+        // 暂停闸表项跟着这条任务活（完成 / 失败 / 取消都摘掉，见 `ReceiveGate`）。
+        let _gate = gate;
+        if let Err(e) = run(state.clone(), invite, peer_id.clone(), token, control).await {
             // 会话级失败（建目录、清单非法、请求……）：**这一轮没成，但推送还在** ——
             // 保留邀请与待续传记录，退避重试。真落终态的两条路是"对端撤了（410）"与
             // "源文件与清单对不上"，它们自己走 `fail_download`。
@@ -669,12 +733,16 @@ async fn run(
     invite: InboundInvite,
     peer_id: String,
     token: Option<String>,
+    control: Arc<DownloadControl>,
 ) -> Result<(), String> {
     // 淘汰放太久的旧记录（连带它们指着的 `.part`）：兜底清理，顺手做一次就够。
     let swept = state.push.resume.sweep_stale(30 * 24 * 60 * 60);
     if swept > 0 {
         info!(swept, "清掉了过期的续传记录");
     }
+    // 续传记录可能来自旧版本/被篡改的本机文件：真正分配位图前再校验一次。
+    crate::transfer::push_job::validate_invite(&invite)
+        .map_err(|e| format!("清单超出上限: {e}"))?;
 
     let config = state.config.lock().clone();
     // 落盘根 = `<落盘目录>/<对端名字>`（S-12 关掉这层时就是落盘根本身，见 `resume::landing_dir`）。
@@ -682,7 +750,10 @@ async fn run(
     // 下由用户亲自挑过的邀请才带自己的根（`invite.root`，见 `accept_invite`）。
     // 名字先净化（对端自报的串不能直接当目录名用，
     // 否则 `C:\Windows\Temp` / `..\..\Users\Public` 会把基址那一层整个顶掉）。
-    let base = invite.root.as_deref().unwrap_or(config.download_dir.as_path());
+    let base = invite
+        .root
+        .as_deref()
+        .unwrap_or(config.download_dir.as_path());
     let dir = super::resume::landing_dir(base, &invite.sender.name, config.device_subdir);
     tokio::fs::create_dir_all(&dir)
         .await
@@ -690,9 +761,7 @@ async fn run(
 
     // 两个旋钮都从配置来（设置里的「传输并发数」「分块大小」），并在读的时候夹一次
     // 取值域 —— 配置文件是可以手改的，越界的值不能让传输行为失控。
-    let block_size = crate::config::clamp_transfer_block_mb(config.transfer_block_mb)
-        * 1024
-        * 1024;
+    let block_size = crate::config::clamp_transfer_block_mb(config.transfer_block_mb) * 1024 * 1024;
     let workers = crate::config::clamp_transfer_workers(config.transfer_workers) as usize;
     let callback = invite.callback.clone();
     // 数据面拨谁：优先地址簿里此刻的拨号地址（可能是中转端点，F-106），
@@ -700,6 +769,7 @@ async fn run(
     let dial = state
         .dial_endpoint(&peer_id, callback.clone())
         .unwrap_or_default();
+    let dial_host = dial.0.clone();
     let base_url = crate::net::peer_base(&dial.0, dial.1);
 
     // ---- 准备每个文件：路径、身份、续传记录 ----------------------------------------
@@ -709,8 +779,8 @@ async fn run(
     let mut pending_finalize: Vec<Arc<FileWork>> = Vec::new();
 
     for entry in invite.files.iter() {
-        let target = safe_join(&dir, &entry.path)
-            .ok_or_else(|| format!("非法路径: {}", entry.path))?;
+        let target =
+            safe_join(&dir, &entry.path).ok_or_else(|| format!("非法路径: {}", entry.path))?;
         if let Some(parent) = target.parent() {
             if made_dirs.insert(parent.to_path_buf()) {
                 tokio::fs::create_dir_all(parent)
@@ -735,9 +805,11 @@ async fn run(
 
         // 续传：只有"身份（含大小与时间戳）+ 块大小都一致"才认这条旧记录，
         // 否则那份位图指的是另一个文件。
-        let adopted = state.push.resume.file_record(&key).filter(|rec| {
-            rec.size == entry.size && rec.block_size == block_size
-        });
+        let adopted = state
+            .push
+            .resume
+            .file_record(&key)
+            .filter(|rec| rec.size == entry.size && rec.block_size == block_size);
         let mut rec = match adopted {
             Some(mut rec) if part.exists() => {
                 let part_len = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
@@ -745,7 +817,8 @@ async fn run(
                 // （理论上不该发生 —— 置位前都 fsync 过；真遇上就以磁盘为准）。
                 for index in 0..total_blocks {
                     if bitmap_has(&rec.blocks, index) {
-                        if let Some((offset, len)) = stream::block_range(entry.size, block_size, index)
+                        if let Some((offset, len)) =
+                            stream::block_range(entry.size, block_size, index)
                         {
                             if offset + len as u64 > part_len {
                                 warn!(path = %entry.path, index, "位图与磁盘对不上，这块重下");
@@ -782,10 +855,7 @@ async fn run(
             .filter(|i| bitmap_has(&rec.blocks, *i))
             .count() as u32;
         received += rec.done_bytes();
-        state
-            .push
-            .resume
-            .save_file(&key, rec.clone());
+        state.push.resume.save_file(&key, rec.clone());
 
         let fw = Arc::new(FileWork {
             rel: entry.path.clone(),
@@ -843,31 +913,33 @@ async fn run(
     }
 
     let total = invite.total_bytes();
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let session = Arc::new(Session {
         state: state.clone(),
         peer_id: peer_id.clone(),
         invite_id: invite.invite_id.clone(),
         callback: callback.clone(),
         base_url,
+        dial_host,
         token,
         block_size,
         workers,
         files: files.clone(),
-        by_path: files
-            .iter()
-            .map(|f| (f.rel.clone(), f.clone()))
-            .collect(),
+        by_path: files.iter().map(|f| (f.rel.clone(), f.clone())).collect(),
         queue: Mutex::new(queue),
         notify: tokio::sync::Notify::new(),
         received: Arc::new(AtomicU64::new(received)),
         total,
         cancel: Arc::new(AtomicBool::new(false)),
+        cancel_tx,
+        cancel_rx,
         local_cancel: AtomicBool::new(false),
         sender_cancel: AtomicBool::new(false),
         source_changed: AtomicBool::new(false),
         finished: AtomicBool::new(false),
         failed: Mutex::new(Vec::new()),
         bufs: Mutex::new(Vec::new()),
+        control,
     });
 
     info!(
@@ -903,9 +975,10 @@ async fn run(
     let mut handles = Vec::new();
     for _ in 0..session.workers {
         let s = session.clone();
-        handles.push(crate::task::spawn("push worker", async move {
-            worker(s).await
-        }));
+        handles.push(crate::task::spawn(
+            "push worker",
+            async move { worker(s).await },
+        ));
     }
     for h in handles {
         let _ = h.await;
@@ -1021,6 +1094,7 @@ async fn reporter(session: Arc<Session>) {
         {
             session.local_cancel.store(true, Ordering::SeqCst);
             session.cancel.store(true, Ordering::SeqCst);
+            let _ = session.cancel_tx.send(true);
             session.notify.notify_waiters();
             return;
         }
@@ -1061,9 +1135,18 @@ async fn worker(session: Arc<Session>) {
         if session.cancel.load(Ordering::Relaxed) {
             return;
         }
+        // **先取任务、再等闸门**：队列空了就退出 —— 暂停不该把收尾挡在门外（最后一块已经
+        // 落盘、只差报终态时，用户按一下暂停就永远收不了尾）。拿在手里的任务不会丢：
+        // 继续后照常发请求；取消则随 worker 一起放掉（取消本来就是"不要了"）。
         let Some(task) = session.next_task() else {
             return;
         };
+        // 用户暂停：不向对端要任何新字节。正在收的那一批照常落盘，之后停在这里。
+        // 取消会先放开闸门（`cancel_receive`），所以醒来后再看一眼 `cancel`。
+        session.control.wait_if_paused().await;
+        if session.cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let (tasks, label) = match &task {
             Task::Block(fw, index) => (
                 vec![StreamTask {
@@ -1170,12 +1253,14 @@ mod tests {
             crate::config::Config::default(),
             dir.join("config.toml"),
         ));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         Session {
             state,
             peer_id: "device-test".into(),
             invite_id: "inv-test".into(),
             callback: None,
             base_url: String::new(),
+            dial_host: String::new(),
             token: None,
             block_size: BLOCK,
             workers: 1,
@@ -1186,12 +1271,15 @@ mod tests {
             received: Arc::new(AtomicU64::new(0)),
             total: files.iter().map(|f| f.size).sum(),
             cancel: Arc::new(AtomicBool::new(false)),
+            cancel_tx,
+            cancel_rx,
             local_cancel: AtomicBool::new(false),
             sender_cancel: AtomicBool::new(false),
             source_changed: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             failed: Mutex::new(Vec::new()),
             bufs: Mutex::new(Vec::new()),
+            control: Arc::new(super::DownloadControl::default()),
         }
     }
 
@@ -1206,13 +1294,23 @@ mod tests {
         let s = session(vec![fw.clone()]);
         let digest = [7u8; 32];
 
-        assert!(!s.complete_block(&fw, 0, BLOCK, &digest), "还差一块，没完成");
+        assert!(
+            !s.complete_block(&fw, 0, BLOCK, &digest),
+            "还差一块，没完成"
+        );
         assert_eq!(fw.done_blocks.load(Ordering::Acquire), 1);
         assert_eq!(s.received.load(Ordering::Relaxed), BLOCK as u64);
 
         // 同一块再来一次（断流重试）：计数不动、字节不动，仍然"没完成"。
-        assert!(!s.complete_block(&fw, 0, BLOCK, &digest), "重复的那块不该让它变成完成");
-        assert_eq!(fw.done_blocks.load(Ordering::Acquire), 1, "重复的块不能再记一次数");
+        assert!(
+            !s.complete_block(&fw, 0, BLOCK, &digest),
+            "重复的那块不该让它变成完成"
+        );
+        assert_eq!(
+            fw.done_blocks.load(Ordering::Acquire),
+            1,
+            "重复的块不能再记一次数"
+        );
         assert_eq!(
             s.received.load(Ordering::Relaxed),
             BLOCK as u64,
@@ -1239,8 +1337,14 @@ mod tests {
         let done = work("done.txt", BLOCK as u64, 1);
         let broken = work("broken.txt", 2 * BLOCK as u64, 2);
         let s = session(vec![done.clone(), broken.clone()]);
-        assert!(s.complete_block(&done, 0, BLOCK, &digest), "这份整份收完了（只差收尾）");
-        assert!(!s.complete_block(&broken, 0, BLOCK, &digest), "这份只收了一半");
+        assert!(
+            s.complete_block(&done, 0, BLOCK, &digest),
+            "这份整份收完了（只差收尾）"
+        );
+        assert!(
+            !s.complete_block(&broken, 0, BLOCK, &digest),
+            "这份只收了一半"
+        );
 
         s.fail_task_files(
             &Task::Bundle(vec![(done.clone(), 0), (broken.clone(), 1)]),
@@ -1253,10 +1357,65 @@ mod tests {
             vec!["broken.txt".to_string()],
             "只有没收全的那份该被标失败"
         );
-        assert!(!done.failed.load(Ordering::SeqCst), "收全的那份不能被标 failed");
+        assert!(
+            !done.failed.load(Ordering::SeqCst),
+            "收全的那份不能被标 failed"
+        );
         assert!(broken.failed.load(Ordering::SeqCst));
         // 收全的那份照旧参与收尾（兜底扫描只看 `failed`/`finalized`）。
         assert!(!done.finalized.load(Ordering::SeqCst));
     }
-}
 
+    /// 块收全之后才收到 `SourceChanged`（同一文件的失败已经是终态）时，收尾**绝不能**
+    /// 把 `.part` 改名到最终路径：否则最终路径上会出现一份新旧混合/不完整的文件。
+    #[tokio::test]
+    async fn a_failed_file_is_never_published() {
+        let fw = work("failed_never_published.bin", 4, 1);
+        let _ = std::fs::remove_file(&fw.target);
+        std::fs::write(&fw.part, [1u8; 4]).unwrap();
+        // 模拟"已经进了 to_finalize、随后又被判失败"。
+        fw.failed.store(true, Ordering::SeqCst);
+
+        let s = session(vec![fw.clone()]);
+        s.finalize(&fw).await.unwrap();
+
+        assert!(
+            !fw.target.exists(),
+            "已判失败的文件不该出现在最终路径上"
+        );
+        assert!(fw.part.exists(), "临时文件保留给上层清理/重试");
+        let _ = std::fs::remove_file(&fw.part);
+    }
+
+    /// 暂停不该把**已经没活儿的会话**挡在收尾之前：队列空了 worker 直接退出，
+    /// 不因为闸门合着就永远等下去（否则用户恰好在 100% 时按暂停，文件就永远不改名/不报完成）。
+    #[tokio::test]
+    async fn an_empty_queue_finishes_even_while_paused() {
+        let s = Arc::new(session(Vec::new()));
+        s.control.set_paused(true);
+        tokio::time::timeout(Duration::from_millis(500), worker(s))
+            .await
+            .expect("空队列的 worker 不该等在暂停闸门前");
+    }
+
+    /// 暂停时**一个块都不开始拉**：worker 把任务拿在手里、停在闸门前；取消（或继续）才退出。
+    #[tokio::test]
+    async fn a_paused_worker_does_not_start_its_block() {
+        let fw = work("paused_worker.bin", 4, 1);
+        let s = Arc::new(session(vec![fw.clone()]));
+        s.queue.lock().push_back(Task::Block(fw, 0));
+        s.control.set_paused(true);
+
+        let handle = tokio::spawn(worker(s.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!handle.is_finished(), "暂停中 worker 不该开始取块");
+
+        // 取消会先放开闸门（`cancel_receive` 就是这个顺序）：worker 醒来看到取消就退出。
+        s.cancel.store(true, Ordering::SeqCst);
+        s.control.set_paused(false);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("放开闸门后 worker 应当退出")
+            .expect("worker 不应 panic");
+    }
+}

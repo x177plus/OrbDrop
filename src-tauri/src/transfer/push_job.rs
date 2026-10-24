@@ -150,6 +150,49 @@ pub const CAP_STREAM: &str = "stream1";
 /// 发送方还会在源文件/目录变化时自己取消）。
 pub const CAP_AWAIT: &str = "await1";
 
+/// 一条入站邀请的硬上限。**正常使用远低于这些值**（README 的基准是 3000 个文件），
+/// 它们只用来挡住"远端报一个 9PB 的 size 让接收端自己分配位图/任务队列"这类攻击。
+pub const MAX_INVITE_FILES: usize = 100_000;
+pub const MAX_INVITE_TOTAL_BYTES: u64 = 10 * 1024 * 1024 * 1024 * 1024; // 10 TiB
+pub const MAX_INVITE_FILE_BYTES: u64 = 1 * 1024 * 1024 * 1024 * 1024; // 1 TiB
+pub const MAX_INVITE_PATH_BYTES: usize = 4096;
+
+/// 校验远端清单。**在 insert/accept 之前调用**：`download::run` 会按清单里的 size
+/// 分配块位图与任务队列，一个伪造的巨大 size 就能在真正传输前把内存打满。
+pub fn validate_invite(inv: &InboundInvite) -> Result<(), String> {
+    if inv.count > MAX_INVITE_FILES || inv.files.len() > MAX_INVITE_FILES {
+        return Err(format!(
+            "文件数超过上限（{} > {MAX_INVITE_FILES}）",
+            inv.files.len().max(inv.count)
+        ));
+    }
+    if !inv.is_dir && inv.size > MAX_INVITE_FILE_BYTES {
+        return Err(format!(
+            "单文件大小超过上限（{} > {MAX_INVITE_FILE_BYTES}）",
+            inv.size
+        ));
+    }
+    let mut total = 0u64;
+    for f in &inv.files {
+        if f.path.len() > MAX_INVITE_PATH_BYTES {
+            return Err(format!("路径过长（{} 字节）", f.path.len()));
+        }
+        if f.size > MAX_INVITE_FILE_BYTES {
+            return Err(format!(
+                "单文件大小超过上限（{} > {MAX_INVITE_FILE_BYTES}）",
+                f.size
+            ));
+        }
+        total = total.saturating_add(f.size);
+    }
+    if total > MAX_INVITE_TOTAL_BYTES {
+        return Err(format!(
+            "单批总大小超过上限（{total} > {MAX_INVITE_TOTAL_BYTES}）"
+        ));
+    }
+    Ok(())
+}
+
 impl InboundInvite {
     /// 走新协议还是老循环。判据只有一个：**对端说自己支持**（老对端不带这个位）。
     pub fn supports_stream(&self) -> bool {
@@ -163,7 +206,9 @@ impl InboundInvite {
 
     pub fn total_bytes(&self) -> u64 {
         if self.is_dir {
-            self.files.iter().map(|f| f.size).sum()
+            self.files
+                .iter()
+                .fold(0u64, |acc, f| acc.saturating_add(f.size))
         } else {
             self.size
         }
@@ -307,7 +352,10 @@ impl TargetState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            TargetState::Done | TargetState::Cancelled | TargetState::Rejected | TargetState::Failed
+            TargetState::Done
+                | TargetState::Cancelled
+                | TargetState::Rejected
+                | TargetState::Failed
         )
     }
 
@@ -494,6 +542,32 @@ pub struct PushStore {
 /// 就没有时钟），代价是极端滥用下丢几张卡，而**不是**把本机 OOM。
 const MAX_INBOUND_INVITES: usize = 128;
 
+/// 所有入站邀请**合计**允许保留的清单字节数。
+///
+/// 只限条数不够：每条 body 上限 64 MiB，128 条就是约 8 GiB 常驻内存。正常用户同一时刻
+/// 手上只有几张卡，512 MiB 对正常使用仍有数量级余量；到顶时与条数上限一样挤掉最老的，
+/// 只影响滥用流量，不改变正常推送的可见行为。
+const MAX_INBOUND_BYTES: usize = 512 * 1024 * 1024;
+
+/// 一条入站邀请在内存里大概占多少：结构体本身 + 对端给的字符串/清单。估算只用于触发
+/// 淘汰，不需要精确；宁可略高估。
+fn invite_footprint(inv: &InboundInvite) -> usize {
+    let mut bytes = 512usize
+        .saturating_add(inv.invite_id.len())
+        .saturating_add(inv.sender.id.len())
+        .saturating_add(inv.sender.name.len())
+        .saturating_add(inv.name.len())
+        .saturating_add(inv.root.as_ref().map(|p| p.to_string_lossy().len()).unwrap_or(0))
+        .saturating_add(inv.callback.as_ref().map(|(ip, _)| ip.len()).unwrap_or(0))
+        .saturating_add(inv.caps.iter().map(String::len).sum::<usize>());
+    for f in &inv.files {
+        bytes = bytes
+            .saturating_add(64)
+            .saturating_add(f.path.len());
+    }
+    bytes
+}
+
 /// 一条**入站**邀请的处理结局（对账用；`state` 是 `PushInviteStateWire::state` 的取值）。
 struct RecentOutcome {
     /// 发送方 id：只有它自己能问出这一条（别人的会话问同一个 id 一律 `unknown`）。
@@ -571,7 +645,11 @@ impl PushStore {
     /// 一批里**每台**的字节总量（各台共用同一份清单）。过期收尾时拿它判"最后是不是报满了"
     /// —— 不能用 `BatchView.total`：那是"还活着的台之和"，多台时会偏大。
     pub fn batch_per_target_total(&self, batch_id: &str) -> u64 {
-        self.batches.lock().get(batch_id).map(|b| b.per_target_total).unwrap_or(0)
+        self.batches
+            .lock()
+            .get(batch_id)
+            .map(|b| b.per_target_total)
+            .unwrap_or(0)
     }
 
     /// 全部批次的快照（`push_batches` 命令用：界面挂载时拉一次初值 —— 重启后那些恢复出来的
@@ -582,7 +660,9 @@ impl PushStore {
         let batches = self.batches.lock();
         let mut ids: Vec<&String> = batches.keys().collect();
         ids.sort();
-        ids.into_iter().filter_map(|id| batches.get(id).map(snapshot)).collect()
+        ids.into_iter()
+            .filter_map(|id| batches.get(id).map(snapshot))
+            .collect()
     }
 
     /// 整批走完就丢掉：界面手里那份最后的快照已经是全量。
@@ -615,7 +695,8 @@ impl PushStore {
             // 重启后这条才能被重建出来（见 `push_out`）。之后的进度只挪 TTL 锚点（`touch_job`）。
             let was_invited = matches!(job.status, PushStatus::Invited);
             job.status = status;
-            (was_invited && !matches!(job.status, PushStatus::Invited)).then(|| out_job_of(job, true))
+            (was_invited && !matches!(job.status, PushStatus::Invited))
+                .then(|| out_job_of(job, true))
         };
         if let Some(rec) = accepted_now {
             self.out.save_job(rec);
@@ -631,7 +712,9 @@ impl PushStore {
         self.jobs.lock().get(id).map(|j| match &j.status {
             PushStatus::Invited => "invited".into(),
             PushStatus::Accepted => "accepted".into(),
-            PushStatus::Downloading { received, total } => format!("downloading: {received}/{total}"),
+            PushStatus::Downloading { received, total } => {
+                format!("downloading: {received}/{total}")
+            }
             PushStatus::Completed => "completed".into(),
             PushStatus::Failed(r) => format!("failed: {r}"),
         })
@@ -674,28 +757,46 @@ impl PushStore {
 
     // receiver
     pub fn insert_invite(&self, inv: InboundInvite) {
+        self.insert_invite_with_budget(inv, MAX_INBOUND_BYTES);
+    }
+
+    /// [`insert_invite`] 的预算参数版：生产用 [`MAX_INBOUND_BYTES`]，测试用小预算跑同一条
+    /// 淘汰路径（不必真的分配 512 MiB）。
+    fn insert_invite_with_budget(&self, inv: InboundInvite, max_bytes: usize) {
         let id = inv.invite_id.clone();
+        let footprint = invite_footprint(&inv);
         // 锁序固定 `inbound` → `invite_seen`（`remove_invite` / `take_invite` 同序）。
         let mut inbound = self.inbound.lock();
         let mut seen = self.invite_seen.lock();
         // 顺序记账跟着表走：表里已经没有的键一律丢掉（它在 `remove_invite`/`take_invite` 里也删，
         // 这里是兜底 —— 两个入口漏一处，淘汰就会按一条早就不在的 id 去"最老"）。
         seen.retain(|k, _| inbound.contains_key(k));
-        while inbound.len() >= MAX_INBOUND_INVITES {
+        // 32 位手机上 128 × 64 MiB 会超过 `usize::MAX`：这里必须饱和加，不能 `.sum()`
+        // （debug 下溢出 panic，release 下绕回一个小数，淘汰就不受控了）。
+        let mut total: usize = inbound
+            .values()
+            .fold(0usize, |acc, inv| acc.saturating_add(invite_footprint(inv)));
+        while !inbound.is_empty()
+            && (inbound.len() >= MAX_INBOUND_INVITES
+                || total.saturating_add(footprint) > max_bytes)
+        {
             // 满了就挤掉**最老**的那条（与结局记录淘汰旧条同一套写法，见 `record_outcome`）。
             // 挤不动（记账与表不同步到一条都对不出来）就 break：宁可留一条多的，也不空转。
             let Some(oldest) = seen
                 .iter()
                 .min_by_key(|(_, at)| **at)
                 .map(|(k, _)| k.clone())
-                else {
+            else {
                 break;
             };
+            if let Some(gone) = inbound.remove(&oldest) {
+                total = total.saturating_sub(invite_footprint(&gone));
+            }
             seen.remove(&oldest);
-            inbound.remove(&oldest);
             warn!(
                 invite = %oldest,
                 limit = MAX_INBOUND_INVITES,
+                bytes = max_bytes,
                 "入站邀请到上限了，挤掉最老的一条（未鉴权的投递换新 id 也刷不出无上界的表）"
             );
         }
@@ -865,7 +966,9 @@ impl PushStore {
 }
 
 impl Default for PushStore {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,7 +1110,10 @@ pub fn out_batch_of(batch: &PushBatch, roots: &[std::path::PathBuf]) -> super::p
                 error: t.error.clone(),
             })
             .collect(),
-        roots: roots.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+        roots: roots
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
     }
 }
 
@@ -1030,8 +1136,7 @@ pub fn restore_outbound(state: &Arc<AppState>) -> usize {
     if jobs.is_empty() && batches.is_empty() {
         return 0;
     }
-    let accepted: HashMap<String, bool> =
-        jobs.iter().map(|j| (j.id.clone(), j.accepted)).collect();
+    let accepted: HashMap<String, bool> = jobs.iter().map(|j| (j.id.clone(), j.accepted)).collect();
     // 每批的"每台字节总量"：恢复 job 的 `Downloading{received,total}` 要用它。
     let mut totals: HashMap<String, u64> = HashMap::new();
 
@@ -1073,7 +1178,10 @@ pub fn restore_outbound(state: &Arc<AppState>) -> usize {
             last_emit: Instant::now(),
         };
         totals.insert(batch.id.clone(), batch.per_target_total);
-        let has_invited = batch.targets.iter().any(|t| t.state == TargetState::Invited);
+        let has_invited = batch
+            .targets
+            .iter()
+            .any(|t| t.state == TargetState::Invited);
         state.push.insert_batch(batch);
         // 还有台在等对方点头 → 把源监视挂回去（不然"源变了就撤"这条只在重启前成立）。
         if has_invited {
@@ -1088,7 +1196,11 @@ pub fn restore_outbound(state: &Arc<AppState>) -> usize {
     let mut restored = 0usize;
     for rec in jobs {
         // 进度初值从批次那一行抄（落盘的粒度是"最后一次状态跃迁"，见 `push_out`）。
-        let received = state.push.target_of_invite(&rec.id).map(|t| t.received).unwrap_or(0);
+        let received = state
+            .push
+            .target_of_invite(&rec.id)
+            .map(|t| t.received)
+            .unwrap_or(0);
         let total = totals.get(&rec.batch_id).copied().unwrap_or(0);
         let status = match (rec.accepted, total) {
             (false, _) => PushStatus::Invited,
@@ -1137,7 +1249,11 @@ pub fn sweep_outbound(state: &AppState) {
     let now = super::push_out::now_secs();
     for (invite_id, batch_id) in state.push.out.expired(now) {
         let per_target = state.push.batch_per_target_total(&batch_id);
-        let received = state.push.target_of_invite(&invite_id).map(|t| t.received).unwrap_or(0);
+        let received = state
+            .push
+            .target_of_invite(&invite_id)
+            .map(|t| t.received)
+            .unwrap_or(0);
         if expired_target_state(received, per_target) == TargetState::Done {
             info!(%invite_id, "这条推送最后报的是全量，按已送达收尾");
             state.push.remove_job(&invite_id);
@@ -1161,11 +1277,15 @@ pub fn sweep_outbound(state: &AppState) {
             true,
         );
         if let Some(peer_id) = peer_id {
-            super::notify_peer(state, &peer_id, WsEvent::PushDone {
-                invite_id,
-                status: "failed".into(),
-                reason: Some("发送方已放弃（你一直没来续传）".into()),
-            });
+            super::notify_peer(
+                state,
+                &peer_id,
+                WsEvent::PushDone {
+                    invite_id,
+                    status: "failed".into(),
+                    reason: Some("发送方已放弃（你一直没来续传）".into()),
+                },
+            );
         }
     }
 }
@@ -1214,6 +1334,9 @@ pub fn report_to_sender(
         .ok()
         .flatten()
         .filter(|t| !t.is_empty());
+    // 带 token 的拨号按目标建表：同一地址上另一台已配对设备不能顶替它收走回执。
+    let paired = state.get_peer(peer_id).is_some_and(|p| p.paired);
+    let client = crate::net::dial_client(&ip, &crate::credential::dial_pin(peer_id, paired));
     crate::task::spawn("push report", async move {
         for (attempt, delay) in [
             Duration::ZERO,
@@ -1226,7 +1349,7 @@ pub fn report_to_sender(
             if !delay.is_zero() {
                 sleep(delay).await;
             }
-            let mut req = crate::net::client().post(&url).json(&event);
+            let mut req = client.post(&url).json(&event);
             if let Some(token) = token.as_deref() {
                 req = req.bearer_auth(token);
             }
@@ -1276,21 +1399,65 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
     let token = match credential::get_peer_token(&peer_id) {
         Ok(t) => t,
         Err(e) => {
-            fail_download(&state, &peer_id, &callback, &invite_id, format!("读取凭据失败: {e}"));
+            fail_download(
+                &state,
+                &peer_id,
+                &callback,
+                &invite_id,
+                format!("读取凭据失败: {e}"),
+            );
             return;
         }
     };
     let paired = state.get_peer(&peer_id).map(|p| p.paired).unwrap_or(false);
     if paired && token.is_none() {
-        fail_download(&state, &peer_id, &callback, &invite_id, "本机没有对端 token".into());
+        fail_download(
+            &state,
+            &peer_id,
+            &callback,
+            &invite_id,
+            "本机没有对端 token".into(),
+        );
         return;
     }
 
+    // 暂停闸在这一刻就登记（不是等任务跑起来）：界面那条消息一变成"接收中"，
+    // 用户点右侧圆环就该找得到它。表项跟着 `ReceiveGate` 活，见它的说明。
+    let control = Arc::new(super::browse_dl::DownloadControl::default());
+    state
+        .receive_downloads
+        .lock()
+        .insert(invite_id.clone(), control.clone());
+    let gate = ReceiveGate::new(state.clone(), invite_id.clone());
+
     if invite.supports_stream() {
-        super::download::spawn(state, invite, peer_id, token);
+        super::download::spawn(state, invite, peer_id, token, control, gate);
         return;
     }
-    spawn_download_legacy(state, invite, peer_id, token);
+    spawn_download_legacy(state, invite, peer_id, token, control, gate);
+}
+
+/// 一个接收任务的暂停闸表项：**寿命 = 任务的寿命**。
+///
+/// 任务以任何方式退出（完成 / 失败 / 对端取消 / 本机取消）都会把 `AppState::receive_downloads`
+/// 里那一项摘掉 —— 界面之后点圆环会拿到 `false`（"这条接收已经不在跑"），而不是对着一个
+/// 早已没人等的闸门点头。`cancel_receive` 也会先摘表并**放开闸门**：暂停中的 worker 正等
+/// 在 `wait_for` 上，不放它就永远醒不过来（表摘了、任务还在，比留着更难查）。
+pub(crate) struct ReceiveGate {
+    state: Arc<AppState>,
+    invite_id: String,
+}
+
+impl ReceiveGate {
+    fn new(state: Arc<AppState>, invite_id: String) -> Self {
+        Self { state, invite_id }
+    }
+}
+
+impl Drop for ReceiveGate {
+    fn drop(&mut self) {
+        self.state.receive_downloads.lock().remove(&self.invite_id);
+    }
 }
 
 /// 老数据面：`GET /push/download`，一次一个文件、整份流、串行。
@@ -1302,6 +1469,8 @@ fn spawn_download_legacy(
     invite: InboundInvite,
     peer_id: String,
     token: Option<String>,
+    control: Arc<super::browse_dl::DownloadControl>,
+    gate: ReceiveGate,
 ) {
     use futures_util::StreamExt;
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -1313,7 +1482,20 @@ fn spawn_download_legacy(
     // 下载跑在运行时上：「同意接收」是 async 命令（`task::spawn` 另有"没有 reactor 就退到
     // Tauri 全局运行时"的兜底，见 task.rs）—— 这条任务绝不能被无声丢掉，否则两边都停在 0%。
     crate::task::spawn("push download", async move {
-        let client = crate::net::client();
+        // 暂停闸表项跟着这条任务活（完成 / 失败 / 取消都摘掉，见 `ReceiveGate`）。
+        let _gate = gate;
+        // 带 token 的拨号按目标建表：同一地址上另一台已配对设备不能顶替它。
+        let paired = state.get_peer(&peer_id).is_some_and(|p| p.paired);
+        let dial_host = callback
+            .as_ref()
+            .map(|(ip, _)| ip.clone())
+            .unwrap_or_default();
+        let client = crate::net::dial_client_streaming(
+            &dial_host,
+            &crate::credential::dial_pin(&peer_id, paired),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        );
         let config = state.config.lock().clone();
         // 落盘根 = `<落盘目录>/<发送方名>`（S-12 那颗开关关掉时就是落盘根本身；两条引擎共用
         // `resume::landing_dir`）。落盘目录默认是用户设的下载目录（S-01）；只有在
@@ -1327,8 +1509,12 @@ fn spawn_download_legacy(
         // 名字必须先净化：它是报文里的自由字符串，`C:\Windows\Temp`、`..\..\..\Users\Public`
         // 之类会把基址顶掉（`PathBuf::push` 遇到带前缀的段会清空已累积的部分）。净化 +
         // `safe_join` 两道闸都在 `landing_root` 里（关掉那层时 `safe_join` 仍是唯一的围栏）。
-        let base = invite.root.as_deref().unwrap_or(config.download_dir.as_path());
-        let sender_dir = super::resume::landing_dir(base, &invite.sender.name, config.device_subdir);
+        let base = invite
+            .root
+            .as_deref()
+            .unwrap_or(config.download_dir.as_path());
+        let sender_dir =
+            super::resume::landing_dir(base, &invite.sender.name, config.device_subdir);
         let _ = tokio::fs::create_dir_all(&sender_dir).await;
 
         let mut total_received: u64 = 0;
@@ -1354,11 +1540,20 @@ fn spawn_download_legacy(
             discard_legacy(&state, &invite_id, &sender_dir, &sizes, Some(target));
             fail_download(&state, &peer_id, &callback, &invite_id, reason);
         };
+        // 用户取消（邀请被取走）：只收掉半截文件与记录，**不再回报** —— `cancel_receive`
+        // 已经把话带给发送方了。放在闸门前后两处都能调（暂停期间被取消也要收干净）。
+        let cancel_file = |fh: tokio::fs::File, target: &std::path::Path| {
+            drop(fh);
+            discard_legacy(&state, &invite_id, &sender_dir, &sizes, Some(target));
+        };
 
         let base_url = format!(
             "{}/push/download",
             crate::net::peer_base(
-                callback.as_ref().map(|(ip, _)| ip.as_str()).unwrap_or_default(),
+                callback
+                    .as_ref()
+                    .map(|(ip, _)| ip.as_str())
+                    .unwrap_or_default(),
                 callback.as_ref().map(|(_, port)| *port).unwrap_or(0),
             )
         );
@@ -1367,7 +1562,13 @@ fn spawn_download_legacy(
             let file_target = match super::resume::safe_join(&sender_dir, &file.path) {
                 Some(p) => p,
                 None => {
-                    fail_download(&state, &peer_id, &callback, &invite_id, format!("非法路径: {}", file.path));
+                    fail_download(
+                        &state,
+                        &peer_id,
+                        &callback,
+                        &invite_id,
+                        format!("非法路径: {}", file.path),
+                    );
                     return;
                 }
             };
@@ -1393,11 +1594,20 @@ fn spawn_download_legacy(
             // 句柄**一次开到底**：续传时它跨多次尝试复用，收尾那次 `sync_data` 也用它，
             // 不必为了确认落盘再开一次。
             let mut fh = match tokio::fs::OpenOptions::new()
-                .create(true).write(true).open(&file_target).await
+                .create(true)
+                .write(true)
+                .open(&file_target)
+                .await
             {
                 Ok(f) => f,
                 Err(e) => {
-                    fail_download(&state, &peer_id, &callback, &invite_id, format!("打开文件失败: {e}"));
+                    fail_download(
+                        &state,
+                        &peer_id,
+                        &callback,
+                        &invite_id,
+                        format!("打开文件失败: {e}"),
+                    );
                     return;
                 }
             };
@@ -1415,25 +1625,29 @@ fn spawn_download_legacy(
                     // `cancel_receive` 里做了），重推一次又是新 id —— 留着它，用户目录里就多一个
                     // "名字对、内容截断"的假文件，而且永远没人清（见 `discard_legacy`）。
                     info!(%invite_id, "download cancelled");
-                    drop(fh);
-                    discard_legacy(
-                        &state,
-                        &invite_id,
-                        &sender_dir,
-                        &sizes,
-                        Some(file_target.as_path()),
-                    );
+                    cancel_file(fh, &file_target);
                     return;
                 }
-                if offset >= file.size { break; }
+                // 这一份已经收完就不必再等闸门：用户恰好在收官时按暂停，不该把整条任务
+                // 卡在"最后一块已经落完、只差报终态"之前。
+                if offset >= file.size {
+                    break;
+                }
+                // 界面点圆环暂停：停在闸门前，一个字节都不再向对端要。已经写进文件/临时文件
+                // 的字节与 `offset` 都不动，继续之后从当前位置接着要（与浏览下载同一条语义）。
+                control.wait_if_paused().await;
+                // 等闸门期间可能被取消：`cancel_receive` 会先放开闸门把人叫醒，这里补看一眼。
+                if state.push.inbound.lock().get(&invite_id).is_none() {
+                    info!(%invite_id, "download cancelled while paused");
+                    cancel_file(fh, &file_target);
+                    return;
+                }
 
-                let mut req = client
-                    .get(&base_url)
-                    .query(&[
-                        ("id", invite_id.as_str()),
-                        ("path", file.path.as_str()),
-                        ("offset", &offset.to_string()),
-                    ]);
+                let mut req = client.get(&base_url).query(&[
+                    ("id", invite_id.as_str()),
+                    ("path", file.path.as_str()),
+                    ("offset", &offset.to_string()),
+                ]);
                 if let Some(t) = &token {
                     req = req.bearer_auth(t);
                 }
@@ -1482,7 +1696,10 @@ fn spawn_download_legacy(
                     tokio::io::BufWriter::with_capacity(crate::net::STREAM_CHUNK, &mut fh);
 
                 let mut stream = resp.bytes_stream();
-                while let Some(chunk) = stream.next().await {
+                loop {
+                    let Some(chunk) = stream.next().await else {
+                        break;
+                    };
                     let chunk = match chunk {
                         Ok(c) => c,
                         Err(e) => {
@@ -1497,6 +1714,30 @@ fn spawn_download_legacy(
                             continue 'file;
                         }
                     };
+                    // 老协议一次请求把整个文件发完：只在请求边界等的话，大文件要一直收完
+                    // 才能暂停 —— 这里逐块看一眼。**放在读到这一块之后**：流到了 EOF 直接
+                    // break，不会因为"暂停"把收尾卡住。暂停时先把缓冲交给盘（`offset` 已经
+                    // 把这些字节算进去了），再停在闸门前；恢复后照常把这一块写进去。
+                    if control.is_paused() {
+                        if let Err(e) = out.flush().await {
+                            drop(out);
+                            fail_file(fh, &file_target, format!("写入失败: {e}"));
+                            return;
+                        }
+                        control.wait_if_paused().await;
+                    }
+                    // 清单里的 `size` 是这一批的契约：正常对端只发 `size - offset` 字节。
+                    // 多发出来的字节只可能来自"清单生成后源文件变大"或恶意对端 —— 照单全收
+                    // 会写出比清单长的文件、还把它判成完成。宁可判失败，也不落一份长度错的。
+                    if offset.saturating_add(chunk.len() as u64) > file.size {
+                        drop(out);
+                        fail_file(
+                            fh,
+                            &file_target,
+                            format!("源文件在传输中被修改（比清单大）: {}", file.path),
+                        );
+                        return;
+                    }
                     if let Err(e) = out.write_all(&chunk).await {
                         // 缓冲里那些字节本来就是"写不进去"的那一批，直接丢（文件要删）——
                         // 但得先把它对 `fh` 的借用交出来。
@@ -1533,16 +1774,25 @@ fn spawn_download_legacy(
                     let now = Instant::now();
                     if last_report.map_or(true, |t| now.duration_since(t) >= REPORT_INTERVAL) {
                         last_report = Some(now);
-                        report_to_sender(&state, &peer_id, &callback, WsEvent::PushProgress {
-                            invite_id: invite_id.clone(),
-                            received: total_received,
-                            total: total_bytes,
-                        });
-                        ws::emit_ui(&state, ws::events::ui::PUSH_PROGRESS, &serde_json::json!({
-                            "inviteId": invite_id,
-                            "received": total_received,
-                            "total": total_bytes,
-                        }));
+                        report_to_sender(
+                            &state,
+                            &peer_id,
+                            &callback,
+                            WsEvent::PushProgress {
+                                invite_id: invite_id.clone(),
+                                received: total_received,
+                                total: total_bytes,
+                            },
+                        );
+                        ws::emit_ui(
+                            &state,
+                            ws::events::ui::PUSH_PROGRESS,
+                            &serde_json::json!({
+                                "inviteId": invite_id,
+                                "received": total_received,
+                                "total": total_bytes,
+                            }),
+                        );
                     }
                 }
                 if let Err(e) = out.flush().await {
@@ -1586,18 +1836,27 @@ fn spawn_download_legacy(
             .push
             .record_outcome(&invite_id, &peer_id, "done", total_bytes, None);
         state.push.remove_invite(&invite_id);
-        report_to_sender(&state, &peer_id, &callback, WsEvent::PushDone {
-            invite_id: invite_id.clone(),
-            status: "completed".into(),
-            reason: None,
-        });
-        ws::emit_ui(&state, ws::events::ui::PUSH_DONE, &serde_json::json!({
-            "inviteId": invite_id,
-            "status": "completed",
-            // 落盘位置（<下载目录>/<发送方名>）：界面那条"已收到"的长通知要告诉用户
-            // 东西到底在哪 —— 没有这个，通知只能说"收到了"，点完「知道了」就再也找不到。
-            "dest": sender_dir.to_string_lossy(),
-        }));
+        report_to_sender(
+            &state,
+            &peer_id,
+            &callback,
+            WsEvent::PushDone {
+                invite_id: invite_id.clone(),
+                status: "completed".into(),
+                reason: None,
+            },
+        );
+        ws::emit_ui(
+            &state,
+            ws::events::ui::PUSH_DONE,
+            &serde_json::json!({
+                "inviteId": invite_id,
+                "status": "completed",
+                // 落盘位置（<下载目录>/<发送方名>）：界面那条"已收到"的长通知要告诉用户
+                // 东西到底在哪 —— 没有这个，通知只能说"收到了"，点完「知道了」就再也找不到。
+                "dest": sender_dir.to_string_lossy(),
+            }),
+        );
         info!(%invite_id, "push download completed");
     });
 }
@@ -1713,16 +1972,25 @@ pub(super) fn fail_download(
         .push
         .record_outcome(invite_id, peer_id, "failed", 0, Some(reason.clone()));
     state.push.remove_invite(invite_id);
-    report_to_sender(state, peer_id, callback, WsEvent::PushDone {
-        invite_id: invite_id.to_string(),
-        status: "failed".into(),
-        reason: Some(reason.clone()),
-    });
-    ws::emit_ui(state, ws::events::ui::PUSH_DONE, &serde_json::json!({
-        "inviteId": invite_id,
-        "status": "failed",
-        "reason": reason,
-    }));
+    report_to_sender(
+        state,
+        peer_id,
+        callback,
+        WsEvent::PushDone {
+            invite_id: invite_id.to_string(),
+            status: "failed".into(),
+            reason: Some(reason.clone()),
+        },
+    );
+    ws::emit_ui(
+        state,
+        ws::events::ui::PUSH_DONE,
+        &serde_json::json!({
+            "inviteId": invite_id,
+            "status": "failed",
+            "reason": reason,
+        }),
+    );
 }
 
 /// **这一轮没成，但这条推送还能再试**：保留邀请与待续传任务，**不报终态**。
@@ -1742,7 +2010,9 @@ pub(super) fn fail_download(
 pub(super) fn fail_attempt(state: &AppState, peer_id: &str, invite_id: &str, reason: String) {
     warn!(%invite_id, %reason, "这次接收没成，推送还在，等下一轮重试");
     state.push.remove_invite(invite_id);
-    state.push.record_outcome(invite_id, peer_id, "waiting", 0, None);
+    state
+        .push
+        .record_outcome(invite_id, peer_id, "waiting", 0, None);
     state.push.resume.flush();
 }
 
@@ -1779,11 +2049,31 @@ mod tests {
     #[test]
     fn an_expired_job_with_full_progress_lands_as_done() {
         let full = 10 * 1024 * 1024;
-        assert_eq!(expired_target_state(full, full), TargetState::Done, "最后报的是全量");
-        assert_eq!(expired_target_state(full + 1, full), TargetState::Done, "报多了也算满");
-        assert_eq!(expired_target_state(full - 1, full), TargetState::Failed, "还差一块 = 放弃");
-        assert_eq!(expired_target_state(0, full), TargetState::Failed, "一个字节都没来过");
-        assert_eq!(expired_target_state(0, 0), TargetState::Failed, "总量都不知道（没批次）");
+        assert_eq!(
+            expired_target_state(full, full),
+            TargetState::Done,
+            "最后报的是全量"
+        );
+        assert_eq!(
+            expired_target_state(full + 1, full),
+            TargetState::Done,
+            "报多了也算满"
+        );
+        assert_eq!(
+            expired_target_state(full - 1, full),
+            TargetState::Failed,
+            "还差一块 = 放弃"
+        );
+        assert_eq!(
+            expired_target_state(0, full),
+            TargetState::Failed,
+            "一个字节都没来过"
+        );
+        assert_eq!(
+            expired_target_state(0, 0),
+            TargetState::Failed,
+            "总量都不知道（没批次）"
+        );
     }
 
     /// 终结清理（`discard_legacy`）只看记录里那一条的 offset 与清单里的 size：
@@ -1802,7 +2092,10 @@ mod tests {
             "已经收完的留着 —— 用户要的就是它"
         );
         assert!(!is_half_written(0, 0), "空文件、且没写过");
-        assert!(!is_half_written(2, 1), "记录比清单还大（换过源）：不当成半截文件");
+        assert!(
+            !is_half_written(2, 1),
+            "记录比清单还大（换过源）：不当成半截文件"
+        );
     }
 
     /// 快照就是界面那张卡片的全部输入，所以它的**形状**（camelCase 字段名、state 字符串）
@@ -1888,7 +2181,10 @@ mod reconcile_tests {
     fn invite_of(id: &str, sender: &str) -> InboundInvite {
         InboundInvite {
             invite_id: id.into(),
-            sender: PeerInfo { id: sender.into(), name: sender.into() },
+            sender: PeerInfo {
+                id: sender.into(),
+                name: sender.into(),
+            },
             name: "a.txt".into(),
             size: 10,
             is_dir: false,
@@ -1901,6 +2197,45 @@ mod reconcile_tests {
         }
     }
 
+    #[test]
+    fn invite_limits_reject_oversized_and_overlong_manifests() {
+        let mut inv = invite_of("i", "pc");
+        inv.is_dir = true;
+        inv.files = vec![crate::ws::events::FileEntry {
+            path: "a.bin".into(),
+            size: MAX_INVITE_FILE_BYTES + 1,
+            mtime: 0,
+        }];
+        assert!(validate_invite(&inv).is_err(), "单文件超过上限必须拒绝");
+
+        let mut inv = invite_of("i", "pc");
+        inv.is_dir = true;
+        inv.files = vec![crate::ws::events::FileEntry {
+            path: "a".repeat(MAX_INVITE_PATH_BYTES + 1),
+            size: 1,
+            mtime: 0,
+        }];
+        assert!(validate_invite(&inv).is_err(), "超长路径必须拒绝");
+
+        let mut inv = invite_of("i", "pc");
+        inv.is_dir = true;
+        inv.files = (0..=MAX_INVITE_FILES)
+            .map(|i| crate::ws::events::FileEntry {
+                path: format!("f{i}"),
+                size: 1,
+                mtime: 0,
+            })
+            .collect();
+        assert!(validate_invite(&inv).is_err(), "文件数超过上限必须拒绝");
+
+        let mut inv = invite_of("i", "pc");
+        inv.size = MAX_INVITE_FILE_BYTES + 1;
+        assert!(validate_invite(&inv).is_err(), "单文件推送超过上限必须拒绝");
+
+        let ok = invite_of("i", "pc");
+        assert!(validate_invite(&ok).is_ok(), "正常小清单必须放行");
+    }
+
     /// 入站邀请有上界：`/push/invite` 是公开路由，第三方换个 invite id 就能再投一条（每条还带着
     /// 对端给的清单），带 `await1` 的邀请又**没有时钟**（F-51：不点就一直留着）—— 没有这个上限，
     /// 表就没有上界。挤掉的是**最老**那条，不是随机一条：正常用永远碰不到这个数，碰到的只有滥用。
@@ -1910,7 +2245,11 @@ mod reconcile_tests {
         for i in 0..MAX_INBOUND_INVITES + 5 {
             store.insert_invite(invite_of(&format!("i{i}"), "pc"));
         }
-        assert_eq!(store.inbound.lock().len(), MAX_INBOUND_INVITES, "表刚好卡在上限");
+        assert_eq!(
+            store.inbound.lock().len(),
+            MAX_INBOUND_INVITES,
+            "表刚好卡在上限"
+        );
         for i in 0..5 {
             assert_eq!(
                 store.answer_invite_state(&format!("i{i}"), "pc").state,
@@ -1943,6 +2282,46 @@ mod reconcile_tests {
         assert_eq!(store.inbound.lock().len(), MAX_INBOUND_INVITES);
     }
 
+    /// 只限条数挡不住 128 × 64 MiB；这里用小预算跑同一条淘汰路径，证明**总字节**也会
+    /// 触发挤掉最老的，而不是无限保留。
+    #[test]
+    fn inbound_invites_are_also_capped_by_total_bytes() {
+        let store = PushStore::new();
+        let budget = 450_000usize;
+        let mut a = invite_of("a", "pc");
+        a.name = "x".repeat(200_000);
+        let mut b = invite_of("b", "pc");
+        b.name = "x".repeat(200_000);
+        let mut c = invite_of("c", "pc");
+        c.name = "x".repeat(200_000);
+
+        store.insert_invite_with_budget(a, budget);
+        store.insert_invite_with_budget(b, budget);
+        assert_eq!(
+            store.answer_invite_state("a", "pc").state,
+            "waiting",
+            "两条 200 KB 在 450 KB 预算内"
+        );
+        store.insert_invite_with_budget(c, budget);
+        assert_eq!(
+            store.answer_invite_state("a", "pc").state,
+            "unknown",
+            "加入第三条时挤掉最老的"
+        );
+        assert_eq!(store.answer_invite_state("b", "pc").state, "waiting");
+        assert_eq!(store.answer_invite_state("c", "pc").state, "waiting");
+        let total: usize = store
+            .inbound
+            .lock()
+            .values()
+            .map(invite_footprint)
+            .sum();
+        assert!(
+            total <= budget,
+            "保留总量必须回到预算内，实际 {total} > {budget}"
+        );
+    }
+
     /// 单文件推送那条路上对端只给了名字与大小（没有清单），清单是现场**合成**的一条；
     /// 终结清理要按同一份清单判"哪一个是我们写了一半的"，合成规则差一点就是删错文件。
     #[test]
@@ -1959,10 +2338,17 @@ mod reconcile_tests {
 
         // 目录推送：清单是权威的，原样给出（不合成、不改写）。
         inv.is_dir = true;
-        inv.files = vec![FileEntry { path: "a.bin".into(), size: 16, mtime: 7 }];
+        inv.files = vec![FileEntry {
+            path: "a.bin".into(),
+            size: 16,
+            mtime: 7,
+        }];
         let m = inv.manifest();
         assert_eq!(m.len(), 1);
-        assert_eq!((m[0].path.as_str(), m[0].size, m[0].mtime), ("a.bin", 16, 7));
+        assert_eq!(
+            (m[0].path.as_str(), m[0].size, m[0].mtime),
+            ("a.bin", 16, 7)
+        );
     }
 
     /// 还拿在手里的 = `waiting`（等用户处理或下载循环还在跑），处理过的报结局，
@@ -2033,10 +2419,19 @@ mod reconcile_tests {
             TargetState::Invited,
             TargetState::Sending,
         ] {
-            assert!(!late_success(from, TargetState::Done), "{from:?} 不该被改成成功");
+            assert!(
+                !late_success(from, TargetState::Done),
+                "{from:?} 不该被改成成功"
+            );
         }
-        assert!(!late_success(TargetState::Done, TargetState::Rejected), "成功不该变成被拒");
-        assert!(!late_success(TargetState::Failed, TargetState::Cancelled), "失败不该变成已取消");
+        assert!(
+            !late_success(TargetState::Done, TargetState::Rejected),
+            "成功不该变成被拒"
+        );
+        assert!(
+            !late_success(TargetState::Failed, TargetState::Cancelled),
+            "失败不该变成已取消"
+        );
     }
 
     /// 待对账的邀请：只列这台设备、还没落终态的那些。
@@ -2082,5 +2477,37 @@ mod reconcile_tests {
         assert_eq!(json["inviteId"], "i1");
         assert_eq!(json["state"], "waiting");
         assert!(json.get("reason").is_some(), "字段在（值为 null 也要在）");
+    }
+}
+
+#[cfg(test)]
+mod receive_gate_tests {
+    use super::*;
+
+    /// 暂停闸表项的寿命 = 接收任务：`ReceiveGate` 一落，`receive_downloads` 里那条就该没了。
+    /// 留着的后果是界面永远点得动一个没人等的闸门（命令回 `true`，进度却永远不动）。
+    #[test]
+    fn a_receive_gate_unregisters_when_the_task_ends() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_gate_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ));
+        let control = Arc::new(crate::transfer::browse_dl::DownloadControl::default());
+        state
+            .receive_downloads
+            .lock()
+            .insert("inv-1".into(), control.clone());
+        let gate = ReceiveGate::new(state.clone(), "inv-1".into());
+        assert!(state.receive_downloads.lock().contains_key("inv-1"));
+
+        drop(gate);
+        assert!(!state.receive_downloads.lock().contains_key("inv-1"));
+        // 闸门本身还在任务手里（最后一个引用由任务持有）：暂停语义不受摘表影响。
+        control.set_paused(true);
+        assert!(control.is_paused());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
