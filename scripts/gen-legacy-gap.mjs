@@ -147,7 +147,7 @@ export function render({ rules, notes, keep }) {
     lines.push(
       "",
       "/*",
-      " * 应用里**故意写的**外边距：兜底表基数更高（(0,2,1)），会把 `mobile.css` 里 `.fbub .fstop { margin-left: … }`",
+      " * 应用里**故意写的**外边距：兜底表基数更高（(0,2,1)），会把 `mobile.css` 里 `.mode input { margin: … }`",
       " * 这类设计值盖掉 —— 原样再声明一遍（基数 (0,3,1)）把它保回来。`margin: 0` 那种不算（那是重置 <p>/<input>",
       " * 的默认外边距，得让兜底表的间距生效）。",
       " */",

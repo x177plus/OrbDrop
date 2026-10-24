@@ -2,7 +2,8 @@
 /**
  * 一条命令发布一版：
  *   构建 → 签名 → 生成 update.json → 落入本仓根目录（update.json + CHANGELOG.md）→
- *   （远端）commit + tag + push 两个远端 → 建 Release 传附件 → 回读校验。
+ *   （远端）commit + tag → GitHub 推 master/tag；Gitee 推 gitee-mirror 快照与镜像 tag
+ *   → 建 Release 传附件 → 回读校验。
  *
  * 两种模式：
  *   默认（远端）：上面全走。需要配置里的 owner/repo，以及环境变量 GITHUB_TOKEN / GITEE_TOKEN。
@@ -133,7 +134,7 @@ const drifted = Object.entries(versions).filter(([, v]) => v !== ver.raw);
 
 step(`发布 OrbDrop ${ver.raw}（versionCode ${ver.code}）· ${LOCAL ? "本机演练（--local）" : "远端发布"}`);
 note(`配置 ${rel(cfg.__source)} · 本仓 ${cfg.repoPath} · 私钥 ${keyPath}`);
-note(`模式 ${VERIFY_ONLY ? "只回读校验（不构建 / 不 push / 不调 API）" : LOCAL ? "不联网 / 不 push / mirrors 指向本机镜像台" : "构建 + push 两个远端 + 调 API + 回读校验"}${SKIP_BUILD ? " · --skip-build（用现有产物）" : ""}${REPUBLISH ? " · --republish（同版本重发：复用已发布的 tag 与 Release）" : ""}`);
+note(`模式 ${VERIFY_ONLY ? "只回读校验（不构建 / 不 push / 不调 API）" : LOCAL ? "不联网 / 不 push / mirrors 指向本机镜像台" : "构建 + push GitHub + Gitee 快照 + 调 API + 回读校验"}${SKIP_BUILD ? " · --skip-build（用现有产物）" : ""}${REPUBLISH ? " · --republish（同版本重发：复用已发布的 tag 与 Release）" : ""}`);
 
 if (drifted.length) {
   const detail = drifted.map(([f, v]) => `${f}=${v}`).join("、");
@@ -373,6 +374,56 @@ function branchOfRepo(cfg) {
 
 /* ---------- 远端模式 ---------- */
 
+/**
+ * Gitee 侧只推“发布快照”，不推开发历史。
+ *
+ * GitHub 的 master 里是开发提交；Gitee 的 master 必须是一条从零开始的快照链，否则一推就把
+ * 旧历史带回 Gitee。这里用 `commit-tree HEAD^{tree}` 造一个父提交为 `gitee-mirror` 的新提交
+ * （整棵树 = 本次发布提交），再把它推到 Gitee 的 manifestBranch。发布 tag 也打在这个快照提交上，
+ * Release 附件照旧挂同名 tag。一次性建立快照链见 docs/update.md §19。
+ */
+function pushGiteeMirror(cfg, tag) {
+  const remote = cfg.gitee.remote;
+  const mirrorBranch = cfg.gitee.mirrorBranch;
+  const parent = git(["rev-parse", "--verify", `refs/heads/${mirrorBranch}`], { allowFail: true });
+  if (parent.status !== 0) {
+    die(
+      `本地没有 Gitee 快照分支 ${mirrorBranch}`,
+      "先按 docs/update.md §19 建立快照链（只需一次），再发版。",
+    );
+  }
+  const tree = git(["rev-parse", "HEAD^{tree}"]).stdout.trim();
+  const mirror = git([
+    "-c", `user.name=${cfg.gitee.mirrorAuthorName}`,
+    "-c", `user.email=${cfg.gitee.mirrorAuthorEmail}`,
+    "commit-tree", tree,
+    "-p", parent.stdout.trim(),
+    "-m", `OrbDrop ${tag} snapshot`,
+  ]).stdout.trim();
+  if (!mirror) die("Gitee 快照提交创建失败", "git commit-tree 没有输出 SHA。");
+  git(["branch", "-f", mirrorBranch, mirror]);
+  git(["push", remote, `refs/heads/${mirrorBranch}:refs/heads/${cfg.gitee.manifestBranch}`], {
+    inherit: true,
+    label: `git push ${remote} ${mirrorBranch} → ${cfg.gitee.manifestBranch}（快照）`,
+  });
+  if (!REPUBLISH) {
+    const mirrorTag = `gitee-${tag}`;
+    if (git(["tag", "-l", mirrorTag]).stdout.trim()) {
+      die(`本地镜像 tag ${mirrorTag} 已存在`, "确认这次不是重复发布；重复发布请用 --republish。");
+    }
+    git([
+      "-c", `user.name=${cfg.gitee.mirrorAuthorName}`,
+      "-c", `user.email=${cfg.gitee.mirrorAuthorEmail}`,
+      "tag", "-a", mirrorTag, "-m", `OrbDrop ${tag} (Gitee mirror)`, mirror,
+    ]);
+    git(["push", remote, `refs/tags/${mirrorTag}:refs/tags/${tag}`], {
+      inherit: true,
+      label: `git push ${remote} ${tag}（Gitee 镜像 tag）`,
+    });
+  }
+  return mirror;
+}
+
 async function publishRemote(cfg, tokens, ver, tag, notes, branch, files) {
   /* git：commit + tag + push（先落仓库，再建 Release —— GitHub 建 Release 时 tag 必须已存在） */
   step("本仓：commit + tag + push");
@@ -415,6 +466,11 @@ async function publishRemote(cfg, tokens, ver, tag, notes, branch, files) {
     if (url.status !== 0) {
       die(`本仓没有配置远端 ${remote}`,
         `git -C "${cfg.repoPath}" remote add ${remote} git@${platform}.com:${conf.owner}/${conf.repo}.git`);
+    }
+    if (platform === "gitee" && cfg.gitee.mirrorBranch) {
+      const mirror = pushGiteeMirror(cfg, tag);
+      ok(`已推送 ${remote} → ${url.stdout.trim()}（${cfg.gitee.mirrorBranch} → ${cfg.gitee.manifestBranch} @ ${mirror.slice(0, 12)}）`);
+      continue;
     }
     git(["push", remote, branch], { inherit: true, label: `git push ${remote} ${branch}（推送失败：代理/权限/仓库不存在，别忽略）` });
     if (!REPUBLISH) {

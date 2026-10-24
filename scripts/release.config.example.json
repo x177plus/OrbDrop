@@ -6,6 +6,8 @@
     "github/gitee.remote": "本仓里的 git 远端名（git remote add 时用的名字）",
     "github/gitee.tokenEnv": "去哪读 token：先读这个环境变量，没有就读 scripts/release.local.env 里的同名项（文件已 gitignore；整体换路径用 ORBDROP_RELEASE_SECRETS）",
     "gitee.manifestBranch": "客户端读 Gitee 清单走 raw/<分支>/update.json，这个分支必须是本仓的默认分支（当前为 master）",
+    "gitee.mirrorBranch": "Gitee 只承载发布快照：本地这条分支的整树提交会推到 Gitee 的 manifestBranch；不要往 Gitee 推本仓 master（见 docs/update.md §19）",
+    "gitee.mirrorAuthorName/Email": "快照提交与镜像 tag 的创建身份，确保 Gitee 上不出现本机全局身份",
     "signingKeyPath": "tauri 更新签名私钥（不在仓库里）；公钥已编译进 Rust，换了私钥客户端就得重发",
     "localMirrorBase": "--local 演练时清单里 mirrors 的前缀（scripts/dev-mirror.mjs 默认就监听它）",
     "notes": "远端发布时如果没给 --notes，用这个当更新说明；留空则远端模式强制要求 --notes",
@@ -22,7 +24,10 @@
     "repo": "OrbDrop",
     "remote": "gitee",
     "tokenEnv": "GITEE_TOKEN",
-    "manifestBranch": "master"
+    "manifestBranch": "master",
+    "mirrorBranch": "gitee-mirror",
+    "mirrorAuthorName": "x177plus",
+    "mirrorAuthorEmail": "x177plus@users.noreply.github.com"
   },
   "tagPrefix": "v",
   "signingKeyPath": "C:/Users/<你的用户名>/.tauri/orbdrop.key",

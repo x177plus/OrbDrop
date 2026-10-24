@@ -1609,10 +1609,16 @@ ORBDROP_DATA_DIR=$TMP/orbdrop-smoke ORBDROP_ALLOW_MULTI=1 \
   ./src-tauri/target/debug/orbdrop.exe                          # 数据目录另起一份，别动真机那份
 ```
 
-日志（`$ORBDROP_DATA_DIR/logs/orbdrop.log.<日期>`，JSON）里该有的那几行：
+`ORBDROP_ALLOW_MULTI` 下 mDNS 默认只走回环（`ORBDROP_MDNS_SCOPE=local`）：同机的其他
+调试实例能互相发现，**局域网上的其他用户看不到这台临时实例**。需要让手机/另一台机器
+看见它时，再显式加 `ORBDROP_MDNS_SCOPE=lan`；完全不要广播就设 `off`。
+
+日志（`$ORBDROP_DATA_DIR/logs/orbdrop.log.<日期>`，JSON）里该有的那几行 ——
+**托盘交互那四条只在 `RUST_LOG=debug` 时出现**（默认 `info` 会把它们挡在文件外）：
 
 ```text
 托盘菜单已就绪（右键可退出）
+RUST_LOG=debug 时：
 托盘：有事等处理 → 图标挂红点并开始闪动      ← 界面报"有事"（tray_set_alert(true)）
 托盘：左键单击 → 界面落到该看的那件事上      ← 左键单击（只在有事时才会出现）
 托盘：左键双击 → 展开面板                    ← 左键双击
@@ -1633,13 +1639,15 @@ ORBDROP_DATA_DIR=$TMP/orbdrop-smoke ORBDROP_ALLOW_MULTI=1 \
    - **右键** → 悬停第一行展开子菜单。菜单是原生 `#32768`，**UIA 读不到菜单项文字**，所以按
      像素验：8×8 那颗点（在线 44/64 绿、离线 44/64 灰，几何完全一致）、子菜单勾选列（勾在
      在线 12 暗像素 / 离线 0，反之亦然）、托盘图标（蓝 饱和 170 / 灰 饱和 10）。
-   - **左键单击 / 双击** → 看上面那两条日志；双击的两次点击间隔要 < 400ms（判定窗口），
+   - **左键单击 / 双击** → 看上面那两条日志（冒烟实例要带 `RUST_LOG=debug`，默认 `info`
+     不写这两条）；双击的两次点击间隔要 < 400ms（判定窗口），
      而单击那一下**不管有没有双击都会先按单击办一次**（见"左键"那一节）。
    - **红点与闪动**：有事那一档连拍两张（间隔 ~250ms）那张**图标槽位**（提升到托盘区之后
      就是它自己那一格；32×48 的槽位、内容 16×16）：一张必须是"圆环 + 右上角那颗红"
      （`#ea3c3f`），另一张**除按钮底色外一个图标像素都没有**（空白帧）—— 这就是"闪动"的全貌。
      连拍期间再各点一次左键，日志里该留下对应的 `托盘：左键单击`（空白那半秒点下去照样有用）。
-     两张**都看不见红点**就说明 `tray_set_alert(true)` 没送到（先查上面那条日志在不在）。
+     两张**都看不见红点**就说明 `tray_set_alert(true)` 没送到（先查上面那条日志在不在，
+     同样要 `RUST_LOG=debug`）。
 3. **两个入口都要走**：托盘切、面板右上角状态框切 —— 后者断言 tooltip 跟着变，证明
    `local://online` 监听器在起作用；两条路在日志里都应留下
    `mDNS service unregistered (offline)` / `dropping link` / `local presence changed`。
@@ -1647,6 +1655,9 @@ ORBDROP_DATA_DIR=$TMP/orbdrop-smoke ORBDROP_ALLOW_MULTI=1 \
    刷新抹掉。）
 
 **实测（2026-10-12，Win11 26200，本机）**：
+
+> 下面提到的 `托盘：左键单击/双击` 等交互日志都是 `RUST_LOG=debug` 下的输出；默认 `info`
+> 不写这几条（见上面校验一节）。
 
 - 这台机器的托盘图标**默认落在溢出面板里**（未提升），此时 `Shell_NotifyIconGetRect`（crate 拿
   rect 用的那条 API）把这颗图标的 rect 报成「显示隐藏的图标」那个按钮（1583,1032,32×48）。
@@ -1870,9 +1881,9 @@ Rust → Kotlin 一路直达，不经过界面：
 ### 「消息通知」这条渠道要在**装完那一刻**就存在（不是等第一条消息）
 
 渠道不只是"发通知时的路由"，它同时是**用户在系统设置里唯一能看到、能调的东西**：横幅、提醒方式、
-铃声、锁屏，全都挂在渠道（华为那一层是它自己映射出来的"通知类型"）上。原来它建在
+铃声、锁屏，全都挂在渠道（部分厂商 ROM 会把它映射成自己的"通知类型"）上。原来它建在
 `notifyMessage` 里（第一次在后台收到消息才建），于是**装完到第一条消息之间，这一页是空的** ——
-用户想开横幅也无处可开；而华为那侧的默认值正是在"这个应用有哪些通知类型"的那一刻定下的。
+用户想开横幅也无处可开；而部分厂商 ROM 那侧的默认值正是在"这个应用有哪些通知类型"的那一刻定下的。
 
 现在：`MessageNotifierPlugin.ensureChannel(context)` 是幂等的、公开的，`MainActivity.onResume`
 在 `areNotificationsEnabled()` 为真时叫它一次。挂 `onResume` 而不是 `onCreate`，是因为 Android 13+
@@ -1926,7 +1937,7 @@ Rust → Kotlin 一路直达，不经过界面：
 - 真机（渠道存在时机，本轮新增）：**装完并答完通知授权（或已授权时首次进应用）之后不做任何别的
   操作** → `设置 → 通知和状态栏 → OrbDrop` 里就能看到「消息通知」这一条（改前：要等后台收到第一条
   消息才出现）；`adb logcat -s orbdrop-mdns` 里有 `消息通知渠道已建：orbdrop.messages（importance=HIGH）`。
-- 待验证的假设（需要一台**重装**过的华为）：渠道在装完那一刻就存在时，华为那页的「横幅」是否就
+- 待验证的假设（需要一台**重装**过的真机）：渠道在装完那一刻就存在时，那一页的「横幅」是否就
   默认为开（改前是关的）。渠道随应用数据走，所以这一条只能用重装测（会清数据、`device_id` 可能重生成）。
 
 ## 20. 安卓：收件里的文件点开，APK 点一下就装（F-109）
@@ -2256,7 +2267,7 @@ CDP 那份方法见下；验完已换回 release 包）：
 
 ## 22. 安卓：让应用在后台活着（F-87）
 
-### 现象（真机，华为 ABC-AL00）
+### 现象（真机，部分厂商 ROM）
 
 装完即用，什么都没动：对端把它看成**离线**（mDNS 发现不到、5s 探活也不通），别人推过来的
 东西收不到 —— 而**手机这一侧看不出任何毛病**：通知栏那条「OrbDrop 正在运行」还挂着，
@@ -2271,11 +2282,36 @@ CDP 那份方法见下；验完已换回 release 包）：
 所以这条需求的本质不是"再加一层保活"，而是**把 ROM 那一层读得到的读到、读不到的引导清楚**。
 `OrbDropService` 那四件事（前台服务类型 / `START_STICKY` / 两把 Wi-Fi 锁 / 网络回调）只够 AOSP。
 
+### 后台耗电管理（2026-10-24 真机）
+
+某国产 ROM（Android 15，应用 0.0.3）上还有一层**不在自启动页上**的冻结：
+
+| 观测 | 结果 |
+|---|---|
+| 服务状态 | `isForeground=true`、`connectedDevice`、`startForegroundCount=1` —— 前台服务没死 |
+| Doze | `dumpsys deviceidle whitelist` 里已有 `user,com.x177plus.orbdrop,10331` —— 不是 Doze |
+| Wi-Fi 锁 | `orbdrop-wifi`（low latency）与 `orbdrop-mdns`（multicast）都持有 |
+| 亮屏时 `/pair/info` | `HTTP 200`（27ms） |
+| 熄屏 20 秒后同一端点 | `http=000`，5 秒超时 |
+| 熄屏时进程 cgroup | `/sys/fs/cgroup/uid_10331/pid_24331/cgroup.freeze=1` |
+| 唤醒后 | 同一文件变回 `0`，服务立刻恢复 `200` |
+| 应用自己的 watchdog | `进程疑似被系统冻结过：上一拍在 1573s 前`（约 26 分钟）；Rust 日志同一段空白，随后 `peer unreachable, marking offline` |
+
+根因：部分厂商 ROM 的**设置 → 电池 → 后台耗电管理**会在熄屏后把前台服务进程整个放进 freezer，
+自启动/关联启动/后台活动与电池优化白名单都挡不住。改成 **OrbDrop → 允许后台运行 / 允许后台高耗电**
+后，同一套熄屏测试立刻恢复（`cgroup.freeze=0`、`/pair/info` 200、对端不再掉线）。
+
+界面上因此单独加了一格「后台耗电管理」与一条跳转命令
+（`SystemSettingsPlugin.openBackgroundPowerSettings`）：先试已知的公开 action
+（`com.iqoo.powersaving.battery.high.power.jump` → `BackgroundHighUsageActivity`），
+再试组件名，最后退到应用详情页。**开关状态 ROM 不公开，读不到**，只能把用户送到那一页。
+包名/类名是运行时标识，不面向用户展示。
+
 ### 能读的只有一样，其余只能"送到那一页"
 
 - **能读**：电池优化白名单 —— `PowerManager.isIgnoringBatteryOptimizations()`（Google 官方 API）。
   界面上"电池优化：已允许 / 未允许"那一行因此是真的。
-- **读不到、也改不了**：ROM 的「应用启动管理」（华为）/「自启动」（小米）/OPPO、vivo 同类开关 ——
+- **读不到、也改不了**：ROM 的「应用启动管理 / 自启动 / 后台耗电管理」这类开关 ——
   厂商自己的权限位，没有公开 API，应用既不能读也不能写。能做的只有两件：
   1. 弹**系统那个**对话框：`ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`（清单里必须有
      `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`，否则当场 `SecurityException`）；ROM 不认这条 action
@@ -2295,7 +2331,7 @@ CDP 那份方法见下；验完已换回 release 包）：
 - `NotificationManagerService.buzzBeepBlinkLocked` 的门槛是 `importance >= IMPORTANCE_DEFAULT`，
   而 `record.setInterruptive(true)` **只在"真的响过/震过"那条分支里**被置位（`nms.java:7803/7921`）。
 
-所以一个"高"渠道如果被静默（华为那层的「静默通知」开关，官方文档：只显示在通知面板、不出横幅、
+所以一个"高"渠道如果被静默（部分厂商 ROM 的「静默通知」开关，官方文档：只显示在通知面板、不出横幅、
 不响不震），横幅就没了 —— 而这一层应用读不到。能做的是把状态读回来 + 把用户送到能改它的页面：
 `MessageNotifierPlugin` 新增三条命令 —— `notificationState`（总开关 + 「消息通知」渠道的重要性，
 `-1` = 渠道还没建）、`openNotificationSettings`、`openChannelSettings`（跳之前先 `ensureChannel`：
@@ -2314,16 +2350,16 @@ CDP 那份方法见下；验完已换回 release 包）：
 
 | 层 | 文件 | 干什么 |
 |---|---|---|
-| Kotlin | `SystemSettingsPlugin.kt` | 读白名单、弹电池优化对话框、跳 ROM 自启动页（候选表 + 应用详情页兜底） |
-| Rust | `src-tauri/src/system_settings.rs` | 插件句柄 + `keepalive_state` / `request_ignore_battery_optimizations` / `open_autostart_settings` / `keepalive_guided` / `mark_keepalive_guided` |
+| Kotlin | `SystemSettingsPlugin.kt` | 读白名单、弹电池优化对话框、跳 ROM 自启动页与「后台耗电管理」页（候选表 + 应用详情页兜底） |
+| Rust | `src-tauri/src/system_settings.rs` | 插件句柄 + `keepalive_state` / `request_ignore_battery_optimizations` / `open_autostart_settings` / `open_background_power_settings` / `keepalive_guided` / `mark_keepalive_guided` |
 | 配置 | `Config::keepalive_guided`（`#[serde(default)]` = false） | 只问一次；重装重问 |
-| 界面 | `sheets/KeepAliveSheet.svelte`、`tabs/SettingsTab.svelte` 一格、`MobileApp.onMount` | 引导底板 / 常驻入口 / 首次自动开 |
+| 界面 | `sheets/KeepAliveSheet.svelte`、`tabs/SettingsTab.svelte` 一格、`MobileApp.onMount` | 引导底板（电池优化 / 自启动 / **后台耗电管理**）/ 常驻入口 / 首次自动开 |
 | Kotlin | `MessageNotifierPlugin.kt` | `notificationState` / `openNotificationSettings` / `openChannelSettings` |
 | Kotlin | `OrbDropService.kt` | 冻结看门狗 + `onLost` 日志 |
 
 ### 校验
 
-- 静态：`npm run check`（svelte-check 140 文件 0 错）、`sh gradlew :app:compileUniversalDebugKotlin`
+- 静态：`npm run check`（svelte-check 0 错）、`sh gradlew :app:compileUniversalDebugKotlin`
   （Kotlin 编译）、release 打包（`npx tauri android build --apk --target aarch64`）。
   **release 下新插件靠 tauri 自带的 keep 规则活着**：`tauri-*/mobile/android/proguard-rules.pro` 里有
   `-keep @app.tauri.annotation.TauriPlugin public class * { @app.tauri.annotation.Command public <methods>; … }`
@@ -2335,9 +2371,12 @@ CDP 那份方法见下；验完已换回 release 包）：
   3. 点「打开系统设置」→ 落到「应用启动管理」（或兜底的应用详情页），toast 说清是哪一页；
      把三个开关打开后，对端设备行不再掉成"离线"；
   4. 通知那一格：显示"高 · 会弹横幅"；点「打开渠道设置」落到「消息通知」那一页，
-     华为那层的「静默通知 / 横幅」就在那儿；
-  5. 后台被冻结过一轮之后，`adb logcat -s orbdrop-mdns` 里有「进程疑似被系统冻结过：上一拍在 Xs 前」；
-     Wi-Fi 被收走时另有「Wi-Fi 断了」一行。
+     部分厂商 ROM 的「静默通知 / 横幅」就在那儿；
+  5. **后台耗电管理**：点「打开后台耗电设置」→ 落到系统后台耗电页（或兜底应用详情），
+     把 OrbDrop 设为「允许后台运行 / 允许后台高耗电」；熄屏 20s 后 `curl` 本机 `/pair/info` 仍 200，
+     `/sys/fs/cgroup/uid_<uid>/pid_<pid>/cgroup.freeze` 保持 `0`；
+  6. 后台被冻结过一轮之后，`adb logcat -s orbdrop-mdns` 里有「进程疑似被系统冻结过：上一拍在 Xs 前」
+     （实测 1573s）；Wi-Fi 被收走时另有「Wi-Fi 断了」一行。
 
 ---
 
@@ -3053,16 +3092,40 @@ callback, updatedAt }`
   直到 7 天窗口结束才给说法。要改成"立刻报错"就得给失败分门别类（哪些重试、哪些不重试），
   而那正是"网络抖一下也弹一堆提示"的来源 —— 这次选的是安静 + 一句日志（`warn`），窗口结束时报实数。
 
-### 停止按钮（两端卡片上）
+### 文件气泡的右侧控件（接收圆环 / 发送停止）
 
-- **接收端**：会话里那张"正在接收"的卡右端一颗停止（桌面 `ConvoPanel` 的 `.ic-stop`、移动
-  `ChatScreen` 的 `.fstop`，都只有图标，`margin-left:auto` 顶到右缘）→ `cancel_receive`。
-- **发送端**：右下角那张推送卡**本来就有**（多台逐行的 ✕ + 卡片级的「取消 / 取消全部」），这次没动。
-- `cancel_receive` 顺带把待续传任务删掉：**点停止 = 就是要停**（只有"关掉应用"才走自动续传那条）。
-  `ChatFileMsg.inviteState` 新增 `cancelled` 一档，文案「已停止接收」—— 这是**有人按了停止**，
-  不是出错，所以不并进「failed」（此前桌面端把"取消"写成「接收失败」，移动端写成「已拒绝接收」，
-  两端现在同一句话）。
-- 通知气泡里那颗「取消」与它是同一个落点（在会话里点的时候，通知还在就一并收掉）。
+- **两端共用一颗 `TransferRing`**（`src/lib/components/TransferRing.svelte`）：桌面与安卓的文件气泡右侧都是
+  **圆环 + 中心图标**，左侧只留文件名 / 大小 / 状态（含百分比）。不再有独立的底部进度条。
+- **两端同一个样子**：同一颗组件、同一套样式；直径按**各自气泡的字号**配平 —— 安卓 36u
+  （`--u` 按屏宽缩放），桌面 32px（`main.css` 的 `.chat-msg` 覆盖 `--xring-size`）。桌面气泡
+  文字是 13px、安卓是 15u，环在桌面若按 36 画会比安卓大一圈；32 才是同一个观感。中心图标取
+  直径的 42%（安卓 15u / 桌面约 13px），间距交给所在 flex 的 gap。
+  进度弧是**开路径**（`M18 3 A15 15 …`，`pathLength="100"` + 虚线位移），端帽用
+  `stroke-linecap="round"`：闭合圆切出来的两端在部分引擎/版本上不保证圆角，这里不依赖那种画法。
+  线宽桌面补到 3px 的绝对粗细（`--xring-stroke: 3.375` × 32/36），安卓仍是 3u；
+  0% 时整条弧不画（避免零长度虚线的圆头画出一个点）。
+  中心图标用**默认色**（`currentColor`，跟着气泡文字：蓝气泡上是白的、浅底卡片上是深灰），
+  不再按动作涂蓝/涂红；进度弧仍是主色，暂停时整圈转灰（那是状态，不是图标）。
+  待接收那张「接收 / 拒绝」卡不动；接收中 / 发送中 / 等待对方接收 / 已暂停 / 各终态的左侧
+  文件名、大小、状态文字也都不变。
+- **接收端**：进行中 = 暂停键，已暂停 = 继续键，点它 → `set_push_receive_paused(inviteId, paused)`。
+  后端那道闸与浏览下载共用 `DownloadControl`（表是 `AppState::receive_downloads`，键 = invite id；
+  `push_job::ReceiveGate` 随任务退出摘表）：新引擎的 worker **先取到下一批任务、再等闸门**
+  （队列空了就直接退出，暂停不会把收尾挡住），老协议在请求边界与逐块读取之间等闸门 ——
+  两条都不丢已收字节、不重置块位图/offset。暂停时状态文案写「已暂停 · N%」；
+  **暂停之后右端仍然只有这一颗圆环**（点它继续），会话气泡里不再出现「停止接收」；
+  要放弃这条接收走右下角那条通知卡上的「取消」（同一个后端动作）。
+- **发送端**：等同意 / 传输中时同一颗环的中心是停止键，环按这批的进度走。一对一（含群发副本躺在
+  1:1 里那一档）只撤**这一台**（`cancel_push`）；群发 / 群聊那条气泡代表整批（`cancel_push_batch`，
+  后端只动还在等 / 在传的台）。气泡左侧状态同样带百分比。
+- **进度文案**：接收中写「接收中 N%」/「已暂停 · N%」，发送中写「传输中 N%」；环与文字读同一份
+  `pct`（接收侧由 `noteInviteProgress` 写入，发送侧来自 `push://batch`）。不再有 `.cf-bar` / `.fbar`。
+- **发送端通知卡保留**：右下角那张推送卡仍是"整批 + 逐台"的操作台（多台逐行的 ✕ + 卡片级的
+  「取消 / 取消全部」），与气泡里这颗停止是同一个后端动作。接收侧通知气泡的「取消」同理。
+- `cancel_receive` 顺带把待续传任务删掉：**点通知卡上的「取消」= 就是要停**（只有"关掉应用"才走
+  自动续传那条）。`ChatFileMsg.inviteState` 新增 `cancelled` 一档，文案「已停止接收」—— 这是
+  **有人按了停止**，不是出错，所以不并进「failed」（此前桌面端把"取消"写成「接收失败」，
+  移动端写成「已拒绝接收」，两端现在同一句话）。
 
 ### 坑
 
@@ -3098,6 +3161,8 @@ callback, updatedAt }`
   aria-label 说清是哪条）、已停止那条**没有**按钮、状态文案分别是「接收中」/「已停止接收」、点下去
   分别把 `inv-1` 交给回调和调 `cancel_receive`。几何：那颗按钮的右缘与所在行的右缘重合
   （桌面 147=147，移动 204=204）、与行垂直居中 —— 贴在右端，不与状态文字挤在一起。
+  **（后来按用户要求去掉会话气泡里的「停止接收」：暂停后右端只留圆环，见上面那节；这条断言
+  只代表当时那一版。）**
 - **没跑到的一层**：真机上的文件传输（要两台设备）。落盘/重试那一半由上面那条集成测试覆盖，
   界面那一半由上面那次真浏览器烟测覆盖。
 
@@ -3373,11 +3438,11 @@ callback, updatedAt }`
 
 ### 用户报的（原话）
 
-「你看下我现在连着的三星设备，我安装安卓端启动直接是白屏」
+「你看下我现在连着的这台设备，我安装安卓端启动直接是白屏」
 
 ### 根因：那台设备的系统 WebView 是 Chromium 81，而移动端产物的下限是 Chrome 90
 
-实测（`adb`，设备 `c7626a22`，SM-G8750 / Android 10 / SDK 29 / arm64-v8a，装的是 16:59 出的
+实测（`adb`，设备 `c7626a22`，Android 10 / SDK 29 / arm64-v8a，装的是 16:59 出的
 `universal/release` APK，`versionCode 2`）：
 
 - `dumpsys webviewupdate`：当前 WebView = `com.google.android.webview` **81.0.4044.138**，且是**唯一**
@@ -3415,8 +3480,7 @@ callback, updatedAt }`
   拦下而不放行是因为 `market://` 这个 scheme WebView 自己加载不了（unknown scheme），放行只会得到
   一个空白页。同步那条 `run_mobile_plugin` 会阻塞主线程回调 → 只能走异步那条。
 - Kotlin 里**先点名 Play**（`setPackage("com.android.vending")`）再退回让系统挑：`market://` 在这台
-  机器上同时被 Play、Galaxy Store（`samsungapps/.MainForChina`）、华为应用市场
-  （`huawei.appmarket`）三家认领，不点名每次都得先过一张「打开方式」选择框。
+  机器上同时被多个应用商店认领，不点名每次都得先过一张「打开方式」选择框。
 
 ### 校验
 
@@ -3426,7 +3490,7 @@ callback, updatedAt }`
   ES2017 的写法，acorn 当场就把它挑出来了）。
 - 逻辑：Bun 里用最小 DOM 桩跑两遍 —— 能力齐全 → 不出浮层；删掉 `String.prototype.replaceAll` 且
   flex `gap` 量为 0 → 浮层出现、内容含缺项 / `market://` 链接 / 重试按钮，重复执行只留一个。
-- 真机（SM-G8750 / WebView 81）：装上这一版后**兜底页如期出现**（截图里那条主色按钮 133px 高、
+- 真机（WebView 81）：装上这一版后**兜底页如期出现**（截图里那条主色按钮 133px 高、
   通栏），点它 → `dumpsys activity` 里出现
   `Intent { act=android.intent.action.VIEW dat=market://details?id=com.google.android.webview
   flg=0x800000 }`、`launchedFromPackage=com.x177plus.orbdrop`（三家都认领 → 先出系统选择框），
@@ -3434,7 +3498,7 @@ callback, updatedAt }`
 - **顺带实测到的两件事**（写在这是为了让下一个人不用再查一遍）：
   1. 这台机器上**商店救不了它**：`resolve-activity -a MAIN -c LAUNCHER -p com.android.vending`
      → `No activity found`（Play 版本停在 22.6.45-23，`market://` 只匹配到它的 headless
-     `GmsCoreUpdateActivity`），Galaxy Store / 华为应用市场的目录里没有 Google 的 WebView
+     `GmsCoreUpdateActivity`），其他应用商店的目录里没有 Google 的 WebView
      （用户去商店更新得到的答复是"不兼容"）。**唯一出路是侧载**：包名 `com.google.android.webview`
      \+ 同版本的 `com.google.android.trichrome` 共享库（Chrome 87 起 WebView 是 trichrome 架构），
      证书必须是系统那份的同一张 —— 现场用 `apksigner` 验过：`CN=webview, O=Google Inc.`，
@@ -3449,8 +3513,7 @@ callback, updatedAt }`
 ### 这台机器最后是怎么修好的（侧载配方，已实测）
 
 **下载源**：官方没有 —— WebView 只在 Play 分发（官方页面就是 Play 页面），国内渠道拿不到直链（
-应用宝有 `com.google.android.webview` 的页面但只推它自己的客户端；酷安没有这个包；Galaxy Store /
-华为应用市场的目录里没有 Google 的 WebView，"不兼容"就是这么来的）。能用的是 GitHub 上的归档仓库
+第三方应用商店的目录里没有 Google 的 WebView，"不兼容"就是这么来的）。能用的是 GitHub 上的归档仓库
 `JonaNorman/WebViewPackage`（release `google`），而**设备侧直连 GitHub 不通**（ping 通、TLS 拉不动），
 要么走国内加速代理（`ghfast.top` / `ghproxy.net` / `gh-proxy.com` 实测可达，返回的
 `Content-Length` 与 GitHub API 报的字节数一致），要么把包放到我们自己能控的存储上。
@@ -3496,10 +3559,10 @@ callback, updatedAt }`
 
 ### 缘起：为什么会不再指望"更新系统 WebView"
 
-§35 查明那台 SM-G8750 的白屏是"系统 WebView 81 < 产物下限 90"。当时给的处置是侧载一个自包含的
+§35 查明那台真机的白屏是"系统 WebView 81 < 产物下限 90"。当时给的处置是侧载一个自包含的
 Google WebView（实测可行：`119.0.6045.53` 那份装上去界面就起来了）。但把它当**主路径**站不住：
 那台机器上 `com.android.vending` 是 2020 年的残壳（**没有启动界面**，`market://` 只匹配到 headless
-的 `GmsCoreUpdateActivity`）、GMS 停在 `20.21.17`、Galaxy Store 与华为应用市场的目录里都没有 Google
+的 `GmsCoreUpdateActivity`）、GMS 停在 `20.21.17`、其他应用商店的目录里都没有 Google
 的 WebView、手机直连 github 是"ping 通 TLS 拉不动"。依赖用户"自己找到一份能装的包"= 把可用性押在
 别人身上。
 
@@ -3536,10 +3599,10 @@ Google WebView（实测可行：`119.0.6045.53` 那份装上去界面就起来�
    `(0,1,1)` —— 真机上第一次跑，空态那块正好少了 23px 间距（逐元素比对 81 与 119 的 a11y bounds 才看出
    来）。所以生成的每条都带 **`html.lgap`** 前缀（基数抬到 `(0,2,1)`），而 `html.lgap` 这个类**只在
    `engine-floor.js` 真的注入本表时才挂上去** —— 没挂上时全表一条都不生效，等于双保险。
-2. **故意的外边距要保住**：`.fbub .fstop { margin-left: calc(4 * var(--u)) }` 是设计值，会被兜底表盖掉 →
-   生成器把它（以及 `.chatlog > .empty { margin: auto }`、`.mode input` 那几条）**原样再声明一遍**
+2. **故意的外边距要保住**：`.mode input { margin: calc(3 * var(--u)) 0 0 }` 是设计值，会被兜底表盖掉 →
+   生成器把它（以及 `.chatlog > .empty { margin: auto }` 那几条）**原样再声明一遍**
    （基数 `(0,3,1)`）。而 `margin: 0` 那种**不复述** —— 那是重置 `<p>`/`<input>` 的默认外边距，正好该让
-   兜底表的间距生效。生成器会把两类都印出来（`9 条待人工核对`），需要人扫一眼。
+   兜底表的间距生效。生成器会把两类都印出来（`8 条待人工核对`），需要人扫一眼。
 3. **探测函数本身也得在真机上验**：第一版 `flexGapWorks()` 写的是
    `b.offsetLeft - a.offsetLeft >= 10` —— `offsetLeft` 是**位置**不是**间距**：没有 gap 时第二块也紧挨着
    第一块（差值正好 10），于是**逢老引擎必判"支持 gap"**、兜底表永远不注入（真机上量到的症状：81 上
@@ -3575,7 +3638,7 @@ Google WebView（实测可行：`119.0.6045.53` 那份装上去界面就起来�
   `getComputedStyle` 写进 `document.title`，再用 `adb shell uiautomator dump` 读出来（`title` 在无障碍树里是
   一个可读节点）。现代路径读到的 `lgap=- | gapSheet=false | miscSheet=false | p.mt=0px | ic→p1=8` 与降级路径
   一对照，就看得出那一层到底有没有生效 —— 比看截图猜可靠得多（打印完记得删掉那段）。
-- 真机（SM-G8750，**同一版 APK 在两台内核上各跑一遍**，计算样式用上面那个 `document.title` 的办法读）：
+- 真机（**同一版 APK 在两台内核上各跑一遍**，计算样式用上面那个 `document.title` 的办法读）：
   · **WebView 81（降级路径）**：界面完整渲染（无障碍树读到 appbar、空态、标签栏一整套），无兜底页；
     `lgap=lgap | gapSheet=true | miscSheet=true | p.mt=8.45519px | ab2.ml=12.6828px | ic→p1=8 | empty.h=193`。
   · **WebView 119（现代路径）**：`lgap=- | gapSheet=false | miscSheet=false | p.mt=0px | ic→p1=8 | empty.h=194`
@@ -4273,7 +4336,7 @@ F2 把"记录里那个名字"播进了设备行的名字格，于是暴露出一
 | 前端 | 设备 store 多存一份备注表（与设备表**一起拉**，事件刷新时同进同出）；新增 `deviceRemarkOf(peerId)`（行里那份 → 备注表那份）；**`peerShortName` 先看备注**（不管有没有那一行），再走"设备行 → 记录 → id"；群聊发言人名字改成**备注优先**（两处）；`saveDeviceRemark` 三份镜像一起改 |
 | 不动 | 设备列表那一行仍是「备注(设备名)」（`deviceDisplayName`）—— 那里是"挑哪一台机器"的地方 |
 
-**验证**：显示层冒烟换成这一条的正面判据 —— **一行都没有**的设备（不在设备表里）在会话列表里显示的是**备注**（"客厅的手机"）而不是记录里那个设备名（"小米 15"）；隐藏行（只在 `allDevices`）同样备注优先；有备注的行：会话只写备注、设备列表写「备注(设备名)」—— **11/11**。`npm run check` 150 文件 0 错 1 警告（改动前就在的那条）、`npm run build` 通过；`lib` **379 passed / 1 ignored**、`cargo check --all-targets` 0 warning。
+**验证**：显示层冒烟换成这一条的正面判据 —— **一行都没有**的设备（不在设备表里）在会话列表里显示的是**备注**（"客厅的手机"）而不是记录里那个设备名（"示例设备"）；隐藏行（只在 `allDevices`）同样备注优先；有备注的行：会话只写备注、设备列表写「备注(设备名)」—— **11/11**。`npm run check` 150 文件 0 错 1 警告（改动前就在的那条）、`npm run build` 通过；`lib` **379 passed / 1 ignored**、`cargo check --all-targets` 0 warning。
 
 **没做（要说清的一处）**：**给"没有那一行"的设备改备注**仍然要点得进那张表 —— 桌面端右键「修改备注」与移动端的备注底板都要求那一行存在（`ctxRemark` 里 `if (!device) toast('该设备已被移除')`），理由是那张表还要显示"对端**自己的**设备名"。显示这一半已经修好；要连编辑也放开，是另一条（需要定"行不在时那一格写什么"）。
 

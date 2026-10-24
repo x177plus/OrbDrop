@@ -122,7 +122,7 @@ npm run android:build:arm64  # 只编 arm64 的安卓 release 包
 
 打包：`npm run tauri build`（桌面端）、`npm run android:release`（arm64 APK 并安装到设备）、`npm run release`（升版本 + 构建 + 发布到两个发行仓）。`npm run mirror` 启动本机镜像演练台，用来测更新链路。
 
-在一台机器上开多份（拿自己当两台设备测）需要每份各自的数据目录与端口：设 `ORBDROP_ALLOW_MULTI=1` 与对应的 `ORBDROP_DATA_DIR`。
+在一台机器上开多份（拿自己当两台设备测）需要每份各自的数据目录与端口：设 `ORBDROP_ALLOW_MULTI=1` 与对应的 `ORBDROP_DATA_DIR`。这个模式下 mDNS 默认只走回环：局域网上其他机器（包括本机那份正式版）都看不见这些实例。确实需要让调试实例出现在局域网里时，单独给它设 `ORBDROP_MDNS_SCOPE=lan`；完全不广播则设 `off`（手动添加仍然可用）。
 
 发行版产物与更新清单见本仓的[发行版](https://github.com/x177plus/OrbDrop/releases/latest)。
 
