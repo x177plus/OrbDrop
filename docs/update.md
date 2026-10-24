@@ -497,8 +497,9 @@ Gitee 的 `master` 不再承载逐条开发提交，只保留**每个发布版�
   所以客户端编译期常量不用改。
 - Gitee 的 `vX.Y.Z` tag 指向对应的快照提交（`C1`/`C2`/`C3`），Release 附件挂同名 tag；
   `src-vX.Y.Z` 只在 GitHub 保留。
-- 发布脚本里 Gitee 侧改为：`commit-tree HEAD^{tree} -p gitee-mirror` → 推
+- 发布脚本里 Gitee 侧改为：`rev-parse HEAD:` 取根树 → `commit-tree <tree> -p gitee-mirror` → 推
   `gitee-mirror:master` → 打镜像 tag `gitee-vX.Y.Z` 并推到 Gitee 的 `vX.Y.Z`。GitHub 侧完全不变。
+  （不用 `HEAD^{tree}`：Windows 的发布脚本经 cmd 执行，`^` 会被当成转义符吃掉。）
 
 **不要**再往 Gitee 推本仓 `master`。一次 `git push gitee master` 就会把旧历史带回来；建议装
 `.git/hooks/pre-push` 拦住（见下）。

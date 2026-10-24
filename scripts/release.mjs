@@ -378,9 +378,12 @@ function branchOfRepo(cfg) {
  * Gitee 侧只推“发布快照”，不推开发历史。
  *
  * GitHub 的 master 里是开发提交；Gitee 的 master 必须是一条从零开始的快照链，否则一推就把
- * 旧历史带回 Gitee。这里用 `commit-tree HEAD^{tree}` 造一个父提交为 `gitee-mirror` 的新提交
+ * 旧历史带回 Gitee。这里取 `HEAD` 的根树造一个父提交为 `gitee-mirror` 的新提交
  * （整棵树 = 本次发布提交），再把它推到 Gitee 的 manifestBranch。发布 tag 也打在这个快照提交上，
  * Release 附件照旧挂同名 tag。一次性建立快照链见 docs/update.md §19。
+ *
+ * 取树用 `HEAD:` 而不是 `HEAD^{tree}`：Windows 下 `run()` 走 cmd，`^` 是转义符，
+ * 会把 `HEAD^{tree}` 吃成 `HEAD{tree}`（实测 rev-parse 直接失败）。
  */
 function pushGiteeMirror(cfg, tag) {
   const remote = cfg.gitee.remote;
@@ -392,7 +395,7 @@ function pushGiteeMirror(cfg, tag) {
       "先按 docs/update.md §19 建立快照链（只需一次），再发版。",
     );
   }
-  const tree = git(["rev-parse", "HEAD^{tree}"]).stdout.trim();
+  const tree = git(["rev-parse", "HEAD:"]).stdout.trim();
   const mirror = git([
     "-c", `user.name=${cfg.gitee.mirrorAuthorName}`,
     "-c", `user.email=${cfg.gitee.mirrorAuthorEmail}`,
