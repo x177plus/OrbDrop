@@ -156,7 +156,7 @@
     </div>
     <div class="recip-list" role="group" aria-label="局域网设备">
       {#each devices as d (d.id)}
-        <!-- 状态点与状态章和设备页同一套（`stores/devices` 的 `deviceState`）：颜色=能不能送到、形状=有没有长连接。 -->
+        <!-- 状态点与状态章和设备页同一套（`stores/devices` 的 `deviceState`）：颜色=链路，实心/空心=是否已验证。 -->
         {@const st = deviceState(d)}
         <label class="recip-row">
           <input type="checkbox" checked={selected.includes(d.id)} onchange={(e) => toggle(d.id, e.currentTarget.checked)} />
@@ -165,7 +165,7 @@
             <span class="rr-name" title={deviceShortName(d)}>{deviceShortName(d)}</span>
             <span class="rr-ip num">{d.ip}:{d.port}</span>
           </span>
-          <span class="state-chip {st.chip}"><span class="dot {st.dot}"></span>{st.label}</span>
+          <span class="state-chip {st.chip}"><span class="dot {st.dot} {st.trusted ? 'solid' : 'hollow'}"></span>{st.label}</span>
         </label>
       {:else}
         <p class="field-hint">还没有设备：先到「设备」页添加，或等局域网里的设备出现。</p>

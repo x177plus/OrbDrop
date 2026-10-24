@@ -103,6 +103,9 @@
    * 的意思也只有这里说得下）。
    */
   function linkHint(d: PeerDevice): string {
+    if (d.paired && !d.verified) {
+      return '没有钉住这台设备的证书指纹（老记录或凭据缺失）：需要重新配对才能验证身份。';
+    }
     if (!d.online) {
       if (!d.paired) {
         // 未绑定又离线：只有"看得见"过的设备才留得到这一行（见 `visibleDevices`）——
@@ -192,7 +195,7 @@
         el, kind: 'device',
         deviceState: d.connected ? 'connected' : d.paired ? 'paired' : 'unbound',
         online: d.online,
-        needsPair: needsRepair(d),
+        needsPair: needsRepair(d) || !d.verified,
         name: deviceDisplayName(d),
         deviceId: d.id,
       }
@@ -228,12 +231,13 @@
 <div class="list-label dev-label">
   <span class="ll-name"><span class="ll-text">局域网设备</span><Hint>
     <p>
-      <span class="hl">状态点</span>：实心绿=长连接（会收到你拖入悬浮球的广播的就是这几台）、
-      蓝环=已配对在线（能收到，但不会收到自动广播）、灰环=离线、琥珀=本机在等、红=需重新配对；
+      <span class="hl">状态点</span>：<b>实心=已配对且指纹已核对（信任设备），空心=未配对/未验证</b>；
+      颜色：实心绿=长连接（会收到你拖入悬浮球的广播的就是这几台）、蓝=在线（能收到，但不会收到自动广播）、
+      灰=离线、琥珀=本机在等、红=需重新配对（红永远空心：关系失效就不算信任设备）。
       胶囊上那几个字说的是关系与链路，与点不重复 —— 行上不再另挂一枚「自动广播」标签，
       要一眼看出哪几台收得到广播，看状态点的颜色就够（绿只给长连接）。
       <span class="hl">发消息</span>按钮打开与这台设备的会话 —— 消息**长连接优先、HTTP 兜底**：
-      已配对的不点「连接」也能收发，未绑定设备也能收能发（对端名字是它自报的）；
+      已配对的不点「连接」也能收发，未配对设备也能收能发（对端名字是它自报的）；
       对端不在网上时那条消息**排着队**，它一上线就自动发出去（界面那一刻写「等待发送」）；
       <span class="hl">已配对</span>设备点「连接」建立长连接（配对本身不建链）；
       处于<span class="hl">长连接</span>的设备会自动收到你拖入悬浮球文件的广播，无需逐条操作；
@@ -291,7 +295,7 @@
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <ul class="device-list" id="deviceList" bind:this={listEl} onclick={handleDeviceAction}>
     {#each filtered as d (d.id)}
-      <!-- 状态点与状态章同一处判据（`stores/devices` 的 `deviceState`）：颜色=能不能送到、形状=有没有长连接。 -->
+      <!-- 状态点与状态章同一处判据（`stores/devices` 的 `deviceState`）：颜色=链路，填充=是否已验证（实心/空心）。 -->
       {@const st = deviceState(d)}
       <!-- 这台设备"还有几件等你处理"（F-112）：未读消息（会话 store 算好的）＋ 它那边挂着的
            通知（右下角那组气泡里属于它的几条）。两处都有角标了，头像上再来一颗 —— 设备列表
@@ -325,7 +329,7 @@
             <!-- 名字长了这一行只淡不截断（右端渐隐）：悬停给全名（这一栏的全名就是「备注(设备名)」）。 -->
             <span class="d-name-txt" title={deviceDisplayName(d)}>{deviceDisplayName(d)}</span>
             <span class="state-chip {st.chip}" title={linkHint(d)}>
-              <span class="dot {st.dot}"></span>{st.label}
+              <span class="dot {st.dot} {st.trusted ? 'solid' : 'hollow'}"></span>{st.label}
             </span>
           </div>
           <div class="d-ip">{addressLabel(d)}</div>

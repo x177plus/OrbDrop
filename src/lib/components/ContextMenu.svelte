@@ -41,6 +41,7 @@
     onChatCopy,
     onConvoFiles,
     onConvoEdit,
+    onConvoClear,
     onConvoExit,
     onMessage,
   }: {
@@ -127,6 +128,8 @@
     onConvoFiles: () => void;
     /** 会话菜单：编辑收件人与名字（多台会话才有）。 */
     onConvoEdit: () => void;
+    /** 会话菜单：清空群聊的本地记录（**不退群**）。 */
+    onConvoClear: () => void;
     /** 会话菜单：删除群发（消息留在各台会话里）/ 退出群聊（本地删除，并把"没有本机了"的名册广播给其他成员）。 */
     onConvoExit: () => void;
     /** 设备菜单：打开与这台设备的会话。 */
@@ -258,6 +261,12 @@
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 18V8"/><path d="m8 12 4-4 4 4"/><path d="M5 20h14"/></svg>
         升级为群聊
+      </button>
+    {/if}
+    {#if convoThread && !convoBc}
+      <button class="ctx-item" onclick={() => handleItem(onConvoClear)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/><path d="M10 11v5M14 11v5"/></svg>
+        清空聊天记录（不退群）
       </button>
     {/if}
     <button class="ctx-item danger" onclick={() => handleItem(onConvoExit)}>

@@ -13,11 +13,12 @@
   import { getServerPort, setServerPort, loadShares, addShare, removeShare, getShares } from '$lib/stores/shares.svelte';
   import { loadSettings, getSettings } from '$lib/stores/settings.svelte';
   import { getPeerSharesState, loadPeerShares, forgetPeerShares } from '$lib/stores/peers.svelte';
+  import { notePeerDownload, preparePeerDownload, cancelPeerDownload, finishPeerDownload } from '$lib/stores/peerDownloads.svelte';
   import { getBcStatus, loadBcStatus, setLeft, compareWithLeft } from '$lib/stores/bc.svelte';
   import * as chat from '$lib/stores/chat.svelte';
   import type { ConvoThread, ChatItem } from '$lib/stores/chat.svelte';
   import * as upd from '$lib/stores/update.svelte';
-  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, pushPaths, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
+  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, setPushReceivePaused, pushPaths, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
   import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem } from '$lib/types';
   import { shareMeta, updateStatusText, updateTitleText } from '$lib/types';
   import { planExpansion, planCollapse, planDock, planRectDock, spinForDock, type BadgeSpin, type DockAxis, type DockPlan, type ScreenRect } from '$lib/orbLayout';
@@ -125,7 +126,7 @@
   // 右键菜单：开在哪（窗口 CSS px）、开的是什么（`kind` 决定菜单画哪一组），外加一个"这次是
   // 折叠态卡片上开的那一份"的标记（`orb`，见 `orbCtxOpen`）。开与关只有两条路：面板里的各行
   // 派 `od:ctx` 事件（见 `handleCtx`），卡片那一档直接调 `openRectCtx`。
-  type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer' | 'chat' | 'convo'; el?: HTMLElement; shareId?: string; path?: string; isDir?: boolean; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; name?: string; chatId?: string; chatFull?: string; chatSel?: string; convoKey?: string; convoPeerId?: string; convoThread?: boolean; convoBc?: boolean; convoBrowse?: boolean; orb?: boolean; placed?: boolean; menuW?: number; menuH?: number };
+  type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer' | 'chat' | 'convo'; el?: HTMLElement; shareId?: string; path?: string; isDir?: boolean; size?: number; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; name?: string; chatId?: string; chatFull?: string; chatSel?: string; convoKey?: string; convoPeerId?: string; convoThread?: boolean; convoBc?: boolean; convoBrowse?: boolean; orb?: boolean; placed?: boolean; menuW?: number; menuH?: number };
   let ctxState = $state<CtxState | null>(null);
   /**
    * 折叠态卡片上那个右键菜单是不是开着（`ctxState.orb`，见 `openRectCtx`）。
@@ -212,6 +213,16 @@
   let expandedBatches = $state<Record<string, boolean>>({});
   /** 已经收过尾的批次（toast/定时收起只做一次，快照可能连着来好几条终态）。 */
   const settledBatches = new Set<string>();
+  /**
+   * 已经从界面上收掉的批次（墓碑）：迟到的终态快照**不能再把卡片加回来**。
+   *
+   * `push://batch` 对没见过的 batchId 是直接追加的，而 `dropBatch` 之后仍可能来一拍
+   * （对账补账 / `late_success` 纠正 / 初值拉取晚到）—— 没有墓碑，那张已经被用户
+   * 收掉的卡就会原地复活，且再没有任何事件会来收它。
+   */
+  const closedBatches = new Set<string>();
+  /** 墓碑只防迟到事件，留最近这些就够（batchId 是 UUID，不会复用）。 */
+  const CLOSED_BATCHES_MAX = 128;
   // 接收侧：待处理的通知（推送邀请 / 接收中 / 已收到待确认 / 接收失败）。
   // 悬浮球左上角的数字就是这个数组的长度 —— 卡片/气泡撤掉，数字就减。
   type PushNotice = {
@@ -251,6 +262,8 @@
      * 正文要提醒用户"它自称是老搭档，但凭据对不上"。
      */
     unproven?: boolean;
+    /** 邀请路径的 8 位 SAS：两端应显示同一串；`undefined` = 对端版本过旧，无法核对。 */
+    sas?: string;
   };
   let notices = $state<PushNotice[]>([]);
   // 铃铛：展开/收起右下角那组"等你确认"的气泡。收起 ≠ 已读 —— 角标照旧挂着。
@@ -345,6 +358,11 @@
   let updatePct = $derived(
     updateTask?.size ? Math.min(100, Math.round((updateTask.received / updateTask.size) * 100)) : 0,
   );
+  // 一检测到新版就把右下角那组通知打开：铃铛可能被用户收着，而"有新版本"不该等他想起来再点。
+  // 这里只认 `updateTask`（更新这件事本身），用户主动收起铃铛不会让这个 effect 重跑。
+  $effect(() => {
+    if (updateTask?.phase === 'available') notifOpen = true;
+  });
   /**
    * 发送侧那几张卡里**还该进角标**的件数。
    *
@@ -1068,7 +1086,8 @@
       // 「每次询问」下用户在保存框里取消：什么都没发生，别去打开一个不存在的路径。
       if (!copy) return;
       await openPath(copy);
-      toast(`已下载「${slot.name}」的副本并打开`);
+      // 提示只报状态：文件名/路径可能很长，卡片和列表里已经能看全。
+      toast('已下载副本并打开');
     } catch (e) {
       toast(`打开失败：${e instanceof Error ? e.message : String(e)}`);
     }
@@ -1609,6 +1628,9 @@
 
   // Toast
   function toast(msg: string) {
+    // 提示是主面板上的瞬时反馈：面板收着（只剩悬浮球）时一律不弹 —— 通知/进度卡才是
+    // 收起态要看的东西，旧提示排到下次展开再冒出来只会对不上眼前的状态。
+    if (!expanded) return;
     const id = ++toastId;
     toasts = [...toasts, { id, msg, leaving: false }];
     setTimeout(() => {
@@ -1685,9 +1707,10 @@
     }
     if (b.count > 1) {
       const what = `（${b.count} 项）`;
-      return !live ? `已发送${what}` : sending ? `正在发送${what}` : `等待对方同意${what}`;
+      if (live) return sending ? `正在发送${what}` : `等待对方同意${what}`;
+      return b.failed > 0 ? `发送未完成${what}` : `已发送${what}`;
     }
-    if (!live) return `已发送 · ${b.name}`;
+    if (!live) return b.failed > 0 ? `发送未完成 · ${b.name}` : `已发送 · ${b.name}`;
     return sending ? `正在发送 · ${b.name}` : '等待对方同意';
   }
 
@@ -1771,10 +1794,69 @@
     return pushBatches.find((b) => b.targets.some((t) => t.inviteId === inviteId));
   }
 
+  /**
+   * 批次收尾：**所有**走到终态的批次都在这里收，唯一调用点是 `push://batch`。
+   *
+   * 以前单台的收尾挂在 `push://done` 上，可后端有几条路只推进批次快照、不发那条事件
+   * （对账 `apply_push_states` 与超时兜底 `sweep_outbound`）—— 那几拍把 `waiting` 落成 0
+   * 之后，单台卡既没有「取消」也没有「知道了」，就永久钉在右下角。快照本来就是这张卡
+   * 唯一的数据来源（见 `push://batch` 的监听注释），收尾也跟着它走：不管终态是回执、
+   * 对账还是超时写进来的，这一拍就能收掉。
+   *
+   * 手感与原来一字不差：单台成功 toast + 3 秒收；失败/取消一条 toast 立刻收；多台全成
+   * toast + 3 秒收、整批取消或一台没成 toast + 立刻收、部分失败粘住等「知道了」。
+   */
+  function settleBatch(b: PushBatch) {
+    if (settledBatches.has(b.batchId)) {
+      // 已经收过尾：只认「本机推测的失败被对端成功回执改写」这一种后到的终态 ——
+      // 粘住的那张卡这时该跟着走掉（否则它会变成一张没有按钮的卡）。
+      if (batchAllDone(b) && pushBatches.some((x) => x.batchId === b.batchId)) {
+        setTimeout(() => dropBatch(b.batchId), 3000);
+      }
+      return;
+    }
+    settledBatches.add(b.batchId);
+    if (b.targets.length === 1) {
+      const t = b.targets[0];
+      if (t.state === 'done') {
+        toast('已发送完成');
+        setTimeout(() => dropBatch(b.batchId), 3000);
+      } else if (t.state === 'cancelled') {
+        toast('已取消推送');
+        dropBatch(b.batchId);
+      } else {
+        // 对端拒绝 / 对端没有这条邀请 / 传输失败：原因就在快照里（`push://done` 以前带的那句）。
+        toast(t.error ?? '推送失败');
+        dropBatch(b.batchId);
+      }
+      return;
+    }
+    if (batchAllDone(b)) {
+      toast(`已推送给 ${b.targets.length} 台设备`);
+      setTimeout(() => dropBatch(b.batchId), 3000);
+    } else if (b.targets.every((t) => t.state === 'cancelled')) {
+      // 整批取消：卡片立刻收掉（一次确认过的操作已经是终局，没有"哪台没成"要交代）。
+      toast('已取消推送');
+      dropBatch(b.batchId);
+    } else if (b.done === 0) {
+      // 一台没成：没有"部分成功"要交代，一条提示 + 收起（与单台失败同一个手感）。
+      toast(`推送未成功：${b.targets.find((t) => t.error)?.error ?? '全部失败'}`);
+      dropBatch(b.batchId);
+    } else {
+      // 部分成功、有台没成：一条 toast 说不清是哪几台 —— 卡片粘住，等用户点「知道了」。
+      toast(`推送完成：成功 ${b.done} · 失败 ${b.failed}`);
+    }
+  }
+
   function dropBatch(batchId: string) {
-    // 收尾标记跟着卡片一起清：它只在"卡片还挂着、终态快照可能连着来"的那段时间有用
-    // （后端在这一批没有在路上之后就不再发事件了，所以清掉不会让谁重新收一次尾）。
+    // 收尾标记跟着卡片一起清；真正的防复活交给下面的墓碑。
     settledBatches.delete(batchId);
+    closedBatches.add(batchId);
+    while (closedBatches.size > CLOSED_BATCHES_MAX) {
+      const oldest = closedBatches.values().next().value;
+      if (oldest === undefined) break;
+      closedBatches.delete(oldest);
+    }
     pushBatches = pushBatches.filter((b) => b.batchId !== batchId);
     // 「展开」标记也一起清：一个 batchId 只属于一批、卡片走了就不会再来，留着只增不减。
     if (batchId in expandedBatches) {
@@ -1812,7 +1894,7 @@
     }
     picker = {
       title: `推送到${pushTargetsLabel(live)}`,
-      sub: '文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。同一份内容会分别发给每台设备：已配对的直接收，未绑定的各自点同意，进度与成败都记在右下角那张卡片上。',
+      sub: '文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。同一份内容会分别发给每台设备：已配对的直接收，未配对的各自点同意，进度与成败都记在右下角那张卡片上。',
       confirmLabel: live.length > 1 ? `推送到 ${live.length} 台设备` : '推送',
       onConfirm: (items) => void pushPicked(items, live, chatBatchId, groupId),
     };
@@ -2093,7 +2175,7 @@
       deviceId: dev?.id,
       deviceState: dev ? (dev.connected ? 'connected' : dev.paired ? 'paired' : 'unbound') : undefined,
       deviceOnline: dev?.online,
-      deviceNeedsPair: dev ? needsRepair(dev) : undefined,
+      deviceNeedsPair: dev ? (needsRepair(dev) || !dev.verified) : undefined,
     };
   }
 
@@ -2209,6 +2291,19 @@
    * - 群发 = 「删除群发」：删的是这份名单，**消息一条不动**（它们本来就在各台会话里）；
    * - 群聊 = 「退出群聊」：本机从名册里退掉（后端收掉本机与这个群的关系），其余成员不受影响。
    */
+  /** 群聊菜单：只清本地记录，不退群（之后的新消息照常收）。 */
+  async function ctxConvoClear() {
+    const c = ctxState;
+    hideCtx();
+    if (!c?.convoKey || !c.convoThread || c.convoBc) return;
+    try {
+      await chat.clearGroupHistory(c.convoKey);
+      toast('已清空这个群的本地聊天记录（未退群）');
+    } catch (e) {
+      toast(String(e));
+    }
+  }
+
   async function ctxConvoExit() {
     const c = ctxState;
     hideCtx();
@@ -2283,7 +2378,7 @@
    *
    * 路径都在 `chat` 里：文件消息自己发的记着**本机那个源文件**（选文件时就有的 `LocalPick.path`），
    * 对端推来的在收完时拿到落盘位置（`push://done` 的 `dest`）；**图片消息**记的是会话内容
-   * （`<数据目录>/chat-blobs/` 那一份，见 `blobs`）。所以这里只管开 —— 与文件标签页里双击一格
+   * （`<数据目录>/chat-vault/blobs/` 那一份，见 `blobs`）。所以这里只管开 —— 与文件标签页里双击一格
    * 是同一个落点（`openRectFile`），失败时报原话而不是装成功。
    *
    * 点得早（还在传输、或那一条本来就没路径）就什么都不做：路径还没有，开不了。
@@ -2431,21 +2526,50 @@
   }
 
   /**
-   * 会话里那张**正在接收**的卡上那颗停止：撤掉这条接收（`cancel_receive`）。
+   * 会话里接收气泡右侧那颗圆环：接收中 → 暂停，已暂停 → 继续。
    *
-   * 与通知里那颗「取消」同一个落点（右下角那条通知还在时连它一起收掉）—— 后端把那条邀请取走、
-   * 告诉发送方、并把"待续传任务"一并删掉：**用户喊停就是喊停**，重启之后不会再自己接着收
-   * （只有"关掉应用"才有那一条）。界面不用自己改那条文件消息：随后那条
-   * `push://done{cancelled}` 会把它落成「已停止接收」。
+   * 与安卓同一条命令（`set_push_receive_paused`）、同一套忙态处理：先翻界面，后端说这条
+   * 已经收尾时就安静地退回"未暂停" —— 终局有自己的事件，这里再报一句只会自相矛盾。
    */
-  async function stopReceive(inviteId: string) {
-    const notice = notices.find((n) => n.inviteId === inviteId);
-    if (notice) {
-      await cancelNotice(notice);
-      return;
-    }
+  async function toggleChatReceivePause(inviteId: string) {
+    const before = chat.invitePaused(inviteId);
+    const want = !before;
+    chat.setInvitePaused(inviteId, want);
     try {
-      await cancelReceive(inviteId);
+      const ok = await setPushReceivePaused(inviteId, want);
+      if (!ok) {
+        chat.setInvitePaused(inviteId, false);
+        return;
+      }
+      if (chat.inviteReceiving(inviteId)) {
+        toast(want ? '已暂停接收' : '已继续接收');
+      }
+    } catch (e) {
+      chat.setInvitePaused(inviteId, before);
+      toast(String(e));
+    }
+  }
+
+  /**
+   * 会话里自己发出去的文件气泡右侧那颗停止：取消这条推送。
+   *
+   * 一对一（含群发副本躺在 1:1 里那一档）只撤**这一台**；群发 / 群聊那条气泡代表整批，
+   * 走 `cancel_push_batch`（后端逐台撤、只动还在等 / 在传的）。右下角那张推送卡上的取消
+   * 保留 —— 那是"整批 + 逐台"的操作台，气泡这颗是随手停掉眼前这一条，两处是同一个后端动作。
+   */
+  async function stopChatSend(item: ChatItem) {
+    if (item.kind !== 'file') return;
+    const t = chat.activeThread();
+    if (!t) return;
+    const peerId = t.mode === 'direct' ? t.participants[0] : '';
+    const invites = chat.outgoingWaitingInvites(item, peerId);
+    if (invites.length === 0) return;
+    try {
+      if (peerId === '' && item.batchId) {
+        await cancelPushBatch(item.batchId);
+        return;
+      }
+      for (const inviteId of invites) await cancelPush(inviteId);
     } catch (e) {
       toast(String(e));
     }
@@ -2662,9 +2786,9 @@
       dropNotice(old.inviteId);
       void cancelPairInvite(old.inviteId).catch(() => {});
     }
-    let inviteId: string;
+    let start: { inviteId: string; sas: string };
     try {
-      inviteId = await pairInvite(ps.peerId);
+      start = await pairInvite(ps.peerId);
     } catch (e) {
       if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
       // 邀请就是一次到对端的 POST：投不出去时，这一台是不是"看得见却直连不通"要说清楚。
@@ -2675,13 +2799,14 @@
     const name = ps.peerName ?? '设备';
     closePair();
     notices = [...notices, {
-      inviteId,
+      inviteId: start.inviteId,
       kind: 'pairWait',
       peerId: ps.peerId,
       from: name,
       name: '', size: 0, isDir: false, count: 1, received: 0,
+      sas: start.sas,
     }];
-    toast(`已向「${name}」发起配对邀请：对方在通知里点「接收」即配对成功`);
+    toast(`已向「${name}」发起配对邀请：核对码一致后由对方点「接收」`);
   }
 
   function copyCode() {
@@ -2748,7 +2873,7 @@
       const saved = await downloadFile(c.shareId, c.path ?? '');
       // 保存框里取消 = 不落盘：静默收场（不是失败，所以不弹提示）。
       if (!saved) return;
-      toast(`已下载到 ${saved}`);
+      toast('已下载到本地');
     } catch (e) {
       toast(`下载失败：${e}`);
     }
@@ -2769,16 +2894,25 @@
     }
   }
 
-  /** 对端文件下载：走后端命令（token 取凭据库、落盘按下载目录设置都在 Rust 侧）。 */
+  /** 对端文件下载：走后端命令（token 取凭据库、落盘按下载目录设置都在 Rust 侧）。
+   *
+   *  下载前先把列表里已经知道的大小登记给进度 store（`browse://download` 只报已收字节）：
+   *  那一行的背景底色就会按 `received / total` 从文件图标推进到大小文字右端。 */
   async function ctxPeerDownload() {
     const c = ctxState;
     hideCtx();
     if (c?.kind !== 'peer' || !c.peerId || !c.shareId) return;
+    const path = c.path ?? '';
+    preparePeerDownload(c.peerId, c.shareId, path, c.size ?? 0);
     try {
-      const saved = await downloadFromPeer(c.peerId, c.shareId, c.path ?? '', c.name);
+      const saved = await downloadFromPeer(c.peerId, c.shareId, path, c.name);
       // 保存框里取消 = 不落盘（与「本机共享项下载」同一个口径）。
-      if (!saved) return;
-      toast(`已下载到 ${saved}`);
+      if (!saved) {
+        cancelPeerDownload(c.peerId, c.shareId, path);
+        return;
+      }
+      finishPeerDownload(c.peerId, c.shareId, path);
+      toast('已下载到本地');
     } catch (e) {
       toast(`下载失败：${e}`);
     }
@@ -2850,7 +2984,7 @@
       // 关系没了：这台对本机可见的共享项缓存一起清 —— 留着的话，`states` 会随配对记录一直累积
       // （按 peer id 存），且它下次上线/重新配对时界面会先显示一份已经不成立的清单。
       forgetPeerShares(deviceId);
-      toast('已解除配对（对方在线时会继续显示为「未绑定」）');
+      toast('已解除配对（对方在线时会继续显示为「未配对」）');
     } catch (e) {
       toast(`解除配对失败：${e}`);
     }
@@ -2881,8 +3015,8 @@
       return;
     }
     try {
-      const s = await setLeft(target);
-      toast(`已放入左侧比较位：${s?.label ?? target.label ?? ''}`);
+      await setLeft(target);
+      toast('已放入左侧比较位');
     } catch (e) {
       toast(`设置左侧比较位失败：${e}`);
     }
@@ -2904,7 +3038,7 @@
     }
     try {
       await compareWithLeft(target);
-      toast(`已在 BeyondCompare 中打开比较：${slot.label} ↔ ${target.label ?? ''}`);
+      toast('已在 BeyondCompare 中打开比较');
     } catch (e) {
       toast(`BeyondCompare 启动失败：${e}`);
     }
@@ -2939,8 +3073,19 @@
         await Promise.all([settingsReady, loadDevices(), loadBcStatus()]);
         // 发送侧那张卡的**初值**：重启后恢复出来的批次只会躺在后端，`push://batch` 是"变化"
         // 不是初值 —— 不拉这一次，用户会看到"没传完的推送不见了"（见 `push_batches`）。
+        //
+        // **只补还在路上的**：已结算的批次不会再有任何事件来收它（前端也没有第二处清理），
+        // 拉进来就是一张既无「取消」也无「知道了」的僵尸卡 —— 宁可没有通知，也不留一张
+        // 点不掉的。拉取期间已经由事件推进/收掉的，以事件那份为准（按 batchId 只补缺）。
         try {
-          pushBatches = await pushBatchesApi();
+          const fetched = await pushBatchesApi();
+          const known = new Set(pushBatches.map((b) => b.batchId));
+          pushBatches = [
+            ...pushBatches,
+            ...fetched.filter(
+              (b) => b.waiting > 0 && !known.has(b.batchId) && !closedBatches.has(b.batchId),
+            ),
+          ];
         } catch (e) {
           console.error('读取推送批次失败:', e);
         }
@@ -3020,31 +3165,19 @@
     // 自动/立刻收掉，与以前一模一样）和"多台的收尾方式"（全成自动收；有失败就粘住等确认）。
     const unPushBatch = listen<PushBatch>('push://batch', (ev) => {
       const b = ev.payload;
+      // 已经收掉的卡不许复活：迟到的快照（对账补账 / late_success 纠正 / 初值拉取晚到）
+      // 只说明后端那一份，界面这张已经按用户的动作（或自动收尾）走掉了。
+      if (closedBatches.has(b.batchId)) return;
       pushBatches = pushBatches.some((x) => x.batchId === b.batchId)
         ? pushBatches.map((x) => (x.batchId === b.batchId ? b : x))
         : [...pushBatches, b];
       // 会话里那几条文件消息的进度与成败，抄的就是这张快照（唯一的进度来源）。
       chat.noteBatch(b);
 
-      // 单台那条路由 push://done 收尾（toast 文案与原来一字不差），这里不插手。
-      if (b.targets.length === 1 || settledBatches.has(b.batchId)) return;
-      if (batchLive(b)) return;
-      settledBatches.add(b.batchId);
-      if (batchAllDone(b)) {
-        toast(`已推送给 ${b.targets.length} 台设备`);
-        setTimeout(() => dropBatch(b.batchId), 3000);
-      } else if (b.targets.every((t) => t.state === 'cancelled')) {
-        // 整批取消：卡片立刻收掉（一次确认过的操作已经是终局，没有"哪台没成"要交代）。
-        toast('已取消推送');
-        dropBatch(b.batchId);
-      } else if (b.done === 0) {
-        // 一台没成：没有"部分成功"要交代，一条提示 + 收起（与单台失败同一个手感）。
-        toast(`推送未成功：${b.targets.find((t) => t.error)?.error ?? '全部失败'}`);
-        dropBatch(b.batchId);
-      } else {
-        toast(`推送完成：成功 ${b.done} · 失败 ${b.failed}`);
-        // 剩下的交给卡片上的「知道了」——一条 toast 说不清是哪几台。
-      }
+      // **所有**终态都在这里收：快照是发送侧卡片唯一的数据来源，后端哪条路把 `waiting`
+      // 落到 0（对端回执 / 对账补账 / 超时兜底）都能收掉。以前单台交给 `push://done`，
+      // 而后两条路根本不发它 —— 那张卡就成了没有按钮的僵尸（见 `settleBatch`）。
+      if (b.waiting === 0) settleBatch(b);
     });
 
     const unPushResponse = listen<{ inviteId: string; accepted: boolean; reason?: string | null }>('push://response', (ev) => {
@@ -3085,10 +3218,25 @@
       // 发送侧那张卡的进度由 `push://batch` 快照推进（同一份数据只有一个来源）。
     });
 
+    // 对端共享项的手动下载（右键「下载到本地」/ 双击打开）：进度由后端 `browse://download`
+    // 事件推来。桌面端那一行用它画从左到右的背景底色（见 `peerDownloads` 与 main.css）。
+    const unBrowseDownload = listen<{
+      peerId: string;
+      shareId: string;
+      path: string;
+      name: string;
+      status: 'progress' | 'done' | 'error';
+      received: number;
+      dest?: string | null;
+      error?: string | null;
+    }>('browse://download', (ev) => {
+      notePeerDownload(ev.payload);
+    });
+
     const unPushDone = listen<{ inviteId: string; status: string; reason?: string | null; dest?: string }>('push://done', (ev) => {
       const { inviteId, status, reason, dest } = ev.payload;
       // `dest` 一并带给会话 store：收完那条气泡上的「打开」按它去开（见 `ChatFileMsg.path`）。
-      // `cancelled` 单列一档：那是有人按了停止（本机那颗，或发送方撤销），不是"接收失败"。
+      // `cancelled` 单列一档：那是有人点了取消（本机通知卡上的「取消」，或发送方撤销），不是"接收失败"。
       chat.noteInviteDone(
         inviteId,
         status === 'completed' ? 'received' : status === 'cancelled' ? 'cancelled' : 'failed',
@@ -3097,7 +3245,7 @@
       const notice = notices.find((n) => n.inviteId === inviteId);
       if (notice) {
         if (status === 'completed') {
-          toast(`已收到「${notice.name}」`);
+          toast('已收到文件');
           // 收完 ≠ 处理完：转成一条**待确认**的通知挂在右下角气泡里，直到用户点
           // 「知道了」才消失 —— 否则"东西落在哪"会跟着 toast 一起蒸发掉。
           notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'done', received: n.size, dest } : n));
@@ -3107,17 +3255,8 @@
           notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'failed', error: reason ?? '接收失败' } : n));
         }
       }
-      // 发送侧：**只有单台那一批**在这里收尾（toast 文案与原来一字不差）；多台的收尾
-      // 归 `push://batch`（那里才知道整批成了几台、还有没有在等的）。
-      const b = batchForInvite(inviteId);
-      if (!b || b.targets.length !== 1) return;
-      if (status === 'completed') {
-        toast(`「${b.name}」已发送完成`);
-        setTimeout(() => dropBatch(b.batchId), 3000);
-      } else {
-        toast(status === 'cancelled' ? '已取消推送' : (reason ?? '推送失败'));
-        dropBatch(b.batchId);
-      }
+      // 发送侧那张卡**不在这里**收尾：它的终态由 `push://batch` 快照驱动（见 `settleBatch`）
+      // —— 对账补账 / 超时兜底那两条路根本不发这条事件，只靠它就会漏出一张没有出口的卡。
     });
 
     const unPaired = listen('devices://changed', () => {
@@ -3192,7 +3331,7 @@
 
     // 收到一条配对邀请 → 挂一条通知（带「接收/拒绝」），悬浮球左上角的数字 +1。
     // **不主动弹面板**：与推送邀请同一套约定（F-51），人来点那颗球。
-    const unPairInvite = listen<{ inviteId: string; peerId: string; peerName: string; unproven?: boolean }>('pair://invite', (ev) => {
+    const unPairInvite = listen<{ inviteId: string; peerId: string; peerName: string; unproven?: boolean; sas?: string | null }>('pair://invite', (ev) => {
       const p = ev.payload;
       notices = [...notices, {
         inviteId: p.inviteId,
@@ -3205,6 +3344,7 @@
         count: 1,
         received: 0,
         unproven: p.unproven === true,
+        sas: p.sas ?? undefined,
       }];
     });
 
@@ -3297,7 +3437,7 @@
           const slotFor = detail.kind === 'peer' || detail.isDir !== false ? 'folder' : 'file';
           void loadBcStatus(slotFor);
         }
-        ctxState = { x: detail.x, y: detail.y, el: detail.el, kind: detail.kind, shareId: detail.shareId, path: detail.path, isDir: detail.isDir, deviceState: detail.deviceState, deviceOnline: detail.online, deviceNeedsPair: detail.needsPair, deviceId: detail.deviceId, peerId: detail.peerId, name: detail.name };
+        ctxState = { x: detail.x, y: detail.y, el: detail.el, kind: detail.kind, shareId: detail.shareId, path: detail.path, isDir: detail.isDir, size: detail.size, deviceState: detail.deviceState, deviceOnline: detail.online, deviceNeedsPair: detail.needsPair, deviceId: detail.deviceId, peerId: detail.peerId, name: detail.name };
       }
     };
     document.addEventListener('od:ctx', handleCtx);
@@ -3326,6 +3466,7 @@
       unPushBatch.then(fn => fn());
       unPushResponse.then(fn => fn());
       unPushProgress.then(fn => fn());
+      unBrowseDownload.then(fn => fn());
       unPushDone.then(fn => fn());
       unPaired.then(fn => fn());
       unLocalOnline.then(fn => fn());
@@ -3514,10 +3655,8 @@
       </span>
     </footer>
 
-    <!-- 面板底部堆叠层（`column-reverse`：**DOM 里靠前的元素贴底** —— 谁写在前面，谁最靠近
-         footer）。顺序 = 通知气泡 → 发送进度卡 → 提示：通知要贴右下角、就落在 footer 上缘；
-         进度卡与瞬时提示往上叠。放在 panel 里而不是顶层：面板收起时 opacity:0，
-         这一列结构上就不可能画进那个 90px 的悬浮球窗口。 -->
+    <!-- 面板右下角的通知层（`column-reverse`：DOM 里靠前的元素贴底）。通知组贴 footer 上缘，
+         进度卡往上叠。瞬时提示不在这里 —— 见舞台外那一层 `.toast-stack`。 -->
     <div class="panel-bottom">
       <!-- 通知组（面板右下角的气泡组）：未绑定的邀请（带接收/拒绝）、正在接收（进度 + 取消）、
            已收到待确认、接收失败，外加**发送侧的进度卡**与**「更新这件事」**（启动时的静默
@@ -3616,12 +3755,28 @@
                   <span class="c-name">{n.from}</span>
                 </div>
                 <p class="nb-body">{noticeBody(n)}</p>
+                {#if n.sas}
+                  <div class="sas-line">
+                    <span class="sas-label">核对码</span>
+                    <span class="sas-code num">{n.sas}</span>
+                    <span class="sas-hint">和对方屏幕上的这串一致再点「接收」</span>
+                  </div>
+                {:else}
+                  <p class="sas-hint warn">对方版本过旧，无法核对身份；建议拒绝并改用配对码。</p>
+                {/if}
                 <div class="nb-acts">
                   <button class="btn btn-secondary btn-sm" onclick={() => void rejectPairNotice(n)}>拒绝</button>
                   <button class="btn btn-primary btn-sm" onclick={() => void acceptPairNotice(n)}>接收</button>
                 </div>
               {:else if n.kind === 'pairWait'}
                 <p class="nb-body">{noticeBody(n)}</p>
+                {#if n.sas}
+                  <div class="sas-line">
+                    <span class="sas-label">核对码</span>
+                    <span class="sas-code num">{n.sas}</span>
+                    <span class="sas-hint">对方屏幕应显示同一串；不一致就取消这次邀请</span>
+                  </div>
+                {/if}
                 <div class="nb-acts">
                   <button class="btn btn-secondary btn-sm" onclick={() => void cancelPairWaitNotice(n)}>取消</button>
                 </div>
@@ -3729,7 +3884,10 @@
                   <button class="btn btn-secondary btn-sm" onclick={() => void cancelBatch(b.batchId)}>
                     {b.targets.length > 1 ? '取消全部' : '取消'}
                   </button>
-                {:else if batchSticky(b)}
+                {:else}
+                  <!-- 只要卡还挂着就一定有出口：`settleBatch` 正常会把已结算的卡收掉，这一颗
+                       是最后一道保护 —— 单台卡错过收尾（迟到的快照 / 对账补账）时，绝不允许
+                       出现一张既没有「取消」也没有「知道了」的通知。 -->
                   <button class="btn btn-secondary btn-sm" onclick={() => dropBatch(b.batchId)}>知道了</button>
                 {/if}
               </div>
@@ -3737,17 +3895,6 @@
           {/each}
         </div>
       {/if}
-
-      <div class="toast-stack">
-        {#each toasts as t (t.id)}
-          <div class="toast" class:leaving={t.leaving}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 3v12M7 10l5 5 5-5M5 19h14"/>
-            </svg>
-            {t.msg}
-          </div>
-        {/each}
-      </div>
     </div>
 
     <!-- Settings sheet -->
@@ -3873,7 +4020,8 @@
       onSendFiles={chatSendFiles}
       onAcceptInvite={chatAcceptInvite}
       onRejectInvite={chatRejectInvite}
-      onStopReceive={(id) => void stopReceive(id)}
+      onToggleReceivePause={(id) => void toggleChatReceivePause(id)}
+      onStopSend={(item) => void stopChatSend(item)}
       onConvoCtx={openConvoCtx}
       onMessageCtx={openMessageCtx}
       onOpenFile={(item) => void openChatFile(item)}
@@ -3896,6 +4044,28 @@
 
   </section>
 </aside>
+
+<!-- 瞬时提示层：必须挂在 `.orb-stage` 之外。舞台是 z-index 20 的层叠上下文，留在里面
+     就压不过舞台外的右键菜单（60）与悬停说明（100）；挂到顶层后这里是真正的最上层。
+     位置仍贴着面板 footer 上缘（面板四周 slack + footer 高，两个数都来自 App 的测量）。
+     只有面板开着才会有点（`toast()` 在收起态直接丢弃），所以收起时这一层是空的；
+     它也不吃点击，压住什么都不会挡操作。容器常驻（不随提示有无增删）——
+     `aria-live` 区域要先在 DOM 里，后插进来的内容才会被读屏播报。 -->
+<div
+  class="toast-stack"
+  role="status"
+  aria-live="polite"
+  style="--panel-slack: {PANEL_SLACK}px; --foot-h: {footH}px"
+>
+  {#each toasts as t (t.id)}
+    <div class="toast" class:leaving={t.leaving} title={t.msg}>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3v12M7 10l5 5 5-5M5 19h14"/>
+      </svg>
+      <span class="toast-msg">{t.msg}</span>
+    </div>
+  {/each}
+</div>
 
 <!-- 悬停说明的气泡层：必须挂在 `.orb-stage` 之外 —— 面板里的滚动容器会裁掉它，
      对话框的 `backdrop-filter` 还会把 `position: fixed` 改成相对对话框定位。 -->
@@ -3943,6 +4113,7 @@
     onConvoFiles={ctxConvoFiles}
     onConvoEdit={ctxConvoEdit}
     onConvoUpgrade={() => void ctxConvoUpgrade()}
+    onConvoClear={() => void ctxConvoClear()}
     onConvoExit={() => void ctxConvoExit()}
     onPeerDownload={ctxPeerDownload}
     onBcCompare={ctxBcCompare}

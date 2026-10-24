@@ -166,11 +166,14 @@ export function pairConfirm(peerId: string, code: string): Promise<string> {
   return invoke('pair_confirm', { peerId, code });
 }
 
+/** 发起邀请的返回：邀请 id + 这次邀请的 8 位 SAS（两端屏幕应显示同一串）。 */
+export type PairInviteStart = { inviteId: string; sas: string };
+
 /**
  * 发起配对邀请（F-12 免配对码）：对端在它自己的通知里点「接收」即可配对，谁都不用输码。
- * 返回邀请 id；对方接受后走 `pair://completed`，拒绝/超时/撤回走 `pair://invite_failed`。
+ * 返回邀请 id 与 SAS；对方接受后走 `pair://completed`，拒绝/超时/撤回走 `pair://invite_failed`。
  */
-export function pairInvite(peerId: string): Promise<string> {
+export function pairInvite(peerId: string): Promise<PairInviteStart> {
   return invoke('pair_invite', { peerId });
 }
 
@@ -338,8 +341,18 @@ export function cancelReceive(inviteId: string): Promise<void> {
   return invoke('cancel_receive', { inviteId });
 }
 
+/**
+ * 暂停 / 继续一次**会话里正在接收**的推送（界面上那条文件气泡右侧的圆环）。
+ *
+ * 与 `setBrowseDownloadPaused` 同一个闸门：暂停只让接收在下一块之前停住，已收字节与
+ * `.orbdrop-part` 都留着。`false` = 那条接收已经收尾（完成 / 失败 / 取消），界面据此退回。
+ */
+export function setPushReceivePaused(inviteId: string, paused: boolean): Promise<boolean> {
+  return invoke('set_push_receive_paused', { inviteId, paused });
+}
+
 // 会话（聊天）：文本消息走长连接（后端 `chat.rs` / `WsEvent::ChatText` + `ChatRead`），
-// 会话记录落在 `chat.json` 里。命令一律返回**整份会话状态** —— 界面不做增量演算。
+// 会话记录落在 `chat.dat` 里。命令一律返回**整份会话状态** —— 界面不做增量演算。
 /** 整份会话状态（面板打开时拉一次，之后由 `chat://changed` 事件推进）。 */
 export function chatSnapshot(): Promise<ChatSnapshot> {
   return invoke('chat_snapshot');
@@ -405,7 +418,7 @@ export function chatFilesSet(peerId: string, files: ChatFileMsg[]): Promise<Chat
  * 发一张**图片消息**给一台或多台设备（输入框里粘一张图就是走这一条）。
  *
  * `path` 是本机那份**暂存**图片（粘贴那一刻就落下的）；后端把字节读进来、落成会话内容
- * （`<数据目录>/chat-blobs/`）再发出去。**图片是消息内容，不是推送文件**：对端直接就能看，
+ * （`<数据目录>/chat-vault/blobs/`）再发出去。**图片是消息内容，不是推送文件**：对端直接就能看，
  * 没有"接收 / 同意"那一步 —— 所以它不走 `pushPaths`。
  *
  * 超过上限（`blobs::MAX_IMAGE_BYTES`，8 MB）会当场 reject，**不会**偷偷改走推送。
@@ -487,6 +500,14 @@ export function groupLeave(id: string): Promise<ChatSnapshot> {
   return invoke('group_leave', { id });
 }
 
+/**
+ * 清空一个群的本地聊天记录（**不退群**）：名册/成员关系保留，之后的新消息照常收。
+ * 其他成员不受影响；补拉也不会把清掉的历史拉回来。
+ */
+export function groupClearHistory(id: string): Promise<ChatSnapshot> {
+  return invoke('group_clear_history', { id });
+}
+
 // BeyondCompare（本机 / 长连接设备的共享项）。**左侧槽只有一处存储**：BC 自己的
 // `SavedFileLeft`/`SavedFolderLeft` 注册表值 —— 资源管理器右键那套「选择左侧 / 对比」用的就是
 // 它，所以这三个命令读写的是同一处：谁放左侧谁覆盖它（两个值名都写，见 `bc.rs::write_slot`）。
@@ -520,6 +541,16 @@ export function downloadFile(shareId: string, pathInShare: string): Promise<stri
 
 export function downloadFromPeer(peerId: string, shareId: string, pathInShare: string, fileName?: string): Promise<string | null> {
   return invoke('download_from_peer', { peerId, shareId, pathInShare, fileName: fileName ?? null });
+}
+
+/** 暂停 / 继续一次对端浏览下载；`false` = 那条下载已经结束。 */
+export function setBrowseDownloadPaused(
+  peerId: string,
+  shareId: string,
+  pathInShare: string,
+  paused: boolean,
+): Promise<boolean> {
+  return invoke('set_browse_download_paused', { peerId, shareId, pathInShare, paused });
 }
 
 export function downloadAndOpen(shareId: string, pathInShare: string): Promise<string | null> {
@@ -556,9 +587,19 @@ export function requestIgnoreBatteryOptimizations(): Promise<void> {
   return invoke('request_ignore_battery_optimizations');
 }
 
-/** 跳到 ROM 的「自启动 / 后台活动」页；返回实际打开的是哪一页（华为那三个开关都在那一页上）。 */
+/** 跳到 ROM 的「自启动 / 后台活动」页；返回实际打开的是哪一页（各家把那几个开关放在同一页上）。 */
 export function openAutoStartSettings(): Promise<OpenedPage> {
   return invoke('open_autostart_settings');
+}
+
+/**
+ * 跳到 ROM 的「后台耗电管理」页（「允许后台运行 / 允许后台高耗电」通常在那里）。
+ *
+ * 它和自启动、电池优化白名单都不是一回事：部分厂商 ROM 会在熄屏后把前台服务进程冻住，
+ * 只开前两项挡不住（真机证据见 `docs/p1-implementation.md` §22）。
+ */
+export function openBackgroundPowerSettings(): Promise<OpenedPage> {
+  return invoke('open_background_power_settings');
 }
 
 /** 首次引导给他看过了没有（写在配置文件里，跨重启有效；重装会清掉、于是重新问一次）。 */
@@ -576,7 +617,7 @@ export function notificationState(): Promise<NotifyState> {
   return invoke('notification_state');
 }
 
-/** 跳本应用的通知设置页（华为那一层「静默通知 / 横幅」就在这页上）。 */
+/** 跳本应用的通知设置页（部分厂商 ROM 的「静默通知 / 横幅」开关就在这页上）。 */
 export function openNotificationSettings(): Promise<void> {
   return invoke('open_notification_settings');
 }

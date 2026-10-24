@@ -3,12 +3,12 @@ import { formatFileSize } from '$lib/types';
 import { hasContent, revokeSegs, type ComposerSeg } from '$lib/composer';
 import type { ChatDelivery, ChatFileMsg, ChatGroup, ChatGroupMsg, ChatSnapshot, ChatMessage, ChatPeerConvo, ConvoMode, LocalPick, PendingGroup, PushBatch, PushInvite, PushTargetState } from '$lib/types';
 import * as api from '$lib/api';
-import { getDevices, deviceById, deviceDotState, threadDotState, peerShortName, type DeviceDotState } from './devices.svelte';
+import { getDevices, deviceById, deviceState, threadDotState, threadTrusted, peerShortName, type DeviceDotState } from './devices.svelte';
 
 /**
  * 会话（聊天）：后端那份记录在前端的影子 + 会话界面自己的状态。
  *
- * **一份真相在后端**（`chat.json` + `chat://changed` 事件，载荷是整份快照）：这一层只做
+ * **一份真相在后端**（`chat.dat` + `chat://changed` 事件，载荷是整份快照）：这一层只做
  * "拿来就换"（`replace`），不做增量演算 —— 独立演算的第二份状态迟早跟后端对不上，而会话
  * 是人打字的速度，整份换的开销可以忽略（与推送卡片 `push://batch` 同一个取舍）。
  *
@@ -27,7 +27,7 @@ import { getDevices, deviceById, deviceDotState, threadDotState, peerShortName, 
  * 三处都要能开到同一个会话，状态必须有一个共同的家。
  *
  * **文件消息**（`files`，设备 id → 那几条）：会话里那条"发了 / 收到了一个文件"的气泡。
- * 它与文本**同处落盘**（后端 `chat.json` 的 `ChatFileMsg`，`chatFilesSet` 是写入口）——以前
+ * 它与文本**同处落盘**（后端 `chat.dat` 的 `ChatFileMsg`，`chatFilesSet` 是写入口）——以前
  * 它只活在本机内存里，重启就丢：只发过文件、没说过话的会话整条从列表里消失（见 `convoRows`），
  * 重发一条文本把它拉回来时文件那几条也回不来了。
  *
@@ -40,7 +40,7 @@ import { getDevices, deviceById, deviceDotState, threadDotState, peerShortName, 
  */
 
 /** 会话浮层没数据时的占位（只读，别改）。 */
-const EMPTY_SNAPSHOT: ChatSnapshot = { convos: [], batches: [], groups: [], pendingGroups: [], unread: 0 };
+const EMPTY_SNAPSHOT: ChatSnapshot = { rev: 0, convos: [], batches: [], groups: [], pendingGroups: [], unread: 0 };
 
 let snapshot = $state<ChatSnapshot>(EMPTY_SNAPSHOT);
 /** 会话浮层展开着（底栏那颗「会话」按钮）。 */
@@ -53,6 +53,13 @@ let draft = $state<Record<string, ComposerSeg[]>>({});
 let recipientReq = $state<RecipientReq | null>(null);
 /** 文件消息：设备 id → 那几条（见文件头说明）。启动时由 `seedFiles` 从快照种下。 */
 let files = $state<Record<string, ChatFileMsg[]>>({});
+/**
+ * 会话里**正在接收**的推送被用户按了暂停的那些邀请（`inviteId → true`）。
+ *
+ * **只在内存里、不落盘**：暂停是"这一轮进程里的这个任务"的状态，与「浏览」下载同一档 ——
+ * 重启后接收任务按续传记录自己接着跑，界面不该还停在「已暂停」。收完 / 失败 / 取消时清掉。
+ */
+let receivePaused = $state<Record<string, boolean>>({});
 /** 已经种过了：快照里的文件消息只在启动那一刻取一次，之后这份内存就是实时的真相。 */
 let filesSeeded = false;
 /**
@@ -88,7 +95,7 @@ function known(peerId: string): boolean {
  *
  * 会话与设备行是两件事：设备行说的是"这台现在能不能连上"（离线**且未绑定**的不列，见
  * `visibleDevices`），而聊天记录是**用户数据** —— 一台聊过天的设备解除配对（关系没了、
- * 地址簿里也删了）、又离线之后，记录还躺在 `chat.json` 里，会话列表那一行就没有跟着消失的
+ * 地址簿里也删了）、又离线之后，记录还躺在 `chat.dat` 里，会话列表那一行就没有跟着消失的
  * 道理。所以"列不列、能不能打开、未读算不算"都认这一条，见 [`directPeerIds`] / [`threadOf`]。
  */
 function hasHistory(peerId: string): boolean {
@@ -425,9 +432,10 @@ export type ConvoRow = {
   sub: string;
   time: string;
   unread: number;
-  /** 状态点。 */
-  /** 状态点：`stores/devices` 那五档（颜色 = 可达性、形状 = 链路）。 */
+  /** 状态点：`stores/devices` 那五档（颜色 = 可达性、实心/空心 = 是否已验证）。 */
   dot: DeviceDotState;
+  /** 这一条线程里是否所有设备都已验证（实心/空心的判据）。 */
+  trusted: boolean;
   /** 一对一那行头像上的字（群发/群聊画图标，用不到）。 */
   initial: string;
 };
@@ -481,7 +489,8 @@ export function convoRows(): ConvoRow[] {
       sub: summaryOf(peerId),
       time: timeOf(peerId),
       unread: unreadForPeer(peerId),
-      dot: deviceDotState(dev),
+      dot: deviceState(dev).dot,
+      trusted: deviceState(dev).trusted,
       initial: peerInitial(peerId),
     });
   }
@@ -499,6 +508,7 @@ export function convoRows(): ConvoRow[] {
       time: last ? clock(last.at) : '',
       unread: 0, // 群发那条只放"我发出去的"：未读在各自的 1:1 里
       dot: threadDotState(t.participants),
+      trusted: threadTrusted(t.participants),
       initial: '',
     });
   }
@@ -520,6 +530,7 @@ export function convoRows(): ConvoRow[] {
       time: last ? clock(last.at) : '',
       unread: g.unread,
       dot: threadDotState(t.participants),
+      trusted: threadTrusted(t.participants),
       initial: '',
     });
   }
@@ -695,6 +706,51 @@ export function stamp(at: number): string {
 }
 
 /**
+ * 这条推送此刻是不是用户按了暂停（没暂停过 / 已经收尾 = `false`）。
+ *
+ * 界面读它画右侧那圈（`已暂停` = 圆环转灰、中心是继续键），状态文案也读它
+ * （见 [`fileStatusText`]）。
+ */
+export function invitePaused(inviteId: string): boolean {
+  return inviteId !== '' && receivePaused[inviteId] === true;
+}
+
+/**
+ * 这条邀请此刻还在不在接收中（`inviteState === 'accepted'`；找不到 = `false`）。
+ *
+ * 只给"点圆环发命令"那条路收尾用：命令往返途中 `push://done` 可能已经先到（消息落成
+ * 终态），那时别再把"已暂停/继续"的提示补上去。
+ */
+export function inviteReceiving(inviteId: string): boolean {
+  if (inviteId === '') return false;
+  for (const list of Object.values(files)) {
+    for (const f of list) {
+      if (f.inviteId === inviteId) return f.inviteState === 'accepted';
+    }
+  }
+  return false;
+}
+
+/**
+ * 界面按下暂停 / 继续后当场翻这一档（后端那道闸由调用方单独发命令）。
+ *
+ * 先改界面再发命令是刻意的：圆环要在按下的那一帧就变（等 IPC 回来才变，手快的人会以为
+ * 没点上）；命令返回 `false`（那条接收已经收尾）时调用方再把它翻回去。
+ */
+export function setInvitePaused(inviteId: string, paused: boolean): void {
+  if (!inviteId) return;
+  if (paused) {
+    if (receivePaused[inviteId]) return;
+    receivePaused = { ...receivePaused, [inviteId]: true };
+    return;
+  }
+  if (!receivePaused[inviteId]) return;
+  const next = { ...receivePaused };
+  delete next[inviteId];
+  receivePaused = next;
+}
+
+/**
  * 这条消息在**某台设备**上的状态文案（一对一那条视图就写它，原型 `chat-meta` 的后半段）。
  *
  * 一对一那条会话里也可能躺着群发过去的副本（群发是"每台各存一份"），但那一屏说的是"与这台
@@ -711,6 +767,27 @@ export function deliveryText(peerId: string, item: ChatItem): string {
   return copy ? stateOfDelivery(copy.delivery).label : '';
 }
 
+/** 这一台此刻还能不能喊停（`invited` / `sending`，且拿着能取消的那条邀请）。 */
+export function outgoingWaitingInvites(f: ChatFileMsg, peerId = ''): string[] {
+  if (!f.fromMe) return [];
+  return f.perTargets
+    .filter(
+      (t) =>
+        (peerId === '' || t.peerId === peerId) &&
+        (t.state === 'invited' || t.state === 'sending') &&
+        !!t.inviteId,
+    )
+    .map((t) => t.inviteId);
+}
+
+/**
+ * 自己发出去的那条气泡右侧要不要给停止：一对一 = **这一台**还在等 / 在传；
+ * 群发 / 群聊 = 这一批里**还有台**在等 / 在传（逐台复制件也在各自 1:1 里，按各自那台判）。
+ */
+export function outgoingStoppable(f: ChatFileMsg, peerId = ''): boolean {
+  return outgoingWaitingInvites(f, peerId).length > 0;
+}
+
 /**
  * 文件消息那一行的状态文案（原型 `fileStatusText`）。
  *
@@ -723,19 +800,45 @@ export function fileStatusText(f: ChatFileMsg, peerId = ''): string {
   if (f.fromMe) {
     if (peerId) {
       const target = f.perTargets.find((t) => t.peerId === peerId);
-      return target ? pushStateLabel(target.state) : '';
+      if (!target) return '';
+      const label = pushStateLabel(target.state);
+      // 进度环已经画了百分比，左边这行再给个数 —— 不看环也能读出走到哪了。
+      return target.state === 'sending'
+        ? `${label} ${Math.min(100, Math.max(0, Math.round(f.pct)))}%`
+        : label;
     }
-    if (f.sending) return `传输中 ${f.pct}%`;
+    if (f.sending) return `传输中 ${Math.min(100, Math.max(0, Math.round(f.pct)))}%`;
     if (f.targets === 0) return '';
-    if (f.targets - f.failed <= 0) return '未送达';
-    const done = `已发送至 ${f.targets - f.failed} 台`;
-    return f.failed > 0 ? `${done} · ${f.failed} 台未送达` : done;
+    const targets = f.perTargets;
+    if (!targets.length) {
+      if (f.targets - f.failed <= 0) return '未送达';
+      const done = `已发送至 ${f.targets - f.failed} 台`;
+      return f.failed > 0 ? `${done} · ${f.failed} 台未送达` : done;
+    }
+    const count = (state: PushTargetState) => targets.filter((t) => t.state === state).length;
+    const done = count('done');
+    const cancelled = count('cancelled');
+    const rejected = count('rejected');
+    const failed = count('failed');
+    if (cancelled === f.targets) return '已取消';
+    if (done === 0 && failed === f.targets) return '未送达';
+    if (done === 0 && rejected === f.targets) return '已拒绝';
+    const parts: string[] = [];
+    if (done) parts.push(`已发送至 ${done} 台`);
+    if (cancelled) parts.push(`${cancelled} 台已取消`);
+    if (rejected) parts.push(`${rejected} 台已拒绝`);
+    if (failed) parts.push(`${failed} 台未送达`);
+    return parts.join(' · ');
   }
   if (f.inviteState === 'received') return '已接收 · 已保存到下载目录';
   if (f.inviteState === 'rejected') return '已拒绝接收';
   if (f.inviteState === 'cancelled') return '已停止接收';
   if (f.inviteState === 'failed') return '接收失败';
-  if (f.inviteState === 'accepted') return '接收中';
+  // 接收中：百分比写在状态文字里（右侧圆环同一份进度）；暂停也是一句话，别让环成唯一的信号。
+  if (f.inviteState === 'accepted') {
+    const pct = Math.min(100, Math.max(0, Math.round(f.pct)));
+    return invitePaused(f.inviteId) ? `已暂停 · ${pct}%` : `接收中 ${pct}%`;
+  }
   return '';
 }
 
@@ -919,6 +1022,11 @@ export function askParticipants(key: string) {
 // ── 动作 ──────────────────────────────────────────────────────────────────
 
 function replace(next: ChatSnapshot) {
+  // 命令的返回（IPC 响应）与 `chat://changed`（`eval` 进来的脚本）是两条通道，谁先到没有
+  // 保证：发消息那一刻的返回里这条还是 `sending`，而后台 HTTP 那一跳落定后推的快照已经是
+  // `sent` —— 前者晚到就会把后者盖回去，消息于是一直停在「发送中」，直到重新拉一次整份
+  // 状态（关掉再打开会话）。只往版本大的那份走。
+  if (typeof next.rev === 'number' && next.rev <= snapshot.rev) return;
   snapshot = next;
   // 第一次拿到快照（启动时 `refresh` / 第一条 `chat://changed`）：把落盘的文件消息种进内存。
   // 之后这份内存就是实时的真相 —— 每次 `replace` 再种一遍会把正在传的进度抹回上一次落盘的样子。
@@ -1079,6 +1187,17 @@ export async function exitThread(key: string): Promise<{ title: string; mode: Co
   else replace(await api.chatBatchDelete(t.id));
   if (openKey === key) backToList();
   return { title: t.title, mode: t.mode };
+}
+
+/**
+ * 清空一个群聊的本地记录，但**不退群**：名册与成员关系保留，之后的新消息照常收。
+ * 其他成员不受影响；补拉按清空下界走，不会把历史拉回来。
+ */
+export async function clearGroupHistory(key: string): Promise<boolean> {
+  const t = threadOf(key);
+  if (!t || t.mode !== 'group') return false;
+  replace(await api.groupClearHistory(t.id));
+  return true;
 }
 
 /**
@@ -1324,7 +1443,7 @@ function patchFiles(peerId: string, fn: (list: ChatFileMsg[]) => ChatFileMsg[]) 
  * 把这几台设备的文件消息记录写回后端（`chat_files_set`）。
  *
  * **只在能定下来的时刻叫**（刚发出 / 刚收到 / 接受或拒绝 / 收完或失败 / 整批走完）：
- * 传输中的进度每 200ms 一跳，那是内存里的事，每拍都写一次盘（`chat.json` 整份重写）
+ * 传输中的进度每 200ms 一跳，那是内存里的事，每拍都写一次盘（`chat.dat` 整份重写）
  * 纯属白花 —— 而断了的那一刻，后端重启扫尾会把还在传的那条落成终态。
  *
  * 失败只记一行：这是"记录"的持久化，把它变成用户可见的错误没有出口（下一次能定下来的
@@ -1353,7 +1472,7 @@ export function noteOutgoingFiles(peerIds: string[], items: LocalPick[], push: P
   const pushBatchId = push.batchId;
   // 逐台状态当场就有了（`push_paths` 回来的那份快照）——不等 `push://batch` 再回一条：
   // 未绑定的对端停在"等待同意"时不会有下一条事件，那条记录下面就会一直空着。
-  const perTargets = push.targets.map((t) => ({ peerId: t.peerId, state: t.state }));
+  const perTargets = push.targets.map((t) => ({ peerId: t.peerId, inviteId: t.inviteId, state: t.state }));
   const live = peerIds.filter(known);
   if (!live.length) return;
   const base = at || Date.now();
@@ -1405,7 +1524,7 @@ export function noteBatch(b: PushBatch) {
         failed: b.failed,
         pct: sending ? pct : 100,
         sending,
-        perTargets: b.targets.map((t) => ({ peerId: t.peerId, state: t.state })),
+        perTargets: b.targets.map((t) => ({ peerId: t.peerId, inviteId: t.inviteId, state: t.state })),
         // 结算后就把卡片 id 摘掉：卡片 3 秒后从界面上消失，气泡不能跟着变成空数据。
         batchId: sending ? f.batchId : '',
       };
@@ -1494,6 +1613,22 @@ function landingPath(dest: string, f: ChatFileMsg): string {
 }
 
 /**
+ * 这条邀请是不是**别人推给本机**的（会话里找得到那张接收卡）。
+ *
+ * `push://done` 两侧都会发：接收侧要报"收到 / 已取消 / 失败"，发送侧的同一条事件由
+ * `push://batch` 收尾。发送侧没有这张卡，据此把那几句 toast 挡掉（否则会报成「文件」）。
+ */
+export function hasIncomingInvite(inviteId: string): boolean {
+  if (!inviteId) return false;
+  for (const list of Object.values(files)) {
+    for (const f of list) {
+      if (!f.fromMe && f.inviteId === inviteId) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * 那条邀请的终局：已接收 / 已拒绝 / 接收失败。
  *
  * `dest` = 后端随 `push://done` 给的那一层**落盘目录**（`<落盘目录>/<发送方名>`；S-12 关掉那层
@@ -1501,6 +1636,8 @@ function landingPath(dest: string, f: ChatFileMsg): string {
  * 东西落在哪只有后端知道，界面不自己拼目录名（同名/改写与净化都在后端）。
  */
 export function noteInviteDone(inviteId: string, outcome: 'received' | 'rejected' | 'failed' | 'cancelled', dest = '') {
+  // 收尾了就不存在"暂停/继续"这回事：那条圆环随后会被终态气泡替换掉。
+  setInvitePaused(inviteId, false);
   persistFiles(
     patchInvite(inviteId, (f) => ({
       ...f,

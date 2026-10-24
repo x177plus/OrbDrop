@@ -1004,6 +1004,28 @@ input { font: inherit; }
 .node .n-name { font-family: var(--font-display); font-size: var(--fs-sm); color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .node .n-meta { margin-left: auto; font-size: var(--fs-xs); color: var(--muted); flex: none; }
 .node.sub { padding-left: 62px; }
+/* 对端共享项手动下载时，整行从左往右铺一层底色：起点在文件图标左侧、离图标左缘约一个
+   「图标 ↔ 文件名」的间距（视觉上从图标左边起笔），终点是大小文字右缘（内容区右缘）。
+   用背景层而不是多插一个元素 —— 不参与 flex 排版、不盖住文字、悬停底色照旧在下面。
+   `--dl-pct` 由组件按 `received / total` 写成 0–1；暂停时宽度不动，只把颜色换成灰。 */
+.node.dl-active,
+.share-row.dl-active {
+  background-image: linear-gradient(var(--accent-soft), var(--accent-soft));
+  background-repeat: no-repeat;
+  background-position: var(--dl-start) 0;
+  background-size: calc((100% - var(--dl-start) - 8px) * var(--dl-pct, 0)) 100%;
+  transition: background-size 0.15s linear;
+}
+.node.dl-active.dl-paused,
+.share-row.dl-active.dl-paused {
+  background-image: linear-gradient(
+    color-mix(in oklch, var(--muted) 24%, transparent),
+    color-mix(in oklch, var(--muted) 24%, transparent)
+  );
+}
+.node.dl-active { --dl-start: calc(46px - var(--gap-sm)); }
+.node.sub.dl-active { --dl-start: calc(62px - var(--gap-sm)); }
+.share-row.dl-active { --dl-start: calc(8px + 22px); }
 
 /* ─── device rows ───────────────────────────────────────────── */
 .device-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
@@ -1212,6 +1234,12 @@ input { font: inherit; }
 .nb-size { flex: none; font-size: var(--fs-xs); color: var(--muted); }
 .nb-body { margin: 6px 0 0; font-size: var(--fs-xs); color: var(--muted); overflow-wrap: anywhere; }
 .notif-bubble.fail .nb-body { color: color-mix(in oklch, var(--warn) 75%, black); }
+/* 配对邀请的 SAS：两端应显示同一串；用户用眼睛比对，接收即确认。 */
+.sas-line { margin-top: 8px; padding: 8px 10px; border-radius: var(--radius); background: var(--fg-soft); text-align: center; }
+.sas-label { display: block; font-size: var(--fs-xs); color: var(--muted); }
+.sas-code { display: block; margin: 2px 0; font-family: var(--font-mono, monospace); font-size: 18px; letter-spacing: 2px; font-weight: 600; color: var(--fg); }
+.sas-hint { display: block; font-size: var(--fs-xs); color: var(--muted); }
+.sas-hint.warn { margin: 8px 0 0; color: var(--warn); }
 .nb-acts { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
 /* 气泡里的按钮比卡上的小一号；两个（拒绝/接收）时等宽，单个（知道了/取消）就自然宽度。 */
 .nb-acts .btn { height: 28px; min-width: 76px; }
@@ -1271,17 +1299,27 @@ input { font: inherit; }
 .radio .r-sub { font-size: var(--fs-xs); color: var(--muted); display: block; cursor: default; }
 
 /* ─── 设置里的「悬浮形态」缩略图 ────────────────────────────────
-   两个选项就是**两张图**（没有文字）：里面是真组件（`Orb` / `RectOrb`）+ 骨架数据
+   两个选项就是**两张图**（没有文字）：里面是真组件（`Orb` / `RectOrb`）+ 示例数据
    （见 SettingsPanel.svelte 的 `PREVIEW_PAGES`），所以形状、圆角、角标、分页点、字级
-   都与收起态的实物一致 —— 不另画一套"示意图"，就不会和实物跑偏。
-   外面套一层缩放框：`--w`/`--h` 是含角标出格（-5px）在内的视觉外框，`--s` 是缩放比；
-   `.so-scale` 再把组件原点往里推 5px × `--s`（角标出格那一截正好落在框的左/上边缘，
-   右下角也刚好收进框里）。
+   都与收起态的实物一致 —— 不另画一套"示意图"，就不会和实物跑偏。缩略图里直接写字
+   （设备名 / ip:port / 项数 / 条目名与元信息），角标也带数字：一眼看得出卡片上有什么。
+   外面套一层缩放框：`--w`/`--h` 是不含缩放的视觉外框，`--s` 是缩放比，`--ox`/`--oy`
+   是组件原点在外框里的落点。**卡片那一档的外框以卡片为中心**（`--ox: 30px`，与右侧
+   「间距 10 + 点列 20」对称），分页点收在右格里；框本身再由 `.shape-opt` 居中。
+   缩略图**固定画未收起**的卡片：真悬浮框贴边时 `.orb-stage.docked*` 会把头与列表隐掉、
+   只留竖条，这几条在下面逐项还原。
    整块 `inert`（在模板上），缩略图既不吃指针、也不进 Tab 序。 */
 .shape-picker { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap-sm); }
 .shape-opt {
   position: relative;
   display: grid; justify-items: center;
+  /* 轨道（= 图的 max-content 宽度）默认靠 start 摆，剩下的几像素会全落在右边，
+     看上去就是整张图偏左。轨道与内容一起居中 —— 水平那几 px 与竖向那 1px 都要归零。 */
+  place-content: center;
+  /* 卡片那一档外框比最窄一栏（面板 448 − 边距 − 滚动条）的内容盒还宽几像素：它溢进的是
+     这一格自己的 10px 内边距（仍在边框内），但不该让网格按 max-content 把那一栏撑宽 ——
+     那会让两个选项**不等宽**。`min-width: 0` 关掉网格项的自动最小尺寸，两栏回到 1fr 等分。 */
+  min-width: 0;
   padding: 12px 10px;
   border: 1px solid var(--border); border-radius: var(--radius);
   cursor: pointer;
@@ -1292,13 +1330,13 @@ input { font: inherit; }
 /* 输入框盖满整格：点哪儿都算选中，聚焦环也正好落在这一格上（视觉状态交给 :has） */
 .shape-opt input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
 .so-frame { position: relative; display: block; width: calc(var(--w) * var(--s)); height: calc(var(--h) * var(--s)); overflow: hidden; }
-.so-scale { position: absolute; left: calc(5px * var(--s)); top: calc(5px * var(--s)); transform: scale(var(--s)); transform-origin: 0 0; }
+.so-scale { position: absolute; left: calc(var(--ox, 5px) * var(--s)); top: calc(var(--oy, 5px) * var(--s)); transform: scale(var(--s)); transform-origin: 0 0; }
 /* 缩略图里剥掉/掰回这几处：
    ① 收起态/切窗口那几条隐藏规则（设置面板本来就是面板开着时看的，`.orb-stage.open` 正命中）——
       写成三层选择器（0,3,0）与 `.orb-stage.open .orb` 同权重，靠写在后面取胜；
       **顺带把位置钉回框内原点**：实物 `.orb` / `.rq` 是 `position: fixed` + `--orb-x/y`
       （窗口坐标，见 `.orb` 那条注释），缩略图里这两个变量没有值 —— 照实物的规则它会落到视口
-      原点上、跑出框外；缩略图里它们本来就没有意义，钉死在 `.so-scale` 已经推好角标出格的左上角；
+      原点上、跑出框外；缩略图里它们本来就没有意义，钉死在 `.so-scale` 已经推好的左上角；
    ② 投影（`--shadow`）——在缩略图里它要占掉四周 12/7/17px 的余量才不被框裁出硬边，
       而缩略图是示意图：留边框、去投影，框才能贴着实物往外框。 */
 .shape-picker .so-scale .orb,
@@ -1308,30 +1346,22 @@ input { font: inherit; }
 }
 .shape-picker .so-scale .orb,
 .shape-picker .so-scale .rq-card,
+.shape-picker .so-scale .rq-dots,
 .shape-picker .so-scale .rq-shellbadge { box-shadow: none; }
 .shape-picker .so-scale .orb .pulse { display: none; }
-/* 骨架：数据侧给的是空串，卡片上"有字的地方"在这里画成灰条 —— 名/址/元信息各占一条，
-   宽度错开一点（同宽会像一堵砖墙），图标（文件夹 / 文件）保留：一眼能看出这一格是什么。
-   `.rq-devname` 是 flex 项且 `flex: 1 1 0`，不改成 `flex: none` 的话宽度会被拉满整行。 */
-.shape-picker .so-scale .rq-devname,
-.shape-picker .so-scale .rq-ip,
-.shape-picker .so-scale .rq-count,
-.shape-picker .so-scale .rq-iname,
-.shape-picker .so-scale .rq-imeta {
-  background: color-mix(in oklch, var(--fg) 11%, transparent);
-  border-radius: 3px;
-}
-.shape-picker .so-scale .rq-devname { flex: none; width: 52px; height: 8px; }
-.shape-picker .so-scale .rq-ip { width: 62px; height: 6px; }
-.shape-picker .so-scale .rq-count { width: 18px; height: 6px; }
-.shape-picker .so-scale .rq-iname { width: 46px; height: 7px; }
-.shape-picker .so-scale .rq-item:nth-child(2n) .rq-iname { width: 38px; }
-.shape-picker .so-scale .rq-item:nth-child(3n) .rq-iname { width: 42px; }
-.shape-picker .so-scale .rq-imeta { width: 24px; height: 5px; background: color-mix(in oklch, var(--fg) 7%, transparent); }
-/* 项数与角标数字是组件自己生成的文字：`font-size: 0` 只隐数字、形状（胶囊/圆）原样保留 */
-.shape-picker .so-scale .rq-count,
-.shape-picker .so-scale .rq-shellbadge,
-.shape-picker .so-scale .orb-badge { font-size: 0; }
+/* 设置面板与真悬浮框同在一个 `.orb-stage` 里：悬浮框**贴边收起**时，stage 上带着
+   `.docked` / `.docked-left|right`，缩略图会继承那一档 —— 卡片的头与列表被隐掉、只画竖条，
+   角标也换到另外两条边上。缩略图要的永远是**未收起**的卡片形态（设备名 / ip 在上、
+   下面两列共享项），所以把这几条贴边规则在缩略图里逐条还原。 */
+.shape-picker .so-scale .rq-head,
+.shape-picker .so-scale .rq-viewport { opacity: 1; }
+.shape-picker .so-scale .rq-dock { opacity: 0; }
+.shape-picker .so-scale .rq-shellbadge.is-alert { left: -5px; right: auto; top: -5px; }
+.shape-picker .so-scale .rq-shellbadge.is-devices { right: -5px; left: auto; top: -5px; }
+/* 分页点列在实物上静止不显示、hover 才淡入；缩略图整块 `pointer-events: none`（见上），
+   `:hover` 永远走不到 —— 不补这一条，右边那格就成了一块没人知道是什么的留白。
+   静态缩略图把这一列直接显出来：它本身也是"这张卡片长这样"的一部分。 */
+.shape-picker .so-scale .rq-dots { opacity: 1; }
 .sheet-foot { display: flex; justify-content: flex-end; gap: var(--gap-sm); padding: 12px 16px; border-top: 1px solid var(--border); }
 
 /* ─── hint（圆圈 ? + 悬停说明）──────────────────────────────── */
@@ -1513,21 +1543,53 @@ input { font: inherit; }
    会整体偏掉一个面板内边距。坐标在 FilePicker.svelte 里减过层的原点。 */
 .picker-ctx { position: absolute; }
 
-/* 面板底部的堆叠层：通知组（通知 + 发送进度卡）与提示共用一列，谁也不盖谁。
-   `column-reverse` 下**DOM 里靠前的元素贴底** —— App 里通知组写在最前，所以它永远
-   落在最下缘；提示往上叠。
+/* 面板底部的通知层。`column-reverse` 下 DOM 里靠前的元素贴底，这里只有通知组一项。
    底边 = **footer 上缘那条横线**（`--foot-h` 是 App 量出来的 footer 实际高度，这里不留余量）：
    通知组的盒子底边就压在这条线上，滚动区域因此"在两条横线中间"，内容不会溜到线下面。
-   气泡向下 9.6px 的阴影余量由组自己的 `padding-bottom` 在盒内让出，不占位置也不越线。 */
+   气泡向下 9.6px 的阴影余量由组自己的 `padding-bottom` 在盒内让出，不占位置也不越线。
+   瞬时提示不在这里 —— 它要压过底板 / 遮罩 / 图片预览与舞台外的菜单，所以挂在舞台外
+   （见 `.toast-stack`）。 */
 .panel-bottom { position: absolute; left: 12px; right: 12px; bottom: var(--foot-h, 40px); z-index: 70; display: flex; flex-direction: column-reverse; gap: 8px; pointer-events: none; }
 /* 浮层里**只有真正可点的东西吃指针**：容器与滚动容器的内边距/空白一律放过。
    给阴影留的那层 padding（上 5 / 下 10 / 右 10）若也算点击区，面板右下角就会多出
    一条看不见的"点击黑洞"。（代价：组内滚动条拖不动了 —— 滚轮悬停在气泡上照常滚整组。） */
 .panel-bottom > * { pointer-events: none; }
-.notif-bubble, .toast { pointer-events: auto; }
-.toast-stack { display: flex; flex-direction: column; gap: 8px; align-items: center; padding-bottom: 10px; }
-.toast { padding: 9px 16px; background: color-mix(in oklch, var(--fg) 92%, transparent); color: var(--surface); border-radius: 999px; font-size: var(--fs-sm); box-shadow: var(--shadow-bubble); display: flex; align-items: center; gap: 8px; max-width: 100%; text-align: center; animation: toast-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1); }
-.toast svg { width: 14px; height: 14px; color: color-mix(in oklch, var(--surface) 80%, transparent); }
+.notif-bubble { pointer-events: auto; }
+/* 提示层挂在 `.orb-stage` 之外（App 里紧跟在舞台后面）：舞台自己是 z-index 20 的层叠
+   上下文，留在里面就永远压不过舞台外的右键菜单（60）与悬停说明（100）。挂在顶层后
+   这一层是真正的最上层，且不吃点击（`pointer-events: none`），压住什么都不挡操作。 */
+.toast-stack {
+  position: fixed; left: 0; right: 0;
+  /* 底边 = 面板 footer 上缘（面板四周的 slack + footer 高，App 把这两个数写在行内）。 */
+  bottom: calc(var(--panel-slack, 20px) + var(--foot-h, 40px));
+  z-index: 200;
+  display: flex; flex-direction: column; gap: 8px; align-items: center;
+  padding: 0 12px 10px;
+  pointer-events: none;
+}
+/* 提示是**瞬时层**：永远画在所有界面之上（底板 85 / 遮罩 90 / 图片预览 95），
+   否则"保存成功""下载完成"这些话会被恰好开着的设置面板或大图盖住。
+   居中三件套：容器 `align-items: center`（短提示按内容收窄、整条居中）+ `justify-content:
+   center`（图标与文字作为一组居中）+ `text-align: center`（换行后每一行都居中）。
+   `overflow-wrap: anywhere` 是兜底：文件名 / 路径 / ID 这类没有空格的串必须能在任意处断，
+   否则文本会从色块里溢出去，看上去就是"内容没居中"。 */
+.toast {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  max-width: min(100%, 360px);
+  padding: 9px 16px;
+  background: color-mix(in oklch, var(--fg) 92%, transparent);
+  color: var(--surface);
+  border-radius: 999px;
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+  text-align: center;
+  overflow-wrap: anywhere;
+  box-shadow: var(--shadow-bubble);
+  animation: toast-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+/* 超过三行就截断：提示只报"发生了什么"，细节留给对应的卡片 / 面板。 */
+.toast-msg { min-width: 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+.toast svg { width: 14px; height: 14px; flex: none; color: color-mix(in oklch, var(--surface) 80%, transparent); }
 .toast.leaving { opacity: 0; transform: translateY(6px); transition: opacity 0.25s ease, transform 0.25s ease; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 .empty { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 34px 16px; text-align: center; color: var(--muted); }
@@ -1681,11 +1743,11 @@ input { font: inherit; }
 .recip-chip.refused .rc-av { color: color-mix(in oklch, var(--danger) 72%, black); background: color-mix(in oklch, var(--danger) 12%, transparent); }
 .recip-chip .rc-st { flex: none; width: 6px; height: 6px; border-radius: 50%; }
 
-/* ─── 设备状态点：一处判据，四处共用（颜色 = 链路与广播范围，形状 = 有没有实时链路）─────
+/* ─── 设备状态点：一处判据，四处共用（颜色 = 链路，填充 = 是否已验证）─────
    档位与 `stores/devices.svelte.ts` 的 `deviceDotState` 一一对应：
-   `live` 长连接（**只有它填实心**，并带一圈浅绿光环，也只有它会收到自动广播）/
-   `online` 在线但没连长连接（蓝环，消息照样收得到）/ `offline` 不在网上（灰环）/
-   `retrying` 本机在等（琥珀环）/ `repair` 关系失效（红环）。会话列表行、会话标题旁、
+   `live` 长连接（实心绿 + 浅绿光环，也只有它会收到自动广播）/ `online` 在线但没长连接
+   （已验证=实心蓝，未验证=空心蓝）/ `offline` 不在网上（已验证=实心灰，未验证=空心灰）/
+   `retrying` 本机在等（已验证=实心琥珀）/ `repair` 关系失效（永远空心红）。会话列表行、会话标题旁、
    收件人栏、设备行胶囊里的那颗点，画的都是这一套 —— 各画一套的话，"灰"迟早又变成两种意思。 */
 /* 环的粗细在 6px 的点上是实测取舍：1.5px 会被浏览器取整成 1px（环太细，和实心那档几乎分不出），
    2px 留下的 2px 内孔刚好看得见"这是个环"。 */
@@ -1695,9 +1757,15 @@ input { font: inherit; }
 .dot.offline, .convo-dot.offline, .conv-status.offline, .rc-st.offline { border-color: color-mix(in oklch, var(--fg) 32%, transparent); }
 .dot.retrying, .convo-dot.retrying, .conv-status.retrying, .rc-st.retrying { border-color: var(--warn); }
 .dot.repair, .convo-dot.repair, .conv-status.repair, .rc-st.repair { border-color: var(--danger); }
-/* 光圈只给"长连接"那一档（= 实时）：会话列表与标题旁那两处是"一眼扫过去"的地方，
-   有它才分得出"实心绿 + 光圈"和"绿环"；胶囊里的点不用（胶囊本来就在边框里）。 */
-.dot.live, .convo-dot.live, .conv-status.live { box-shadow: 0 0 0 3px var(--ok-soft); }
+/* 实心 = 已配对且指纹已验证（信任设备）；未配对 / 未验证保持空心。
+   颜色继续说链路：绿=长连接、蓝=在线、灰=离线、琥珀=重连中、红=需配对。
+   `repair` 永远空心 —— 关系失效 = 不再信任，不该画成实心。 */
+.dot.solid.online, .convo-dot.solid.online, .conv-status.solid.online, .rc-st.solid.online { background: var(--accent); border-color: var(--accent); }
+.dot.solid.offline, .convo-dot.solid.offline, .conv-status.solid.offline, .rc-st.solid.offline { background: color-mix(in oklch, var(--fg) 32%, transparent); border-color: color-mix(in oklch, var(--fg) 32%, transparent); }
+.dot.solid.retrying, .convo-dot.solid.retrying, .conv-status.solid.retrying, .rc-st.solid.retrying { background: var(--warn); border-color: var(--warn); }
+/* 光圈只给"长连接"那一档（= 实时）：会话列表、标题旁、群聊成员芯片都是"一眼扫过去"的地方，
+   有它才分得出"实心绿 + 光圈"和"实心蓝 / 空心蓝"；胶囊里的点不用（胶囊本来就在边框里）。 */
+.dot.live, .convo-dot.live, .conv-status.live, .rc-st.live { box-shadow: 0 0 0 3px var(--ok-soft); }
 .state-chip .dot, .state-chip .dot.live { box-shadow: none; }
 .recip-chip .rc-x { flex: none; width: 16px; height: 16px; border-radius: 50%; display: grid; place-items: center; color: var(--muted); }
 .recip-chip .rc-x:hover { background: var(--fg-soft); color: var(--fg); }
@@ -1747,6 +1815,11 @@ input { font: inherit; }
 .chat-empty p { margin: 0; font-size: var(--fs-xs); }
 .chat-empty .ce-sub { font-size: 10px; line-height: 1.5; max-width: 170px; }
 .chat-msg { display: flex; flex-direction: column; max-width: 86%; user-select: text; -webkit-user-select: text; animation: chat-in 0.2s cubic-bezier(0.2, 0.8, 0.2, 1); }
+/* 文件气泡右侧那颗圆环在桌面上的直径：这里的气泡文字是 13px，安卓那套是 15u —— 环按
+   36 画会显得比安卓大一圈（用户反馈），32 与安卓的观感一致（组件默认仍是 36u）。
+   线宽同步补到 3px 的绝对粗细（3.375 用户单位 × 32 / 36 = 3px）：环缩小后线若还按 3
+   用户单位画就只有 2.67px，圆头端帽会细到看起来像平头。 */
+.chat-msg { --xring-size: 32px; --xring-stroke: 3.375; }
 @keyframes chat-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .chat-msg.me { align-self: flex-end; align-items: flex-end; }
 .chat-msg.peer { align-self: flex-start; align-items: flex-start; }
@@ -1763,16 +1836,22 @@ input { font: inherit; }
 .chat-per .per.read { color: color-mix(in oklch, var(--ok) 78%, black); }
 .chat-per .per.failed { color: color-mix(in oklch, var(--warn) 78%, black); }
 .chat-bubble-file { display: flex; align-items: center; gap: 8px; }
+/* 图片消息 / 自己发的图片文件：图就是气泡内容，气泡不留内边距（缩略图用 `flush` 那一档贴齐
+   边缘，圆角跟着气泡走，见 `ImagePreview.svelte`）。读不出来时 `ImagePreview` 退回文件行，
+   那两行由这里把内边距补回去 —— 不能只删气泡的 padding，否则文字会顶到边缘。 */
+.chat-bubble-media { padding: 0; }
+.chat-bubble-media > .cf-main, .chat-bubble-media > .cf-open { padding: 7px 10px; }
 .cf-ico { flex: none; display: grid; place-items: center; }
 .cf-ico svg { width: 16px; height: 16px; }
 .cf-main { min-width: 0; max-width: 148px; display: grid; gap: 1px; }
 .cf-name { display: block; font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cf-size { display: block; font-family: var(--font-mono); font-size: 10px; opacity: 0.8; }
 .cf-status { display: block; font-family: var(--font-mono); font-size: 10px; opacity: 0.85; }
-/* 传输进度条：颜色跟着气泡的字色走（自己的气泡是深蓝底、对端是浅灰底） */
-.cf-bar { display: block; height: 3px; margin-top: 5px; border-radius: 999px; background: color-mix(in oklch, currentColor 22%, transparent); overflow: hidden; }
-.cf-bar i { display: block; height: 100%; width: 0; border-radius: 999px; background: currentColor; transition: width 0.1s linear; }
-.chat-msg.me .cf-bar { color: var(--surface); }
+/* 右侧那颗圆环（发送中 = 停止，接收中 = 暂停/继续）：贴着气泡右缘，不把左边的
+   文件名 / 大小 / 状态挤走。两侧的间距交给外面那层 flex 的 gap（收下的卡 / 自己的气泡
+   分别是 9px / 8px），这里不再另加 margin —— 两端看起来才是同一个位置。 */
+.cf-act, .ic-act { flex: none; display: flex; align-items: center; }
+.chat-bubble-media > .cf-act { padding: 0 8px; }
 
 /* ── 会话里的「接收 / 拒绝」卡（对端推过来的那条邀请）── */
 .invite-card { display: flex; flex-direction: column; gap: 9px; max-width: 100%; padding: 11px 12px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); box-shadow: 0 2px 8px -4px oklch(18% 0.012 250 / 0.14); }
@@ -1782,27 +1861,18 @@ input { font: inherit; }
 .ic-main { flex: 1; min-width: 0; display: grid; gap: 1px; }
 .ic-name { font-family: var(--font-display); font-size: var(--fs-sm); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ic-size { font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+.ic-status { font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
 .ic-sub { font-size: var(--fs-xs); color: var(--muted); }
 .ic-acts { display: flex; gap: 8px; }
 .ic-acts .btn { flex: 1; height: 30px; }
-.ic-done { display: flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--muted); }
-/* 正在接收时那一行右端那颗停止（只要图标：这一行本来就窄，写"停止"字数会把状态挤走）。
-   `margin-left: auto` 把它顶到右缘，与状态文字分开 —— 免得点"接收中"的旁边误触。 */
-.ic-stop {
-  margin-left: auto; flex: none; width: 20px; height: 20px; padding: 0;
-  display: grid; place-items: center;
-  border: none; border-radius: 6px; background: transparent;
-  color: var(--muted); cursor: pointer;
-}
-.ic-stop:hover { color: var(--danger); background: var(--fg-soft); }
-.ic-stop svg { width: 14px; height: 14px; }
 
 /* ── 会话里点得开的文件行（自己发出去的那条气泡 / 收完的那张卡）──
    外面套一层按钮：落点与文件标签页里双击一格一样（交给系统默认程序）。按钮要把 UA 那套清掉
    （底色、边框、居中、字体），排版仍旧由 `.ic-row` / 气泡那套给；`user-select: text` 是补回来的
    —— 浏览器默认把按钮里的字设成不可选，而消息流（含这一块）一直可以选中复制。 */
 .ic-open, .cf-open { display: flex; align-items: center; gap: 9px; width: 100%; padding: 0; border: 0; background: none; text-align: left; font: inherit; color: inherit; cursor: pointer; user-select: text; -webkit-user-select: text; }
-.cf-open { gap: 8px; }
+.cf-open { gap: 8px; flex: 1; min-width: 0; width: auto; }
+.ic-row .ic-open { flex: 1; min-width: 0; width: auto; }
 .ic-open:hover .ic-name, .cf-open:hover .cf-name { text-decoration: underline; }
 .ic-open:hover .ic-name { color: var(--accent); }
 
@@ -1978,5 +2048,5 @@ input { font: inherit; }
 .field-hint b { color: var(--fg); font-weight: 600; }
 
 @media (prefers-reduced-motion: reduce) {
-  .orb-stage, .panel, .orb, .orb-arm, .orb-badge, .rq, .rq-card, .rq-dock, .rq-dots, .rq-dotlist, .rq-dot, .rq-shellbadge, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin, .chat-msg, .convo-pop, .foot-msg, .cf-bar i, .chat-receipt, .mode-opt, .cm-act { transition: none !important; animation: none !important; }
+  .orb-stage, .panel, .orb, .orb-arm, .orb-badge, .rq, .rq-card, .rq-dock, .rq-dots, .rq-dotlist, .rq-dot, .rq-shellbadge, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin, .chat-msg, .convo-pop, .foot-msg, .chat-receipt, .mode-opt, .cm-act { transition: none !important; animation: none !important; }
 }

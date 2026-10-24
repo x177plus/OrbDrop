@@ -131,14 +131,14 @@
             <div class="s-name">{share.name}</div>
             <div class="s-meta">
               <span class="num">{share.path}</span>
-              {#if connectedDevices.length > 0 && share.broadcastEnabled}
-                <span class="bcast-chip" title="自动广播至 {connectedDevices.map(d => `「${deviceShortName(d)}」`).join('、')}">
-                  <span class="dot live"></span>{connectedDevices.length}台设备
-                </span>
-              {/if}
             </div>
           </div>
           <div class="s-acts">
+            {#if connectedDevices.length > 0 && share.broadcastEnabled}
+              <span class="bcast-chip" title="自动广播至 {connectedDevices.map(d => `「${deviceShortName(d)}」`).join('、')}">
+                <span class="dot live"></span>{connectedDevices.length}台设备
+              </span>
+            {/if}
             <label class="switch" title="向设备广播">
               <input
                 type="checkbox"

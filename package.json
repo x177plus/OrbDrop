@@ -13,6 +13,7 @@
     "check:compat": "node scripts/check-compat.mjs",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test:snapshot": "node scripts/test-snapshot-order.mjs",
     "check:watch": "svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
     "android:dev": "tauri android dev",
