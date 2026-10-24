@@ -6,7 +6,7 @@
   import * as api from "$lib/api";
   import * as devices from "$lib/stores/devices.svelte";
 
-  let { onClose }: { onClose: () => void } = $props();
+  let { onClose, peerId }: { onClose: () => void; peerId?: string } = $props();
 
   /**
    * 候选目标：未绑定的，外加"需重新配对"的（token 被对端清过 / 换了机器 —— 那台的长连接
@@ -16,13 +16,23 @@
    * 码本身不跟设备绑定（`PairStore` 里写得很清楚：持码即凭证，认的是谁把它念出来），
    * 但命令要有一台目标设备，所以这里先选目标再生成码，而不是照抄原型那把假码。
    */
-  const candidates = $derived(
+  const allCandidates = $derived(
     devices.visibleDevices(devices.getDevices()).filter((d) => !d.paired || devices.needsRepair(d)),
   );
 
+  /**
+   * 从某台设备的行 / 底板点进来时，目标**已经选定**（`peerId`）：表里只画这一台，不再把
+   * 整份设备列表摊开让人重新挑 —— 用户点的就是它。那台若在表开着的时候被别处配好，
+   * `fixed` 为空、这张表落到「不需要配对」那一档，而不是悄悄选到别的设备上去。
+   */
+  const fixed = $derived(peerId ? allCandidates.find((d) => d.id === peerId) ?? null : null);
+  const candidates = $derived(peerId ? (fixed ? [fixed] : []) : allCandidates);
+
   let picked = $state<string | null>(null);
   /** 选中项跟着候选收敛：那台配对成功后就从候选里消失，自动落到下一台，别留一个悬空的 id。 */
-  const target = $derived(candidates.find((d) => d.id === picked) ?? candidates[0] ?? null);
+  const target = $derived(
+    peerId ? fixed : (candidates.find((d) => d.id === picked) ?? candidates[0] ?? null),
+  );
 
   let code = $state<string | null>(null);
   let codeAt = $state(0);
@@ -94,8 +104,8 @@
       //
       // **表不关**（P1-13⑤）：发出去的邀请只有 60s，而撤回的唯一入口就是这一张表 ——
       // 收起它等于把"取消"这颗按钮藏起来（对端界面上那条通知只能等它超时）。
-      const inviteId = await api.pairInvite(peer.id);
-      store.setPendingPairInvite(inviteId, devices.deviceShortName(peer));
+      const start = await api.pairInvite(peer.id);
+      store.setPendingPairInvite(start.inviteId, devices.deviceShortName(peer), start.sas);
       store.toast(`已向「${devices.deviceShortName(peer)}」发起配对邀请`);
     } catch (e) {
       store.failed("发起配对邀请", e);
@@ -126,28 +136,48 @@
   {#if !target}
     <div class="empty">
       <Icon name="devices" />
-      <p>没有待配对的设备</p>
-      <p class="es">确保两台设备在同一局域网，或手动添加 IP:端口。</p>
+      <p>{peerId ? "这台设备当前不需要配对" : "没有待配对的设备"}</p>
+      <p class="es">{peerId
+        ? "它已经配对完成；若对端不认本机凭据，设备列表会把它标成「需重新配对」。"
+        : "确保两台设备在同一局域网，或手动添加 IP:端口。"}</p>
     </div>
   {:else}
-    <!-- 目标设备这一份就是**设备列表**（候选取自 `visibleDevices`）：名字与头像字都走
-         **显示名**（F-101：有备注就是「备注(设备名)」），与设备页那一行同规。 -->
-    <div class="sec-label" style="padding-bottom:0">
-      <span>目标设备</span><span class="num">{candidates.length} 台</span>
-    </div>
-    <div class="stack">
-      {#each candidates as d (d.id)}
-        <label class="pick" class:is-checked={target.id === d.id}>
-          <input type="radio" name="pairTarget" checked={target.id === d.id} onchange={() => (picked = d.id)} />
-          <span class="pav">{devices.deviceDisplayName(d).charAt(0)}</span>
+    <!-- 从设备行点进来时目标已经定了（`peerId`）：只画这一台，不出整份候选表。
+         没给 `peerId`（「配对设备」那颗全局按钮）才列所有候选。 -->
+    {#if fixed}
+      <div class="sec-label" style="padding-bottom:0">
+        <span>目标设备</span><span class="num">1 台</span>
+      </div>
+      <div class="stack">
+        <div class="pick is-checked">
+          <span class="pav">{devices.deviceDisplayName(fixed).charAt(0)}</span>
           <span class="fmain">
-            <span class="fname2" title={devices.deviceDisplayName(d)}>{devices.deviceDisplayName(d)}</span>
-            <span class="fmeta num">{d.ip}:{d.port}</span>
+            <span class="fname2" title={devices.deviceDisplayName(fixed)}>{devices.deviceDisplayName(fixed)}</span>
+            <span class="fmeta num">{fixed.ip}:{fixed.port}</span>
           </span>
-          <StateChip state={devices.deviceState(d)} />
-        </label>
-      {/each}
-    </div>
+          <StateChip state={devices.deviceState(fixed)} />
+        </div>
+      </div>
+    {:else}
+      <!-- 目标设备这一份就是**设备列表**（候选取自 `visibleDevices`）：名字与头像字都走
+           **显示名**（F-101：有备注就是「备注(设备名)」），与设备页那一行同规。 -->
+      <div class="sec-label" style="padding-bottom:0">
+        <span>目标设备</span><span class="num">{candidates.length} 台</span>
+      </div>
+      <div class="stack">
+        {#each candidates as d (d.id)}
+          <label class="pick" class:is-checked={target.id === d.id}>
+            <input type="radio" name="pairTarget" checked={target.id === d.id} onchange={() => (picked = d.id)} />
+            <span class="pav">{devices.deviceDisplayName(d).charAt(0)}</span>
+            <span class="fmain">
+              <span class="fname2" title={devices.deviceDisplayName(d)}>{devices.deviceDisplayName(d)}</span>
+              <span class="fmeta num">{d.ip}:{d.port}</span>
+            </span>
+            <StateChip state={devices.deviceState(d)} />
+          </label>
+        {/each}
+      </div>
+    {/if}
 
     <!-- 换目标设备不清掉已生成的码：后端那串码不跟设备绑定（`PairStore`），清了反而是骗人。 -->
     <button class="btn btn-primary btn-block" type="button" onclick={() => void start()}>
@@ -176,9 +206,15 @@
         <span class="oi"><Icon name="bell" /></span>
         <span class="om">
           <span class="on">等待「{waiting.peerName}」确认</span>
-          <span class="od">对方在它的配对通知里点「接收」即完成；60 秒没人处理自动作废。</span>
+          <span class="od">先核对两边的码一致，再由对方点「接收」；60 秒没人处理自动作废。</span>
         </span>
       </div>
+      {#if waiting.sas}
+        <div class="code-box">
+          <span class="sas-code">{waiting.sas}</span>
+          <span class="code-hint">对方屏幕应显示同一串；不一致就取消这次邀请。</span>
+        </div>
+      {/if}
       <button class="btn btn-secondary btn-block" type="button" onclick={() => void cancelInvite()}>
         <Icon name="x" />取消邀请
       </button>

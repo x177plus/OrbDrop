@@ -10,7 +10,8 @@
     /** 无障碍名字；缺省用标题。 */
     label?: string;
     onClose: () => void;
-    children: Snippet;
+    /** 确认框只有标题、说明与底部按钮，没有 body 内容。 */
+    children?: Snippet;
     foot?: Snippet;
   } = $props();
 </script>
@@ -28,9 +29,11 @@
       </div>
       <button class="icon-btn" type="button" aria-label="关闭" onclick={onClose}><Icon name="x" /></button>
     </div>
-    <div class="sheet-body">
-      {@render children()}
-      {#if foot}<div class="sheet-foot">{@render foot()}</div>{/if}
-    </div>
+    {#if children || foot}
+      <div class="sheet-body">
+        {#if children}{@render children()}{/if}
+        {#if foot}<div class="sheet-foot">{@render foot()}</div>{/if}
+      </div>
+    {/if}
   </div>
 </div>

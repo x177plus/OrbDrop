@@ -30,6 +30,11 @@
   const onlineCount = $derived(devices.getDevices().filter((d) => d.connected).length);
   const deviceCount = $derived(devices.getDevices().length);
   const addr = $derived(store.getLocalAddr());
+  /**
+   * 「设置」页签的更新角标：有可用新版就挂一颗 `1`。与设置页里那格「版本与更新」同一份状态；
+   * 按过「稍后」也照挂（那是"不再自动弹"，不是"没有更新"）。
+   */
+  const updateBadge = $derived(upd.updateBadge());
 
   /**
    * 启动时的静默检查发现新版 → **主动弹一张底板**（后端 `check(force = false)`，起来 8 秒后跑，
@@ -203,6 +208,8 @@
             <span class="ti-badge">{convoBadge}</span>
           {:else if t.id === "files" && pending > 0}
             <span class="ti-badge hot">{pending}</span>
+          {:else if t.id === "settings" && updateBadge > 0}
+            <span class="ti-badge">{updateBadge}</span>
           {/if}
         </span>
         <span class="ti-lb">{t.label}</span>

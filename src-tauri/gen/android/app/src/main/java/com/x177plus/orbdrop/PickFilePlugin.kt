@@ -75,17 +75,23 @@ class PickFilePlugin(private val activity: Activity) : Plugin(activity) {
       invoke.resolve(empty)
       return
     }
-    try {
-      val files = JSArray()
-      for (uri in urisOf(result.data)) {
-        files.put(copyToCache(uri))
+    // `@ActivityCallback` 在主线程上执行；这里可能是一整个 500 MB–1 GB 的视频/安装包，
+    // `copyToCache` 的 `ins.copyTo` 不能占着 UI 线程（否则就是 ANR）。URI 列表先在主线程
+    // 取好，复制放到后台线程，结果再回主线程 resolve。
+    val uris = urisOf(result.data)
+    Thread {
+      try {
+        val files = JSArray()
+        for (uri in uris) {
+          files.put(copyToCache(uri))
+        }
+        val out = JSObject()
+        out.put("files", files)
+        activity.runOnUiThread { invoke.resolve(out) }
+      } catch (e: Exception) {
+        activity.runOnUiThread { invoke.reject(e.message ?: e.toString()) }
       }
-      val out = JSObject()
-      out.put("files", files)
-      invoke.resolve(out)
-    } catch (e: Exception) {
-      invoke.reject(e.message ?: e.toString())
-    }
+    }.start()
   }
 
   /**

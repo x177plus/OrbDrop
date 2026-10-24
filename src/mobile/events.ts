@@ -17,6 +17,8 @@
  *   这件事只有 toast 与「文件」页两个出口。
  * - `push://batch` —— **发送侧**那张快照（输入框里粘一张图发出去就是一次推送）：
  *   会话里那条文件气泡的百分比与成败都抄它。
+ * - `browse://download` —— 浏览对端共享项时的一次下载：`progress` 推行右那圈进度环，
+ *   `done` / `error` 更新终局；「传输」页签正在下载的数量读同一份 store。
  * - `pair://completed` / `pair://invite_failed` —— 本机**发出去**的配对邀请的结果
  *   （`PairSheet` 只负责报"已发出"，结果由这两条回来）。
  * - `link://request` / `link://request_sent` / `link://request_closed` / `link://request_result`
@@ -47,17 +49,6 @@ import { peerShortName } from "$lib/stores/devices.svelte";
 import { undeliverableText, type PushBatch, type PushInvite, type Undeliverable } from "$lib/types";
 import * as store from "./store.svelte";
 
-/** 事件载荷里只有 `inviteId`，而 toast 要说"收到了哪个文件"，所以回会话里认一下。 */
-function nameOfInvite(inviteId: string): string {
-  if (!inviteId) return "文件";
-  for (const row of chat.convoRows()) {
-    for (const item of chat.itemsOf(row.key)) {
-      if (item.kind === "file" && item.inviteId === inviteId) return item.name;
-    }
-  }
-  return "文件";
-}
-
 export const ready: Promise<void> = (async () => {
   // 别人推来的文件：会话里当场落一条文件消息。已配对设备后端已经 `auto` 收下了，
   // 那张卡一出现就是"接收中"；未绑定的那条要等人在卡上点「接收」。
@@ -65,13 +56,13 @@ export const ready: Promise<void> = (async () => {
     const inv = ev.payload;
     chat.noteInboundInvite(inv);
     store.toast(
-      inv.auto ? `正在接收「${inv.name}」` : `「${peerShortName(inv.sender.id, inv.sender.name)}」发来「${inv.name}」`,
+      inv.auto ? "正在接收文件" : `「${peerShortName(inv.sender.id, inv.sender.name)}」发来文件`,
       "download",
     );
   });
 
-  // 接收进度：会话里那张卡就地变成"接收中 xx%"（`noteInviteProgress` 顺带把
-  // `pending` 推进到 `accepted` —— 人点过「接收」之后第一条进度就是它）。
+  // 接收进度：会话里那条气泡的百分比与右侧圆环就地推进（状态文字也带同一个数）；
+  // `noteInviteProgress` 顺带把 `pending` 推进到 `accepted` —— 人点过「接收」后第一条进度就是它。
   await listen<{ inviteId: string; received: number; total: number }>("push://progress", (ev) => {
     const { inviteId, received, total } = ev.payload;
     if (total <= 0) return;
@@ -95,24 +86,45 @@ export const ready: Promise<void> = (async () => {
   // 看着像出错了，其实是有人主动做的决定。
   await listen<{ inviteId: string; status: string; reason?: string | null; dest?: string }>("push://done", (ev) => {
     const { inviteId, status, reason, dest } = ev.payload;
-    const name = nameOfInvite(inviteId);
+    // 发送侧也会收到同一条 `push://done`（取消 / 完成）：那几条由 `push://batch` 推着气泡走，
+    // 接收侧才有"收到 / 已取消"这句话。没有那张接收卡就别报 —— 否则取消自己的发送会跳出一句
+    // 「文件」已取消。
+    const incoming = chat.hasIncomingInvite(inviteId);
     const outcome =
       status === "completed" ? "received" : status === "cancelled" ? "cancelled" : "failed";
     // `dest`（落盘那一层目录）一并给会话 store：会话里那条气泡上的「打开」按它去开
     // （见 `ChatFileMsg.path`）—— 东西落在哪只有后端知道。
     chat.noteInviteDone(inviteId, outcome, dest);
     if (status === "completed") {
-      store.toast(`已收到「${name}」`, "download");
+      if (!incoming) return;
+      store.toast("已收到文件", "download");
       // 收件目录里刚多了一项，而「文件」页那份列表只在挂载/手动刷新/删除时才拉 ——
       // 不在这儿补一次，用户会看到会话里写着"已接收"、文件页却还是"还没有收到的文件"。
       void store.loadInbox();
     } else if (status === "cancelled") {
       // 取消/拒绝是自己点的或对方点的，不必再报一次错。
-      store.toast(`「${name}」已取消`, "x");
+      if (!incoming) return;
+      store.toast("传输已取消", "x");
     } else {
+      if (!incoming) return;
       // 失败要给原因（磁盘满了、对端走了都在这里）。
-      store.failed(`接收「${name}」`, reason ?? "接收失败");
+      store.failed("接收文件", reason ?? "接收失败");
     }
+  });
+
+  // 浏览对端共享项时的一次下载：中途字节数与终局都走这一条。命令 `download_from_peer`
+  // 本身仍阻塞到落盘，界面拿它的返回值兜底收尾；进度只能从事件来（见 `store.noteBrowseDownload`）。
+  await listen<{
+    peerId: string;
+    shareId: string;
+    path: string;
+    name: string;
+    status: "progress" | "done" | "error";
+    received: number;
+    dest?: string | null;
+    error?: string | null;
+  }>("browse://download", (ev) => {
+    store.noteBrowseDownload(ev.payload);
   });
 
   // 本机发出的配对邀请有结果了。**`inviteId` 非空才是这条路**：本机自己输码那条
@@ -136,7 +148,7 @@ export const ready: Promise<void> = (async () => {
   // **别人发来的**配对邀请（P1-13⑤）：桌面端挂一条带「接收/拒绝」的通知，移动端用一张底板
   // 接住（`store.notePairInvite` 会把它打开）。旧版本这里干脆没登记，于是"PC 点发起邀请、
   // 手机上什么都不会发生"，60 秒后那条邀请就作废了。
-  await listen<{ inviteId: string; peerId: string; peerName: string; unproven?: boolean }>(
+  await listen<{ inviteId: string; peerId: string; peerName: string; unproven?: boolean; sas?: string | null }>(
     "pair://invite",
     (ev) => {
       const p = ev.payload;
@@ -145,6 +157,7 @@ export const ready: Promise<void> = (async () => {
         peerId: p.peerId,
         peerName: peerShortName(p.peerId, p.peerName),
         unproven: p.unproven === true,
+        sas: p.sas ?? undefined,
       });
     },
   );

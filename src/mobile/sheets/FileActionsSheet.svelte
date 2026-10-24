@@ -51,15 +51,12 @@
    * （见 `docs/p1-implementation.md` §20），这条前端 bug 只是把它遮住了。
    */
   async function open(): Promise<void> {
-    const { path, name } = entry;
+    const { path } = entry;
     const apk = isApk;
     onClose();
     try {
       await api.openPath(path);
-      store.toast(
-        apk ? `已交给系统安装器安装「${name}」` : `已用系统应用打开「${name}」`,
-        apk ? "download" : "file",
-      );
+      store.toast(apk ? "已交给系统安装器安装" : "已用系统应用打开", apk ? "download" : "file");
     } catch (e) {
       store.failed(apk ? "安装" : "打开", e);
     }
@@ -72,7 +69,7 @@
       // 原型拼的是 `settings.inboxDir + '/' + name`（那份设置是 mock）；真实后端把完整路径
       // 随着收件项一起给全了，不自己拼，免得目录名一改就指到不存在的地方。
       await navigator.clipboard.writeText(path);
-      store.toast(`已复制路径：${path}`, "copy");
+      store.toast("已复制路径", "copy");
     } catch (e) {
       store.failed("复制路径", e);
     }
@@ -80,13 +77,19 @@
 
   async function remove(): Promise<void> {
     // 后端是直接删盘上这一份（没有回收站），删错了找不回来；原型敢直接删是因为列表全是 mock。
-    // 先问一句再动手 —— 移动端 webview 里 `window.confirm` 是原生对话框，拿得到用户的选择。
+    // 确认框走应用自己的 Sheet（`store.confirmAction`），不再用 WebView 的系统 `confirm`。
     const { name, path } = entry;
-    if (!confirm(`删除收件目录中的「${name}」？此操作不可撤销。`)) return;
+    const ok = await store.confirmAction({
+      title: "删除本地副本",
+      desc: `「${name}」将从收件目录中移除。此操作不可撤销。`,
+      confirmLabel: "删除",
+      danger: true,
+    });
+    if (!ok) return;
     onClose();
     try {
       await store.deleteInboxEntry(path);
-      store.toast(`已删除本地副本「${name}」`, "trash");
+      store.toast("已删除本地副本", "trash");
     } catch (e) {
       store.failed("删除", e);
     }

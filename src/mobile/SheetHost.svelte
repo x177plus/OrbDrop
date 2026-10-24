@@ -14,6 +14,7 @@
   import EditRecipientsSheet from "./sheets/EditRecipientsSheet.svelte";
   import KeepAliveSheet from "./sheets/KeepAliveSheet.svelte";
   import UpdateSheet from "./sheets/UpdateSheet.svelte";
+  import ConfirmSheet from "./sheets/ConfirmSheet.svelte";
 
   // 底板宿主：把 store 里那个槽位翻成具体的 sheet。
   // 这里是唯一"哪张 sheet 对应哪个组件"的地方 —— 各 tab 只 `openSheet({ kind: ... })`。
@@ -21,7 +22,7 @@
 </script>
 
 {#if sheet.kind === "pair"}
-  <PairSheet {onClose} />
+  <PairSheet peerId={sheet.peerId} {onClose} />
 {:else if sheet.kind === "pairInvite"}
   <PairInviteSheet {onClose} />
 {:else if sheet.kind === "linkRequest"}
@@ -48,4 +49,6 @@
   <KeepAliveSheet {onClose} />
 {:else if sheet.kind === "update"}
   <UpdateSheet {onClose} />
+{:else if sheet.kind === "confirm"}
+  <ConfirmSheet prompt={sheet.prompt} {onClose} />
 {/if}

@@ -126,7 +126,7 @@ class MessageNotifierPlugin(private val activity: Activity) : Plugin(activity) {
 
   /**
    * 跳到「消息通知」**那一条渠道**自己的设置页：横幅、铃声、锁屏、勿扰，全挂在这一页上
-   * （华为那一层是把渠道映射成"通知类型"的，同一批开关换了个名字）。
+   * （部分厂商 ROM 会把渠道映射成"通知类型"，同一批开关换了个名字）。
    *
    * 先 `ensureChannel` 再跳：渠道不在时那一页是空的 —— 用户被送到一个什么都没有的页面上，
    * 比不引导更糟。渠道建不出来（没给通知权限）时退回应用通知页，好歹能看到总开关。
@@ -210,7 +210,7 @@ class MessageNotifierPlugin(private val activity: Activity) : Plugin(activity) {
      * 只按需在建在 `notifyMessage` 里的话，装完那一刻渠道表是空的（另一条 `orbdrop.keepalive`
      * 是 `IMPORTANCE_LOW`、而且它在系统那一页里本来也没什么可调的），于是
      * "设置 → 通知和状态栏 → OrbDrop"里看不到「消息通知」这一条：**横幅/提醒方式无从开起**
-     * （华为那一层的默认值也是在"这个应用有哪些通知类型"的那一刻定下的，见 docs/p1-implementation.md §19）。
+     * （部分厂商 ROM 的默认值也是在"这个应用有哪些通知类型"的那一刻定下的，见 docs/p1-implementation.md §19）。
      *
      * 重要性只有**建渠道那一刻**能定：AOSP 之后只允许应用把它**降**下去，不允许升
      * （`PreferencesHelper.createNotificationChannel`：`existing.getUserLockedFields() == 0 &&

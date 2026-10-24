@@ -47,7 +47,7 @@
          未配对（拨号要求 paired）、对端不在网上（只会开一个空转的拨号循环）、
          token 已被对端作废（必 401，出路是重新配对）。 -->
     {#if !d.paired}
-      <button class="opt" type="button" onclick={() => store.openSheet({ kind: "pair" })}>
+      <button class="opt" type="button" onclick={() => store.openSheet({ kind: "pair", peerId: d.id })}>
         <span class="oi"><Icon name="plus" /></span>
         <span class="om">
           <span class="on">配对</span>
@@ -64,7 +64,7 @@
           </span>
         </button>
       {:else if devices.needsRepair(d)}
-        <button class="opt" type="button" onclick={() => store.openSheet({ kind: "pair" })}>
+        <button class="opt" type="button" onclick={() => store.openSheet({ kind: "pair", peerId: d.id })}>
           <span class="oi"><Icon name="plus" /></span>
           <span class="om">
             <span class="on">重新配对</span>

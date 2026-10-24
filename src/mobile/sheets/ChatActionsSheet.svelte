@@ -37,9 +37,35 @@
     store.openSheet({ kind: "editRecipients", key: convoKey });
   }
 
+  async function clearGroupHistory(): Promise<void> {
+    const key = convoKey;
+    const ok = await store.confirmAction({
+      title: "清空聊天记录",
+      desc: `清空「${title}」的本地聊天记录？不会退群，之后的新消息仍会收到；其他成员不受影响。`,
+      confirmLabel: "清空",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await chat.clearGroupHistory(key);
+    } catch (e) {
+      store.failed("清空聊天记录", e);
+      return;
+    }
+    onClose();
+    store.toast("已清空本地聊天记录（未退群）", "trash");
+  }
+
   async function clearHistory(): Promise<void> {
     const peerId = thread?.participants[0];
     if (!peerId) return;
+    const ok = await store.confirmAction({
+      title: "清空聊天记录",
+      desc: `清空与「${title}」的本机聊天记录？不会影响对方，删掉后不能恢复。`,
+      confirmLabel: "清空",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await chat.clearPeer(peerId);
     } catch (e) {
@@ -57,8 +83,9 @@
    *
    * 三件事是移动端这边必须自己做的：
    * - **先问一句**：退群没有回收站，"退错了再进"要对方重新邀请，所以按移动端一贯的做法
-   *   （见 `FileActionsSheet`）用原生 `confirm`；文案写明"其余成员不受影响、**本机这份记录
-   *   会一起删掉**"（`GroupStore::leave` 的实情：本地 groups/convos/mySeq 都清掉）。
+   *   （见 `FileActionsSheet`）用应用自己的确认框（`store.confirmAction`）；文案写明"其余
+   *   成员不受影响、**本机这份记录会一起删掉**"（`GroupStore::leave` 的实情：本地 groups/
+   *   convos/mySeq 都清掉）。
    * - **退回会话列表**：子屏的路由是 hash（`#/chat/<key>`），退出之后那条会话已经不在快照里
    *   （`activeThread()` 为空）—— 停在原处就是一屏没有标题、也发不出消息的空壳。
    * - 提示用 `exitThread` 回来的标题（那是离开前快照里的名字），不是这里 `$derived` 的那份。
@@ -66,14 +93,21 @@
   async function exitThread(): Promise<void> {
     const t = thread;
     if (!t || t.mode === "direct") return;
+    const key = convoKey;
     const isGroup = t.mode === "group";
     const ask = isGroup
       ? `退出「${title}」？本机不再收发这个群的消息，本机这份聊天记录也会一起删掉；其他成员不受影响。`
       : `删除群发「${title}」？消息仍留在与各台设备的单独会话里，名单不再保留。`;
-    if (!confirm(ask)) return;
+    const ok = await store.confirmAction({
+      title: isGroup ? "退出群聊" : "删除群发",
+      desc: ask,
+      confirmLabel: isGroup ? "退出" : "删除",
+      danger: true,
+    });
+    if (!ok) return;
     let gone: { title: string } | null = null;
     try {
-      gone = await chat.exitThread(convoKey);
+      gone = await chat.exitThread(key);
     } catch (e) {
       store.failed(isGroup ? "退出群聊" : "删除群发", e);
       return;
@@ -108,7 +142,7 @@
        会话正是"看着这台设备"的地方，要改对它的叫法或重新配对，不该先退回设备页长按那一行。
        分档与设备底板逐条同规 —— 备注与在线状态无关（纯本机数据，离线/未绑定的会话照样能改）；
        配对项只给「未绑定」与「凭据失效」两档（已配对的一对一会话没有配对可言）。
-       目标设备照旧在配对表里选（`pair_start` 要 peerId，那张表本来就是选目标的地方）。 -->
+       配对表直接钉在这台设备上（带 `peerId`），不再让人从整份设备列表里重挑。 -->
   {#if dev}
     <button class="opt" type="button" onclick={() => store.openSheet({ kind: "remarkDevice", peerId: dev.id })}>
       <span class="oi"><Icon name="settings" /></span>
@@ -119,7 +153,7 @@
     </button>
 
     {#if !dev.paired || devices.needsRepair(dev)}
-      <button class="opt" type="button" onclick={() => store.openSheet({ kind: "pair" })}>
+      <button class="opt" type="button" onclick={() => store.openSheet({ kind: "pair", peerId: dev.id })}>
         <span class="oi"><Icon name="plus" /></span>
         <span class="om">
           <span class="on">{dev.paired ? "重新配对" : "配对"}</span>
@@ -143,7 +177,16 @@
         <span class="od">只清理本机记录，不影响对方。</span>
       </span>
     </button>
-  {:else if thread}
+  {:else if thread?.mode === "group"}
+    <button class="opt" type="button" onclick={() => void clearGroupHistory()}>
+      <span class="oi"><Icon name="trash" /></span>
+      <span class="om">
+        <span class="on">清空聊天记录</span>
+        <span class="od">只清本机记录，不退群；之后的新消息照常收。</span>
+      </span>
+    </button>
+  {/if}
+  {#if thread && thread.mode !== "direct"}
     <!-- 多台会话的出口（与桌面端会话菜单的最后一项对齐）：群聊是退名册 + 广播离开，
          群发是删掉这份名单 —— 两者的消息都一条不动。 -->
     <button class="opt danger" type="button" onclick={() => void exitThread()}>

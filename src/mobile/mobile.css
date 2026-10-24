@@ -12,7 +12,7 @@
      5. **行尾必须是 LF**：`tokens:gen` / `tokens:check` 按整文件字符串比对，CRLF（或 CRLF/LF
         混杂）会被判成"回退未同步"——编辑器别把这个文件存成 CRLF。
      6. **`color-mix()` 一律写 `in oklab`（直角插值），不写 `in oklch`**：Chrome 111–114 的极坐标
-        色相插值会把 `transparent` 的色相当 0 绕行，蓝色底纹被染成粉色（真机 Huawei WebView
+        色相插值会把 `transparent` 的色相当 0 绕行，蓝色底纹被染成粉色（真机 Android WebView
         114.0.5.302 实测：`--accent-soft` 叠白底 = rgb(243,221,237)，正确值 rgb(227,239,251)；
         同引擎的 `oklch()` 本身是准的）。与 `transparent` / `black` 混时 `in oklab` 与 `in oklch`
         等价，只有两个带色相的颜色互混才有差别 —— 那几处（`--hairline`/`.pend`/`.opt.danger`）
@@ -101,7 +101,7 @@
 [hidden] { display: none !important; }
 html, body { margin: 0; min-height: 100%; }
 /* 手指按住元素时那层**蓝**，是 Android WebView 自己盖上去的，不是本套 UI 的样式：
-   `-webkit-tap-highlight-color` 的默认高亮 —— 真机（Huawei WebView / Android 12）实测按住
+   `-webkit-tap-highlight-color` 的默认高亮 —— 真机（Android WebView / Android 12）实测按住
    按钮时整个按钮被刷成 rgb(170,223,244)，正好是 `#33B5E5` 按 40% 不透明度叠在 --bg 上；
    按下即现、抬手才退 —— 用户看到的就是"点击按钮出现一个蓝色的按压效果"。
    UI 自己的按压反馈由各处 `:active` 的 scale 承担，不需要系统再叠一层。
@@ -270,7 +270,7 @@ a { color: inherit; text-decoration: none; }
 .cv-dot.warn { background: var(--warn); }
 
 /* 会话列表 / 会话头那颗点与设备页的 `.dot` **同一套五档语义**（实心绿 = 长连接、
-   绿环 = 在线、灰环 = 离线、琥珀环 = 重连中、红环 = 需配对）。
+   蓝=在线（实心蓝=已验证，空心蓝=未配对/未验证）、灰=离线、琥珀=重连中、红=需配对）。
    这里以前把五档压成两颗（长连接与"在线"都是实心绿）—— 于是"经中转够得着"与"有长连接"
    在同一颗绿点上分不出来，而同一台设备在设备页上又是另一套画法。两处必须同一套。 */
 .cv-dot.live,
@@ -283,6 +283,9 @@ a { color: inherit; text-decoration: none; }
 .cv-dot.offline { border-color: rgba(14, 18, 23, 0.32); }
 .cv-dot.retrying { border-color: var(--warn); }
 .cv-dot.repair { border-color: var(--danger); }
+.cv-dot.solid.online { background: var(--accent); border-color: var(--accent); }
+.cv-dot.solid.offline { background: rgba(14, 18, 23, 0.32); border-color: rgba(14, 18, 23, 0.32); }
+.cv-dot.solid.retrying { background: var(--warn); border-color: var(--warn); }
 .cv-time { margin-left: auto; flex: none; font-family: var(--font-mono); font-size: calc(11 * var(--u)); color: var(--muted); }
 .cv-prev { font-size: var(--fs-sm); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cv-unread {
@@ -349,6 +352,11 @@ a { color: inherit; text-decoration: none; }
 .msg.peer .bubble { background: var(--surface-2); color: var(--fg); border-bottom-left-radius: calc(6 * var(--u)); }
 .msg.me .bubble { background: var(--accent-deep); color: #fff; border-bottom-right-radius: calc(6 * var(--u)); }
 .msg.bc .bubble { background: var(--bc-deep); }
+/* 图片消息 / 图片文件：图就是气泡内容，气泡不留内边距（缩略图用 `flush` 那一档贴齐边缘，
+   圆角跟着气泡走，见 `ImagePreview.svelte`）。读不出来退回文件行时，由下面那条把内边距
+   补回去 —— 只删气泡 padding 的话那一行字会顶到边缘。 */
+.bubble.media { padding: 0; }
+.bubble.media > .fbub-row > .fbub { padding: calc(9 * var(--u)) calc(12 * var(--u)); }
 .ctext { display: block; white-space: pre-wrap; }
 .meta { margin-top: calc(4 * var(--u)); font-family: var(--font-mono); font-size: calc(10 * var(--u)); color: var(--muted); }
 .who { display: flex; align-items: center; gap: calc(5 * var(--u)); margin: 0 2px calc(4 * var(--u)); }
@@ -370,8 +378,14 @@ a { color: inherit; text-decoration: none; }
    （底色、边框、居中、字体）得清掉，排版仍旧由 `.fbub` 自己给。`width: 100%` 是补回按钮的收缩
    行为 —— `min-width` 那一条本来就撑着它，这里只是别让按钮比内容还窄。 */
 button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: left; font: inherit; color: inherit; }
-/* 老引擎算不出 `color-mix(… currentColor …)`（它取决于继承来的文字色，无法预计算）：这一处与下面
-   `.fbar` 各给一条**中性**回退。数值刻意取成与新引擎同值 —— 浅底气泡里 currentColor 就是 `--fg`，
+/* 文件气泡：左边是文件名 / 大小 / 状态，右边是那颗大圆环（发送 = 停止，接收 = 暂停/继续）。
+   图片那一档环留在图外面，不盖住缩略图。 */
+.fbub-row { display: flex; align-items: center; min-width: 0; }
+.fbub-row > .fbub { flex: 1; width: auto; min-width: 0; }
+.fring { flex: none; display: flex; align-items: center; padding-left: calc(10 * var(--u)); }
+.bubble.media .fring { padding: 0 calc(8 * var(--u)); }
+/* 老引擎算不出 `color-mix(… currentColor …)`（它取决于继承来的文字色，无法预计算）：这一处给一条
+   **中性**回退。数值刻意取成与新引擎同值 —— 浅底气泡里 currentColor 就是 `--fg`，
    所以老引擎得到的颜色与新的逐位相同；蓝气泡（文字是白）另由下面的 `.msg.me` 两条兜住。 */
 .fbub .fio { flex: none; width: calc(34 * var(--u)); height: calc(34 * var(--u)); border-radius: calc(10 * var(--u)); display: grid; place-items: center; background: rgba(14, 18, 23, 0.15); }
 .fbub .fio .ic { width: calc(18 * var(--u)); height: calc(18 * var(--u)); }
@@ -379,22 +393,8 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .fname { font-size: var(--fs-md); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .fsize { font-family: var(--font-mono); font-size: calc(10 * var(--u)); opacity: .82; }
 .fstat { font-size: calc(10 * var(--u)); opacity: .88; }
-.fbar { display: block; height: calc(4 * var(--u)); margin-top: calc(5 * var(--u)); border-radius: 99px; background: rgba(14, 18, 23, 0.24); overflow: hidden; }
-.fbar i { display: block; height: 100%; border-radius: 99px; background: currentColor; }
 /* 自己发的气泡（含群发那条）背景是深蓝，currentColor = 白：老引擎用白色浅底，与新引擎同值。 */
 .msg.me .fbub .fio { background: rgba(255, 255, 255, 0.15); }
-.msg.me .fbar { background: rgba(255, 255, 255, 0.24); }
-
-/* 「正在接收」那一行右端的停止（图标就够：手机这一行本来就窄，写"停止"会把进度条挤没）。 */
-.fbub .fstop {
-  flex: none; margin-left: calc(4 * var(--u));
-  width: calc(28 * var(--u)); height: calc(28 * var(--u)); padding: 0;
-  display: grid; place-items: center;
-  border: 0; border-radius: calc(8 * var(--u)); background: none;
-  color: var(--muted); cursor: pointer;
-}
-.fbub .fstop:hover { color: var(--danger); background: var(--fg-soft); }
-.fbub .fstop .ic { width: calc(16 * var(--u)); height: calc(16 * var(--u)); }
 
 .invite {
   align-self: flex-start; max-width: 88%;
@@ -521,7 +521,11 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .t-pct { flex: none; font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--muted); }
 .t-bar { height: calc(6 * var(--u)); border-radius: 99px; background: var(--fg-soft); overflow: hidden; }
 .t-bar i { display: block; height: 100%; border-radius: 99px; background: var(--accent); transition: width .3s linear; }
+/* 对端没报大小时不编百分比：一段短条来回走，只表示"还在动"。 */
+.t-bar.indet i { width: 35%; animation: t-indet 1.2s ease-in-out infinite; }
+@keyframes t-indet { from { transform: translateX(-110%); } to { transform: translateX(300%); } }
 .t-bar.done i { background: var(--ok); }
+.t-bar.paused i { background: var(--muted); transition: none; }
 .t-bar.fail i { background: var(--warn); }
 .t-meta { display: flex; align-items: center; justify-content: space-between; gap: calc(10 * var(--u)); font-size: var(--fs-xs); color: var(--muted); }
 .t-meta .num { font-family: var(--font-mono); }
@@ -531,7 +535,11 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .chips { display: flex; gap: calc(8 * var(--u)); overflow-x: auto; padding: 2px 0 calc(6 * var(--u)); scrollbar-width: none; }
 .chips::-webkit-scrollbar { display: none; }
 .node { width: 100%; display: flex; align-items: center; gap: calc(11 * var(--u)); padding: calc(11 * var(--u)) calc(12 * var(--u)); text-align: left; }
-.node + .node { border-top: 1px solid var(--border); }
+/* 每个节点外面套一层 `.noderow`：分割线跟着这一层走；文件行右侧留出圆环那一格
+   （`DownloadRing` 绝对定位盖在行上面，行高与目录行完全一致）。 */
+.noderow { position: relative; }
+.noderow.has-dl .node { padding-right: calc(59 * var(--u)); }
+.noderow + .noderow { border-top: 1px solid var(--border); }
 .node:hover { background: var(--fg-soft); }
 .node .ntile { flex: none; width: calc(36 * var(--u)); height: calc(36 * var(--u)); border-radius: calc(10 * var(--u)); display: grid; place-items: center; background: var(--fg-soft); color: var(--muted); }
 .node .ntile.folder { background: rgba(180, 98, 0, 0.14); color: rgb(106, 55, 0); }
@@ -574,7 +582,7 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .drow:hover { background: var(--fg-soft); }
 .drow.is-pressing { background: var(--fg-soft); }
 .state-chip { flex: none; display: inline-flex; align-items: center; gap: calc(5 * var(--u)); height: calc(22 * var(--u)); padding: 0 calc(8 * var(--u)); border-radius: 99px; background: var(--fg-soft); color: var(--muted); font-size: calc(10 * var(--u)); font-weight: 600; }
-.state-chip.unbound { background: rgba(180, 98, 0, 0.15); color: rgb(106, 55, 0); }
+.state-chip.unbound { background: var(--fg-soft); color: var(--muted); }
 .dacts { flex: none; display: flex; align-items: center; gap: calc(4 * var(--u)); }
 
 /* ─────────────────────────── settings ─────────────────────────── */
@@ -685,19 +693,30 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 
 .code-box { display: grid; gap: calc(8 * var(--u)); justify-items: center; padding: calc(16 * var(--u)); border-radius: calc(15 * var(--u)); background: var(--accent-soft); }
 .code { font-family: var(--font-mono); font-size: calc(40 * var(--u)); font-weight: 700; letter-spacing: .14em; color: var(--accent-deep); }
+/* 邀请的 8 位 SAS：比 6 位配对码长，字号小一档才放得下。 */
+.sas-code { font-family: var(--font-mono); font-size: calc(28 * var(--u)); font-weight: 700; letter-spacing: .12em; color: var(--accent-deep); }
 .code-hint { font-size: var(--fs-xs); color: var(--accent-deep); opacity: .85; }
 
 /* ─────────────────────────── toasts ─────────────────────────── */
-.toasts { position: absolute; left: 0; right: 0; bottom: calc(92 * var(--u)); z-index: 30; display: flex; flex-direction: column; align-items: center; gap: calc(8 * var(--u)); padding: 0 calc(24 * var(--u)); pointer-events: none; }
+/* 瞬时提示层：**永远在最上层**（底板 `.sheet-layer` 是 14、会话子屏 `.sub` 是 6），
+   否则"已保存""已收到"会被正开着的底板盖住。容器不吃指针，压在上面也不挡操作。 */
+.toasts { position: absolute; left: 0; right: 0; bottom: calc(92 * var(--u)); z-index: 60; display: flex; flex-direction: column; align-items: center; gap: calc(8 * var(--u)); padding: 0 calc(24 * var(--u)); pointer-events: none; }
+/* 居中三件套：短提示按内容收窄（容器 `align-items: center`）、图标与文字作为一组居中
+   （`justify-content: center`）、换行后每一行居中（`text-align: center`）。
+   `overflow-wrap: anywhere` 兜住文件名 / 路径这类没有空格的串 —— 它们断不开时会把文本
+   顶出色块，看起来就是"没居中"。 */
 .toast {
   max-width: 100%; padding: calc(10 * var(--u)) calc(16 * var(--u)); border-radius: 999px;
   background: rgba(14, 18, 23, 0.93); color: #fff;
-  font-size: var(--fs-sm); text-align: center;
+  font-size: var(--fs-sm); line-height: 1.45; text-align: center;
+  overflow-wrap: anywhere;
   box-shadow: 0 calc(12 * var(--u)) calc(30 * var(--u)) calc(-12 * var(--u)) rgba(0,0,0,.45);
-  display: flex; align-items: center; gap: calc(8 * var(--u));
+  display: flex; align-items: center; justify-content: center; gap: calc(8 * var(--u));
   animation: toast-in .22s cubic-bezier(.2,.8,.2,1);
 }
-.toast .ic { width: calc(14 * var(--u)); height: calc(14 * var(--u)); opacity: .82; }
+/* 超过三行就截断：提示只报状态，细节留在对应页面。 */
+.toast-msg { min-width: 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+.toast .ic { width: calc(14 * var(--u)); height: calc(14 * var(--u)); flex: none; opacity: .82; }
 .toast.leaving { opacity: 0; transform: translateY(calc(6 * var(--u))); transition: opacity .24s ease, transform .24s ease; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(calc(8 * var(--u))); } }
 
@@ -764,6 +783,10 @@ body {
 .dot.offline { border-color: rgba(14, 18, 23, 0.32); }
 .dot.retrying { border-color: var(--warn); }
 .dot.repair { border-color: var(--danger); }
+/* 实心 = 已配对且指纹已验证；未配对/未验证保持空心。repair 永远空心。 */
+.dot.solid.online { background: var(--accent); border-color: var(--accent); }
+.dot.solid.offline { background: rgba(14, 18, 23, 0.32); border-color: rgba(14, 18, 23, 0.32); }
+.dot.solid.retrying { background: var(--warn); border-color: var(--warn); }
 /* 胶囊里那几颗点不发光环：6–7px 的点套一圈 3px 光环会糊成一团（桌面端同一条）。 */
 .state-chip .dot { box-shadow: none; }
 @keyframes chip-breathe {
@@ -780,7 +803,7 @@ body {
    纯 oklch() 不同：它在解析期就非法、那条声明被丢掉、前一条生效，所以那些用成对声明就够。
    另一条硬规矩：这块里的 color-mix() **一律 `in oklab`（直角插值）**，不用 `in oklch` ——
    Chromium 111–114 的极坐标色相插值会把 transparent 的色相当 0 绕行，蓝色底纹会被染成粉色
-   （真机 Huawei WebView 114.0.5.302 实测）；与 transparent / black 混时两者等价，见 gen 脚本注释。 */
+   （真机 Android WebView 114.0.5.302 实测）；与 transparent / black 混时两者等价，见 gen 脚本注释。 */
 @supports (color: oklch(0% 0 0)) and (background: color-mix(in oklab, red, blue)) {
   :root {
   --bg: oklch(99% 0.002 240);
@@ -817,12 +840,11 @@ body {
   .dot.off { background: color-mix(in oklab, var(--fg) 26%, transparent); }
   .cv-dot { background: color-mix(in oklab, var(--fg) 24%, transparent); }
   .fbub .fio { background: color-mix(in oklab, currentColor 15%, transparent); }
-  .fbar { background: color-mix(in oklab, currentColor 24%, transparent); }
   .pend { background: color-mix(in oklab, var(--accent-soft) 55%, var(--surface)); border: 1px solid color-mix(in oklab, var(--accent) 26%, var(--border)); }
   .ftile.doc { color: color-mix(in oklab, var(--ok) 72%, black); }
   .ftile.folder { background: color-mix(in oklab, var(--warn) 14%, transparent); color: color-mix(in oklab, var(--warn) 68%, black); }
   .node .ntile.folder { background: color-mix(in oklab, var(--warn) 14%, transparent); color: color-mix(in oklab, var(--warn) 68%, black); }
-  .state-chip.unbound { background: color-mix(in oklab, var(--warn) 15%, transparent); color: color-mix(in oklab, var(--warn) 68%, black); }
+  .state-chip.unbound { background: var(--fg-soft); color: var(--muted); }
   .switch .track { background: color-mix(in oklab, var(--fg) 18%, transparent); }
   .scrim { background: color-mix(in oklab, var(--fg) 32%, transparent); }
   .sheet-grip { background: color-mix(in oklab, var(--fg) 18%, transparent); }

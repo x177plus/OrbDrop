@@ -208,14 +208,14 @@
                 {#if d.connected}
                   <button class="btn btn-secondary btn-sm" type="button" onclick={() => void store.toggleConnection(d.id, true)}>断开</button>
                 {:else if !d.paired || devices.needsRepair(d)}
-                  <!-- 目标设备在配对表里选：`pair_start` 要 peerId，而这个 tab 只知道自己按了哪一行。 -->
-                  <button class="btn btn-primary btn-sm" type="button" onclick={() => store.openSheet({ kind: "pair" })}>配对</button>
+                  <!-- 按的是哪一行就配哪一台：把 peerId 带进配对表，表里不再列全部候选。 -->
+                  <button class="btn btn-primary btn-sm" type="button" onclick={() => store.openSheet({ kind: "pair", peerId: d.id })}>配对</button>
                 {:else}
                   <button class="btn btn-primary btn-sm" type="button" onclick={() => void store.toggleConnection(d.id, false)}>连接</button>
                 {/if}
                 {@render messageBtn(d)}
               {:else if !d.paired}
-                <button class="btn btn-primary btn-sm" type="button" onclick={() => store.openSheet({ kind: "pair" })}>配对</button>
+                <button class="btn btn-primary btn-sm" type="button" onclick={() => store.openSheet({ kind: "pair", peerId: d.id })}>配对</button>
                 {@render messageBtn(d)}
               {/if}
             </span>
