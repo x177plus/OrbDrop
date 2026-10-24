@@ -2,12 +2,12 @@
   "version": "0.1.0",
   "versionCode": 1000,
   "notes": "安全：配对码改为 SPAKE2（P-256）PAKE——6 位码只做双方口令、不再出现在报文里；配对邀请加入 8 位 SAS 核对码。出站 TLS 同时出示本机证书，并按目标设备钉住证书指纹；群消息与名册改为 Ed25519 签名，成员公钥只认本机绑定，群回执/补拉补上成员与签名校验。公开路由增加请求体空闲超时与每来源 IP 并发上限，对端回话、DAV 正文与更新产物一律按体积上限读取；中转路由记录按来源分档，未配对设备换地址必须出示同一枚 TLS 证书；镜像目录的设备 id/共享项 id 按安全路径段校验；安卓 FileProvider 只放开应用自己的目录，并关闭系统备份。\n\n新增：会话文件气泡改为两侧布局——左侧文件名/大小/状态，右侧一颗进度圆环（发送方可停止、接收方可暂停/继续），桌面与安卓同一套；安卓「文件 → 浏览」与桌面「下载到本地」支持暂停/续传与重启接传。群聊新增「清空聊天记录（不退群）」。安卓 4 处系统 confirm 换成应用自己的确认底板，「后台与通知」新增「后台耗电管理」入口。聊天记录/群聊/图片迁到 chat-vault（固定掩码封装，不是加密），首启自动迁移。\n\n修复：会话图片铺满气泡、缩略图不再闪回占位行；点不掉的 0 B/0 B 推送卡、偶现的「消息一直显示发送中」、连续拖拽到资源管理器随机失败、删除收件副本后「浏览」仍显示已下载，均已修复。提示层统一置顶且不吃点击，长文本按内容居中；设备/会话状态点改为「填充=已验证、颜色=链路」两维。",
-  "pubDate": "2026-10-24T14:31:04Z",
+  "pubDate": "2026-10-24T14:32:28Z",
   "desktop": {
     "windows-x86_64": {
       "size": 16892416,
       "sha256": "0a85fbdcb000d436e19a76b43d597a3d760444dc58ea5344a1484ef397341dda",
-      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NHQxeUcrb1VickU1UXJaQWhGNjl1YmJNTHE1a0pHOWhiK2xDTTRPYlBMUDhOZHJ1aEZIOTFLd1BXVk9uclBOQzVjYytRZXBQTFJac3Q4M0xkRlFHK3c0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyODUyMjY0CWZpbGU6b3JiZHJvcC5leGUKaVRDTXJodm44WHFVMDc3dUNsYkVhOWI2SUpDak8zOVN5UUMvcUNrRmZWd1JjL1lyOWQwWWNwMEs4NjdzOFlKKzlxN0Q3MDJVbWFnZ2RqTkdVbHNuRFE9PQo=",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NHFkN3E1U0RwNFphUlMxTWtORTMrQ0pVSVB0NCtKU2RCdmszWkwwTlBNdkJZTi9ST1hSRXNadUlRbkhCS2lNbG9zQkx1NVJlTVJVMkdneXU4K1VHSkF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyODUyMzQ4CWZpbGU6b3JiZHJvcC5leGUKN3VORmFpTkZkOG9xdWdldG1COGY0WlhOdHR6ZWhmQ1lGK2p1bXFiN2ludHNWbWxjQ0NsaXQxanlxU2NWNzYyd0VlZXN2SVMzcldoTmgzYUFJRno2Q0E9PQo=",
       "mirrors": [
         "https://github.com/x177plus/OrbDrop/releases/download/v0.1.0/orbdrop.exe",
         "https://gitee.com/x177plus/OrbDrop/releases/download/v0.1.0/orbdrop.exe"
