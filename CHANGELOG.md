@@ -1,6 +1,6 @@
 # 更新日志
 
-## 未发布 — macOS 桌面端
+## v0.1.1 — 2026-10-26
 
 新增：macOS 11+（Apple Silicon + Intel 通用包）。与 Windows 共用同一份 Rust 核心与 Svelte 前端，
 补齐 macOS 外壳：不占 Dock 的菜单栏应用、全空间透明置顶悬浮球、`⌘W` 隐藏而非销毁、再次打开叫回面板；
