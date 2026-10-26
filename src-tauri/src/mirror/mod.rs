@@ -54,6 +54,10 @@ pub mod identity;
 
 #[cfg(windows)]
 mod win;
+/// macOS 没有 CFAPI 的公开等价物：对端项在**起拖之前**整份落到镜像目录，再按真实路径交给
+/// `NSDraggingSession`（见 `docs/macos.md`）。文件/目录的回收与 Windows 共用下面的 `sweep`。
+#[cfg(target_os = "macos")]
+mod mac;
 
 /// 镜像里一项在磁盘上留多久（兜底）。真正让回收及时的是"目标关句柄"那条路（见 [`note_closed`]）：
 /// 进程重启过、回调没收到的情况才靠这条按龄扫。
@@ -61,6 +65,11 @@ mod win;
 /// 年龄必须按**本地放入镜像的时刻**算（[`Lifecycle::placed`]），不能用文件 mtime：占位符的
 /// mtime 是对端的修改时间（可能是几天前），拿它当"放了多久"会在 sweep 里删掉刚放好、
 /// 甚至正在被目标复制的那一项 —— 目标侧看到的就是"源文件已损坏或不可用"。
+#[cfg(target_os = "macos")]
+const MIRROR_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Windows 的占位符水合有「目标关句柄」那条及时回收；macOS 的暂存是普通文件，没有句柄回调，
+/// 只能靠 TTL，所以给足一天（用户把一份大目录拖到 Finder、过一夜再回来读也不该空）。
+#[cfg(not(target_os = "macos"))]
 const MIRROR_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// 目标关句柄之后多久可以回收。留一段余地：复制完再校验一遍、杀软顺手扫一眼都会重新打开，
@@ -69,7 +78,7 @@ const CLOSE_GRACE: Duration = Duration::from_secs(60);
 
 /// 后台回收的节拍。回收**不在拖拽路径上**：拖拽路径里做扫描既慢，又会和"刚放好的项"抢同一
 /// 路径（并发拖两个项时，后一个的扫描可能把前一个正在复制的占位符删掉）。
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 const SWEEP_INTERVAL: Duration = Duration::from_secs(120);
 
 /// 镜像根：`<数据目录>/mirror`。
@@ -102,10 +111,14 @@ pub async fn place(state: &Arc<AppState>, item: &MirroredItem) -> Result<PathBuf
         ensure_ready(state.clone());
         win::place_item(state, item).await
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        mac::place_item(state, item).await
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (state, item);
-        Err("镜像只在 Windows 上有实现".into())
+        Err("当前平台没有对端项的拖出实现".into())
     }
 }
 
@@ -321,7 +334,7 @@ fn should_reclaim(path: &Path, life: &Lifecycle, now: Instant) -> bool {
 
 /// 启动后台周期回收。启动时由调用方先同步 [`sweep`] 一次，之后按 [`SWEEP_INTERVAL`] 收。
 pub fn start_sweeper() {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     crate::task::spawn("mirror sweep", async {
         loop {
             tokio::time::sleep(SWEEP_INTERVAL).await;

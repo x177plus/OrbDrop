@@ -149,6 +149,58 @@ export function setCaretEnd(el: HTMLElement): void {
   sel.addRange(range);
 }
 
+// ── 输入法组合闸门 ────────────────────────────────────────────────────────
+
+/**
+ * 正在输入法组合（`compositionstart` … `compositionend` 之间）的那几个输入区。
+ *
+ * 组合期间**绝不能**重画输入区的 DOM、也不能挪光标：预编辑串（拼音）此刻就躺在 DOM 里，
+ * 重画等于把它当普通文本落下来 —— 用户看到的就是"没选字，拼音却固化进框里了"。
+ * 按元素记而不是一个全局布尔：组件销毁重建时，旧元素上没等到的 `compositionend`
+ * 不会把新元素的闸门一起关上。
+ */
+const composing = new WeakSet<HTMLElement>();
+
+/** 组合期间被推迟的那一次重画（后到的覆盖先到的：界面只认"最新该画成什么样"）。 */
+let deferred: { el: HTMLElement; paint: () => void } | null = null;
+
+/**
+ * `compositionstart` / `compositionend` 的落点（组件在输入区上挂同名事件时调）。
+ *
+ * 组合结束**不立刻**画：上屏那一下 DOM 还在落字，最后一次 `input` 可能排在
+ * `compositionend` 之后 —— 等一帧，让草稿先写完（`applyComposer` 读的就是草稿）。
+ * 这一帧里要是又进了新的组合，就留着这次重画，等下一次组合结束再说。
+ */
+export function noteComposition(el: HTMLElement, started: boolean): void {
+  if (started) {
+    composing.add(el);
+    return;
+  }
+  composing.delete(el);
+  if (deferred?.el !== el) return;
+  requestAnimationFrame(() => {
+    if (composing.has(el) || deferred?.el !== el) return; // 又进了组合 / 已经画过了
+    const run = deferred.paint;
+    deferred = null;
+    run();
+  });
+}
+
+/**
+ * 组合中就把这次重画推迟到组合结束；否则当场跑。
+ *
+ * **推迟的是"重画这件事"，不是某一刻的会话**：到点后 `paint` 自己重读当前会话键 ——
+ * 组合结束与点击切会话可能落在同一帧，拿旧键重画会把上一条的草稿盖过来。
+ */
+export function paintWhenNotComposing(el: HTMLElement, paint: () => void): void {
+  if (composing.has(el)) {
+    deferred = { el, paint };
+    return;
+  }
+  deferred = null; // 立刻画了，之前排着的那一次作废
+  paint();
+}
+
 /**
  * 把一张图插到**光标处**（不是框末）—— "在图片前后添加文字"这件事全靠它：
  * 光标在中间，图就落在中间；前后各有一段文字时，那两段就是两条消息。

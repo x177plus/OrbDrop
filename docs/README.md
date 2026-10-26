@@ -1,6 +1,6 @@
 # OrbDrop 文档
 
-这个目录是**改代码的人**的地图：8 份文档 + 1 份定点审计 + 本索引，全部为简体中文。
+这个目录是**改代码的人**的地图：9 份文档 + 1 份定点审计 + 本索引，全部为简体中文。
 面向使用者/下载者的入口在根目录：[README.zh-CN.md](../README.zh-CN.md)（中文）、[README.md](../README.md)（英文）。
 
 ## 一、文档清单
@@ -15,6 +15,7 @@
 | [p2-beyondcompare.md](p2-beyondcompare.md) | Beyond Compare 集成：`BCProfiles.xml` 注入与密码信封、回环代理与命名空间改写、写回 | **现行**；读路径已实测，**写回未用真机 BC 验证**（§4） | `src-tauri/src/bc.rs`、`src-tauri/src/server/proxy.rs` |
 | [relay.md](relay.md) | 局域网中转：盲转（F-106）、跨网段中转记忆与失效转移（F-107）、锚点与反向传播、安卓当锚点 | **现行**（已实现；与设计的偏离与未验部分见 §17） | `src-tauri/src/relay.rs`、`server/routes_relay.rs`、`server/routes_discover.rs`、`config.rs` |
 | [update.md](update.md) | 自更新与发行链路（F-110）：不用官方 updater 的理由、清单与信任链、Gitee 镜像切换、覆盖 exe、发布流程 | **现行**（运维向） | `src-tauri/src/update/`、`scripts/release.mjs` |
+| [macos.md](macos.md) | macOS 移植：窗口外壳、拖出/暂存、BC、自更新、构建与真机验证清单 | **现行代码，已构建/启动冒烟，功能待逐项验证** | 全仓的 `cfg(target_os = "macos")` 分支、`Info.plist`、`scripts/macos-artifact.mjs` |
 | [audit-2026-09-26.md](audit-2026-09-26.md) | 定点全项目审计（只读）：P0 致命、P1、P2、功能缺失、未验证、修复状态 | **快照**（2026-09-26）；P0 与 P1 已全部修复，逐条见 §7 | — |
 
 ## 二、建议阅读顺序
@@ -24,7 +25,8 @@
 3. [p1-implementation.md](p1-implementation.md) —— 实现怎么长起来的；最大的一份，按需要挑节读，别通读。
 4. 三个专题：[cfapi-mirror.md](cfapi-mirror.md)（拖出）、[p2-beyondcompare.md](p2-beyondcompare.md)（BC）、[relay.md](relay.md)（中转）。
 5. [update.md](update.md) —— 发一版要动什么（发布链路与信任链）。
-6. [audit-2026-09-26.md](audit-2026-09-26.md) —— 体检结论、安全面的取舍与已知缝。
+6. [macos.md](macos.md) —— 动 macOS 的窗口/拖出/BC/自更新之前先看这里的平台映射与真机验证清单。
+7. [audit-2026-09-26.md](audit-2026-09-26.md) —— 体检结论、安全面的取舍与已知缝。
 
 ## 三、引用约定（改文档之前先读这节）
 
@@ -42,7 +44,7 @@
 | 两台真实设备之间的表现：带宽、续传、群聊收敛、离线排队 | `audit-2026-09-26.md` §5 |
 | Android 真机：mDNS 可达性（受 ROM 影响）、后台存活、SAF | `audit-2026-09-26.md` §5 |
 | Android 真机：应用表（包可见性 + 直读别人的 `base.apk`）与「发送应用」端到端 | `p1-implementation.md` §41 |
-| macOS 全部（开发机是 Windows） | `audit-2026-09-26.md` §5、`requirements.md` |
+| macOS 全部（开发机是 Windows；代码已落地，按 `macos.md` §7 逐项验证） | `macos.md` §7、`audit-2026-09-26.md` §5 |
 
 ## 五、脱敏约定
 

@@ -1,5 +1,9 @@
 //! 悬浮球窗口几何：判定展开方向所需的显示器工作区，以及原子的移动 + 缩放。
 //!
+//! macOS 的窗口外壳（不在 Dock 露面、全屏空间可见、透明）在 [`setup_macos`] 里补齐：
+//! `tauri.conf.json` 的 `visibleOnAllWorkspaces` 只加 `CanJoinAllSpaces`，而别的应用进入
+//! 全屏后，浮窗还需要 `FullScreenAuxiliary` 才会被一起带过去。
+//!
 //! 展开方向必须知道「悬浮球当前在哪、四周还剩多少可显示区域」，而 Tauri 的
 //! `Monitor` 只给出整块显示器矩形（不含任务栏/Dock），所以工作区直接取
 //! Win32 `GetMonitorInfoW(...).rcWork`；移动+缩放用一次 `SetWindowPos` 完成，
@@ -31,6 +35,54 @@ pub struct ScreenMetrics {
 /// 查询悬浮球所在显示器的工作区（物理像素）。
 pub fn metrics(window: &WebviewWindow) -> Result<ScreenMetrics, String> {
     imp::metrics(window)
+}
+
+/// macOS 的应用外壳：不占 Dock、不挂菜单栏，但悬浮窗在**所有空间**（含别的应用的全屏空间）
+/// 和普通桌面上都可见。
+///
+/// `LSUIElement`（`Info.plist`）管启动那一刻；这里再调一次 `ActivationPolicy::Accessory` 是
+/// 为了 `tauri dev` 与从终端直接拉起二进制的场合 —— 那两种启动方式不一定经过 LaunchServices。
+#[cfg(target_os = "macos")]
+pub fn setup_macos(app: &tauri::App) -> Result<(), String> {
+    use tauri::Manager as _;
+    app.handle()
+        .set_activation_policy(tauri::ActivationPolicy::Accessory)
+        .map_err(|e| format!("设置 Accessory 激活策略失败: {e}"))?;
+
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+    window
+        .set_visible_on_all_workspaces(true)
+        .map_err(|e| format!("设置「所有空间可见」失败: {e}"))?;
+    window
+        .set_always_on_top(true)
+        .map_err(|e| format!("重新置顶失败: {e}"))?;
+
+    // `visibleOnAllWorkspaces` 只给 CanJoinAllSpaces；全屏空间是另一面旗子，
+    // 而且没有 Tauri 封装，只能直接落到 NSWindow 上。
+    let ns_window = window
+        .ns_window()
+        .map_err(|e| format!("取 NSWindow 失败: {e}"))?;
+    if ns_window.is_null() {
+        return Err("NSWindow 为空".into());
+    }
+    unsafe {
+        use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior as B};
+        let ns_window = &*(ns_window as *const NSWindow);
+        let behavior = ns_window.collectionBehavior()
+            | B::CanJoinAllSpaces
+            | B::Stationary
+            | B::FullScreenAuxiliary;
+        ns_window.setCollectionBehavior(behavior);
+    }
+    Ok(())
+}
+
+/// 非 macOS：没有这层外壳（Windows 由 `skipTaskbar` + 透明窗口承担）。
+#[cfg(not(target_os = "macos"))]
+pub fn setup_macos(_app: &tauri::App) -> Result<(), String> {
+    Ok(())
 }
 
 /// 一次性移动 + 缩放窗口：保持 Z 序（始终置顶）、不抢焦点。
@@ -530,6 +582,17 @@ mod imp {
     }
 
     /// 非 Windows 拿不到全局键状态：一律当作「没按住」，落位判定退回按 move 事件间隔触发。
+    ///
+    /// macOS 例外：拖出与移窗的起拖都发生在主线程，`NSEvent.pressedMouseButtons` 就在那一跳
+    /// 里读，能真实回答「主键还按着吗」。这一条让「准备对端项太久、手先松了」不再起一场
+    /// 立刻结束的空拖。
+    #[cfg(target_os = "macos")]
+    pub fn mouse_down() -> bool {
+        // 必须在主线程调用（本文件的调用点都在 `run_on_main_thread` 里）。
+        objc2_app_kit::NSEvent::pressedMouseButtons() & 1 != 0
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn mouse_down() -> bool {
         false
     }
@@ -568,8 +631,16 @@ mod imp {
             w: size.width as i32,
             h: size.height as i32,
         };
+        // macOS 的 Dock / 菜单栏不在 `monitor.size()` 里扣：Tauri 的 `Monitor::work_area()` 走
+        // `NSScreen.visibleFrame`，正是这里要的「可落位区域」。Linux 上它退化成整屏，行为不变。
+        let work = monitor.work_area();
         Ok(ScreenMetrics {
-            work_area: rect,
+            work_area: Rect {
+                x: work.position.x,
+                y: work.position.y,
+                w: work.size.width as i32,
+                h: work.size.height as i32,
+            },
             monitor: rect,
             scale_factor: monitor.scale_factor(),
         })

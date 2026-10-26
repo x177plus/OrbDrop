@@ -107,6 +107,13 @@ pub struct AppState {
     /// 而 `PeerDevice` 是要落盘进地址簿的形状。存在这里的 id，`peers` 里对应那行就是
     /// "临时条目"—— 不写地址簿、不被探活接管、超时由 `sweep_learned` 收走。
     pub learned: Mutex<HashMap<String, Instant>>,
+    /// 5s 探活**连续失败**计数（只活在本进程）：未配对的行到
+    /// [`PROBE_FAIL_LIMIT_UNPAIRED`] 就整行忘掉，配对的行保留关系、只记一条 debug。
+    ///
+    /// 为什么要这一档：`knownPeers` 按 device id 存，对端重装/清数据后 id 变了，
+    /// 旧 id 若没被身份核对接手，就会一直指着同一个死地址；5s 一拍各拨一次，macOS 的
+    /// 256 fd 上限很快被这些无用的 `SYN_SENT` 吃掉（见 docs/macos.md §1.3）。
+    probe_failures: Mutex<HashMap<String, u32>>,
     /// 本机替别人开出去的中转端点（F-106，运行时；见 `relay`）。开关一关就全收。
     pub relays: crate::relay::RelayRegistry,
     /// 本机替别人中转**累计搬过的字节**（收发两方向之和，F-106 / S-09 的用量记录）。
@@ -656,7 +663,7 @@ impl AppState {
         let groups = crate::group::GroupStore::with_blobs(group_path, group_blobs);
         groups.sanitize_read_by(&own_id);
 
-        Self {
+        let state = Self {
             config_path,
             config: Mutex::new(config),
             peers: Mutex::new(peers),
@@ -692,7 +699,12 @@ impl AppState {
             relay_failed: Mutex::new(HashMap::new()),
             adopted: Mutex::new(HashMap::new()),
             share_changed_at: Mutex::new(HashMap::new()),
-        }
+            probe_failures: Mutex::new(HashMap::new()),
+        };
+        // 启动时先合并同一地址上的重复未配对行（knownPeers 按 device id 存，对端换过 id
+        // 就会留下多条指向同一格的死行 —— 每 5s 各拨一次）。
+        state.dedupe_known_addresses();
+        state
     }
 
     // ------------------------------------------------------------------
@@ -2907,6 +2919,121 @@ impl AppState {
         self.emit_devices_changed();
     }
 
+    /// 忘掉一台**未配对**设备：设备行、地址簿里的观察记忆、备注、观察指纹、临时表一起清。
+    ///
+    /// 已配对的行返回 `false`（调用方应先「解除配对」；否则清掉 token 之外的记录会让
+    /// 对端还认着本机，而本机这里已经没有它 —— 那是最糟的半清状态）。凭据读不到时也不动，
+    /// 宁可让用户重试，不拿一次瞬时 IO 故障去删用户数据。
+    pub fn forget_peer(&self, peer_id: &str) -> bool {
+        match crate::credential::get_peer_token(peer_id) {
+            Ok(None) => {}
+            Ok(Some(_)) => return false,
+            Err(e) => {
+                debug!(%peer_id, %e, "读取凭据失败，暂不忘记这台设备");
+                return false;
+            }
+        }
+        self.clear_heard(peer_id);
+        self.ws.drop_peer(peer_id);
+        self.learned.lock().remove(peer_id);
+        self.seen.lock().remove(peer_id);
+        self.adopted.lock().remove(peer_id);
+        self.probe_failures.lock().remove(peer_id);
+        self.peers.lock().retain(|p| p.id != peer_id);
+        {
+            let mut config = self.config.lock();
+            config.known_peers.remove(peer_id);
+            config.device_remarks.remove(peer_id);
+            config.observed_fingerprints.remove(peer_id);
+            config.peers.retain(|p| p.id != peer_id);
+            let _ = crate::config::save_config_at(&self.config_path, &config);
+        }
+        self.emit_devices_changed();
+        true
+    }
+
+    /// 同一个 `ip:port` 只留一行：未配对的重复行忘掉，已配对的行一律不动。
+    ///
+    /// `knownPeers` 按 **device id** 存，对端重装/清数据后 id 变了，旧 id 若没被身份核对接手
+    /// （旧端口又不通）就会和新行一起指着同一格地址 —— 5s 探活各拨一次，等于把同一台死设备
+    /// 拨 N 遍。启动时与每轮探活后各调一次。
+    ///
+    /// 保留顺序：已配对 > 在线 > id 字典序（确定性）。已配对的行**永远不自动删**：
+    /// 关系是用户数据，宁可多留一行，也不替用户解除配对。
+    pub fn dedupe_known_addresses(&self) -> usize {
+        let mut groups: HashMap<(String, u16), Vec<(String, bool, bool)>> = HashMap::new();
+        for p in self.peers.lock().iter() {
+            if p.ip.is_empty() {
+                continue;
+            }
+            groups
+                .entry((p.ip.clone(), p.port))
+                .or_default()
+                .push((p.id.clone(), p.paired, p.online));
+        }
+        let mut doomed = Vec::new();
+        for (_, mut rows) in groups {
+            if rows.len() < 2 {
+                continue;
+            }
+            rows.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then(b.2.cmp(&a.2))
+                    .then(a.0.cmp(&b.0))
+            });
+            for (id, paired, _) in rows.into_iter().skip(1) {
+                if !paired {
+                    doomed.push(id);
+                }
+            }
+        }
+        let mut removed = 0;
+        for id in doomed {
+            if self.forget_peer(&id) {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            info!(removed, "同一地址上的重复未配对设备行已合并");
+        }
+        removed
+    }
+
+    /// 一轮探活结束后记账：在线即清零；连续失败到阈值时，未配对的行整行忘掉。
+    ///
+    /// 配对的行走 [`PROBE_FAIL_LIMIT_PAIRED`] 那档，只留一条 debug —— 关系与地址都不动。
+    fn note_probe_outcome(&self, peer_id: &str) {
+        let (online, paired) = match self.peers.lock().iter().find(|p| p.id == peer_id) {
+            Some(p) => (p.online, p.paired),
+            None => return,
+        };
+        if online {
+            self.probe_failures.lock().remove(peer_id);
+            return;
+        }
+        let limit = if paired {
+            PROBE_FAIL_LIMIT_PAIRED
+        } else {
+            PROBE_FAIL_LIMIT_UNPAIRED
+        };
+        let count = {
+            let mut failures = self.probe_failures.lock();
+            let n = failures.entry(peer_id.to_string()).or_insert(0);
+            *n = n.saturating_add(1);
+            *n
+        };
+        if count < limit {
+            return;
+        }
+        self.probe_failures.lock().remove(peer_id);
+        if paired {
+            debug!(%peer_id, count, "连续探活失败已达上限：已配对行保留地址");
+        } else {
+            info!(%peer_id, count, "连续探活失败：忘掉未配对设备行");
+            self.forget_peer(peer_id);
+        }
+    }
+
     pub fn get_peer(&self, peer_id: &str) -> Option<PeerDevice> {
         self.peers.lock().iter().find(|p| p.id == peer_id).cloned()
     }
@@ -3765,6 +3892,18 @@ static PROBE_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock:
 /// 串行时一屏死行能把最后那一台拖到十几秒，而它其实第一拍就该被判在线。
 const PROBE_CONCURRENCY: usize = 8;
 
+/// 未配对的行连续失败多少拍就整行忘掉（12 × 5s = 60s）。
+///
+/// 只对**未配对**的行用：它没有关系要保，行里的地址只是"上次见过"，对端一上线 mDNS 会
+/// 重新把它带回来。60s 足够盖住一次短暂掉线，又不至于让死地址在 256 fd 的机器上无限拨。
+const PROBE_FAIL_LIMIT_UNPAIRED: u32 = 12;
+
+/// 已配对的行连续失败多少拍只记一条 debug（关系要保，不清地址）。
+///
+/// 配对设备可能在另一个网段、或只是暂时离线；清掉地址等于让用户重新配对。这里只用于
+/// "别让失败计数无界长 + 每 5 分钟留一条可查的痕迹"。
+const PROBE_FAIL_LIMIT_PAIRED: u32 = 60;
+
 /// 身份核对用的客户端（超时比探活宽一点：这一步的回话更长，一问一答里带整段设备表）。
 static RECONCILE_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     crate::net::client_builder()
@@ -3862,19 +4001,26 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
     let adopted: HashSet<String> = state.adopted.lock().keys().cloned().collect();
     let own_id = state.config.lock().device_id.clone();
 
-    let candidates: Vec<PeerDevice> = state
-        .peers
-        .lock()
-        .iter()
-        .filter(|p| {
-            // 只排除"本机跟它之间没有关系"的那两类（学来的 / 反向记录带进来的：要借中转时
-            // 按需拨）。**有地址的、只有一条借来端点的、以及什么都还没有的**都要进来 ——
-            // 最后那一类（只经中转见过一面、重启后又什么都不剩）在下面只能"借一次"，
-            // 而这正是它的出路所在。
-            !learned.contains(&p.id) && !adopted.contains(&p.id)
-        })
-        .cloned()
-        .collect();
+    let candidates: Vec<PeerDevice> = {
+        // 同一个 `ip:port` 只探一次：`knownPeers` 按 device id 存，对端换 id 后可能有多条
+        // 行指着同一格地址（见 `dedupe_known_addresses`）；这里再兜一层，避免一轮里把
+        // 同一台死设备拨 N 遍。空地址的行不参与这个去重（它们只能走"借中转"那一条）。
+        let mut seen_addr: HashSet<(String, u16)> = HashSet::new();
+        state
+            .peers
+            .lock()
+            .iter()
+            .filter(|p| {
+                // 只排除"本机跟它之间没有关系"的那两类（学来的 / 反向记录带进来的：要借中转时
+                // 按需拨）。**有地址的、只有一条借来端点的、以及什么都还没有的**都要进来 ——
+                // 最后那一类（只经中转见过一面、重启后又什么都不剩）在下面只能"借一次"，
+                // 而这正是它的出路所在。
+                !learned.contains(&p.id) && !adopted.contains(&p.id)
+            })
+            .filter(|p| p.ip.is_empty() || seen_addr.insert((p.ip.clone(), p.port)))
+            .cloned()
+            .collect()
+    };
 
     /// 探一台设备：判死活、收拾换了 id 的行、顺带交换视野与"配对还活不活着"的活口供。
     ///
@@ -4115,11 +4261,20 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
     }
 
     futures_util::stream::iter(candidates)
-        .map(|p| probe_peer(state, p, own_id.as_str()))
+        .map(|p| {
+            let id = p.id.clone();
+            let own = own_id.clone();
+            async move {
+                probe_peer(state, p, own.as_str()).await;
+                state.note_probe_outcome(&id);
+            }
+        })
         .buffer_unordered(PROBE_CONCURRENCY)
         .for_each(|()| async {})
         .await;
 
+    // 一轮结束后再合并一次：这一轮里 mDNS/中转可能又带进来同一地址的新 id。
+    state.dedupe_known_addresses();
     // 担保人这一轮没再提到、或担保人自己掉了的学习条目，从这里收走。放在一轮之末：
     // 这一轮里刚被提到的都已经刷新过时间戳，不会误伤。
     state.sweep_learned();
@@ -6167,5 +6322,42 @@ mod tests {
             "证据过期要如实落回离线"
         );
         assert!(!state.heard_recently("dev-ad"));
+    }
+
+    fn row(id: &str, ip: &str, port: u16, paired: bool) -> PeerDevice {
+        PeerDevice {
+            id: id.into(),
+            name: id.into(),
+            ip: ip.into(),
+            port,
+            online: false,
+            paired,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dedupe_keeps_paired_row_and_one_unpaired_at_the_same_address() {
+        let state = memory_state();
+        state.peers.lock().extend([
+            row("paired", "10.0.0.9", 3890, true),
+            row("stale-a", "10.0.0.9", 3890, false),
+            row("stale-b", "10.0.0.9", 3890, false),
+        ]);
+        assert_eq!(state.dedupe_known_addresses(), 2);
+        let ids: Vec<String> = state.peers.lock().iter().map(|p| p.id.clone()).collect();
+        assert_eq!(ids, vec!["paired".to_string()]);
+    }
+
+    #[test]
+    fn unpaired_row_is_forgotten_after_the_failure_limit() {
+        let state = memory_state();
+        state.peers.lock().push(row("dead", "10.0.0.8", 3891, false));
+        for _ in 0..PROBE_FAIL_LIMIT_UNPAIRED - 1 {
+            state.note_probe_outcome("dead");
+        }
+        assert!(state.get_peer("dead").is_some(), "未到阈值前不能忘");
+        state.note_probe_outcome("dead");
+        assert!(state.get_peer("dead").is_none(), "到阈值后整行忘掉");
     }
 }

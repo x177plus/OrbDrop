@@ -334,24 +334,53 @@ fn drive_type_name(dtype: u32) -> &'static str {
 
 #[cfg(target_os = "macos")]
 fn drives() -> Vec<FsDrive> {
-    // macOS 的"盘"就是 `/` 和挂在 `/Volumes` 下的卷（含 U 盘与外接盘）。
-    // 容量留给 future：`statfs` 不在当前依赖里，拿不到就只列名字（界面按 total = 0 不画占用条）。
-    let mut out = vec![FsDrive {
+    // macOS 的"盘"就是 `/` 和挂在 `/Volumes` 下的卷（含 U 盘与外接盘）。Finder 的侧栏里
+    // 第一项永远是「个人文件夹」，这里也把它放在最前面 —— 否则用户每次都要从 `/` 一路点进
+    // `/Users/<自己>`。容量留给 future：`statfs` 不在当前依赖里，拿不到就只列名字
+    // （界面按 total = 0 不画占用条）。
+    let mut out = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        out.push(FsDrive {
+            name: "个人文件夹".to_string(),
+            path: home.to_string_lossy().to_string(),
+            removable: false,
+            total: 0,
+            free: 0,
+        });
+    }
+    let root = FsDrive {
         name: "/".to_string(),
         path: "/".to_string(),
         removable: false,
         total: 0,
         free: 0,
-    }];
+    };
+    // 启动盘在 `/Volumes` 下常常有一个同名入口（指向 `/`）：别把同一块盘列两遍。
+    // 用 `canonicalize` 比词法路径稳（卷名可以是 `Macintosh HD`，也可能被用户改名）。
+    let root_real = std::fs::canonicalize(&root.path).ok();
+    out.push(root);
     if let Ok(dir) = std::fs::read_dir("/Volumes") {
         for entry in dir.flatten() {
-            if !entry.path().is_dir() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with('.')
+            {
                 continue;
+            }
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if let (Some(a), Ok(b)) = (&root_real, std::fs::canonicalize(&path)) {
+                if *a == b {
+                    continue;
+                }
             }
             out.push(FsDrive {
                 name: entry.file_name().to_string_lossy().to_string(),
-                path: entry.path().to_string_lossy().to_string(),
-                removable: false,
+                path: path.to_string_lossy().to_string(),
+                removable: true,
                 total: 0,
                 free: 0,
             });
@@ -650,6 +679,9 @@ mod tests {
         for d in &list {
             let p = Path::new(&d.path);
             assert!(p.is_absolute(), "{} 不是绝对路径", d.path);
+            // Windows 的盘根必须没有父目录（`C:` 少了尾分隔符会变成「C 盘上的当前目录」）；
+            // macOS 的 `/Volumes/X` 与个人文件夹本来就有父目录，只要求绝对路径。
+            #[cfg(windows)]
             assert!(
                 p.parent().is_none(),
                 "{} 不是盘根 —— 少了尾分隔符就会变成「C 盘上的当前目录」",

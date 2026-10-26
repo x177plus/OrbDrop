@@ -1,0 +1,74 @@
+name: macOS
+
+# 在 Mac（或 GitHub 的 macOS runner）上编通用 .app，并打成自更新用的 zip。
+# 手动触发；产物在 Actions 的 Artifacts 里，交给 `release.mjs --macos-zip` 发布。
+#
+# 签名/公证是可选的：在仓库 Secrets 里放好下面几项，构建步骤会自动带上：
+#   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
+#   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
+# 没有 Secrets 也能出可运行的未签名包（用户需右键「打开」一次）。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust targets
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Import Apple certificate (optional)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            echo "没有配置 APPLE_CERTIFICATE，跳过导入（产物为未签名包）"
+            exit 0
+          fi
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import certificate.p12 -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Build universal app + packages
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # 没配签名身份时把空的环境变量摘掉：Tauri 看到空串会当成"要签但没身份"。
+          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            unset APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          fi
+          # 同一个脚本本地也能跑：只出 .app，再用 hdiutil 做 DMG（不依赖 Finder/AppleScript）。
+          npm run mac:artifact
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          cp assets/v*/orbdrop-macos-universal.app.zip out/
+          cp assets/v*/OrbDrop_*_universal.dmg out/
+          shasum -a 256 out/* | tee out/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbdrop-macos
+          path: out/*
+          if-no-files-found: error

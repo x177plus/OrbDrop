@@ -138,6 +138,21 @@ Windows 上**运行中的 exe 不能被写**（进程映像还映射着它，是
 数据不落在 exe 旁边（设置/日志/传输记录都在 `%LOCALAPPDATA%\OrbDrop`），覆盖 exe 不动用户数据；
 开机自启注册的是 exe 路径，路径不变就照旧有效。
 
+### 6.1 macOS：替换整个 `.app`
+
+macOS 的更新单位是 `.app` 包（Info.plist、资源与签名都在里面），只换包内二进制会留下新旧混杂的包。
+产物是通用包 zip（`ditto -c -k --keepParent`，保留符号链接与资源分叉）：
+
+1. 下载 zip 到 `$TMPDIR/orbdrop-update-<版本>/`，校验 sha256 + minisign；
+2. `ditto -x -k` 解压 → 写入 `/bin/sh` helper，参数是 `pid / 旧 .app / 新 .app / 日志`；
+3. 父进程退出后，helper 把新包 `ditto` 到同卷 `.new` → `旧 .app` 改名 `.old` → 两次 `mv` 原子替换
+   → `open` 新版本 → 删 `.old`；
+4. 任何一步失败都把旧包改名回去并重新打开旧版本；日志同样写 `<数据目录>/logs/update.log`。
+
+限制：必须放在可写位置（通常是 `/Applications`）；从 DMG / 下载目录直接运行会被 App Translocation
+挡住（报错提示先拖进「应用程序」）。未签名/未公证的包首次运行需要右键「打开」。清单键是
+`macos-universal`（客户端先找本机架构键，再退通用包），细节见 [`macos.md`](./macos.md) §5。
+
 ## 7. 安卓端：下载 → 拉起系统安装器
 
 安卓这一段没有静默安装这条路（非系统应用不给），标准姿势是：

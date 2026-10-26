@@ -15,10 +15,11 @@
   import { getPeerSharesState, loadPeerShares, forgetPeerShares } from '$lib/stores/peers.svelte';
   import { notePeerDownload, preparePeerDownload, cancelPeerDownload, finishPeerDownload } from '$lib/stores/peerDownloads.svelte';
   import { getBcStatus, loadBcStatus, setLeft, compareWithLeft } from '$lib/stores/bc.svelte';
+  import { loadPlatform } from '$lib/stores/platform.svelte';
   import * as chat from '$lib/stores/chat.svelte';
   import type { ConvoThread, ChatItem } from '$lib/stores/chat.svelte';
   import * as upd from '$lib/stores/update.svelte';
-  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, setPushReceivePaused, pushPaths, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
+  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, setPushReceivePaused, pushPaths, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, forgetPeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
   import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem } from '$lib/types';
   import { shareMeta, updateStatusText, updateTitleText } from '$lib/types';
   import { planExpansion, planCollapse, planDock, planRectDock, spinForDock, type BadgeSpin, type DockAxis, type DockPlan, type ScreenRect } from '$lib/orbLayout';
@@ -2997,6 +2998,22 @@
     await unpairDevice(deviceId);
   }
 
+  /** 右键「忘记设备」：只清本机记录（未配对行才有这一项；已配对的走「解除配对」）。
+   *  地址簿里的观察记忆、备注与观察指纹一起清 —— 否则下一次 mDNS 又把它带回来，
+   *  用户会以为"忘记"没生效。 */
+  async function ctxForget() {
+    const deviceId = ctxState?.deviceId;
+    const name = ctxState?.name ?? '设备';
+    hideCtx();
+    if (!deviceId) return;
+    try {
+      await forgetPeer(deviceId);
+      toast(`已忘记「${name}」（仅本机记录）`);
+    } catch (e) {
+      toast(`忘记设备失败：${e}`);
+    }
+  }
+
   /** 右键「重新配对」：token 已失效，走一遍配对流程换新 token（与行内「配对」同一个入口）。 */
   function ctxPair() {
     const deviceId = ctxState?.deviceId;
@@ -3070,7 +3087,7 @@
     // Init data + server
     void (async () => {
       try {
-        await Promise.all([settingsReady, loadDevices(), loadBcStatus()]);
+        await Promise.all([settingsReady, loadDevices(), loadBcStatus(), loadPlatform()]);
         // 发送侧那张卡的**初值**：重启后恢复出来的批次只会躺在后端，`push://batch` 是"变化"
         // 不是初值 —— 不拉这一次，用户会看到"没传完的推送不见了"（见 `push_batches`）。
         //
@@ -4107,6 +4124,7 @@
     onDisconnect={ctxDisconnect}
     onPair={ctxPair}
     onUnpair={ctxUnpair}
+    onForget={ctxForget}
     onRemark={ctxRemark}
     onMessage={ctxMessage}
     onChatCopy={ctxChatCopy}

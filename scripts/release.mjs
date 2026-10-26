@@ -67,7 +67,9 @@ const USAGE = `用法：node scripts/release.mjs [选项]
   --local              本机演练：不联网、不 push、不调 API，mirrors 指向本机镜像台
   --verify-only        只回读校验某个已发布的版本（两个清单地址 + 每个资产 URL），不构建、不 push、不调 API
   --skip-build         不构建，直接发布现有产物（本机演练、或刚手动构建过）
-  --republish          同版本重发：复用已发布的 tag/Release，只把清单与四个附件换成这次构建的
+  --macos-zip <文件>   随本版一起发布的 macOS 通用 .app zip（在 Mac 上用 npm run mac:artifact 生成）。
+                       不给时清单里就没有 macOS 产物，macOS 客户端会明确报「这一版没出包」。
+  --republish          同版本重发：复用已发布的 tag/Release，只把清单与各附件换成这次构建的
                        （给"版本号没变、但产物必须换掉"的补发用，比如发布后才发现的客户端缺陷）。
                        仓库里 tag 不动，所以 tag 指向的提交与 Release 附件会不一致 —— 见 docs/update.md
 
@@ -94,11 +96,11 @@ if (flag("--help") || flag("-h")) {
   log(USAGE);
   process.exit(0);
 }
-const KNOWN_FLAGS = ["--local", "--skip-build", "--verify-only", "--republish", "--help", "-h", "--version", "--notes"];
-// 跳过 `--version` / `--notes` 后面的那个值：更新说明里以 `-` 开头也不该被当成未知参数
-// （只有这两个选项真的出现时才登记下标，否则 indexOf 返回 -1，+1 会误把 argv[0] 排除）
+const KNOWN_FLAGS = ["--local", "--skip-build", "--verify-only", "--republish", "--help", "-h", "--version", "--notes", "--macos-zip"];
+// 跳过带值选项后面的那个值：更新说明/路径里以 `-` 开头也不该被当成未知参数
+// （只有这些选项真的出现时才登记下标，否则 indexOf 返回 -1，+1 会误把 argv[0] 排除）
 const valueIdx = new Set();
-for (const name of ["--version", "--notes"]) {
+for (const name of ["--version", "--notes", "--macos-zip"]) {
   const i = argv.indexOf(name);
   if (i >= 0) valueIdx.add(i + 1);
 }
@@ -122,6 +124,8 @@ const VERIFY_ONLY = flag("--verify-only");
  *    Release 再建一个同 tag 的（它没有"删单个附件"这一步，而且这样也顺带释放配额）。
  */
 const REPUBLISH = flag("--republish");
+/** 可选：预先在 Mac 上构建好的 macOS 通用包 zip（见 `scripts/macos-artifact.mjs`）。 */
+const MACOS_ZIP = opt("--macos-zip");
 if (REPUBLISH && LOCAL) die("--republish 只在远端模式有意义", "本机演练直接覆盖本仓根目录的清单即可，不用它。");
 // --verify-only 只读远端（清单 + 资产 URL），不需要 token，也不碰构建与 git。
 const tokens = LOCAL || VERIFY_ONLY ? null : requireRemoteConfig(cfg);
@@ -191,6 +195,15 @@ const ARTIFACTS = [
   { kind: "universal", label: "Android 通用包 APK", src: path.resolve(ROOT, cfg.artifacts.androidUniversalApk), name: ASSET_NAMES.universal },
   { kind: "arm64", label: "Android arm64 APK", src: path.resolve(ROOT, cfg.artifacts.androidArm64Apk), name: ASSET_NAMES.arm64 },
 ];
+if (MACOS_ZIP) {
+  ARTIFACTS.push({
+    kind: "macos",
+    label: "macOS 通用包 zip",
+    // 允许相对路径（相对仓库根）与绝对路径；`path.resolve` 对两者都成立。
+    src: path.resolve(ROOT, MACOS_ZIP),
+    name: ASSET_NAMES.macos,
+  });
+}
 
 step("核对产物");
 for (const a of ARTIFACTS) {
@@ -231,7 +244,7 @@ function apkMeta(apkPath) {
   }
 }
 
-for (const a of ARTIFACTS.filter((x) => x.kind !== "exe")) {
+for (const a of ARTIFACTS.filter((x) => x.kind === "universal" || x.kind === "arm64")) {
   const meta = apkMeta(a.src);
   if (!meta) {
     warn(`${rel(a.src)} 旁边没有 output-metadata.json，跳过 APK 内部版本核对`);
@@ -246,11 +259,13 @@ for (const a of ARTIFACTS.filter((x) => x.kind !== "exe")) {
   }
 }
 
-/* ---------- 签名（桌面端 exe；客户端用这个 sig 校验更新包） ---------- */
+/* ---------- 签名（桌面端产物；客户端用这个 sig 校验更新包） ---------- */
 
-step("签名桌面端 exe（tauri signer sign）");
-const sig = signFile(ARTIFACTS[0].src, keyPath, cfg.signingKeyPassword);
-ok(`签名 OK：${sig.split("\n").length} 行 / ${sig.length} 字符（清单里内联）`);
+step("签名桌面端产物（Windows exe / macOS app zip，tauri signer sign）");
+for (const a of ARTIFACTS.filter((x) => x.kind === "exe" || x.kind === "macos")) {
+  a.sig = signFile(a.src, keyPath, cfg.signingKeyPassword);
+  ok(`${a.label} 签名 OK：${a.sig.split("\n").length} 行 / ${a.sig.length} 字符（清单里内联）`);
+}
 
 /**
  * 在临时目录的副本上签名：signer 会在文件旁边写 `<文件>.sig`，
@@ -295,12 +310,17 @@ const entry = (a, extra = {}) => ({
   mirrors: mirrorsFor(cfg, ver.raw, a.name, { local: LOCAL }),
 });
 const byKind = Object.fromEntries(ARTIFACTS.map((a) => [a.kind, a]));
+const desktop = {
+  "windows-x86_64": entry(byKind.exe, { sig: byKind.exe.sig }),
+};
+// macOS 只发通用包（Apple Silicon + Intel 都能跑）；客户端先找本机架构键，再退 `macos-universal`。
+if (byKind.macos) desktop["macos-universal"] = entry(byKind.macos, { sig: byKind.macos.sig });
 const manifest = {
   version: ver.raw,
   versionCode: ver.code,
   notes,
   pubDate,
-  desktop: { "windows-x86_64": entry(byKind.exe, { sig }) },
+  desktop,
   android: { universal: entry(byKind.universal), "arm64-v8a": entry(byKind.arm64) },
 };
 
@@ -311,7 +331,9 @@ ensureRepoFiles(cfg.repoPath);
 const verDir = path.join(cfg.repoPath, "assets", tag);
 fs.mkdirSync(verDir, { recursive: true });
 for (const a of ARTIFACTS) {
-  fs.copyFileSync(a.src, path.join(verDir, a.name));
+  const dest = path.join(verDir, a.name);
+  // `macos-artifact.mjs` 默认就把 zip 写进 assets/<tag>/；同一路径不能 copyFile 到自己。
+  if (path.resolve(dest) !== path.resolve(a.src)) fs.copyFileSync(a.src, dest);
   ok(`assets/${tag}/${a.name} · ${humanSize(a.size)}`);
 }
 upsertChangelog(cfg.repoPath, cfg, ver.raw, notes, pubDate.slice(0, 10));
@@ -336,10 +358,13 @@ if (LOCAL) {
 
 step("完成");
 note(`${LOCAL ? "本机演练" : "远端发布"} · OrbDrop ${ver.raw}（versionCode ${ver.code}）· ${pubDate}`);
-note(`本仓 ${cfg.repoPath}/（assets/${tag}/ 三个产物 + 清单）`);
-for (const a of ARTIFACTS) note(`  ${a.name.padEnd(26)} ${humanSize(a.size)}  sha256=${a.sha256.slice(0, 16)}…`);
+note(`本仓 ${cfg.repoPath}/（assets/${tag}/ ${ARTIFACTS.length} 个产物 + 清单）`);
+for (const a of ARTIFACTS) note(`  ${a.name.padEnd(30)} ${humanSize(a.size)}  sha256=${a.sha256.slice(0, 16)}…`);
 note("mirrors（GitHub → Gitee）：");
-for (const m of manifest.desktop["windows-x86_64"].mirrors) note(`  ${m}`);
+for (const [key, art] of Object.entries(manifest.desktop)) {
+  note(`  ${key}:`);
+  for (const m of art.mirrors) note(`    ${m}`);
+}
 log();
 
 /* =======================================================================
@@ -358,8 +383,11 @@ function printLocalRecipe(cfg, manifest) {
   note("   Windows PowerShell 写法：");
   log(`     $env:ORBDROP_UPDATE_MANIFEST="${base}/manifest.json"; npm run tauri dev`);
   note("   安卓端把启动命令换成 npm run tauri -- android dev（设备侧 adb reverse 见项目文档）。");
-  note("3) 清单里这三条就是这个演练要打的地址（/gh 挂起 → 客户端应超时切 /gitee）：");
-  for (const m of manifest.desktop["windows-x86_64"].mirrors) log(`     ${m}`);
+  note("3) 清单里每个桌面产物的两条镜像就是这个演练要打的地址（/gh 挂起 → 客户端应超时切 /gitee）：");
+  for (const [key, art] of Object.entries(manifest.desktop)) {
+    note(`   ${key}`);
+    for (const m of art.mirrors) log(`     ${m}`);
+  }
   note("   镜像台还会直接吐清单：GET /manifest.json");
 }
 
@@ -750,6 +778,9 @@ function unreachable(url, why) {
 
 async function verifyRemote(cfg, ver) {
   step("回读校验：两个清单地址 + 每个资产 URL（GitHub 资产 + Gitee 资产）");
+  // 资产 URL 从**清单本身**取：这样 `--verify-only` 也能校验 macOS 等所有已发布的档位，
+  // 不依赖本次命令行有没有带 `--macos-zip`。
+  const assetUrls = new Set();
   for (const url of manifestUrls(cfg)) {
     const got = await readManifest(url, 3);
     if (got.netError) {
@@ -768,26 +799,32 @@ async function verifyRemote(cfg, ver) {
         `多半是 CDN 缓存，或 GitHub 的 \`latest\` 别名指到了别的 Release。\n${PUSHED_HINT}`,
       );
     }
-    ok(`清单 OK（version=${json.version}）：${url}`);
-  }
-  for (const file of [ASSET_NAMES.exe, ASSET_NAMES.universal, ASSET_NAMES.arm64]) {
-    for (const url of mirrorsFor(cfg, ver.raw, file)) {
-      const got = await fetchSoft(url, { headers: { Range: "bytes=0-0" }, timeoutMs: 60_000 });
-      if (got.netError) {
-        unreachable(url, got.netError);
-        continue;
+    for (const table of ["desktop", "android"]) {
+      for (const art of Object.values(json[table] ?? {})) {
+        for (const mirror of art?.mirrors ?? []) assetUrls.add(mirror);
       }
-      const res = got.res;
-      if (res.status !== 200 && res.status !== 206) {
-        die(`资产 URL 校验失败（HTTP ${res.status}）：${url}`, [await bodySnippet(res), PUSHED_HINT].join("\n"));
-      }
-      try {
-        await res.body?.cancel();
-      } catch {
-        /* 只取了一个字节就断开，cancel 报错无所谓 */
-      }
-      ok(`HTTP ${res.status} ${url}`);
     }
+    ok(`清单 OK（version=${json.version}，${assetUrls.size} 条资产地址）：${url}`);
+  }
+  if (assetUrls.size === 0) {
+    die("清单里没有任何资产地址", "两个清单地址都读不到内容？检查 Release 与 Gitee raw 分支。");
+  }
+  for (const url of assetUrls) {
+    const got = await fetchSoft(url, { headers: { Range: "bytes=0-0" }, timeoutMs: 60_000 });
+    if (got.netError) {
+      unreachable(url, got.netError);
+      continue;
+    }
+    const res = got.res;
+    if (res.status !== 200 && res.status !== 206) {
+      die(`资产 URL 校验失败（HTTP ${res.status}）：${url}`, [await bodySnippet(res), PUSHED_HINT].join("\n"));
+    }
+    try {
+      await res.body?.cancel();
+    } catch {
+      /* 只取了一个字节就断开，cancel 报错无所谓 */
+    }
+    ok(`HTTP ${res.status} ${url}`);
   }
 }
 

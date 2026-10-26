@@ -60,8 +60,8 @@ export function dragOut(node: HTMLElement, params: DragOutParams) {
     try {
       const ticket = await prepareDragOut(src);
       if (!ticket.ready) {
-        // 对端项：两种实现都在这里等（镜像只需问一次元数据就建好占位符；旧路可能要先把内容
-        // 下到暂存目录）。无论哪种，起拖都跟着**按住的主键**走 —— 所以这句必须提醒"按住不放"。
+        // 对端项：平台实现不同（Windows 只问一次元数据就建好占位符；macOS 要先把内容暂存到
+        // 镜像目录）。无论哪种，起拖都跟着**按住的主键**走 —— 所以这句必须提醒"按住不放"。
         p.onMessage?.(`正在准备「${ticket.name}」…（请按住不放）`);
       }
       await startDragOut(ticket.ticket);

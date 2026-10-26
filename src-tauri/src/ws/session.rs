@@ -677,9 +677,19 @@ mod tests {
     use std::sync::Arc;
 
     fn state(tag: &str) -> Arc<AppState> {
-        let path =
-            std::env::temp_dir().join(format!("orbdrop_ws_{tag}_{}.toml", uuid::Uuid::new_v4()));
-        Arc::new(AppState::new(crate::config::Config::default(), path))
+        // 每个用例一个**独立目录**：`AppState::new` 把 chat-vault / groups 放在
+        // `config.toml` 旁边（见 `state.rs`），而只用唯一文件名、共用一个临时目录时，
+        // 这些文件仍会在用例之间串（实测：一个用例留下 `dev-hw` 的旧会话，另一个用例
+        // 读到的首条消息就是旧名字）。
+        let dir = std::env::temp_dir().join(format!(
+            "orbdrop_ws_{tag}_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("建测试数据目录");
+        Arc::new(AppState::new(
+            crate::config::Config::default(),
+            dir.join("config.toml"),
+        ))
     }
 
     /// WS 上的 `Unpair` 只认**连接自己的身份**：报文里那个 id 一律不采信。

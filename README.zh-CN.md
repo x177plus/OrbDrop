@@ -9,7 +9,7 @@
 <p>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg" alt="License"></a>
   <a href="https://github.com/x177plus/OrbDrop/releases/latest"><img src="https://img.shields.io/github/v/release/x177plus/OrbDrop?sort=semver&color=green" alt="Release"></a>
-  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Android-0078d4.svg" alt="Platform">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Android-0078d4.svg" alt="Platform">
   <img src="https://img.shields.io/badge/Tauri-2-24C8DB.svg?logo=tauri&logoColor=white" alt="Tauri">
   <img src="https://img.shields.io/badge/SvelteKit-2-FF3E00.svg?logo=svelte&logoColor=white" alt="SvelteKit">
 </p>
@@ -32,10 +32,15 @@ OrbDrop 是一个局域网文件工具，界面主体是一个始终置顶的悬
 | 平台 | 文件 | GitHub | Gitee |
 | --- | --- | --- | --- |
 | Windows 桌面端（x86_64） | `orbdrop.exe` | [最新版](https://github.com/x177plus/OrbDrop/releases/latest) | [最新版](https://gitee.com/x177plus/OrbDrop/releases) |
+| macOS 11+（通用包） | `orbdrop-macos-universal.app.zip` | [最新版](https://github.com/x177plus/OrbDrop/releases/latest) | [最新版](https://gitee.com/x177plus/OrbDrop/releases) |
 | 安卓（通用包） | `app-universal-release.apk` | [最新版](https://github.com/x177plus/OrbDrop/releases/latest) | [最新版](https://gitee.com/x177plus/OrbDrop/releases) |
 | 安卓（arm64） | `app-arm64-release.apk` | [最新版](https://github.com/x177plus/OrbDrop/releases/latest) | [最新版](https://gitee.com/x177plus/OrbDrop/releases) |
 
-桌面端是单文件绿色版（不带安装器）。APK 装不上时按机型选包：手机上绝大多数是 arm64（`app-arm64-release.apk` 更小、更省内存），拿不准就用通用包。
+Windows 桌面端是单文件绿色版（不带安装器）。macOS 是通用 `.app`（Apple Silicon + Intel）；
+CI 出的未签名包首次运行需要右键「打开」一次，自更新要求应用放在可写位置（通常是 `/Applications`）。
+平台差异与真机验证清单见 [`docs/macos.md`](./docs/macos.md)。
+
+APK 装不上时按机型选包：手机上绝大多数是 arm64（`app-arm64-release.apk` 更小、更省内存），拿不准就用通用包。
 
 ### 更新清单与校验
 
@@ -44,7 +49,7 @@ OrbDrop 是一个局域网文件工具，界面主体是一个始终置顶的悬
 - GitHub：Release 附件 `update.json` —— `https://github.com/x177plus/OrbDrop/releases/latest/download/update.json`
 - Gitee：仓库根目录 `update.json` —— `https://gitee.com/x177plus/OrbDrop/raw/master/update.json`
 
-清单里的下载地址都钉了 tag（`releases/download/vX.Y.Z/...`），老版本客户端不会因为新版本发布而下错包。每个产物都带 `size` 与 `sha256`（Windows 版另有 Tauri 更新签名 `sig`），下载后可以自己核对：`sha256sum orbdrop.exe`。
+清单里的下载地址都钉了 tag（`releases/download/vX.Y.Z/...`），老版本客户端不会因为新版本发布而下错包。每个产物都带 `size` 与 `sha256`（Windows / macOS 版另有 Tauri 更新签名 `sig`），下载后可以自己核对：`sha256sum orbdrop.exe` 或 `shasum -a 256 orbdrop-macos-universal.app.zip`。
 
 ## 功能亮点
 
@@ -52,12 +57,12 @@ OrbDrop 是一个局域网文件工具，界面主体是一个始终置顶的悬
 
 - 始终置顶、无边框，两种形态可选 —— 圆球，或带设备分页的圆角矩形卡片。可贴边（只留一小条，指针移入自动滑回），拖文件过来时高亮预告，有事等你时托盘图标整帧闪动并盖红点；再次启动会唤起已在运行的实例，不会开出第二份。
 - 把目录拖进球 → 登记为一个共享项（按路径幂等去重），**当场对每一台长连接设备可见**。每个共享项有自己的广播开关，并有递归文件监听把变更推给对端，对面的目录树自己刷新。
-- 把树里的任意文件/目录**直接拖进资源管理器，或拖进任意其他应用**。对端的东西在本地先建一个 Windows 云文件（CFAPI）占位符（实测每项 **0.22 ms、占 0 字节磁盘**），字节等目标进程真去读的时候才从对端拉。只认 `CF_HDROP` 的程序（微信这类）拿到的是真实路径，同样收得到 —— 起拖不用等，也不产生任何预下载。
+- 把树里的任意文件/目录**直接拖进资源管理器 / 访达，或拖进任意其他应用**。Windows 上对端的东西在本地先建一个云文件（CFAPI）占位符（实测每项 **0.22 ms、占 0 字节磁盘**），字节等目标进程真去读的时候才从对端拉；macOS 没有公开的等价机制，对端项在起拖前整份暂存到镜像目录（见 [`docs/macos.md`](./docs/macos.md)）。只认真实路径的程序（微信这类）两边都收得到 —— Windows 起拖不用等、不预下载，macOS 只多出这一段暂存等待。
 - 把文件拖到正开着的会话浮层上，直接发到那条会话。
 
 ### 2. BeyondCompare 直连比较
 
-- 右键任意本机/对端共享项 → 用 Beyond Compare 打开（Windows；macOS 的 `bcomp` 已接但未验证）。
+- 右键任意本机/对端共享项 → 用 Beyond Compare 打开（Windows；macOS 接的是 `.app` 内的 `bcomp`（也认 `bcompare`）与应用内左侧槽，profile 注入/写回尚未在真机 BC 上验证，见 [`docs/macos.md`](./docs/macos.md) §4）。
 - OrbDrop 自己往 Beyond Compare 的 `BCProfiles.xml` 写入一条 WebDAV profile：地址指向**本机回环代理**，用户名 `OrbDrop`，密码是该设备的 token，并且完全按 BC 自己的格式加密（`BCmp|1|` 信封里的 AES-256-GCM）。用户不用配 profile、也不用填密码。
 - BC 连的是 `http://127.0.0.1:<端口>/proxy/<设备id>/`，OrbDrop 再把它经 TLS（带指纹校验）转发到对端的 `/dav/` 端点 —— BC 永远不接触证书，也不直接碰网络。
 - BC 保存时的 `PUT` / `DELETE` / `MKCOL` / `MOVE` / `COPY` **实时写回发送方的源文件**，没有暂存目录，也不留临时副本。
@@ -100,7 +105,7 @@ OrbDrop 是一个局域网文件工具，界面主体是一个始终置顶的悬
 
 ## 技术栈
 
-Rust 核心，桌面端与安卓端共用同一份：单端口上的 axum HTTP/WebSocket 服务（监听口按首字节区分 TLS 与明文）、rustls/rcgen 的自签身份与指纹 pinning、`mdns-sd` 做发现、tokio-tungstenite 做长连接信令，另有手写的 WebDAV 面与用于拖出的 Windows 云文件（CFAPI）provider。外壳是 Tauri 2，界面是 Svelte 5 + Vite。
+Rust 核心，Windows / macOS / 安卓共用同一份：单端口上的 axum HTTP/WebSocket 服务（监听口按首字节区分 TLS 与明文）、rustls/rcgen 的自签身份与指纹 pinning、`mdns-sd` 做发现、tokio-tungstenite 做长连接信令，另有手写的 WebDAV 面、用于拖出的 Windows 云文件（CFAPI）provider，以及 macOS 的 `NSDraggingSession` 拖出与暂存下载。外壳是 Tauri 2，界面是 Svelte 5 + Vite。
 
 ## 文档
 
@@ -108,11 +113,13 @@ Rust 核心，桌面端与安卓端共用同一份：单端口上的 axum HTTP/W
 
 ## 从源码构建
 
-需要 Node.js、Rust 工具链；安卓端另需 Android SDK/NDK。
+需要 Node.js、Rust 工具链；安卓端另需 Android SDK/NDK；macOS 端需在 Mac 上并装好 Xcode Command Line Tools。
 
 ```bash
 npm install          # 安装依赖
 npm run tauri dev    # 桌面端开发（vite + tauri）
+npm run mac:build    # macOS 通用 .app + .dmg（在 Mac 上）
+npm run mac:artifact # macOS .app + DMG + 自更新 zip（在 Mac 上）
 npm run android:dev  # 安卓端开发
 npm run check        # svelte-check 类型检查
 npm run android:build:arm64  # 只编 arm64 的安卓 release 包
@@ -120,7 +127,7 @@ npm run android:build:arm64  # 只编 arm64 的安卓 release 包
 
 `npm run android:build` 会把 Rust crate 按四个 ABI **串行**编一遍（每个 ABI 一次全量重链接），所以它慢；改功能期间用 `android:build:arm64`（只编一个 ABI，工作量约四分之一），通用包留到发布时再出。注意 `--target aarch64` 只是限制 Rust 编哪个 ABI，Gradle 的 flavor 仍是 `universal` —— 这个单 ABI 包落在 `apk/universal/release/`，并会**覆盖**那里的通用包。
 
-打包：`npm run tauri build`（桌面端）、`npm run android:release`（arm64 APK 并安装到设备）、`npm run release`（升版本 + 构建 + 发布到两个发行仓）。`npm run mirror` 启动本机镜像演练台，用来测更新链路。
+打包：`npm run tauri build`（Windows 桌面端）、`npm run mac:build`（macOS .app/.dmg）、`npm run android:release`（arm64 APK 并安装到设备）、`npm run release`（升版本 + 构建 + 发布到两个发行仓；加 `--macos-zip` 把 Mac 上打好的包一起发）。`npm run mirror` 启动本机镜像演练台，用来测更新链路。
 
 在一台机器上开多份（拿自己当两台设备测）需要每份各自的数据目录与端口：设 `ORBDROP_ALLOW_MULTI=1` 与对应的 `ORBDROP_DATA_DIR`。这个模式下 mDNS 默认只走回环：局域网上其他机器（包括本机那份正式版）都看不见这些实例。确实需要让调试实例出现在局域网里时，单独给它设 `ORBDROP_MDNS_SCOPE=lan`；完全不广播则设 `off`（手动添加仍然可用）。
 

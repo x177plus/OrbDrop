@@ -16,7 +16,10 @@ crate-type = ["cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+# `macos-private-api` 只为透明窗口开启（`tauri.conf.json` 的 `app.macOSPrivateApi` 与它同开）：
+# macOS 上 `transparent: true` 要走私有 API，否则窗口底色是不透明的白/灰，悬浮球那圈
+# `--shadow` 会变成一块实心方块。这个 feature 在 Windows 上只是编一个空分支，不影响现有产物。
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-opener = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
@@ -107,6 +110,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"
 
+# fd 上限与占用（`src/resource.rs`）：macOS/Linux 走 libc；Windows 没有这种低句柄上限。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 # `#[implement(...)]` 生成的代码里写的是 `windows_core::…` 这个 crate 名，
@@ -136,6 +143,23 @@ windows = { version = "0.61", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# 原生拖出（F-46 的 macOS 版）：`drag` 用 `NSDraggingSession` 把真实路径交给 Finder。
+# 只给 macOS 编：Windows 那份 OLE 数据对象在 `src/drag.rs` 里，两套互不相干。
+# 包名是 `drag`，但本仓自己的模块也叫 `drag`（`src/drag.rs`）：别名成 `native-drag`，
+# 免得 `drag::start_drag` 解析到本模块的异步起拖函数而不是这个 crate。
+native-drag = { package = "drag", version = "2.1.1" }
+# 悬浮窗的 NSWindow 行为（全屏空间可见、次要浮层）。Tauri 已带 objc2-app-kit，
+# 这里只是把我们要的两个 feature 打开；版本必须与 tauri / tray-icon 用的那两份对得上。
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSEvent",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
 ] }
 
 [profile.release]

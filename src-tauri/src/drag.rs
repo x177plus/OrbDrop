@@ -69,10 +69,11 @@ pub struct DragTicket {
     pub ready: bool,
 }
 
-/// 拖出去的内容：**交给资源管理器的真实路径**。
+/// 拖出去的内容：**交给文件管理器的真实路径**。
 ///
-/// 本机共享项本来就是磁盘上的真文件；对端项是镜像里的占位符（`crate::mirror`，真实路径、
-/// 按需从对端拉字节）—— 两者对 `CF_HDROP` 来说都是路径，所以这里不再区分。
+/// 本机共享项本来就是磁盘上的真文件；对端项在 Windows 上是 CFAPI 占位符（按需水合），
+/// 在 macOS 上是起拖前暂存的普通副本（`crate::mirror::mac`）—— 两者对
+/// `CF_HDROP` / `public.file-url` 来说都是路径，所以这里不再区分。
 pub type Payload = Vec<PathBuf>;
 
 enum Staged {
@@ -200,10 +201,11 @@ impl DragStore {
     }
 }
 
-/// 等元数据备齐，然后在**主线程**上起 OLE 拖放。
+/// 等元数据备齐，然后在**主线程**上起原生拖放。
 ///
-/// `DoDragDrop` 自带模态循环，会一直阻塞到拖放结束（原生应用就是这么干的），所以必须跑在
-/// 窗口所在线程上；对端项的建占位符是异步的，先在 tokio 线程上等完再切过去。
+/// Windows 走 OLE 的 `DoDragDrop`，它自带模态循环、会一直阻塞到拖放结束；macOS 走
+/// `NSDraggingSession`，起拖那一刻返回、拖动由窗口服务器接手。两者的共同点是**只能在
+/// 窗口所在线程上发起**，所以对端项的下载/暂存先在 tokio 线程上等完，再切到主线程。
 pub async fn start(app: AppHandle, state: Arc<AppState>, ticket: String) -> Result<(), String> {
     // 记一行"界面确实发起了起拖"：以后某次拖拽整个日志里什么都没有时，这一行在不在
     // 就是"手势没触发"与"起拖被吃掉"的分界。
@@ -212,25 +214,27 @@ pub async fn start(app: AppHandle, state: Arc<AppState>, ticket: String) -> Resu
     let result = match payload {
         Err(e) => Err(e),
         Ok(payload) => {
-            // 主键已经松开就别起拖了：拖放循环跟着按住的主键走，抬起状态下起拖会在当前位置
-            // 立刻"落下"（可能正好落在面板自己身上）。内容留着，用户再拖一次即可。
-            #[cfg(windows)]
-            if !crate::orb_window::mouse_down() {
-                state.drag.forget(&ticket);
-                tracing::info!(target: PROBE, ticket = %ticket, "拖放：起拖前主键已松开，放弃本次");
-                return Err("鼠标已松开：按住再拖一次即可".into());
-            }
-            // 起拖前把窗口带到前台（见 `orb_window::ensure_foreground`）：`DoDragDrop` 同样只在
-            // 窗口是前台窗口时才真正吃住指针，而"点击激活"是异步的。
-            // 起拖前把窗口带到前台是 Windows OLE 拖放的前提（见 `orb_window::ensure_foreground`）：
-            // 桌面专属，移动端连悬浮球窗口都没有。
-            #[cfg(desktop)]
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = crate::orb_window::ensure_foreground(&win);
-            }
             let (tx, rx) = tokio::sync::oneshot::channel();
+            let main_app = app.clone();
+            let ticket_for_thread = ticket.clone();
             app.run_on_main_thread(move || {
-                let _ = tx.send(imp::drag(&payload));
+                // 起拖前把窗口带到前台（见 `orb_window::ensure_foreground`）：两种原生拖放都只在
+                // 窗口是前台窗口时才真正吃住指针，而"点击激活"是异步的。这一跳放主线程上：
+                // macOS 的 `set_focus` 最终是 AppKit 调用，不在主线程上等于把线程约束交给运气。
+                #[cfg(desktop)]
+                if let Some(win) = main_app.get_webview_window("main") {
+                    let _ = crate::orb_window::ensure_foreground(&win);
+                }
+                // 主键已经松开就别起拖了：拖放循环跟着按住的主键走，抬起状态下起拖会在当前位置
+                // 立刻"落下"（可能正好落在面板自己身上）。这一跳必须在主线程读（macOS 的
+                // `NSEvent.pressedMouseButtons` 是主线程 API）。内容留着，用户再拖一次即可。
+                #[cfg(any(windows, target_os = "macos"))]
+                if !crate::orb_window::mouse_down() {
+                    tracing::info!(target: PROBE, ticket = %ticket_for_thread, "拖放：起拖前主键已松开，放弃本次");
+                    let _ = tx.send(Err("鼠标已松开：按住再拖一次即可".into()));
+                    return;
+                }
+                let _ = tx.send(imp::drag(&main_app, &payload));
             })
             .map_err(|e| format!("无法进入主线程起拖: {e}"))?;
             rx.await.map_err(|_| "拖拽线程未响应".to_string())?
@@ -292,10 +296,11 @@ fn local_share_path(
 // 对端共享项：只走元数据，内容等落下时再说
 // ---------------------------------------------------------------------------
 
-/// 对端项的准备：本地建一个占位符就完事（**不下载任何字节**）。
+/// 对端项的准备：Windows 建占位符（不下载字节），macOS 整份暂存到镜像目录。
 ///
-/// 交给 `CF_HDROP` 的是镜像里的真实路径 —— 只认路径的应用（微信这类）与认虚拟文件的目标走
-/// 同一条路；字节等目标真去读的时候才从对端拉（见 `crate::mirror`）。
+/// 两条路最终交给文件管理器的都是**真实路径** —— 只认路径的应用（微信这类）与认虚拟文件的
+/// 目标走同一条路。Windows 的字节等目标真去读的时候才从对端拉；macOS 没有这个公开机制，
+/// 见 `crate::mirror::mac` 的模块注释。
 async fn prepare_peer_payload(
     state: &Arc<AppState>,
     req: &DragOutRequest,
@@ -494,7 +499,7 @@ mod imp {
     ///
     /// `OleInitialize` 是每线程一次、可重复调用的（WebView2 早就初始化过 STA），这里只是
     /// 保证拖放线程自己有一份调用计数。
-    pub fn drag(paths: &[PathBuf]) -> Result<(), String> {
+    pub fn drag(_app: &tauri::AppHandle, paths: &[PathBuf]) -> Result<(), String> {
         unsafe {
             let _ = OleInitialize(None);
         }
@@ -871,11 +876,51 @@ mod imp {
     }
 }
 
-/// 非 Windows 平台还没有原生拖放源（macOS 要走 `NSDraggingSession`）。
-#[cfg(not(windows))]
+// ---------------------------------------------------------------------------
+// 原生拖放源（macOS）
+// ---------------------------------------------------------------------------
+
+/// macOS：`NSDraggingSession` + `public.file-url`。
+///
+/// 交给 Finder 的仍然是**真实路径**：本机共享项是磁盘上的原文件；对端项在 `prepare` 阶段
+/// 已经暂存到镜像目录（见 `mirror::mac`）。macOS 没有 CFAPI 那种「占位符水合」的公开接口
+/// （File Provider 要独立扩展 target 与签名，不适合单文件应用），所以对端项在这里是
+/// 「先落盘、再拖出」—— 起拖那一刻内容已经在盘上，代价是 `prepare` 阶段要等下载完；
+/// 磁盘上会有一份副本，回收规则与 Windows 镜像一致（`mirror::sweep`，按本地放入时刻算 TTL）。
+///
+/// `drag` crate 负责 `NSDraggingItem` / `NSDraggingSource` 的 Objective-C 一侧；
+/// 只声明 `Copy`，与 Windows 那条「拖出不是搬走源文件」的语义一致。
+#[cfg(target_os = "macos")]
 mod imp {
-    pub fn drag(_paths: &[std::path::PathBuf]) -> Result<(), String> {
-        Err("当前平台暂不支持把文件拖出到资源管理器".into())
+    use std::path::PathBuf;
+
+    use tauri::Manager as _;
+
+    pub fn drag(app: &tauri::AppHandle, paths: &[PathBuf]) -> Result<(), String> {
+        let window = app
+            .get_webview_window("main")
+            .ok_or_else(|| "未找到 main 窗口，无法起拖".to_string())?;
+        // 拖动预览用应用图标；`32x32.png` 是编译期嵌入的（与托盘同一张，运行时不需要文件）。
+        let image = native_drag::Image::Raw(include_bytes!("../icons/32x32.png").to_vec());
+        native_drag::start_drag(
+            &window,
+            native_drag::DragItem::Files(paths.to_vec()),
+            image,
+            |_result, _cursor| {},
+            native_drag::Options {
+                mode: native_drag::DragMode::Copy,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| format!("起拖失败: {e}"))
+    }
+}
+
+/// 其余平台（含移动端）还没有原生拖放源。
+#[cfg(not(any(windows, target_os = "macos")))]
+mod imp {
+    pub fn drag(_app: &tauri::AppHandle, _paths: &[std::path::PathBuf]) -> Result<(), String> {
+        Err("当前平台暂不支持把文件拖出到文件管理器".into())
     }
 }
 

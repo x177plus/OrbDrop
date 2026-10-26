@@ -56,6 +56,14 @@ export function getActualPort(): Promise<number> {
 }
 
 /**
+ * 运行平台（编译期常量，不是 UA）。界面只用它换文案与快捷键写法：
+ * 资源管理器 / Finder、Ctrl+V / ⌘V、BC 的示例路径。
+ */
+export function runtimeInfo(): Promise<{ os: 'windows' | 'macos' | 'linux' | 'android' | 'ios' | string; arch: string; desktop: boolean }> {
+  return invoke('runtime_info');
+}
+
+/**
  * 本机内网 IPv4 地址（左下角「IP:端口」用）。`primary` 是界面显示的那一个，
  * `all` 含其余几块网卡的地址 —— 多网卡时悬停提示要把它列全。
  */
@@ -104,6 +112,11 @@ export function addPeer(ip: string, port: number): Promise<PeerDevice> {
 
 export function removePeer(peerId: string): Promise<void> {
   return invoke('remove_peer', { peerId });
+}
+
+/** 忘掉一台**未配对**设备：只清本机记录，不通知对端。已配对的会报错（先解除配对）。 */
+export function forgetPeer(peerId: string): Promise<void> {
+  return invoke('forget_peer', { peerId });
 }
 
 /**
