@@ -3,6 +3,7 @@
   import type { ChatItem } from '$lib/stores/chat.svelte';
   import { getDevices, deviceById, deviceState, threadDotState, threadTrusted, deviceRemarkOf, peerShortName } from '$lib/stores/devices.svelte';
   import { getSettings } from '$lib/stores/settings.svelte';
+  import { pasteShortcut } from '$lib/stores/platform.svelte';
   import { undeliverableText, type PendingGroup, type Undeliverable } from '$lib/types';
   import {
     adoptDomImages,
@@ -10,6 +11,8 @@
     imageFiles,
     insertImages,
     isImageName,
+    noteComposition,
+    paintWhenNotComposing,
     serializeComposer,
     setCaretEnd,
   } from '$lib/composer';
@@ -161,24 +164,43 @@
   });
 
   /**
-   * 打开某个会话：把这条会话的草稿**重画**进输入区，光标放到末尾。
+   * 把这条会话的草稿重画进输入区（切会话 / 浮层重新展开时那一次）。
    *
-   * `untrack` 不能省：输入区在编辑时**不归 Svelte 管**（DOM 就是编辑时的真相，否则每敲一个字
-   * 都被重画一遍、光标丢到最前）。这个 effect 因此只认"哪条会话 / 哪个节点"，
-   * 而**不能**跟着草稿的每一次变化跑 —— 读草稿那一下包在 `untrack` 里。
+   * 一律**现读** `inputEl` / `threadKey`：组合结束时补画的那一趟晚一帧，这一帧里用户
+   * 可能已经切了会话 —— 画当前这条，别把上一条的草稿盖过来。
    */
-  $effect(() => {
+  function paintComposer() {
     const el = inputEl;
-    const key = thread?.key ?? '';
+    const key = threadKey;
     if (!el || !key) return;
     untrack(() => {
       applyComposer(el, chat.draftSegsOf(key));
       markEmpty();
     });
-    // 换会话 / 关掉浮层：大图跟着收掉（它不是"第二个窗口"，只是这一条会话里的一次摊开）。
-    viewing = null;
     el.focus();
     if (open) setCaretEnd(el);
+  }
+
+  /**
+   * 打开某个会话：把这条会话的草稿**重画**进输入区，光标放到末尾。
+   *
+   * 依赖的必须是 `threadKey`（字符串）而**不是** `thread`：`thread` 每次会话快照、每次
+   * 设备表刷新都是**新对象**（`$derived` 按 `===` 比较），读它会让这个 effect 跟着每一次
+   * 后端事件重跑 —— 而它一跑就把输入区整个重画。输入法正在组合时那一下就是灾难：预编辑的
+   * 拼音会被当成普通文本固化在框里（用户看到"没选字，拼音却上去了"）。
+   *
+   * `untrack` 不能省：输入区在编辑时**不归 Svelte 管**（DOM 就是编辑时的真相，否则每敲一个字
+   * 都被重画一遍、光标丢到最前）—— 读草稿那一下包在 `untrack` 里。
+   */
+  $effect(() => {
+    const el = inputEl;
+    const key = threadKey;
+    void open; // 收起 / 再展开也要重画一次（原来读 `thread` 时顺带依赖了它）
+    if (!el || !key) return;
+    // 换会话 / 关掉浮层：大图跟着收掉（它不是"第二个窗口"，只是这一条会话里的一次摊开）。
+    viewing = null;
+    // 组合期间不动输入区：那一下会把预编辑串固化成普通文本（见 `paintWhenNotComposing`）。
+    paintWhenNotComposing(el, paintComposer);
   });
 
   /** 输入区那句占位文案的判据（`:empty` 认不出"只剩一个空文本节点"的框，见 `main.css`）。 */
@@ -195,6 +217,11 @@
     if (!el || !t) return;
     chat.setDraftSegs(t.key, serializeComposer(el));
     markEmpty();
+  }
+
+  /** 输入法组合开始 / 结束：组合期间不许重画输入区（见 `composer.noteComposition`）。 */
+  function onComposition(start: boolean) {
+    if (inputEl) noteComposition(inputEl, start);
   }
 
   /**
@@ -950,8 +977,10 @@
               ? '在群里说一句…'
               : '输入消息…'}
           aria-label={thread.mode === 'broadcast' ? '输入要群发的消息' : thread.mode === 'group' ? '输入群消息' : '发送消息'}
-          title={thread.mode === 'group' ? '群里说的话，名册上的成员都会看到；图片也可以直接粘进来' : '图片可以直接粘进来（Ctrl+V），前后还能继续写文字'}
+          title={thread.mode === 'group' ? '群里说的话，名册上的成员都会看到；图片也可以直接粘进来' : `图片可以直接粘进来（${pasteShortcut()}），前后还能继续写文字`}
           oninput={() => void onInput()}
+          oncompositionstart={() => onComposition(true)}
+          oncompositionend={() => onComposition(false)}
           onpaste={onPaste}
           onkeydown={(e) => {
             // Shift+回车留给换行（这一版输入区支持多行），回车是发送。
@@ -1042,7 +1071,7 @@
   .chat-who.sp-0 .cw-av { background: var(--accent-deep); }
   .chat-who.sp-0 .cw-nm { color: var(--accent-deep); }
   .chat-who.sp-1 .cw-av { background: var(--ok); }
-  .chat-who.sp-1 .cw-nm { color: color-mix(in oklch, var(--ok) 78%, black); }
+  .chat-who.sp-1 .cw-nm { color: var(--ok-deep); }
   .chat-who.sp-2 .cw-av { background: var(--bc-deep); }
   .chat-who.sp-2 .cw-nm { color: var(--bc-deep); }
 </style>

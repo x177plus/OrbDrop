@@ -1,9 +1,15 @@
 #!/usr/bin/env node
 /**
- * 把 `src/mobile/mobile.css` 里的现代颜色写法**降级到 Chrome 81 也能读**，同时保住新引擎的高保真。
+ * 把样式表里的现代颜色写法**降级成老引擎也读得懂的 sRGB**，同时保住新引擎的高保真。
  *
- * 背景：`oklch()` / `color-mix()` 是 Chrome 111（2023-03）起才有的。老 WebView（MuMu 里是 110）
- * 上它们**不报错**，只是那条声明失效 —— 界面变成白底黑字没配色，开发机（新引擎）完全看不出来。
+ * 两处调用（`npm run tokens:gen` / `tokens:check` 各跑两次，文件作为参数传入）：
+ *   · `src/mobile/mobile.css` —— 下限 Chrome 81。`oklch()` / `color-mix()` 是 Chrome 111（2023-03）
+ *     起才有的；老 WebView（MuMu 里是 110）上它们**不报错**，只是那条声明失效。
+ *   · `src/styles/main.css` —— 桌面端（WebView2 / macOS WKWebView）。**不能假定 `oklch()` 有就等于
+ *     `color-mix()` 有**：macOS 12.7.6 的系统 WKWebView（Safari 17.6 内核）实测 `oklch()` 支持、
+ *     `color-mix()` 不支持 —— 于是 `--accent-deep` 之类的令牌整条失效，`.btn-primary` 计算成
+ *     **透明底 + 白字**（配对确认、保存设置两颗主按钮在 Mac 上因此"看不见"，见 docs/macos.md）。
+ *     反过来，Windows 上 111 之前的 WebView2 同样没有 `color-mix()`。
  *
  * 三种处理方式，**因为 CSS 在三处的失效时机不同**（都是实测出来的，不是照规范推的）：
  *
@@ -30,18 +36,25 @@
  * 插值在 Chromium 111–114 上会把 `transparent` 的色相当 0 参与绕行，把蓝色底纹染成粉色（真机
  * Huawei WebView 114.0.5.302 实测）。等价性与理由见 `SUPPORTS_COND` 上方那段注释。
  *
- * 配色仍只有**一处来源**（原型那套 oklch/color-mix 写法），sRGB 值是它的机械派生。
+ * 配色仍只有**一处来源**（那张表里的 oklch/color-mix 写法），sRGB 值是它的机械派生。
  * 计算自己实现（OKLab ↔ sRGB + `color-mix` 的预乘插值），不引依赖；生成值已用 Chromium 的 canvas
  * 渲染逐条对照过（27 条里 26 条逐通道一致，唯一偏差是 canvas 在低不透明度下预乘量化的读数误差）。
  *
- * 用法：`npm run tokens:gen` 写入 / `npm run tokens:check` 校验（不同步则退出码 1）。
+ * 用法：`node scripts/gen-color-tokens.mjs <css>`（写入）/ 加 `--check`（校验，不同步则退出码 1）。
+ * 平时走 `npm run tokens:gen` / `npm run tokens:check`，它们对两份表各跑一次。
  */
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-const CSS_PATH = path.resolve("src/mobile/mobile.css");
+const FILE_ARG = process.argv.slice(2).find((a) => !a.startsWith("-"));
+const CSS_PATH = path.resolve(FILE_ARG ?? "src/mobile/mobile.css");
 const CHECK_ONLY = process.argv.includes("--check");
+if (!fs.existsSync(CSS_PATH)) {
+  console.error(`找不到样式表：${CSS_PATH}`);
+  process.exit(1);
+}
+const LABEL = path.relative(process.cwd(), CSS_PATH).replace(/\\/g, "/");
 
 const MODERN = /color-mix\(|oklch\(|oklab\(|lab\(|lch\(|\bcolor\(/;
 const isLegacySafe = (value) => !MODERN.test(value);
@@ -171,12 +184,21 @@ const modernTokens = hiFiRootMatch ? readTokenMap(hiFiRootMatch[1]) : {};
 /** var() 解析用：现代值优先，退回主 root（没有现代写法的令牌本来就不参与）。 */
 const tokens = { ...rootTokens, ...modernTokens };
 
-/** 生成区里已有的规则级覆盖：选择器 → [{prop, value}]（用于幂等重建）。 */
+/**
+ * 生成区里已有的规则级覆盖：选择器 → [{prop, value}]。
+ *
+ * 为什么必须读回来：首轮生成之后，基础表里只剩 sRGB、**现代写法只存在于生成区** —— 源码里
+ * 已经没有 `color-mix()` 可抓了。每次重跑都从上一轮生成区把它们捞回来再原样写回去（幂等）。
+ *
+ * 但也不能无条件信它：源码里某条声明可能已经改成 `var(--token)`（令牌自己带生成区回退），
+ * 那条旧覆盖必须消失（`--ok-deep` 那次就撞上了）。所以下面只做「候选」，等基础表重建完之后
+ * 再逐条校验（见 `keptPrevOverrides`）。
+ */
 const prevRuleOverrides = new Map();
 {
   const withoutRoot = generatedRegion.replace(/:root\s*\{[\s\S]*?\n\s*\}/, "");
   for (const rule of withoutRoot.matchAll(/([^{}]+?)\s*\{([^{}]*)\}/g)) {
-    const sel = rule[1].trim().replace(/^@supports[^{]*/, "").trim();
+    const sel = rule[1].trim().replace(/\s+/g, " ");
     if (!sel || sel.startsWith("@")) continue;
     const decls = rule[2]
       .split(";")
@@ -286,21 +308,66 @@ const beginIdx = source.indexOf(BEGIN_MARK, afterTokens);
 const bodyEnd = beginIdx < 0 ? source.length : Math.max(afterTokens, source.lastIndexOf("\n", beginIdx));
 const bodyLines = source.slice(afterTokens, bodyEnd).split("\n");
 
+/**
+ * 每一行开头处在几层 at-rule 里（`@media` / `@supports` / `@keyframes` …）。
+ *
+ * 旧写法是逐行推："`@` 开头的行 +1、`}` 开头的行 -1"。单行 `@media (…) { … }` 会把这笔账
+ * 顶高（同一行的 `}` 不算），后面某条普通规则的 `}` 又把它抹平 —— 计数于是漂移：明明不在
+ * at-rule 里的声明会被判成在里面（生成器直接抛错），反过来也可能把 at-rule 里的声明搬出去。
+ * 这里按字符扫一遍（先把注释替换成空格：注释里的 `button { … }` 不该参与配对），每行只记行首
+ * 的层数；行首是 `@` 的那一行在循环里再 +1（它自己打开了 at-rule）。
+ */
+const atRuleDepthPerLine = (() => {
+  const text = source.slice(afterTokens, bodyEnd);
+  let clean = "";
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2);
+      const stop = end < 0 ? text.length : end + 2;
+      clean += text.slice(i, stop).replace(/[^\n]/g, " ");
+      i = stop - 1;
+    } else {
+      clean += text[i];
+    }
+  }
+  const depths = [];
+  const stack = []; // 每层是不是 at-rule
+  let line = 0;
+  let depth = 0;
+  for (let i = 0; i < clean.length; i += 1) {
+    if (i === 0 || clean[i - 1] === "\n") {
+      depths[line] = depth;
+      line += 1;
+    }
+    const ch = clean[i];
+    if (ch === "{") {
+      let p = i - 1;
+      while (p >= 0 && !";{}".includes(clean[p])) p -= 1;
+      const isAt = clean.slice(p + 1, i).trim().startsWith("@");
+      stack.push(isAt);
+      if (isAt) depth += 1;
+    } else if (ch === "}") {
+      if (stack.pop()) depth = Math.max(0, depth - 1);
+    }
+  }
+  depths[line] = depth;
+  return depths;
+})();
+
 const out = [];
 const paired = [];
 const skipped = [];
 const extraCustomProps = [];
 const collectedOverrides = new Map(); // 选择器 → [{prop, value}]
 const bodySelectors = [];
-let atRuleDepth = 0;
 /** 跨行选择器列表的前半截（`.a,\n.b { … }`）：单独一行的选择器不以 `{` 结尾，得先攒着。 */
 let selectorLead = "";
 
 const recordOverride = (selector, prop, value) => {
-  if (!collectedOverrides.has(selector)) {
-    collectedOverrides.set(selector, []);
-    bodySelectors.push(selector);
-  }
+  if (!collectedOverrides.has(selector)) collectedOverrides.set(selector, []);
+  // 选择器可能已经由规则头那一支记过（`single` / `ruleStart` 都会 push）：这里再 push 一次
+  // 会让生成区里的同一条覆盖出现两遍（幂等仍成立，只是白写一份）。
+  if (!bodySelectors.includes(selector)) bodySelectors.push(selector);
   const list = collectedOverrides.get(selector);
   const at = list.findIndex((x) => x.prop === prop);
   if (at >= 0) list[at] = { prop, value };
@@ -309,9 +376,8 @@ const recordOverride = (selector, prop, value) => {
 
 for (let i = 0; i < bodyLines.length; i += 1) {
   const line = bodyLines[i];
-
-  if (/^\s*@/.test(line)) atRuleDepth += 1;
-  if (/^\s*\}/.test(line)) atRuleDepth = Math.max(0, atRuleDepth - 1);
+  // 行首已经在 at-rule 里，或这一行自己就是 at-rule（多行 / 单行的 `@media … {` 都算）
+  const atRuleDepth = (atRuleDepthPerLine[i] ?? 0) + (/^\s*@/.test(line) ? 1 : 0);
 
   // 单行规则
   const single = /^(\s*)([^{}@]+?)\s*\{\s*([^{}]+?)\s*\}\s*$/.exec(line);
@@ -432,10 +498,64 @@ for (let i = 0; i < bodyLines.length; i += 1) {
   }
 }
 
-// 生成区里的规则级覆盖 = 本轮收集到的 + 上一轮已有（且该选择器仍在表里）—— 保证幂等
+// 基础表重建完之后，逐条校验上一轮的规则覆盖：只有「基础表里那条声明仍然是它的 sRGB 回退」
+// 才继续保留（源码已改成 `var(--token)` / 规则删掉的，旧覆盖自然消失）。
+const baseProps = new Map(); // 选择器 → Map(prop → value)
+{
+  // 注释先换成空格（保留换行）：注释里那段 `button { cursor: pointer }` 与紧跟着的真实规则
+  // 会被当成「一个选择器」整体吃掉，`.state-chip.live` 这种紧跟长注释的规则就永远配不上。
+  const raw = out.join("\n");
+  let text = "";
+  for (let i = 0; i < raw.length; i += 1) {
+    if (raw[i] === "/" && raw[i + 1] === "*") {
+      const end = raw.indexOf("*/", i + 2);
+      const stop = end < 0 ? raw.length : end + 2;
+      text += raw.slice(i, stop).replace(/[^\n]/g, " ");
+      i = stop - 1;
+    } else {
+      text += raw[i];
+    }
+  }
+  for (const m of text.matchAll(/([^{}@]+?)\s*\{([^{}]*)\}/g)) {
+    const sel = m[1].trim().replace(/\s+/g, " ");
+    if (!sel) continue;
+    const map = baseProps.get(sel) ?? new Map();
+    for (const decl of m[2].split(";")) {
+      const d = /^((?:--)?[a-z][\w-]*)\s*:\s*(.+)$/.exec(decl.trim());
+      if (d) map.set(d[1], d[2].trim());
+    }
+    baseProps.set(sel, map);
+  }
+}
+const keptPrevOverrides = new Map();
+for (const selector of bodySelectors) {
+  const prev = prevRuleOverrides.get(selector);
+  if (!prev) continue;
+  const map = baseProps.get(selector);
+  if (!map) continue;
+  const kept = [];
+  for (const { prop, value } of prev) {
+    const base = map.get(prop);
+    if (base === undefined) continue;
+    if (/currentColor/.test(value)) {
+      // currentColor 的混合算不出静态值：基础表里那条手写中性回退就是它的回退，原样保留。
+      kept.push({ prop, value });
+      continue;
+    }
+    let fallback;
+    try {
+      fallback = downlevelValue(value).text;
+    } catch {
+      continue; // 旧覆盖引用了已经不存在的令牌：丢掉，别让重跑失败
+    }
+    if (base === fallback) kept.push({ prop, value });
+  }
+  if (kept.length) keptPrevOverrides.set(selector, kept);
+}
+
 const ruleOverrides = [];
 for (const selector of bodySelectors) {
-  const list = collectedOverrides.get(selector) ?? prevRuleOverrides.get(selector);
+  const list = collectedOverrides.get(selector) ?? keptPrevOverrides.get(selector);
   if (!list || !list.length) continue;
   ruleOverrides.push(`  ${selector} { ${list.map((x) => `${x.prop}: ${x.value};`).join(" ")} }`);
 }
@@ -469,13 +589,13 @@ const next =
 
 if (CHECK_ONLY) {
   if (next !== source) {
-    console.error("✗ 兼容性回退未同步：请运行 `npm run tokens:gen` 并提交结果");
+    console.error(`✗ ${LABEL} 的兼容性回退未同步：请运行 \`npm run tokens:gen\` 并提交结果`);
     process.exit(1);
   }
-  console.log(`✓ 已同步（令牌 ${hiFiTokens.length + extraCustomProps.length} 条 + 规则覆盖 ${ruleOverrides.length} 条进 @supports；成对回退 ${paired.length} 条）`);
+  console.log(`✓ ${LABEL} 已同步（令牌 ${hiFiTokens.length + extraCustomProps.length} 条 + 规则覆盖 ${ruleOverrides.length} 条进 @supports；成对回退 ${paired.length} 条）`);
   process.exit(0);
 }
 
 fs.writeFileSync(CSS_PATH, next);
-console.log(`令牌 ${hiFiTokens.length + extraCustomProps.length} 条 + 规则覆盖 ${ruleOverrides.length} 条收进 @supports；成对回退 ${paired.length} 条`);
+console.log(`${LABEL}：令牌 ${hiFiTokens.length + extraCustomProps.length} 条 + 规则覆盖 ${ruleOverrides.length} 条收进 @supports；成对回退 ${paired.length} 条`);
 for (const s of skipped) console.log(`  · currentColor 跳过：${s.selector} { ${s.prop} }（需手写中性回退）`);

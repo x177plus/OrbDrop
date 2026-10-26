@@ -11,7 +11,7 @@
     "signingKeyPath": "tauri 更新签名私钥（不在仓库里）；公钥已编译进 Rust，换了私钥客户端就得重发",
     "localMirrorBase": "--local 演练时清单里 mirrors 的前缀（scripts/dev-mirror.mjs 默认就监听它）",
     "notes": "远端发布时如果没给 --notes，用这个当更新说明；留空则远端模式强制要求 --notes",
-    "artifacts": "三种产物的构建输出路径（客户端认的固定文件名在清单 mirrors 里，别改 basename）"
+    "artifacts": "Windows exe 与两个 APK 的构建输出路径（客户端认的固定文件名在清单 mirrors 里，别改 basename）。macOS 的 .app zip 不在这里：用 --macos-zip 显式传入，或在 Mac 上先跑 npm run mac:artifact"
   },
   "github": {
     "owner": "x177plus",

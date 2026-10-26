@@ -5,6 +5,7 @@
   import { formatFileSize } from '$lib/types';
   import { scrollRail } from '$lib/scrollRail';
   import { ctxPlacement } from '$lib/ctxPlacement';
+  import { computerLabel } from '$lib/stores/platform.svelte';
   import Hint from '$lib/components/Hint.svelte';
 
   /**
@@ -168,7 +169,7 @@
   /** 当前所在位置（给车上的"在哪选的"用）：`''` = 此电脑；否则 crumbs 末段就是当前目录
    *  （后端保证，见 p1 的路径语义）。 */
   function here(): { from: string; fromName: string } {
-    return { from: cwd, fromName: cwd === '' ? '此电脑' : crumbs[crumbs.length - 1].name };
+    return { from: cwd, fromName: cwd === '' ? computerLabel() : crumbs[crumbs.length - 1].name };
   }
 
   function toggle(row: Row) {
@@ -449,7 +450,7 @@
     <div class="picker-crumbs">
       <button class="crumb-up" onclick={up} disabled={cwd === ''} aria-label="返回上一级">{@html ICON_UP}</button>
       <div class="crumb-trail">
-        <button class="crumb" class:current={cwd === ''} onclick={() => void go('')}>此电脑</button>
+        <button class="crumb" class:current={cwd === ''} onclick={() => void go('')}>{computerLabel()}</button>
         {#each crumbs as c, i (c.path)}
           <span class="crumb-sep">/</span>
           <button class="crumb" class:current={i === crumbs.length - 1} onclick={() => void go(c.path)}>{c.name}</button>

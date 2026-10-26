@@ -45,6 +45,7 @@ const BACKUP_SUFFIX: &str = ".old";
 // ---------------------------------------------------------------------------
 
 /// 把 helper（= 刚下好的新 exe）拉起来。返回后父进程应当立刻退出。
+#[cfg(windows)]
 pub fn spawn_helper(new_exe: &Path, target: &Path) -> Result<(), String> {
     if !new_exe.is_file() {
         return Err(format!("下载的更新包不在：{}", new_exe.display()));
@@ -73,17 +74,195 @@ pub fn spawn_helper(new_exe: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// macOS：解压刚下好的 `.app` zip，再拉起一个 `/bin/sh` helper 等本进程退出后替换整个包。
+///
+/// 为什么不能像 Windows 那样"让新二进制自己当 helper"：macOS 的更新单位是 **`.app` 包**
+/// （含 Info.plist、资源、签名），只换包内可执行文件会留下新旧混杂的包。也不能在进程内
+/// `mv` 自己：脚本要在父进程退出后再动 `/Applications`，而父进程一退就没有代码可跑了。
+///
+/// 失败路径全部写进 `<数据目录>/logs/update.log`，并且脚本会尽量把旧包放回去、重新 `open`。
+#[cfg(target_os = "macos")]
+pub fn spawn_helper(new_package: &Path, target_exe: &Path) -> Result<(), String> {
+    if !new_package.is_file() {
+        return Err(format!("下载的更新包不在：{}", new_package.display()));
+    }
+    let target = macos_bundle(target_exe)?;
+    if target.to_string_lossy().contains("/AppTranslocation/") {
+        return Err(
+            "当前应用是从「下载 / 磁盘映像」里直接运行的（App Translocation）：\
+             请先把 OrbDrop 拖进「应用程序」再更新"
+                .to_string(),
+        );
+    }
+    let work = new_package
+        .parent()
+        .ok_or_else(|| "更新包没有父目录".to_string())?;
+    let extracted = work.join("extracted");
+    let _ = std::fs::remove_dir_all(&extracted);
+    std::fs::create_dir_all(&extracted)
+        .map_err(|e| format!("建解压目录失败（{}）：{e}", extracted.display()))?;
+    let status = std::process::Command::new("/usr/bin/ditto")
+        .arg("-x")
+        .arg("-k")
+        .arg(new_package)
+        .arg(&extracted)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("解压更新包失败：{e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "解压更新包失败（ditto 退出码 {}）：{}",
+            status.code().unwrap_or(-1),
+            new_package.display()
+        ));
+    }
+    let new_app = find_app(&extracted)
+        .ok_or_else(|| format!("更新包里没有 .app：{}", extracted.display()))?;
+
+    let script = work.join("apply-macos.sh");
+    std::fs::write(&script, MACOS_APPLY_SCRIPT)
+        .map_err(|e| format!("写更新脚本失败（{}）：{e}", script.display()))?;
+    let log = crate::config::data_dir().join("logs").join("update.log");
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg(&script)
+        .arg(std::process::id().to_string())
+        .arg(&target)
+        .arg(&new_app)
+        .arg(&log)
+        .current_dir(work)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd.spawn().map_err(|e| {
+        format!(
+            "拉不起 macOS 更新脚本：{e}（更新包已下好，在 {}）",
+            new_package.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// 覆盖脚本。参数由 `spawn_helper` 以独立 argv 传入（路径里有空格也不用转义）：
+/// `$1` pid、`$2` 旧 .app、`$3` 新 .app、`$4` 日志。
+///
+/// 先 `ditto` 到**同一卷**的 `.new` 再做两次 `mv`：`mv` 在同一卷上是原子的，替换期间
+/// 不会出现"半个包"。新包落位失败就把旧包改名回去并重新打开旧版本。
+#[cfg(target_os = "macos")]
+const MACOS_APPLY_SCRIPT: &str = r#"#!/bin/sh
+set -u
+pid="$1"
+target="$2"
+new="$3"
+log="$4"
+say() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$log"; }
+say "macOS helper 开始：等 $pid 退出后替换 $target"
+i=0
+while kill -0 "$pid" 2>/dev/null; do
+  i=$((i + 1))
+  [ "$i" -ge 300 ] && break
+  sleep 0.2
+done
+staging="${target}.new"
+old="${target}.old"
+rm -rf "$staging" "$old"
+if ! /usr/bin/ditto "$new" "$staging"; then
+  say "复制新版本失败；继续用旧版本"
+  /usr/bin/open "$target"
+  exit 1
+fi
+if ! mv "$target" "$old"; then
+  say "旧版本改名失败；继续用旧版本"
+  rm -rf "$staging"
+  /usr/bin/open "$target"
+  exit 1
+fi
+if mv "$staging" "$target"; then
+  say "新版本已就位，重新打开"
+  /usr/bin/open "$target"
+  sleep 1
+  rm -rf "$old"
+  say "完成"
+else
+  say "新版本落位失败，回滚旧版本"
+  mv "$old" "$target"
+  /usr/bin/open "$target"
+  exit 1
+fi
+"#;
+
+/// `当前 exe` → 它所在的 `.app` 包（必须真的在 `Contents/MacOS` 下）。
+#[cfg(target_os = "macos")]
+fn macos_bundle(exe: &Path) -> Result<PathBuf, String> {
+    let bundle = exe
+        .ancestors()
+        .find(|p| p.extension().is_some_and(|e| e.to_string_lossy() == "app"))
+        .ok_or_else(|| {
+            format!(
+                "当前可执行文件不在 .app 包里（{}）：开发构建不支持自更新",
+                exe.display()
+            )
+        })?;
+    Ok(bundle.to_path_buf())
+}
+
+/// 解压目录里的 `.app`（优先 `OrbDrop.app`，否则取第一个）。
+#[cfg(target_os = "macos")]
+fn find_app(dir: &Path) -> Option<PathBuf> {
+    let mut first = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|e| e.to_string_lossy() == "app")
+            && path.is_dir()
+        {
+            if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy() == "OrbDrop.app")
+            {
+                return Some(path);
+            }
+            first.get_or_insert(path);
+        }
+    }
+    first
+}
+
 /// 清掉上一次更新留下的过渡文件：`<exe>.old` 与过期的临时目录。
 ///
 /// helper 自己删不掉正在运行的那个文件与目录（都还被映射着），所以这两件残渣由**下一次
 /// 启动**来收 —— 收在启动最早期，别让用户看见。
 pub fn cleanup_stale() {
     if let Ok(exe) = std::env::current_exe() {
-        let backup = with_suffix(&exe, BACKUP_SUFFIX);
-        if backup.exists() {
-            match std::fs::remove_file(&backup) {
-                Ok(()) => log_line(&format!("清掉上次更新的备份 {}", backup.display())),
-                Err(e) => log_line(&format!("删不掉 {}：{e}", backup.display())),
+        #[cfg(windows)]
+        {
+            let backup = with_suffix(&exe, BACKUP_SUFFIX);
+            if backup.exists() {
+                match std::fs::remove_file(&backup) {
+                    Ok(()) => log_line(&format!("清掉上次更新的备份 {}", backup.display())),
+                    Err(e) => log_line(&format!("删不掉 {}：{e}", backup.display())),
+                }
+            }
+        }
+        // macOS 的备份是整个 `.app` 目录（`.old`）；还有上一轮没来得及搬走的 `.new`。
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(bundle) = macos_bundle(&exe) {
+                for suffix in [".old", ".new"] {
+                    let path = with_suffix(&bundle, suffix);
+                    if !path.exists() {
+                        continue;
+                    }
+                    match std::fs::remove_dir_all(&path) {
+                        Ok(()) => log_line(&format!("清掉上次更新的过渡包 {}", path.display())),
+                        Err(e) => log_line(&format!("删不掉 {}：{e}", path.display())),
+                    }
+                }
             }
         }
     }

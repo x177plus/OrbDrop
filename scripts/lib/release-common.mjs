@@ -190,6 +190,7 @@ export function loadConfig() {
 /** 三个产物的最终发布文件名（也是 Release 附件名、也是清单 mirrors 里 URL 的末段，必须一致）。 */
 export const ASSET_NAMES = {
   exe: "orbdrop.exe",
+  macos: "orbdrop-macos-universal.app.zip",
   universal: "app-universal-release.apk",
   arm64: "app-arm64-release.apk",
   manifest: "update.json",

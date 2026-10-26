@@ -3281,9 +3281,14 @@ callback, updatedAt }`
 ### 看大图与缩略图
 
 - 会话里那条**图片消息**画成一张图（`ImagePreview.svelte`，读 `ChatMessage.path` —— 后端在快照里
-  现算，不进 `chat.json`：那是"这台机器上它在哪"），点开是 `ImageViewer.svelte`（点背景 / Esc /
-  「关闭」收掉，另留一颗「用系统程序打开」—— 图片在应用里看得见不代表"交给别的程序"这条老路该没了）。
+  现算，不进 `chat.json`：那是"这台机器上它在哪"），点开是 `ImageViewer.svelte`（**点图片** /
+  点背景 / Esc / 「关闭」收掉，另留一颗「用系统程序打开」—— 图片在应用里看得见不代表"交给别的
+  程序"这条老路该没了）。
   两端共用这两个组件，文件消息那条气泡（真文件）也复用同一对。
+- 尺寸按**这一层**量，不按视口：这一层常常只挂在会话浮层里（桌面端 320×420），用 `72vh` 量出来
+  的图会比浮层高，下半截与底下那排按钮一起被裁掉。现在图片区吃满剩余高度、自己滚；**长图**按
+  容器宽度铺开（`max-width: 100%`，不是 `max-height`），滚轮 / 触屏拖动 / 按住鼠标拖都能翻，
+  滚动条本身不画（啤酒肚一样横在图片右侧太抢眼），「用系统程序打开 / 关闭」那条永远留在底部。
 - 读盘走 `read_image_data_url` → `data:` URL，**缓存 8 条 + LRU**（`lib/images.ts`）。缓存**不做成
   响应式**：那样读取发生在渲染期，而淘汰之后下一次渲染又会去读 → 读回来又写 → 又渲染，转成一个停不
   下来的取数循环。取数一律由组件自己的 `$effect` 驱动，淘汰最多让下次挂载重读一次。
@@ -3619,6 +3624,11 @@ Google WebView（实测可行：`119.0.6045.53` 那份装上去界面就起来�
 ### 门禁（`scripts/check-compat.mjs`）
 
 - `FLOOR` 由 `Chrome 90` 改成 **`Chrome 81`**；
+- **桌面端同表同查**：`src/styles/main.css` 与 `dist/assets/*.css` 也过「基础表不许出现
+  `color-mix()`、纯 `oklch()` 必须成对、生成区覆盖必须能在基础表里找到回退」这三条。桌面端不查
+  移动端的 `:has()` 并联与 JS 语法/内建下限（Safari 15.4+ / WebView2 105+ 原生支持），下限文案
+  写作 **macOS 11+ WKWebView / 旧 WebView2**。原因见 `docs/macos.md` §1.1：macOS 12.7.6 的
+  WKWebView 支持 `oklch()` 但不支持 `color-mix()`，只按版本号推会漏掉；
 - 内建黑名单补上**没被兜住**的那几个：`Promise.any`/`AggregateError`（85）、`WeakRef`/
   `FinalizationRegistry`（84）—— `replaceAll` **不列**，因为补丁兜住了；
 - 新增**语法闸**：`dist-mobile/assets/*.js` 必须能被 acorn 按 `ecmaVersion: 2020` 解析 —— `target`

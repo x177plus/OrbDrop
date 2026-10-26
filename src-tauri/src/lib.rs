@@ -39,6 +39,8 @@ pub mod pake;
 pub mod paste;
 pub mod peer_fs;
 pub mod relay;
+#[cfg(desktop)]
+pub mod resource;
 pub mod sas;
 pub mod server;
 pub mod share;
@@ -1239,6 +1241,19 @@ async fn remove_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result
     unpair_peer(state.inner(), &peer_id).await
 }
 
+/// 忘掉一台**未配对**设备：只清本机记录（设备行 / 地址 / 备注 / 观察指纹），不通知对端。
+///
+/// 已配对的设备必须先「解除配对」—— 只清本机记录会让对端还认着本机，而本机这里
+/// 已经没有它（最糟的半清状态）。返回的错误文案直接展示给用户。
+#[tauri::command]
+fn forget_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    if state.forget_peer(&peer_id) {
+        Ok(())
+    } else {
+        Err("这台设备仍在配对关系中：请先「解除配对」".into())
+    }
+}
+
 /// 一键清空本机**全部**配对凭据（F-15）：用户不必（也不该）去翻文件或系统凭据管理器。
 ///
 /// 三处一起清，少一处就等于没清干净：
@@ -1266,6 +1281,10 @@ pub fn wipe_all_credentials(state: &Arc<AppState>) -> Result<usize, String> {
     state.clear_observed_fingerprints();
     #[cfg(desktop)]
     bc::provision_profiles(state);
+    // macOS 的左侧比较位里有可能是 `profile:<ip:port>?…`（对端共享项）：profile 已被剪掉，
+    // 槽也一起清，免得下一次右键比较还指着一个空位置。
+    #[cfg(target_os = "macos")]
+    bc::clear_slot();
     // 凭据全清了，钉住的指纹也就没有归属了：Trust 表跟着清空，地址上的对端从此按
     // "没见过的身份"重新认（那正是"清空后重新配对"该有的样子）。
     state::refresh_trust(state);
@@ -2613,6 +2632,30 @@ fn urlencode(s: &str) -> String {
 // Server lifecycle
 // ---------------------------------------------------------------------------
 
+/// 运行平台（界面据此换文案：资源管理器 / Finder、Ctrl+V / ⌘V、BC 示例路径）。
+///
+/// 用编译期常量而不是 `navigator.platform`：WebView 在 macOS 上也可以伪装 UA，
+/// 而这里要回答的是「这个二进制是为哪个系统编的」，只有 `cfg!` 知道。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeInfo {
+    /// `windows` / `macos` / `linux` / `android` / `ios`
+    pub os: &'static str,
+    /// `x86_64` / `aarch64` / …
+    pub arch: &'static str,
+    /// 桌面壳（悬浮球、托盘、原生拖放）还是移动壳。
+    pub desktop: bool,
+}
+
+#[tauri::command]
+fn runtime_info() -> RuntimeInfo {
+    RuntimeInfo {
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        desktop: cfg!(desktop),
+    }
+}
+
 #[tauri::command]
 fn get_app_state(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let s = state.config.lock();
@@ -3145,6 +3188,11 @@ fn boot_state() -> Arc<AppState> {
     // 排在数据目录确定之后 —— 移动端正是这个原因把 `boot_state` 推迟到 `setup()` 里。
     log::init_log();
 
+    // fd 上限要在起任何监听之前抬好；放在 `init_log` 之后，启动那条 `info!` 才进得了日志
+    // （macOS 默认软上限只有 256，见 `resource` 与 docs/macos.md §1.3）。
+    #[cfg(desktop)]
+    resource::prepare_process();
+
     let config = config::load_config();
     let config_path = config::config_file_path();
 
@@ -3289,6 +3337,17 @@ pub fn run() {
         _ => {}
     });
 
+    // macOS：悬浮球窗口没有标题栏，但 `⌘W` / 菜单里的「关闭窗口」仍然会走到这里。
+    // 直接销毁窗口的话，托盘还在、`get_webview_window("main")` 却永远拿不到东西了 ——
+    // 用户从此只能退出重开。所以关窗只隐藏，退出走托盘菜单 / `⌘Q`。
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_window_event(|window, event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            let _ = window.hide();
+        }
+    });
+
     // 桌面端：数据目录随时可得，状态在这里就建好，命令与 setup 都能直接用。
     #[cfg(desktop)]
     let builder = builder.manage(boot_state());
@@ -3320,6 +3379,7 @@ pub fn run() {
             relay_traffic,
             add_peer,
             remove_peer,
+            forget_peer,
             pair_start,
             pair_confirm,
             pair_invite,
@@ -3419,6 +3479,7 @@ pub fn run() {
             start_http_server,
             set_online,
             get_app_state,
+            runtime_info,
             #[cfg(desktop)]
             orb_screen_metrics,
             #[cfg(desktop)]
@@ -3484,6 +3545,14 @@ pub fn run() {
                     None => warn!("未找到 main 窗口，跳过系统边框处理"),
                 }
 
+                // macOS：不占 Dock / 菜单栏，悬浮窗在所有空间（含别人的全屏空间）可见。
+                // 失败只记日志：窗口已经出来了，最坏情况是它只在本桌面可见，不该拦住启动。
+                #[cfg(target_os = "macos")]
+                match orb_window::setup_macos(app) {
+                    Ok(()) => info!("macOS 窗口外壳已就绪（Accessory + 全空间浮层）"),
+                    Err(e) => warn!("macOS 窗口外壳设置失败: {e}"),
+                }
+
                 // 窗口不在任务栏露面了，托盘是唯一的窗口外入口 —— 菜单得在这里就位，
                 // 晚一步（比如等前端起来再挂）用户手上就有个没有出口的进程。
                 match tray::setup(app.handle()) {
@@ -3533,6 +3602,21 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            // macOS：用户再次双击 .app（或在 Finder 里点它）时，LaunchServices 不会起第二个
+            // 进程，而是给已经在跑的那个送 `applicationShouldHandleReopen`。单实例插件收不到
+            // 这一跳，得在这里把悬浮球叫回台面 —— 不然「再点一次没反应」就是必然。
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(win) = app.get_webview_window("main") {
+                    if let Err(e) = orb_window::raise(&win) {
+                        warn!("Reopen 叫回悬浮球失败: {e}");
+                    }
+                }
+                if let Err(e) = app.emit(ws::events::ui::ORB_SHOW, ()) {
+                    warn!("Reopen 的展开事件发不出去: {e}");
+                }
+            }
+
             // 退出时松开镜像连接。**注册留着**：注册一次长期存在（注销是 O(N)，实测 10,100 个
             // 占位符 1.9 s），下次启动 `mirror::ensure_ready` 只做连接；注销属于卸载路径。
             if let tauri::RunEvent::Exit = event {

@@ -148,7 +148,8 @@ pub struct Manifest {
     /// 发布日期（RFC 3339）。只用于显示。
     #[serde(default)]
     pub_date: Option<String>,
-    /// 桌面端产物：`windows-x86_64`（将来要加平台就加键，客户端按键取）。
+    /// 桌面端产物：`windows-x86_64` / `macos-aarch64` / `macos-x86_64` / `macos-universal`
+    /// （客户端按键取，见 `desktop_keys`）。
     #[serde(default)]
     desktop: HashMap<String, Artifact>,
     /// 安卓端产物：`universal` / `arm64-v8a`。
@@ -160,22 +161,43 @@ impl Manifest {
     /// 本机该拿哪一个产物。取不到就是"这版没为本机出包"，检查阶段直接报错——
     /// 比下载到一半才发现要干净。
     fn artifact_for_this_platform(&self) -> Result<Artifact, String> {
-        let (table, key) = if cfg!(desktop) {
-            (&self.desktop, desktop_key())
-        } else {
-            (&self.android, android_key())
-        };
-        table
-            .get(key)
+        if cfg!(desktop) {
+            // 优先精确架构，其次通用包（macOS 可以只发一份 universal）。找不到时把
+            // **本机认过的键**都报出来，别只说一个，否则用户看不出清单到底缺哪一档。
+            let keys = desktop_keys();
+            for key in keys {
+                if let Some(artifact) = self.desktop.get(*key) {
+                    return Ok(artifact.clone());
+                }
+            }
+            return Err(format!(
+                "这一版没有为 {} 出包（清单 desktop 里缺这一档）",
+                keys.join(" / ")
+            ));
+        }
+        self.android
+            .get(android_key())
             .cloned()
-            .ok_or_else(|| format!("这一版没有为 {key} 出包（清单里缺这一档）"))
+            .ok_or_else(|| format!("这一版没有为 {} 出包（清单里缺这一档）", android_key()))
     }
 }
 
-/// 桌面端在清单里的键。只出 Windows 一份：本应用是 Windows 桌面端 + 安卓端
-/// （将来要出别的平台就往清单里加键，客户端按键取）。
-fn desktop_key() -> &'static str {
-    "windows-x86_64"
+/// 桌面端在清单里的候选键，按优先级排列。
+///
+/// Windows 只有 `windows-x86_64`；macOS 先认本机架构，再认通用包 —— 发布侧可以只编一份
+/// `macos-universal`，也可以为两种架构分别出包。
+fn desktop_keys() -> &'static [&'static str] {
+    #[cfg(target_os = "macos")]
+    {
+        if cfg!(target_arch = "aarch64") {
+            return &["macos-aarch64", "macos-universal"];
+        }
+        return &["macos-x86_64", "macos-universal"];
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        &["windows-x86_64"]
+    }
 }
 
 /// 安卓端在清单里的键：**按本机架构选包**。
@@ -895,10 +917,18 @@ pub async fn apply(app: AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests;
 
-/// 下到哪：桌面落到临时目录（helper 要从那里把自己覆盖过去），安卓落到应用私有目录下的
-/// `updates/`（FileProvider 用的是 `root-path`，覆盖得到）。
+/// 下到哪：Windows 落到临时目录（helper 从那里把自己覆盖过去）；macOS 下 `.app` zip 到临时
+/// 目录（解开后整体替换）；安卓落到应用私有目录下的 `updates/`（FileProvider 用的是
+/// `root-path`，覆盖得到）。
 fn download_dest(version: &str) -> PathBuf {
-    #[cfg(desktop)]
+    #[cfg(all(desktop, target_os = "macos"))]
+    {
+        // macOS 的更新产物是 `.app` 的 zip（保留符号链接与资源分叉，必须用 `ditto -c -k`）。
+        std::env::temp_dir()
+            .join(format!("orbdrop-update-{version}"))
+            .join("orbdrop-macos-universal.app.zip")
+    }
+    #[cfg(all(desktop, not(target_os = "macos")))]
     {
         std::env::temp_dir()
             .join(format!("orbdrop-update-{version}"))

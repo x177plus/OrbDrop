@@ -9,7 +9,7 @@
 <p>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg" alt="License"></a>
   <a href="https://github.com/x177plus/OrbDrop/releases/latest"><img src="https://img.shields.io/github/v/release/x177plus/OrbDrop?sort=semver&color=green" alt="Release"></a>
-  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Android-0078d4.svg" alt="Platform">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Android-0078d4.svg" alt="Platform">
   <img src="https://img.shields.io/badge/Tauri-2-24C8DB.svg?logo=tauri&logoColor=white" alt="Tauri">
   <img src="https://img.shields.io/badge/SvelteKit-2-FF3E00.svg?logo=svelte&logoColor=white" alt="SvelteKit">
 </p>
@@ -32,10 +32,16 @@ LAN only: no NAT traversal, no relay servers, no cloud, no accounts.
 | Platform | File | GitHub | Gitee |
 | --- | --- | --- | --- |
 | Windows desktop (x86_64) | `orbdrop.exe` | [latest](https://github.com/x177plus/OrbDrop/releases/latest) | [latest](https://gitee.com/x177plus/OrbDrop/releases) |
+| macOS 11+ (universal) | `orbdrop-macos-universal.app.zip` | [latest](https://github.com/x177plus/OrbDrop/releases/latest) | [latest](https://gitee.com/x177plus/OrbDrop/releases) |
 | Android (universal) | `app-universal-release.apk` | [latest](https://github.com/x177plus/OrbDrop/releases/latest) | [latest](https://gitee.com/x177plus/OrbDrop/releases) |
 | Android (arm64) | `app-arm64-release.apk` | [latest](https://github.com/x177plus/OrbDrop/releases/latest) | [latest](https://gitee.com/x177plus/OrbDrop/releases) |
 
-The desktop build is a single portable exe (no installer). If an APK refuses to install, pick by device:
+The Windows desktop build is a single portable exe (no installer). The macOS build is a universal
+`.app` (Apple Silicon + Intel); unsigned CI builds need one right-click → **Open** on first launch,
+and self-update requires the app to live in a writable location (normally `/Applications`). See
+[`docs/macos.md`](./docs/macos.md) for the platform notes and the real-Mac verification checklist.
+
+If an APK refuses to install, pick by device:
 almost every phone is arm64 (`app-arm64-release.apk`, smaller and lighter); if unsure, use the universal build.
 
 ### Update manifest and verification
@@ -55,7 +61,7 @@ additionally carry a Tauri update signature in `sig`), so a download can be chec
 
 - Always-on-top, frameless, in one of two shapes — a round orb or a rounded-rect card with per-device pages. It snaps to a screen edge (only a sliver stays visible and slides back on hover), highlights while you drag files over it, and the tray icon flashes with a red dot while something needs you. A second launch raises the running instance instead of starting a second copy.
 - Drop a folder onto the orb → it becomes a share (idempotent, deduped by path) and is instantly visible to every peer currently holding a long-lived connection. Each share has its own broadcast switch, and a recursive watcher pushes change notifications so the remote tree refreshes itself.
-- Drag any file or folder **out of the tree and into Explorer — or into any other application**. For remote items OrbDrop creates a Windows Cloud Files placeholder locally (measured **0.22 ms and 0 bytes of disk** per item) and pulls the bytes from the peer only when the target process actually reads them. Applications that only accept `CF_HDROP` (WeChat and friends) receive a real path, so they work too — with no pre-download and nothing to wait for at drag start.
+- Drag any file or folder **out of the tree and into Explorer / Finder — or into any other application**. On Windows, remote items become a Windows Cloud Files placeholder locally (measured **0.22 ms and 0 bytes of disk** per item) and the bytes are pulled from the peer only when the target process actually reads them; macOS has no public equivalent, so remote items are staged to the mirror directory before the drag starts (see [`docs/macos.md`](./docs/macos.md)). Applications that only accept real paths (WeChat and friends) receive one on both platforms. On Windows there is no pre-download and nothing to wait for at drag start; on macOS only the staging wait applies.
 - Drop files onto an open conversation overlay and they are sent to that conversation immediately.
 
 ### 2. Beyond Compare, straight from the tree
@@ -103,7 +109,7 @@ No internet traversal or relay servers — relaying happens strictly inside the 
 
 ## Tech
 
-Rust core, shared verbatim by the desktop and Android builds: an axum HTTP/WebSocket server on a single port (the listener tells TLS from plaintext by the first byte), self-signed identities and fingerprint pinning via rustls/rcgen, mDNS via `mdns-sd`, WebSocket signalling via tokio-tungstenite, plus hand-written WebDAV and a Windows Cloud Filters (CFAPI) provider for drag-out. The shell is Tauri 2; the UI is Svelte 5 + Vite.
+Rust core, shared verbatim by the desktop and Android builds: an axum HTTP/WebSocket server on a single port (the listener tells TLS from plaintext by the first byte), self-signed identities and fingerprint pinning via rustls/rcgen, mDNS via `mdns-sd`, WebSocket signalling via tokio-tungstenite, plus hand-written WebDAV, a Windows Cloud Filters (CFAPI) provider for drag-out, and a macOS `NSDraggingSession` / staging path. The shell is Tauri 2; the UI is Svelte 5 + Vite.
 
 ## Documentation
 
@@ -120,6 +126,8 @@ Requirements: Node.js, a Rust toolchain, and — for Android — the Android SDK
 ```bash
 npm install          # install dependencies
 npm run tauri dev    # desktop dev (vite + tauri)
+npm run mac:build    # macOS universal .app + .dmg (on macOS)
+npm run mac:artifact # macOS .app + DMG + updater zip (on macOS)
 npm run android:dev  # Android dev
 npm run check        # svelte-check type check
 npm run android:build:arm64  # Android release APK for arm64 only
@@ -127,7 +135,7 @@ npm run android:build:arm64  # Android release APK for arm64 only
 
 `npm run android:build` compiles the Rust crate for all four ABIs sequentially, so it is the slow one — use `android:build:arm64` while iterating (one ABI, roughly a quarter of the work) and save the full build for release day. Note that `--target aarch64` only limits which ABIs Rust builds: the Gradle flavor stays `universal`, so the arm64-only APK lands in (and overwrites) `apk/universal/release/`.
 
-Packaging: `npm run tauri build` (desktop), `npm run android:release` (arm64 APK, installed to the device), `npm run release` (bump version, build, publish to both release remotes). `npm run mirror` runs the local mirror harness used to test the updater.
+Packaging: `npm run tauri build` (Windows desktop), `npm run mac:build` (macOS .app/.dmg), `npm run android:release` (arm64 APK, installed to the device), `npm run release` (bump version, build, publish to both release remotes; add `--macos-zip` to include a macOS artifact). `npm run mirror` runs the local mirror harness used to test the updater.
 
 Running several instances on one machine (useful for testing against yourself) needs a distinct data directory and port per instance: set `ORBDROP_ALLOW_MULTI=1` and `ORBDROP_DATA_DIR` accordingly. In this mode mDNS is loopback-only by default, so the extra instances are invisible to other machines on the LAN (the release app on the same machine won't see them either). Set `ORBDROP_MDNS_SCOPE=lan` on an instance to expose it deliberately, or `off` to disable mDNS entirely (manual add still works).
 

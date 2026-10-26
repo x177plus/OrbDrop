@@ -1,5 +1,68 @@
 # 更新日志
 
+## 未发布 — macOS 桌面端
+
+新增：macOS 11+（Apple Silicon + Intel 通用包）。与 Windows 共用同一份 Rust 核心与 Svelte 前端，
+补齐 macOS 外壳：不占 Dock 的菜单栏应用、全空间透明置顶悬浮球、`⌘W` 隐藏而非销毁、再次打开叫回面板；
+原生 `NSDraggingSession` 拖出到访达；对端共享项在起拖前整份暂存（没有 CFAPI 的公开等价物）；
+Beyond Compare 的 `.app` 探测、macOS 配置目录与应用内左侧比较位；LaunchAgent 自启动；
+`.app` zip 自更新（helper 等旧进程退出后原子替换整个包）；`Info.plist` 补上局域网/Bonjour 与
+TCC 文件夹说明。构建与发布：`npm run mac:build` / `npm run mac:artifact`、
+`release.mjs --macos-zip`、`.github/workflows/macos.yml`。细节与真机验证清单见 `docs/macos.md`。
+
+修复：macOS 上**配对确认与保存设置两颗主按钮看不见**（设置页底部只剩「取消」、配对对话框只剩
+次要按钮），且状态章/悬停底/遮罩等整体失色。根因不是布局：macOS 12.7.6 的系统 WKWebView
+支持 `oklch()`、**不支持 `color-mix()`**，而桌面样式表按 WebView2 写、没有 sRGB 回退 ——
+`color-mix()` 在计算期失效后是 `unset`，于是 `--accent-deep` 等派生令牌整条作废，
+`.btn-primary` 计算成透明底 + 白字。现在 `src/styles/main.css` 与移动端走同一套生成器
+（`npm run tokens:gen` 两份表各跑一次，`tokens:check` 同步校验）：基础表只留 sRGB，现代写法收进
+`@supports` 生成区；`check:compat` 增查桌面源码与 `dist/assets/*.css`，构建期两端都不再压缩 CSS
+（压缩器会去重回退声明并删掉生成区标记）。同一份产物 CSS 在系统 WKWebView 上实测主按钮为
+实色蓝 + 白字，现代 Chromium 仍走 `@supports` 的高保真路径。细节见 `docs/macos.md` §1.1。
+
+修复：macOS 上**鼠标划过正文会变成 I 形、还能拖选** —— WKWebView（12.7.6 / Safari 17.6 内核实测）
+不认无前缀的 `user-select`（`CSS.supports('user-select','none')` 为 `false`），只写
+`user-select: none` 时计算值仍是 `text`。全局 `body` 改成 `-webkit-user-select` 与 `user-select`
+成对出现（聊天记录、文件行、输入区照旧用 `-webkit-user-select: text` 明确开回来）。
+**贴边收起的竖条里设备名 / `ip:port` 被裁掉 3px**：竖排时 `line-height` 就是列宽，这两列原先继承
+body 的 1.6（12px→19.2px / 10px→16px），而列宽只有 16px / 13px（实测 `scrollWidth 19/16` 对
+`clientWidth 16/13`）。现在两列的 `line-height` 直接等于各自的列宽，左右两侧贴边都不再切字。
+另外去掉全局 `-webkit-font-smoothing: antialiased`：它只在 macOS/WebKit 生效，会把正文压成更细的
+灰度抗锯齿（1x 屏上尤其发虚；这不是字体本身的问题 —— 栈里就是系统字体 SF Pro + PingFang SC）。
+细节与实测值见 `docs/macos.md` §1.2。
+
+修复：macOS 上**输入框获得焦点时外面会多出一个方框**（Windows/安卓没有）。不是新增的样式：
+WebKit 对非 `auto` 的 `outline-style` 长期不跟 `border-radius`（到 Safari 27 才补完
+"outline radii rendering"），而三个输入框（`.input` / `.chat-input` / `.dev-search`）都是圆角，
+全局 `:focus-visible` 又带 `outline-offset: 2px` —— 那圈本应贴着圆角的柔光在 macOS 上被画成
+离输入框 2px 的直角空框；Chromium 上它跟着圆角，看不出来。焦点环改为
+`box-shadow: 0 0 0 2px var(--accent-soft)` + `outline: none`（群发模式换 `--bc-soft`）：
+`box-shadow` 在所有引擎上都跟圆角，`outline: none` 一并挡掉 UA 焦点环，键盘焦点仍有柔光与
+描边变色。细节见 `docs/macos.md` §1.2 第 4 条。
+
+优化：macOS 的 fd 上限与探活/中转的连接峰值。启动时把 `RLIMIT_NOFILE` 软上限抬到硬上限
+（封顶 65535，`src-tauri/src/resource.rs`），每 30s 采样、占用到 80% 打 warning；`knownPeers`
+同一个 `ip:port` 一轮只探一次，启动与每轮探活后合并同一地址上的重复未配对行，未配对行连续
+60s 探活失败后整行忘掉（设备右键新增「忘记设备」）；中转同一对请求方→目标复用已开端点，
+目标连不上后 60s 冷却、空闲回收 60s，并加全局 24 条 / 单端点 8 条并发上限（超出丢连接，
+不把 fd 打满）。实测配置里的 7 条 `D1159@:3891` 与 2 条「演示机」(:3990/:3991) 是主要的
+死探活来源。细节见 `docs/macos.md` §1.3。
+
+修复：桌面端（Windows / macOS）在中文输入法组合期间，输入框会隔一阵子"自己刷新"——没选字，
+拼音却被当成普通文本留在了框里，打字时经常夹着拼音。根因是会话输入区那个"打开会话"的 effect
+读的是整个 `thread` 派生对象：`activeThread()` 每次会话快照、每次设备表刷新都会返回新对象
+（`$derived` 按 `===` 比较），于是每一份 `chat://changed` / `devices://changed`（mDNS 解析、
+5s 探活、收发消息与回执）都会把输入区 `textContent` 清空再重挂一遍，组合中的预编辑串正是被
+这一下固化的。现在 effect 只依赖字符串会话键（`threadKey`），并给两端输入区加了组合闸门：
+`compositionstart` … `compositionend` 之间的重画推迟到结束后的下一帧（那一帧里又进了新组合就
+继续推迟），安卓同一处一并接上。
+
+修复：会话里点开的图片只能点周围那圈才关得掉，长图又看不全、底下那排「用系统程序打开 / 关闭」
+被裁在可视区外。图片层原先按视口 `72vh` 量尺寸，而它常挂在 320×420 的会话浮层里 —— 图比浮层高，
+多出来的部分连同按钮一起被浮层的 `overflow: hidden` 裁掉。现在图片区吃满这一层的剩余高度并自己
+滚：**点图片（或图旁空处）再点一下即收起**，点背景 / Esc / 「关闭」照旧；长图按容器宽度铺开，
+鼠标滚轮、触屏拖动、按住鼠标拖都能翻，滚动条不显示，操作条永远留在底部。
+
 ## v0.1.0 — 2026-10-24
 
 安全：配对码改为 SPAKE2（P-256）PAKE——6 位码只做双方口令、不再出现在报文里；配对邀请加入 8 位 SAS 核对码。出站 TLS 同时出示本机证书，并按目标设备钉住证书指纹；群消息与名册改为 Ed25519 签名，成员公钥只认本机绑定，群回执/补拉补上成员与签名校验。公开路由增加请求体空闲超时与每来源 IP 并发上限，对端回话、DAV 正文与更新产物一律按体积上限读取；中转路由记录按来源分档，未配对设备换地址必须出示同一枚 TLS 证书；镜像目录的设备 id/共享项 id 按安全路径段校验；安卓 FileProvider 只放开应用自己的目录，并关闭系统备份。

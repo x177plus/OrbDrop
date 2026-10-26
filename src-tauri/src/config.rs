@@ -1155,7 +1155,15 @@ pub(crate) fn default_download_dir() -> PathBuf {
         return data_dir().join("received");
     }
     #[cfg(not(mobile))]
-    dirs::desktop_dir().unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\Desktop"))
+    {
+        // macOS / Linux / Windows 的「桌面」由 `dirs` 各自回答；没有桌面目录的环境
+        // （无 GUI 的 Linux、被裁剪的安装）退到「下载」，再退到临时目录。
+        // **不要**再写死 `C:\Users\Default\Desktop`：macOS 上那会是一个不存在的路径，
+        // 第一次接收推送就会在错的落点建目录。
+        dirs::desktop_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+            .unwrap_or_else(std::env::temp_dir)
+    }
 }
 
 /// S-12 的缺省：**开**。旧配置里没有这一项（升级上来的）也按"开"读 —— 那正是它们一直
@@ -1178,12 +1186,42 @@ pub(crate) fn default_device_name() -> String {
     {
         std::env::var("COMPUTERNAME").unwrap_or_else(|_| "OrbDrop-PC".into())
     }
-    #[cfg(not(any(target_os = "android", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        // GUI 应用由 launchd 拉起，环境里通常没有 `HOSTNAME`（那是 shell 才设的）。
+        // `scutil --get ComputerName` 回答的正是「共享」里那个给人看的电脑名；
+        // 拿不到再退回 `hostname` / 环境变量。
+        if let Some(name) = command_output("scutil", &["--get", "ComputerName"]) {
+            return name;
+        }
+        if let Some(name) = command_output("hostname", &[]) {
+            return name;
+        }
+        std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("HOST"))
+            .unwrap_or_else(|_| "OrbDrop-Mac".into())
+    }
+    #[cfg(not(any(target_os = "android", target_os = "windows", target_os = "macos")))]
     {
         std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("HOST"))
             .unwrap_or_else(|_| "OrbDrop-Mac".into())
     }
+}
+
+/// 跑一条只读命令并取第一行非空输出；失败/空输出一律 `None`。
+///
+/// 只给 `default_device_name` 用：`scutil` 与 `hostname` 都是系统自带、只读、毫秒级。
+/// 不引入 `libc`/`sysctl` 依赖，是因为这条路径只在**首次生成配置**时跑一次。
+#[cfg(target_os = "macos")]
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(line.to_string())
 }
 
 /// **测试实例**用的配置：只把身份换掉，其余照 `Config::default()`。

@@ -803,7 +803,7 @@ body {
    纯 oklch() 不同：它在解析期就非法、那条声明被丢掉、前一条生效，所以那些用成对声明就够。
    另一条硬规矩：这块里的 color-mix() **一律 `in oklab`（直角插值）**，不用 `in oklch` ——
    Chromium 111–114 的极坐标色相插值会把 transparent 的色相当 0 绕行，蓝色底纹会被染成粉色
-   （真机 Android WebView 114.0.5.302 实测）；与 transparent / black 混时两者等价，见 gen 脚本注释。 */
+   （真机 Huawei WebView 114.0.5.302 实测）；与 transparent / black 混时两者等价，见 gen 脚本注释。 */
 @supports (color: oklch(0% 0 0)) and (background: color-mix(in oklab, red, blue)) {
   :root {
   --bg: oklch(99% 0.002 240);

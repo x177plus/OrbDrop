@@ -55,10 +55,13 @@ const ENC_PREFIX: &str = "BCmp|1|";
 /// 左侧槽所在的那把键（21 行的注释里那几条事实就来自它）。**父键在 = 本机装过 BC5**：
 /// `ExePath` 就住在父键里（`registry_candidates` 读的也是它）—— 再加上"开得出写权限"这一条，
 /// 就是 `slot_writable()` 的全部判据。不在没装 BC 的机器上凭空造 `Scooter Software` 这棵树。
+#[cfg(target_os = "windows")]
 const SHELL_PARENT_KEY: &str = r"SOFTWARE\Scooter Software\Beyond Compare 5";
+#[cfg(target_os = "windows")]
 const SHELL_KEY: &str = r"SOFTWARE\Scooter Software\Beyond Compare 5\BcShellEx";
 /// 32 位 shell 的那一份（安装器 / repack 脚本写过）。**只读回退，从不写**：写它要管理员，
 /// 而 64 位资源管理器用的是 `BCShellEx64.dll`（读 HKCU 那份）。
+#[cfg(target_os = "windows")]
 const SHELL_KEY_WOW: &str = r"SOFTWARE\WOW6432Node\Scooter Software\Beyond Compare 5\BcShellEx";
 
 fn b64() -> base64::engine::general_purpose::GeneralPurpose {
@@ -72,13 +75,41 @@ fn b64() -> base64::engine::general_purpose::GeneralPurpose {
 /// 定位 BC 可执行文件：设置里指定的优先，其次注册表（安装版/便携版脚本都会写），
 /// 最后按常见安装路径兜底。
 pub fn locate_exe(configured: Option<&Path>) -> Option<PathBuf> {
-    if let Some(p) = configured.filter(|p| p.is_file()) {
-        return Some(p.to_path_buf());
+    if let Some(p) = configured {
+        // macOS 上用户很可能填的是 `.app` 包（Finder 里拖出来的就是它），而 BC4 的命令行
+        // 入口是 `Contents/MacOS/bcomp`（BC5 有些包叫 `bcompare`）。两种都认；Windows 上
+        // `.app` 不存在，不变。
+        if let Some(binary) = app_bundle_binary(p) {
+            if binary.is_file() {
+                return Some(binary);
+            }
+        }
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
     }
     registry_candidates()
         .into_iter()
         .chain(common_candidates())
         .find(|p| p.is_file())
+}
+
+/// `.app` 包目录 → 包内可执行文件；不是 `.app` 或包内没有入口时返回 `None`。
+fn app_bundle_binary(path: &Path) -> Option<PathBuf> {
+    if path
+        .extension()
+        .is_some_and(|e| e.to_string_lossy() == "app")
+        && path.is_dir()
+    {
+        // BC4 的入口是 `bcomp`；部分 BC5 安装包/文档写 `bcompare`。按实际存在的取。
+        for name in ["bcomp", "bcompare"] {
+            let candidate = path.join("Contents/MacOS").join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(target_os = "windows")]
@@ -150,9 +181,20 @@ fn common_candidates() -> Vec<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        out.push(PathBuf::from(
-            "/Applications/Beyond Compare.app/Contents/MacOS/bcompare",
-        ));
+        // 系统级安装与「拖进个人应用程序目录」两种位置都常见。
+        for base in ["/Applications", "~/Applications"] {
+            let base = if let Some(rest) = base.strip_prefix("~/") {
+                match dirs::home_dir() {
+                    Some(home) => home.join(rest),
+                    None => continue,
+                }
+            } else {
+                PathBuf::from(base)
+            };
+            for name in ["bcomp", "bcompare"] {
+                out.push(base.join("Beyond Compare.app/Contents/MacOS").join(name));
+            }
+        }
     }
     out
 }
@@ -168,10 +210,22 @@ pub fn config_dir(exe: &Path) -> PathBuf {
             return dir.to_path_buf();
         }
     }
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Scooter Software")
-        .join("Beyond Compare 5")
+    // macOS 的 BC 设置目录**不带厂商层**：官方文档给的是
+    // `~/Library/Application Support/Beyond Compare`（`dirs::config_dir()` 正是
+    // `~/Library/Application Support`）。Windows 才是 `Scooter Software\Beyond Compare 5`。
+    #[cfg(target_os = "macos")]
+    {
+        return dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Beyond Compare");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Scooter Software")
+            .join("Beyond Compare 5")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -616,6 +670,7 @@ pub enum ShellSlot {
 }
 
 impl ShellSlot {
+    #[cfg(target_os = "windows")]
     fn value_name(self) -> &'static str {
         match self {
             ShellSlot::File => "SavedFileLeft",
@@ -625,6 +680,7 @@ impl ShellSlot {
 }
 
 /// 槽里那条值：喂给 BC 的**原文** + 它占的是哪个槽。
+#[derive(Clone, Debug)]
 pub struct ShellLeft {
     /// 读到什么喂什么 —— 不做任何再加工（那条路有实测背书），反解只服务菜单显示。
     pub arg: String,
@@ -650,7 +706,14 @@ pub fn slot_writable() -> bool {
             .open_subkey_with_flags(SHELL_PARENT_KEY, KEY_READ | KEY_WRITE)
             .is_ok()
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        // macOS 没有资源管理器右键扩展的 `Saved*Left`，本应用自己维护一个「左侧比较位」
+        // （`<数据目录>/bc-left.json`）。能不能显示 BC 菜单由 `status().exe_path` 决定，
+        // 这里只回答「有地方放左侧」—— 文件写入失败会在 `write_slot` 当场报。
+        true
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         false
     }
@@ -672,6 +735,7 @@ fn read_slot_values(key: &RegKey) -> (Option<String>, Option<String>) {
 /// 取哪个槽：`prefer` = "右键的那一项是文件还是文件夹"。BC 就是按类型取槽的，我们跟着它取；
 /// 要的那一档空着就退另一个槽（BC 自己的「对比」项也是这么兜到底的）。
 /// `None`（没有上下文：启动、设置面板）= 文件夹槽优先（右键文件夹那一档最常用）。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn pick_slot(
     folder: Option<String>,
     file: Option<String>,
@@ -702,25 +766,66 @@ pub fn read_slot(prefer: Option<ShellSlot>) -> Option<ShellLeft> {
         }
         None
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        // 只有一个槽：macOS 上没有「文件槽 / 文件夹槽」之分，`prefer` 不参与。
+        let _ = prefer;
+        let raw = std::fs::read_to_string(macos_slot_path()).ok()?;
+        let stored: MacSlot = serde_json::from_str(&raw).ok()?;
+        let arg = clean_slot_value(&stored.arg)?;
+        Some(ShellLeft {
+            arg,
+            dir: stored.dir,
+        })
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = prefer;
         None
     }
 }
 
-/// 写槽：**两个值名写同一个值**。
+/// macOS 的左侧比较位落盘形状（应用自己维护，不是 BC 的注册表值）。
+#[cfg(target_os = "macos")]
+#[derive(serde::Deserialize, serde::Serialize)]
+struct MacSlot {
+    arg: String,
+    dir: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_slot_path() -> PathBuf {
+    crate::config::data_dir().join("bc-left.json")
+}
+
+/// 清掉 macOS 的左侧比较位（"清空全部凭据"时调用：槽里可能是对端 profile 的位置）。
+#[cfg(target_os = "macos")]
+pub fn clear_slot() {
+    let path = macos_slot_path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => info!(path = %path.display(), "已清掉左侧比较位"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(path = %path.display(), error = %e, "左侧比较位没清掉"),
+    }
+}
+
+/// 写槽。
 ///
-/// BC 的槽按**右键项类型**分（右键文件看 `SavedFileLeft`、右键文件夹看 `SavedFolderLeft`），
+/// Windows：**两个值名写同一个值**。BC 的槽按**右键项类型**分（右键文件看
+/// `SavedFileLeft`、右键文件夹看 `SavedFolderLeft`），
 /// 而且它自己的扩展**不会**动另一个槽 —— 真机实测：资源管理器里"选择左侧文件"之后，之前那个
 /// 文件夹左侧还在。所以只写一个槽的后果是"另一类条目在资源管理器里看不见对比项"（用户实测踩到过）。
 /// 两个都写 = 右键文件、右键文件夹都能看到「对比 <我们放的那一项>」。
 ///
 /// 只写 HKCU 那把键，且只碰这两个值名：同一把键里还住着 BC 自己的 `Viewers` / `ArchiveMasks` /
 /// `PictureMasks` / `RegistryViewer`，一个都不动。
-pub fn write_slot(arg: &str) -> Result<(), String> {
+///
+/// macOS：BC 没有资源管理器右键扩展，槽由本应用自己维护在 `<数据目录>/bc-left.json`，
+/// 写入是原子的；`dir` 只用于菜单显示（不参与 BC 命令行）。
+pub fn write_slot(arg: &str, dir: bool) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        let _ = dir;
         // 父键要**可写**地打开（建子键需要 KEY_CREATE_SUB_KEY，它含在 KEY_WRITE 里）
         let parent = RegKey::predef(HKEY_CURRENT_USER)
             .open_subkey_with_flags(SHELL_PARENT_KEY, KEY_READ | KEY_WRITE)
@@ -733,10 +838,23 @@ pub fn write_slot(arg: &str) -> Result<(), String> {
         info!(arg, "已写入资源管理器左侧槽（两个值名）");
         Ok(())
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        let _ = arg;
-        Err("左侧槽只存在于 Windows 上 BC 的右键扩展里".to_string())
+        let path = macos_slot_path();
+        let text = serde_json::to_vec(&MacSlot {
+            arg: arg.to_string(),
+            dir,
+        })
+        .map_err(|e| format!("序列化左侧比较位失败：{e}"))?;
+        crate::config::write_atomic(&path, &text)
+            .map_err(|e| format!("写入左侧比较位失败（{}）：{e}", path.display()))?;
+        info!(arg, dir, "已写入本机左侧比较位（macOS 应用内维护）");
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = (arg, dir);
+        Err("当前平台没有左侧比较位".to_string())
     }
 }
 
@@ -969,7 +1087,8 @@ pub fn set_left(state: &AppState, target: &BcTarget) -> Result<(), String> {
     let exe = locate_exe(state.config.lock().bc_exe_path.as_deref())
         .ok_or_else(|| "未找到 BeyondCompare 可执行文件，请在设置里指定路径".to_string())?;
     let side = resolve_side(state, &exe, target)?;
-    write_slot(&side.arg)
+    let dir = matches!(slot_for(state, target), ShellSlot::Folder);
+    write_slot(&side.arg, dir)
 }
 
 /// 与左侧比对：**左边读槽（原文喂进去）**，右边是右键那一项（本机路径或 `profile:` 位置）。
@@ -1548,8 +1667,12 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("BCompare.exe");
         fs::write(&exe, b"stub").unwrap();
-        // 没有 BC*.xml → 用户配置目录
-        assert!(config_dir(&exe).ends_with("Beyond Compare 5"));
+        // 没有 BC*.xml → 用户配置目录（macOS 的官方目录不带厂商层与版本号）
+        if cfg!(target_os = "macos") {
+            assert!(config_dir(&exe).ends_with("Beyond Compare"));
+        } else {
+            assert!(config_dir(&exe).ends_with("Beyond Compare 5"));
+        }
 
         fs::write(dir.join("BCState.xml"), b"<BCState/>").unwrap();
         assert_eq!(config_dir(&exe), dir);

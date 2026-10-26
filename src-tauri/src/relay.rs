@@ -38,7 +38,7 @@ use parking_lot::Mutex;
 use tauri::Emitter;
 use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::config::RelayAddr;
@@ -101,7 +101,9 @@ fn loopback_relay_targets_allowed_for_tests() -> bool {
 ///
 /// 只在"一条连接都没有"时计时：中转的典型用途是一条长连接（`/events` 的 WS）+ 若干短
 /// 请求，长时间没有新连接但有活连接是正常的（一次大文件传输就是这样），那不算空闲。
-const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// 60s（不是 120s）：请求方自己 30s 重试一次，**同一对已经有端点时走复用**（见 `open`）；
+/// 请求方真的走了，端点最多一分钟就收，不再靠两条旧端点空转。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 中转方向连目标那一跳的超时。连不上就断，不让请求方挂在一个永远不动的 socket 上。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -115,6 +117,23 @@ const REQUEST_COOLDOWN: Duration = Duration::from_secs(30);
 /// 控制面调用（`/relay/open`）的超时。
 const OPEN_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// 目标地址刚连不上时的冷却：这期间不再为它**新开**端点。
+///
+/// 请求方（`ensure_for`）每 30s 重试一次；没有这一档时，一台目标的端口死了，Mac 就会每
+/// 30s 新开一个监听器 + 一条注定超时的出站连接（日志里"开了中转端点"一串新端口就是这么来的）。
+/// 60s = 隔一次重试才放行一次，足够让"目标恢复了"在一分钟内被发现。
+const RELAY_FAIL_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// 全局同时搬运的中转连接上限（每条占**两个** socket：入站 + 出站）。
+///
+/// 256 fd 的机器上，基线（mDNS/长连接/探活/文件）已经 150 左右；24 条 = 48 个 socket，
+/// 把突发压在 200 上下。超出时**丢弃新连接**（不排队）：请求方是短连接重试模型，丢一条
+/// 比把本机 fd 打满、连 UI 的 HTTP 都 accept 不了要好。
+const MAX_RELAY_STREAMS: usize = 24;
+
+/// 单个端点同时搬运的连接上限（一次传输的并行度通常 ≤8）。
+const MAX_RELAY_STREAMS_PER_ENDPOINT: usize = 8;
+
 // ---------------------------------------------------------------------------
 // 注册表：本机替别人开出去的中转端点
 // ---------------------------------------------------------------------------
@@ -124,22 +143,77 @@ struct ActiveRelay {
     requester: String,
     target: String,
     port: u16,
+    /// 本机给请求方的端点地址（`pick_own_ipv4` → `net::relay_host` 的字面量）。
+    /// 复用同一对 (请求方, 目标) 时原样回给请求方，不能再算一次（算出来可能换了网卡）。
+    host: String,
+    /// 这条端点要连的目标地址；复用与控制面回话都用它。
+    target_addr: SocketAddr,
     /// 关停信号：`send(true)` 让监听任务与它底下所有在跑的连接一起收。
     stop: watch::Sender<bool>,
 }
 
 /// 本机开出去的中转端点（`AppState::relays`）。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RelayRegistry {
     inner: Mutex<HashMap<u64, ActiveRelay>>,
     /// 控制面限流：`请求方 id → 上次开中转的时刻`。
     last_open: Mutex<HashMap<String, Instant>>,
     next_id: AtomicU64,
+    /// 全局同时在跑的中转连接额度（见 [`MAX_RELAY_STREAMS`]）。
+    streams: Arc<Semaphore>,
+    /// 刚连不上的目标地址 → 失败时刻（见 [`RELAY_FAIL_COOLDOWN`]）。
+    failures: Mutex<HashMap<SocketAddr, Instant>>,
+}
+
+impl Default for RelayRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            last_open: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+            streams: Arc::new(Semaphore::new(MAX_RELAY_STREAMS)),
+            failures: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl RelayRegistry {
     pub fn active(&self) -> usize {
         self.inner.lock().len()
+    }
+
+    /// 同一对 (请求方, 目标) 已经开着的端点：复用它的端口与地址。
+    fn find(&self, requester: &str, target: &str) -> Option<(u16, String, SocketAddr)> {
+        self.inner
+            .lock()
+            .values()
+            .find(|r| r.requester == requester && r.target == target)
+            .map(|r| (r.port, r.host.clone(), r.target_addr))
+    }
+
+    /// 全局中转连接额度（`serve` 的 accept 循环用它兜住突发）。
+    fn streams(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.streams)
+    }
+
+    /// 记一次"目标地址连不上"：冷却期内 `open` 不再为它新开端点。
+    fn target_failed(&self, addr: SocketAddr) {
+        let now = Instant::now();
+        let mut f = self.failures.lock();
+        f.retain(|_, at| now.saturating_duration_since(*at) < RELAY_FAIL_COOLDOWN);
+        f.insert(addr, now);
+    }
+
+    fn target_cooling(&self, addr: SocketAddr) -> bool {
+        let now = Instant::now();
+        let mut f = self.failures.lock();
+        f.retain(|_, at| now.saturating_duration_since(*at) < RELAY_FAIL_COOLDOWN);
+        f.contains_key(&addr)
+    }
+
+    /// 目标连上了：清掉失败冷却（下一次换地址/恢复时立刻可用）。
+    fn target_ok(&self, addr: SocketAddr) {
+        self.failures.lock().remove(&addr);
     }
 
     /// 控制面限流：同一位请求方在 [`CALLER_COOLDOWN`] 内只放一次。
@@ -411,6 +485,34 @@ pub async fn open(
         .ok()
         .and_then(crate::subnet::local_net_of);
 
+    // 同一对请求方→目标已经有端点：**复用**，不再新开监听。
+    //
+    // 请求方（`ensure_for`）在目标暂时不可达时每 30s 重问一次控制面；每次都新开监听器 +
+    // 出站连接，旧端点还要空转 120s，日志里就是一串不同端口。复用只花一次查表。
+    if let Some((port, host, target_addr)) = state.relays.find(requester, target) {
+        info!(%requester, %target, port, "复用已开的中转端点");
+        return Ok(Opened {
+            host,
+            port,
+            target: target.to_string(),
+            expires_in_secs: IDLE_TIMEOUT.as_secs(),
+            via_cidr: own_net
+                .as_ref()
+                .map(|c| c.to_cidr_string())
+                .unwrap_or_default(),
+            via_devices: own_net
+                .as_ref()
+                .map(|c| state.relay_devices_in(c, &[requester, target]))
+                .unwrap_or_default(),
+            target_addr: target_addr.to_string(),
+        });
+    }
+    // 刚连不上的目标地址：冷却期内不再新开端点。请求方 30s 后会再问一次，那一次才放行。
+    if state.relays.target_cooling(target_addr) {
+        debug!(%target, %target_addr, "目标刚连不上，冷却中，暂不新开端点");
+        return Err(OpenError::Unavailable("目标刚连不上，稍后再试".into()));
+    }
+
     let listener = TcpListener::bind(("0.0.0.0", 0))
         .await
         .map_err(|e| OpenError::Unavailable(format!("绑定中转监听失败: {e}")))?;
@@ -426,6 +528,8 @@ pub async fn open(
             requester: requester.to_string(),
             target: target.to_string(),
             port,
+            host: host.clone(),
+            target_addr,
             stop,
         })
         .map_err(|_| OpenError::Busy(format!("本机同时在转的中转已达上限（{MAX_RELAYS}）")))?;
@@ -582,6 +686,10 @@ async fn serve(
     mut stop: watch::Receiver<bool>,
 ) {
     let live = Arc::new(AtomicU64::new(0));
+    // 并发额度：全局（24 条）+ 本端点（8 条）。超了**丢连接**而不是排队 —— 请求方是
+    // 短连接重试模型；把 fd 打满、连本机 UI 的 HTTP 都 accept 不了才是更坏的结局。
+    let global_streams = state.relays.streams();
+    let endpoint_streams = Arc::new(Semaphore::new(MAX_RELAY_STREAMS_PER_ENDPOINT));
     loop {
         // F-107：本机切到「离线」= 隐身 —— 对所有设备都不可见，中转也不该例外。
         // `apply_offline` 会直接把这些端点收掉（close_all → stop），这一条是兜底：万一有哪条
@@ -631,6 +739,17 @@ async fn serve(
             break;
         }
 
+        let Ok(global_permit) = global_streams.clone().try_acquire_owned() else {
+            warn!(%requester, %target, "中转并发已达全局上限，丢弃这条连接");
+            drop(inbound);
+            continue;
+        };
+        let Ok(endpoint_permit) = endpoint_streams.clone().try_acquire_owned() else {
+            warn!(%requester, %target, "中转并发已达单端点上限，丢弃这条连接");
+            drop(inbound);
+            continue;
+        };
+
         let _ = inbound.set_nodelay(true);
         let live_child = Arc::clone(&live);
         let stop_child = stop.clone();
@@ -638,6 +757,9 @@ async fn serve(
         live.fetch_add(1, Ordering::SeqCst);
         let label = (requester.clone(), target.clone());
         tokio::spawn(async move {
+            // 两个 permit 跟着这条连接活到结束（drop 即归还）。
+            let _global_permit = global_permit;
+            let _endpoint_permit = endpoint_permit;
             pump(inbound, target_addr, stop_child, conn_state).await;
             live_child.fetch_sub(1, Ordering::SeqCst);
             debug!(requester = %label.0, target = %label.1, "一条中转连接结束");
@@ -682,13 +804,18 @@ async fn pump(
 ) {
     let outbound =
         match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target_addr)).await {
-            Ok(Ok(stream)) => stream,
+            Ok(Ok(stream)) => {
+                state.relays.target_ok(target_addr);
+                stream
+            }
             Ok(Err(e)) => {
                 warn!(target = %target_addr, "中转连目标失败: {e}");
+                state.relays.target_failed(target_addr);
                 return;
             }
             Err(_) => {
                 warn!(target = %target_addr, "中转连目标超时");
+                state.relays.target_failed(target_addr);
                 return;
             }
         };
@@ -1355,6 +1482,8 @@ mod tests {
                     requester: "requester".into(),
                     target: format!("target-{i}"),
                     port: 0,
+                    host: "127.0.0.1".into(),
+                    target_addr: "127.0.0.1:1".parse().unwrap(),
                     stop,
                 })
                 .expect("上限之内的插入必须成功");
@@ -1366,6 +1495,8 @@ mod tests {
                     requester: "requester".into(),
                     target: "overflow".into(),
                     port: 0,
+                    host: "127.0.0.1".into(),
+                    target_addr: "127.0.0.1:1".parse().unwrap(),
                     stop,
                 })
                 .is_err(),
@@ -1373,6 +1504,32 @@ mod tests {
         );
         registry.close_all();
         assert_eq!(registry.active(), 0);
+    }
+
+    #[test]
+    fn registry_reuses_endpoint_and_cools_failed_target() {
+        let registry = RelayRegistry::default();
+        let addr: SocketAddr = "10.0.0.2:3890".parse().unwrap();
+        let (stop, _rx) = watch::channel(false);
+        registry
+            .insert(ActiveRelay {
+                requester: "requester".into(),
+                target: "target".into(),
+                port: 41000,
+                host: "10.0.0.1".into(),
+                target_addr: addr,
+                stop,
+            })
+            .unwrap();
+        let (port, host, target) = registry.find("requester", "target").expect("同一对应能复用");
+        assert_eq!(port, 41000);
+        assert_eq!(host, "10.0.0.1");
+        assert_eq!(target, addr);
+        assert!(registry.find("other", "target").is_none());
+        registry.target_failed(addr);
+        assert!(registry.target_cooling(addr), "刚失败的目标应处于冷却期");
+        registry.target_ok(addr);
+        assert!(!registry.target_cooling(addr), "连上后冷却必须清掉");
     }
 
     #[test]

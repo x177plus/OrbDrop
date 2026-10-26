@@ -5,6 +5,7 @@
   import Hint from '$lib/components/Hint.svelte';
   import Logo from '$lib/components/Logo.svelte';
   import { getSettings, loadSettings, updateSettings } from '$lib/stores/settings.svelte';
+  import { fileManagerLabel, isMac } from '$lib/stores/platform.svelte';
   import * as upd from '$lib/stores/update.svelte';
   import { formatFileSize, updateStatusText } from '$lib/types';
   import type { OrbShape, RectPage, RelayTraffic } from '$lib/types';
@@ -375,7 +376,7 @@
         <strong>圆球</strong>：62px 的球，贴边会收进屏幕边缘、悬停滑回来。<br />
         <strong>圆角矩形悬浮框</strong>：一张卡片，第一页是本机、其后每台长连接设备一页，
         列出各自对本机可见的共享项；贴边会收起成一条竖条（图标 + 设备名 + ip:port），
-        悬停滑回来；直接拖动卡片里的条目可以拖到资源管理器里（与面板里一样），
+        悬停滑回来；直接拖动卡片里的条目可以拖到{fileManagerLabel()}里（与面板里一样），
         滚轮/点右侧小点换页。
       </Hint></label>
       <div class="shape-picker" role="radiogroup" aria-labelledby="orbShapeLabel">
@@ -421,9 +422,16 @@
     </div>
     <div class="field">
       <label for="bcExePath">BC 可执行文件路径<Hint>
-        用于右键菜单里的「用 BeyondCompare 比较」，例如 BCompare.exe 的完整路径。
+        用于右键菜单里的「用 BeyondCompare 比较」。{isMac()
+          ? '可以填 .app 包（如 /Applications/Beyond Compare.app），也可以填包内的 bcompare。'
+          : '例如 BCompare.exe 的完整路径。'}
       </Hint></label>
-      <input class="input" id="bcExePath" bind:value={bcExePath} placeholder="留空 = 自动探测" />
+      <input
+        class="input"
+        id="bcExePath"
+        bind:value={bcExePath}
+        placeholder={isMac() ? '留空 = 自动探测（.app 也可）' : '留空 = 自动探测'}
+      />
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">

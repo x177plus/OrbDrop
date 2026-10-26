@@ -12,6 +12,15 @@
         "https://github.com/x177plus/OrbDrop/releases/download/v0.0.2/orbdrop.exe",
         "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.2/orbdrop.exe"
       ]
+    },
+    "macos-universal": {
+      "size": 18874368,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkK",
+      "mirrors": [
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.0.2/orbdrop-macos-universal.app.zip",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.0.2/orbdrop-macos-universal.app.zip"
+      ]
     }
   },
   "android": {

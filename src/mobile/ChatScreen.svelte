@@ -12,6 +12,8 @@
     insertImagePicks,
     insertImages,
     isImageName,
+    noteComposition,
+    paintWhenNotComposing,
     serializeComposer,
     setCaretEnd,
   } from "$lib/composer";
@@ -302,20 +304,37 @@
   /**
    * 换会话：把这条会话的草稿**重画**进输入区（图片是 `blob:` 预览，重画就是重新挂上去）。
    *
+   * 依赖只有 `convoKey`（字符串）与这个节点 —— **不能**读 `thread` 之类的对象派生：那些每次
+   * 快照都是新对象，effect 会跟着每次后端事件重跑，而它一跑就把输入区整个重画。输入法正在
+   * 组合时那一下会把预编辑的拼音当普通文本固化在框里（"没选字，拼音却上去了"）。
+   * 组合期间的重画再由 `paintWhenNotComposing` 推迟到组合结束。
+   *
    * `untrack` 不能省：输入区在编辑时**不归 Svelte 管**（DOM 就是编辑时的真相 —— 否则每敲一个
-   * 字都被重画一遍、光标丢到最前）。这个 effect 只认"哪条会话 / 哪个节点"，读草稿那一下包在
-   * `untrack` 里。`viewing` 一起收掉：一张已经不属于这条会话的图不该还挂在屏幕上。
+   * 字都被重画一遍、光标丢到最前）。读草稿那一下包在 `untrack` 里。
    */
   $effect(() => {
     const el = inputEl;
     void convoKey;
     if (!el) return;
+    // 一张已经不属于这条会话的图不该还挂在屏幕上。
+    viewing = null;
+    paintWhenNotComposing(el, paintComposer);
+  });
+
+  /** 把这条会话的草稿重画进输入区（现读当前键：推迟的那一趟晚一帧，可能已经换了会话）。 */
+  function paintComposer(): void {
+    const el = inputEl;
+    if (!el) return;
     untrack(() => {
       applyComposer(el, chat.draftSegsOf(convoKey));
       markEmpty();
     });
-    viewing = null;
-  });
+  }
+
+  /** 输入法组合开始 / 结束：组合期间不许重画输入区（见 `composer.noteComposition`）。 */
+  function onComposition(start: boolean): void {
+    if (inputEl) noteComposition(inputEl, start);
+  }
 
   /**
    * 底板上刚选好的那几张图：从 store 里取过来插进输入区（F-118）。
@@ -587,6 +606,8 @@
     aria-label="消息内容"
     bind:this={inputEl}
     oninput={() => void onInput()}
+    oncompositionstart={() => onComposition(true)}
+    oncompositionend={() => onComposition(false)}
     onpaste={onPaste}
     onkeydown={onKey}
   ></div>

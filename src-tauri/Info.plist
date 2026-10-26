@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS 打包时由 tauri-build 合并进 bundle 的 Info.plist（键名与 Apple 的文档一致）。
+
+  - LSUIElement：本应用是「托盘 + 悬浮球」，按设计不占 Dock、不挂菜单栏；运行中还会
+    再调一次 `set_activation_policy(Accessory)`，这一条保证的是**启动那一刻**就不会闪一下
+    Dock 图标。
+  - NSLocalNetworkUsageDescription / NSBonjourServices：macOS 15 起访问局域网要用户授权，
+    而 mDNS 发现 `_orbdrop._tcp` 是核心功能；不写这两项，系统不会给出授权提示，发现直接失败。
+  - 四个 *FolderUsageDescription：桌面 / 文稿 / 下载 / 可移动卷是 TCC 保护范围，第一次
+    被选为共享项或下载落点时会弹系统授权；说明文字让用户知道这是他自己刚做的操作。
+-->
+<plist version="1.0">
+<dict>
+    <key>LSUIElement</key>
+    <true/>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>OrbDrop 需要访问本地网络，用来发现并连接同一局域网内的设备、传输文件。</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_orbdrop._tcp</string>
+    </array>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>OrbDrop 需要访问「桌面」文件夹，用来共享或接收你选中的文件。</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>OrbDrop 需要访问「文稿」文件夹，用来共享或接收你选中的文件。</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>OrbDrop 需要访问「下载」文件夹，用来保存接收到的文件。</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>OrbDrop 需要访问可移动磁盘，用来共享或接收你选中的文件。</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>OrbDrop 需要访问网络磁盘，用来共享或接收你选中的文件。</string>
+</dict>
+</plist>

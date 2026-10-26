@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 /**
- * 兼容性门禁：保证移动端产物在 **Chrome 81+** 的 WebView 上不会"静默失色"，也不会因语法过新而白屏。
+ * 兼容性门禁：保证移动端产物在 **Chrome 81+** 的 WebView、桌面端产物在 **macOS 11/12 的 WKWebView
+ * 与旧 WebView2** 上不会"静默失色"，移动端产物也不会因语法过新而白屏。
  *
  * 为什么必须有它：这几类失效都**不报错**，开发机（新引擎）看不出来 ——
  *   · `oklch()` / `color-mix()`（Chrome 111 起）与 `:has()`（105 起）：那条声明只是失效（背景透明、
  *     文字变默认黑、强调色全没）；
+ *   · 桌面端还有一条**不能按版本号推**的坑：macOS 12.7.6 的系统 WKWebView（Safari 17.6 内核）
+ *     **支持 `oklch()`、不支持 `color-mix()`**，于是所有依赖 color-mix 的令牌整条失效（主按钮
+ *     白字透明底）。所以桌面表也走同一套 sRGB 回退生成；
  *   · flex `gap`（84 起）：子元素只是全贴在一起；
  *   · `??=` / `||=` / `&&=`（85 起）：**整块脚本解析期作废** → 纯白屏（实测 SM-G8750 / WebView 81，
  *     见 `docs/p1-implementation.md` §35）。
@@ -17,9 +21,11 @@
  *      （解析期就非法 → 那条被丢掉 → 前一条生效 ✓）。
  *   3. **生成区里的每条 `color-mix()` 声明，基础表里都要有同属性、老引擎读得懂的值**，
  *      否则老引擎那条属性会整个丢掉。
- *   4. 含 `:has()` 的选择器必须并联 `.is-checked`（组件按已有状态挂类）。
- *   5. 产物层：`dist-mobile/assets/*.css` 同 1–4；`*.js` 不得用超出下限的内建方法，且**必须能被
+ *   4. 移动端：含 `:has()` 的选择器必须并联 `.is-checked`（组件按已有状态挂类）。桌面端下限
+ *      （Safari 15.4+ / WebView2 105+）支持 `:has()`，这一条不查。
+ *   5. 产物层：`dist-mobile/assets/*.css` 同 1–4；移动端 `*.js` 不得用超出下限的内建方法，且**必须能被
  *      ES2020 语法解析器读下来**（`vite.config.js` 的 `target: "chrome81"` 若被调高，这里当场红）。
+ *      桌面产物 `dist/assets/*.css` 同 1–3（JS 走现代目标，不查语法）。
  *   6. `static/legacy-gap.css` 必须与 `src/mobile/mobile.css` 同步（跑 `npm run legacy:gen`）。
  *
  * 下限之外的门槛靠 `static/engine-floor.js` 兜（`replaceAll` 打补丁、缺 flex gap/`inset` 才按需加载
@@ -80,7 +86,7 @@ function regionSplit(cssText) {
   };
 }
 
-function checkSheet(label, raw) {
+function checkSheet(label, raw, { hasRule = true, floor = FLOOR } = {}) {
   // 先按**原文**切生成区，再各自剥注释 —— 标记本身是注释，剥完就找不到了（第一版就栽在这）。
   const { base: baseRaw, region: regionRaw } = regionSplit(raw);
   const base = stripComments(baseRaw);
@@ -128,18 +134,28 @@ function checkSheet(label, raw) {
     }
   }
 
-  // 4：:has() 并联 .is-checked
-  const rawLines = stripComments(raw).split("\n");
-  for (let i = 0; i < rawLines.length; i += 1) {
-    if (!rawLines[i].includes(":has(")) continue;
-    if (!rawLines[i].includes("is-checked")) {
-      problems.push(`${label}:${i + 1} 含 \`:has()\`（${FLOOR} 不支持）却无 \`.is-checked\` 并行选择器\n      ${rawLines[i].trim().slice(0, 90)}`);
+  // 4：:has() 并联 .is-checked（仅移动端下限；桌面端 Safari 15.4+ / WebView2 105+ 原生支持）
+  if (hasRule) {
+    const rawLines = stripComments(raw).split("\n");
+    for (let i = 0; i < rawLines.length; i += 1) {
+      if (!rawLines[i].includes(":has(")) continue;
+      if (!rawLines[i].includes("is-checked")) {
+        problems.push(`${label}:${i + 1} 含 \`:has()\`（${floor} 不支持）却无 \`.is-checked\` 并行选择器\n      ${rawLines[i].trim().slice(0, 90)}`);
+      }
     }
   }
 }
 
 const CSS_PATH = path.resolve("src/mobile/mobile.css");
 checkSheet("src/mobile/mobile.css", fs.readFileSync(CSS_PATH, "utf8"));
+
+// 桌面表：同一套 1–3（不查 `:has()` 与移动端的语法/内建下限）。
+const DESKTOP_CSS_PATH = path.resolve("src/styles/main.css");
+const DESKTOP_FLOOR = "macOS 11+ WKWebView / 旧 WebView2";
+checkSheet("src/styles/main.css", fs.readFileSync(DESKTOP_CSS_PATH, "utf8"), {
+  hasRule: false,
+  floor: DESKTOP_FLOOR,
+});
 
 const distDir = path.resolve("dist-mobile/assets");
 if (fs.existsSync(distDir)) {
@@ -179,6 +195,21 @@ if (fs.existsSync(distDir)) {
   notes.push("dist-mobile 不存在，跳过产物层检查（只查了源码）");
 }
 
+// 桌面产物：只查 CSS（1–3）；JS 走现代目标，不套 Chrome 81 的门槛。
+const desktopDist = path.resolve("dist/assets");
+if (fs.existsSync(desktopDist)) {
+  for (const file of fs.readdirSync(desktopDist)) {
+    if (!file.endsWith(".css")) continue;
+    const full = path.join(desktopDist, file);
+    checkSheet(`dist/assets/${file}`, fs.readFileSync(full, "utf8"), {
+      hasRule: false,
+      floor: DESKTOP_FLOOR,
+    });
+  }
+} else {
+  notes.push("dist 不存在，跳过桌面产物层检查（只查了源码）");
+}
+
 // 6：间距兜底表必须与 mobile.css 同步（生成器与门禁共用同一份实现，不靠人记得跑）
 {
   const collected = collectLegacyGap(fs.readFileSync(CSS_PATH, "utf8"));
@@ -194,9 +225,9 @@ if (fs.existsSync(distDir)) {
 
 for (const n of notes) console.log(`· ${n}`);
 if (problems.length) {
-  console.error(`\n✗ 兼容性门禁未通过（下限 ${FLOOR}），${problems.length} 个问题：`);
+  console.error(`\n✗ 兼容性门禁未通过（移动端 ${FLOOR} / 桌面端 ${DESKTOP_FLOOR}），${problems.length} 个问题：`);
   for (const p of problems.slice(0, 14)) console.error(`  - ${p}`);
   if (problems.length > 14) console.error(`  … 另有 ${problems.length - 14} 条`);
   process.exit(1);
 }
-console.log(`✓ 兼容性门禁通过（下限 ${FLOOR}）`);
+console.log(`✓ 兼容性门禁通过（移动端 ${FLOOR} / 桌面端 ${DESKTOP_FLOOR}）`);

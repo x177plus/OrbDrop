@@ -34,6 +34,7 @@
     onDisconnect,
     onPair,
     onUnpair,
+    onForget,
     onRemark,
     onPeerDownload,
     onBcCompare,
@@ -117,6 +118,8 @@
     onDisconnect: () => void;
     onPair: () => void;
     onUnpair: () => void;
+    /** 未配对设备：忘掉它（只清本机记录，不通知对端）。不传 = 不画这一项。 */
+    onForget?: () => void;
     /** 设备 / 一对一会话菜单：改本机给这台设备起的备注（F-101）—— 纯本机动作，任何状态的行都给。 */
     onRemark: () => void;
     onPeerDownload: () => void;
@@ -354,6 +357,16 @@
       <button class="ctx-item danger" onclick={() => handleItem(onUnpair)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
         解除配对
+      </button>
+    {:else if onForget}
+      <div class="ctx-sep"></div>
+      <button
+        class="ctx-item danger"
+        title="只清本机记录：设备行、地址、备注与观察指纹；对端不受影响。它下次广播时还会重新出现。"
+        onclick={() => handleItem(onForget)}
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
+        忘记设备
       </button>
     {/if}
   {/if}

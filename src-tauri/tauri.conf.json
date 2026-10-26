@@ -10,12 +10,15 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
         "title": "OrbDrop",
         "decorations": false,
         "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "acceptFirstMouse": true,
         "transparent": true,
         "shadow": false,
         "width": 90,
@@ -46,6 +49,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "windows": {}
+    "windows": {},
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
   }
 }
