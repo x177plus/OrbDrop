@@ -69,6 +69,9 @@ const USAGE = `用法：node scripts/release.mjs [选项]
   --skip-build         不构建，直接发布现有产物（本机演练、或刚手动构建过）
   --macos-zip <文件>   随本版一起发布的 macOS 通用 .app zip（在 Mac 上用 npm run mac:artifact 生成）。
                        不给时清单里就没有 macOS 产物，macOS 客户端会明确报「这一版没出包」。
+  --macos-dmg <文件>   随本版一起发布的 macOS 安装 DMG（同一个 mac:artifact 产物）。
+                       只上传到 Release 与本地 assets/，**不写进 update.json** —— 自更新只认
+                       --macos-zip；DMG 是给用户首次安装用的。
   --republish          同版本重发：复用已发布的 tag/Release，只把清单与各附件换成这次构建的
                        （给"版本号没变、但产物必须换掉"的补发用，比如发布后才发现的客户端缺陷）。
                        仓库里 tag 不动，所以 tag 指向的提交与 Release 附件会不一致 —— 见 docs/update.md
@@ -96,11 +99,11 @@ if (flag("--help") || flag("-h")) {
   log(USAGE);
   process.exit(0);
 }
-const KNOWN_FLAGS = ["--local", "--skip-build", "--verify-only", "--republish", "--help", "-h", "--version", "--notes", "--macos-zip"];
+const KNOWN_FLAGS = ["--local", "--skip-build", "--verify-only", "--republish", "--help", "-h", "--version", "--notes", "--macos-zip", "--macos-dmg"];
 // 跳过带值选项后面的那个值：更新说明/路径里以 `-` 开头也不该被当成未知参数
 // （只有这些选项真的出现时才登记下标，否则 indexOf 返回 -1，+1 会误把 argv[0] 排除）
 const valueIdx = new Set();
-for (const name of ["--version", "--notes", "--macos-zip"]) {
+for (const name of ["--version", "--notes", "--macos-zip", "--macos-dmg"]) {
   const i = argv.indexOf(name);
   if (i >= 0) valueIdx.add(i + 1);
 }
@@ -126,6 +129,8 @@ const VERIFY_ONLY = flag("--verify-only");
 const REPUBLISH = flag("--republish");
 /** 可选：预先在 Mac 上构建好的 macOS 通用包 zip（见 `scripts/macos-artifact.mjs`）。 */
 const MACOS_ZIP = opt("--macos-zip");
+/** 可选：同一个 mac:artifact 产出的 DMG；只随 Release 上传，不进 update.json。 */
+const MACOS_DMG = opt("--macos-dmg");
 if (REPUBLISH && LOCAL) die("--republish 只在远端模式有意义", "本机演练直接覆盖本仓根目录的清单即可，不用它。");
 // --verify-only 只读远端（清单 + 资产 URL），不需要 token，也不碰构建与 git。
 const tokens = LOCAL || VERIFY_ONLY ? null : requireRemoteConfig(cfg);
@@ -204,9 +209,21 @@ if (MACOS_ZIP) {
     name: ASSET_NAMES.macos,
   });
 }
+/**
+ * 只进 Release/本地缓存、不进 update.json 的附件。
+ *
+ * DMG 是给用户首次安装的；自更新只认 zip。客户端清单里没有 DMG，更新器也不会去下载它，
+ * 所以它不参与 size/sha256/sig 清单，只跟着 Release 上传（Gitee 的附件配额也会算上它）。
+ */
+const EXTRA_ASSETS = [];
+if (MACOS_DMG) {
+  const src = path.resolve(ROOT, MACOS_DMG);
+  EXTRA_ASSETS.push({ kind: "macos-dmg", label: "macOS 安装 DMG", src, name: path.basename(src) });
+}
+const UPLOAD_ARTIFACTS = [...ARTIFACTS, ...EXTRA_ASSETS];
 
 step("核对产物");
-for (const a of ARTIFACTS) {
+for (const a of UPLOAD_ARTIFACTS) {
   if (!fs.existsSync(a.src)) {
     die(
       `产物不存在：${rel(a.src)}（${a.label}）`,
@@ -297,9 +314,9 @@ const tag = tagOf(cfg, ver.raw);
 const pubDate = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 
 step("生成 update.json（size + sha256 + sig + mirrors）");
-for (const a of ARTIFACTS) {
+for (const a of UPLOAD_ARTIFACTS) {
   a.sha256 = await sha256File(a.src);
-  ok(`${a.name} · ${a.sha256}`);
+  ok(`${a.name} · ${a.sha256}${EXTRA_ASSETS.includes(a) ? "（仅上传，不进清单）" : ""}`);
 }
 
 const entry = (a, extra = {}) => ({
@@ -330,9 +347,9 @@ step(`落入本仓：${cfg.repoPath}`);
 ensureRepoFiles(cfg.repoPath);
 const verDir = path.join(cfg.repoPath, "assets", tag);
 fs.mkdirSync(verDir, { recursive: true });
-for (const a of ARTIFACTS) {
+for (const a of UPLOAD_ARTIFACTS) {
   const dest = path.join(verDir, a.name);
-  // `macos-artifact.mjs` 默认就把 zip 写进 assets/<tag>/；同一路径不能 copyFile 到自己。
+  // `macos-artifact.mjs` 默认就把 zip/dmg 写进 assets/<tag>/；同一路径不能 copyFile 到自己。
   if (path.resolve(dest) !== path.resolve(a.src)) fs.copyFileSync(a.src, dest);
   ok(`assets/${tag}/${a.name} · ${humanSize(a.size)}`);
 }
@@ -344,7 +361,7 @@ for (const f of listTracked(cfg.repoPath)) note(`  跟踪文件 ${f}`);
 if (LOCAL) warn("根目录 update.json 现在指向本机镜像台；正式发布要重跑一次远端模式才会换回真实地址。");
 
 const uploadFiles = [
-  ...ARTIFACTS.map((a) => ({ name: a.name, src: a.src, size: a.size })),
+  ...UPLOAD_ARTIFACTS.map((a) => ({ name: a.name, src: a.src, size: a.size })),
   { name: ASSET_NAMES.manifest, src: manifestPath, size: fileSize(manifestPath) },
 ];
 
@@ -358,8 +375,8 @@ if (LOCAL) {
 
 step("完成");
 note(`${LOCAL ? "本机演练" : "远端发布"} · OrbDrop ${ver.raw}（versionCode ${ver.code}）· ${pubDate}`);
-note(`本仓 ${cfg.repoPath}/（assets/${tag}/ ${ARTIFACTS.length} 个产物 + 清单）`);
-for (const a of ARTIFACTS) note(`  ${a.name.padEnd(30)} ${humanSize(a.size)}  sha256=${a.sha256.slice(0, 16)}…`);
+note(`本仓 ${cfg.repoPath}/（assets/${tag}/ ${UPLOAD_ARTIFACTS.length} 个产物 + 清单）`);
+for (const a of UPLOAD_ARTIFACTS) note(`  ${a.name.padEnd(30)} ${humanSize(a.size)}  sha256=${a.sha256.slice(0, 16)}…`);
 note("mirrors（GitHub → Gitee）：");
 for (const [key, art] of Object.entries(manifest.desktop)) {
   note(`  ${key}:`);
