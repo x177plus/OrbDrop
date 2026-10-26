@@ -140,5 +140,7 @@ ok(`dmg sha256：${dmgSha}`);
 
 console.log(`
 下一步（在发布机上）：
-  node scripts/release.mjs --version ${version} --notes "..." --macos-zip "${zip}"
+  node scripts/release.mjs --version ${version} --notes "..." \\
+    --macos-zip "${zip}" \\
+    --macos-dmg "${dmg}"
 `);

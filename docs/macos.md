@@ -254,8 +254,12 @@ DMG 不走 Tauri 自带的 dmg bundler：那个 bundler 会调 Finder/AppleScrip
 
 ```bash
 node scripts/release.mjs --version X.Y.Z --notes "..." \
-  --macos-zip assets/vX.Y.Z/orbdrop-macos-universal.app.zip
+  --macos-zip assets/vX.Y.Z/orbdrop-macos-universal.app.zip \
+  --macos-dmg assets/vX.Y.Z/OrbDrop_X.Y.Z_universal.dmg
 ```
+
+`--macos-zip` 是自更新单元，会写进 `update.json` 并被客户端校验/解压；`--macos-dmg` 只随
+Release 上传（GitHub/Gitee 各一份）并落进 `assets/vX.Y.Z/`，**不进清单**，供用户首次安装。
 
 macOS 包只能在 Mac 上构建：用 `macos-artifact.mjs` 或
 `.github/workflows/macos.yml`（手动触发，上传 `orbdrop-macos-universal.app.zip` 与 dmg）。
