@@ -2,24 +2,24 @@
   "version": "0.1.1",
   "versionCode": 1001,
   "notes": "新增：macOS 11+（Apple Silicon + Intel 通用包）。与 Windows 共用同一份 Rust 核心与 Svelte 前端，\n补齐 macOS 外壳：不占 Dock 的菜单栏应用、全空间透明置顶悬浮球、`⌘W` 隐藏而非销毁、再次打开叫回面板；\n原生 `NSDraggingSession` 拖出到访达；对端共享项在起拖前整份暂存（没有 CFAPI 的公开等价物）；\nBeyond Compare 的 `.app` 探测、macOS 配置目录与应用内左侧比较位；LaunchAgent 自启动；\n`.app` zip 自更新（helper 等旧进程退出后原子替换整个包）；`Info.plist` 补上局域网/Bonjour 与\nTCC 文件夹说明。构建与发布：`npm run mac:build` / `npm run mac:artifact`、\n`release.mjs --macos-zip`、`.github/workflows/macos.yml`。细节与真机验证清单见 `docs/macos.md`。\n\n修复：macOS 上**配对确认与保存设置两颗主按钮看不见**（设置页底部只剩「取消」、配对对话框只剩\n次要按钮），且状态章/悬停底/遮罩等整体失色。根因不是布局：macOS 12.7.6 的系统 WKWebView\n支持 `oklch()`、**不支持 `color-mix()`**，而桌面样式表按 WebView2 写、没有 sRGB 回退 ——\n`color-mix()` 在计算期失效后是 `unset`，于是 `--accent-deep` 等派生令牌整条作废，\n`.btn-primary` 计算成透明底 + 白字。现在 `src/styles/main.css` 与移动端走同一套生成器\n（`npm run tokens:gen` 两份表各跑一次，`tokens:check` 同步校验）：基础表只留 sRGB，现代写法收进\n`@supports` 生成区；`check:compat` 增查桌面源码与 `dist/assets/*.css`，构建期两端都不再压缩 CSS\n（压缩器会去重回退声明并删掉生成区标记）。同一份产物 CSS 在系统 WKWebView 上实测主按钮为\n实色蓝 + 白字，现代 Chromium 仍走 `@supports` 的高保真路径。细节见 `docs/macos.md` §1.1。\n\n修复：macOS 上**鼠标划过正文会变成 I 形、还能拖选** —— WKWebView（12.7.6 / Safari 17.6 内核实测）\n不认无前缀的 `user-select`（`CSS.supports('user-select','none')` 为 `false`），只写\n`user-select: none` 时计算值仍是 `text`。全局 `body` 改成 `-webkit-user-select` 与 `user-select`\n成对出现（聊天记录、文件行、输入区照旧用 `-webkit-user-select: text` 明确开回来）。\n**贴边收起的竖条里设备名 / `ip:port` 被裁掉 3px**：竖排时 `line-height` 就是列宽，这两列原先继承\nbody 的 1.6（12px→19.2px / 10px→16px），而列宽只有 16px / 13px（实测 `scrollWidth 19/16` 对\n`clientWidth 16/13`）。现在两列的 `line-height` 直接等于各自的列宽，左右两侧贴边都不再切字。\n另外去掉全局 `-webkit-font-smoothing: antialiased`：它只在 macOS/WebKit 生效，会把正文压成更细的\n灰度抗锯齿（1x 屏上尤其发虚；这不是字体本身的问题 —— 栈里就是系统字体 SF Pro + PingFang SC）。\n细节与实测值见 `docs/macos.md` §1.2。\n\n修复：macOS 上**输入框获得焦点时外面会多出一个方框**（Windows/安卓没有）。不是新增的样式：\nWebKit 对非 `auto` 的 `outline-style` 长期不跟 `border-radius`（到 Safari 27 才补完\n\"outline radii rendering\"），而三个输入框（`.input` / `.chat-input` / `.dev-search`）都是圆角，\n全局 `:focus-visible` 又带 `outline-offset: 2px` —— 那圈本应贴着圆角的柔光在 macOS 上被画成\n离输入框 2px 的直角空框；Chromium 上它跟着圆角，看不出来。焦点环改为\n`box-shadow: 0 0 0 2px var(--accent-soft)` + `outline: none`（群发模式换 `--bc-soft`）：\n`box-shadow` 在所有引擎上都跟圆角，`outline: none` 一并挡掉 UA 焦点环，键盘焦点仍有柔光与\n描边变色。细节见 `docs/macos.md` §1.2 第 4 条。\n\n优化：macOS 的 fd 上限与探活/中转的连接峰值。启动时把 `RLIMIT_NOFILE` 软上限抬到硬上限\n（封顶 65535，`src-tauri/src/resource.rs`），每 30s 采样、占用到 80% 打 warning；`knownPeers`\n同一个 `ip:port` 一轮只探一次，启动与每轮探活后合并同一地址上的重复未配对行，未配对行连续\n60s 探活失败后整行忘掉（设备右键新增「忘记设备」）；中转同一对请求方→目标复用已开端点，\n目标连不上后 60s 冷却、空闲回收 60s，并加全局 24 条 / 单端点 8 条并发上限（超出丢连接，\n不把 fd 打满）。实测配置里的 7 条 `D1159@:3891` 与 2 条「演示机」(:3990/:3991) 是主要的\n死探活来源。细节见 `docs/macos.md` §1.3。\n\n修复：桌面端（Windows / macOS）在中文输入法组合期间，输入框会隔一阵子\"自己刷新\"——没选字，\n拼音却被当成普通文本留在了框里，打字时经常夹着拼音。根因是会话输入区那个\"打开会话\"的 effect\n读的是整个 `thread` 派生对象：`activeThread()` 每次会话快照、每次设备表刷新都会返回新对象\n（`$derived` 按 `===` 比较），于是每一份 `chat://changed` / `devices://changed`（mDNS 解析、\n5s 探活、收发消息与回执）都会把输入区 `textContent` 清空再重挂一遍，组合中的预编辑串正是被\n这一下固化的。现在 effect 只依赖字符串会话键（`threadKey`），并给两端输入区加了组合闸门：\n`compositionstart` … `compositionend` 之间的重画推迟到结束后的下一帧（那一帧里又进了新组合就\n继续推迟），安卓同一处一并接上。\n\n修复：会话里点开的图片只能点周围那圈才关得掉，长图又看不全、底下那排「用系统程序打开 / 关闭」\n被裁在可视区外。图片层原先按视口 `72vh` 量尺寸，而它常挂在 320×420 的会话浮层里 —— 图比浮层高，\n多出来的部分连同按钮一起被浮层的 `overflow: hidden` 裁掉。现在图片区吃满这一层的剩余高度并自己\n滚：**点图片（或图旁空处）再点一下即收起**，点背景 / Esc / 「关闭」照旧；长图按容器宽度铺开，\n鼠标滚轮、触屏拖动、按住鼠标拖都能翻，滚动条不显示，操作条永远留在底部。",
-  "pubDate": "2026-10-26T12:06:45Z",
+  "pubDate": "2026-10-27T03:46:58Z",
   "desktop": {
     "windows-x86_64": {
       "size": 17030144,
       "sha256": "6e67b743e5ce01b2ab69e9d8e810e584485138e503e48deff2be7f2ced8ec26a",
-      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NG5GVFV2OWlxcmtPQmtaV0E3d0RYUE15cm5CWDJZcnE4RDBpRDJkQVJyVWF5WHoxNERqMEVXajA1QVRhUTBNSVM3QjBFNU1vVE1jNkRFZVA0MkFsVWdJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMDE2NDA1CWZpbGU6b3JiZHJvcC5leGUKZUh3Qy9qZDJPaTVvTnllTmIrWiswdTA3VFVOckkwaTFJRWE0ODFZWHFOYjR1Y0hDL3BJWmtZZGpHeWpEaEtMUzRhSWZSQml4OVpOYzZqVmpKZWRDREE9PQo=",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NHFDUERjVHpHdy9HZHgxNXkreElZNWJCN0FvemdhZHdBRStuWENYdDhRZjNldjRqL2xZM1RwRjFxSUJod29oa3pHT3E3Z21hUTluQnpuVmtWUktKZlFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMDcyODE3CWZpbGU6b3JiZHJvcC5leGUKWG9yM0haL25DMTVDRURBUmxQTDZzcFh6aFI4ekZyWkI3Ti9PdTZORm0rdEw5ZnBNUjhwV3VaanpZb0FGaXc4cmpRbEh0UnVpQmpVb2VjYWx5ZlFQQXc9PQo=",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.1.1/orbdrop.exe",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.1.1/orbdrop.exe"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.1.1/OrbDrop_0.1.1_windows_x64.exe",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.1.1/OrbDrop_0.1.1_windows_x64.exe"
       ]
     },
     "macos-universal": {
       "size": 13923446,
       "sha256": "174b85ec4a8fa7db84947ff5a978e8d225526f3190bf22cb60850a64b7a4778d",
-      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NGpvVklxTnBFS0UrZUpyb29YbSswelVXR3lPK0QvZitNTGt5Y2h3NHdXYy81amJqc2lMVEVqSkdYZXIvVjJTU1RtaUp2SEdRZmNRQ1FjRGg5L0ZaSEFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMDE2NDA1CWZpbGU6b3JiZHJvcC1tYWNvcy11bml2ZXJzYWwuYXBwLnppcApFNjBDM0RYY20wdElteEpBR2NUUXRscnE5NkNkWU5kZlRyTjdsdll2TVNxejNhZThDY3JMblQyTEhmMlJIbG54V3AxK1VUaCtOcm5CU3RPVnZIWEhBdz09Cg==",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NGtFdlZQY1RWMXY1ek5tNnRXcDYzUHlBVFFrT1FqWHVTRE9ZcXUwSjh3bVV3cXhVYzNkeVF5OGhaVXdGazhsWTQrM1BuRUNuMS8xR3ZYdVc4R2h1RWdnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMDcyODE4CWZpbGU6b3JiZHJvcC1tYWNvcy11bml2ZXJzYWwuYXBwLnppcApmMmRhL2ZuS0ZmUHQrbHROZEljWk9xYTBuMHJLc3l1OXh2QU0wbCttZEdjeGVaZkdNc3pReEhxWWZpV3FMZXVqYWtxWmJaTFpqZmQ1UWwvakpnVWlCdz09Cg==",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.1.1/orbdrop-macos-universal.app.zip",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.1.1/orbdrop-macos-universal.app.zip"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.1.1/OrbDrop_0.1.1_macos_universal.app.zip",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.1.1/OrbDrop_0.1.1_macos_universal.app.zip"
       ]
     }
   },
@@ -28,16 +28,16 @@
       "size": 29027987,
       "sha256": "dbd29790b1fa1f79a6b5d8fcc08578708d64bf801dd30622e08b1db8b66cff68",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.1.1/app-universal-release.apk",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.1.1/app-universal-release.apk"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.1.1/OrbDrop_0.1.1_android_universal.apk",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.1.1/OrbDrop_0.1.1_android_universal.apk"
       ]
     },
     "arm64-v8a": {
       "size": 9122983,
       "sha256": "3b6529953dd1ee7ffe0a771fe12630ac7c401af03d792e07233bfc0720a99906",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.1.1/app-arm64-release.apk",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.1.1/app-arm64-release.apk"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.1.1/OrbDrop_0.1.1_android_arm64.apk",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.1.1/OrbDrop_0.1.1_android_arm64.apk"
       ]
     }
   }
