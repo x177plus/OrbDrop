@@ -10,6 +10,7 @@
   import Sheet from "../components/Sheet.svelte";
   import Icon from "../Icon.svelte";
   import * as store from "../store.svelte";
+  import { t } from "$lib/i18n.svelte";
 
   let { onClose }: { onClose: () => void } = $props();
 
@@ -33,35 +34,40 @@
   }
 </script>
 
-<Sheet title="配对邀请" desc={invite ? `来自「${invite.peerName}」` : ""} label="配对邀请" onClose={onClose}>
+<Sheet
+  title={t("配对邀请")}
+  desc={invite ? t("来自「{name}」", { name: invite.peerName }) : ""}
+  label={t("配对邀请")}
+  onClose={onClose}
+>
   {#if invite}
     <div class="opt">
       <span class="oi"><Icon name="link" /></span>
       <span class="om">
-        <span class="on">接受后两台设备互信</span>
-        <span class="od">双方各存一枚 token，之后即可互相发消息、收文件。</span>
+        <span class="on">{t("接受后两台设备互信")}</span>
+        <span class="od">{t("双方各存一枚 token，之后即可互相发消息、收文件。")}</span>
       </span>
     </div>
     {#if invite.unproven}
       <p class="field-hint" style="color:var(--warn)">
-        这台设备自称是本机已配对的设备，但没能出示凭据（它可能只是换了地址，也可能不是）。接受前请确认对方身份。
+        {t("这台设备自称是本机已配对的设备，但没能出示凭据（它可能只是换了地址，也可能不是）。接受前请确认对方身份。")}
       </p>
     {/if}
     {#if invite.sas}
       <div class="code-box">
         <span class="sas-code">{invite.sas}</span>
-        <span class="code-hint">和对方屏幕上的这串一致再点「接收」；不一致请拒绝。</span>
+        <span class="code-hint">{t("和对方屏幕上的这串一致再点「接收」；不一致请拒绝。")}</span>
       </div>
     {:else}
       <p class="field-hint" style="color:var(--warn)">
-        对方版本过旧，无法核对身份；建议拒绝并改用配对码。
+        {t("对方版本过旧，无法核对身份；建议拒绝并改用配对码。")}
       </p>
     {/if}
-    <p class="field-hint">剩余 {left} 秒，超时自动作废。</p>
+    <p class="field-hint">{t("剩余 {n} 秒，超时自动作废。", { n: left })}</p>
   {/if}
 
   {#snippet foot()}
-    <button class="btn btn-secondary" type="button" onclick={() => void answer(false)}>拒绝</button>
-    <button class="btn btn-primary" type="button" onclick={() => void answer(true)}>接收</button>
+    <button class="btn btn-secondary" type="button" onclick={() => void answer(false)}>{t("拒绝")}</button>
+    <button class="btn btn-primary" type="button" onclick={() => void answer(true)}>{t("接收")}</button>
   {/snippet}
 </Sheet>

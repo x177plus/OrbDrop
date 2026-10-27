@@ -6,6 +6,7 @@
   import Icon from "../Icon.svelte";
   import Sheet from "../components/Sheet.svelte";
   import * as store from "../store.svelte";
+  import { t } from "$lib/i18n.svelte";
 
   /**
    * 会话里那颗「＋」→「应用」（F-119）：这张表列的是**这台设备上已安装的应用**，点一行就把
@@ -57,48 +58,48 @@
 </script>
 
 <Sheet
-  title="发送应用"
+  title={t("发送应用")}
   desc={thread
-    ? `发送到「${thread.title}」：流的是它自己的安装包，落盘名叫「应用名_版本名(版本号)_包名.apk」。标着「拆包」的那些是商店拆开装的，单发安装包对端可能装不上。`
-    : "发送应用到这条会话。"}
-  label="选择要发送的应用"
+    ? t("发送到「{title}」：流的是它自己的安装包，落盘名叫「应用名_版本名(版本号)_包名.apk」。标着「拆包」的那些是商店拆开装的，单发安装包对端可能装不上。", { title: thread.title })
+    : t("发送应用到这条会话。")}
+  label={t("选择要发送的应用")}
   onClose={onClose}
 >
   {#if apps === null && loadState.loading}
-    <div class="empty"><Icon name="zip" /><p>正在读取应用列表…</p></div>
+    <div class="empty"><Icon name="zip" /><p>{t("正在读取应用列表…")}</p></div>
   {:else if apps === null && loadState.error}
     <!-- 读不到就把话说出来（原生那一跳的原文），不留一个空表让人以为"这台设备上没有应用"。 -->
     <div class="empty">
       <Icon name="zip" />
-      <p>读不到应用列表</p>
+      <p>{t("读不到应用列表")}</p>
       <p class="es">{loadState.error}</p>
     </div>
   {:else}
     <div class="field">
-      <input class="input" type="search" placeholder="搜索应用名或包名" bind:value={query} />
+      <input class="input" type="search" placeholder={t("搜索应用名或包名")} bind:value={query} />
     </div>
     <!-- 重读失败但旧表还在：把话说在表头上，不假装这一份就是最新的。 -->
     {#if loadState.error && apps !== null}
-      <p class="field-hint">读不到最新列表（{loadState.error}），下面是上次读到的。</p>
+      <p class="field-hint">{t("读不到最新列表（{error}），下面是上次读到的。", { error: loadState.error ?? "" })}</p>
     {/if}
 
     {#if (apps ?? []).length === 0}
       <div class="card list">
         <div class="empty">
           <Icon name="zip" />
-          <p>没有可发送的应用</p>
-          <p class="es">这台设备上没有带桌面图标的应用可发（应用列表只列得到有入口的那些）。</p>
+          <p>{t("没有可发送的应用")}</p>
+          <p class="es">{t("这台设备上没有带桌面图标的应用可发（应用列表只列得到有入口的那些）。")}</p>
         </div>
       </div>
     {:else}
       <div class="sec-label" style="padding-bottom:0">
-        <span>应用</span>
+        <span>{t("应用")}</span>
         <!-- 重读期间（旧表还在屏幕上）说"读取中"，不留一个看不出在动的数字。 -->
-        <span class="num">{loadState.loading ? "读取中…" : `${shown.length} / ${apps?.length ?? 0}`}</span>
+        <span class="num">{loadState.loading ? t("读取中…") : `${shown.length} / ${apps?.length ?? 0}`}</span>
       </div>
       {#if shown.length === 0}
         <div class="card list">
-          <div class="empty"><p>没有匹配「{query.trim()}」的应用</p></div>
+          <div class="empty"><p>{t("没有匹配「{query}」的应用", { query: query.trim() })}</p></div>
         </div>
       {:else}
         <div class="card list">
@@ -110,7 +111,7 @@
                 <!-- 版本名可能为空（有的应用就是不写）：那就只写版本号，不摆一个空括号。 -->
                 <span class="fmeta num">
                   {app.versionName ? `${app.versionName}(${app.versionCode})` : `${app.versionCode}`} ·
-                  {formatFileSize(app.size)}{app.hasSplits ? " · 拆包" : ""}
+                  {formatFileSize(app.size)}{app.hasSplits ? ` · ${t("拆包")}` : ""}
                 </span>
               </span>
             </button>

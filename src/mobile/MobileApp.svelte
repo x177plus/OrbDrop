@@ -13,6 +13,8 @@
   import SettingsTab from "./tabs/SettingsTab.svelte";
   import ChatScreen from "./ChatScreen.svelte";
   import * as store from "./store.svelte";
+  import * as api from "$lib/api";
+  import { adoptLanguagePreference, t } from "$lib/i18n.svelte";
   import * as chat from "$lib/stores/chat.svelte";
   import * as devices from "$lib/stores/devices.svelte";
   import * as upd from "$lib/stores/update.svelte";
@@ -43,7 +45,8 @@
    *
    * **只在没有别的底板时弹**：配对邀请（有效期 60 秒）也占着同一个槽位，那种时候它优先 ——
    * 这张板等它关掉之后自己会补上（`currentSheet` 一变这个 effect 就重跑）。
-   * 「稍后」按过之后 `updatePrompt` 就空了，本次运行内不再弹。
+   * 「稍后」按过之后这一版就不再自动弹（记在 `dismissedVersion` 里、后端落盘），
+   * 更新的一版仍然会弹。
    */
   $effect(() => {
     if (upd.updatePrompt() && !store.currentSheet()) store.openSheet({ kind: "update" });
@@ -53,39 +56,41 @@
   const bar = $derived.by((): { title: string; sub: string; act?: { icon: IconName; label: string; run: () => void } } => {
     if (tab === "convos") {
       return {
-        title: "会话",
-        sub: `${onlineCount} 台在线 · ${deviceCount} 台设备`,
-        act: { icon: "plus", label: "新建会话", run: () => store.openSheet({ kind: "convo" }) },
+        title: t("会话"),
+        sub: t("{online} 台在线 · {total} 台设备", { online: onlineCount, total: deviceCount }),
+        act: { icon: "plus", label: t("新建会话"), run: () => store.openSheet({ kind: "convo" }) },
       };
     }
     if (tab === "files") {
       return {
-        title: "文件",
-        sub: `${pending} 个待接收 · ${inboxCount} 个已接收`,
-        act: { icon: "refresh", label: "刷新", run: () => void refreshAll() },
+        title: t("文件"),
+        sub: t("{pending} 个待接收 · {inbox} 个已接收", { pending, inbox: inboxCount }),
+        act: { icon: "refresh", label: t("刷新"), run: () => void refreshAll() },
       };
     }
     if (tab === "devices") {
       return {
-        title: "设备",
-        sub: addr ? `本机 · ${addr.ip || "离线"}:${addr.port}` : "本机",
-        act: { icon: "plus", label: "手动添加设备", run: () => store.openSheet({ kind: "addDevice" }) },
+        title: t("设备"),
+        sub: addr
+          ? t("本机 · {addr}:{port}", { addr: addr.ip || t("离线"), port: addr.port })
+          : t("本机"),
+        act: { icon: "plus", label: t("手动添加设备"), run: () => store.openSheet({ kind: "addDevice" }) },
       };
     }
-    return { title: "设置", sub: "OrbDrop 移动端 · 局域网文件共享" };
+    return { title: t("设置"), sub: t("OrbDrop 移动端 · 局域网文件共享") };
   });
 
-  const tabs = [
-    { id: "convos", label: "会话", icon: "chat" },
-    { id: "files", label: "文件", icon: "files" },
-    { id: "devices", label: "设备", icon: "devices" },
-    { id: "settings", label: "设置", icon: "settings" },
-  ] as const;
+  const tabs = $derived([
+    { id: "convos", label: t("会话"), icon: "chat" },
+    { id: "files", label: t("文件"), icon: "files" },
+    { id: "devices", label: t("设备"), icon: "devices" },
+    { id: "settings", label: t("设置"), icon: "settings" },
+  ] as const);
 
   /** 一次把三处数据拉齐（下拉刷新没有：桌面端也没有，靠这颗按钮与后端事件）。 */
   async function refreshAll(): Promise<void> {
     await Promise.all([devices.loadDevices(), chat.refresh(), store.loadInbox()]);
-    store.toast("已刷新设备与共享项", "refresh");
+    store.toast(t("已刷新设备与共享项"), "refresh");
   }
 
   onMount(() => {
@@ -149,6 +154,8 @@
     void chat.refresh();
     void store.loadInbox();
     void store.loadLocalAddr();
+    // 语言配置优先于 localStorage 的上一份（首帧已按后者渲染，这里只是对齐）。
+    void api.getSettings().then((s) => adoptLanguagePreference(s.language)).catch(() => {});
     // 自更新那份状态：**从启动就订阅**（设置页挂载时也会叫一次，那个是幂等的）——
     // 启动那次静默检查的结论要能落在这张板上，而不是等用户先点进设置页才第一次听说。
     void upd.watchUpdate();
@@ -192,7 +199,7 @@
 
   <!-- 用 div 而不是 nav：`role="tablist"` 会顶掉 `<nav>` 自己的 landmark 语义，屏幕阅读器
        里就少了一个导航地标（a11y 检查也会报）。原型把它写在 `<nav>` 上，这里改掉。 -->
-  <div class="tabbar" role="tablist" aria-label="主导航">
+  <div class="tabbar" role="tablist" aria-label={t("主导航")}>
     {#each tabs as t (t.id)}
       <button
         class="tab-item"
@@ -218,7 +225,7 @@
   </div>
 
   <!-- 会话子屏：盖在 tab 之上（原型 `.sub`），开着时底下的列表不再可点。 -->
-  <section class="sub" class:open={!!chatKey} aria-hidden={!chatKey} aria-label="会话详情">
+  <section class="sub" class:open={!!chatKey} aria-hidden={!chatKey} aria-label={t("会话详情")}>
     {#if chatKey}
       <ChatScreen convoKey={chatKey} />
     {/if}

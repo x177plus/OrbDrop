@@ -14,6 +14,7 @@
  * 宁可不动，也不编一个百分比。
  */
 import * as api from '$lib/api';
+import { t } from '$lib/i18n.svelte';
 
 export interface PeerDownload {
   key: string;
@@ -168,7 +169,7 @@ export function notePeerDownload(ev: PeerDownloadEvent): void {
       peerId: ev.peerId,
       shareId: ev.shareId,
       path: ev.path,
-      name: ev.name || cur?.name || '文件',
+      name: ev.name || cur?.name || t('单个文件'),
       total: totals[key] ?? cur?.total ?? 0,
       received: Math.max(0, ev.received),
       status: 'running',
@@ -182,7 +183,7 @@ export function notePeerDownload(ev: PeerDownloadEvent): void {
     peerId: ev.peerId,
     shareId: ev.shareId,
     path: ev.path,
-    name: ev.name || '文件',
+    name: ev.name || t('单个文件'),
     total: totals[key] ?? 0,
     received: 0,
     status: 'running',
@@ -201,5 +202,5 @@ export function notePeerDownload(ev: PeerDownloadEvent): void {
     });
     return;
   }
-  if (cur) put({ ...cur, status: 'failed', error: ev.error ?? '下载失败' });
+  if (cur) put({ ...cur, status: 'failed', error: ev.error ?? t('下载失败') });
 }

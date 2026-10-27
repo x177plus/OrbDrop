@@ -6,6 +6,7 @@
   import Sheet from "../components/Sheet.svelte";
   import StateChip from "../components/StateChip.svelte";
   import * as store from "../store.svelte";
+  import { t } from "$lib/i18n.svelte";
 
   let { convoKey, onClose }: { convoKey: string; onClose: () => void } = $props();
 
@@ -53,7 +54,7 @@
   async function save(): Promise<void> {
     const ids = picked;
     if (ids.length < 2) {
-      store.toast("至少保留两台设备");
+      store.toast(t("至少保留两台设备"));
       return;
     }
     try {
@@ -61,29 +62,29 @@
       else await api.chatBatchEnsure(ids, listId);
       await chat.refresh();
       onClose();
-      store.toast("已更新参与设备", "check");
+      store.toast(t("已更新参与设备"), "check");
     } catch (e) {
-      store.failed("更新参与设备", e);
+      store.toast(t("更新参与设备失败：{error}", { error: e instanceof Error ? e.message : String(e) }));
     }
   }
 </script>
 
 <Sheet
-  title={mode === "group" ? "编辑群聊" : "编辑群发"}
-  desc="至少保留两台设备。"
-  label="编辑收件人"
+  title={mode === "group" ? t("编辑群聊") : t("编辑群发")}
+  desc={t("至少保留两台设备。")}
+  label={t("编辑收件人")}
   onClose={onClose}
 >
   <!-- 原型在底板里给这行去掉了底边距（`.sheet-body` 自己用 gap 排），照抄它那份 inline。 -->
   <div class="sec-label" style="padding-bottom:0">
-    <span>参与设备</span><span class="num">已选 {picked.length} 台</span>
+    <span>{t("参与设备")}</span><span class="num">{t("已选 {n} 台", { n: picked.length })}</span>
   </div>
   {#if candidates.length === 0}
     <div class="card list">
       <div class="empty">
         <Icon name="devices" />
-        <p>还没有设备</p>
-        <p class="es">名册里的设备都不在本机设备表里了。</p>
+        <p>{t("还没有设备")}</p>
+        <p class="es">{t("名册里的设备都不在本机设备表里了。")}</p>
       </div>
     </div>
   {:else}
@@ -107,7 +108,7 @@
   {/if}
 
   {#snippet foot()}
-    <button class="btn btn-secondary" type="button" onclick={onClose}>取消</button>
-    <button class="btn btn-primary" type="button" onclick={() => void save()}>保存</button>
+    <button class="btn btn-secondary" type="button" onclick={onClose}>{t("取消")}</button>
+    <button class="btn btn-primary" type="button" onclick={() => void save()}>{t("保存")}</button>
   {/snippet}
 </Sheet>

@@ -210,14 +210,15 @@ pub fn config_dir(exe: &Path) -> PathBuf {
             return dir.to_path_buf();
         }
     }
-    // macOS 的 BC 设置目录**不带厂商层**：官方文档给的是
-    // `~/Library/Application Support/Beyond Compare`（`dirs::config_dir()` 正是
-    // `~/Library/Application Support`）。Windows 才是 `Scooter Software\Beyond Compare 5`。
+    // macOS 的 BC 设置目录**不带厂商层**，但可能带大版本号：
+    // 官方默认是 `~/Library/Application Support/Beyond Compare`；装过多个大版本
+    // （或用户按官方说明重命名过）时，BC5 真正读写的是 `Beyond Compare 5`，
+    // BC4 是 `Beyond Compare 4`。只认不带版本号的那个目录，会写到 BC 根本不看的
+    // 文件里 —— 表现正是「配置文件找不到 / 文件夹不可用」（真机踩到）。
     #[cfg(target_os = "macos")]
     {
-        return dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("Beyond Compare");
+        let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        return macos_config_dir(&base, exe);
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -226,6 +227,48 @@ pub fn config_dir(exe: &Path) -> PathBuf {
             .join("Scooter Software")
             .join("Beyond Compare 5")
     }
+}
+
+/// macOS 设置目录的挑选：**大版本号目录优先，匹配 exe 的版本**。
+///
+/// 拆分出来是为了能单测（不碰真实 `~/Library`）：`base` = `~/Library/Application Support`。
+#[cfg(any(target_os = "macos", test))]
+fn macos_config_dir(base: &Path, exe: &Path) -> PathBuf {
+    let major = bc_major_version(exe);
+    if let Some(n) = major {
+        let versioned = base.join(format!("Beyond Compare {n}"));
+        if versioned.is_dir() {
+            return versioned;
+        }
+        // 已知大版本但没有对应目录：BC 用的是默认的无版本目录（不是另一个大版本）。
+        return base.join("Beyond Compare");
+    }
+    // 读不出版本（例如用户填的是包外符号链接且 plist 不可读）：有版本目录就先用
+    // 版本号大的，否则退回默认目录。
+    for n in [5, 4] {
+        let versioned = base.join(format!("Beyond Compare {n}"));
+        if versioned.is_dir() {
+            return versioned;
+        }
+    }
+    base.join("Beyond Compare")
+}
+
+/// 从 BC 的 `Contents/Info.plist` 读 `CFBundleShortVersionString` 的大版本号。
+///
+/// `exe` 可能是 `.../Contents/MacOS/bcomp`，也可能是 `/usr/local/bin/bcomp` 这种
+/// 包外符号链接；先 `canonicalize` 回包内。plist 是 XML（BC 自己写的），用字符串
+/// 定位即可；不是 XML 时返回 `None`，由调用方退回目录存在性判断。
+#[cfg(any(target_os = "macos", test))]
+fn bc_major_version(exe: &Path) -> Option<u32> {
+    let real = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let plist = real.parent()?.parent()?.join("Info.plist");
+    let text = std::fs::read_to_string(plist).ok()?;
+    let key = "<key>CFBundleShortVersionString</key>";
+    let after_key = &text[text.find(key)? + key.len()..];
+    let start = after_key.find("<string>")? + "<string>".len();
+    let end = after_key[start..].find("</string>")? + start;
+    after_key[start..end].split('.').next()?.parse().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1667,9 +1710,10 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("BCompare.exe");
         fs::write(&exe, b"stub").unwrap();
-        // 没有 BC*.xml → 用户配置目录（macOS 的官方目录不带厂商层与版本号）
+        // 没有 BC*.xml → 用户配置目录（macOS 还可能落到 `Beyond Compare 5/4`，
+        // 取决于真实用户目录；这里只确认**不是** exe 同目录）
         if cfg!(target_os = "macos") {
-            assert!(config_dir(&exe).ends_with("Beyond Compare"));
+            assert_ne!(config_dir(&exe), dir);
         } else {
             assert!(config_dir(&exe).ends_with("Beyond Compare 5"));
         }
@@ -1677,6 +1721,59 @@ mod tests {
         fs::write(dir.join("BCState.xml"), b"<BCState/>").unwrap();
         assert_eq!(config_dir(&exe), dir);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// macOS 的版本化设置目录：BC5/BC4 装在一起或被官方说明重命名过时，必须写进
+    /// `Beyond Compare 5` / `Beyond Compare 4`，否则 BC 报「配置文件找不到」。
+    #[test]
+    fn macos_config_dir_prefers_the_versioned_folder_matching_the_exe() {
+        let base = std::env::temp_dir().join(format!("orbdrop_bc_cfg_{}", uuid::Uuid::new_v4()));
+        let bundle = base.join("Beyond Compare.app");
+        let macos = bundle.join("Contents/MacOS");
+        fs::create_dir_all(&macos).unwrap();
+        fs::write(macos.join("bcomp"), b"stub").unwrap();
+        fs::create_dir_all(base.join("Beyond Compare 5")).unwrap();
+        fs::create_dir_all(base.join("Beyond Compare 4")).unwrap();
+        fs::create_dir_all(base.join("Beyond Compare")).unwrap();
+
+        let write_version = |v: &str| {
+            fs::write(
+                bundle.join("Contents/Info.plist"),
+                format!(
+                    "<?xml version=\"1.0\"?><plist><dict><key>CFBundleShortVersionString</key><string>{v}</string></dict></plist>"
+                ),
+            )
+            .unwrap()
+        };
+
+        write_version("5.2.6.32774");
+        assert_eq!(
+            macos_config_dir(&base, &macos.join("bcomp")),
+            base.join("Beyond Compare 5")
+        );
+
+        // BC4 的 exe 选 4，不能被先找到的 5 抢走
+        write_version("4.4.7.28397");
+        assert_eq!(
+            macos_config_dir(&base, &macos.join("bcomp")),
+            base.join("Beyond Compare 4")
+        );
+
+        // 已知大版本但对应目录不存在：BC 用的是默认无版本目录，不去用另一个大版本
+        fs::remove_dir_all(base.join("Beyond Compare 4")).unwrap();
+        assert_eq!(
+            macos_config_dir(&base, &macos.join("bcomp")),
+            base.join("Beyond Compare")
+        );
+
+        // 读不出版本（plist 不可读）：有版本目录就用大版本号大的
+        fs::remove_file(bundle.join("Contents/Info.plist")).unwrap();
+        assert_eq!(
+            macos_config_dir(&base, &macos.join("bcomp")),
+            base.join("Beyond Compare 5")
+        );
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

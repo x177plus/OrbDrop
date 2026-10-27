@@ -55,7 +55,12 @@
 `BCProfiles.xml`，位置：
 
 - **便携版：BC exe 同目录**（判断依据：同目录存在 `BCState.xml` / `BCPreferences.xml` / `BCProfiles.xml` 之一）
-- 常规安装：`%APPDATA%\Scooter Software\Beyond Compare 5\`
+- 常规安装（Windows）：`%APPDATA%\Scooter Software\Beyond Compare 5\`
+- 常规安装（macOS）：默认 `~/Library/Application Support/Beyond Compare`；装过多个大版本时是
+  `~/Library/Application Support/Beyond Compare 5`（BC5）或 `Beyond Compare 4`（BC4）。
+  **BC 只读自己那个目录**，写错目录会报「配置文件找不到」/「文件夹不可用」（真机 BC 5.2.6 踩到）。
+  `config_dir()` 从 `.app/Contents/Info.plist` 的 `CFBundleShortVersionString` 取大版本号，优先匹配的版本化目录。
+  启动预写若跑在服务器端口落下来之前（异步起服务），只会写骨架；服务起来后会再补写一次（`lib.rs` setup）。
 
 结构（照抄 BC 自己写出来的即可）：
 
@@ -117,7 +122,7 @@
 ### 2.1 Rust
 
 - `src-tauri/src/bc.rs`
-  - `locate_exe()`：设置项 → Windows 注册表（`App Paths\BCompare.exe`、`Scooter Software\Beyond Compare 5\ExePath`，便携版脚本也写这里）→ 常见安装路径；macOS 走 `/Applications/Beyond Compare.app/Contents/MacOS/bcompare`。
+  - `locate_exe()`：设置项 → Windows 注册表（`App Paths\BCompare.exe`、`Scooter Software\Beyond Compare 5\ExePath`，便携版脚本也写这里）→ 常见安装路径；macOS 取 `.app` 内 `Contents/MacOS/bcomp`（兼容 `bcompare`）。
   - `config_dir()`：见 1.3 的判断规则。
   - `ensure_profile_file()` / `provision_profiles()`：**预写**（见 1.5）——应用启动、配对完成时各跑一次；没有已配对设备时也要把骨架文件立起来，好让 BC 下次启动把它纳入跟踪。
   - `encrypt_password()/decrypt_password()`：见 1.4。
@@ -186,7 +191,7 @@
 | 写回未实测 | PUT/DELETE/MKCOL/MOVE/COPY 已实现并有单测，但**还没让 BC 真的保存改动**验证过（BC 保存时才发这些请求） |
 | profile 新鲜度 | 已实测：**运行中的 BC 实时跟随文件**（BC 启动后写入的 profile 立刻可用，打开过配置文件管理器也一样）。唯一失效情形是"BC 启动时 `BCProfiles.xml` 还不存在"——那个实例会一直无视它，需**重启一次 BC**；已用"应用启动/配对时预写"把这个窗口消掉 |
 | 非便携安装 | 本机是便携版；`%APPDATA%` 分支未在本机实测 |
-| macOS | `bcomp` 路径与行为未验证 |
+| macOS | **读路径已在真机 BC 5.2.6 跑通**：设置目录 `Beyond Compare 5`、`bcomp` 两参数、`profile:...?<shareId>` 经回环代理 PROPFIND Depth 0/1、Basic 鉴权与 `href` 改写正常；写回仍未验证。BC4.2.8 未验证 |
 | 只读策略 | F-73（共享方可设"允许写回/只读"）尚未接入 DAV 端点，目前 DAV 一律可写 |
 | 未装 BC | `bc_status().exePath === null` ⇒ 前端 **整个 BC 菜单区不显示**（`ContextMenu.svelte` 的 `bcAvailable`；「左：X」/「用 BeyondCompare 比较 · 与左侧：X」/「添加到左侧比较位」连同分隔线一起隐藏）。设置面板保存/取消后重连一次 `bc_status`，所以刚填上的 BC 路径不用重启就生效。后端 `bc_compare_with_left` 的"未找到…请在设置里指定路径"只剩兜底作用（前端已挡住入口） |
 | 槽不可写 | `bc_status().slotWritable === false`（没装过 BC5，或那把键开不出写权限；前端判据是 `exePath && slotWritable`）⇒ 整区同样不显示：没有卡槽的地方，我们也不去造 |

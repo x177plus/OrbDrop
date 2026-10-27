@@ -9,6 +9,7 @@
   import type { TreeEntry } from '$lib/types';
   import { fetchTree } from '$lib/api';
   import type { ShareItem } from '$lib/types';
+  import { t } from '$lib/i18n.svelte';
 
   let {
     onToast,
@@ -50,7 +51,7 @@
         st.entries = await fetchTree(getServerPort(), shareId, '');
         st.loaded = true;
       } catch (e: any) {
-        st.error = e?.message ?? '加载失败';
+        st.error = e?.message ?? t('加载失败');
       } finally {
         st.loading = false;
       }
@@ -61,8 +62,10 @@
   function handleBroadcastToggle(shareId: string, checked: boolean) {
     toggleBroadcast(shareId, checked).catch(console.error);
     onToast(checked
-      ? (connectedDevices.length > 0 ? `已开启广播 · 自动广播至 ${connectedDevices.map(deviceShortName).join('、')}` : '已开启广播')
-      : '已停止广播该共享项');
+      ? (connectedDevices.length > 0
+        ? t('已开启广播 · 自动广播至 {names}', { names: connectedDevices.map(deviceShortName).join(t('、')) })
+        : t('已开启广播'))
+      : t('已停止广播该共享项'));
   }
 
   function openCtx(e: MouseEvent, el: HTMLElement, share: ShareItem) {
@@ -83,7 +86,7 @@
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
     <path d="M12 3v12M6 9l6 6 6-6M5 19h14"/>
   </svg>
-  拖入文件或文件夹，点击添加共享项
+  {t('拖入文件或文件夹，点击添加共享项')}
 </button>
 
 <!-- 文案按**实际行为**写：`add_share` 落盘时 `broadcastEnabled` 是 false（`config.rs` 的
@@ -91,13 +94,13 @@
 {#if connectedDevices.length > 0}
   <p class="bcast-hint">
     <span class="dot live"></span>
-    <span>{connectedDevices.map(d => `「${deviceShortName(d)}」`).join('、')} 已连接：在共享项上打开广播开关，对端才能看到</span>
+    <span>{t('{names} 已连接：在共享项上打开广播开关，对端才能看到', { names: connectedDevices.map(d => t('「{name}」', { name: deviceShortName(d) })).join(t('、')) })}</span>
   </p>
 {/if}
 
 <div class="list-label">
-  <span>共享项</span>
-  <span class="num">{totalShares} 项</span>
+  <span>{t('共享项')}</span>
+  <span class="num">{t('{n} 项', { n: totalShares })}</span>
 </div>
 
 {#if totalShares === 0}
@@ -105,8 +108,8 @@
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2v11Z"/>
     </svg>
-    <p>还没有共享项</p>
-    <p class="e-sub">拖入文件或文件夹到悬浮球即可添加共享项，并可选择广播至长连接设备。</p>
+    <p>{t('还没有共享项')}</p>
+    <p class="e-sub">{t('拖入文件或文件夹到悬浮球即可添加共享项，并可选择广播至长连接设备。')}</p>
   </div>
 {:else}
   <ul class="share-list">
@@ -122,7 +125,7 @@
       >
         <div class="share-row" use:dragOut={{ source: { shareId: share.id, path: '', name: share.name, isDir: dir }, onMessage: onToast }}>
           {#if dir}
-            <button class="chev" onclick={() => toggleTree(share.id)} aria-label="展开">{@html ICON_CHEVRON}</button>
+            <button class="chev" onclick={() => toggleTree(share.id)} aria-label={t('展开')}>{@html ICON_CHEVRON}</button>
           {:else}
             <button class="chev" style="visibility:hidden">{@html ICON_CHEVRON}</button>
           {/if}
@@ -135,11 +138,11 @@
           </div>
           <div class="s-acts">
             {#if connectedDevices.length > 0 && share.broadcastEnabled}
-              <span class="bcast-chip" title="自动广播至 {connectedDevices.map(d => `「${deviceShortName(d)}」`).join('、')}">
-                <span class="dot live"></span>{connectedDevices.length}台设备
+              <span class="bcast-chip" title={t('自动广播至 {names}', { names: connectedDevices.map(d => t('「{name}」', { name: deviceShortName(d) })).join(t('、')) })}>
+                <span class="dot live"></span>{t('{n}台设备', { n: connectedDevices.length })}
               </span>
             {/if}
-            <label class="switch" title="向设备广播">
+            <label class="switch" title={t('向设备广播')}>
               <input
                 type="checkbox"
                 checked={share.broadcastEnabled}
@@ -154,11 +157,11 @@
           <div class="tree">
             <div class="tree-inner">
               {#if ts.loading}
-                <div class="node"><span class="n-name" style="color:var(--muted)">加载中…</span></div>
+                <div class="node"><span class="n-name" style="color:var(--muted)">{t('加载中…')}</span></div>
               {:else if ts.error}
                 <div class="node"><span class="n-name" style="color:var(--warn)">{ts.error}</span></div>
               {:else if ts.expanded && ts.entries.length === 0}
-                <div class="node"><span class="n-name" style="color:var(--muted)">空目录</span></div>
+                <div class="node"><span class="n-name" style="color:var(--muted)">{t('空目录')}</span></div>
               {:else if ts.expanded}
                 {#each ts.entries as entry (entry.name)}
                   <TreeNode

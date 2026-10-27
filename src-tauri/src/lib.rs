@@ -19,6 +19,8 @@ pub mod group;
 pub mod group_identity;
 #[cfg(desktop)]
 pub mod hit_region;
+/// 后端自己那几处原生文案（托盘 / 通知栏）的语言解析与翻译，见模块头。
+pub mod i18n;
 /// 对端自报标识符（设备 id / 共享项 id）的形态校验：它们会被当成本地路径段与 URL 路径段用。
 pub mod ids;
 pub mod link;
@@ -177,6 +179,10 @@ pub struct UpdateSettingsRequest {
     /// 与前端 `AppSettings.downloadMode` 同一套字面量（`Direct` / `AskEachTime`）。
     pub download_mode: DownloadMode,
     pub device_name: String,
+    /// 界面语言（具体语言：`en` / `zh-CN`）。`None` = 老界面没带这一项，保持原值；
+    /// 旧值 `auto` 会解析成系统语言后落盘。
+    #[serde(default)]
+    pub language: Option<String>,
     pub auto_start: bool,
     /// 推送接收是否再放一层 `<发送方名>/`（设置里的「推送按发送方分目录」，默认开，S-12）。
     /// 缺省用配置的缺省（**开**）而不是 `bool::default()`（关）：老界面不带这个字段时，
@@ -398,6 +404,32 @@ fn get_settings(state: State<'_, Arc<AppState>>) -> Result<AppSettings, String> 
     Ok(state.config.lock().settings())
 }
 
+/// 切换界面语言：**立即落盘**并让托管文案（托盘）跟着换。
+///
+/// 与其它设置项分开，是因为语言在设置页里是"选了就生效"的一档（不必等「保存」）：
+/// 前端选完立刻换界面，托盘菜单也在同一刻换字；用户在别处取消编辑不该把语言也退回去。
+#[tauri::command]
+fn set_language(
+    preference: String,
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> Result<AppSettings, String> {
+    #[cfg(mobile)]
+    let _ = &app; // 移动端没有托盘：语言只影响后端通知文案，`app` 只是命令签名的一部分。
+    let language = i18n::canonical_preference(&preference);
+    let settings = {
+        let mut config = state.config.lock();
+        config.language = language.clone();
+        config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
+        config.settings()
+    };
+    i18n::set_preference(&language);
+    #[cfg(desktop)]
+    tray::refresh_language(&app);
+    info!(language = %language, "界面语言已切换");
+    Ok(settings)
+}
+
 #[tauri::command]
 async fn update_settings(
     req: UpdateSettingsRequest,
@@ -406,6 +438,7 @@ async fn update_settings(
 ) -> Result<AppSettings, String> {
     let (old_port, old_name);
     let old_allow_relay;
+    let language = req.language.as_deref().map(i18n::canonical_preference);
     #[cfg(desktop)]
     let old_autostart;
     {
@@ -422,6 +455,9 @@ async fn update_settings(
         config.download_mode = req.download_mode;
         config.device_subdir = req.device_subdir;
         config.device_name = req.device_name.clone();
+        if let Some(lang) = &language {
+            config.language = lang.clone();
+        }
         config.auto_start = req.auto_start;
         config.bc_exe_path =
             Some(PathBuf::from(req.bc_exe_path.trim())).filter(|p| !p.as_os_str().is_empty());
@@ -433,6 +469,13 @@ async fn update_settings(
         config.transfer_workers = config::clamp_transfer_workers(req.transfer_workers);
         config.transfer_block_mb = config::clamp_transfer_block_mb(req.transfer_block_mb);
         config::save_config_at(&state.config_path, &config).map_err(|e| e.to_string())?;
+    }
+
+    // 语言：落盘之后才换后端文案（托盘菜单就地改字，不重建图标）。
+    if let Some(lang) = language.as_deref() {
+        i18n::set_preference(lang);
+        #[cfg(desktop)]
+        tray::refresh_language(&app);
     }
 
     // Autostart change
@@ -3193,8 +3236,20 @@ fn boot_state() -> Arc<AppState> {
     #[cfg(desktop)]
     resource::prepare_process();
 
-    let config = config::load_config();
+    let mut config = config::load_config();
     let config_path = config::config_file_path();
+    // 语言没有「跟随系统」这一档：旧配置的 `auto` 在这里解析成具体系统语言并写回一次，
+    // 之后设置里显示的就是那个语言，系统语言再变也不会偷偷改掉。
+    let language = i18n::canonical_preference(&config.language);
+    if config.language != language {
+        let previous = config.language.clone();
+        config.language = language;
+        if let Err(e) = config::save_config_at(&config_path, &config) {
+            warn!(previous, "语言配置迁移写盘失败（本次仍按解析结果运行）: {e}");
+        }
+    }
+    // 托盘 / 通知栏的原生文案从这里开始按配置语言出字（读不到即英语）。
+    i18n::init(&config.language);
 
     // 启动第一行就写清"用什么配置起的"：出问题时（尤其 release 没有控制台）
     // 这行决定了能不能判断到没到 Tauri/服务那一步。
@@ -3203,6 +3258,7 @@ fn boot_state() -> Arc<AppState> {
         config = %config_path.display(),
         device_id = %config.device_id,
         device_name = %config.device_name,
+        language = %config.language,
         port = config.port,
         peers = config.peers.len(),
         shares = config.shares.len(),
@@ -3274,6 +3330,9 @@ pub fn run() {
                     }
                     let _ = win.emit(ws::events::ui::ORB_SHOW, ());
                 }
+                // 用户明确又拉了一次应用：让更新调度器按"回前台"那一档判断要不要复查
+                // （距上次成功不足 1 小时就不查，见 `update::wake`）。
+                update::wake();
             }))
         } else {
             warn!("ORBDROP_ALLOW_MULTI 已设置：跳过单实例约束（本机多开，各自的数据目录/端口必须分开）");
@@ -3333,7 +3392,11 @@ pub fn run() {
     let builder = builder.on_window_event(|_window, event| match event {
         tauri::WindowEvent::Destroyed => notify::set_ui_alive(false),
         // 界面又回来了（换配置重建、从最近任务点回来）：通知这条路跟着恢复。
-        tauri::WindowEvent::Resumed => notify::set_ui_alive(true),
+        tauri::WindowEvent::Resumed => {
+            notify::set_ui_alive(true);
+            // 回到前台：更新调度器按"距上次成功 ≥1 小时"决定要不要复查。
+            update::wake();
+        }
         _ => {}
     });
 
@@ -3360,6 +3423,7 @@ pub fn run() {
             rename_share,
             toggle_broadcast,
             get_settings,
+            set_language,
             update_settings,
             #[cfg(desktop)]
             bc_status,
@@ -3498,6 +3562,7 @@ pub fn run() {
             // 自更新（桌面端 + 安卓端同一套，见 `src/update/`）。
             update::update_state,
             update::update_check,
+            update::update_dismiss,
             update::update_apply,
         ])
         .setup(|app| {
@@ -3596,6 +3661,30 @@ pub fn run() {
             {
                 let written = bc::provision_profiles(&state_arc);
                 info!(written, "启动预写 BeyondCompare profile 完成");
+
+                // `setup_server_task` 是异步起的：上面这一跑的时候 `server_port` 可能还是 0，
+                // 于是只写了骨架、没写 profile（真机 BC 5.2.6 踩到：文件里没有条目 ->
+                // 「配置文件找不到 / 文件夹不可用」）。等端口真的落下来再补一次，保证
+                // BC 在应用之后启动时 profile 已经在了。
+                //
+                // 这段在 Windows 也跑：`provision_profiles` 是幂等的，端口已就绪时第二次
+                // 调用只做复核、不重写文件；第一次若跑在端口之前，它把缺的 profile 补上。
+                // 不改变 Windows 的目录/命名规则。
+                let state = state_arc.inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    for _ in 0..30 {
+                        if state
+                            .server_port
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                            != 0
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    let written = bc::provision_profiles(&state);
+                    info!(written, "服务起来后补写 BeyondCompare profile 完成");
+                });
             }
             Ok(())
         })
@@ -3615,6 +3704,7 @@ pub fn run() {
                 if let Err(e) = app.emit(ws::events::ui::ORB_SHOW, ()) {
                     warn!("Reopen 的展开事件发不出去: {e}");
                 }
+                update::wake();
             }
 
             // 退出时松开镜像连接。**注册留着**：注册一次长期存在（注销是 O(N)，实测 10,100 个

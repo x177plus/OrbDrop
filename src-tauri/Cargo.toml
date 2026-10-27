@@ -1,6 +1,6 @@
 [package]
 name = "orbdrop"
-version = "0.1.1"
+version = "0.1.2"
 description = "OrbDrop — LAN file sharing tool"
 authors = ["you"]
 license = "GPL-3.0-or-later"
@@ -97,6 +97,9 @@ getrandom = { version = "0.4", features = ["sys_rng"] }
 pakery-core = "0.6"
 hkdf = "0.12"
 zeroize = "1"
+# 系统语言（托盘菜单与安卓通知栏的后端文案）：Android / iOS / macOS / Windows / Linux
+# 走同一套 API；读不到时由 `i18n` 回退英语。
+sys-locale = "0.3"
 
 [dev-dependencies]
 # 集成测试里那个"老版本对端"桩要自己起一个 **TLS** 服务端（对端那一跳已经全是 TLS，

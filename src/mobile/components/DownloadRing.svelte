@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from "../Icon.svelte";
+  import { t } from "$lib/i18n.svelte";
 
   /**
    * 文件行右侧那一圈：**行高不变**，下载键原地变成进度环。
@@ -41,6 +42,8 @@
   } = $props();
 
   const R = 15;
+  /** 动作动词按 msgid 传进来（默认「下载」，会话接收是「接收」）—— 跟着界面语言一起翻。 */
+  const verbText = $derived(t(verb));
   const C = 2 * Math.PI * R;
 
   const knownTotal = $derived(total > 0);
@@ -49,12 +52,12 @@
   );
   const label = $derived(
     status === "running"
-      ? `暂停${verb}「${name}」`
+      ? t("暂停{verb}「{name}」", { verb: verbText.toLowerCase(), name })
       : status === "paused"
-        ? `继续${verb}「${name}」`
+        ? t("继续{verb}「{name}」", { verb: verbText.toLowerCase(), name })
         : status === "failed"
-          ? `${verb}失败：${error ?? "未知原因"}，点击重试`
-          : `${verb}「${name}」`,
+          ? t("{verb}失败：{error}，点击重试", { verb: verbText, error: error ?? t("未知原因") })
+          : t("{verb}「{name}」", { verb: verbText, name }),
   );
 
   function toggle(e: MouseEvent): void {

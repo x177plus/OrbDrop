@@ -449,6 +449,7 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
    （一颗 20u 圆角的胶囊，与两颗圆按钮同高）**，长高之后圆角仍是 20u，于是成了一张圆角矩形。
    `pre-wrap` 让文本里那个换行（Shift+回车）真的换行。 */
 .cinput.cx {
+  position: relative; /* 占位文案（下面的 `::before`）以输入框自己为定位基准 */
   height: auto;
   min-height: calc(40 * var(--u));
   max-height: calc(132 * var(--u));
@@ -459,8 +460,20 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
   line-height: 1.5;
 }
 /* 空的时候写占位文案：`:empty` 只认"一个子节点都没有"，而被编辑过的框里往往留着一个空文本节点
-   （甚至一个 `<br>`），所以真正的判据是组件挂的那个 `data-empty`。 */
-.cinput.cx[data-empty="1"]::before { content: attr(data-placeholder); color: var(--muted); pointer-events: none; }
+   （甚至一个 `<br>`），所以真正的判据是组件挂的那个 `data-empty`。
+   占位文案必须**脱离行内流**（`position: absolute`）：空框被编辑过之后往往只剩一个 `<br>`，
+   光标锚在它前面；`::before` 若仍在流里就是那一行的第一个盒子，光标于是被画在占位文案
+   **右边**（首次聚焦时框里一个子节点都没有，光标不受它影响，才看着在最左）。
+   定位值 = 上面的 `padding`，`line-height` 继承，所以文案与光标的位置和原来看不出差别。
+   与桌面端 `main.css` 里那条同名规则是同一份东西（两份产物各带一份）。 */
+.cinput.cx[data-empty="1"]::before {
+  content: attr(data-placeholder);
+  position: absolute;
+  top: calc(7 * var(--u));
+  left: calc(14 * var(--u));
+  color: var(--muted);
+  pointer-events: none;
+}
 /* 框里那张图：既要是"能看见的一张小图"，又要是**一个原子**（一次退格删掉一整张、光标跳得过去）
    —— 原子性由 `contenteditable="false"` 给（见 `lib/composer.ts`），这里只管长相。
    与桌面端 `main.css` 里那条同名规则是同一份东西（两份产物各带一份，见那个文件的注释）。 */
@@ -600,6 +613,34 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .input::placeholder { color: var(--muted); }
 .input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
 .input[readonly] { background: var(--surface-2); color: var(--muted); }
+/* 界面语言下拉框（`LanguageSelect.svelte`）：按钮与 `.input` 同高同圆角、左 12u 与
+   设备名称输入框文字对齐；展开菜单由应用自己画（原生 select 的弹层样式收不住）。 */
+.lang-select { position: relative; width: 100%; }
+.lang-trigger {
+  width: 100%; height: calc(42 * var(--u)); display: flex; align-items: center;
+  padding: 0 calc(12 * var(--u)); border: 1px solid var(--border); border-radius: calc(11 * var(--u));
+  background: var(--surface); color: var(--fg); font-size: var(--fs-md); text-align: left; cursor: pointer;
+}
+.lang-trigger:focus-visible { outline: 2px solid var(--accent-soft); outline-offset: 0; border-color: var(--accent); }
+.lang-select.open .lang-trigger { border-color: var(--accent); }
+.lang-caret { flex: none; width: calc(18 * var(--u)); height: calc(18 * var(--u)); margin-left: auto; color: var(--muted); transition: transform 0.15s ease, color 0.15s ease; }
+.lang-select.open .lang-caret { transform: rotate(180deg); color: var(--accent); }
+.lang-menu {
+  position: absolute; left: 0; right: 0; top: calc(100% + calc(6 * var(--u))); z-index: 40;
+  display: flex; flex-direction: column; gap: calc(2 * var(--u)); padding: calc(5 * var(--u));
+  background: var(--surface); border: 1px solid var(--border); border-radius: calc(13 * var(--u));
+  box-shadow: 0 calc(12 * var(--u)) calc(32 * var(--u)) rgba(0, 0, 0, 0.18);
+}
+.lang-option {
+  display: flex; align-items: center; width: 100%; height: calc(38 * var(--u)); padding: 0 calc(10 * var(--u));
+  border-radius: calc(9 * var(--u)); color: var(--fg); font-size: var(--fs-md); text-align: left; cursor: pointer;
+}
+.lang-option:active, .lang-option:focus-visible { background: var(--fg-soft); outline: none; }
+.lang-option.active { color: var(--accent-deep); background: var(--accent-soft); }
+.lang-check { flex: none; width: calc(18 * var(--u)); height: calc(18 * var(--u)); margin-left: auto; }
+/* 语言卡片要允许菜单溢出：`.gcard` 默认 `overflow: hidden` 是为了裁行底色，
+   这一张只有一行，菜单还得盖在下面的卡片上。 */
+.lang-card { overflow: visible; }
 .radio { display: flex; align-items: center; gap: calc(11 * var(--u)); padding: calc(11 * var(--u)) calc(12 * var(--u)); border: 1px solid var(--border); border-radius: calc(12 * var(--u)); }
 /* `:has()` 是 Chrome 105 才有的：选择器各写两路 —— 新引擎走 `:has`，老引擎走组件挂的 `.is-checked`，
    两条路命中同一批样式，不存在两套外观。 */

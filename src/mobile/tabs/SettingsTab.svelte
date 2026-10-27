@@ -2,9 +2,12 @@
   import { onMount } from "svelte";
   import * as api from "$lib/api";
   import { formatFileSize, updateStatusText } from "$lib/types";
+  import { t, setLanguagePreference, adoptLanguagePreference, normalizePreference, type Locale } from "$lib/i18n.svelte";
   import type { AppSettings, KeepAliveState, RelayTraffic } from "$lib/types";
   import * as devices from "$lib/stores/devices.svelte";
   import * as upd from "$lib/stores/update.svelte";
+  import UpdateNotes from "$lib/components/UpdateNotes.svelte";
+  import LanguageSelect from "$lib/components/LanguageSelect.svelte";
   import Icon from "../Icon.svelte";
   import * as store from "../store.svelte";
 
@@ -14,6 +17,8 @@
   let loading = $state(true);
   let loadError = $state<string | null>(null);
   let saving = $state(false);
+  /** 界面语言（具体语言，没有「跟随系统」）：改它 = 立刻生效并落后端。 */
+  let languagePref = $state<Locale>(normalizePreference(null));
 
   // 不在 `store.form()` 里的两项：表单只装"用户正在改的那几个"（见 store 里 resetForm 的注释），
   // 下载模式与"添加后自动共享"是本页自己的编辑态，保存时一起写回。
@@ -88,7 +93,10 @@
       await upd.checkUpdate(true);
     } catch (e) {
       // 用户主动点的那次失败要说出来（启动时的静默检查失败不打扰）。
-      store.toast(`检查更新失败：${e instanceof Error ? e.message : String(e)}`, "download");
+      store.toast(
+        t("检查更新失败：{error}", { error: e instanceof Error ? e.message : String(e) }),
+        "download",
+      );
     } finally {
       checking = false;
     }
@@ -98,7 +106,10 @@
     try {
       await upd.installUpdate();
     } catch (e) {
-      store.toast(`更新失败：${e instanceof Error ? e.message : String(e)}`, "download");
+      store.toast(
+        t("更新失败：{error}", { error: e instanceof Error ? e.message : String(e) }),
+        "download",
+      );
     }
   }
 
@@ -110,6 +121,8 @@
     try {
       const s = await api.getSettings();
       saved = s;
+      languagePref = normalizePreference(s.language);
+      adoptLanguagePreference(s.language);
       downloadMode = s.downloadMode;
       deviceSubdir = s.deviceSubdir;
       autoBroadcast = s.autoBroadcastNew;
@@ -166,10 +179,13 @@
       online = await api.setOnline(next);
       // 把落地值报给设备 store 的镜像：那是"本机在线"唯一的另一份显示来源，分叉了就会互相打脸。
       devices.noteLocalOnline(online);
-      store.toast(online ? "本机已上线" : "本机已离线 · 对端看不到你", online ? "check" : undefined);
+      store.toast(
+        online ? t("本机已上线") : t("本机已离线 · 对端看不到你"),
+        online ? "check" : undefined,
+      );
       return true;
     } catch (e) {
-      store.failed("切换在线状态", e);
+      store.failed(t("切换在线状态"), e);
       return false;
     }
   }
@@ -189,6 +205,23 @@
     return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : hi;
   }
 
+  async function changeLanguage(next: Locale): Promise<void> {
+    const previous = languagePref;
+    languagePref = next;
+    setLanguagePreference(next);
+    try {
+      const s = await api.setLanguage(next);
+      saved = s;
+      store.toast(t("界面语言已切换"), "check");
+    } catch (err) {
+      languagePref = previous;
+      adoptLanguagePreference(previous);
+      store.toast(
+        t("切换语言失败：{error}", { error: err instanceof Error ? err.message : String(err) }),
+      );
+    }
+  }
+
   async function save(): Promise<void> {
     const f = form;
     if (!saved || !f || saving) return;
@@ -198,6 +231,7 @@
       const next = await api.updateSettings({
         ...saved,
         deviceName: f.deviceName.trim() || saved.deviceName,
+        language: languagePref,
         port: digits ? Number(digits) : saved.port,
         downloadMode,
         deviceSubdir,
@@ -218,9 +252,9 @@
       transferWorkers = String(next.transferWorkers);
       transferBlockMb = String(next.transferBlockMb);
       store.resetForm({ deviceName: next.deviceName, port: next.port });
-      store.toast("设置已保存", "check");
+      store.toast(t("设置已保存"), "check");
     } catch (e) {
-      store.failed("保存设置", e);
+      store.failed(t("保存设置"), e);
     } finally {
       saving = false;
     }
@@ -232,8 +266,8 @@
     <div class="card list">
       <div class="empty">
         <Icon name="settings" />
-        <p>正在读取设置</p>
-        <p class="es">配置都在本机后端，读回来就填上。</p>
+        <p>{t("正在读取设置")}</p>
+        <p class="es">{t("配置都在本机后端，读回来就填上。")}</p>
       </div>
     </div>
   </div>
@@ -242,79 +276,92 @@
     <div class="card list">
       <div class="empty">
         <Icon name="settings" />
-        <p>读取设置失败</p>
+        <p>{t("读取设置失败")}</p>
         <p class="es">{loadError}</p>
-        <button class="btn btn-secondary" type="button" onclick={() => void load()}>重试</button>
+        <button class="btn btn-secondary" type="button" onclick={() => void load()}>{t("重试")}</button>
       </div>
     </div>
   </div>
 {:else}
   <div class="body">
     <div class="sec">
-      <div class="sec-label"><span>本机</span></div>
+      <div class="sec-label"><span>{t("语言")}</span></div>
+      <div class="card gcard lang-card">
+        <div class="srow">
+          <span class="slabel">{t("界面语言")}</span>
+          <LanguageSelect value={languagePref} ariaLabel={t("界面语言")} onChange={changeLanguage} />
+          <p class="shelp">
+            {t("界面正文与通知栏会立刻切换。首次启动使用系统语言，系统语言不在支持列表里时使用英语。")}
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-label"><span>{t("本机")}</span></div>
       <div class="card gcard">
         <div class="srow">
-          <span class="slabel">本机名称</span>
+          <span class="slabel">{t("本机名称")}</span>
           <input
             class="input"
             maxlength="20"
-            aria-label="本机名称"
+            aria-label={t("本机名称")}
             value={form?.deviceName ?? ""}
             oninput={(e: Event) => store.editForm({ deviceName: (e.currentTarget as HTMLInputElement).value })}
           />
         </div>
         <div class="srow">
-          <span class="slabel">监听端口</span>
+          <span class="slabel">{t("监听端口")}</span>
           <input
             class="input num"
             inputmode="numeric"
-            aria-label="监听端口"
+            aria-label={t("监听端口")}
             value={form?.port ?? ""}
             oninput={(e: Event) => store.editForm({ port: (e.currentTarget as HTMLInputElement).value })}
           />
-          <p class="shelp">默认 3890；被占用时自动探测 3891–3899。</p>
+          <p class="shelp">{t("默认 3890；被占用时自动探测 3891–3899。")}</p>
         </div>
       </div>
     </div>
 
     <div class="sec">
-      <div class="sec-label"><span>文件</span></div>
+      <div class="sec-label"><span>{t("文件")}</span></div>
       <div class="card gcard">
         <!-- 原型这行是「收件目录」：移动端的收件目录由后端定、不落配置，没有可编辑也没有可回填的值。
              唯一的落盘目录就是下载目录（手动下载与推送接收都写它）。 -->
         <div class="srow">
-          <span class="slabel">下载目录</span>
-          <input class="input" value={saved.downloadDir} readonly aria-label="下载目录" />
+          <span class="slabel">{t("下载目录")}</span>
+          <input class="input" value={saved.downloadDir} readonly aria-label={t("下载目录")} />
         </div>
         <div class="srow">
           <div class="srow-top">
-            <span class="slabel">推送按发送方分目录</span>
+            <span class="slabel">{t("推送按发送方分目录")}</span>
             <label class="switch">
-              <input type="checkbox" bind:checked={deviceSubdir} aria-label="推送按发送方分目录" />
+              <input type="checkbox" bind:checked={deviceSubdir} aria-label={t("推送按发送方分目录")} />
               <span class="track"></span>
             </label>
           </div>
           <p class="shelp">
-            打开（默认）时，接收到的推送放在以<strong>发送方名字</strong>命名的子目录里
-            （「文件」页按"发送方"分组就是它）；关掉则和手动下载的文件落在同一层 —— 同名的会自动改名，
-            但别人推来的目录会并进你本来就有的同名目录。
+            {t(
+              "打开（默认）时，接收到的推送放在以发送方名字命名的子目录里（「文件」页按“发送方”分组就是它）；关掉则和手动下载的文件落在同一层 —— 同名的会自动改名，但别人推来的目录会并进你本来就有的同名目录。",
+            )}
           </p>
         </div>
         <div class="srow">
-          <span class="slabel">下载模式</span>
+          <span class="slabel">{t("下载模式")}</span>
           <!-- 取值是后端的 `DownloadMode`（`Direct` / `AskEachTime`），原型里那两个小写字面量是 mock。 -->
           <label class="radio" class:is-checked={downloadMode === "Direct"}>
             <input type="radio" name="dlMode" value="Direct" bind:group={downloadMode} />
             <span class="rmain">
-              <span class="rname">直接存下载目录</span>
-              <span class="rdesc">引用下载时不再询问位置。</span>
+              <span class="rname">{t("直接存下载目录")}</span>
+              <span class="rdesc">{t("引用下载时不再询问位置。")}</span>
             </span>
           </label>
           <label class="radio" class:is-checked={downloadMode === "AskEachTime"}>
             <input type="radio" name="dlMode" value="AskEachTime" bind:group={downloadMode} />
             <span class="rmain">
-              <span class="rname">每次弹窗选位置</span>
-              <span class="rdesc">每次下载前选择保存位置。</span>
+              <span class="rname">{t("每次弹窗选位置")}</span>
+              <span class="rdesc">{t("每次下载前选择保存位置。")}</span>
             </span>
           </label>
         </div>
@@ -322,139 +369,150 @@
     </div>
 
     <div class="sec">
-      <div class="sec-label"><span>传输</span></div>
+      <div class="sec-label"><span>{t("传输")}</span></div>
       <div class="card gcard">
         <div class="srow">
-          <span class="slabel">传输并发数</span>
+          <span class="slabel">{t("传输并发数")}</span>
           <input
             class="input num"
             inputmode="numeric"
-            aria-label="传输并发数"
+            aria-label={t("传输并发数")}
             value={transferWorkers}
             oninput={(e: Event) => (transferWorkers = (e.currentTarget as HTMLInputElement).value)}
           />
-          <p class="shelp">一次接收同时跑几路传输；取值 1–8，默认 4，超出范围保存时自动夹住。</p>
+          <p class="shelp">{t("一次接收同时跑几路传输；取值 1–8，默认 4，超出范围保存时自动夹住。")}</p>
         </div>
         <div class="srow">
-          <span class="slabel">分块大小（MB）</span>
+          <span class="slabel">{t("分块大小（MB）")}</span>
           <input
             class="input num"
             inputmode="numeric"
-            aria-label="分块大小（MB）"
+            aria-label={t("分块大小（MB）")}
             value={transferBlockMb}
             oninput={(e: Event) => (transferBlockMb = (e.currentTarget as HTMLInputElement).value)}
           />
-          <p class="shelp">大文件按它切片、片与片之间并行；取值 1–32，默认 4，超出范围保存时自动夹住。</p>
+          <p class="shelp">{t("大文件按它切片、片与片之间并行；取值 1–32，默认 4，超出范围保存时自动夹住。")}</p>
         </div>
       </div>
     </div>
 
     <div class="sec">
-      <div class="sec-label"><span>中转</span></div>
+      <div class="sec-label"><span>{t("中转")}</span></div>
       <div class="card gcard">
         <div class="srow">
           <div class="srow-top">
-            <span class="slabel">允许中转</span>
+            <span class="slabel">{t("允许中转")}</span>
             <label class="switch">
-              <input type="checkbox" bind:checked={relay} aria-label="允许中转" />
+              <input type="checkbox" bind:checked={relay} aria-label={t("允许中转")} />
               <span class="track"></span>
             </label>
           </div>
           <p class="shelp">
-            替够不着彼此的其它设备搬字节（有些 Wi‑Fi 把同网段客户端之间的单播隔开），也替够不着的
-            同群成员转消息；不限已配对设备。会占用本机上行带宽（手机上是流量），**默认打开**
-            （首次启动就是开的，不想出这笔开销就关掉），关掉立刻收掉正在替别人转的每一条。
+            {t(
+              "替够不着彼此的其它设备搬字节（有些 Wi‑Fi 把同网段客户端之间的单播隔开），也替够不着的同群成员转消息；不限已配对设备。会占用本机上行带宽（手机上是流量），默认打开（首次启动就是开的，不想出这笔开销就关掉），关掉立刻收掉正在替别人转的每一条。",
+            )}
           </p>
         </div>
         <div class="srow">
-          <span class="slabel">中转流量</span>
+          <span class="slabel">{t("中转流量")}</span>
           {#if traffic && (traffic.bytes > 0 || traffic.connections > 0)}
             <p class="shelp">
-              本机替别人中转累计 {formatFileSize(traffic.bytes)}{traffic.connections > 0
-                ? ` · ${traffic.connections} 条连接`
-                : ""}（只算本机当中转方替别人搬的那部分，重启接着算）。
+              {t(
+                "本机替别人中转累计 {size}{conn}（只算本机当中转方替别人搬的那部分，重启接着算）。",
+                {
+                  size: formatFileSize(traffic.bytes),
+                  conn:
+                    traffic.connections > 0
+                      ? " · " + t("{n} 条连接", { n: traffic.connections })
+                      : "",
+                },
+              )}
             </p>
           {:else}
-            <p class="shelp">还没有替别人中转 —— 有设备借本机中转之后才会有这个数。</p>
+            <p class="shelp">{t("还没有替别人中转 —— 有设备借本机中转之后才会有这个数。")}</p>
           {/if}
         </div>
       </div>
     </div>
 
     <div class="sec">
-      <div class="sec-label"><span>运行</span></div>
+      <div class="sec-label"><span>{t("运行")}</span></div>
       <div class="card gcard">
         <div class="srow">
           <div class="srow-top">
-            <span class="slabel">本机在线</span>
+            <span class="slabel">{t("本机在线")}</span>
             <label class="switch">
               <input
                 type="checkbox"
                 checked={online}
-                aria-label="本机在线"
+                aria-label={t("本机在线")}
                 onchange={(e: Event) => void toggleOnline(e)}
               />
               <span class="track"></span>
             </label>
           </div>
-          <p class="shelp">关掉＝隐身：停止广播、断开全部长连接，也收不到别人的推送。</p>
+          <p class="shelp">{t("关掉＝隐身：停止广播、断开全部长连接，也收不到别人的推送。")}</p>
         </div>
         <div class="srow">
           <div class="srow-top">
-            <span class="slabel">添加后自动共享</span>
+            <span class="slabel">{t("添加后自动共享")}</span>
             <label class="switch">
-              <input type="checkbox" bind:checked={autoBroadcast} aria-label="添加后自动共享" />
+              <input type="checkbox" bind:checked={autoBroadcast} aria-label={t("添加后自动共享")} />
               <span class="track"></span>
             </label>
           </div>
-          <p class="shelp">只影响之后新添加的共享项；已经在列表里的开关一个都不动。</p>
+          <p class="shelp">{t("只影响之后新添加的共享项；已经在列表里的开关一个都不动。")}</p>
         </div>
       </div>
     </div>
 
     <div class="sec">
-      <div class="sec-label"><span>后台与通知</span></div>
+      <div class="sec-label"><span>{t("后台与通知")}</span></div>
       <div class="card gcard">
         <div class="srow">
           <div class="srow-top" style="justify-content:space-between;">
-            <span class="slabel">保活与通知</span>
+            <span class="slabel">{t("保活与通知")}</span>
             <button
               class="btn btn-secondary btn-sm"
               type="button"
               onclick={() => store.openSheet({ kind: "keepAlive" })}
             >
-              检查
+              {t("检查")}
             </button>
           </div>
           <p class="shelp">
-            电池优化：{keepAlive === null
-              ? "读取中…"
-              : keepAlive.batteryOptimizationIgnored
-                ? "已允许"
-                : "未允许"}。系统那一层（自启动 / 后台活动）与通知横幅都在这里检查 ——
-            留在默认档时，应用在后台会被系统冻结：通知栏那条「OrbDrop 正在运行」还挂着，
-            对端却已经看不到你了。
+            {t(
+              "电池优化：{status}。系统那一层（自启动 / 后台活动）与通知横幅都在这里检查 —— 留在默认档时，应用在后台会被系统冻结：通知栏那条「OrbDrop 正在运行」还挂着，对端却已经看不到你了。",
+              {
+                status:
+                  keepAlive === null
+                    ? t("读取中…")
+                    : keepAlive.batteryOptimizationIgnored
+                      ? t("已允许")
+                      : t("未允许"),
+              },
+            )}
           </p>
         </div>
       </div>
     </div>
 
     <div class="sec">
-      <div class="sec-label"><span>版本与更新</span></div>
+      <div class="sec-label"><span>{t("版本与更新")}</span></div>
       <!-- 这一格是设置页的最后一格。原型末尾还有一张「OrbDrop 移动端 / 需求 v0.5…」的卡片，
            而且这一行底下压着一句"更新包先试 GitHub…"的小字 —— 两张都**不搬**：版本号这里本来
            就有，卡片只是把同一件事说第二遍，小字则在出错时和真正的报错抢视线。 -->
       <div class="card gcard">
         <div class="srow">
           <div class="srow-top" style="justify-content:space-between;">
-            <span class="slabel">当前版本 v{update?.current ?? "…"}</span>
+            <span class="slabel">{t("当前版本 v{version}", { version: update?.current ?? "…" })}</span>
             <button
               class="btn btn-secondary btn-sm"
               type="button"
               disabled={checking || updateBusy}
               onclick={() => void checkUpdateNow()}
             >
-              {checking ? "检查中…" : "检查更新"}
+              {checking ? t("检查中…") : t("检查更新")}
             </button>
           </div>
         </div>
@@ -468,12 +526,13 @@
                 disabled={upd.isApplying()}
                 onclick={() => void installUpdateNow()}
               >
-                {upd.isApplying() ? "准备中…" : "下载并安装"}
+                {upd.isApplying() ? t("准备中…") : t("下载并安装")}
               </button>
             </div>
-            <p class="shelp">
-              {update.notes ?? "下载完会打开系统安装器，需要你确认一次安装（非系统应用不能静默安装）。"}
-            </p>
+            <UpdateNotes
+              notes={update.notes}
+              empty={t("下载完会打开系统安装器，需要你确认一次安装（非系统应用不能静默安装）。")}
+            />
           </div>
         {/if}
         {#if update?.phase === "downloading" || update?.phase === "verifying"}
@@ -498,7 +557,7 @@
     <div class="sec">
       <!-- 原型末尾还有一颗「清空全部凭据」（`wipe_credentials`）：危险操作，移动端本阶段不做。 -->
       <button class="btn btn-primary btn-block" type="button" disabled={saving} onclick={() => void save()}>
-        保存设置
+        {t("保存设置")}
       </button>
     </div>
   </div>

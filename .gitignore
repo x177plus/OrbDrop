@@ -22,6 +22,10 @@ scripts/release.local.env
 # 根目录的临时截图：全仓没有任何文档或脚本引用它
 /.shot.png
 
+# 发布/补传时留在根目录的临时物（`.tmp-dmg/` 的 DMG 与 app.zip、`.tmp-upload-*.mjs` 一次性脚本）：
+# 都是本机执行的中间物，不该进仓库 —— DMG/zip 单个十几 MB，补传脚本还会读本机 token。
+/.tmp-*
+
 # 本机演练用的产物缓存：镜像台（scripts/dev-mirror.mjs）直接伺服这个目录。
 # 正式产物在 GitHub/Gitee 的 Release 附件里，不进 git（十几 MB × 每个版本）—— 这条原先是发布仓
 # 单独一个 .gitignore 承担的，单仓化之后归到这里。

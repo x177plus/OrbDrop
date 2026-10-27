@@ -120,7 +120,7 @@ class MessageNotifierPlugin(private val activity: Activity) : Plugin(activity) {
       activity.startActivity(intent)
       invoke.resolve()
     } catch (e: Exception) {
-      invoke.reject("打不开通知设置：请手动进入 设置 → 通知和状态栏 → OrbDrop")
+      invoke.reject(activity.getString(R.string.notif_settings_failed))
     }
   }
 
@@ -156,7 +156,7 @@ class MessageNotifierPlugin(private val activity: Activity) : Plugin(activity) {
       )
       invoke.resolve()
     } catch (e: Exception) {
-      invoke.reject("打不开通知设置：请手动进入 设置 → 通知和状态栏 → OrbDrop")
+      invoke.reject(activity.getString(R.string.notif_settings_failed))
     }
   }
 

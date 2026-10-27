@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
   import Icon from "../Icon.svelte";
+  import { t } from "$lib/i18n.svelte";
 
   // 底板（sheet）的公共外壳：底板 + 遮罩 + 抓手 + 头部 + 可滚动的 body + 可选底部按钮区。
   // 各 sheet 只填内容 —— 免得每张表都自己写一遍 `.sheet-layer` 的定位与关闭手势。
@@ -27,7 +28,7 @@
         <h3 class="sheet-title">{title}</h3>
         {#if desc}<p class="sheet-desc">{desc}</p>{/if}
       </div>
-      <button class="icon-btn" type="button" aria-label="关闭" onclick={onClose}><Icon name="x" /></button>
+      <button class="icon-btn" type="button" aria-label={t("关闭")} onclick={onClose}><Icon name="x" /></button>
     </div>
     {#if children || foot}
       <div class="sheet-body">

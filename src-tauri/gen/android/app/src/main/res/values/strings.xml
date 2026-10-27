@@ -1,13 +1,37 @@
 <resources>
     <string name="app_name">"OrbDrop"</string>
     <string name="main_activity_title">"OrbDrop"</string>
-    <!-- 常驻前台服务那条通知（F-81）：它的作用只是"别让系统把进程回收掉"。 -->
-    <string name="notif_channel_keepalive">保持互联</string>
-    <string name="notif_channel_keepalive_desc">让 OrbDrop 在后台保持在线，别人推过来的文件才不会错过。</string>
-    <string name="notif_keepalive_title">OrbDrop 正在运行</string>
-    <string name="notif_keepalive_text">保持局域网在线，随时接收文件。</string>
-    <!-- 收到消息那一条（F-108）：与上面那条常驻通知**两个渠道** —— 用户可以在系统设置里
-         单独把消息提醒关掉，而"保持互联"那条照旧，后台在线不跟着一起丢。 -->
-    <string name="notif_channel_messages">消息通知</string>
-    <string name="notif_channel_messages_desc">收到设备发来的消息时提醒你；关掉不影响 OrbDrop 在后台保持在线。</string>
+    <!-- The persistent foreground-service notification (F-81): its only job is to keep the system from reclaiming the process. -->
+    <string name="notif_channel_keepalive">"Stay connected"</string>
+    <string name="notif_channel_keepalive_desc">"Keeps OrbDrop online in the background, so files pushed to you are never missed."</string>
+    <string name="notif_keepalive_title">"OrbDrop is running"</string>
+    <string name="notif_keepalive_text">"Online on the local network, ready to receive files."</string>
+    <!-- The incoming-message notification (F-108): a separate channel from the persistent one above, so the
+         message alerts can be turned off on their own in system settings while "Stay connected" keeps running. -->
+    <string name="notif_channel_messages">"Message notifications"</string>
+    <string name="notif_channel_messages_desc">"Notifies you when a device sends you a message. Turning this off does not affect OrbDrop staying online in the background."</string>
+
+    <!-- User-facing errors surfaced from the Android plugins (invoke.reject / thrown exceptions). -->
+    <string name="file_open_not_owned">"Only files owned by this app can be opened: %1$s"</string>
+    <string name="file_open_missing">"The file is gone: %1$s"</string>
+    <string name="file_open_is_directory">"This is a folder: no app on Android can open a directory inside private app storage"</string>
+
+    <string name="pick_open_failed">"Cannot open the system picker"</string>
+    <string name="pick_cache_dir_failed">"Cannot create the send staging directory: %1$s"</string>
+    <string name="pick_read_failed">"Cannot read the selected item: %1$s"</string>
+    <string name="pick_empty">"The selected item is empty: %1$s"</string>
+
+    <string name="paste_cache_dir_failed">"Cannot create the paste staging directory: %1$s"</string>
+    <string name="paste_read_failed">"Cannot read this image from the clipboard: %1$s"</string>
+    <string name="paste_empty">"The image on the clipboard is empty"</string>
+
+    <string name="settings_battery_optimization_failed">"Cannot open battery optimization settings: please go to Settings → Battery → App launch management / More battery settings manually"</string>
+    <string name="settings_autostart_failed">"Cannot open the system settings page: please go to Settings → Apps → OrbDrop and enable autostart / associated startup / background activity manually"</string>
+    <string name="settings_background_power_failed">"Cannot open the system settings page: please go to Settings → Battery → Background power management → OrbDrop and choose Allow background activity / Allow high background power usage"</string>
+
+    <string name="store_no_handler">"No app on this device can handle %1$s"</string>
+
+    <string name="notif_settings_failed">"Cannot open notification settings: please go to Settings → Notifications and status bar → OrbDrop manually"</string>
+
+    <string name="apps_missing_package">"No package name given"</string>
 </resources>

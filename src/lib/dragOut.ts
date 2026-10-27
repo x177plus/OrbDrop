@@ -1,4 +1,5 @@
 import { prepareDragOut, startDragOut } from './api';
+import { t } from '$lib/i18n.svelte';
 import type { DragOutSource } from './types';
 
 /**
@@ -62,7 +63,7 @@ export function dragOut(node: HTMLElement, params: DragOutParams) {
       if (!ticket.ready) {
         // 对端项：平台实现不同（Windows 只问一次元数据就建好占位符；macOS 要先把内容暂存到
         // 镜像目录）。无论哪种，起拖都跟着**按住的主键**走 —— 所以这句必须提醒"按住不放"。
-        p.onMessage?.(`正在准备「${ticket.name}」…（请按住不放）`);
+        p.onMessage?.(t('正在准备「{name}」…（请按住不放）', { name: ticket.name }));
       }
       await startDragOut(ticket.ticket);
     } catch (err) {

@@ -100,8 +100,32 @@ const SPEED_WINDOW: Duration = Duration::from_secs(10);
 /// 镜像记忆的有效期：上次成功的镜像 24 小时内优先用它。没有这条，国内用户每次检查都要
 /// 先把 GitHub 那条超时路径走一遍。
 const MIRROR_PREF_TTL: Duration = Duration::from_secs(24 * 3600);
-/// 静默检查（启动后自动跑的那次）多久内复用上次结论：设置面板每开一次都重新联网没必要。
+/// 静默检查两次之间的**最短间隔**：上一次成功还在这个窗口内就直接复用，不联网。
+///
+/// 判据跨进程（落盘），所以崩溃重启 / 反复拉起不会把镜像打成筛子。
 const SILENT_CHECK_CACHE: Duration = Duration::from_secs(30 * 60);
+/// 启动后第一次静默检查的延迟：启动瞬间是应用最忙的时候（起服务器、注册 mDNS、前端首帧）。
+const STARTUP_CHECK_DELAY: Duration = Duration::from_secs(8);
+/// 运行期间的常态检查间隔。
+///
+/// 6 小时的理由：更新不是急事（本应用刻意不发系统通知）；清单只有几 KB，一天 4 次对
+/// 镜像没有压力；而托盘常驻 / 安卓前台服务都可能几周不重启，"只在启动查"会让更新晚到几天。
+const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+/// 常态间隔的抖动幅度（±30 分钟）：发布当刻所有客户端不会同一秒打同一个镜像。
+const CHECK_JITTER: Duration = Duration::from_secs(30 * 60);
+/// "用户回到前台 / 再次拉起"这一档的最小复查间隔：用户反复切前后台不该反复联网。
+const RESUME_MIN_GAP: Duration = Duration::from_secs(60 * 60);
+/// 静默检查连续失败后的重试间隔；用完之后按 [`CHECK_INTERVAL`]（即 6 小时封顶）。
+const RETRY_BACKOFF: &[Duration] = &[
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(30 * 60),
+    Duration::from_secs(2 * 3600),
+];
+/// 调度器一次最多睡这么久，醒来按墙钟重算。
+///
+/// 休眠/挂起期间单调时钟会停（Linux 的 `CLOCK_MONOTONIC` 就不算挂起时间），一个 6 小时的
+/// `sleep` 在睡了一晚之后可能还剩 5 小时。分段睡 + 墙钟判定才是对的。
+const MAX_SLEEP: Duration = Duration::from_secs(5 * 60);
 /// 进度事件的节流：按"距上次发事件多久"发，而不是按字节 —— 高速镜像上按字节发会把
 /// webview 刷爆，而界面上要的只是"进度条在动"。
 const PROGRESS_EMIT_EVERY: Duration = Duration::from_millis(120);
@@ -258,6 +282,9 @@ pub struct UpdateState {
     pub received: u64,
     /// 当前正在用的镜像主机名（界面显示"正在从 gitee.com 下载"）。
     pub mirror: Option<String>,
+    /// 用户按过「稍后」的那一版：**同版本不再自动弹**（角标仍挂着），更新的一版照弹。
+    /// 落盘在 `update.json`，重启之后同样有效。
+    pub dismissed_version: Option<String>,
     pub error: Option<String>,
 }
 
@@ -275,6 +302,7 @@ impl Default for UpdateState {
             size: None,
             received: 0,
             mirror: None,
+            dismissed_version: None,
             error: None,
         }
     }
@@ -288,14 +316,47 @@ fn platform_name() -> &'static str {
     }
 }
 
+/// 跨进程保存的一小份更新状态（数据目录下的 `update.json`）。
+///
+/// **不塞进 `config.toml`**：它不是用户设置，不该走 `update_settings` 的写路径；与
+/// `push_out.json` 从 `chat.json` 分家同一个理由（"读进来 → 原样写回"会把不认识的顶层键抹掉）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct Persisted {
+    /// 上一次**成功**检查的墙钟时刻（Unix 毫秒）。
+    ///
+    /// 必须用墙钟：`Instant` 在系统挂起/休眠期间不前进，笔记本睡一晚醒来会被当成
+    /// "才过了一小时"，周期检查就被无限推后。
+    last_success_ms: Option<i64>,
+    /// 上次成功检查看到的远端版本（不判断是否比本机新，只用于日志与恢复）。
+    latest_version: Option<String>,
+    /// 上次查到、还没装的那一版：重启后先按它画，等新的检查结果回来再改。
+    available: Option<PersistedAvailable>,
+    /// 用户按过「稍后」的那一版：同版本不再自动弹，新版本照弹。
+    dismissed_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedAvailable {
+    version: String,
+    #[serde(default)]
+    notes: Option<String>,
+    #[serde(default)]
+    pub_date: Option<String>,
+    size: u64,
+}
+
 /// 内部状态：给前端的快照 + "检查到的这一版"（`apply` 直接用它，不重新检查一遍）。
 #[derive(Default)]
 struct Ctl {
     state: UpdateState,
     manifest: Option<Manifest>,
     artifact: Option<Artifact>,
-    /// 上次检查完成的时刻（静默检查的缓存判据）。
-    last_check: Option<Instant>,
+    /// 跨进程的那份小状态（成功时刻 / 上次版本 / 按掉的版本）。
+    persisted: Persisted,
+    /// 连续失败次数：静默检查的退避判据，成功一次归零（不落盘）。
+    failures: u32,
 }
 
 static CTL: std::sync::LazyLock<Mutex<Ctl>> =
@@ -334,31 +395,253 @@ fn in_flight(phase: Phase) -> bool {
 // 启动
 // ---------------------------------------------------------------------------
 
-/// 启动时的一次性装配：填本机版本、清上次更新留下的残渣、安排一次静默检查。
+/// 启动时的一次性装配：填本机版本、恢复上次结论、清残渣、把调度器拉起来。
 pub fn init(app: &AppHandle) {
     let current = app.package_info().version.to_string();
+    let mut persisted = load_persisted();
+    // 上次查到的那一版先画出来：新的检查回来之前（以及这趟失败时）界面不至于空着。
+    let restored = restored_available(&persisted, &current);
+    if restored.is_none() && persisted.available.take().is_some() {
+        // 本机已经装到那一版（或更晚）：过期的"待安装"记录留着只会误报。
+        save_persisted(&persisted);
+    }
     {
         let mut c = ctl().lock();
         c.state.current = current;
         c.state.platform = platform_name();
+        c.state.dismissed_version = persisted.dismissed_version.clone();
+        if let Some(a) = restored {
+            tracing::debug!(version = %a.version, "恢复上次查到的待安装版本");
+            c.state.phase = Phase::Available;
+            c.state.version = Some(a.version);
+            c.state.notes = a.notes;
+            c.state.pub_date = a.pub_date;
+            c.state.size = Some(a.size);
+            // 上一次运行的后台结论：允许主动提示（按掉的版本由 `dismissedVersion` 挡）。
+            c.state.silent = true;
+        }
+        c.persisted = persisted;
     }
     // 上次更新可能留下 `<exe>.old` 或临时目录（helper 自己删不掉的那些）。
     #[cfg(desktop)]
     apply::cleanup_stale();
 
-    // 静默检查：**延迟 8 秒**。启动瞬间是应用自己最忙的时候（起服务器、注册 mDNS、
-    // 前端首帧），没必要再挤一条 HTTPS 进去；而用户真要点"检查更新"也是一分钟后的事。
-    // 查到新版本时界面会**主动弹一格**（桌面是通知组里的一条气泡，手机是一张底板）——
-    // 这一趟的全部意义就在这儿，`state.silent` 就是给界面认这一档用的。
     let handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(8)).await;
-        if let Err(e) = check(handle.clone(), false).await {
-            // 静默检查失败**不弹错**：没网、被墙、镜子挂了都是常态，用户没要求这一趟。
-            // 记日志即可（真要看结果时，设置面板里点一次"检查更新"会给明确报错）。
-            tracing::debug!("启动时的更新检查没成功：{e}");
+    tauri::async_runtime::spawn(async move { supervise(handle).await });
+}
+
+// ---------------------------------------------------------------------------
+// 调度
+// ---------------------------------------------------------------------------
+
+static WAKE: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+/// 叫醒调度器：用户回到前台 / 再次拉起（安卓 Activity Resumed、桌面单实例、macOS Reopen）。
+///
+/// **不是"立刻查"**：查不查由调度器按 [`RESUME_MIN_GAP`] 与失败退避决定 —— 用户反复
+/// 切前后台不该变成反复联网。
+pub fn wake() {
+    WAKE.notify_one();
+}
+
+/// 静默检查的调度循环。
+///
+/// 一条时间线管四档：启动 8 秒、常态 6 小时（带抖动）、回前台（距上次成功 ≥1 小时）、
+/// 失败退避（5m → 30m → 2h → 6h）。[`check`] 自己带着"正在跑就不排队"的闸门，所以这里的
+/// 重复唤醒最多只是白跑一次空转，不会并发打两次网络。
+async fn supervise(app: AppHandle) {
+    let started = now_ms();
+    let startup_delay = STARTUP_CHECK_DELAY.as_millis() as i64;
+    let mut next_at = started + startup_delay;
+
+    loop {
+        let woken = wait_until(next_at, started).await;
+        if woken && !resume_due() {
+            // 回来得太勤（或正在退避）：不动原定时刻。
+            continue;
         }
-    });
+
+        match check(app.clone(), false).await {
+            Ok(_) => {}
+            Err(e) => tracing::debug!("静默检查没成功：{e}"),
+        }
+
+        let now = now_ms();
+        let (phase, failures, last_success) = {
+            let c = ctl().lock();
+            (c.state.phase, c.failures, c.persisted.last_success_ms)
+        };
+        next_at = if in_flight(phase) {
+            // 手动检查 / 下载正在跑：不跟它抢，过一会儿再看结论。
+            now + 60_000
+        } else if failures > 0 {
+            now + retry_delay(failures).as_millis() as i64
+        } else {
+            due_after_success(
+                now,
+                last_success,
+                check_interval(),
+                random_jitter(jitter_span()),
+            )
+        };
+        tracing::debug!(?phase, in_ms = next_at - now, failures, "下一次更新检查已排好");
+    }
+}
+
+/// 睡到 `next_at`；被 [`wake`] 叫醒时返回 `true`。
+///
+/// 启动后的前 8 秒叫醒**不算**：安卓 Activity 起来时本来就会来一拍，不能让它绕过
+/// "启动让一让"的延迟。
+async fn wait_until(next_at: i64, started: i64) -> bool {
+    loop {
+        let now = now_ms();
+        if now >= next_at {
+            return false;
+        }
+        let sleep_ms = (next_at - now).min(MAX_SLEEP.as_millis() as i64) as u64;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
+            _ = WAKE.notified() => {
+                if now_ms() - started < STARTUP_CHECK_DELAY.as_millis() as i64 {
+                    continue;
+                }
+                return true;
+            }
+        }
+    }
+}
+
+/// 回前台这一档要不要查：正在跑就不插队；成功过一次且不足 [`RESUME_MIN_GAP`] 就不查；
+/// 失败退避期间也不查（别让"反复切前后台"把退避冲掉）。
+fn resume_due() -> bool {
+    let c = ctl().lock();
+    if in_flight(c.state.phase) || c.failures > 0 {
+        return false;
+    }
+    match c.persisted.last_success_ms {
+        Some(ms) => now_ms().saturating_sub(ms) >= RESUME_MIN_GAP.as_millis() as i64,
+        None => true,
+    }
+}
+
+/// 成功后下一次：以**上次成功时刻**为基准 + 间隔 + 抖动；时钟往回跳时以 `now` 为基准兜底。
+///
+/// 用上次成功而不是"现在"：启动时那次可能只是命中缓存（`SILENT_CHECK_CACHE`），
+/// 没有真的联网，按"现在 + 6h"会把周期往后推。
+///
+/// 下限取 `min(间隔, 60 秒)`：正常 6 小时间隔下这是防"时钟回拨 → 立刻重查"的护栏；
+/// 演练把间隔缩到 15 秒时不能还被 60 秒压住（否则验证不了周期）。
+fn due_after_success(
+    now: i64,
+    last_success_ms: Option<i64>,
+    interval: Duration,
+    jitter: Duration,
+) -> i64 {
+    let interval = interval.as_millis() as i64;
+    let jitter = jitter.as_millis() as i64;
+    let from_now = now.saturating_add(interval).saturating_add(jitter);
+    let from_success = last_success_ms
+        .map(|ms| ms.saturating_add(interval).saturating_add(jitter))
+        .unwrap_or(from_now);
+    let floor = now.saturating_add(interval.min(60_000).max(1_000));
+    from_success.min(from_now).max(floor)
+}
+
+/// 第 `failures` 次连续失败之后等多久再试；退避用完就按常态间隔（6 小时封顶）。
+fn retry_delay(failures: u32) -> Duration {
+    let idx = failures.saturating_sub(1) as usize;
+    RETRY_BACKOFF.get(idx).copied().unwrap_or_else(check_interval)
+}
+
+/// 常态间隔；演练/冒烟时用 `ORBDROP_UPDATE_INTERVAL_SECS` 缩短（只用来验证调度）。
+fn check_interval() -> Duration {
+    std::env::var("ORBDROP_UPDATE_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(CHECK_INTERVAL)
+}
+
+/// 静默检查的最短间隔：默认 30 分钟；演练把周期缩到秒级时跟着缩（`interval / 2`），
+/// 否则每一拍都会被缓存拦掉，验证不了周期检查。
+fn silent_cache_window() -> Duration {
+    SILENT_CHECK_CACHE.min(check_interval() / 2)
+}
+
+/// 抖动窗口：默认 ±30 分钟（`CHECK_JITTER × 2` 的跨度）。
+///
+/// 演练时（设了 `ORBDROP_UPDATE_INTERVAL_SECS`）跟着间隔缩到 1/5：15 秒的间隔配 30 分钟
+/// 抖动，等于把周期检查推迟到本轮运行之外，没法验证。
+fn jitter_span() -> Duration {
+    if std::env::var_os("ORBDROP_UPDATE_INTERVAL_SECS").is_some() {
+        Duration::from_millis((check_interval().as_millis() as u64 / 5).max(1))
+    } else {
+        CHECK_JITTER * 2
+    }
+}
+
+/// `[0, span)` 的随机抖动。
+fn random_jitter(span: Duration) -> Duration {
+    use rand::Rng;
+    Duration::from_millis(rand::thread_rng().gen_range(0..span.as_millis().max(1) as u64))
+}
+
+// ---------------------------------------------------------------------------
+// 跨进程状态（`update.json`）
+// ---------------------------------------------------------------------------
+
+fn persisted_path() -> PathBuf {
+    crate::config::data_dir().join("update.json")
+}
+
+fn load_persisted() -> Persisted {
+    let path = persisted_path();
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            tracing::warn!(path = %path.display(), "更新状态文件读不动（忽略）：{e}");
+            Persisted::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Persisted::default(),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), "读更新状态文件失败（忽略）：{e}");
+            Persisted::default()
+        }
+    }
+}
+
+fn save_persisted(p: &Persisted) {
+    let path = persisted_path();
+    let bytes = match serde_json::to_vec_pretty(p) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("更新状态序列化失败：{e}");
+            return;
+        }
+    };
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(dir = %dir.display(), "建不了数据目录：{e}");
+            return;
+        }
+    }
+    if let Err(e) = crate::config::write_atomic(&path, &bytes) {
+        tracing::warn!(path = %path.display(), "写更新状态文件失败：{e}");
+    }
+}
+
+fn save_persisted_now() {
+    let p = ctl().lock().persisted.clone();
+    save_persisted(&p);
+}
+
+/// 恢复上次查到的"待安装"版本：只在本机还没装上（远端更高）时返回。
+fn restored_available(p: &Persisted, current: &str) -> Option<PersistedAvailable> {
+    let a = p.available.as_ref()?;
+    let mine = parse_version(current).ok()?;
+    let remote = parse_version(&a.version).ok()?;
+    (remote > mine).then(|| a.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -367,56 +650,62 @@ pub fn init(app: &AppHandle) {
 
 /// 检查更新。
 ///
-/// `force = true`（用户手动点）忽略静默检查的 30 分钟缓存与镜像记忆；`false` 是启动那次。
+/// `force = true`（用户手动点）忽略静默检查的 30 分钟缓存与失败退避；`false` 是后台调度。
 /// 这一位同时决定了快照里的 [`UpdateState::silent`] —— 界面据它区分"后台自己查到的"与
 /// "用户要看的结果"，前者要主动弹一格。
 /// 已经有检查/下载在跑时**不排队、不报错**，直接把当前快照还回去 —— 界面跟着事件走就行。
 pub async fn check(app: AppHandle, force: bool) -> Result<UpdateState, String> {
-    {
+    let preserve = {
         let c = ctl().lock();
         if in_flight(c.state.phase) {
             return Ok(c.state.clone());
         }
-        // 静默检查：上一次结论还在有效期内就直接复用，不联网。
+        // 静默检查：上一次结论还在有效期内就直接复用，不联网（判据跨进程）。
         if !force {
-            if let Some(at) = c.last_check {
-                if at.elapsed() < SILENT_CHECK_CACHE {
+            if let Some(ms) = c.persisted.last_success_ms {
+                if now_ms().saturating_sub(ms) < silent_cache_window().as_millis() as i64 {
                     return Ok(c.state.clone());
                 }
             }
         }
-    }
+        // 已经查到一版、等用户决定时，后台这趟**不把界面推回 `checking`**：那会让
+        // 气泡/角标消失几百毫秒再回来。结果照常更新；失败则原样保留。
+        !force && c.state.phase == Phase::Available
+    };
 
-    put(&app, |c| {
-        c.state.phase = Phase::Checking;
-        c.state.error = None;
-        c.state.received = 0;
-        // **整个检查过程都带着这个标记**（后面几步只改阶段，不动它）：它说的是"这份结论
-        // 是谁要的"，不是一个阶段的属性 —— 下载/校验那几步下面接着跑，界面靠它认得这一格
-        // 是不是自己弹出来的。
-        c.state.silent = !force;
-    });
+    if !preserve {
+        put(&app, |c| {
+            c.state.phase = Phase::Checking;
+            c.state.error = None;
+            c.state.received = 0;
+            // **整个检查过程都带着这个标记**（后面几步只改阶段，不动它）：它说的是"这份结论
+            // 是谁要的"，不是一个阶段的属性 —— 下载/校验那几步下面接着跑，界面靠它认得这一格
+            // 是不是自己弹出来的。
+            c.state.silent = !force;
+        });
+    }
 
     let manifest = match fetch_manifest(&app).await {
         Ok(m) => m,
-        Err(e) => {
-            put(&app, |c| {
-                c.state.phase = Phase::Error;
-                c.state.error = Some(e.clone());
-                c.last_check = None;
-            });
-            return Err(e);
-        }
+        Err(e) => return fail_check(&app, preserve, !force, e),
     };
 
-    let current = parse_version(&snapshot().current)?;
-    let remote = parse_version(&manifest.version)?;
+    let current = match parse_version(&snapshot().current) {
+        Ok(v) => v,
+        Err(e) => return fail_check(&app, preserve, !force, e),
+    };
+    let remote = match parse_version(&manifest.version) {
+        Ok(v) => v,
+        Err(e) => return fail_check(&app, preserve, !force, e),
+    };
 
     // 版本比本机高才算有更新。**降级不装**（用户自测时把 0.1.0 退回 0.0.1 那次就是靠这条
     // 兜的）：自更新一旦会降级，线上出事故想回滚就得先发一个"版本号更高但内容是旧的"版本，
     // 那是另一套流程，这里不掺进来。
     if remote <= current {
-        put(&app, |c| {
+        let state = {
+            let mut c = ctl().lock();
+            let now = now_ms();
             c.manifest = None;
             c.artifact = None;
             c.state.phase = Phase::Uptodate;
@@ -424,28 +713,93 @@ pub async fn check(app: AppHandle, force: bool) -> Result<UpdateState, String> {
             c.state.notes = manifest.notes.clone();
             c.state.pub_date = manifest.pub_date.clone();
             c.state.size = None;
-            c.last_check = Some(Instant::now());
-        });
-        return Ok(snapshot());
+            c.state.received = 0;
+            c.state.error = None;
+            c.state.silent = !force;
+            c.state.dismissed_version = c.persisted.dismissed_version.clone();
+            c.persisted.last_success_ms = Some(now);
+            c.persisted.latest_version = Some(manifest.version.clone());
+            c.persisted.available = None;
+            c.failures = 0;
+            c.state.clone()
+        };
+        let _ = app.emit(ui::UPDATE_STATE, state.clone());
+        save_persisted_now();
+        return Ok(state);
     }
 
-    let artifact = manifest.artifact_for_this_platform()?;
+    let artifact = match manifest.artifact_for_this_platform() {
+        Ok(a) => a,
+        Err(e) => return fail_check(&app, preserve, !force, e),
+    };
     // 安卓的安装门槛在 versionCode 上，不在版本号上：清单的版本号更高但 versionCode 没涨时，
     // 系统会以 `INSTALL_FAILED_VERSION_DOWNGRADE` 拒装（用户看到的是"安装失败"，看不出原因）。
     // 这种事只会发生在发布方漏了递增，所以在**检查阶段**就说清楚。
     #[cfg(mobile)]
-    ensure_installable(&current, &manifest)?;
-    put(&app, |c| {
+    if let Err(e) = ensure_installable(&current, &manifest) {
+        return fail_check(&app, preserve, !force, e);
+    }
+
+    let state = {
+        let mut c = ctl().lock();
+        let now = now_ms();
+        tracing::info!(version = %manifest.version, "检查到新版本");
         c.state.phase = Phase::Available;
         c.state.version = Some(manifest.version.clone());
         c.state.notes = manifest.notes.clone();
         c.state.pub_date = manifest.pub_date.clone();
         c.state.size = Some(artifact.size);
-        c.last_check = Some(Instant::now());
+        c.state.received = 0;
+        c.state.error = None;
+        c.state.silent = !force;
+        // 用户手动查的那次是明确想看结论：之前按过「稍后」也重新给一次。
+        if force {
+            c.persisted.dismissed_version = None;
+        }
+        c.state.dismissed_version = c.persisted.dismissed_version.clone();
+        c.persisted.last_success_ms = Some(now);
+        c.persisted.latest_version = Some(manifest.version.clone());
+        c.persisted.available = Some(PersistedAvailable {
+            version: manifest.version.clone(),
+            notes: manifest.notes.clone(),
+            pub_date: manifest.pub_date.clone(),
+            size: artifact.size,
+        });
         c.artifact = Some(artifact);
         c.manifest = Some(manifest);
+        c.failures = 0;
+        c.state.clone()
+    };
+    let _ = app.emit(ui::UPDATE_STATE, state.clone());
+    save_persisted_now();
+    Ok(state)
+}
+
+/// 检查失败：**后台这趟**（`preserve`）不动界面，只把错误交给调用方（调度器据此退避）；
+/// 用户自己点的那次才推 `error`（界面要看见原因）。
+fn fail_check(
+    app: &AppHandle,
+    preserve: bool,
+    count_failure: bool,
+    e: String,
+) -> Result<UpdateState, String> {
+    {
+        let mut c = ctl().lock();
+        // 只有后台那趟算"连续失败"：用户手动点的那次失败了，不该替后台排一条退避
+        // （他可能只是在没网的时候试了一下，后台该按自己的节奏走）。
+        if count_failure {
+            c.failures = c.failures.saturating_add(1);
+        }
+        if preserve {
+            tracing::debug!("后台检查失败，保留已查到的版本：{e}");
+            return Err(e);
+        }
+    }
+    put(app, |c| {
+        c.state.phase = Phase::Error;
+        c.state.error = Some(e.clone());
     });
-    Ok(snapshot())
+    Err(e)
 }
 
 /// 安卓端的安装门槛：清单里的 versionCode 必须**大于**本机已装的那个。
@@ -1072,6 +1426,25 @@ pub fn update_state() -> UpdateState {
 #[tauri::command]
 pub async fn update_check(app: AppHandle, force: bool) -> Result<UpdateState, String> {
     check(app, force).await
+}
+
+/// 记下「稍后」的是哪一版：快照与落盘两份一起改（只有这一个入口，别处不要各写一份）。
+fn mark_dismissed(c: &mut Ctl, version: String) {
+    c.persisted.dismissed_version = Some(version.clone());
+    c.state.dismissed_version = Some(version);
+}
+
+/// 用户按掉「稍后」/「知道了」：记下**这一版**（落盘），同版本不再自动弹、角标照旧；
+/// 更新的一版仍然会弹。手动「检查更新」会把它清掉，让用户重新看见结论。
+#[tauri::command]
+pub fn update_dismiss(app: AppHandle, version: Option<String>) -> UpdateState {
+    let chosen = version.or_else(|| snapshot().version);
+    let Some(version) = chosen else {
+        return snapshot();
+    };
+    put(&app, |c| mark_dismissed(c, version));
+    save_persisted_now();
+    snapshot()
 }
 
 #[tauri::command]

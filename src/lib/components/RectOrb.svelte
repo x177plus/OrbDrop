@@ -4,6 +4,7 @@
   import { RECT_CARD_W } from '$lib/orbShape';
   import Logo from '$lib/components/Logo.svelte';
   import type { OrbDragInfo, RectPage } from '$lib/types';
+  import { t } from '$lib/i18n.svelte';
 
   /**
    * 圆角矩形悬浮框（`design/orbdrop-rect-orb.html`）：收起态的另一种形态。
@@ -416,10 +417,10 @@
    * 钻进去之后说的就是"这个文件夹里有什么"。
    */
   function pageLabel(page: RectPage): string {
-    if (page.dir) return `${page.name}，${page.dir.full}，${page.items.length} 项`;
+    if (page.dir) return t('{name}，{path}，{n} 项', { name: page.name, path: page.dir.full, n: page.items.length });
     return page.kind === 'local'
-      ? `${page.name}，${page.items.length} 个共享项`
-      : `${page.name}，${page.items.length} 个可见共享项`;
+      ? t('{name}，{n} 个共享项', { name: page.name, n: page.items.length })
+      : t('{name}，{n} 个可见共享项', { name: page.name, n: page.items.length });
   }
 
   /**
@@ -440,7 +441,7 @@
   bind:this={wrapEl}
   inert={expanded}
   role="group"
-  aria-label="OrbDrop 悬浮框：设备分页与共享项"
+  aria-label={t('OrbDrop 悬浮框：设备分页与共享项')}
   style="--rq-w: {RECT_CARD_W}px"
   onwheel={onWheel}
   onpointerdown={onPointerDown}
@@ -456,9 +457,9 @@
          **本机在途的推送卡不算** —— 那是自己在做事，不是有事等你）；右 = 长连接设备数（绿，同球右上那颗）。
          翻页时轻微呼吸一下，和翻页动作产生关联。 -->
     <span class="rq-shellbadge is-alert num" bind:this={alertBadgeEl} role="img" hidden={notifCount === 0}
-      aria-label="待处理 {notifCount} 条：通知、未读消息与群邀请">{notifCount}</span>
+      aria-label={t('待处理 {n} 条：通知、未读消息与群邀请', { n: notifCount })}>{notifCount}</span>
     <span class="rq-shellbadge is-devices num" bind:this={devBadgeEl} role="img" hidden={deviceCount === 0}
-      aria-label="长连接设备 {deviceCount} 台">{deviceCount}</span>
+      aria-label={t('长连接设备 {n} 台', { n: deviceCount })}>{deviceCount}</span>
 
     <!-- 贴边收起态的内容（`.rq-dock`）在每张卡**里面**（见下面 `article` 的末尾）：卡片滑出屏幕时
          被屏幕边裁掉的是卡片自己，所以露在屏内的那一条左侧是卡片自己的圆角、右侧是切口 ——
@@ -493,7 +494,7 @@ bind:this={cardEls[i]}
               <span class="rq-ip num" title={page.ip}>{page.ip}</span>
             {/if}
             <span class="rq-count num">
-              {page.loading ? '…' : page.error ? '—' : `${page.items.length} 项`}
+              {page.loading ? '…' : page.error ? '—' : t('{n} 项', { n: page.items.length })}
             </span>
           </div>
         </header>
@@ -508,13 +509,13 @@ bind:this={cardEls[i]}
             bind:this={scrollers[i]}
             tabindex="0"
             role="group"
-            aria-label="{pageLabel(page)}：上下方向键滚动列表，滚到底后继续即翻页"
+            aria-label={t('{label}：上下方向键滚动列表，滚到底后继续即翻页', { label: pageLabel(page) })}
             onkeydown={(e) => onKeydown(e, i)}
             onscroll={() => onScroll(i)}
           >
             {#if page.loading && page.items.length === 0}
               <div class="rq-empty">
-                <p>{page.dir ? `正在读取「${page.dir.label}」…` : `正在读取「${page.name}」的共享项…`}</p>
+                <p>{page.dir ? t('正在读取「{label}」…', { label: page.dir.label }) : t('正在读取「{name}」的共享项…', { name: page.name })}</p>
               </div>
             {:else if page.error}
               <div class="rq-empty">
@@ -522,8 +523,8 @@ bind:this={cardEls[i]}
                 <p>{page.error}</p>
                 <p class="rq-empty-sub">
                   {page.dir
-                    ? '回上一层再试一次'
-                    : page.kind === 'local' ? '确认共享项还在磁盘上' : '确认双方仍在长连接状态后重试'}
+                    ? t('回上一层再试一次')
+                    : page.kind === 'local' ? t('确认共享项还在磁盘上') : t('确认双方仍在长连接状态后重试')}
                 </p>
               </div>
             {:else if page.items.length === 0 && !page.up}
@@ -534,11 +535,11 @@ bind:this={cardEls[i]}
               <div class="rq-empty">
                 {@html ICON_EMPTY}
                 {#if page.kind === 'local'}
-                  <p>还没有共享项</p>
-                  <p class="rq-empty-sub">拖入文件或文件夹到悬浮框即可添加</p>
+                  <p>{t('还没有共享项')}</p>
+                  <p class="rq-empty-sub">{t('拖入文件或文件夹到悬浮框即可添加')}</p>
                 {:else}
-                  <p>对方还没有向本机广播共享项</p>
-                  <p class="rq-empty-sub">对方打开共享项的广播开关后会自动出现</p>
+                  <p>{t('对方还没有向本机广播共享项')}</p>
+                  <p class="rq-empty-sub">{t('对方打开共享项的广播开关后会自动出现')}</p>
                 {/if}
               </div>
             {:else}
@@ -549,8 +550,8 @@ bind:this={cardEls[i]}
                        它是这张列表的出口，不是某一层里的东西。 -->
                   <li
                     class="rq-item is-up"
-                    title="回到「{page.up.name}」"
-                    aria-label="返回上一级：{page.up.name}"
+                    title={t('回到「{name}」', { name: page.up.name })}
+                    aria-label={t('返回上一级：{name}', { name: page.up.name })}
                     onpointerdown={(e) => e.stopPropagation()}
                     ondblclick={() => onUp(i)}
                   >
@@ -590,7 +591,7 @@ bind:this={cardEls[i]}
                 {#if page.up && page.items.length === 0}
                   <!-- 空目录：只说明"这里没东西"。不是条目、不吃指针（`is-void`）。 -->
                   <li class="rq-item is-void" aria-hidden="true">
-                    <span class="rq-itxt"><span class="rq-iname">空文件夹</span></span>
+                    <span class="rq-itxt"><span class="rq-iname">{t('空文件夹')}</span></span>
                   </li>
                 {/if}
               </ul>
@@ -621,7 +622,7 @@ bind:this={cardEls[i]}
        整列不画（没得翻）。位置照旧占着 —— 窗口尺寸是定尺（`orbShape.ts` 的 `rectLayout`），
        不因为这列画不画而变。 -->
   {#if pages.length > 1}
-    <nav class="rq-dots" aria-label="设备分页">
+    <nav class="rq-dots" aria-label={t('设备分页')}>
       <div class="rq-dotlist" bind:this={dotListEl} style="--rq-dot-shift: {dotShift}px">
         {#each pages as page, i (page.id)}
           <button
@@ -631,7 +632,7 @@ bind:this={cardEls[i]}
             bind:this={dotEls[i]}
             data-dot={i}
             style="opacity: {dotOpacities[i] ?? 0.07}"
-            aria-label="切换到 {page.name}"
+            aria-label={t('切换到 {name}', { name: page.name })}
             aria-current={i === idx ? 'true' : undefined}
             onkeydown={(e) => {
               if (e.key !== 'Enter' && e.key !== ' ') return;
@@ -646,5 +647,5 @@ bind:this={cardEls[i]}
 </div>
 
 <p class="rq-sr" aria-live="polite">
-  {pageLabel(activePage)}，第 {idx + 1} 页，共 {pages.length} 页
+  {t('{label}，第 {page} 页，共 {total} 页', { label: pageLabel(activePage), page: idx + 1, total: pages.length })}
 </p>

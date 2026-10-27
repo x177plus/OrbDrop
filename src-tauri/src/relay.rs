@@ -353,6 +353,14 @@ pub async fn open(
     if !state.config.lock().allow_relay {
         return Err(OpenError::Disabled);
     }
+    // 本机自己既不能当目标、也不能当请求方：请求方那一半是"选路把自己当成了中转候选"
+    // （池里留着一条指向本机的旧地址），会在核实阶段把自己登记成一台设备。
+    let own_id = state.own_id().to_string();
+    if requester == own_id.as_str() {
+        return Err(OpenError::NotEligible(
+            "不能把本机自己作为中转请求方".into(),
+        ));
+    }
     if requester == target {
         return Err(OpenError::NotEligible(
             "不能把请求方自己作为中转目标".into(),
@@ -361,8 +369,7 @@ pub async fn open(
     // 本机自己不能当中转目标：本机不在地址簿里，请求方却可以拿 `/pair/info` 问出本机 id
     // 再把 `addr` 填成 `127.0.0.1:<本机端口>`。那会让裸 TCP 中转连回自己的回环监听，
     // 目标端于是把这条连接当成本机 UI（免认证）—— 见 `forbidden_relay_target` 的说明。
-    let own_id = state.config.lock().device_id.clone();
-    if target == own_id {
+    if target == own_id.as_str() {
         debug!(%target, "中转请求被拒：不能把本机自己作为中转目标");
         return Err(OpenError::NotEligible(
             "不能把本机自己作为中转目标".into(),
@@ -971,7 +978,11 @@ fn relay_candidates(state: &AppState, target: &str, target_cidrs: &[String]) -> 
     let mut tiers: Vec<(u8, Candidate)> = Vec::new();
     {
         let add = |tier: u8, id: &str, tiers: &mut Vec<(u8, Candidate)>| {
-            if id == target || id.is_empty() {
+            // 本机自己永远不是中转候选：反向记录 / 落盘的池里可能留着一条指向本机的
+            // id 与地址（接收侧有 own-id 闸，这里是使用侧的最后一道）。少了这一挡，
+            // "请中转"会 POST 到自己的监听端点 —— 服务端核实请求方（本机）之后就把
+            // 自己登记成了一台在线设备（真机：更新重启后列表里出现本机）。
+            if id == target || id.is_empty() || id == state.own_id() {
                 return;
             }
             let row = peers.iter().find(|p| p.id == id);
@@ -988,6 +999,12 @@ fn relay_candidates(state: &AppState, target: &str, target_cidrs: &[String]) -> 
             };
             let (name, host, port, paired) = resolved;
             if host.is_empty() || port == 0 {
+                return;
+            }
+            // 地址兜底：池里那条可能挂着**别的 id**、地址却是本机的监听端点（旧配置 /
+            // DHCP 换号后的残留）。判据与入站会话那一侧同一套：地址在本机网卡上、端口
+            // 正好是本机在听的那个 = 本机自己（同机多开的另一个端口仍然合法）。
+            if is_own_endpoint(state, &host, port) {
                 return;
             }
             tiers.push((
@@ -1055,6 +1072,19 @@ fn relay_candidates(state: &AppState, target: &str, target_cidrs: &[String]) -> 
         out.sort_by_key(|c| u8::from(c.id == bad));
     }
     out
+}
+
+/// `host:port` 是不是**本机自己在听的那个端点**（判据与入站会话那一侧同一套，
+/// 见 `net::observed_dial_target` 与 `net::is_own_endpoint` 的说明）。
+///
+/// 候选的地址来自对端报来的池 / 落盘的 `viaAddrs`：池里的 id 可能还是**别台设备**，
+/// 地址却已经指向本机（旧配置、DHCP 换号后的残留、或对端把自己那条推回来的池）。
+/// 拨它等于向自己请中转，服务的核实随后会把本机登记成一台设备。
+fn is_own_endpoint(state: &AppState, host: &str, port: u16) -> bool {
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    crate::net::observed_dial_target(ip, port, state.listening_port()).is_none()
 }
 
 /// 一条消息既直连不通、又没有可用的中转时，把**为什么**报到界面上（F-106）。
@@ -1360,6 +1390,19 @@ fn routes_where(state: &AppState, keep: impl Fn(&crate::subnet::Cidr) -> bool) -
     out
 }
 
+/// 把记录里**收件人自己**那一项剔掉；池被剔空的记录整条丢弃。
+///
+/// 只剔 `via_devices`（地址半份跟着 id 走，`via_devices` 空 = 纪录没有候选中转方，
+/// 接收方留着的 `viaAddrs` 也拨不动）；`via_paired` 是同一批 id 的标注，一起剔。
+fn without_recipient(mut routes: Vec<RouteRecord>, peer_id: &str) -> Vec<RouteRecord> {
+    routes.retain_mut(|r| {
+        r.via_devices.retain(|d| d.id != peer_id);
+        r.via_paired.retain(|id| id != peer_id);
+        !r.via_devices.is_empty()
+    });
+    routes
+}
+
 /// 把本机的中转记忆推给这台对端（F-107 §10）。
 ///
 /// 由 5s 探活的"它在线"那一档调用（直连与中转两条路都会走到）。三道闸：
@@ -1385,6 +1428,12 @@ pub fn maybe_send_route(state: &Arc<AppState>, peer_id: &str) {
     } else {
         routes_for(state, &peer.ip)
     };
+    // **一条路由不能点名收件人自己当中转方**。记录里的池是"这一段该经谁中转"，而
+    // `routes_where` 会把池里那几台的 `viaAddrs` 一并带上 —— 对端的池里可能还留着本机
+    // 的地址（`viaAddrs` 是"最后已知事实"，锚点离散后也不清）。推给 P 的记录里必须剔掉 P：
+    // 否则 P 收下后池里就多了"自己"，重启后的第一拍会向自己请中转，把自己登记成一台
+    // **在线设备**（真机：更新完成、应用重启后，设备列表里出现本机）。
+    let routes = without_recipient(routes, peer_id);
     if routes.is_empty() {
         return;
     }
@@ -1577,6 +1626,12 @@ mod tests {
         let state = Arc::new(AppState::new(config, config_path));
         let from: StdIpAddr = "192.0.2.10".parse().unwrap();
 
+        let err = match open(&state, &own_id, from, "some-other-device", None, false).await {
+            Err(e) => e,
+            Ok(_) => panic!("本机自己不能当中转请求方"),
+        };
+        assert!(matches!(err, OpenError::NotEligible(_)));
+
         let err = match open(&state, "attacker", from, &own_id, None, false).await {
             Err(e) => e,
             Ok(_) => panic!("本机自己不能当中转目标"),
@@ -1612,5 +1667,145 @@ mod tests {
             Ok(_) => panic!("IPv4 映射的回环地址同样不能当中转目标"),
         };
         assert!(matches!(err, OpenError::NotEligible(_)));
+    }
+
+    /// 更新重启后的真机回归：对端推回来的反向记录里点名本机、而本机正是收件人时，
+    /// 推给对端之前先剔掉收件人自己；池被剔空的记录整条丢弃。
+    #[test]
+    fn a_route_pushed_to_a_peer_never_names_that_peer() {
+        let dev = |id: &str| RouteDevice {
+            id: id.into(),
+            name: id.to_uppercase(),
+            ip: "10.20.30.40".into(),
+            port: 3890,
+        };
+        let record = |devices: Vec<RouteDevice>, paired: Vec<String>| RouteRecord {
+            target_cidr: "10.20.30.0/24".into(),
+            via_cidr: "10.20.30.0/24".into(),
+            via_devices: devices,
+            via_paired: paired,
+            confirmed_at: None,
+        };
+        let out = without_recipient(
+            vec![record(
+                vec![dev("recipient"), dev("peer-c")],
+                vec!["recipient".into()],
+            )],
+            "recipient",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0]
+                .via_devices
+                .iter()
+                .map(|d| d.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["peer-c"],
+            "收件人自己不能出现在它收到的池里"
+        );
+        assert!(out[0].via_paired.is_empty());
+        assert!(
+            without_recipient(
+                vec![record(vec![dev("recipient")], vec!["recipient".into()])],
+                "recipient"
+            )
+            .is_empty(),
+            "只剩收件人自己的记录整条丢弃"
+        );
+    }
+
+    fn memory_state(own_id: &str) -> Arc<AppState> {
+        let dir = std::env::temp_dir().join(format!(
+            "orbdrop_relay_self_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(AppState::new(
+            crate::config::Config {
+                device_id: own_id.into(),
+                device_name: "OWN".into(),
+                relay_memory: true,
+                ..Default::default()
+            },
+            dir.join("config.toml"),
+        ))
+    }
+
+    /// 池里留着本机自己的 id/地址（旧配置 / 对端推回来的记录）时，选路永远不把自己当中转：
+    /// 否则会向自己的监听端点 POST `/relay/open`，服务端核实"请求方 = 本机"后把自己登记成
+    /// 一台在线设备（真机：更新重启后设备列表里出现自己）。
+    #[test]
+    fn relay_candidates_never_include_the_local_device() {
+        let state = memory_state("own-relay");
+        {
+            let mut config = state.config.lock();
+            let route = config.relay_route_mut("10.20.30.0/24");
+            route.via_cidr = "10.20.30.0/24".into();
+            route.via_devices = vec!["own-relay".into(), "peer-c".into()];
+            route.via_addrs = vec![
+                RouteDevice {
+                    id: "own-relay".into(),
+                    name: "OWN".into(),
+                    ip: "10.20.30.40".into(),
+                    port: 3890,
+                },
+                RouteDevice {
+                    id: "peer-c".into(),
+                    name: "C".into(),
+                    ip: "10.20.30.41".into(),
+                    port: 3890,
+                },
+            ];
+        }
+        state.upsert_peer(&crate::config::PeerDevice {
+            id: "peer-c".into(),
+            name: "C".into(),
+            ip: "10.20.30.41".into(),
+            port: 3890,
+            online: true,
+            ..Default::default()
+        });
+        let ids: Vec<String> = relay_candidates(&state, "target-x", &["10.20.30.0/24".into()])
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(
+            ids.contains(&"peer-c".to_string()),
+            "正常的池成员仍要被选中：{ids:?}"
+        );
+        assert!(
+            !ids.contains(&"own-relay".to_string()),
+            "本机自己永远不是候选：{ids:?}"
+        );
+    }
+
+    /// 池里那条挂着**别台 id**、地址却是本机监听端点的旧记录也不能拨（同机多开的另一个
+    /// 端口是合法对端，不能误伤）。
+    #[test]
+    fn relay_candidates_skip_addresses_that_are_our_own_listener() {
+        let state = memory_state("own-relay");
+        for (id, port) in [("stale-own", 3890_u16), ("second-instance", 3891)] {
+            state.upsert_peer(&crate::config::PeerDevice {
+                id: id.into(),
+                name: id.to_uppercase(),
+                ip: "127.0.0.1".into(),
+                port,
+                online: true,
+                ..Default::default()
+            });
+            state.set_relay_capable(id, true);
+        }
+        let ids: Vec<String> = relay_candidates(&state, "target-x", &[])
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(
+            !ids.contains(&"stale-own".to_string()),
+            "指向本机监听端点的 id 不许当候选：{ids:?}"
+        );
+        assert!(
+            ids.contains(&"second-instance".to_string()),
+            "同机多开的另一个端口是合法对端：{ids:?}"
+        );
     }
 }

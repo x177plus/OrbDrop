@@ -1,5 +1,6 @@
 <script lang="ts">
   import { imageDataUrl } from '$lib/images';
+  import { t } from '$lib/i18n.svelte';
   import { onDestroy, type Snippet } from 'svelte';
 
   /**
@@ -14,7 +15,7 @@
    */
   let {
     path,
-    label = '图片',
+    label = '',
     onopen,
     onlayout,
     flush = false,
@@ -79,15 +80,15 @@
       class="ip-thumb"
       class:flush
       type="button"
-      title="点一下看大图"
-      aria-label="看大图：{label}"
+      title={t('点一下看大图')}
+      aria-label={t('看大图：{label}', { label: label || t('图片') })}
       onclick={onopen}
     >
-      <img src={url} alt={label} draggable="false" onload={onlayout} />
+      <img src={url} alt={label || t('图片')} draggable="false" onload={onlayout} />
     </button>
   {:else}
     <span class="ip-thumb static" class:flush>
-      <img src={url} alt={label} draggable="false" onload={onlayout} />
+      <img src={url} alt={label || t('图片')} draggable="false" onload={onlayout} />
     </span>
   {/if}
 {:else}

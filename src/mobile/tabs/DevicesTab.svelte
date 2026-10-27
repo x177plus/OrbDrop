@@ -6,6 +6,7 @@
   import * as devices from "$lib/stores/devices.svelte";
   import * as settings from "$lib/stores/settings.svelte";
   import * as chat from "$lib/stores/chat.svelte";
+  import { t } from "$lib/i18n.svelte";
   import type { PeerDevice } from "$lib/types";
 
   // 哪些行该列、按什么序，交给 `visibleDevices`（离线且未绑定的不列：它没有任何可做的动作；
@@ -29,14 +30,14 @@
    */
   function pendingLabel(unread: number, pending: number): string {
     return [
-      unread ? `${unread} 条未读消息` : '',
-      pending ? `${pending} 条待接收推送` : '',
+      unread ? t("{n} 条未读消息", { n: unread }) : '',
+      pending ? t("{n} 条待接收推送", { n: pending }) : '',
     ].filter(Boolean).join(" · ");
   }
 
   // 本机名字与桌面那份「本机名称」是同一份设置。设备页可能是开机后第一个进的页，
   // 那时还没人拉过设置，缺了就补一次；已经拉到就沿用，不重复请求。
-  const name = $derived(settings.getSettings()?.deviceName || "本机");
+  const name = $derived(settings.getSettings()?.deviceName || t("本机"));
   onMount(() => {
     if (!settings.getSettings()) void settings.loadSettings();
   });
@@ -95,7 +96,7 @@
      而设备名只有一行可显示 —— 名字比图标重要（底板里那一项仍旧带图标）。
      次要样式（`.btn-ghost`）：同一行里主按钮只该有一颗（配对 / 连接 / 断开）。 -->
 {#snippet messageBtn(d: PeerDevice)}
-  <button class="btn btn-ghost btn-sm" type="button" onclick={() => store.openChat(d.id)}>发消息</button>
+  <button class="btn btn-ghost btn-sm" type="button" onclick={() => store.openChat(d.id)}>{t("发消息")}</button>
 {/snippet}
 
 <div class="body">
@@ -106,18 +107,18 @@
         <span class="dmain">
           <span class="dname">{name}</span>
           <!-- 没有内网地址 = 本机现在谁也找不到（原型写死了一个地址，这里按真实情况说）。 -->
-          <span class="dip num">{addr?.ip ? `${addr.ip}:${addr.port}` : "离线"}</span>
+          <span class="dip num">{addr?.ip ? `${addr.ip}:${addr.port}` : t("离线")}</span>
         </span>
         <!-- 原型这里用的是 mock 才有那档 `.state-chip.connected`；真样式表只留五档，
              本机自己那档取 `live`（实心绿点 = 有实时链路，与原型那颗点同形）。 -->
-        <span class="state-chip live"><i class="dot live"></i>本机</span>
+        <span class="state-chip live"><i class="dot live"></i>{t("本机")}</span>
       </div>
     </div>
   </div>
 
   <div class="sec">
     <button class="btn btn-primary btn-block" type="button" onclick={() => store.openSheet({ kind: "pair" })}>
-      <Icon name="link" />配对设备
+      <Icon name="link" />{t("配对设备")}
     </button>
   </div>
 
@@ -129,24 +130,24 @@
       <div class="opt">
         <span class="oi"><Icon name="link" /></span>
         <span class="om">
-          <span class="on">等待「{linkWait.peerName}」同意</span>
-          <span class="od">连接请求已发出，等它在自己的通知里点「接受」。</span>
+          <span class="on">{t("等待「{name}」同意", { name: linkWait.peerName })}</span>
+          <span class="od">{t("连接请求已发出，等它在自己的通知里点「接受」。")}</span>
         </span>
       </div>
       <button class="btn btn-secondary btn-block" type="button" onclick={() => void store.cancelPendingLinkRequest()}>
-        <Icon name="x" />取消请求
+        <Icon name="x" />{t("取消请求")}
       </button>
     </div>
   {/if}
 
   <div class="sec">
-    <div class="sec-label"><span>已发现设备</span><span class="num">{rows.length} 台</span></div>
+    <div class="sec-label"><span>{t("已发现设备")}</span><span class="num">{t("{n} 台", { n: rows.length })}</span></div>
     {#if rows.length === 0}
       <div class="card list">
         <div class="empty">
           <Icon name="devices" />
-          <p>还没有发现设备</p>
-          <p class="es">确保两台设备在同一局域网，或手动添加 IP:端口。</p>
+          <p>{t("还没有发现设备")}</p>
+          <p class="es">{t("确保两台设备在同一局域网，或手动添加 IP:端口。")}</p>
         </div>
       </div>
     {:else}
@@ -189,7 +190,7 @@
                   <span
                     class="dn-pending num"
                     role="img"
-                    aria-label="等你处理 {unread + pending} 件：{pendingLabel(unread, pending)}"
+                    aria-label={t("等你处理 {n} 件：{labels}", { n: unread + pending, labels: pendingLabel(unread, pending) })}
                     title={pendingLabel(unread, pending)}
                   >{unread + pending}</span>
                 {/if}
@@ -206,16 +207,16 @@
                    离线已配对 = 一颗不放（F-14 那颗「解除配对」走长按菜单，与其它设备操作同路）。 -->
               {#if d.online}
                 {#if d.connected}
-                  <button class="btn btn-secondary btn-sm" type="button" onclick={() => void store.toggleConnection(d.id, true)}>断开</button>
+                  <button class="btn btn-secondary btn-sm" type="button" onclick={() => void store.toggleConnection(d.id, true)}>{t("断开")}</button>
                 {:else if !d.paired || devices.needsRepair(d)}
                   <!-- 按的是哪一行就配哪一台：把 peerId 带进配对表，表里不再列全部候选。 -->
-                  <button class="btn btn-primary btn-sm" type="button" onclick={() => store.openSheet({ kind: "pair", peerId: d.id })}>配对</button>
+                  <button class="btn btn-primary btn-sm" type="button" onclick={() => store.openSheet({ kind: "pair", peerId: d.id })}>{t("配对")}</button>
                 {:else}
-                  <button class="btn btn-primary btn-sm" type="button" onclick={() => void store.toggleConnection(d.id, false)}>连接</button>
+                  <button class="btn btn-primary btn-sm" type="button" onclick={() => void store.toggleConnection(d.id, false)}>{t("连接")}</button>
                 {/if}
                 {@render messageBtn(d)}
               {:else if !d.paired}
-                <button class="btn btn-primary btn-sm" type="button" onclick={() => store.openSheet({ kind: "pair", peerId: d.id })}>配对</button>
+                <button class="btn btn-primary btn-sm" type="button" onclick={() => store.openSheet({ kind: "pair", peerId: d.id })}>{t("配对")}</button>
                 {@render messageBtn(d)}
               {/if}
             </span>
@@ -227,7 +228,7 @@
 
   <div class="sec">
     <button class="btn btn-secondary btn-block" type="button" onclick={() => store.openSheet({ kind: "addDevice" })}>
-      <Icon name="plus" />手动添加设备
+      <Icon name="plus" />{t("手动添加设备")}
     </button>
   </div>
 </div>

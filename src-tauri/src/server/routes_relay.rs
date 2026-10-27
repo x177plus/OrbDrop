@@ -119,6 +119,16 @@ pub async fn relay_open(
             // 本身是公开的自报端点，所以这个 id 拿来做限流键或界面标签都不够 —— 限流按
             // **来源地址**记（见 `relay::open`），端点来源白名单也只认来源地址（`trusted_caller`
             // = false）。失败细节只进日志，不回给调用方。
+            // 本机自己不是请求方：选路时池里可能留着自己一条旧地址（见
+            // `relay::relay_candidates` 的 own-id 闸）。不挡这一下，就会向自己请中转，
+            // 下面的核实随后把"请求方 = 本机"写进设备表 —— 设备列表里多出一台自己。
+            if claim.id.trim() == state.own_id() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "不能把本机自己当成中转请求方",
+                )
+                    .into_response();
+            }
             let at = SocketAddr::new(addr.ip(), claim.port);
             let observed = match crate::relay::verify_identity_at(at, claim.id.trim()).await {
                 Ok(observed) => observed,
@@ -257,6 +267,15 @@ pub async fn relay_route(
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
                     "路由记录推得太频繁，稍后再试",
+                )
+                    .into_response();
+            }
+            // 与 `/relay/open` 同一道闸：记录自称是本机时，下面那些 `observe_verified_addr`
+            // / `note_heard_online` 会把本机登记成一台设备。
+            if claim.id.trim() == state.own_id() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "不能把本机自己当成路由记录的发送方",
                 )
                     .into_response();
             }

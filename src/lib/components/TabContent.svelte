@@ -3,6 +3,7 @@
   import DeviceTab from './DeviceTab.svelte';
   import PeerTab from './PeerTab.svelte';
   import type { PeerDevice, TabKey } from '$lib/types';
+  import { t } from '$lib/i18n.svelte';
 
   let {
     tab,
@@ -44,5 +45,5 @@
     <PeerTab device={peer} {onToast} />
   {/key}
 {:else}
-  <div class="empty"><p>设备已离线</p><p class="e-sub">对方不在线或已解除配对，切回「设备」标签可以重新连接。</p></div>
+  <div class="empty"><p>{t('设备已离线')}</p><p class="e-sub">{t('对方不在线或已解除配对，切回「设备」标签可以重新连接。')}</p></div>
 {/if}

@@ -495,7 +495,7 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                         crate::notify::message(
                             &crate::notify::Convo::Direct(peer_id.to_string()),
                             &sender,
-                            "[图片]",
+                            crate::i18n::t("notify.image"),
                         )
                         .await;
                     }
@@ -573,19 +573,21 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                         .group(&group_id)
                         .map(|g| g.name.trim().to_string())
                         .filter(|n| !n.is_empty())
-                        .unwrap_or_else(|| "群聊".to_string());
+                        .unwrap_or_else(|| crate::i18n::t("notify.group").to_string());
                     let who = crate::group::display_name(state, &notify_author, &notify_claimed);
                     // 图片消息在通知里写「[图片]」（手机那条通知只有一行字的位置，
                     // 而这里的 `text` 对图片来说是空串）。
                     let body = if image {
-                        "[图片]".to_string()
+                        crate::i18n::t("notify.image").to_string()
                     } else {
                         text.clone()
                     };
+                    let body_text =
+                        crate::i18n::group_notification_body(crate::i18n::current(), &who, &body);
                     crate::notify::message(
                         &crate::notify::Convo::Group(group_id),
                         &title,
-                        &format!("{who}：{body}"),
+                        &body_text,
                     )
                     .await;
                 }

@@ -78,7 +78,7 @@ class SystemSettingsPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.resolve()
       return
     }
-    invoke.reject("打不开电池优化设置：请手动进入 设置 → 电池 → 应用启动管理/更多电池设置")
+    invoke.reject(activity.getString(R.string.settings_battery_optimization_failed))
   }
 
   /**
@@ -112,7 +112,7 @@ class SystemSettingsPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.resolve(out)
       return
     }
-    invoke.reject("打不开系统设置页：请手动进入 设置 → 应用 → OrbDrop，打开自启动/关联启动/后台活动")
+    invoke.reject(activity.getString(R.string.settings_autostart_failed))
   }
 
   /**
@@ -150,7 +150,7 @@ class SystemSettingsPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.resolve(out)
       return
     }
-    invoke.reject("打不开系统设置页：请手动进入 设置 → 电池 → 后台耗电管理 → OrbDrop，选择「允许后台运行 / 允许后台高耗电」")
+    invoke.reject(activity.getString(R.string.settings_background_power_failed))
   }
 
   /** 本应用在系统设置里的详情页（`ACTION_APPLICATION_DETAILS_SETTINGS`）。 */

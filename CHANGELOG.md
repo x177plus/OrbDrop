@@ -1,5 +1,48 @@
 # 更新日志
 
+## v0.1.2 — 2026-10-27
+
+新增：**中英双语界面（桌面端 + 安卓端 + 原生层）**。首次启动**直接采用系统语言**（支持
+English / 简体中文；系统语言不在支持列表里时用英语），并把解析结果写成具体语言保存 —— 设置页
+只列「English / 简体中文」，没有「跟随系统」这一档，选中即刻生效并落盘，下一次启动首帧就是该语言。
+旧版本配置里的 `auto` 会在启动时解析成系统语言并写回。前端文案走 `src/lib/i18n.svelte.ts`：**消息键就是简体中文原文**（gettext 风格），
+英文词条按域放在 `src/lib/i18n/locales/en/*.json`；`npm run check:i18n` 校验缺译、占位符与词典冲突。
+后端原生文案同一份语言偏好：托盘菜单/tooltip 就地换字（不重建图标），安卓通知渠道名、常驻通知与
+插件错误走 `values` / `values-zh-rCN` 资源（按系统语言选择）。英文目录、移动端与所有对话框、气泡、空态、无障碍标签
+都已覆盖；后端日志保持中文，命令返回的底层错误文本也可能仍是中文（界面提示前缀会本地化）。
+
+新增：**后台更新检查不再只有「启动后一次」**。后端由一个调度循环管四档：启动 8 秒后查一次；
+运行期间每 **6 小时 ± 30 分钟**一次；安卓回前台 / 桌面单实例 / macOS `Reopen` 时，距上次成功
+**≥1 小时**才查；静默检查失败按 **5 分钟 → 30 分钟 → 2 小时 → 6 小时** 退避，成功一次归零。
+调度用**墙钟**判定（`<数据目录>/update.json` 的 `lastSuccessMs`），系统休眠/挂起醒来不会把周期
+推后。查到的新版本与按掉的版本都落盘：重启后第一帧就有气泡/角标；按过「稍后」只压住**当前这一版**
+（换新版照弹，手动「检查更新」清掉记录），后台那趟失败也不会把已经查到的「有新版本」抹掉。
+更新日志在所有出现说明的地方默认折叠成两行（`UpdateNotes.svelte`），点「查看完整更新日志」展开。
+
+修复（安卓）：应用界面能像网页一样**双指缩放**（整页连同底栏、固定层一起被放大，布局不重排，
+边缘被裁、退不回去）。根因在 WebView：`WebSettings.supportZoom` 默认是 `true`，而页面
+viewport 只写了 `width=device-width, initial-scale=1`，等于告诉引擎"允许缩放"。现在
+`MainActivity.onWebViewCreate` 里显式关掉 `supportZoom` / `builtInZoomControls` /
+`displayZoomControls`，`index.html` 的 viewport 同时补上
+`maximum-scale=1.0, user-scalable=no`。前者是准的（WebView 原生手势），后者只是第二道保险
+（Chrome 系为无障碍会忽略 `user-scalable=no`）。系统设置里的字体/显示大小与无障碍放大不受影响。
+
+修复（macOS）：Beyond Compare 的 profile 写错设置目录，导致「用 BeyondCompare 比较」对端共享项
+报「配置文件找不到 / 文件夹不可用」（本机路径正常）。BC5 的机器上如果存在
+`~/Library/Application Support/Beyond Compare 5`，它只读这个目录；OrbDrop 却一直写不带版本号的
+`Beyond Compare`。现在 `config_dir` 从 `.app/Contents/Info.plist` 的
+`CFBundleShortVersionString` 取大版本号，优先匹配的 `Beyond Compare 5` / `Beyond Compare 4`
+目录，没有版本目录才退回默认；Windows 分支不变。真机 BC 5.2.6 实测：把 profile 放进
+`Beyond Compare 5` 后，`bcomp` 加载 `profile:<ip:端口>?<共享项id>`、PROPFIND Depth 0/1、
+Basic 鉴权与 `href` 改写都正常。BC 只在启动时登记 `BCProfiles.xml`，所以更新后第一次需要
+**重启一次 BC**。另外服务监听是异步起的，预写可能跑在端口落下来之前，只写下骨架；
+现在服务起来后会再补写一次，避免更新后首次启动 profile 为空。回归见
+`bc::tests::macos_config_dir_prefers_the_versioned_folder_matching_the_exe`。
+
+修复：更新重启后设备列表里会短暂出现**本机自己**（macOS 上最容易看到，Windows 重启后同样可能）。根因在中转记忆，不在 mDNS：已配对对端推回来的反向路由记录里点名了**收件人自己**（它那份中转池还留着你的地址），本机把它并进设备表与池；第一拍探活够不着某台设备时，选路又把"自己"当成中转候选，向自己的监听端点发了一次 `/relay/open`，服务端核实"请求方 = 本机"后把本机登记成一台**在线**设备（`adopted` 档，15 分钟后才随 TTL 收走）。现在推记录前剔掉收件人自己；接收、池合并与选路都排除 own id（含本机监听端点）；`/relay/open` / `/relay/route` 对自称本机的请求直接 400；启动时清掉旧配置里写下的自己（`relayRoutes` 的池、`knownPeers`、观察指纹、链路）。回归见 `a_route_naming_itself_never_becomes_a_peer`、`pool_never_contains_the_local_device`、`relay_candidates_never_include_the_local_device`、`relay_candidates_skip_addresses_that_are_our_own_listener`、`a_route_pushed_to_a_peer_never_names_that_peer`、`self_identities_are_scrubbed_from_persisted_memory`、`observing_own_id_never_creates_or_marks_a_row`、`identity_reconcile_does_not_migrate_a_row_onto_the_local_device`、`open_refuses_to_target_ourselves_or_loopback`。
+
+修复：会话输入框在占位文案状态下，**输入过内容再清空**之后光标会跑到占位文案右侧（首次聚焦时正常在最左）。根因不是清空逻辑：清空后 Chromium 会在框里留下一个 `<br>`，光标锚在它前面，而占位文案的 `::before` 仍在行内流里、是那一行的第一个盒子。现在占位文案改为绝对定位（桌面与安卓两份样式同步），光标不再跟着它走；实际 CSS 在 Chromium 上实测清空后光标仍在内容左缘。
+
 ## v0.1.1 — 2026-10-27
 
 新增：macOS 11+（Apple Silicon + Intel 通用包）。与 Windows 共用同一份 Rust 核心与 Svelte 前端，

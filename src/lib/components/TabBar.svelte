@@ -5,6 +5,7 @@
   import { scrollRail } from '$lib/scrollRail';
   import { unreadForPeer } from '$lib/stores/chat.svelte';
   import { deviceShortName } from '$lib/stores/devices.svelte';
+  import { t } from '$lib/i18n.svelte';
 
   let {
     localCount = 0,
@@ -84,7 +85,7 @@
     aria-selected={isActive(LOCAL)}
     onclick={() => onSelect(LOCAL)}
   >
-    本机 <span class="count num">{localCount}</span>
+    {t('本机')} <span class="count num">{localCount}</span>
   </button>
   <button
     class="tab"
@@ -93,7 +94,7 @@
     aria-selected={isActive(DEVICES)}
     onclick={() => onSelect(DEVICES)}
   >
-    设备 <span class="count num">{deviceCount}</span>
+    {t('设备')} <span class="count num">{deviceCount}</span>
   </button>
   {#each browsers as device (device.id)}
     {@const tab: TabKey = { kind: 'peer', peerId: device.id }}
@@ -102,7 +103,7 @@
       class:active={isActive(tab)}
       role="tab"
       aria-selected={isActive(tab)}
-      title="{deviceShortName(device)} · {device.ip}:{device.port} · 长连接"
+      title={t('{name} · {ip}:{port} · 长连接', { name: deviceShortName(device), ip: device.ip, port: device.port })}
       bind:this={peerEls[device.id]}
       onclick={() => onSelect(tab)}
     >
@@ -111,7 +112,7 @@
            全名与地址在 `title` 里，页头那颗胶囊（`PeerTab`）也写着「长连接」。 -->
       <span class="tab-name">{deviceShortName(device)}</span>
       {#if unreadForPeer(device.id) > 0}
-        <span class="tab-dot" title={`${unreadForPeer(device.id)} 条未读消息`}></span>
+        <span class="tab-dot" title={t('{n} 条未读消息', { n: unreadForPeer(device.id) })}></span>
       {/if}
     </button>
   {/each}

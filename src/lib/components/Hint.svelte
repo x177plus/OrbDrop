@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import { hideHint, showHint } from '$lib/stores/hint.svelte';
+  import { t } from '$lib/i18n.svelte';
 
   /**
    * 说明正文：直接写成子内容，能带 `<strong>` / `<span class="hl">` 这类强调。
@@ -28,7 +29,7 @@
   bind:this={trigger}
   role="button"
   tabindex="0"
-  aria-label="说明"
+  aria-label={t('说明')}
   aria-describedby="hint-tip"
   onmouseenter={show}
   onmouseleave={hideHint}

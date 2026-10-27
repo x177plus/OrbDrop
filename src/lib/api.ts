@@ -30,8 +30,18 @@ export function getSettings(): Promise<AppSettings> {
   return invoke('get_settings');
 }
 
-export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; deviceSubdir: boolean; downloadMode: string; deviceName: string; autoStart: boolean; bcExePath: string; autoBroadcastNew: boolean; groupRelay: boolean; allowRelay: boolean; relayMemory: boolean; transferWorkers: number; transferBlockMb: number }): Promise<AppSettings> {
+export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; deviceSubdir: boolean; downloadMode: string; deviceName: string; language: string; autoStart: boolean; bcExePath: string; autoBroadcastNew: boolean; groupRelay: boolean; allowRelay: boolean; relayMemory: boolean; transferWorkers: number; transferBlockMb: number }): Promise<AppSettings> {
   return invoke('update_settings', { req: s });
+}
+
+/**
+ * 切换界面语言：后端立即落盘，并让托盘菜单/通知栏的原生文案跟着换。
+ *
+ * 与 `updateSettings` 分开：语言是"选了就生效"的一档，不该等设置面板的「保存」。
+ * 前端界面由 `$lib/i18n.svelte` 的 `setLanguagePreference` 当场切换。
+ */
+export function setLanguage(preference: string): Promise<AppSettings> {
+  return invoke('set_language', { preference });
 }
 
 // 自更新（桌面端 + 安卓端共用同一套后端逻辑，见 `src-tauri/src/update/`）。
@@ -40,9 +50,14 @@ export function updateState(): Promise<UpdateState> {
   return invoke('update_state');
 }
 
-/** `force = true`（用户手动点）忽略后端的静默检查缓存与镜像记忆。 */
+/** `force = true`（用户手动点）忽略后端的静默检查缓存与失败退避。 */
 export function updateCheck(force: boolean): Promise<UpdateState> {
   return invoke('update_check', { force });
+}
+
+/** 记下「稍后」的是哪一版（后端落盘；手动检查会清掉它）。 */
+export function updateDismiss(version: string | null): Promise<UpdateState> {
+  return invoke('update_dismiss', { version });
 }
 
 /** 下载并安装：桌面端会覆盖当前 exe 并重启（进程随之结束），安卓端拉起系统安装器。 */

@@ -6,6 +6,7 @@
   import Sheet from "../components/Sheet.svelte";
   import StateChip from "../components/StateChip.svelte";
   import * as store from "../store.svelte";
+  import { t } from "$lib/i18n.svelte";
 
   let { onClose }: { onClose: () => void } = $props();
 
@@ -25,10 +26,11 @@
   /** 标题预览里那串设备名（原型 `ids.map(devName).join('、')`）——**短名**（F-101：有备注就是备注本身）。 */
   const pickedNames = $derived(candidates.filter((d) => picked.includes(d.id)).map((d) => deviceShortName(d)));
   const preview = $derived(
-    (mode === "broadcast" ? "群发 · " : "群聊 · ") +
-      (name.trim() || (mode === "broadcast" ? "未命名群发" : pickedNames.join("、") || "设备名称")),
+    mode === "broadcast"
+      ? t("群发 · {name}", { name: name.trim() || t("未命名群发") })
+      : t("群聊 · {name}", { name: name.trim() || pickedNames.join(t("、")) || t("未选择设备") }),
   );
-  const actionLabel = $derived(many ? (mode === "broadcast" ? "进入群发" : "进入群聊") : "进入会话");
+  const actionLabel = $derived(many ? (mode === "broadcast" ? t("进入群发") : t("进入群聊")) : t("进入会话"));
 
   function toggle(id: string, on: boolean): void {
     picked = on ? [...picked, id] : picked.filter((x) => x !== id);
@@ -63,48 +65,48 @@
       }
     } catch (e) {
       // 失败就把底板留着：名单还在，用户可以改完再试。
-      store.failed("新建会话", e);
+      store.failed(t("新建会话"), e);
     }
   }
 </script>
 
-<Sheet title="新建会话" desc="选一台设备建立一对一；选两台以上可用群发或群聊。" onClose={onClose}>
+<Sheet title={t("新建会话")} desc={t("选一台设备建立一对一；选两台以上可用群发或群聊。")} onClose={onClose}>
   <div class="stack">
     <label class="mode" data-mode="broadcast" class:is-checked={mode === "broadcast"}>
       <input type="radio" name="convoMode" value="broadcast" bind:group={mode} />
       <span class="mi"><Icon name="bc" /></span>
       <span class="mm">
-        <span class="mn">群发</span>
-        <span class="md">单向：每条消息分别作为单独的一对一消息发给每台设备。</span>
+        <span class="mn">{t("群发")}</span>
+        <span class="md">{t("单向：每条消息分别作为单独的一对一消息发给每台设备。")}</span>
       </span>
     </label>
     <label class="mode" data-mode="group" class:is-checked={mode === "group"}>
       <input type="radio" name="convoMode" value="group" bind:group={mode} />
       <span class="mi"><Icon name="group" /></span>
       <span class="mm">
-        <span class="mn">群聊</span>
-        <span class="md">共享：所有参与设备都能看到彼此的消息。</span>
+        <span class="mn">{t("群聊")}</span>
+        <span class="md">{t("共享：所有参与设备都能看到彼此的消息。")}</span>
       </span>
     </label>
   </div>
 
   <!-- 名称只在多选时出现（原型 `nameField.hidden`）；用 hidden 而不是 {#if}，缩回一台再选回来时不用重打。 -->
   <div class="field" hidden={!many}>
-    <label for="convoName">会话名称</label>
-    <input class="input" id="convoName" maxlength="16" placeholder="例如：发布通知" bind:value={name} />
-    <p class="field-hint">显示为 <b>{preview}</b></p>
+    <label for="convoName">{t("会话名称")}</label>
+    <input class="input" id="convoName" maxlength="16" placeholder={t("例如：发布通知")} bind:value={name} />
+    <p class="field-hint">{t("显示为")} <b>{preview}</b></p>
   </div>
 
   <!-- 原型在底板里给这行去掉了底边距（`.sheet-body` 自己用 gap 排），照抄它那份 inline。 -->
   <div class="sec-label" style="padding-bottom:0">
-    <span>选择设备</span><span class="num">已选 {picked.length} 台</span>
+    <span>{t("选择设备")}</span><span class="num">{t("已选 {n} 台", { n: picked.length })}</span>
   </div>
   {#if candidates.length === 0}
     <div class="card list">
       <div class="empty">
         <Icon name="devices" />
-        <p>还没有设备</p>
-        <p class="es">等局域网里的设备出现，或到「设备」页手动添加。</p>
+        <p>{t("还没有设备")}</p>
+        <p class="es">{t("等局域网里的设备出现，或到「设备」页手动添加。")}</p>
       </div>
     </div>
   {:else}
@@ -128,7 +130,7 @@
   {/if}
 
   {#snippet foot()}
-    <button class="btn btn-secondary" type="button" onclick={onClose}>取消</button>
+    <button class="btn btn-secondary" type="button" onclick={onClose}>{t("取消")}</button>
     <button class="btn btn-primary" type="button" disabled={picked.length === 0} onclick={() => void enter()}>
       {actionLabel}
     </button>

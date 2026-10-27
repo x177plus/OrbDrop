@@ -4,6 +4,7 @@
   import * as store from "../store.svelte";
   import * as api from "$lib/api";
   import type { InboxEntry } from "$lib/types";
+  import { t } from "$lib/i18n.svelte";
 
   let { entry, onClose }: { entry: InboxEntry; onClose: () => void } = $props();
 
@@ -20,16 +21,16 @@
     const d = new Date(at);
     const now = new Date();
     const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-    if (d.toDateString() === now.toDateString()) return `今天 ${hm}`;
+    if (d.toDateString() === now.toDateString()) return t("今天 {time}", { time: hm });
     const yesterday = new Date(now);
     yesterday.setDate(now.getDate() - 1);
-    if (d.toDateString() === yesterday.toDateString()) return `昨天 ${hm}`;
-    return `${d.getMonth() + 1}月${d.getDate()}日`;
+    if (d.toDateString() === yesterday.toDateString()) return t("昨天 {time}", { time: hm });
+    return t("{month}月{day}日", { month: d.getMonth() + 1, day: d.getDate() });
   }
 
   /** 表头那行：`发送方 · 大小 · 时间`（`from` 为空 = 本机自己下载的，省掉那一段）。 */
   const meta = $derived(
-    [entry.from, entry.isDir ? "文件夹" : fmtBytes(entry.size), shortTime(entry.modified)]
+    [entry.from, entry.isDir ? t("文件夹") : fmtBytes(entry.size), shortTime(entry.modified)]
       .filter((s) => s !== "")
       .join(" · "),
   );
@@ -56,9 +57,13 @@
     onClose();
     try {
       await api.openPath(path);
-      store.toast(apk ? "已交给系统安装器安装" : "已用系统应用打开", apk ? "download" : "file");
+      store.toast(apk ? t("已交给系统安装器安装") : t("已用系统应用打开"), apk ? "download" : "file");
     } catch (e) {
-      store.failed(apk ? "安装" : "打开", e);
+      store.toast(
+        apk
+          ? t("安装失败：{error}", { error: e instanceof Error ? e.message : String(e) })
+          : t("打开失败：{error}", { error: e instanceof Error ? e.message : String(e) }),
+      );
     }
   }
 
@@ -69,9 +74,9 @@
       // 原型拼的是 `settings.inboxDir + '/' + name`（那份设置是 mock）；真实后端把完整路径
       // 随着收件项一起给全了，不自己拼，免得目录名一改就指到不存在的地方。
       await navigator.clipboard.writeText(path);
-      store.toast("已复制路径", "copy");
+      store.toast(t("已复制路径"), "copy");
     } catch (e) {
-      store.failed("复制路径", e);
+      store.toast(t("复制路径失败：{error}", { error: e instanceof Error ? e.message : String(e) }));
     }
   }
 
@@ -80,39 +85,39 @@
     // 确认框走应用自己的 Sheet（`store.confirmAction`），不再用 WebView 的系统 `confirm`。
     const { name, path } = entry;
     const ok = await store.confirmAction({
-      title: "删除本地副本",
-      desc: `「${name}」将从收件目录中移除。此操作不可撤销。`,
-      confirmLabel: "删除",
+      title: t("删除本地副本"),
+      desc: t("「{name}」将从收件目录中移除。此操作不可撤销。", { name }),
+      confirmLabel: t("删除"),
       danger: true,
     });
     if (!ok) return;
     onClose();
     try {
       await store.deleteInboxEntry(path);
-      store.toast("已删除本地副本", "trash");
+      store.toast(t("已删除本地副本"), "trash");
     } catch (e) {
-      store.failed("删除", e);
+      store.toast(t("删除失败：{error}", { error: e instanceof Error ? e.message : String(e) }));
     }
   }
 </script>
 
 <!-- 「分享」这一项本阶段不做：系统分享菜单要原生 Intent，后端还没有这条命令，放上去也是假按钮。 -->
-<Sheet title={entry.name} desc={meta} label="文件操作" onClose={onClose}>
+<Sheet title={entry.name} desc={meta} label={t("文件操作")} onClose={onClose}>
   <button class="opt" type="button" onclick={open}>
     <span class="oi"><Icon name={isApk ? "download" : "file"} /></span>
     <span class="om">
-      <span class="on">{isApk ? "安装" : "打开"}</span>
+      <span class="on">{isApk ? t("安装") : t("打开")}</span>
       <span class="od">
-        {isApk ? "交给系统安装器安装这个 APK（首次需先允许 OrbDrop 安装未知应用）。" : "用系统应用打开这份文件。"}
+        {isApk ? t("交给系统安装器安装这个 APK（首次需先允许 OrbDrop 安装未知应用）。") : t("用系统应用打开这份文件。")}
       </span>
     </span>
   </button>
   <button class="opt" type="button" onclick={copyPath}>
     <span class="oi"><Icon name="copy" /></span>
-    <span class="om"><span class="on">复制路径</span><span class="od">复制收件目录中的完整路径。</span></span>
+    <span class="om"><span class="on">{t("复制路径")}</span><span class="od">{t("复制收件目录中的完整路径。")}</span></span>
   </button>
   <button class="opt danger" type="button" onclick={remove}>
     <span class="oi"><Icon name="trash" /></span>
-    <span class="om"><span class="on">删除本地副本</span><span class="od">仅删除本机收件目录中的这一份。</span></span>
+    <span class="om"><span class="on">{t("删除本地副本")}</span><span class="od">{t("仅删除本机收件目录中的这一份。")}</span></span>
   </button>
 </Sheet>

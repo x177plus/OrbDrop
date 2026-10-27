@@ -1,4 +1,5 @@
 import * as api from '$lib/api';
+import { t } from '$lib/i18n.svelte';
 
 /**
  * 运行平台。**只用于换文案与快捷键写法**，不参与任何功能分支 —— 后端已经按平台把能力
@@ -35,12 +36,12 @@ export function isMac() {
 
 /** 文件管理器在文案里的名字。 */
 export function fileManagerLabel() {
-  return isMac() ? '访达' : info.os === 'windows' ? '资源管理器' : '文件管理器';
+  return isMac() ? t('访达') : info.os === 'windows' ? t('资源管理器') : t('文件管理器');
 }
 
 /** 文件选择器最外层那一层的名字（Windows 习惯叫「此电脑」）。 */
 export function computerLabel() {
-  return info.os === 'windows' ? '此电脑' : '本机';
+  return info.os === 'windows' ? t('此电脑') : t('本机');
 }
 
 /** 粘贴的快捷键写法。 */

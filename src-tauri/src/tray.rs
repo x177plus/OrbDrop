@@ -55,7 +55,10 @@ use tracing::{debug, info, warn};
 
 use crate::log;
 use crate::state::AppState;
-use crate::ws::events::ui::{LOCAL_ONLINE, ORB_SHOW, TRAY_ALERT};
+use crate::{
+    i18n,
+    ws::events::ui::{LOCAL_ONLINE, ORB_SHOW, TRAY_ALERT},
+};
 
 /// 配置里写了 `trayIcon`，Tauri 在 `Builder::build()` 阶段就把它建出来了；id 没指定时
 /// 默认 `main`（tauri `app.rs`：`tray_config.id.clone().unwrap_or_else(|| "main".into())`）。
@@ -68,9 +71,8 @@ const MENU_ONLINE: &str = "online";
 const MENU_OFFLINE: &str = "offline";
 const MENU_QUIT: &str = "quit";
 
-/// 状态头的标题：**固定文案，不随状态变** —— 状态由那颗点的颜色说。
-/// 顺带 `refresh` 里少一次 `set_text`（标题永远不变，就没有要改的东西）。
-const TITLE_PRESENCE: &str = "状态";
+// 状态头的标题固定不随状态变（名词，状态由那颗点的颜色说），但随语言变：
+// 见 `i18n::t("tray.status")`。
 
 /// 在线点：面板 `--ok`（`src/styles/main.css` 的 `oklch(58% 0.16 158)`）换算到 sRGB。
 const DOT_ONLINE: (u8, u8, u8) = (0x00, 0x95, 0x54);
@@ -131,6 +133,7 @@ struct TrayHandles {
     presence: Submenu<tauri::Wry>,
     online: CheckMenuItem<tauri::Wry>,
     offline: CheckMenuItem<tauri::Wry>,
+    quit: MenuItem<tauri::Wry>,
 }
 
 /// 句柄存放处。`manage` 要求 `Send + Sync + 'static`：这几个类型都是引用计数的句柄，
@@ -159,23 +162,36 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
     let presence = Submenu::with_id_and_icon(
         app,
         MENU_PRESENCE,
-        TITLE_PRESENCE,
+        i18n::t("tray.status"),
         true,
         Some(dot_image(for_state(online_now), app)),
     )
     .map_err(|e| format!("建状态子菜单失败: {e}"))?;
 
-    let online = CheckMenuItem::with_id(app, MENU_ONLINE, "在线", true, online_now, None::<&str>)
-        .map_err(|e| format!("建「在线」菜单项失败: {e}"))?;
-    let offline =
-        CheckMenuItem::with_id(app, MENU_OFFLINE, "离线", true, !online_now, None::<&str>)
-            .map_err(|e| format!("建「离线」菜单项失败: {e}"))?;
+    let online = CheckMenuItem::with_id(
+        app,
+        MENU_ONLINE,
+        i18n::t("tray.online"),
+        true,
+        online_now,
+        None::<&str>,
+    )
+    .map_err(|e| format!("建「在线」菜单项失败: {e}"))?;
+    let offline = CheckMenuItem::with_id(
+        app,
+        MENU_OFFLINE,
+        i18n::t("tray.offline"),
+        true,
+        !online_now,
+        None::<&str>,
+    )
+    .map_err(|e| format!("建「离线」菜单项失败: {e}"))?;
     presence
         .append_items(&[&online, &offline])
         .map_err(|e| format!("状态子菜单装配失败: {e}"))?;
 
     let sep = PredefinedMenuItem::separator(app).map_err(|e| format!("建分隔线失败: {e}"))?;
-    let quit = MenuItem::with_id(app, MENU_QUIT, "退出", true, None::<&str>)
+    let quit = MenuItem::with_id(app, MENU_QUIT, i18n::t("tray.quit"), true, None::<&str>)
         .map_err(|e| format!("建托盘菜单项失败: {e}"))?;
     let menu = Menu::with_items(app, &[&presence, &sep, &quit])
         .map_err(|e| format!("建托盘菜单失败: {e}"))?;
@@ -243,6 +259,7 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
             presence,
             online,
             offline,
+            quit,
         });
     }
     // 初次落位：图标/tooltip/勾选按真值刷一遍。离线是**落盘状态**，重启后如果仍是离线，
@@ -402,15 +419,33 @@ fn paint_tray_icon(app: &AppHandle) {
     }
 }
 
-/// 把状态点、勾选、托盘图标、tooltip 一起刷成当前真值的样子。
+/// 把状态点、勾选、托盘图标、tooltip、菜单文字一起刷成当前真值的样子。
 ///
 /// 一律从 `state.is_online()` 现读，不信任何一处缓存：这条路径同时服务"托盘切的"、
-/// "面板切的"与"启动时是什么"三种来源，只有真值不会分叉。标题是固定文案，不用改。
+/// "面板切的"与"启动时是什么"三种来源，只有真值不会分叉。文字随当前语言重写
+/// （切换语言时 `set_language` 也走这里）——`set_text` 与状态无关，重复调用没有副作用。
 fn refresh(app: &AppHandle) {
     let Some(h) = handles() else { return };
     let online = local_online(app);
 
-    // 就地改：状态头的点色；两个子项用原生勾选表示"当前是哪个"
+    // 就地改：状态头的文字与点色；两个子项用原生勾选表示"当前是哪个"。
+    let texts = [
+        h.presence
+            .set_text(i18n::t("tray.status"))
+            .map_err(|e| e.to_string()),
+        h.online
+            .set_text(i18n::t("tray.online"))
+            .map_err(|e| e.to_string()),
+        h.offline
+            .set_text(i18n::t("tray.offline"))
+            .map_err(|e| e.to_string()),
+        h.quit
+            .set_text(i18n::t("tray.quit"))
+            .map_err(|e| e.to_string()),
+    ];
+    if let Some(e) = texts.into_iter().find_map(Result::err) {
+        warn!("托盘菜单文字更新失败: {e}");
+    }
     if let Err(e) = h.presence.set_icon(Some(dot_image(for_state(online), app))) {
         warn!("托盘状态点更新失败: {e}");
     }
@@ -429,6 +464,11 @@ fn refresh(app: &AppHandle) {
     }
 }
 
+/// 切换语言后让托盘菜单**就地**换字（不重建菜单：Linux 上 `set_menu` 换不了）。
+pub fn refresh_language(app: &AppHandle) {
+    refresh(app);
+}
+
 fn for_state(online: bool) -> (u8, u8, u8) {
     if online {
         DOT_ONLINE
@@ -439,9 +479,9 @@ fn for_state(online: bool) -> (u8, u8, u8) {
 
 fn tooltip_text(online: bool) -> &'static str {
     if online {
-        "OrbDrop · 在线"
+        i18n::t("tray.tooltip.online")
     } else {
-        "OrbDrop · 离线（对局域网隐身）"
+        i18n::t("tray.tooltip.offline")
     }
 }
 

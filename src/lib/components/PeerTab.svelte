@@ -8,6 +8,7 @@
   import type { PeerDevice, PeerShareItem, TreeEntry } from '$lib/types';
   import { dragOut } from '$lib/dragOut';
   import TreeNode from './TreeNode.svelte';
+  import { t } from '$lib/i18n.svelte';
 
   let {
     device,
@@ -94,7 +95,7 @@
       const entries = await peerTree(device.id, shareId, '');
       patchTree(shareId, { entries, loaded: true });
     } catch (e: unknown) {
-      patchTree(shareId, { error: e instanceof Error ? e.message : '加载失败' });
+      patchTree(shareId, { error: e instanceof Error ? e.message : t('加载失败') });
     } finally {
       patchTree(shareId, { loading: false });
     }
@@ -115,7 +116,7 @@
       if (st.loaded) void loadShareRoot(shareId, true);
     }
     await loadPeerShares(device.id);
-    onToast(`已刷新「${deviceName}」的共享项`);
+    onToast(t('已刷新「{name}」的共享项', { name: deviceName }));
   }
 
   function openCtx(e: MouseEvent, share: PeerShareItem) {
@@ -138,8 +139,8 @@
     e.preventDefault();
     e.stopPropagation();
     const result = await togglePeerDownloadPause(device.id, share.id, '');
-    if (result === 'missing') onToast('这项已不在下载中');
-    else if (result === 'error') onToast('暂停 / 继续下载失败');
+    if (result === 'missing') onToast(t('这项已不在下载中'));
+    else if (result === 'error') onToast(t('暂停 / 继续下载失败'));
   }
 
   const ICON_CHEVRON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>';
@@ -153,15 +154,15 @@
     <div class="d-name" title={deviceName}>{deviceName}</div>
     <div class="d-ip num">{device.ip}:{device.port}</div>
   </div>
-  <span class="state-chip live"><span class="dot live"></span>长连接</span>
-  <button class="icon-btn" onclick={refresh} aria-label="刷新共享项" title="刷新共享项">
+  <span class="state-chip live"><span class="dot live"></span>{t('长连接')}</span>
+  <button class="icon-btn" onclick={refresh} aria-label={t('刷新共享项')} title={t('刷新共享项')}>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5"/></svg>
   </button>
 </div>
 
 <div class="list-label">
-  <span>共享项</span>
-  <span class="num">{shares.items.length} 项</span>
+  <span>{t('共享项')}</span>
+  <span class="num">{t('{n} 项', { n: shares.items.length })}</span>
 </div>
 
 {#if shares.error}
@@ -170,17 +171,17 @@
       <path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/>
     </svg>
     <p>{shares.error}</p>
-    <p class="e-sub">对方只把开了广播的共享项发给长连接设备；确认双方仍在长连接状态后重试。</p>
+    <p class="e-sub">{t('对方只把开了广播的共享项发给长连接设备；确认双方仍在长连接状态后重试。')}</p>
   </div>
 {:else if shares.loading && !shares.loaded}
-  <div class="empty"><p>正在读取「{deviceName}」的共享项…</p></div>
+  <div class="empty"><p>{t('正在读取「{name}」的共享项…', { name: deviceName })}</p></div>
 {:else if shares.items.length === 0}
   <div class="empty">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2v11Z"/>
     </svg>
-    <p>对方还没有向本机广播共享项</p>
-    <p class="e-sub">对方在「本机」标签里打开某个共享项的广播开关后，这里会自动出现。</p>
+    <p>{t('对方还没有向本机广播共享项')}</p>
+    <p class="e-sub">{t('对方在「本机」标签里打开某个共享项的广播开关后，这里会自动出现。')}</p>
   </div>
 {:else}
   <ul class="share-list">
@@ -203,20 +204,20 @@
           class:dl-paused={dlPaused}
           style="--dl-pct: {dlPct / 100}"
           title={dlPaused
-            ? `已暂停 · 双击继续「${share.name}」`
-            : dl?.status === 'running' ? `双击暂停「${share.name}」` : undefined}
+            ? t('已暂停 · 双击继续「{name}」', { name: share.name })
+            : dl?.status === 'running' ? t('双击暂停「{name}」', { name: share.name }) : undefined}
           ondblclick={(e) => void toggleShareDownload(e, share)}
           use:dragOut={{ source: { peerId: device.id, shareId: share.id, path: '', name: share.name, isDir: share.isDir }, onMessage: onToast }}
         >
           {#if share.isDir}
-            <button class="chev" onclick={() => toggleShare(share)} aria-label="展开">{@html ICON_CHEVRON}</button>
+            <button class="chev" onclick={() => toggleShare(share)} aria-label={t('展开')}>{@html ICON_CHEVRON}</button>
           {:else}
             <button class="chev" style="visibility:hidden">{@html ICON_CHEVRON}</button>
           {/if}
           <span class="f-icon">{@html share.isDir ? ICON_FOLDER : ICON_FILE}</span>
           <div class="s-main">
             <div class="s-name">{share.name}</div>
-            <div class="s-meta"><span class="num">来自「{deviceName}」</span></div>
+            <div class="s-meta"><span class="num">{t('来自「{name}」', { name: deviceName })}</span></div>
           </div>
         </div>
 
@@ -224,11 +225,11 @@
           <div class="tree">
             <div class="tree-inner">
               {#if ts.loading}
-                <div class="node"><span class="n-name" style="color:var(--muted)">加载中…</span></div>
+                <div class="node"><span class="n-name" style="color:var(--muted)">{t('加载中…')}</span></div>
               {:else if ts.error}
                 <div class="node"><span class="n-name" style="color:var(--warn)">{ts.error}</span></div>
               {:else if ts.expanded && ts.entries.length === 0}
-                <div class="node"><span class="n-name" style="color:var(--muted)">空目录</span></div>
+                <div class="node"><span class="n-name" style="color:var(--muted)">{t('空目录')}</span></div>
               {:else if ts.expanded}
                 {#each ts.entries as entry (entry.name)}
                   <TreeNode shareId={share.id} {entry} level={1} peerId={device.id} {refreshSignal} />

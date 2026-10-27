@@ -22,6 +22,7 @@
   import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, setPushReceivePaused, pushPaths, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, forgetPeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
   import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem } from '$lib/types';
   import { shareMeta, updateStatusText, updateTitleText } from '$lib/types';
+  import { adoptLanguagePreference, t } from '$lib/i18n.svelte';
   import { planExpansion, planCollapse, planDock, planRectDock, spinForDock, type BadgeSpin, type DockAxis, type DockPlan, type ScreenRect } from '$lib/orbLayout';
   import { circleLayout, collapsedLayout, ORB_SIZE, RECT_CARD_W, RECT_DOCK_W } from '$lib/orbShape';
   import Orb from '$lib/components/Orb.svelte';
@@ -35,6 +36,7 @@
   import ConvoPanel from '$lib/components/ConvoPanel.svelte';
   import RecipientDialog from '$lib/components/RecipientDialog.svelte';
   import Hint from '$lib/components/Hint.svelte';
+  import UpdateNotes from '$lib/components/UpdateNotes.svelte';
   import HintLayer from '$lib/components/HintLayer.svelte';
 
   const appWindow = getCurrentWebviewWindow();
@@ -301,10 +303,10 @@
     noteLocalOnline(on);
     try {
       await setOnline(on);
-      toast(on ? '已切回「在线」，重新对局域网可见' : '已切到「离线」，本机对局域网隐身');
+      toast(on ? t('已切回「在线」，重新对局域网可见') : t('已切到「离线」，本机对局域网隐身'));
     } catch (e) {
       noteLocalOnline(prev);
-      toast(typeof e === 'string' ? e : '切换在线状态失败');
+      toast(typeof e === 'string' ? e : t('切换在线状态失败'));
     }
   }
   // 文件选择框的请求：标题/说明/确认按钮文案 + 确认动作。推送与「添加共享项」都用它 ——
@@ -378,7 +380,7 @@
    * 所以这里也不会把它数进去）。
    */
   let pushPendingCount = $derived(pushBatches.filter(batchSticky).length);
-  // 「更新这件事」也算一件：启动时的静默检查发现新版（或已经点过「立即更新」）时，
+  // 「更新这件事」也算一件：后台检查发现新版（或已经点过「立即更新」）时，
   // 它就和那些"等你确认"的通知一样占着右下角一格（见上面的 `upd.updateTask`）。
   let notifCount = $derived(notices.length + pushPendingCount + (updateTask ? 1 : 0));
   // 底栏右下角那格版本号：**与设置里「当前版本」同一个源**（后端 `UpdateState.current`，
@@ -392,11 +394,11 @@
   // 底栏「会话」那颗角标的读屏文案：未读与群邀请是两个数，合成一个数字就说不清是哪一类。
   let convoBadgeLabel = $derived(
     [
-      chat.unreadTotal() > 0 ? `${chat.unreadTotal()} 条未读` : '',
-      chat.pendingGroups().length > 0 ? `${chat.pendingGroups().length} 个群邀请` : '',
+      chat.unreadTotal() > 0 ? t('{n} 条未读', { n: chat.unreadTotal() }) : '',
+      chat.pendingGroups().length > 0 ? t('{n} 个群邀请', { n: chat.pendingGroups().length }) : '',
     ]
       .filter(Boolean)
-      .join('，'),
+      .join(' · '),
   );
   // 悬浮球左上角那颗角标：**同一组东西再加上会话侧那一堆**。未读消息与群邀请也是"有事等你"，
   // 而面板收着的时候，那颗球是唯一还看得见的提示（铃铛只数它自己那组气泡里的东西 —— 会话
@@ -486,8 +488,8 @@
   let localAddrs = $state<{ primary: string | null; all: string[] }>({ primary: null, all: [] });
   let addrTitle = $derived(
     localAddrs.all.length > 1
-      ? `本机有 ${localAddrs.all.length} 个内网地址（点一下复制第一个）：\n${localAddrs.all.join('\n')}`
-      : '点一下复制「IP:端口」',
+      ? t('本机有 {n} 个内网地址（点一下复制第一个）：{list}', { n: localAddrs.all.length, list: '\n' + localAddrs.all.join('\n') })
+      : t('点一下复制「IP:端口」'),
   );
 
   /** 左下角「端口 · IP」的地址：后端枚举，本机在**启动**与**网卡变化**时各拉一次
@@ -506,8 +508,8 @@
     if (!ip) return;
     const text = `${ip}:${serverPortVal || 3890}`;
     navigator.clipboard.writeText(text).then(
-      () => toast(`已复制 ${text}`),
-      () => toast('复制失败，请手动输入'),
+      () => toast(t('已复制 {text}', { text })),
+      () => toast(t('复制失败，请手动输入')),
     );
   }
 
@@ -638,7 +640,7 @@
         : await peerTree(pageId, loc.shareId, loc.rel);
       rectKids[key] = { loading: false, error: null, entries };
     } catch (e) {
-      rectKids[key] = { loading: false, error: e instanceof Error ? e.message : '读取失败', entries: [] };
+      rectKids[key] = { loading: false, error: e instanceof Error ? e.message : t('读取失败'), entries: [] };
     }
   }
 
@@ -657,13 +659,13 @@
     const full = loc.rel ? `${loc.shareName}/${loc.rel}` : loc.shareName;
     // 上一格是**父目录**：'a/b' 里回到 'a'，'a' 里回到共享项自己，共享项根再往上就是清单。
     const parentRel = loc.rel.slice(0, Math.max(0, loc.rel.lastIndexOf('/')));
-    const upName = loc.rel === '' ? '共享项'
+    const upName = loc.rel === '' ? t('共享项')
       : parentRel === '' ? loc.shareName
       : parentRel.slice(parentRel.lastIndexOf('/') + 1);
     return {
       view: {
         dir: { label: full.length > RECT_DIR_MAX ? `…${full.slice(-(RECT_DIR_MAX - 1))}` : full, full },
-        up: { name: upName, meta: '上一级' },
+        up: { name: upName, meta: t('上一级') },
         items: kids.entries.map((e) => ({
           id: loc.shareId,
           path: loc.rel ? `${loc.rel}/${e.name}` : e.name,
@@ -705,7 +707,7 @@
       // 「本机」这一个词就把"这是我的"说完了；设备名（常是 DESKTOP-XXXX 这种主机名）反而要
       // 用户自己回忆，且它在设置里、给对端看的配对弹窗里都有，不差这一处。
       // 具体身份由下面那行地址（本机 IP:端口）承担 —— 那才是别人拿来连你的东西。
-      name: '本机',
+      name: t('本机'),
       ip: localAddrs.primary ? `${localAddrs.primary}:${serverPortVal || 3890}` : '',
       loading: localDrill.loading ?? false,
       error: localDrill.error,
@@ -1079,7 +1081,7 @@
     try {
       if (page.kind === 'local') {
         const share = getShares().find((s) => s.id === slot.id);
-        if (!share) throw new Error('共享项已不存在');
+        if (!share) throw new Error(t('共享项已不存在'));
         await openPath(slot.path ? `${share.path}/${slot.path}` : share.path);
         return;
       }
@@ -1088,9 +1090,9 @@
       if (!copy) return;
       await openPath(copy);
       // 提示只报状态：文件名/路径可能很长，卡片和列表里已经能看全。
-      toast('已下载副本并打开');
+      toast(t('已下载副本并打开'));
     } catch (e) {
-      toast(`打开失败：${e instanceof Error ? e.message : String(e)}`);
+      toast(t('打开失败：{error}', { error: e instanceof Error ? e.message : String(e) }));
     }
   }
 
@@ -1156,7 +1158,7 @@
       console.error('展开悬浮球失败:', e);
       resetOrbDom();   // 窗口没长开，球别按展开偏移留在一个看不见的位置
       holdOrb = false;
-      toast('展开失败，请重试');
+      toast(t('展开失败，请重试'));
     } finally {
       opening = false;
       if (stuckTimer) { clearTimeout(stuckTimer); stuckTimer = null; }
@@ -1649,7 +1651,7 @@
       await upd.installUpdate();
     } catch (e) {
       // 失败必须说出来：那条命令的报错讲的是真因（镜像都不通 / 校验不过 / helper 起不来）。
-      toast(`更新失败：${e instanceof Error ? e.message : String(e)}`);
+      toast(t('更新失败：{error}', { error: e instanceof Error ? e.message : String(e) }));
     }
   }
 
@@ -1700,19 +1702,20 @@
    */
   function pushBatchTitle(b: PushBatch): string {
     const live = batchLive(b);
-    const sending = b.targets.some((t) => t.state === 'sending');
+    const sending = b.targets.some((target) => target.state === 'sending');
     if (b.targets.length > 1) {
-      const names = b.targets.map((t) => `「${targetName(t)}」`);
-      const head = names.length <= 2 ? names.join('') : `${names[0]}${names[1]}等 ${names.length} 台设备`;
-      return `推送给${head}`;
+      const names = b.targets.map((target) => targetName(target));
+      if (names.length === 1) return t('推送给「{name}」', { name: names[0] });
+      if (names.length === 2) return t('推送给「{a}」「{b}」', { a: names[0], b: names[1] });
+      return t('推送给「{a}」「{b}」等 {n} 台设备', { a: names[0], b: names[1], n: names.length });
     }
     if (b.count > 1) {
-      const what = `（${b.count} 项）`;
-      if (live) return sending ? `正在发送${what}` : `等待对方同意${what}`;
-      return b.failed > 0 ? `发送未完成${what}` : `已发送${what}`;
+      const n = b.count;
+      if (live) return sending ? t('正在发送（{n} 项）', { n }) : t('等待对方同意（{n} 项）', { n });
+      return b.failed > 0 ? t('发送未完成（{n} 项）', { n }) : t('已发送（{n} 项）', { n });
     }
-    if (!live) return b.failed > 0 ? `发送未完成 · ${b.name}` : `已发送 · ${b.name}`;
-    return sending ? `正在发送 · ${b.name}` : '等待对方同意';
+    if (!live) return b.failed > 0 ? t('发送未完成 · {name}', { name: b.name }) : t('已发送 · {name}', { name: b.name });
+    return sending ? t('正在发送 · {name}', { name: b.name }) : t('等待对方同意');
   }
 
   /**
@@ -1727,7 +1730,7 @@
   /** 悬停里的完整名单（标题只放得下两个名字）。 */
   function batchTitleFull(b: PushBatch): string {
     if (b.targets.length < 3) return '';
-    return b.targets.map(targetName).join('、');
+    return b.targets.map(targetName).join(t('、'));
   }
 
   /**
@@ -1736,10 +1739,11 @@
    */
   function batchCounts(b: PushBatch): string {
     if (batchAllDone(b)) {
-      return b.targets.length > 1 ? `${b.targets.length} 台全部完成` : '已发送完成';
+      return b.targets.length > 1 ? t('{n} 台全部完成', { n: b.targets.length }) : t('已发送完成');
     }
-    const failed = b.failed > 0 ? ` · 失败 ${b.failed}` : '';
-    return `成功 ${b.done} · 等待 ${b.waiting}${failed}`;
+    return b.failed > 0
+      ? t('成功 {done} · 等待 {waiting} · 失败 {failed}', { done: b.done, waiting: b.waiting, failed: b.failed })
+      : t('成功 {done} · 等待 {waiting}', { done: b.done, waiting: b.waiting });
   }
 
   /**
@@ -1748,16 +1752,16 @@
    * 已配对的目标**不问同意**直接收（token 就是那份信任），所以它那一行不能说
    * 「等待对方同意」—— 对面根本没点过任何东西，说成"等同意"是在编一个没发生的事。
    */
-  function targetLabel(t: PushTarget, total: number): string {
-    switch (t.state) {
-      case 'invited': return t.paired ? '等待开始（对方自动接收）' : '等待对方同意';
-      case 'sending': return `传输中 ${pushPercent(t.received, total)}%`;
-      case 'done': return `已发送 ${fmtBytes(t.received)}`;
-      case 'cancelled': return '已取消';
+  function targetLabel(target: PushTarget, total: number): string {
+    switch (target.state) {
+      case 'invited': return target.paired ? t('等待开始（对方自动接收）') : t('等待对方同意');
+      case 'sending': return t('传输中 {percent}%', { percent: pushPercent(target.received, total) });
+      case 'done': return t('已发送 {size}', { size: fmtBytes(target.received) });
+      case 'cancelled': return t('已取消');
       // 对端给了原因就用它的：**「对方拒绝」与「本机收不下」是两件事**（后者是已配对设备
       // 免同意自动收时的失败，对面根本没点过任何东西）。
-      case 'rejected': return t.error ?? '对方拒绝';
-      default: return `失败：${t.error ?? '未知原因'}`;
+      case 'rejected': return target.error ?? t('对方拒绝');
+      default: return t('失败：{reason}', { reason: target.error ?? t('未知原因') });
     }
   }
 
@@ -1818,34 +1822,34 @@
     }
     settledBatches.add(b.batchId);
     if (b.targets.length === 1) {
-      const t = b.targets[0];
-      if (t.state === 'done') {
-        toast('已发送完成');
+      const target = b.targets[0];
+      if (target.state === 'done') {
+        toast(t('已发送完成'));
         setTimeout(() => dropBatch(b.batchId), 3000);
-      } else if (t.state === 'cancelled') {
-        toast('已取消推送');
+      } else if (target.state === 'cancelled') {
+        toast(t('已取消推送'));
         dropBatch(b.batchId);
       } else {
         // 对端拒绝 / 对端没有这条邀请 / 传输失败：原因就在快照里（`push://done` 以前带的那句）。
-        toast(t.error ?? '推送失败');
+        toast(target.error ?? t('推送失败'));
         dropBatch(b.batchId);
       }
       return;
     }
     if (batchAllDone(b)) {
-      toast(`已推送给 ${b.targets.length} 台设备`);
+      toast(t('已推送给 {n} 台设备', { n: b.targets.length }));
       setTimeout(() => dropBatch(b.batchId), 3000);
-    } else if (b.targets.every((t) => t.state === 'cancelled')) {
+    } else if (b.targets.every((target) => target.state === 'cancelled')) {
       // 整批取消：卡片立刻收掉（一次确认过的操作已经是终局，没有"哪台没成"要交代）。
-      toast('已取消推送');
+      toast(t('已取消推送'));
       dropBatch(b.batchId);
     } else if (b.done === 0) {
       // 一台没成：没有"部分成功"要交代，一条提示 + 收起（与单台失败同一个手感）。
-      toast(`推送未成功：${b.targets.find((t) => t.error)?.error ?? '全部失败'}`);
+      toast(t('推送未成功：{reason}', { reason: b.targets.find((target) => target.error)?.error ?? t('全部失败') }));
       dropBatch(b.batchId);
     } else {
       // 部分成功、有台没成：一条 toast 说不清是哪几台 —— 卡片粘住，等用户点「知道了」。
-      toast(`推送完成：成功 ${b.done} · 失败 ${b.failed}`);
+      toast(t('推送完成：成功 {done} · 失败 {failed}', { done: b.done, failed: b.failed }));
     }
   }
 
@@ -1873,8 +1877,8 @@
    */
   function toastNoLiveTarget(devices: PeerDevice[]) {
     toast(devices.length === 1
-      ? `「${deviceShortName(devices[0])}」不在网上，推送未发送`
-      : '所选设备都不在网上，推送未发送');
+      ? t('「{name}」不在网上，推送未发送', { name: deviceShortName(devices[0]) })
+      : t('所选设备都不在网上，推送未发送'));
   }
 
   /**
@@ -1894,19 +1898,19 @@
       return;
     }
     picker = {
-      title: `推送到${pushTargetsLabel(live)}`,
-      sub: '文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。同一份内容会分别发给每台设备：已配对的直接收，未配对的各自点同意，进度与成败都记在右下角那张卡片上。',
-      confirmLabel: live.length > 1 ? `推送到 ${live.length} 台设备` : '推送',
+      title: t('推送到{targets}', { targets: pushTargetsLabel(live) }),
+      sub: t('文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。同一份内容会分别发给每台设备：已配对的直接收，未配对的各自点同意，进度与成败都记在右下角那张卡片上。'),
+      confirmLabel: live.length > 1 ? t('推送到 {n} 台设备', { n: live.length }) : t('推送'),
       onConfirm: (items) => void pushPicked(items, live, chatBatchId, groupId),
     };
   }
 
   /** 「A」「B」等 3 台设备 —— 与卡片标题同一个规则（设备名一律用「」框住）。 */
   function pushTargetsLabel(devices: PeerDevice[]): string {
-    const names = devices.map((d) => `「${deviceShortName(d)}」`);
-    if (names.length === 1) return names[0];
-    if (names.length === 2) return names.join('');
-    return `${names[0]}${names[1]}等 ${names.length} 台设备`;
+    const names = devices.map((d) => deviceShortName(d));
+    if (names.length === 1) return t('「{name}」', { name: names[0] });
+    if (names.length === 2) return t('「{a}」「{b}」', { a: names[0], b: names[1] });
+    return t('「{a}」「{b}」等 {n} 台设备', { a: names[0], b: names[1], n: names.length });
   }
 
   function closePicker() {
@@ -1932,9 +1936,9 @@
   /** 本机页点「拖入文件或文件夹，点击添加共享项」：开同一个选择框挑本机内容（F-20）。 */
   function requestAddShare() {
     picker = {
-      title: '添加共享项',
-      sub: '文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。登记后可在本机标签里对每项开关广播。',
-      confirmLabel: '添加共享项',
+      title: t('添加共享项'),
+      sub: t('文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。登记后可在本机标签里对每项开关广播。'),
+      confirmLabel: t('添加共享项'),
       onConfirm: (items) => {
         closePicker();
         void addShares(items.map((i) => i.path));
@@ -1976,12 +1980,12 @@
     );
     const added = results.filter((r) => r === 'added').length;
     const skipped = results.filter((r) => r === 'dup').length;
-    if (added > 0 && skipped > 0) toast(`已添加 ${added} 个共享项（${skipped} 项已在共享项里）`);
-    else if (added > 0) toast(`已添加 ${added} 个共享项`);
-    else if (skipped > 0) toast(skipped === 1 ? '这项已经在共享项里了' : `这 ${skipped} 项已经在共享项里了`);
+    if (added > 0 && skipped > 0) toast(t('已添加 {added} 个共享项（{skipped} 项已在共享项里）', { added, skipped }));
+    else if (added > 0) toast(t('已添加 {added} 个共享项', { added }));
+    else if (skipped > 0) toast(skipped === 1 ? t('这项已经在共享项里了') : t('这 {n} 项已经在共享项里了', { n: skipped }));
     else if (failures.length > 0)
-      toast(failures.length === 1 ? failures[0] : `${failures.length} 项没能添加：${failures[0]}`);
-    else toast('没有添加任何共享项');
+      toast(failures.length === 1 ? failures[0] : t('{n} 项没能添加：{reason}', { n: failures.length, reason: failures[0] }));
+    else toast(t('没有添加任何共享项'));
     return added;
   }
 
@@ -2015,7 +2019,7 @@
    */
   function openDeviceChat(peerId: string) {
     if (!getDevices().some((d) => d.id === peerId)) {
-      toast('该设备已被移除');
+      toast(t('该设备已被移除'));
       return;
     }
     chat.openDeviceChat(peerId);
@@ -2187,8 +2191,8 @@
     const text = (which === 'sel' ? c?.chatSel : c?.chatFull) ?? '';
     if (!text) return;
     navigator.clipboard.writeText(text).then(
-      () => toast(which === 'sel' ? '已复制所选文字' : '已复制整条消息'),
-      () => toast('复制失败，请手动选中文字后复制'),
+      () => toast(which === 'sel' ? t('已复制所选文字') : t('已复制整条消息')),
+      () => toast(t('复制失败，请手动选中文字后复制')),
     );
   }
 
@@ -2211,7 +2215,7 @@
     if (!id) return;
     const device = deviceById(id);
     if (!device) {
-      toast('该设备已被移除');
+      toast(t('该设备已被移除'));
       return;
     }
     const saved = device.remark ?? '';
@@ -2236,7 +2240,9 @@
     try {
       const stored = await saveDeviceRemark(rs.peerId, rs.value);
       closeRemark();
-      toast(stored ? `已把「${rs.rawName}」的备注设为「${stored}」` : `已清除「${rs.rawName}」的备注`);
+      toast(stored
+        ? t('已把「{name}」的备注设为「{remark}」', { name: rs.rawName, remark: stored })
+        : t('已清除「{name}」的备注', { name: rs.rawName }));
     } catch (e) {
       remarkState = { ...rs, busy: false, error: String(e) };
     }
@@ -2280,7 +2286,7 @@
     if (!key) return;
     try {
       const id = await chat.upgradeBatch(key);
-      if (id) toast('已升级为群聊：邀请已发出去，对方点「加入」后才算进群');
+      if (id) toast(t('已升级为群聊：邀请已发出去，对方点「加入」后才算进群'));
     } catch (e) {
       toast(String(e));
     }
@@ -2299,7 +2305,7 @@
     if (!c?.convoKey || !c.convoThread || c.convoBc) return;
     try {
       await chat.clearGroupHistory(c.convoKey);
-      toast('已清空这个群的本地聊天记录（未退群）');
+      toast(t('已清空这个群的本地聊天记录（未退群）'));
     } catch (e) {
       toast(String(e));
     }
@@ -2320,15 +2326,15 @@
         return;
       }
       chat.backToList();
-      toast(`已清空与「${title}」的聊天记录`);
+      toast(t('已清空与「{name}」的聊天记录', { name: title }));
       return;
     }
     try {
       const gone = await chat.exitThread(c.convoKey);
       if (!gone) return;
       toast(gone.mode === 'broadcast'
-        ? `已删除「${gone.title}」（消息仍留在各台设备的会话里）`
-        : `已退出「${gone.title}」`);
+        ? t('已删除「{name}」（消息仍留在各台设备的会话里）', { name: gone.title })
+        : t('已退出「{name}」', { name: gone.title }));
     } catch (e) {
       toast(String(e));
     }
@@ -2390,7 +2396,7 @@
     try {
       await openPath(item.path);
     } catch (e) {
-      toast(`打开失败：${e instanceof Error ? e.message : String(e)}`);
+      toast(t('打开失败：{error}', { error: e instanceof Error ? e.message : String(e) }));
     }
   }
 
@@ -2417,28 +2423,40 @@
       await openPath(dest);
       dropNotice(n.inviteId);
     } catch (e) {
-      toast(`打开目录失败：${e}`);
+      toast(t('打开目录失败：{error}', { error: String(e) }));
     }
   }
 
   /** 通知标题（与发送卡同一套规则：多项只说项数，不说那个分组标签）。 */
   function noticeTitle(n: PushNotice): string {
     // 配对邀请与推送无关：既没有文件也没有项数，只说"谁在等你的决定"。
-    if (n.kind === 'pair') return `「${n.from}」请求与你配对`;
+    if (n.kind === 'pair') return t('「{name}」请求与你配对', { name: n.from });
     // 本机发出去的那条：说清"在等谁" —— 卡片挂着就代表对面还没处理。
-    if (n.kind === 'pairWait') return `等待「${n.from}」确认配对`;
+    if (n.kind === 'pairWait') return t('等待「{name}」确认配对', { name: n.from });
     // 长连接请求（F-16 的同意制）：两边的卡片都说清"这个动作在等谁"。
-    if (n.kind === 'link') return `「${n.from}」请求建立长连接`;
-    if (n.kind === 'linkWait') return `等待「${n.from}」同意连接`;
+    if (n.kind === 'link') return t('「{name}」请求建立长连接', { name: n.from });
+    if (n.kind === 'linkWait') return t('等待「{name}」同意连接', { name: n.from });
     if (n.count > 1) {
-      const what = `（${n.count} 项）`;
-      if (n.kind === 'invite') return `收到「${n.from}」的推送${what}`;
-      if (n.kind === 'done') return `已收到「${n.from}」的推送${what}`;
-      return n.kind === 'receiving' ? `正在接收${what}` : `接收失败${what}`;
+      const count = n.count;
+      if (n.kind === 'invite') return t('收到「{name}」的推送（{n} 项）', { name: n.from, n: count });
+      if (n.kind === 'done') return t('已收到「{name}」的推送（{n} 项）', { name: n.from, n: count });
+      return n.kind === 'receiving'
+        ? t('正在接收（{n} 项）', { n: count })
+        : t('接收失败（{n} 项）', { n: count });
     }
-    if (n.kind === 'invite') return `收到「${n.from}」的推送${n.isDir ? '目录' : '文件'}`;
-    if (n.kind === 'done') return `已收到「${n.from}」的推送${n.isDir ? '目录' : '文件'}`;
-    return n.kind === 'receiving' ? `正在接收 · ${n.name}` : `接收失败 · ${n.name}`;
+    if (n.kind === 'invite') {
+      return n.isDir
+        ? t('收到「{name}」的推送（目录）', { name: n.from })
+        : t('收到「{name}」的推送（文件）', { name: n.from });
+    }
+    if (n.kind === 'done') {
+      return n.isDir
+        ? t('已收到「{name}」的推送（目录）', { name: n.from })
+        : t('已收到「{name}」的推送（文件）', { name: n.from });
+    }
+    return n.kind === 'receiving'
+      ? t('正在接收 · {name}', { name: n.name })
+      : t('接收失败 · {name}', { name: n.name });
   }
 
   /** 气泡正文：收完的说清"东西在哪"（`dest` 由后端给），失败的说清原因。 */
@@ -2447,26 +2465,32 @@
     if (n.kind === 'pair') {
       // 没带凭据的那种（后端 `unproven`）要当场说清：用户是在"它可能真是那台老设备、
       // 也可能不是"的前提下按「接收」的。
-      const warn = n.unproven
-        ? '注意：它自称是本机已配对的设备，却没带上本机发给它的凭据（它重新装过 / 解除过配对？）。接收即按它现在这个地址重新配对。'
-        : '';
-      return `${warn}接受后两台设备互为「已配对」（互相交换凭据），之后就能建立长连接、互相推送；60 秒内未处理自动作废。`;
+      if (n.unproven) {
+        return t('注意：它自称是本机已配对的设备，却没带上本机发给它的凭据（它重新装过 / 解除过配对？）。接收即按它现在这个地址重新配对。接受后两台设备互为「已配对」（互相交换凭据），之后就能建立长连接、互相推送；60 秒内未处理自动作废。');
+      }
+      return t('接受后两台设备互为「已配对」（互相交换凭据），之后就能建立长连接、互相推送；60 秒内未处理自动作废。');
     }
     if (n.kind === 'pairWait') {
-      return `已把邀请推到「${n.from}」：它在自己的通知里点「接收」即配对成功。60 秒内没人处理自动作废。`;
+      return t('已把邀请推到「{name}」：它在自己的通知里点「接收」即配对成功。60 秒内没人处理自动作废。', { name: n.from });
     }
     // 长连接请求：说清"点了会怎样"，两边同一套措辞，用户才知道对面在等什么。
     if (n.kind === 'link') {
-      return `接受后「${n.from}」会与本机建立长连接（实时通道：共享项变更自动广播、消息即时送达）。60 秒内没人处理自动作废。`;
+      return t('接受后「{name}」会与本机建立长连接（实时通道：共享项变更自动广播、消息即时送达）。60 秒内没人处理自动作废。', { name: n.from });
     }
     if (n.kind === 'linkWait') {
-      return `已把连接请求发给「${n.from}」：它在自己的通知里点「接受」即建立长连接。60 秒内没人处理自动作废。`;
+      return t('已把连接请求发给「{name}」：它在自己的通知里点「接受」即建立长连接。60 秒内没人处理自动作废。', { name: n.from });
     }
     if (n.kind === 'done') {
-      const what = n.count > 1 ? `${n.count} 项` : n.name;
-      return n.dest ? `${what} 已保存到 ${n.dest}` : `${what} 已保存到下载目录`;
+      if (n.count > 1) {
+        return n.dest
+          ? t('{n} 项已保存到 {dest}', { n: n.count, dest: n.dest })
+          : t('{n} 项已保存到下载目录', { n: n.count });
+      }
+      return n.dest
+        ? t('{name} 已保存到 {dest}', { name: n.name, dest: n.dest })
+        : t('{name} 已保存到下载目录', { name: n.name });
     }
-    return n.error ?? '接收失败';
+    return n.error ?? t('接收失败');
   }
 
   /**
@@ -2485,7 +2509,7 @@
     let root: string | null = null;
     if (s?.downloadMode === 'AskEachTime') {
       const picked = await openDialog({
-        title: '选择接收位置',
+        title: t('选择接收位置'),
         directory: true,
         multiple: false,
         defaultPath: s.downloadDir || undefined,
@@ -2543,7 +2567,7 @@
         return;
       }
       if (chat.inviteReceiving(inviteId)) {
-        toast(want ? '已暂停接收' : '已继续接收');
+        toast(want ? t('已暂停接收') : t('已继续接收'));
       }
     } catch (e) {
       chat.setInvitePaused(inviteId, before);
@@ -2584,9 +2608,9 @@
     dropNotice(n.inviteId);
     try {
       const name = await acceptPairInvite(n.inviteId);
-      toast(`已与「${name}」配对成功（点「连接」建立长连接）`);
+      toast(t('已与「{name}」配对成功（点「连接」建立长连接）', { name }));
     } catch (e) {
-      toast(`配对未完成：${e}`);
+      toast(t('配对未完成：{error}', { error: String(e) }));
     }
   }
 
@@ -2603,7 +2627,7 @@
   async function cancelPairWaitNotice(n: PushNotice) {
     dropNotice(n.inviteId);
     try { await cancelPairInvite(n.inviteId); } catch (e) { toast(String(e)); }
-    toast('已取消配对邀请');
+    toast(t('已取消配对邀请'));
   }
 
   /**
@@ -2616,9 +2640,9 @@
     dropNotice(n.inviteId);
     try {
       const name = await acceptLinkRequest(n.inviteId);
-      toast(`已同意「${name}」建立长连接`);
+      toast(t('已同意「{name}」建立长连接', { name }));
     } catch (e) {
-      toast(`同意连接失败：${e}`);
+      toast(t('同意连接失败：{error}', { error: String(e) }));
     }
   }
 
@@ -2656,7 +2680,7 @@
     try {
       code = await pairStart(peerId);
     } catch (e) {
-      toast(`生成配对码失败：${e}`);
+      toast(t('生成配对码失败：{error}', { error: String(e) }));
       return;
     }
     pairState = { peerId, peerName, code, remaining: PAIR_TTL, input: '', busy: false, error: null, ip: '', port: '' };
@@ -2683,7 +2707,7 @@
       const code = await pairStart(ps.peerId);
       pairState = { ...ps, code, remaining: PAIR_TTL, busy: false };
       startPairCountdown(ps.peerId);
-      toast('已换新配对码');
+      toast(t('已换新配对码'));
     } catch (e) {
       if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
     }
@@ -2722,14 +2746,14 @@
     if (colon > 0) { port = ip.slice(colon + 1); ip = ip.slice(0, colon); }
     // 端口留空 = 让对方那一侧自己认领：后端从 3890 起探 10 个（S-06 的端口段）
     if (!ip) {
-      pairState = { ...ps, error: '请填写对方 IP' };
+      pairState = { ...ps, error: t('请填写对方 IP') };
       return;
     }
     let portNum = 0;
     if (port) {
       portNum = Number(port);
       if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
-        pairState = { ...ps, error: '端口要在 1-65535 之间（留空则自动扫描 3890-3899）' };
+        pairState = { ...ps, error: t('端口要在 1-65535 之间（留空则自动扫描 3890-3899）') };
         return;
       }
     }
@@ -2737,7 +2761,7 @@
     try {
       const device = await addPeer(ip, portNum);
       await loadDevices();
-      toast(`已添加设备「${peerShortName(device.id, device.name)}」`);
+      toast(t('已添加设备「{name}」', { name: peerShortName(device.id, device.name) }));
       await issuePairCode(device.id, peerShortName(device.id, device.name));
     } catch (e) {
       if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
@@ -2749,7 +2773,7 @@
     const ps = pairState;
     if (!ps?.peerId) return;
     if (!/^\d{6}$/.test(ps.input)) {
-      pairState = { ...ps, error: '请输入 6 位数字配对码' };
+      pairState = { ...ps, error: t('请输入 6 位数字配对码') };
       return;
     }
     pairState = { ...ps, busy: true, error: null };
@@ -2758,13 +2782,13 @@
       await pairConfirm(ps.peerId, ps.input);
       await loadDevices();
       closePair();
-      toast(`已与「${ps.peerName ?? '设备'}」配对成功（点「连接」建立长连接）`);
+      toast(t('已与「{name}」配对成功（点「连接」建立长连接）', { name: ps.peerName ?? t('设备') }));
     } catch (e) {
       if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
       // 拨过去就没通的：那一台此刻"看得见却直连不通"时，这句解释比"请核对配对码"有用
       // （码很可能是对的，是这张网不让两个客户端互相说话）。
       const tip = unicastBlockedTip(deviceById(ps.peerId));
-      toast(tip ?? '配对失败，请核对配对码');
+      toast(tip ?? t('配对失败，请核对配对码'));
     } finally {
       pairConfirming = false;
     }
@@ -2797,7 +2821,7 @@
       if (tip) toast(tip);
       return;
     }
-    const name = ps.peerName ?? '设备';
+    const name = ps.peerName ?? t('设备');
     closePair();
     notices = [...notices, {
       inviteId: start.inviteId,
@@ -2807,15 +2831,15 @@
       name: '', size: 0, isDir: false, count: 1, received: 0,
       sas: start.sas,
     }];
-    toast(`已向「${name}」发起配对邀请：核对码一致后由对方点「接收」`);
+    toast(t('已向「{name}」发起配对邀请：核对码一致后由对方点「接收」', { name }));
   }
 
   function copyCode() {
     const ps = pairState;
     if (!ps?.code) return;
     navigator.clipboard.writeText(ps.code).then(
-      () => toast(`已复制配对码 ${ps.code}`),
-      () => toast('复制失败，请手动输入')
+      () => toast(t('已复制配对码 {code}', { code: ps.code })),
+      () => toast(t('复制失败，请手动输入'))
     );
   }
 
@@ -2867,16 +2891,16 @@
     if (!c || c.kind !== 'share' || !c.shareId) return;
     const item = localShareItem(c);
     if (item?.isDir) {
-      toast('本机目录不复制到下载目录（它已经在磁盘上）——用「打开所在文件夹」查看');
+      toast(t('本机目录不复制到下载目录（它已经在磁盘上）——用「打开所在文件夹」查看'));
       return;
     }
     try {
       const saved = await downloadFile(c.shareId, c.path ?? '');
       // 保存框里取消 = 不落盘：静默收场（不是失败，所以不弹提示）。
       if (!saved) return;
-      toast('已下载到本地');
+      toast(t('已下载到本地'));
     } catch (e) {
-      toast(`下载失败：${e}`);
+      toast(t('下载失败：{error}', { error: String(e) }));
     }
   }
 
@@ -2891,7 +2915,7 @@
     try {
       await openPath(target);
     } catch (e) {
-      toast(`打开失败：${e}`);
+      toast(t('打开失败：{error}', { error: String(e) }));
     }
   }
 
@@ -2913,9 +2937,9 @@
         return;
       }
       finishPeerDownload(c.peerId, c.shareId, path);
-      toast('已下载到本地');
+      toast(t('已下载到本地'));
     } catch (e) {
-      toast(`下载失败：${e}`);
+      toast(t('下载失败：{error}', { error: String(e) }));
     }
   }
 
@@ -2928,9 +2952,9 @@
     if (!item) return;
     try {
       await navigator.clipboard.writeText(item.abs);
-      toast('已复制共享路径');
+      toast(t('已复制共享路径'));
     } catch (e) {
-      toast(`复制失败：${e}`);
+      toast(t('复制失败：{error}', { error: String(e) }));
     }
   }
 
@@ -2938,7 +2962,7 @@
     const c = ctxState;
     if (c?.kind === 'share' && c.shareId) {
       await removeShare(c.shareId);
-      toast('已移除共享项');
+      toast(t('已移除共享项'));
     }
     hideCtx();
   }
@@ -2956,12 +2980,12 @@
       // 用它记录里那个真名，别把一串 deviceid 塞进 toast。
       const name = chat.deviceNameOf(deviceId);
       if (outcome.kind === 'asked') {
-        toast(`已把连接请求发给「${name}」：等它在自己的通知里点「接受」`);
+        toast(t('已把连接请求发给「{name}」：等它在自己的通知里点「接受」', { name }));
       } else {
-        toast(tip ?? '正在建立长连接，拖入文件将自动广播');
+        toast(tip ?? t('正在建立长连接，拖入文件将自动广播'));
       }
     } catch (e) {
-      toast(`建立长连接失败：${e}`);
+      toast(t('建立长连接失败：{error}', { error: String(e) }));
     }
   }
 
@@ -2971,9 +2995,9 @@
     if (!deviceId) return;
     try {
       await disconnectPeer(deviceId);
-      toast('已断开长连接');
+      toast(t('已断开长连接'));
     } catch (e) {
-      toast(`断开失败：${e}`);
+      toast(t('断开失败：{error}', { error: String(e) }));
     }
   }
 
@@ -2985,9 +3009,9 @@
       // 关系没了：这台对本机可见的共享项缓存一起清 —— 留着的话，`states` 会随配对记录一直累积
       // （按 peer id 存），且它下次上线/重新配对时界面会先显示一份已经不成立的清单。
       forgetPeerShares(deviceId);
-      toast('已解除配对（对方在线时会继续显示为「未配对」）');
+      toast(t('已解除配对（对方在线时会继续显示为「未配对」）'));
     } catch (e) {
-      toast(`解除配对失败：${e}`);
+      toast(t('解除配对失败：{error}', { error: String(e) }));
     }
   }
 
@@ -3003,14 +3027,14 @@
    *  用户会以为"忘记"没生效。 */
   async function ctxForget() {
     const deviceId = ctxState?.deviceId;
-    const name = ctxState?.name ?? '设备';
+    const name = ctxState?.name ?? t('设备');
     hideCtx();
     if (!deviceId) return;
     try {
       await forgetPeer(deviceId);
-      toast(`已忘记「${name}」（仅本机记录）`);
+      toast(t('已忘记「{name}」（仅本机记录）', { name }));
     } catch (e) {
-      toast(`忘记设备失败：${e}`);
+      toast(t('忘记设备失败：{error}', { error: String(e) }));
     }
   }
 
@@ -3028,14 +3052,14 @@
     hideCtx();
     const target = c ? ctxBcTarget(c) : null;
     if (!target) {
-      toast('这项没有可比较的共享路径');
+      toast(t('这项没有可比较的共享路径'));
       return;
     }
     try {
       await setLeft(target);
-      toast('已放入左侧比较位');
+      toast(t('已放入左侧比较位'));
     } catch (e) {
-      toast(`设置左侧比较位失败：${e}`);
+      toast(t('设置左侧比较位失败：{error}', { error: String(e) }));
     }
   }
 
@@ -3045,19 +3069,19 @@
     hideCtx();
     const target = c ? ctxBcTarget(c) : null;
     if (!target) {
-      toast('这项没有可比较的共享路径');
+      toast(t('这项没有可比较的共享路径'));
       return;
     }
     const slot = getBcStatus().left;
     if (!slot) {
-      toast('左侧比较位是空的：先「添加到左侧比较位」');
+      toast(t('左侧比较位是空的：先「添加到左侧比较位」'));
       return;
     }
     try {
       await compareWithLeft(target);
-      toast('已在 BeyondCompare 中打开比较');
+      toast(t('已在 BeyondCompare 中打开比较'));
     } catch (e) {
-      toast(`BeyondCompare 启动失败：${e}`);
+      toast(t('BeyondCompare 启动失败：{error}', { error: String(e) }));
     }
   }
 
@@ -3067,6 +3091,11 @@
     void upd.watchUpdate();
     // 设置只拉一次：形态（折叠态尺寸）与其余初始化都等这一份。
     const settingsReady = loadSettings();
+    // 语言配置优先于 localStorage 的上一份（首帧已按后者渲染，这里只是对齐）。
+    void settingsReady.then(() => {
+      const persisted = getSettings();
+      if (persisted) adoptLanguagePreference(persisted.language);
+    });
     // 折叠态窗口 = 悬浮球/悬浮框 + 四周余量：尺寸在这里归位，**位置**由后端在首帧之前按上次的
     // 落位写好（lib.rs `place_orb_on_startup`）—— 等界面起来再挪会看到球从屏幕中央跳过去。
     // 尺寸也归一次位：形态（设置）决定它，而后端只知道落盘的形态、不知道卡片被 IP 撑宽后的宽度。
@@ -3206,8 +3235,10 @@
         const b = batchForInvite(inviteId);
         if (b && b.targets.length === 1) {
           // 已绑定设备那条路上没有"对方同意"这一步，说"已同意"会让人以为对面点过。
-          const t = b.targets[0];
-          toast(t.paired ? `开始向「${targetName(t)}」传输` : `「${targetName(t)}」已同意接收，开始传输`);
+          const target = b.targets[0];
+          toast(target.paired
+            ? t('开始向「{name}」传输', { name: targetName(target) })
+            : t('「{name}」已同意接收，开始传输', { name: targetName(target) }));
         }
         return;
       }
@@ -3220,8 +3251,8 @@
         dropNotice(inviteId);
         toast(
           notice.kind === 'invite'
-            ? `推送邀请已作废：${reason ?? '对方拒绝'}`
-            : `接收没能开始：${reason ?? '未知原因'}`,
+            ? t('推送邀请已作废：{reason}', { reason: reason ?? t('对方拒绝') })
+            : t('接收没能开始：{reason}', { reason: reason ?? t('未知原因') }),
         );
       }
     });
@@ -3262,14 +3293,14 @@
       const notice = notices.find((n) => n.inviteId === inviteId);
       if (notice) {
         if (status === 'completed') {
-          toast('已收到文件');
+          toast(t('已收到文件'));
           // 收完 ≠ 处理完：转成一条**待确认**的通知挂在右下角气泡里，直到用户点
           // 「知道了」才消失 —— 否则"东西落在哪"会跟着 toast 一起蒸发掉。
           notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'done', received: n.size, dest } : n));
         } else if (status === 'cancelled') {
           dropNotice(inviteId);
         } else {
-          notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'failed', error: reason ?? '接收失败' } : n));
+          notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'failed', error: reason ?? t('接收失败') } : n));
         }
       }
       // 发送侧那张卡**不在这里**收尾：它的终态由 `push://batch` 快照驱动（见 `settleBatch`）
@@ -3335,14 +3366,14 @@
       const waited = notices.find((n) => n.kind === 'pairWait' && n.inviteId === ev.payload.inviteId);
       if (waited) {
         dropNotice(waited.inviteId);
-        toast(`已与「${waited.from}」配对成功（点「连接」建立长连接）`);
+        toast(t('已与「{name}」配对成功（点「连接」建立长连接）', { name: waited.from }));
         return;
       }
       const ps = pairState;
       if (ps?.peerId === ev.payload.peerId) {
-        const name = peerShortName(ev.payload.peerId, ps.peerName ?? ev.payload.peerName ?? '设备');
+        const name = peerShortName(ev.payload.peerId, ps.peerName ?? ev.payload.peerName ?? t('设备'));
         closePair();
-        toast(`已与「${name}」配对成功（点「连接」建立长连接）`);
+        toast(t('已与「{name}」配对成功（点「连接」建立长连接）', { name }));
       }
     });
 
@@ -3370,7 +3401,7 @@
       const { inviteId, reason } = ev.payload;
       if (!notices.some((n) => n.inviteId === inviteId)) return;
       dropNotice(inviteId);
-      toast(`配对邀请已作废：${reason ?? '超时未处理'}`);
+      toast(t('配对邀请已作废：{reason}', { reason: reason ?? t('超时未处理') }));
     });
 
     // 本机发起的邀请没成（对方拒绝 / 超时 / 已撤回 / 联系不上）：把右下角那张卡收掉并说明原因。
@@ -3379,8 +3410,8 @@
       if (!notices.some((n) => n.kind === 'pairWait' && n.inviteId === inviteId)) return;
       dropNotice(inviteId);
       // 用户自己点「取消」时那张卡已经收掉了（撤回来的 403 落到这里时什么都不用说）。
-      const why = reason ?? '对方未接受';
-      toast(why.includes('取消') ? '配对邀请已取消' : `配对邀请未完成：${why}`);
+      const why = reason ?? t('对方未接受');
+      toast(why.includes('取消') ? t('配对邀请已取消') : t('配对邀请未完成：{reason}', { reason: why }));
     });
 
     // 收到一条**长连接请求**（F-16 的同意制）→ 挂一条通知（带「接受/拒绝」）。
@@ -3423,7 +3454,7 @@
       const { requestId, reason } = ev.payload;
       if (!notices.some((n) => n.kind === 'link' && n.inviteId === requestId)) return;
       dropNotice(requestId);
-      toast(`连接请求已作废：${reason ?? '超时未处理'}`);
+      toast(t('连接请求已作废：{reason}', { reason: reason ?? t('超时未处理') }));
     });
 
     // 本机发出去的那条有结果了：`granted`（在建链）/ `denied`（对方拒绝或没处理）/
@@ -3434,11 +3465,11 @@
       const from = notices.find((n) => n.inviteId === requestId)?.from ?? peerShortName(peerId);
       dropNotice(requestId);
       if (outcome === 'granted') {
-        toast(`「${from}」已同意：正在建立长连接`);
+        toast(t('「{name}」已同意：正在建立长连接', { name: from }));
       } else if (outcome === 'fallback') {
-        toast(`正在与「${from}」建立长连接`);
+        toast(t('正在与「{name}」建立长连接', { name: from }));
       } else {
-        toast(`「${from}」没有接受连接请求：${reason ?? '对方未处理'}`);
+        toast(t('「{name}」没有接受连接请求：{reason}', { name: from, reason: reason ?? t('对方未处理') }));
       }
     });
 
@@ -3576,7 +3607,7 @@
   </div>
 
   <!-- Main Panel -->
-  <section class="panel" aria-label="OrbDrop 主面板">
+  <section class="panel" aria-label={t('OrbDrop 主面板')}>
     <!-- `deep`：Tauri 的拖拽脚本只在**命中元素自己**带属性时才拖（`composedPath[0]`），
          logo/文字这些子元素会把 mousedown 从 header 上挡掉，于是只有空隙能拖。`deep` 让整棵
          子树里的非可点击元素都触发拖拽；按钮仍照旧拦截（脚本先判 clickable 再看属性）。 -->
@@ -3592,26 +3623,26 @@
             <div class="ch-list">
               <button class="ch-row online" class:active={isLocalOnline()} aria-expanded={isLocalOnline() ? statusOpen : undefined} onclick={() => pickOnline(true)}>
                 <span class="dot ok"></span>
-                <span>在线</span>
+                <span>{t('在线')}</span>
                 <!-- 与改前那颗胶囊同款文案：`在线 · 长连接 N`。本机离线时那台设备一条长连接
                      都没有，写出来只是噪音 —— 所以整段**藏起来**（`visibility`）而不是删掉：
                      元素仍占着同样的宽度，切到离线时框不会缩一截。 -->
-                <span class="ch-meta" class:gone={!isLocalOnline()}>· 长连接 {connectedCount}</span>
+                <span class="ch-meta" class:gone={!isLocalOnline()}>{t('· 长连接 {n}', { n: connectedCount })}</span>
                 <svg class="ch-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
               </button>
               <button class="ch-row offline" class:active={!isLocalOnline()} aria-expanded={!isLocalOnline() ? statusOpen : undefined} onclick={() => pickOnline(false)}>
                 <span class="dot off"></span>
-                <span>离线</span>
+                <span>{t('离线')}</span>
                 <svg class="ch-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
               </button>
             </div>
           </div>
         </div>
         <!-- 通知铃铛搬到 footer 最右侧（版本号右边）—— 面板头部只留窗口级的动作。 -->
-        <button class="icon-btn" onclick={openSettings} aria-label="打开设置">
+        <button class="icon-btn" onclick={openSettings} aria-label={t('打开设置')}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1Z"/></svg>
         </button>
-        <button class="icon-btn" onclick={() => setOpen(false)} aria-label="收起面板">
+        <button class="icon-btn" onclick={() => setOpen(false)} aria-label={t('收起面板')}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
         </button>
       </div>
@@ -3638,19 +3669,19 @@
           class="foot-msg"
           class:open={chat.isChatOpen()}
           type="button"
-          aria-label={convoBadgeLabel ? `会话，${convoBadgeLabel}` : '会话'}
+          aria-label={convoBadgeLabel ? t('会话，{label}', { label: convoBadgeLabel }) : t('会话')}
           aria-expanded={chat.isChatOpen()}
           onclick={toggleChat}
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.75" y="5.25" width="16.5" height="13.5" rx="4.25"/><circle cx="8.6" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="15.4" cy="12" r="1.15" fill="currentColor" stroke="none"/></svg>
-          <span>会话</span>
+          <span>{t('会话')}</span>
           {#if convoBadgeCount > 0}<span class="msg-fab-badge num">{convoBadgeCount > 99 ? '99+' : convoBadgeCount}</span>{/if}
         </button>
         {#if localAddrs.primary}
           <!-- 本机内网「IP:端口」：多网卡时只显示首个，悬停列出全部（跨网段手动添加要用）；点一下整串复制。 -->
           <button class="foot-addr num" onclick={copyAddr} title={addrTitle}>{localAddrs.primary}:{serverPortVal || 3890}</button>
         {:else}
-          <span class="num">端口 {serverPortVal || 3890}</span>
+          <span class="num">{t('端口 {port}', { port: serverPortVal || 3890 })}</span>
         {/if}
       </span>
       <span class="foot-right">
@@ -3663,7 +3694,7 @@
           class:active={notifOpen}
           class:has={notifCount > 0}
           onclick={() => (notifOpen = !notifOpen)}
-          aria-label={notifOpen ? '收起通知' : '展开通知'}
+          aria-label={notifOpen ? t('收起通知') : t('展开通知')}
           aria-expanded={notifOpen}
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
@@ -3684,7 +3715,7 @@
            那一档（有台没成、等你点「知道了」）算数，见 `pushPendingCount`。 -->
       {#if notifOpen && (notices.length > 0 || pushBatches.length > 0 || updateTask)}
         <div class="notif-group" bind:this={notifEl}>
-          <!-- 「更新这件事」（F-110）：启动时的静默检查发现新版时它就在这儿等用户决定，
+          <!-- 「更新这件事」（F-110）：后台检查（启动 / 周期 / 回前台）发现新版时它就在这儿等用户决定，
                点过「立即更新」之后**就地变成进度**（见 store 的 `updateTask`）—— 这一格是
                "提示 → 进度 → 失败"同一格三种画法，与那些等你确认的通知同一个形状、同一个
                铃铛与角标。面板收着时，悬浮球左上角那颗黄标就是唯一还看得见的提示。 -->
@@ -3711,30 +3742,33 @@
                 <div class="p-bar"><i style="width:{updatePct}%"></i></div>
                 <p class="nb-body">{updateStatusText(updateTask)}</p>
               {:else if updateTask.phase === 'available'}
-                <!-- 版本号已经写在标题里了，正文说"更新什么 / 点下去会发生什么"。 -->
-                <p class="nb-body">{updateTask.notes ?? '下载完会用新版本覆盖当前程序并重启。'}</p>
+                <!-- 版本号已经写在标题里了；正文默认只露两行更新日志，展开才看全文。 -->
+                <UpdateNotes
+                  notes={updateTask.notes}
+                  empty={t('下载完会用新版本覆盖当前程序并重启。')}
+                />
               {:else}
                 <p class="nb-body">{updateStatusText(updateTask)}</p>
               {/if}
 
               <div class="nb-acts">
                 {#if updateTask.phase === 'available'}
-                  <button class="btn btn-secondary btn-sm" onclick={() => upd.dismissUpdatePrompt()}>稍后</button>
+                  <button class="btn btn-secondary btn-sm" onclick={() => upd.dismissUpdatePrompt()}>{t('稍后')}</button>
                   <button
                     class="btn btn-primary btn-sm"
                     disabled={upd.isApplying()}
                     onclick={() => void installUpdateNow()}
                   >
-                    {upd.isApplying() ? '准备中…' : '立即更新'}
+                    {upd.isApplying() ? t('准备中…') : t('立即更新')}
                   </button>
                 {:else if updateTask.phase === 'error'}
-                  <button class="btn btn-secondary btn-sm" onclick={() => upd.dismissUpdatePrompt()}>知道了</button>
+                  <button class="btn btn-secondary btn-sm" onclick={() => upd.dismissUpdatePrompt()}>{t('知道了')}</button>
                   <button
                     class="btn btn-primary btn-sm"
                     disabled={upd.isApplying()}
                     onclick={() => void installUpdateNow()}
                   >
-                    重试
+                    {t('重试')}
                   </button>
                 {/if}
               </div>
@@ -3758,11 +3792,11 @@
               {#if n.kind === 'receiving'}
                 <div class="p-bar"><i style="width:{pushPercent(n.received, n.size)}%"></i></div>
                 <div class="p-meta">
-                  <span>来自「{n.from}」</span>
+                  <span>{t('来自「{name}」', { name: n.from })}</span>
                   <span class="num">{fmtBytes(n.received)} / {fmtBytes(n.size)}</span>
                 </div>
                 <div class="nb-acts">
-                  <button class="btn btn-secondary btn-sm" onclick={() => void cancelNotice(n)}>取消</button>
+                  <button class="btn btn-secondary btn-sm" onclick={() => void cancelNotice(n)}>{t('取消')}</button>
                 </div>
               {:else if n.kind === 'pair'}
                 <div class="consent-info">
@@ -3774,28 +3808,28 @@
                 <p class="nb-body">{noticeBody(n)}</p>
                 {#if n.sas}
                   <div class="sas-line">
-                    <span class="sas-label">核对码</span>
+                    <span class="sas-label">{t('核对码')}</span>
                     <span class="sas-code num">{n.sas}</span>
-                    <span class="sas-hint">和对方屏幕上的这串一致再点「接收」</span>
+                    <span class="sas-hint">{t('和对方屏幕上的这串一致再点「接收」')}</span>
                   </div>
                 {:else}
-                  <p class="sas-hint warn">对方版本过旧，无法核对身份；建议拒绝并改用配对码。</p>
+                  <p class="sas-hint warn">{t('对方版本过旧，无法核对身份；建议拒绝并改用配对码。')}</p>
                 {/if}
                 <div class="nb-acts">
-                  <button class="btn btn-secondary btn-sm" onclick={() => void rejectPairNotice(n)}>拒绝</button>
-                  <button class="btn btn-primary btn-sm" onclick={() => void acceptPairNotice(n)}>接收</button>
+                  <button class="btn btn-secondary btn-sm" onclick={() => void rejectPairNotice(n)}>{t('拒绝')}</button>
+                  <button class="btn btn-primary btn-sm" onclick={() => void acceptPairNotice(n)}>{t('接收')}</button>
                 </div>
               {:else if n.kind === 'pairWait'}
                 <p class="nb-body">{noticeBody(n)}</p>
                 {#if n.sas}
                   <div class="sas-line">
-                    <span class="sas-label">核对码</span>
+                    <span class="sas-label">{t('核对码')}</span>
                     <span class="sas-code num">{n.sas}</span>
-                    <span class="sas-hint">对方屏幕应显示同一串；不一致就取消这次邀请</span>
+                    <span class="sas-hint">{t('对方屏幕应显示同一串；不一致就取消这次邀请')}</span>
                   </div>
                 {/if}
                 <div class="nb-acts">
-                  <button class="btn btn-secondary btn-sm" onclick={() => void cancelPairWaitNotice(n)}>取消</button>
+                  <button class="btn btn-secondary btn-sm" onclick={() => void cancelPairWaitNotice(n)}>{t('取消')}</button>
                 </div>
               {:else if n.kind === 'link'}
                 <div class="consent-info">
@@ -3806,13 +3840,13 @@
                 </div>
                 <p class="nb-body">{noticeBody(n)}</p>
                 <div class="nb-acts">
-                  <button class="btn btn-secondary btn-sm" onclick={() => void rejectLinkNotice(n)}>拒绝</button>
-                  <button class="btn btn-primary btn-sm" onclick={() => void acceptLinkNotice(n)}>接受</button>
+                  <button class="btn btn-secondary btn-sm" onclick={() => void rejectLinkNotice(n)}>{t('拒绝')}</button>
+                  <button class="btn btn-primary btn-sm" onclick={() => void acceptLinkNotice(n)}>{t('接受')}</button>
                 </div>
               {:else if n.kind === 'linkWait'}
                 <p class="nb-body">{noticeBody(n)}</p>
                 <div class="nb-acts">
-                  <button class="btn btn-secondary btn-sm" onclick={() => void cancelLinkWaitNotice(n)}>取消</button>
+                  <button class="btn btn-secondary btn-sm" onclick={() => void cancelLinkWaitNotice(n)}>{t('取消')}</button>
                 </div>
               {:else if n.kind === 'invite'}
                 <div class="consent-info">
@@ -3822,16 +3856,16 @@
                   <span class="c-name">{n.name}</span>
                 </div>
                 <div class="nb-acts">
-                  <button class="btn btn-secondary btn-sm" onclick={() => void rejectNotice(n)}>拒绝</button>
-                  <button class="btn btn-primary btn-sm" onclick={() => void acceptNotice(n)}>接收</button>
+                  <button class="btn btn-secondary btn-sm" onclick={() => void rejectNotice(n)}>{t('拒绝')}</button>
+                  <button class="btn btn-primary btn-sm" onclick={() => void acceptNotice(n)}>{t('接收')}</button>
                 </div>
               {:else}
                 <p class="nb-body">{noticeBody(n)}</p>
                 <div class="nb-acts">
                   {#if n.dest}
-                    <button class="btn btn-secondary btn-sm" onclick={() => void openNoticeDir(n)}>打开目录</button>
+                    <button class="btn btn-secondary btn-sm" onclick={() => void openNoticeDir(n)}>{t('打开目录')}</button>
                   {/if}
-                  <button class="btn btn-secondary btn-sm" onclick={() => confirmNotice(n.inviteId)}>知道了</button>
+                  <button class="btn btn-secondary btn-sm" onclick={() => confirmNotice(n.inviteId)}>{t('知道了')}</button>
                 </div>
               {/if}
             </div>
@@ -3861,7 +3895,7 @@
                 {#if b.targets.length > 1}
                   <span>{batchCounts(b)}</span>
                 {:else}
-                  <span>→「{b.targets[0].target}」· 局域网</span>
+                  <span>{t('→「{name}」· 局域网', { name: b.targets[0].target })}</span>
                 {/if}
                 <span class="num">{fmtBytes(b.received)} / {fmtBytes(b.total)}</span>
               </div>
@@ -3869,28 +3903,28 @@
               <!-- 清单里少了的项（链接 / 读不到）：卡片上必须写出来 —— 清单少了东西却不说，
                    用户会以为"就这些"然后推漏（同 `fs_browse::list_dir` 那条注释的道理）。 -->
               {#if b.skipped > 0}
-                <div class="p-skip">已跳过 {b.skipped} 项（链接 / 读不到）</div>
+                <div class="p-skip">{t('已跳过 {n} 项（链接 / 读不到）', { n: b.skipped })}</div>
               {/if}
 
               {#if b.targets.length > 1}
                 <div class="batch-rows">
-                  {#each visibleTargets(b) as t (t.inviteId || t.peerId)}
-                    <div class="batch-row" class:bad={t.state === 'failed' || t.state === 'rejected'}>
-                      <span class={targetDot(t)}></span>
-                      <span class="br-name" title={targetName(t)}>{targetName(t)}</span>
-                      <span class="br-state">{targetLabel(t, batchPerTarget(b))}</span>
-                      {#if t.state === 'invited' || t.state === 'sending'}
+                  {#each visibleTargets(b) as target (target.inviteId || target.peerId)}
+                    <div class="batch-row" class:bad={target.state === 'failed' || target.state === 'rejected'}>
+                      <span class={targetDot(target)}></span>
+                      <span class="br-name" title={targetName(target)}>{targetName(target)}</span>
+                      <span class="br-state">{targetLabel(target, batchPerTarget(b))}</span>
+                      {#if target.state === 'invited' || target.state === 'sending'}
                         <button
                           class="br-x"
-                          onclick={() => void cancelSending(t.inviteId)}
-                          aria-label="取消推送给「{targetName(t)}」"
-                          title="取消这一台（其余几台照常）">✕</button>
+                          onclick={() => void cancelSending(target.inviteId)}
+                          aria-label={t('取消推送给「{name}」', { name: targetName(target) })}
+                          title={t('取消这一台（其余几台照常）')}>✕</button>
                       {/if}
                     </div>
                   {/each}
                   {#if b.targets.length > 5 && !expandedBatches[b.batchId]}
                     <button class="br-more" onclick={() => (expandedBatches = { ...expandedBatches, [b.batchId]: true })}>
-                      还有 {b.targets.length - 4} 台 ▾
+                      {t('还有 {n} 台 ▾', { n: b.targets.length - 4 })}
                     </button>
                   {/if}
                 </div>
@@ -3899,13 +3933,13 @@
               <div class="nb-acts">
                 {#if batchLive(b)}
                   <button class="btn btn-secondary btn-sm" onclick={() => void cancelBatch(b.batchId)}>
-                    {b.targets.length > 1 ? '取消全部' : '取消'}
+                    {b.targets.length > 1 ? t('取消全部') : t('取消')}
                   </button>
                 {:else}
                   <!-- 只要卡还挂着就一定有出口：`settleBatch` 正常会把已结算的卡收掉，这一颗
                        是最后一道保护 —— 单台卡错过收尾（迟到的快照 / 对账补账）时，绝不允许
                        出现一张既没有「取消」也没有「知道了」的通知。 -->
-                  <button class="btn btn-secondary btn-sm" onclick={() => dropBatch(b.batchId)}>知道了</button>
+                  <button class="btn btn-secondary btn-sm" onclick={() => dropBatch(b.batchId)}>{t('知道了')}</button>
                 {/if}
               </div>
             </div>
@@ -3924,28 +3958,27 @@
           {#if pairState.peerId}
             <!-- 设备名一律「」框住（本文件里的 toast / 通知标题同此），并排的「推送到「X」」同理 -->
             <h3 class="d-head">
-              与「{pairState.peerName}」配对<Hint>
-                两种方式任选：「发起邀请」由对方在它自己的通知里点「接收」（不需要输入配对码）；
-                或让对方把下方这串码输入到它的 OrbDrop 里。
+              {t('与「{name}」配对', { name: pairState.peerName ?? '' })}<Hint>
+                {t('两种方式任选：「发起邀请」由对方在它自己的通知里点「接收」（不需要输入配对码）；或让对方把下方这串码输入到它的 OrbDrop 里。')}
               </Hint>
             </h3>
             <button class="btn btn-primary btn-block pair-invite" onclick={() => void invitePair()} disabled={pairState.busy}>
-              发起邀请
+              {t('发起邀请')}
             </button>
-            <p class="d-target num">或：输入到「{pairState.peerName}」的 OrbDrop</p>
+            <p class="d-target num">{t('或：输入到「{name}」的 OrbDrop', { name: pairState.peerName ?? '' })}</p>
             <div class="code num" class:expired={pairState.remaining === 0}>
               {#each pairState.code as digit}
                 <b>{digit}</b>
               {/each}
             </div>
             {#if pairState.remaining > 0}
-              <p class="code-hint num">剩余 {pairState.remaining}s · 过期后点「刷新配对码」换新码</p>
+              <p class="code-hint num">{t('剩余 {s}s · 过期后点「刷新配对码」换新码', { s: pairState.remaining })}</p>
             {:else}
-              <p class="code-hint num">已过期，旧码已作废</p>
-              <button class="btn btn-secondary btn-sm btn-block" onclick={refreshPairCode} disabled={pairState.busy}>刷新配对码</button>
+              <p class="code-hint num">{t('已过期，旧码已作废')}</p>
+              <button class="btn btn-secondary btn-sm btn-block" onclick={refreshPairCode} disabled={pairState.busy}>{t('刷新配对码')}</button>
             {/if}
             <div class="field pair-enter">
-              <label for="pairCodeInput">输入对方设备上显示的配对码</label>
+              <label for="pairCodeInput">{t('输入对方设备上显示的配对码')}</label>
               <div class="path-input">
                 <input
                   id="pairCodeInput"
@@ -3954,31 +3987,31 @@
                   maxlength="6"
                   inputmode="numeric"
                   autocomplete="off"
-                  placeholder="6 位数字"
+                  placeholder={t('6 位数字')}
                 />
-                <button class="btn btn-primary" onclick={confirmPair} disabled={pairState.busy}>确认配对</button>
+                <button class="btn btn-primary" onclick={confirmPair} disabled={pairState.busy}>{t('确认配对')}</button>
               </div>
             </div>
             {#if pairState.error}<p class="d-err">{pairState.error}</p>{/if}
             <div class="d-acts">
-              <button class="btn btn-secondary" onclick={copyCode}>复制配对码</button>
-              <button class="btn btn-secondary" onclick={closePair}>取消</button>
+              <button class="btn btn-secondary" onclick={copyCode}>{t('复制配对码')}</button>
+              <button class="btn btn-secondary" onclick={closePair}>{t('取消')}</button>
             </div>
           {:else}
-            <h3>添加设备</h3>
-            <p class="d-desc">输入对方设备的 IP，添加后即可与它配对（跨网段场景）。端口留空会自动扫 3890-3899。</p>
+            <h3>{t('添加设备')}</h3>
+            <p class="d-desc">{t('输入对方设备的 IP，添加后即可与它配对（跨网段场景）。端口留空会自动扫 3890-3899。')}</p>
             <div class="field">
-              <label for="pairIp">对方 IP / IP:端口</label>
+              <label for="pairIp">{t('对方 IP / IP:端口')}</label>
               <input id="pairIp" class="input num" bind:value={pairState.ip} placeholder="192.168.1.4" />
             </div>
             <div class="field pair-port">
-              <label for="pairPort">端口（留空自动扫描）</label>
+              <label for="pairPort">{t('端口（留空自动扫描）')}</label>
               <input id="pairPort" class="input num" bind:value={pairState.port} inputmode="numeric" placeholder="3890-3899" />
             </div>
             {#if pairState.error}<p class="d-err">{pairState.error}</p>{/if}
             <div class="d-acts">
-              <button class="btn btn-secondary" onclick={closePair}>取消</button>
-              <button class="btn btn-primary" onclick={addAndPair} disabled={pairState.busy}>添加并配对</button>
+              <button class="btn btn-secondary" onclick={closePair}>{t('取消')}</button>
+              <button class="btn btn-primary" onclick={addAndPair} disabled={pairState.busy}>{t('添加并配对')}</button>
             </div>
           {/if}
         </div>
@@ -3992,23 +4025,18 @@
     {#if remarkState}
       <div class="overlay open" id="remarkDialog">
         <div class="dialog">
-          <h3 class="d-head">设备备注<Hint>
-            备注是<b>你</b>给这台设备起的名字，只保存在本机（`config.toml`），
-            <span class="hl">不会发给对端</span>，也不改对方自己的设备名。
-            设好之后<b>局域网设备列表</b>那一行显示成「<b>备注(设备名)</b>」，
-            其余地方（会话列表与标题、标签栏、收件人选择框、推送卡与通知）只写<b>备注本身</b>；
-            名字太长时把鼠标放上去能看全。备注跟着<b>设备</b>走，不跟地址走 ——
-            换网段、重新配对之后它还在；留空保存即清除。
+          <h3 class="d-head">{t('设备备注')}<Hint>
+            {t('备注是你给这台设备起的名字，只保存在本机（config.toml），不会发给对端，也不改对方自己的设备名。设好之后局域网设备列表那一行显示成「备注(设备名)」，其余地方（会话列表与标题、标签栏、收件人选择框、推送卡与通知）只写备注本身；名字太长时把鼠标放上去能看全。备注跟着设备走，不跟地址走 —— 换网段、重新配对之后它还在；留空保存即清除。')}
           </Hint></h3>
-          <p class="d-desc">当前设备名：{remarkState.rawName}</p>
+          <p class="d-desc">{t('当前设备名：{name}', { name: remarkState.rawName })}</p>
           <div class="field">
-            <label for="remarkInput">备注</label>
+            <label for="remarkInput">{t('备注')}</label>
             <input
               id="remarkInput"
               class="input"
               bind:value={remarkState.value}
               maxlength="24"
-              placeholder="例如：客厅台式机"
+              placeholder={t('例如：客厅台式机')}
               autocomplete="off"
               spellcheck="false"
               use:focusAndSelect
@@ -4018,10 +4046,10 @@
           {#if remarkState.error}<p class="d-err">{remarkState.error}</p>{/if}
           <div class="d-acts">
             {#if remarkState.saved}
-              <button class="btn btn-secondary" onclick={() => void clearRemark()} disabled={remarkState.busy}>清除备注</button>
+              <button class="btn btn-secondary" onclick={() => void clearRemark()} disabled={remarkState.busy}>{t('清除备注')}</button>
             {/if}
-            <button class="btn btn-secondary" onclick={closeRemark}>取消</button>
-            <button class="btn btn-primary" onclick={() => void saveRemark()} disabled={remarkState.busy}>保存</button>
+            <button class="btn btn-secondary" onclick={closeRemark}>{t('取消')}</button>
+            <button class="btn btn-primary" onclick={() => void saveRemark()} disabled={remarkState.busy}>{t('保存')}</button>
           </div>
         </div>
       </div>

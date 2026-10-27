@@ -16,13 +16,6 @@ let state = $state<UpdateState | null>(null);
 /** "安装"这条命令还没返回（桌面端点下去进程就要重启了，按钮得先按住）。 */
 let applying = $state(false);
 /**
- * 用户把这一格按下去了（「稍后」/关掉那张底板）：**本次运行内不再自动弹**。
- *
- * 下次启动是另一个进程，那份静默检查会重新弹一次 —— "每次启动都提示"就是这个意思
- * （状态本来就不落盘，`Ctl` 是内存里的）。
- */
-let dismissed = $state(false);
-/**
  * 「更新这件事」已经在动手了（下载/校验/落地已经露过头）。
  *
  * 有了它，"提示"才能在用户点下「立即更新」之后**就地变成进度**：不然点完那一下这一格就没了，
@@ -55,30 +48,31 @@ export function isApplying(): boolean {
 }
 
 /**
- * 该不该**主动提示**：启动时的静默检查（后端 `check(force = false)`，起来 8 秒后跑）发现了
- * 新版，而且用户还没按掉它。
+ * 该不该**主动提示**：后台静默检查（启动 / 周期 / 回前台）发现了新版，而且**这一版**用户
+ * 还没按掉。
  *
  * `silent` 那道门是必须的：用户自己点「检查更新」得来的结论已经有设置面板在显示，
  * 再弹一张板/一个气泡就是把同一件事说两遍。
+ * 按掉记在 `dismissedVersion`（后端落盘）：同版本不再弹，更新的一版照弹。
  */
 export function updatePrompt(): UpdateState | null {
   const s = state;
-  if (!s || dismissed) return null;
+  if (!s || (s.dismissedVersion != null && s.dismissedVersion === s.version)) return null;
   return s.phase === 'available' && s.silent ? s : null;
 }
 
 /**
  * 「有更新待处理」的角标数字：手机底栏「设置」那颗用。
  *
- * 与 [`updatePrompt`] 不同，**不看 `silent`、也不看 `dismissed`**：按过「稍后」只是不再
- * 自动弹底板，更新本身还在那儿；角标是让用户随时找得到它的那条线索。
+ * 与 [`updatePrompt`] 不同，**不看 `silent`、也不看是否按掉过**：按「稍后」只是不再自动弹，
+ * 更新本身还在那儿；角标是让用户随时找得到它的那条线索。
  */
 export function updateBadge(): number {
   return state?.phase === 'available' ? 1 : 0;
 }
 
 /**
- * 「更新这件事」该不该在界面上占一格：**任何一次**检查发现的可用更新（启动静默检查或
+ * 「更新这件事」该不该在界面上占一格：**任何一次**检查发现的可用更新（后台静默检查或
  * 用户手动检查都算），外加已经点过「立即更新」之后的进度与结果（那时这一格从"提示"变成
  * "进度"，见 [`engaged`]）。
  *
@@ -87,13 +81,23 @@ export function updateBadge(): number {
  */
 export function updateTask(): UpdateState | null {
   const s = state;
-  if (!s || dismissed) return null;
+  if (!s || (s.dismissedVersion != null && s.dismissedVersion === s.version)) return null;
   return engaged || s.phase === 'available' ? s : null;
 }
 
-/** 用户按掉了这次提示（「稍后」/关掉那张底板）。 */
+/**
+ * 用户按掉了这次提示（「稍后」/关掉那张底板）：**只对当前这一版生效**。
+ *
+ * 先就地改快照（按钮不等人），再把这一版告诉后端落盘 —— 重启之后同版本仍然不再弹。
+ */
 export function dismissUpdatePrompt(): void {
-  dismissed = true;
+  const current = state;
+  const version = current?.version ?? null;
+  if (current && version) state = { ...current, dismissedVersion: version };
+  void api
+    .updateDismiss(version)
+    .then(setState)
+    .catch((e) => console.error('记录「稍后」失败:', e));
 }
 
 /**
@@ -119,8 +123,8 @@ export async function watchUpdate(): Promise<void> {
 /** 检查更新（失败时把后端的报错原样抛给调用方，界面自己决定怎么显示）。 */
 export async function checkUpdate(force = true): Promise<void> {
   const next = await api.updateCheck(force);
-  // 用户主动点的那次是明确想看结论：之前按过「稍后」也重新给一次右下角那格。
-  if (force) dismissed = false;
+  // 手动那次的「按掉」由后端清（`check(force = true)` 会重置 `dismissedVersion`），
+  // 所以这里不再维护第二份状态。
   setState(next);
 }
 

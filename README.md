@@ -106,7 +106,7 @@ Messaging is built in, and it is the host of the push feature rather than an add
 | Transport security | A self-signed identity generated once, plus peer certificate fingerprint pinning (TOFU — the fingerprint is remembered, not the hostname). Plaintext exists only on loopback. Tokens and fingerprints share one credentials file in the app data directory; “wipe all credentials” also removes the Beyond Compare profiles. |
 | Transfer engine | Block-level resume keyed by file identity (a failed push resumes instead of restarting, and a receiver keeps receiving on its own even after it restarts), per-block SHA-256 verification, `<name>.orbdrop-part` followed by an atomic rename, configurable concurrency (1–8) and block size (1–32 MB). Measured on loopback TLS with a hot cache: 3,000 × 4 KB files in 1.72 s, a single 128 MB file at 101 MB/s. |
 | Devices | Per-device remarks stored **only locally** (never sent to the peer), search by name or IP, pending badges, unpair at any time — the peer does not need to be online. |
-| Settings | Download folder and mode, per-sender subdirectory for pushes, device name, port, autostart, relay switches, transfer concurrency and block size. Logs rotate daily in the app data directory. |
+| Settings | Download folder and mode, per-sender subdirectory for pushes, device name, port, autostart, relay switches, transfer concurrency and block size, and **interface language** (the system language is picked on first launch, falling back to English; switch between English and Simplified Chinese at any time). The choice takes effect immediately and also switches the tray menu and Android notifications. Logs rotate daily in the app data directory. |
 | Android | A foreground service keeps the app online in the background, pushes arrive with a notification (on a channel separate from the keepalive notification, so you can mute one without losing the other), files can be sent from a conversation, received files open with a tap (`.apk` goes straight to the system installer), and the phone can act as a relay anchor too. |
 | Self-update | The manifest's artifacts carry both `sha256` and a minisign signature; the desktop single-file exe replaces itself using the freshly downloaded exe as a helper (and rolls back on failure); downloads try GitHub then Gitee with speed-based failover and a 24-hour preferred-mirror memory. |
 
@@ -148,6 +148,10 @@ Running several instances on one machine (useful for testing against yourself) n
 
 Release artifacts and the update manifest live in the [releases](https://github.com/x177plus/OrbDrop/releases/latest) of this repository.
 
+## Community & Acknowledgments
+
+- [LINUX DO](https://linux.do) — a new kind of ideal community. Where possible begins.
+
 ## License
 
 **GNU General Public License v3.0 or later** (`GPL-3.0-or-later`) — see [LICENSE](./LICENSE).
@@ -159,3 +163,7 @@ GNU General Public License as published by the Free Software Foundation, either 
 License, or (at your option) any later version. This program is distributed in the hope that it
 will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=x177plus/OrbDrop&type=Date)](https://star-history.com/#x177plus/OrbDrop&Date)

@@ -1,0 +1,66 @@
+{
+  "[文件] {name}": "[File] {name}",
+  "[图片]": "[Image]",
+  "你：{body}": "You: {body}",
+  "已送达 {delivered}/{total} 台 · {body}": "{delivered}/{total} delivered · {body}",
+  "已读": "Read",
+  "已送达": "Delivered",
+  "已同步": "Synced",
+  "发送中": "Sending",
+  "等待发送": "Waiting to send",
+  "未送达": "Not delivered",
+  "已收到": "Received",
+  "已读 {read}/{total}": "Read {read}/{total}",
+  "{n} 台等待发送": {
+    "one": "{n} device waiting to send",
+    "other": "{n} devices waiting to send"
+  },
+  "{n} 台已同步（经其他成员补到）": {
+    "one": "{n} device synced (received via another member)",
+    "other": "{n} devices synced (received via another member)"
+  },
+  "{n} 台已拒绝加入": {
+    "one": "{n} device declined to join",
+    "other": "{n} devices declined to join"
+  },
+  "{n} 台已取消": {
+    "one": "{n} device cancelled",
+    "other": "{n} devices cancelled"
+  },
+  "{n} 台已拒绝": {
+    "one": "{n} device rejected",
+    "other": "{n} devices rejected"
+  },
+  "已拒绝": "Rejected",
+  "传输中": "Transferring",
+  "传输中 {pct}%": "Transferring {pct}%",
+  "等待同意": "Waiting for approval",
+  "今天 {time}": "Today {time}",
+  "昨天 {time}": "Yesterday {time}",
+  "{month}月{day}日": "{month}/{day}",
+  "{date} {time}": "{date} {time}",
+  "{year}年{date} {time}": "{date} {time}, {year}",
+  "已发送至 {n} 台": {
+    "one": "Sent to {n} device",
+    "other": "Sent to {n} devices"
+  },
+  "已发送至 {sent} 台 · {failed} 台未送达": "Sent to {sent} devices · {failed} not delivered",
+  "已接收 · 已保存到下载目录": "Received · saved to Downloads",
+  "已拒绝接收": "Reception declined",
+  "已停止接收": "Reception stopped",
+  "已暂停 · {pct}%": "Paused · {pct}%",
+  "接收中 {pct}%": "Receiving {pct}%",
+  "这条会话里没有能送达的设备": "No reachable device in this conversation",
+  "「{name}」直连不通：它在同一网段（能收到它的 mDNS 记录），但这张 Wi-Fi 可能把客户端之间的单播隔开了。要立刻连上它，得有一台两端都够得着的设备打开设置里的「允许为其它设备中转」。": "Direct connection to “{name}” failed: it is on the same subnet (its mDNS record is visible), but this Wi-Fi may be isolating clients from each other. To connect right now, a device that can reach both sides needs to turn on “Allow relaying for other devices” in Settings.",
+  "需配对": "Pairing needed",
+  "重连中": "Reconnecting",
+  "下载失败": "Download failed",
+  "设备不在列表中": "Device is not in the list",
+  "读取失败：{msg}": "Failed to load: {msg}",
+  "访达": "Finder",
+  "资源管理器": "File Explorer",
+  "文件管理器": "File manager",
+  "此电脑": "This PC",
+  "这个图片格式读不出来": "This image format can't be read",
+  "正在准备「{name}」…（请按住不放）": "Preparing “{name}”… (keep holding)"
+}

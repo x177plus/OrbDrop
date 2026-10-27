@@ -2,6 +2,7 @@
   import Sheet from "../components/Sheet.svelte";
   import * as store from "../store.svelte";
   import * as devices from "$lib/stores/devices.svelte";
+  import { t } from "$lib/i18n.svelte";
 
   // 移动端的「设备备注」底板 —— 与桌面端那一张（`App.svelte` 的 `remarkState` 对话框）同一件事、
   // 同一套规则：只写本机 `config.toml` 的 `deviceRemarks`，不发给对端、也不改对方的设备名。
@@ -31,7 +32,7 @@
     try {
       await store.saveRemark(d.id, rawName, value);
     } catch (e) {
-      store.failed("保存备注", e);
+      store.toast(t("保存备注失败：{error}", { error: e instanceof Error ? e.message : String(e) }));
       return;
     } finally {
       busy = false;
@@ -46,21 +47,21 @@
   }
 </script>
 
-<Sheet title="设备备注" desc="备注只保存在本机，不会发给对端，也不改对方自己的设备名。" onClose={onClose}>
-  <p class="field-hint">当前设备名：<b>{rawName}</b></p>
+<Sheet title={t("设备备注")} desc={t("备注只保存在本机，不会发给对端，也不改对方自己的设备名。")} onClose={onClose}>
+  <p class="field-hint">{t("当前设备名：{name}", { name: rawName })}</p>
   <div class="field">
-    <label for="remarkInput">备注</label>
-    <input class="input" id="remarkInput" maxlength="24" placeholder="例如：客厅台式机" bind:value={value} />
+    <label for="remarkInput">{t("备注")}</label>
+    <input class="input" id="remarkInput" maxlength="24" placeholder={t("例如：客厅台式机")} bind:value={value} />
     <p class="field-hint">
-      设好之后设备页那一行显示成「<b>备注(设备名)</b>」，会话与标题只写<b>备注本身</b>；留空保存即清除。
+      {t("设好之后设备页那一行显示成「备注(设备名)」，会话与标题只写备注本身；留空保存即清除。")}
     </p>
   </div>
 
   {#snippet foot()}
     {#if saved}
-      <button class="btn btn-secondary" type="button" onclick={() => void clear()} disabled={busy}>清除备注</button>
+      <button class="btn btn-secondary" type="button" onclick={() => void clear()} disabled={busy}>{t("清除备注")}</button>
     {/if}
-    <button class="btn btn-secondary" type="button" onclick={onClose}>取消</button>
-    <button class="btn btn-primary" type="button" onclick={() => void save()} disabled={busy}>保存</button>
+    <button class="btn btn-secondary" type="button" onclick={onClose}>{t("取消")}</button>
+    <button class="btn btn-primary" type="button" onclick={() => void save()} disabled={busy}>{t("保存")}</button>
   {/snippet}
 </Sheet>

@@ -1,3 +1,5 @@
+import { getLocale, t } from './i18n.svelte';
+
 export interface ShareItem {
   id: string;
   name: string;
@@ -97,6 +99,16 @@ export interface AppSettings {
    *  已配对设备的推送免同意自动收，与它无关。 */
   downloadMode: 'Direct' | 'AskEachTime';
   deviceName: string;
+  /**
+   * 界面语言（具体语言）：`en` / `zh-CN`。
+   *
+   * 首次启动直接采用系统语言（不支持时英语），之后由设置页手动切换；**没有**「跟随系统」
+   * 这一档。旧配置的 `auto` 由后端在启动时解析成具体语言并写回。
+   *
+   * 前端据它初始化 `$lib/i18n.svelte`；后端托盘与安卓通知栏也读同一个配置
+   * （见 `src-tauri/src/i18n.rs`）。
+   */
+  language: string;
   autoStart: boolean;
   /** BeyondCompare 可执行文件路径；'' = 自动探测。 */
   bcExePath: string;
@@ -803,8 +815,8 @@ export function shareMeta(
   itemCount: number | null | undefined,
   size: number | null | undefined,
 ): string {
-  if (isDir) return typeof itemCount === 'number' ? `${itemCount} 项` : '文件夹';
-  return typeof size === 'number' ? formatFileSize(size) : '文件';
+  if (isDir) return typeof itemCount === 'number' ? t('{n} 项', { n: itemCount }) : t('文件夹');
+  return typeof size === 'number' ? formatFileSize(size) : t('单个文件');
 }
 
 export function formatFileSize(bytes: number): string {
@@ -816,7 +828,7 @@ export function formatFileSize(bytes: number): string {
 
 export function formatTime(iso: string): string {
   try {
-    return new Date(iso).toLocaleString();
+    return new Date(iso).toLocaleString(getLocale());
   } catch { return iso; }
 }
 
@@ -877,6 +889,11 @@ export interface UpdateState {
   received: number;
   /** 当前正在用的镜像主机名（`gitee.com` / `github.com`）。 */
   mirror: string | null;
+  /**
+   * 用户按过「稍后」的那一版：**同版本不再自动弹**（角标仍挂着），更新的一版照弹。
+   * 后端落盘在 `update.json`，重启之后同样有效。
+   */
+  dismissedVersion: string | null;
   error: string | null;
 }
 
@@ -891,21 +908,30 @@ export function updateStatusText(u: UpdateState): string {
     case 'idle':
       return '';
     case 'checking':
-      return '正在检查更新…';
+      return t('正在检查更新…');
     case 'uptodate':
-      return '已是最新版';
+      return t('已是最新版');
     case 'available':
-      return `有新版本 v${u.version ?? ''}`;
-    case 'downloading':
-      return `正在从 ${u.mirror ?? '镜像'} 下载 ${formatFileSize(u.received)}${
-        u.size ? ` / ${formatFileSize(u.size)}` : ''
-      }`;
+      return t('有新版本 v{version}', { version: u.version ?? '' });
+    case 'downloading': {
+      const received = formatFileSize(u.received);
+      return u.size
+        ? t('正在从 {mirror} 下载 {received} / {total}', {
+            mirror: u.mirror ?? t('镜像'),
+            received,
+            total: formatFileSize(u.size),
+          })
+        : t('正在从 {mirror} 下载 {received}', {
+            mirror: u.mirror ?? t('镜像'),
+            received,
+          });
+    }
     case 'verifying':
-      return '正在校验更新包…';
+      return t('正在校验更新包…');
     case 'applying':
-      return u.platform === 'desktop' ? '正在替换并重启…' : '正在打开系统安装器…';
+      return u.platform === 'desktop' ? t('正在替换并重启…') : t('正在打开系统安装器…');
     case 'error':
-      return u.error ? `更新失败：${u.error}` : '更新失败';
+      return u.error ? t('更新失败：{error}', { error: u.error }) : t('更新失败');
   }
 }
 
@@ -918,15 +944,15 @@ export function updateStatusText(u: UpdateState): string {
 export function updateTitleText(u: UpdateState): string {
   switch (u.phase) {
     case 'available':
-      return `有新版本 v${u.version ?? ''}`;
+      return t('有新版本 v{version}', { version: u.version ?? '' });
     case 'downloading':
     case 'verifying':
     case 'applying':
-      return `正在更新到 v${u.version ?? ''}`;
+      return t('正在更新到 v{version}', { version: u.version ?? '' });
     case 'error':
-      return '更新失败';
+      return t('更新失败');
     default:
-      return `版本 v${u.version ?? u.current}`;
+      return t('版本 v{version}', { version: u.version ?? u.current });
   }
 }
 
@@ -937,10 +963,15 @@ export function updateTitleText(u: UpdateState): string {
  * 排队本身是既有语义（等它上线再发，不丢）。
  */
 export function undeliverableText(u: Undeliverable): string {
-  const why = u.reason === 'no_relay' ? '没有可用的中转方' : '中转方这次没转成';
-  let text = `发给「${u.name}」的消息暂时送不出去：${why}。已排队，等它上线会自动发出。`;
+  const why = u.reason === 'no_relay' ? t('没有可用的中转方') : t('中转方这次没转成');
+  let text = t('发给「{name}」的消息暂时送不出去：{why}。已排队，等它上线会自动发出。', {
+    name: u.name,
+    why,
+  });
   if (u.seen) {
-    text += '它在同一网段，可能这张 Wi-Fi 隔离了客户端 —— 让一台两端都够得着的设备打开设置里的「允许为其它设备中转」就能自动接管。';
+    text += t(
+      '它在同一网段，可能这张 Wi-Fi 隔离了客户端 —— 让一台两端都够得着的设备打开设置里的「允许为其它设备中转」就能自动接管。',
+    );
   }
   return text;
 }

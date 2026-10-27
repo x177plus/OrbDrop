@@ -6,6 +6,7 @@
   import * as chat from "$lib/stores/chat.svelte";
   import * as devices from "$lib/stores/devices.svelte";
   import { fileIcon } from "../util";
+  import { t } from "$lib/i18n.svelte";
   import type { BrowseDownload, FilesSeg } from "../store.svelte";
   import type { InboxEntry, PeerShareItem } from "$lib/types";
 
@@ -47,11 +48,11 @@
     const d = new Date(at);
     const now = new Date();
     const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-    if (d.toDateString() === now.toDateString()) return `今天 ${hm}`;
+    if (d.toDateString() === now.toDateString()) return t("今天 {time}", { time: hm });
     const yesterday = new Date(now);
     yesterday.setDate(now.getDate() - 1);
-    if (d.toDateString() === yesterday.toDateString()) return `昨天 ${hm}`;
-    return `${d.getMonth() + 1}月${d.getDate()}日`;
+    if (d.toDateString() === yesterday.toDateString()) return t("昨天 {time}", { time: hm });
+    return t("{month}月{day}日", { month: d.getMonth() + 1, day: d.getDate() });
   }
 
   /**
@@ -59,7 +60,7 @@
    * 空的那一段就地省掉 —— 原型里这一列永远有值，真数据不一定。
    */
   function inboxMeta(f: InboxEntry): string {
-    return [f.from, f.isDir ? "文件夹" : fmtBytes(f.size), shortTime(f.modified)]
+    return [f.from, f.isDir ? t("文件夹") : fmtBytes(f.size), shortTime(f.modified)]
       .filter((s) => s !== "")
       .join(" · ");
   }
@@ -103,7 +104,7 @@
   /** 共享项那一行的副行：目录给直接子项数（老版本对端不带这个字段时干脆不写），文件给大小。 */
   function shareMeta(s: PeerShareItem): string {
     if (!s.isDir) return fmtBytes(s.size ?? 0);
-    return s.itemCount == null ? "" : `${s.itemCount} 项`;
+    return s.itemCount == null ? "" : t("{n} 项", { n: s.itemCount });
   }
 
   /**
@@ -114,14 +115,14 @@
     const kids = store.browseChildrenOf(s.id);
     if (kids === undefined) {
       if (s.itemCount === 0) {
-        store.toast("这是一个空目录");
+        store.toast(t("这是一个空目录"));
         return;
       }
       void store.toggleShare(s.id);
       return;
     }
     if (kids.length === 0) {
-      store.toast("这是一个空目录");
+      store.toast(t("这是一个空目录"));
       return;
     }
     void store.toggleShare(s.id);
@@ -132,7 +133,7 @@
    * 往下再钻没有数据可拿，所以照原型 `browseNoop` 那一档给提示。
    */
   function nestedNoop(): void {
-    store.toast("这是一个空目录");
+    store.toast(t("这是一个空目录"));
   }
 
   /** 嵌套行的缩进：原型 `flattenNodes` 是按深度算的（12 + depth * 20）。 */
@@ -141,7 +142,7 @@
   }
 </script>
 
-<div class="seg" role="tablist" aria-label="文件视图">
+<div class="seg" role="tablist" aria-label={t("文件视图")}>
   {#each SEGS as s (s.id)}
     <button
       class="seg-item"
@@ -151,7 +152,7 @@
       aria-selected={seg === s.id}
       onclick={() => store.setSeg(s.id)}
     >
-      {s.label}
+      {t(s.label)}
       {#if segCount(s.id) > 0}<span class="segn num">{segCount(s.id)}</span>{/if}
     </button>
   {/each}
@@ -161,32 +162,32 @@
   <div class="body">
     {#if invites.length}
       <div class="sec">
-        <div class="sec-label"><span>待接收</span><span class="num">{invites.length} 个</span></div>
+        <div class="sec-label"><span>{t("待接收")}</span><span class="num">{t("{n} 个", { n: invites.length })}</span></div>
         <div class="stack">
           {#each invites as inv (inv.msg.id)}
             <!-- 发送方名字取设备名：原型那条 mock 带了 `fromName`，真实的文件消息里只有 peerId。 -->
             <div class="pend">
               <div class="pend-top">
-                <span class="pend-chip"><Icon name="download" />待接收</span>
-                <span class="pend-who">来自 {chat.deviceNameOf(inv.peerId)}</span>
+                <span class="pend-chip"><Icon name="download" />{t("待接收")}</span>
+                <span class="pend-who">{t("来自 {name}", { name: chat.deviceNameOf(inv.peerId) })}</span>
               </div>
               <div class="pend-body">
                 <FileTile name={inv.msg.name} isDir={inv.msg.isDir} />
                 <span class="fmain">
                   <span class="fname2">{inv.msg.name}</span>
-                  <span class="fmeta">{inv.msg.size || "文件"} · 保存到收件目录</span>
+                  <span class="fmeta">{t("{size} · 保存到收件目录", { size: inv.msg.size || t("文件") })}</span>
                 </span>
               </div>
               <div class="pend-acts">
                 <button
                   class="btn btn-secondary"
                   type="button"
-                  onclick={() => void store.answerInvite(inv.msg, false)}>拒绝</button
+                  onclick={() => void store.answerInvite(inv.msg, false)}>{t("拒绝")}</button
                 >
                 <button
                   class="btn btn-primary"
                   type="button"
-                  onclick={() => void store.answerInvite(inv.msg, true)}>接收</button
+                  onclick={() => void store.answerInvite(inv.msg, true)}>{t("接收")}</button
                 >
               </div>
             </div>
@@ -196,22 +197,22 @@
     {/if}
 
     <div class="sec">
-      <div class="sec-label"><span>已接收文件</span><span class="num">{inbox.length} 个</span></div>
+      <div class="sec-label"><span>{t("已接收文件")}</span><span class="num">{t("{n} 个", { n: inbox.length })}</span></div>
       <div class="card list">
         {#if inboxState.error}
           <!-- 原型这一档没有异步（列表是 mock）；真数据在后端失败时要如实露出原话，不吞。 -->
           <div class="empty">
             <Icon name="x" />
-            <p>读取收件目录失败</p>
+            <p>{t("读取收件目录失败")}</p>
             <p class="es">{inboxState.error}</p>
           </div>
         {:else if inboxState.loading && !inbox.length}
-          <div class="empty"><Icon name="inbox" /><p>正在读取收件目录…</p></div>
+          <div class="empty"><Icon name="inbox" /><p>{t("正在读取收件目录…")}</p></div>
         {:else if !inbox.length}
           <div class="empty">
             <Icon name="inbox" />
-            <p>还没有收到的文件</p>
-            <p class="es">收到推送并同意后，文件会落到收件目录并出现在这里。</p>
+            <p>{t("还没有收到的文件")}</p>
+            <p class="es">{t("收到推送并同意后，文件会落到收件目录并出现在这里。")}</p>
           </div>
         {:else}
           {#each inbox as f (f.path)}
@@ -235,22 +236,26 @@
 {:else if seg === "transfer"}
   <div class="body">
     <div class="sec">
-      <div class="sec-label"><span>进行中</span><span class="num">{transferCount} 个</span></div>
+      <div class="sec-label"><span>{t("进行中")}</span><span class="num">{t("{n} 个", { n: transferCount })}</span></div>
       <div class="card list">
         {#if transferCount}
-          {#each transfers as t (t.id)}
+          {#each transfers as item (item.id)}
             <div class="trow">
               <div class="t-top">
-                <FileTile name={t.name} isDir={t.isDir} />
-                <span class="t-name">{t.name}</span>
-                <span class="t-pct num">{pctOf(t.pct)}%</span>
+                <FileTile name={item.name} isDir={item.isDir} />
+                <span class="t-name">{item.name}</span>
+                <span class="t-pct num">{pctOf(item.pct)}%</span>
               </div>
-              <div class="t-bar"><i style="width:{pctOf(t.pct)}%"></i></div>
+              <div class="t-bar"><i style="width:{pctOf(item.pct)}%"></i></div>
               <div class="t-meta">
-                <span>{t.dir === "out" ? "发送至 " : "接收自 "}{t.who}</span>
+                <span>
+                  {item.dir === "out"
+                    ? t("发送至 {name}", { name: item.who })
+                    : t("接收自 {name}", { name: item.who })}
+                </span>
                 <!-- 原型这里按状态给「取消」按钮或「已完成」；取消整批要 batchId（这条路上拿不到，
                      本阶段不做），而 activeTransfers 只给还在动的行，所以右边换 store 写好的状态文案。 -->
-                <span class="num">{t.status}</span>
+                <span class="num">{item.status}</span>
               </div>
             </div>
           {/each}
@@ -267,9 +272,9 @@
                 <i style="width:{d.total > 0 ? downloadPct(d) : 35}%"></i>
               </div>
               <div class="t-meta">
-                <span>下载自 {devices.peerShortName(d.peerId)}</span>
+                <span>{t("下载自 {name}", { name: devices.peerShortName(d.peerId) })}</span>
                 <span class="num">
-                  {d.status === "paused" ? "已暂停 · " : ""}{d.total > 0
+                  {d.status === "paused" ? t("已暂停") + " · " : ""}{d.total > 0
                     ? `${fmtBytes(d.received)} / ${fmtBytes(d.total)}`
                     : fmtBytes(d.received)}
                 </span>
@@ -279,8 +284,8 @@
         {:else}
           <div class="empty">
             <Icon name="files" />
-            <p>当前没有进行中的传输</p>
-            <p class="es">推送或下载文件时会在这里显示进度。</p>
+            <p>{t("当前没有进行中的传输")}</p>
+            <p class="es">{t("推送或下载文件时会在这里显示进度。")}</p>
           </div>
         {/if}
       </div>
@@ -292,8 +297,8 @@
   <div class="body">
     <div class="empty">
       <Icon name="devices" />
-      <p>没有处于长连接的设备</p>
-      <p class="es">在「设备」页选一台已配对的 PC 点「连接」，建立长连接后就能浏览它共享的目录。</p>
+      <p>{t("没有处于长连接的设备")}</p>
+      <p class="es">{t("在「设备」页选一台已配对的 PC 点「连接」，建立长连接后就能浏览它共享的目录。")}</p>
     </div>
   </div>
 {:else}
@@ -315,17 +320,17 @@
       {#if browseState.error}
         <div class="empty">
           <Icon name="x" />
-          <p>读取共享项失败</p>
+          <p>{t("读取共享项失败")}</p>
           <p class="es">{browseState.error}</p>
         </div>
       {:else if browseState.loading || browsePeer === null}
         <!-- 还没选中任何设备时也按"读取中"画：这一帧之后 `$effect` 就会替用户选第一台。 -->
-        <div class="empty"><Icon name="folder" /><p>正在读取共享项…</p></div>
+        <div class="empty"><Icon name="folder" /><p>{t("正在读取共享项…")}</p></div>
       {:else if !shares.length}
         <div class="empty">
           <Icon name="folder" />
-          <p>对方还没有共享项</p>
-          <p class="es">对方把目录拖入 OrbDrop 并开启广播后，就会出现在这里。</p>
+          <p>{t("对方还没有共享项")}</p>
+          <p class="es">{t("对方把目录拖入 OrbDrop 并开启广播后，就会出现在这里。")}</p>
         </div>
       {:else}
         {#each shares as s (s.id)}

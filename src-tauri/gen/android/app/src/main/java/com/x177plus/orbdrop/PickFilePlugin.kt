@@ -61,7 +61,7 @@ class PickFilePlugin(private val activity: Activity) : Plugin(activity) {
     try {
       startActivityForResult(invoke, intent, "picked")
     } catch (e: Exception) {
-      invoke.reject(e.message ?: "打不开系统选择器")
+      invoke.reject(e.message ?: activity.getString(R.string.pick_open_failed))
     }
   }
 
@@ -147,18 +147,18 @@ class PickFilePlugin(private val activity: Activity) : Plugin(activity) {
     val (rawName, _) = metaOf(uri)
     val dir = File(activity.cacheDir, "pick")
     if (!dir.exists() && !dir.mkdirs()) {
-      throw IllegalStateException("建不了发送暂存目录：${dir.absolutePath}")
+      throw IllegalStateException(activity.getString(R.string.pick_cache_dir_failed, dir.absolutePath))
     }
     val name = uniqueName(dir, stagedName(rawName, mime))
     val out = File(dir, name)
     val input = resolver.openInputStream(uri)
-      ?: throw IllegalArgumentException("读不到选中的这一项：$uri")
+      ?: throw IllegalArgumentException(activity.getString(R.string.pick_read_failed, uri.toString()))
     input.use { ins ->
       out.outputStream().use { outs -> ins.copyTo(outs) }
     }
     if (out.length() <= 0L) {
       out.delete()
-      throw IllegalArgumentException("选中的这一项是空的：${stagedName(rawName, mime)}")
+      throw IllegalArgumentException(activity.getString(R.string.pick_empty, stagedName(rawName, mime)))
     }
     val obj = JSObject()
     obj.put("path", out.absolutePath)

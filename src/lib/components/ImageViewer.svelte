@@ -1,5 +1,6 @@
 <script lang="ts">
   import { imageDataUrl } from '$lib/images';
+  import { t } from '$lib/i18n.svelte';
 
   /**
    * 「看大图」：会话里点一下那张缩略图，就在这一层上把它整张摊开（桌面端与移动端共用）。
@@ -105,8 +106,8 @@
 <!-- 点背景关掉：这一层是"看它一眼"，不是第二个窗口。背景那一层做成**真的 button**
      （铺满整层、`aria-label` 说明它是干什么的），而不是给一个 `div` 挂 `onclick` ——
      前者键盘/读屏都能用，后者只是把"能点"画出来。 -->
-<div class="iv-layer" role="dialog" aria-modal="true" tabindex="-1" aria-label="查看图片：{name}">
-  <button class="iv-scrim" type="button" aria-label="关闭大图" onclick={onclose}></button>
+<div class="iv-layer" role="dialog" aria-modal="true" tabindex="-1" aria-label={t('查看图片：{name}', { name })}>
+  <button class="iv-scrim" type="button" aria-label={t('关闭大图')} onclick={onclose}></button>
   <div class="iv-body">
     <!-- 图片区本身就是那颗"收起"按钮：点图、点图旁边的空处都收，键盘回车上也一样。
          它同时是滚动容器 —— 长图按容器宽度铺开，超出高度就滚；操作条在它外面，永远看得见。
@@ -115,8 +116,8 @@
       class="iv-stage"
       type="button"
       bind:this={stageEl}
-      aria-label="收起大图"
-      title="点一下收起大图"
+      aria-label={t('收起大图')}
+      title={t('点一下收起大图')}
       onclick={onStageClick}
       onpointerdown={onStageDown}
       onpointermove={onStageMove}
@@ -128,13 +129,13 @@
       {:else if error}
         <span class="iv-err">{error}</span>
       {:else}
-        <span class="iv-err">正在读这张图…</span>
+        <span class="iv-err">{t('正在读这张图…')}</span>
       {/if}
     </button>
     <div class="iv-bar">
       <span class="iv-name" title={name}>{name}</span>
-      <button class="iv-btn" type="button" onclick={onopenfile}>用系统程序打开</button>
-      <button class="iv-btn" type="button" onclick={onclose}>关闭</button>
+      <button class="iv-btn" type="button" onclick={onopenfile}>{t('用系统程序打开')}</button>
+      <button class="iv-btn" type="button" onclick={onclose}>{t('关闭')}</button>
     </div>
   </div>
 </div>

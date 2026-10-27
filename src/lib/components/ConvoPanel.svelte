@@ -19,6 +19,7 @@
   import ImagePreview from '$lib/components/ImagePreview.svelte';
   import ImageViewer from '$lib/components/ImageViewer.svelte';
   import TransferRing from '$lib/components/TransferRing.svelte';
+  import { t } from '$lib/i18n.svelte';
   import { listen } from '@tauri-apps/api/event';
   import { onMount, untrack } from 'svelte';
 
@@ -206,16 +207,16 @@
   /** 输入区那句占位文案的判据（`:empty` 认不出"只剩一个空文本节点"的框，见 `main.css`）。 */
   function markEmpty() {
     const el = inputEl;
-    const t = thread;
-    if (el && t) el.dataset.empty = chat.draftHasContent(t.key) ? '0' : '1';
+    const th = thread;
+    if (el && th) el.dataset.empty = chat.draftHasContent(th.key) ? '0' : '1';
   }
 
   /** 把输入区里此刻的样子存成草稿（每次 `input` 之后、认领完图之后都要叫一次）。 */
   function syncDraft() {
     const el = inputEl;
-    const t = thread;
-    if (!el || !t) return;
-    chat.setDraftSegs(t.key, serializeComposer(el));
+    const th = thread;
+    if (!el || !th) return;
+    chat.setDraftSegs(th.key, serializeComposer(el));
     markEmpty();
   }
 
@@ -347,8 +348,8 @@
 
   /** 消息右键要复制的那串（文件消息 = `名字（大小）`，图片消息 = `[图片] 名字`，与原型同一套）。 */
   function copyTextOf(item: ChatItem): string {
-    if (item.kind === 'file') return `${item.name}（${item.size}）`;
-    if (item.image) return `[图片] ${item.name ?? ''}`.trim();
+    if (item.kind === 'file') return t('{name}（{size}）', { name: item.name, size: item.size });
+    if (item.image) return t('[图片] {name}', { name: item.name ?? '' }).trim();
     return item.text;
   }
 
@@ -362,7 +363,7 @@
 
   /** 一条消息的显示名：文件消息与图片消息都有 `name`，都没有时写「图片」。 */
   function msgName(item: ChatItem): string {
-    return item.kind === 'file' ? item.name : item.name ?? '图片';
+    return item.kind === 'file' ? item.name : item.name ?? t('图片');
   }
 
   function onLogContext(e: MouseEvent) {
@@ -391,55 +392,62 @@
    * `chat://changed` 还会更新回执（对端上线后，等待发送的那几台会自己变成已送达）。
    */
   async function send() {
-    const t = thread;
-    if (!t) return;
-    const res = await chat.sendComposer(t.key).catch((e) => {
+    const th = thread;
+    if (!th) return;
+    const res = await chat.sendComposer(th.key).catch((e) => {
       onToast(String(e));
       return null;
     });
     const el = inputEl;
     if (el) {
-      applyComposer(el, chat.draftSegsOf(t.key));
+      applyComposer(el, chat.draftSegsOf(th.key));
       markEmpty();
       el.focus();
       setCaretEnd(el);
     }
     if (!res || res.failed) {
-      if (res?.failed) onToast(`有 ${res.failed} 项没发出去：${res.error ?? '原因不明'}（还留在输入框里）`);
+      if (res?.failed) {
+        onToast(t('有 {n} 项没发出去：{error}（还留在输入框里）', {
+          n: res.failed,
+          error: res.error ?? t('原因不明'),
+        }));
+      }
       return;
     }
-    if (t.mode !== 'broadcast' || !res.textId) {
-      if (res.images && !res.texts) onToast(`已发送 ${res.images} 张图片`);
+    if (th.mode !== 'broadcast' || !res.textId) {
+      if (res.images && !res.texts) onToast(t('已发送 {n} 张图片', { n: res.images }));
       return;
     }
-    const item = chat.itemById(t.key, res.textId);
+    const item = chat.itemById(th.key, res.textId);
     const receipt = item ? chat.receiptOf(item) : null;
     if (!item || !receipt) return;
     if (receipt.delivered === receipt.total) {
-      onToast(`已群发至 ${receipt.total} 台设备`);
+      onToast(t('已群发至 {n} 台设备', { n: receipt.total }));
       return;
     }
-    const tail = [`${receipt.delivered}/${receipt.total} 台送达`];
-    if (receipt.waiting) tail.push(`${receipt.waiting} 台等对端上线`);
-    if (receipt.offline) tail.push(`${receipt.offline} 台未送达`);
+    const tail = [t('{a}/{b} 台送达', { a: receipt.delivered, b: receipt.total })];
+    if (receipt.waiting) tail.push(t('{n} 台等对端上线', { n: receipt.waiting }));
+    if (receipt.offline) tail.push(t('{n} 台未送达', { n: receipt.offline }));
     const pending = chat.perDeviceOf(item).filter((p) => p.state === 'pending').length;
-    if (pending) tail.push(`${pending} 台发送中`);
-    onToast(`已群发 · ${tail.join('，')}`);
+    if (pending) tail.push(t('{n} 台发送中', { n: pending }));
+    onToast(t('已群发 · {detail}', { detail: tail.join(' · ') }));
   }
 
   /** 收件人上那颗 ✕（原型 `removeRecipient`）：去掉一台；只剩一台就退回一对一会话。 */
   function dropRecipient(peerId: string) {
-    const t = thread;
-    if (!t) return;
+    const th = thread;
+    if (!th) return;
     void chat
-      .removeParticipant(t.key, peerId)
+      .removeParticipant(th.key, peerId)
       .then((res) => {
         if (!res) return;
         if (!res.dissolved) {
-          onToast(`已从收件人移除「${res.name}」（不是踢人，对方不会收到任何通知）`);
+          onToast(t('已从收件人移除「{name}」（不是踢人，对方不会收到任何通知）', { name: res.name }));
           return;
         }
-        onToast(res.remaining ? '参与者只剩一台，已退回一对一会话' : '这台设备已经不在设备表里了，会话已关闭');
+        onToast(res.remaining
+          ? t('参与者只剩一台，已退回一对一会话')
+          : t('这台设备已经不在设备表里了，会话已关闭'));
       })
       .catch((e) => onToast(String(e)));
   }
@@ -504,22 +512,24 @@
      一直留着），而这张卡没有期限、处理完的落点就是它将要成为的那条会话。两处都渲染同一份
      （snippet），一处滚走另一处还在。 -->
 {#snippet inviteStrip(inhead: boolean)}
-  <div class="invite-strip" class:inhead={inhead} aria-label="群聊邀请">
+  <div class="invite-strip" class:inhead={inhead} aria-label={t('群聊邀请')}>
     {#each chat.pendingGroups() as pg (pg.id)}
-      {@const wait = pg.buffered > 0 ? ` · 已有 ${pg.buffered} 条消息在等你` : ''}
+      {@const membersText = pg.buffered > 0
+        ? t('其他 {n} 台设备 · 已有 {m} 条消息在等你', { n: pg.members.length, m: pg.buffered })
+        : t('其他 {n} 台设备', { n: pg.members.length })}
       <div class="invite-card">
         <div class="ic-row">
           <span class="f-icon">{@render icGrp()}</span>
           <span class="ic-main">
-            <span class="ic-name">「{pg.fromName}」邀请你加入群聊「{pg.name.trim() || '未命名群聊'}」</span>
+            <span class="ic-name">{t('「{from}」邀请你加入群聊「{name}」', { from: pg.fromName, name: pg.name.trim() || t('未命名群聊') })}</span>
             <!-- 攒着几条是后端数的（`orphans`）：不说的话，用户不点「加入」就永远不知道
                  里面已经有东西在等他了。 -->
-            <span class="ic-size">其他 {pg.members.length} 台设备{wait}</span>
+            <span class="ic-size">{membersText}</span>
           </span>
         </div>
         <div class="ic-acts">
-          <button class="btn btn-secondary btn-sm" type="button" onclick={() => answerInvite(pg, false)}>不加入</button>
-          <button class="btn btn-primary btn-sm" type="button" onclick={() => answerInvite(pg, true)}>加入</button>
+          <button class="btn btn-secondary btn-sm" type="button" onclick={() => answerInvite(pg, false)}>{t('不加入')}</button>
+          <button class="btn btn-primary btn-sm" type="button" onclick={() => answerInvite(pg, true)}>{t('加入')}</button>
         </div>
       </div>
     {/each}
@@ -532,17 +542,17 @@
   class="convo-pop"
   class:open
   class:drop-hot={dropHot}
-  aria-label="会话"
+  aria-label={t('会话')}
   aria-hidden={!open}
   inert={!open}
   data-od-id="convo-sheet"
 >
   <div class="convos-list-view" hidden={!!thread}>
     <header class="convos-head">
-      <span class="convos-title">会话</span>
+      <span class="convos-title">{t('会话')}</span>
       <div class="convos-head-acts">
-        <button class="btn btn-secondary btn-sm" type="button" onclick={() => chat.askNewConvo()}>＋ 新建会话</button>
-        <button class="icon-btn" type="button" aria-label="关闭会话" onclick={() => chat.setChatOpen(false)}>
+        <button class="btn btn-secondary btn-sm" type="button" onclick={() => chat.askNewConvo()}>{t('＋ 新建会话')}</button>
+        <button class="icon-btn" type="button" aria-label={t('关闭会话')} onclick={() => chat.setChatOpen(false)}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
         </button>
       </div>
@@ -556,12 +566,12 @@
       {@render inviteStrip(false)}
     {/if}
 
-    <div class="convo-list" aria-label="会话列表">
+    <div class="convo-list" aria-label={t('会话列表')}>
       {#if rows.length === 0}
         <div class="empty">
           {@render icChat()}
-          <p>还没有会话</p>
-          <p class="e-sub">用「＋ 新建会话」选设备开始，或到「设备」页那一行点「发消息」；对方先发来消息也会出现在这里。</p>
+          <p>{t('还没有会话')}</p>
+          <p class="e-sub">{t('用「＋ 新建会话」选设备开始，或到「设备」页那一行点「发消息」；对方先发来消息也会出现在这里。')}</p>
         </div>
       {:else}
         {#each rows as row (row.key)}
@@ -580,9 +590,9 @@
               <span class="convo-top">
                 <span class="convo-name" title={row.label}>{row.label}</span>
                 {#if row.mode === 'broadcast'}
-                  <span class="convo-mode-chip bc">{@render icBc()}群发</span>
+                  <span class="convo-mode-chip bc">{@render icBc()}{t('群发')}</span>
                 {:else if row.mode === 'group'}
-                  <span class="convo-mode-chip group">{@render icGrp()}群聊</span>
+                  <span class="convo-mode-chip group">{@render icGrp()}{t('群聊')}</span>
                 {/if}
                 <span class="convo-dot {row.dot} {row.trusted ? 'solid' : 'hollow'}"></span>
                 <span class="convo-time num">{row.time}</span>
@@ -600,7 +610,7 @@
     <div class="convo-detail">
       <div class="conv-headgroup">
         <header class="conv-top">
-          <button class="conv-back" type="button" aria-label="返回会话列表" onclick={() => chat.backToList()}>
+          <button class="conv-back" type="button" aria-label={t('返回会话列表')} onclick={() => chat.backToList()}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 6-6 6 6 6" /></svg>
           </button>
           <!-- 返回箭头**右边**：别的会话还等着几条（数与减掉当前这条的算法见 `chat.unreadElsewhere`）。
@@ -614,8 +624,8 @@
               <button
                 class="conv-elsewhere"
                 type="button"
-                title="还有 {elsewhere} 条来自其他会话的消息"
-                aria-label="还有 {elsewhere} 条来自其他会话的消息，回会话列表"
+                title={t('还有 {n} 条来自其他会话的消息', { n: elsewhere })}
+                aria-label={t('还有 {n} 条来自其他会话的消息，回会话列表', { n: elsewhere })}
                 onclick={() => chat.backToList()}
               >{elsewhere > 99 ? '99+' : elsewhere}</button>
             {/if}
@@ -631,14 +641,14 @@
                  （一枚裸的、一枚在胶囊里），看着就像画重了。 -->
             <span class="conv-status {headerDot} {headerTrusted ? 'solid' : 'hollow'}"></span>
             {#if thread.participants.length > 1}
-              <span class="conv-count num">{thread.participants.length} 台</span>
+              <span class="conv-count num">{t('{n} 台', { n: thread.participants.length })}</span>
             {/if}
           </div>
           <div class="conv-acts">
-            <button class="icon-btn" type="button" aria-label="会话操作" onclick={convoMenu}>
+            <button class="icon-btn" type="button" aria-label={t('会话操作')} onclick={convoMenu}>
               <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="19" cy="12" r="1.6" /></svg>
             </button>
-            <button class="icon-btn" type="button" aria-label="关闭会话" onclick={() => chat.setChatOpen(false)}>
+            <button class="icon-btn" type="button" aria-label={t('关闭会话')} onclick={() => chat.setChatOpen(false)}>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
             </button>
           </div>
@@ -649,11 +659,11 @@
           <div class="convo-mode" data-mode={thread.mode}>
             <span class="cm-ic" aria-hidden="true">{#if thread.mode === 'broadcast'}{@render icBc()}{:else}{@render icGrp()}{/if}</span>
             <span class="cm-txt">
-              <b>{thread.mode === 'broadcast' ? '群发模式' : '群聊模式'}</b>
-              {thread.mode === 'broadcast' ? ' · 单向发送，对方各自单独收到' : ' · 任意参与者共享同一条消息流'}
+              <b>{thread.mode === 'broadcast' ? t('群发模式') : t('群聊模式')}</b>
+              {' · '}{thread.mode === 'broadcast' ? t('单向发送，对方各自单独收到') : t('任意参与者共享同一条消息流')}
             </span>
             <button class="cm-act" type="button" onclick={() => chat.askParticipants(thread.key)}>
-              {thread.mode === 'broadcast' ? '编辑群发' : '编辑群聊'}
+              {thread.mode === 'broadcast' ? t('编辑群发') : t('编辑群聊')}
             </button>
           </div>
         {/if}
@@ -669,7 +679,7 @@
           <div class="chat-note" role="status">
             <span class="cn-ic" aria-hidden="true">{@render icWarn()}</span>
             <span class="cn-txt">{undeliverable.text}</span>
-            <button class="icon-btn cn-x" type="button" aria-label="关闭提示" onclick={dismissUndeliverable}>
+            <button class="icon-btn cn-x" type="button" aria-label={t('关闭提示')} onclick={dismissUndeliverable}>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
             </button>
           </div>
@@ -677,7 +687,7 @@
       </div>
 
       <div class="recip">
-        <span class="recip-label">{thread.mode === 'broadcast' ? '群发至' : '发送给'}</span>
+        <span class="recip-label">{thread.mode === 'broadcast' ? t('群发至') : t('发送给')}</span>
         <div class="recip-chips">
           {#each thread.participants as peerId (peerId)}
             {@const dev = deviceById(peerId)}
@@ -701,14 +711,14 @@
               class="recip-chip"
               class:refused
               title={refused
-                ? `${label} · ${st.label} · 已拒绝加入这个群，收不到群消息`
+                ? t('{label} · {state} · 已拒绝加入这个群，收不到群消息', { label, state: st.label })
                 : `${label} · ${st.label}`}
             >
               <span class="rc-av">{(label.trim().charAt(0) || '?').toUpperCase()}</span>
               <span class="rc-name">{label}</span>
               <span class="rc-st {st.dot} {st.trusted ? 'solid' : 'hollow'}"></span>
               {#if thread.mode !== 'direct'}
-                <button class="rc-x" type="button" aria-label="从收件人里移除" onclick={() => dropRecipient(peerId)}>
+                <button class="rc-x" type="button" aria-label={t('从收件人里移除')} onclick={() => dropRecipient(peerId)}>
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
                 </button>
               {/if}
@@ -718,12 +728,12 @@
         <button
           class="recip-add"
           type="button"
-          aria-label={thread.mode === 'direct' ? '再加几台一起发' : '编辑收件人'}
-          title={thread.mode === 'direct' ? '再加几台：选到两台以上就成为一个多台会话（群发或群聊）' : ''}
+          aria-label={thread.mode === 'direct' ? t('再加几台一起发') : t('编辑收件人')}
+          title={thread.mode === 'direct' ? t('再加几台：选到两台以上就成为一个多台会话（群发或群聊）') : ''}
           onclick={() => chat.askParticipants(thread.key)}
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
-          添加
+          {t('添加')}
         </button>
       </div>
 
@@ -732,7 +742,7 @@
         class="chat-log"
         bind:this={logEl}
         role="log"
-        aria-label="会话记录"
+        aria-label={t('会话记录')}
         oncontextmenu={onLogContext}
         onscroll={onLogScroll}
       >
@@ -741,7 +751,7 @@
         {#if missing > 0}
           <div class="chat-sync">
             <span class="cs-line"></span>
-            <span class="cs-txt">有 {missing} 条消息未能同步（来源设备不在线）</span>
+            <span class="cs-txt">{t('有 {n} 条消息未能同步（来源设备不在线）', { n: missing })}</span>
             <span class="cs-line"></span>
           </div>
         {/if}
@@ -749,18 +759,18 @@
           <div class="chat-empty">
             {#if thread.mode === 'broadcast'}
               {@render icBc()}
-              <p>还没有群发消息</p>
+              <p>{t('还没有群发消息')}</p>
               <p class="ce-sub">
-                你发出的每条消息都会作为单独的一对一消息，分别送达 {thread.participants.length} 台设备；这里只显示你发出的内容。
+                {t('你发出的每条消息都会作为单独的一对一消息，分别送达 {n} 台设备；这里只显示你发出的内容。', { n: thread.participants.length })}
               </p>
             {:else if thread.mode === 'group'}
               {@render icGrp()}
-              <p>还没有消息</p>
-              <p class="ce-sub">在这里说一句，名册上的成员都会看到（同一条消息流）；传文件则按成员逐台推送。</p>
+              <p>{t('还没有消息')}</p>
+              <p class="ce-sub">{t('在这里说一句，名册上的成员都会看到（同一条消息流）；传文件则按成员逐台推送。')}</p>
             {:else}
               {@render icChat()}
-              <p>还没有消息</p>
-              <p class="ce-sub">发一条消息或传一个文件，开始和设备对话。</p>
+              <p>{t('还没有消息')}</p>
+              <p class="ce-sub">{t('发一条消息或传一个文件，开始和设备对话。')}</p>
             {/if}
           </div>
         {:else}
@@ -768,7 +778,7 @@
             <!-- 单向台账：这一条条都是我发出去的（对方的回复各自回到它们的 1:1，不在这儿）。 -->
             <div class="chat-ledger">
               <span class="cl-line"></span>
-              <span class="cl-txt">已发送 · {items.length} 条 · 单向</span>
+              <span class="cl-txt">{t('已发送 · {n} 条 · 单向', { n: items.length })}</span>
               <span class="cl-line"></span>
             </div>
           {/if}
@@ -799,15 +809,15 @@
                     {#if item.path}
                       <ImagePreview
                         path={item.path}
-                        label={item.name ?? '图片'}
+                        label={item.name ?? t('图片')}
                         flush
                         onopen={() => (viewing = item)}
                         onlayout={onImageLayout}
                       >
-                        <span class="cf-main"><span class="cf-name">{item.name ?? '图片'}</span></span>
+                        <span class="cf-main"><span class="cf-name">{item.name ?? t('图片')}</span></span>
                       </ImagePreview>
                     {:else}
-                      <span class="cf-main"><span class="cf-name">{item.name ?? '图片'}（读不出来）</span></span>
+                      <span class="cf-main"><span class="cf-name">{t('{name}（读不出来）', { name: item.name ?? t('图片') })}</span></span>
                     {/if}
                   </div>
                 {:else}
@@ -817,10 +827,13 @@
                 <!-- 对端推过来的那条：接收 / 拒绝（原型 `invite-card`） -->
                 <div class="invite-card">
                   <div class="ic-row">{@render fileRow(item)}</div>
-                  <div class="ic-sub">来自 {chat.deviceNameOf(item.peerId)} · {askEachTime ? '接收时选保存位置' : '接收后保存到下载目录'}</div>
+                  <div class="ic-sub">{t('来自 {name} · {hint}', {
+                    name: chat.deviceNameOf(item.peerId),
+                    hint: askEachTime ? t('接收时选保存位置') : t('接收后保存到下载目录'),
+                  })}</div>
                   <div class="ic-acts">
-                    <button class="btn btn-secondary btn-sm" type="button" onclick={() => onRejectInvite(item.inviteId)}>拒绝</button>
-                    <button class="btn btn-primary btn-sm" type="button" onclick={() => onAcceptInvite(item.inviteId)}>接收</button>
+                    <button class="btn btn-secondary btn-sm" type="button" onclick={() => onRejectInvite(item.inviteId)}>{t('拒绝')}</button>
+                    <button class="btn btn-primary btn-sm" type="button" onclick={() => onAcceptInvite(item.inviteId)}>{t('接收')}</button>
                   </div>
                 </div>
               {:else if !item.fromMe}
@@ -849,7 +862,7 @@
                         <button
                           class="ic-open"
                           type="button"
-                          title="打开「{item.name}」"
+                          title={t('打开「{name}」', { name: item.name })}
                           onclick={() => onOpenFile(item)}
                         >{@render fileRow(item, status)}</button>
                       {:else}
@@ -893,7 +906,7 @@
                       <button
                         class="cf-open"
                         type="button"
-                        title="打开本机的「{item.name}」"
+                        title={t('打开本机的「{name}」', { name: item.name })}
                         onclick={() => onOpenFile(item)}
                       >{@render fileBubbleBody(item, fState)}</button>
                     </ImagePreview>
@@ -901,7 +914,7 @@
                     <button
                       class="cf-open"
                       type="button"
-                      title="打开本机的「{item.name}」"
+                      title={t('打开本机的「{name}」', { name: item.name })}
                       onclick={() => onOpenFile(item)}
                     >{@render fileBubbleBody(item, fState)}</button>
                   {:else}
@@ -927,7 +940,7 @@
                 {@const receipt = chat.receiptOf(item)}
                 {#if receipt}
                   <div class="chat-receipt">
-                    <span class="cr-head">已送达 {receipt.delivered}/{receipt.total} 台</span>
+                    <span class="cr-head">{t('已送达 {a}/{b} 台', { a: receipt.delivered, b: receipt.total })}</span>
                     <span class="cr-list">
                       {#each per as p (p.peerId)}
                         <span
@@ -972,12 +985,14 @@
           spellcheck="false"
           data-empty="1"
           data-placeholder={thread.mode === 'broadcast'
-            ? `群发给 ${thread.participants.length} 台设备…`
+            ? t('群发给 {n} 台设备…', { n: thread.participants.length })
             : thread.mode === 'group'
-              ? '在群里说一句…'
-              : '输入消息…'}
-          aria-label={thread.mode === 'broadcast' ? '输入要群发的消息' : thread.mode === 'group' ? '输入群消息' : '发送消息'}
-          title={thread.mode === 'group' ? '群里说的话，名册上的成员都会看到；图片也可以直接粘进来' : `图片可以直接粘进来（${pasteShortcut()}），前后还能继续写文字`}
+              ? t('在群里说一句…')
+              : t('输入消息…')}
+          aria-label={thread.mode === 'broadcast' ? t('输入要群发的消息') : thread.mode === 'group' ? t('输入群消息') : t('发送消息')}
+          title={thread.mode === 'group'
+            ? t('群里说的话，名册上的成员都会看到；图片也可以直接粘进来')
+            : t('图片可以直接粘进来（{shortcut}），前后还能继续写文字', { shortcut: pasteShortcut() })}
           oninput={() => void onInput()}
           oncompositionstart={() => onComposition(true)}
           oncompositionend={() => onComposition(false)}
@@ -994,8 +1009,8 @@
           class="chat-plus"
           class:bc={thread.mode === 'broadcast'}
           type="button"
-          aria-label={thread.mode === 'broadcast' ? '群发文件（即推送）' : thread.mode === 'group' ? '发送文件到群里' : '发送文件（即推送）'}
-          title={thread.mode === 'group' ? '选文件发到群里：按成员逐台推送（未配对的成员各自点一次同意）' : '选文件发过去就是推送'}
+          aria-label={thread.mode === 'broadcast' ? t('群发文件（即推送）') : thread.mode === 'group' ? t('发送文件到群里') : t('发送文件（即推送）')}
+          title={thread.mode === 'group' ? t('选文件发到群里：按成员逐台推送（未配对的成员各自点一次同意）') : t('选文件发过去就是推送')}
           onclick={onSendFiles}
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
@@ -1004,8 +1019,8 @@
           class="chat-send"
           class:bc={thread.mode === 'broadcast'}
           type="submit"
-          aria-label={thread.mode === 'broadcast' ? '群发消息' : '发送消息'}
-          title={thread.mode === 'group' ? '发送到群里' : ''}
+          aria-label={thread.mode === 'broadcast' ? t('群发消息') : t('发送消息')}
+          title={thread.mode === 'group' ? t('发送到群里') : ''}
           disabled={!canSend}
         >
           {#if thread.mode === 'broadcast'}
@@ -1023,7 +1038,7 @@
        指针事件（拖动期间本来也收不到）。它只在该出现时挂上（`dropHot` 只在浮层开着、
        且已经进了某条会话时才为真，见 `App.dropInConvo`）。 -->
   {#if dropHot}
-    <div class="drop-hint"><b>松手即发送到这条会话</b></div>
+    <div class="drop-hint"><b>{t('松手即发送到这条会话')}</b></div>
   {/if}
 
   <!-- 「看大图」：会话里点一张图的缩略图就在这一层上摊开它（`viewing` 跟着会话走 ——

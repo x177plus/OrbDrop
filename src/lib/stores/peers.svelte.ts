@@ -1,6 +1,7 @@
 import { listen } from '@tauri-apps/api/event';
 import type { PeerShareItem } from '$lib/types';
 import * as api from '$lib/api';
+import { t } from '$lib/i18n.svelte';
 import { deviceById } from './devices.svelte';
 
 /**
@@ -40,7 +41,7 @@ function patch(peerId: string, next: Partial<PeerSharesState>) {
 export async function loadPeerShares(peerId: string): Promise<void> {
   const peer = deviceById(peerId);
   if (!peer) {
-    patch(peerId, { items: [], loaded: true, loading: false, error: '设备不在列表中' });
+    patch(peerId, { items: [], loaded: true, loading: false, error: t('设备不在列表中') });
     return;
   }
   patch(peerId, { loading: true, error: null });
@@ -49,7 +50,7 @@ export async function loadPeerShares(peerId: string): Promise<void> {
     patch(peerId, { items, loaded: true, loading: false, error: null });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
-    patch(peerId, { items: [], loaded: true, loading: false, error: `读取失败：${msg}` });
+    patch(peerId, { items: [], loaded: true, loading: false, error: t('读取失败：{msg}', { msg }) });
   }
 }
 

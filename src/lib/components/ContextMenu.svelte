@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { ctxPlacement } from '$lib/ctxPlacement';
+  import { t } from '$lib/i18n.svelte';
 
   let {
     x, y,
@@ -195,16 +196,18 @@
   {#if bcLeftLabel}
     <button class="ctx-item" disabled>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="3"/></svg>
-      左：{bcLeftLabel}{bcLeftExists ? '' : '（已被移动或删除）'}
+      {t('左：{label}', { label: bcLeftLabel })}{bcLeftExists ? '' : t('（已被移动或删除）')}
     </button>
   {/if}
   <button class="ctx-item" disabled={!bcCompareEnabled} onclick={() => handleItem(onBcCompare)}>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><rect x="3" y="4" width="7" height="16" rx="1.5"/><rect x="14" y="4" width="7" height="16" rx="1.5"/></svg>
-    用 BeyondCompare 比较{bcCompareLabel ? ` · 与左侧：${bcCompareLabel}` : ''}
+    {bcCompareLabel
+      ? t('用 BeyondCompare 比较 · 与左侧：{label}', { label: bcCompareLabel })
+      : t('用 BeyondCompare 比较')}
   </button>
   <button class="ctx-item" onclick={() => handleItem(onBcAddLeft)}>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H4M10 6l-6 6 6 6"/></svg>
-    添加到左侧比较位
+    {t('添加到左侧比较位')}
   </button>
 {/snippet}
 
@@ -214,12 +217,12 @@
     {#if chatSel}
       <button class="ctx-item" onclick={() => handleItem(() => onChatCopy('sel'))}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11v13H4z"/><path d="M8 4h12v12"/></svg>
-        复制所选文字
+        {t('复制所选文字')}
       </button>
     {/if}
     <button class="ctx-item" onclick={() => handleItem(() => onChatCopy('all'))}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11v13H4z"/><path d="M8 4h12v12"/></svg>
-      复制整条消息
+      {t('复制整条消息')}
     </button>
   {:else if kind === 'convo'}
     <!-- 一对一那条会话也摆着**设备那两项**（修改备注 / 配对·重新配对），与设备右键菜单
@@ -231,13 +234,13 @@
     {#if !convoThread && deviceState}
       <button class="ctx-item" title={deviceRemark ?? undefined} onclick={() => handleItem(onRemark)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M4 10h10M4 15h16M4 20h7"/></svg>
-        修改备注
+        {t('修改备注')}
         {#if deviceRemark}<span class="ctx-current">{deviceRemark}</span>{/if}
       </button>
       {#if deviceState === 'unbound' || deviceNeedsPair}
         <button class="ctx-item" onclick={() => handleItem(onPair)}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
-          {deviceState === 'unbound' ? '配对' : '重新配对'}
+          {deviceState === 'unbound' ? t('配对') : t('重新配对')}
         </button>
       {/if}
       <div class="ctx-sep"></div>
@@ -245,13 +248,13 @@
     {#if !convoThread && convoBrowse}
       <button class="ctx-item" onclick={() => handleItem(onConvoFiles)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>
-        查看该设备文件
+        {t('查看该设备文件')}
       </button>
     {/if}
     {#if convoThread}
       <button class="ctx-item" onclick={() => handleItem(onConvoEdit)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M16 19v-1a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v1"/><circle cx="9" cy="7" r="3"/><path d="M22 19v-1a4 4 0 0 0-3-3.87"/><path d="M16 4.13a4 4 0 0 1 0 7.75"/></svg>
-        {convoBc ? '编辑收件人与群发名称' : '编辑参与者与群聊名称'}
+        {convoBc ? t('编辑收件人与群发名称') : t('编辑参与者与群聊名称')}
       </button>
     {/if}
     <!-- 群发 → 群聊：拿同一份名单建一个群（没有新后端命令，就是 `group_create`）。
@@ -259,48 +262,48 @@
     {#if convoBc && onConvoUpgrade}
       <button
         class="ctx-item"
-        title="拿这份名单建一个群，之后的讨论共享同一条消息流。历史不迁移：已经发出的消息仍在各设备的单独会话里（对端也从不知道它属于一个群）。"
+        title={t('拿这份名单建一个群，之后的讨论共享同一条消息流。历史不迁移：已经发出的消息仍在各设备的单独会话里（对端也从不知道它属于一个群）。')}
         onclick={() => handleItem(onConvoUpgrade)}
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 18V8"/><path d="m8 12 4-4 4 4"/><path d="M5 20h14"/></svg>
-        升级为群聊
+        {t('升级为群聊')}
       </button>
     {/if}
     {#if convoThread && !convoBc}
       <button class="ctx-item" onclick={() => handleItem(onConvoClear)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/><path d="M10 11v5M14 11v5"/></svg>
-        清空聊天记录（不退群）
+        {t('清空聊天记录（不退群）')}
       </button>
     {/if}
     <button class="ctx-item danger" onclick={() => handleItem(onConvoExit)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
-      {convoThread ? (convoBc ? '删除群发（消息留在各设备会话）' : '退出群聊（本地删除并广播离开）') : '清空聊天记录'}
+      {convoThread ? (convoBc ? t('删除群发（消息留在各设备会话）') : t('退出群聊（本地删除并广播离开）')) : t('清空聊天记录')}
     </button>
   {:else if kind === 'peer'}
     <button class="ctx-item" onclick={() => handleItem(onPeerDownload)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
-      下载到本地{peerName ? ` · 来自「${peerName}」` : ''}
+      {peerName ? t('下载到本地 · 来自「{name}」', { name: peerName }) : t('下载到本地')}
     </button>
     {#if bcAvailable}{@render bcSection()}{/if}
   {:else if kind === 'share'}
     {#if !compact}
       <button class="ctx-item" onclick={() => handleItem(onDownload)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
-        下载到本地
+        {t('下载到本地')}
       </button>
     {/if}
     <button class="ctx-item" onclick={() => handleItem(onOpen)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>
-      {compact ? '打开文件夹' : '打开所在文件夹'}
+      {compact ? t('打开文件夹') : t('打开所在文件夹')}
     </button>
     <button class="ctx-item" onclick={() => handleItem(onCopy)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11v13H4z"/><path d="M8 4h12v12"/></svg>
-      {compact ? '复制路径' : '复制共享路径'}
+      {compact ? t('复制路径') : t('复制共享路径')}
     </button>
     <div class="ctx-sep"></div>
     <button class="ctx-item danger" onclick={() => handleItem(onRemove)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
-      {compact ? '移除共享' : '移除共享项'}
+      {compact ? t('移除共享') : t('移除共享项')}
     </button>
     {#if !compact && bcAvailable}{@render bcSection()}{/if}
   {:else}
@@ -310,7 +313,7 @@
          用户不用先点进去才知道自己起过什么名。 -->
     <button class="ctx-item" title={deviceRemark ?? undefined} onclick={() => handleItem(onRemark)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M4 10h10M4 15h16M4 20h7"/></svg>
-      修改备注
+      {t('修改备注')}
       {#if deviceRemark}<span class="ctx-current">{deviceRemark}</span>{/if}
     </button>
     <div class="ctx-sep"></div>
@@ -323,7 +326,7 @@
            而不是只剩「修改备注」。 -->
       <button class="ctx-item" onclick={() => handleItem(onPair)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
-        配对
+        {t('配对')}
       </button>
     {:else if !deviceOnline}
       <!-- 已配对但离线：只有「解除配对」是本机动作（它不依赖长连接）。会话仍然打得开、消息也发得
@@ -332,41 +335,41 @@
     {:else if deviceState === 'connected'}
       <button class="ctx-item" onclick={() => handleItem(onDisconnect)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/><path d="M3 3l18 18"/></svg>
-        断开长连接
+        {t('断开长连接')}
       </button>
     {:else if deviceNeedsPair}
       <!-- token 已失效：拨号必然 401，唯一出路是重新配对 -->
       <button class="ctx-item" onclick={() => handleItem(onPair)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
-        重新配对
+        {t('重新配对')}
       </button>
     {:else}
       <button class="ctx-item" onclick={() => handleItem(onConnect)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/></svg>
-        立即连接
+        {t('立即连接')}
       </button>
     {/if}
     {#if deviceOnline || deviceState === 'unbound'}
       <button class="ctx-item" onclick={() => handleItem(onMessage)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22 11 13 2 9 22 2Z"/></svg>
-        发消息
+        {t('发消息')}
       </button>
     {/if}
     {#if deviceState !== 'unbound'}
       <div class="ctx-sep"></div>
       <button class="ctx-item danger" onclick={() => handleItem(onUnpair)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
-        解除配对
+        {t('解除配对')}
       </button>
     {:else if onForget}
       <div class="ctx-sep"></div>
       <button
         class="ctx-item danger"
-        title="只清本机记录：设备行、地址、备注与观察指纹；对端不受影响。它下次广播时还会重新出现。"
+        title={t('只清本机记录：设备行、地址、备注与观察指纹；对端不受影响。它下次广播时还会重新出现。')}
         onclick={() => handleItem(onForget)}
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
-        忘记设备
+        {t('忘记设备')}
       </button>
     {/if}
   {/if}

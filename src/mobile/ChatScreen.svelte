@@ -20,6 +20,7 @@
   import ImagePreview from "$lib/components/ImagePreview.svelte";
   import ImageViewer from "$lib/components/ImageViewer.svelte";
   import TransferRing from "$lib/components/TransferRing.svelte";
+  import { t } from "$lib/i18n.svelte";
   import { untrack } from "svelte";
 
   let { convoKey }: { convoKey: string } = $props();
@@ -75,11 +76,11 @@
   const sub = $derived(
     mode === "direct"
       ? linked > 0
-        ? "长连接 · 在线"
+        ? t("长连接 · 在线")
         : reachable > 0
-          ? "在线"
-          : "离线 · 消息不会送达"
-      : `${reachable}/${participants.length} 台在线`,
+          ? t("在线")
+          : t("离线 · 消息不会送达")
+      : t("{reachable}/{total} 台在线", { reachable, total: participants.length }),
   );
 
   /** 发言人的设备 id：群消息带 `from`，本机内存里的文件消息带 `peerId`（群里的文件只会是本机发的）。 */
@@ -134,7 +135,7 @@
 
   /** 一条消息的显示名：文件消息与图片消息都有 `name`，都没有时写「图片」。 */
   function msgName(item: ChatItem): string {
-    return item.kind === "file" ? item.name : item.name ?? "图片";
+    return item.kind === "file" ? item.name : item.name ?? t("图片");
   }
 
   /**
@@ -143,10 +144,31 @@
    * 让人以为剩下那几台都送到了。
    */
   function receiptHead(r: Receipt): string {
-    const parts = [`已送达 ${r.delivered}/${r.total} 台`];
-    if (r.offline) parts.push(`${r.offline} 台离线`);
-    if (r.waiting) parts.push(`${r.waiting} 台等待发送`);
-    return parts.join(" · ");
+    const delivered = r.delivered;
+    const total = r.total;
+    if (r.offline && r.waiting) {
+      return t("已送达 {delivered}/{total} 台 · {offline} 台离线 · {waiting} 台等待发送", {
+        delivered,
+        total,
+        offline: r.offline,
+        waiting: r.waiting,
+      });
+    }
+    if (r.offline) {
+      return t("已送达 {delivered}/{total} 台 · {offline} 台离线", {
+        delivered,
+        total,
+        offline: r.offline,
+      });
+    }
+    if (r.waiting) {
+      return t("已送达 {delivered}/{total} 台 · {waiting} 台等待发送", {
+        delivered,
+        total,
+        waiting: r.waiting,
+      });
+    }
+    return t("已送达 {delivered}/{total} 台", { delivered, total });
   }
 
   /**
@@ -170,12 +192,18 @@
       if (res.failed) {
         // **发失败不清草稿**：没发出去的那几段原样还在输入区里，用户不用重打一遍
         // （原型是 mock 不会失败，真发不出去还把刚打的字抹掉，用户得重打一遍）。
-        store.toast(`有 ${res.failed} 项没发出去：${res.error ?? "原因不明"}`, "x");
+        store.toast(
+          t("有 {n} 项没发出去：{error}", {
+            n: res.failed,
+            error: res.error ?? t("原因不明"),
+          }),
+          "x",
+        );
         return;
       }
-      if (res.images && !res.texts) store.toast(`已发送 ${res.images} 张图片`, "file");
+      if (res.images && !res.texts) store.toast(t("已发送 {n} 张图片", { n: res.images }), "file");
     } catch (e) {
-      store.failed("发送消息", e);
+      store.failed(t("发送"), e);
     }
   }
 
@@ -247,7 +275,7 @@
     try {
       await api.openPath(item.path);
     } catch (e) {
-      store.failed("打开", e);
+      store.failed(t("打开"), e);
     }
   }
 
@@ -368,17 +396,19 @@
   <span class="fio"><Icon name="file" /></span>
   <span class="fmain">
     <span class="fname">{item.name}</span>
-    <span class="fsize num">{item.size || "文件"}</span>
+    <span class="fsize num">{item.size || t("文件")}</span>
     {#if item.sending}
-      <span class="fstat">传输中 {Math.round(item.pct)}%</span>
+      <span class="fstat">{t("传输中 {pct}%", { pct: Math.round(item.pct) })}</span>
     {:else if fileStatus(item)}
-      <span class="fstat">{fileStatus(item)}{item.path ? " · 点一下打开" : ""}</span>
+      <span class="fstat">
+        {item.path ? t("{status} · 点一下打开", { status: fileStatus(item) }) : fileStatus(item)}
+      </span>
     {/if}
   </span>
 {/snippet}
 
 <header class="chatbar">
-  <button class="icon-btn" type="button" aria-label="返回会话列表" onclick={() => store.navigateBackToList()}>
+  <button class="icon-btn" type="button" aria-label={t("返回会话列表")} onclick={() => store.navigateBackToList()}>
     <Icon name="back" />
   </button>
   <!-- 返回箭头**右边**：别的会话还等着几条。不摆在返回键本身上 —— 那位置让给角标就得靠悬停
@@ -394,7 +424,7 @@
       <button
         class="cb-elsewhere"
         type="button"
-        aria-label="还有 {elsewhere} 条来自其他会话的消息，回会话列表"
+        aria-label={t("还有 {n} 条来自其他会话的消息，回会话列表", { n: elsewhere })}
         onclick={() => store.navigateBackToList()}
       >{elsewhere > 99 ? "99+" : elsewhere}</button>
     {/if}
@@ -410,7 +440,7 @@
   <button
     class="icon-btn"
     type="button"
-    aria-label="会话操作"
+    aria-label={t("会话操作")}
     onclick={() => store.openSheet({ kind: "chatActions", key: convoKey })}
   >
     <Icon name="more" cls="ic-fill" />
@@ -420,21 +450,21 @@
 {#if mode === "broadcast"}
   <div class="chat-banner bc">
     <Icon name="bc" />
-    <span>群发（单向）：每条内容都会作为一条独立的一对一消息分别发给 {participants.length} 台设备，这里只显示你发出的部分。</span>
+    <span>{t("群发（单向）：每条内容都会作为一条独立的一对一消息分别发给 {n} 台设备，这里只显示你发出的部分。", { n: participants.length })}</span>
   </div>
 {:else if mode === "group"}
   <div class="chat-banner grp">
     <Icon name="group" />
-    <span>群聊：{participants.length} 台设备共享此会话，任何设备发送的消息所有人都能看到。</span>
+    <span>{t("群聊：{n} 台设备共享此会话，任何设备发送的消息所有人都能看到。", { n: participants.length })}</span>
   </div>
 {/if}
 
-<div class="chatlog" bind:this={logEl} role="log" aria-label="会话记录" onscroll={onLogScroll}>
+<div class="chatlog" bind:this={logEl} role="log" aria-label={t("会话记录")} onscroll={onLogScroll}>
   {#if !items.length}
     <div class="empty">
       <Icon name="chat" />
-      <p>还没有消息</p>
-      <p class="es">发一条消息或传一个文件，开始和设备对话。</p>
+      <p>{t("还没有消息")}</p>
+      <p class="es">{t("发一条消息或传一个文件，开始和设备对话。")}</p>
     </div>
   {/if}
   {#each items as item (item.id)}
@@ -447,17 +477,17 @@
           <Icon name="file" />
           <span class="cv-main">
             <span class="fname">{item.name}</span>
-            <span class="fmeta">{item.size || "文件"}</span>
+            <span class="fmeta">{item.size || t("文件")}</span>
           </span>
         </div>
         <!-- 原型写的是 `fromName`（mock 才有），真实那条消息只带发送方设备 id。 -->
-        <div class="inv-sub">来自 {chat.deviceNameOf(item.peerId)} · 接收后保存到收件目录</div>
+        <div class="inv-sub">{t("来自 {name} · 接收后保存到收件目录", { name: chat.deviceNameOf(item.peerId) })}</div>
         <div class="inv-acts">
           <button class="btn btn-secondary" type="button" onclick={() => void store.answerInvite(item, false)}>
-            拒绝
+            {t("拒绝")}
           </button>
           <button class="btn btn-primary" type="button" onclick={() => void store.answerInvite(item, true)}>
-            接收
+            {t("接收")}
           </button>
         </div>
       </div>
@@ -547,15 +577,15 @@
               {#if item.path}
                 <ImagePreview
                   path={item.path}
-                  label={item.name ?? "图片"}
+                  label={item.name ?? t("图片")}
                   flush
                   onopen={() => (viewing = item)}
                   onlayout={onImageLayout}
                 >
-                  <span class="fbub"><span class="fname">{item.name ?? "图片"}</span></span>
+                  <span class="fbub"><span class="fname">{item.name ?? t("图片")}</span></span>
                 </ImagePreview>
               {:else}
-                <span class="ctext">{item.name ?? "图片"}（读不出来）</span>
+                <span class="ctext">{t("{name}（读不出来）", { name: item.name ?? t("图片") })}</span>
               {/if}
             {:else}
               <span class="ctext">{item.text}</span>
@@ -602,8 +632,8 @@
     aria-multiline="true"
     spellcheck="false"
     data-empty="1"
-    data-placeholder="发送消息…"
-    aria-label="消息内容"
+    data-placeholder={t("发送消息…")}
+    aria-label={t("消息内容")}
     bind:this={inputEl}
     oninput={() => void onInput()}
     oncompositionstart={() => onComposition(true)}
@@ -619,13 +649,13 @@
   <button
     class="cbtn cplus"
     type="button"
-    aria-label="发送文件、图片或应用"
-    title="选图片（落进输入区）、选文件（当场推送）或发送一个应用"
+    aria-label={t("发送文件、图片或应用")}
+    title={t("选图片（落进输入区）、选文件（当场推送）或发送一个应用")}
     onclick={() => store.openSheet({ kind: "attach" })}
   >
     <Icon name="plus" />
   </button>
-  <button class="cbtn csend" type="submit" aria-label="发送消息" disabled={!canSend}>
+  <button class="cbtn csend" type="submit" aria-label={t("发送消息")} disabled={!canSend}>
     <Icon name="send" />
   </button>
 </form>
