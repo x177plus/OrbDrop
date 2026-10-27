@@ -11,8 +11,8 @@
  *   node scripts/macos-artifact.mjs --no-build     # 用现有产物重新打包
  *
  * 产物：
- *   `assets/<tag>/orbdrop-macos-universal.app.zip`（自更新用）
- *   `assets/<tag>/OrbDrop_<版本>_universal.dmg`（直接安装用）
+ *   `assets/<tag>/OrbDrop_<版本>_macos_universal.app.zip`（自更新用）
+ *   `assets/<tag>/OrbDrop_<版本>_macos_universal.dmg`（直接安装用）
  *
  * 为什么 `.dmg` 不交给 `tauri build` 的 dmg bundler：它在 SSH / 无 Finder 会话的机器上
  * 会调 AppleScript 摆窗口，直接失败（本机实测）。这里用 `hdiutil` 做标准 DMG：应用 +
@@ -25,6 +25,7 @@ import process from "node:process";
 
 import {
   ROOT,
+  assetNames,
   die,
   humanSize,
   ok,
@@ -52,6 +53,7 @@ if (process.platform !== "darwin") {
 
 const version = tauriVersion();
 const tag = `v${version}`;
+const NAMES = assetNames(version);
 const app = path.join(
   ROOT,
   "src-tauri",
@@ -63,7 +65,7 @@ const app = path.join(
   "OrbDrop.app",
 );
 const outDir = path.join(ROOT, "assets", tag);
-const zip = path.join(outDir, "orbdrop-macos-universal.app.zip");
+const zip = path.join(outDir, NAMES.macos);
 
 if (!noBuild) {
   step(`构建 macOS 通用包（${app}）`);
@@ -114,7 +116,7 @@ ok(`zip sha256：${sha}`);
 
 // DMG：应用 + /Applications 链接，hdiutil 不需要 Finder/AppleScript。
 step("生成 DMG（hdiutil）");
-const dmg = path.join(outDir, `OrbDrop_${version}_universal.dmg`);
+const dmg = path.join(outDir, NAMES.macosDmg);
 const dmgRoot = fs.mkdtempSync(path.join(os.tmpdir(), "orbdrop-dmg-"));
 try {
   fs.rmSync(dmg, { force: true });

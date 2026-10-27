@@ -187,21 +187,36 @@ export function loadConfig() {
   return cfg;
 }
 
-/** 三个产物的最终发布文件名（也是 Release 附件名、也是清单 mirrors 里 URL 的末段，必须一致）。 */
-export const ASSET_NAMES = {
-  exe: "orbdrop.exe",
-  macos: "orbdrop-macos-universal.app.zip",
-  universal: "app-universal-release.apk",
-  arm64: "app-arm64-release.apk",
-  manifest: "update.json",
-};
+/**
+ * Release 附件命名，全仓统一：`OrbDrop_<版本>_<平台>_<架构>.<扩展名>`。
+ *
+ * 为什么版本号进文件名：用户从 Release 页面下载后，文件躺在下载目录里也能一眼看出是哪一版、
+ * 哪个平台；不再出现 `orbdrop.exe` / `app-arm64-release.apk` / `OrbDrop_0.1.1_universal.dmg`
+ * 这种大小写、平台词都不统一的混搭。平台与架构固定用小写词，产品名固定 `OrbDrop`。
+ *
+ * manifest 是客户端契约，固定 `update.json`，不跟版本走；它由 `ASSET_NAMES.manifest` 单独给出。
+ * 更新器的本地临时文件名是硬编码的（不认附件名），所以改附件名只影响清单里的 URL 与 Release 列表。
+ */
+export function assetNames(version) {
+  return {
+    exe: `OrbDrop_${version}_windows_x64.exe`,
+    universal: `OrbDrop_${version}_android_universal.apk`,
+    arm64: `OrbDrop_${version}_android_arm64.apk`,
+    macos: `OrbDrop_${version}_macos_universal.app.zip`,
+    macosDmg: `OrbDrop_${version}_macos_universal.dmg`,
+  };
+}
+
+/** 清单文件名（唯一不随版本变的附件）。 */
+export const ASSET_NAMES = { manifest: "update.json" };
 
 export const tagOf = (cfg, version) => `${cfg.tagPrefix}${version}`;
 
 /**
  * 清单里的 mirrors：**GitHub 在前、Gitee 在后**（客户端先试 GitHub，超时/太慢再切 Gitee）。
  * 本机演练时换成镜像台地址：`/gh/**` 与 `/gitee/**` 分别映射到仓库根目录，所以
- * `assets/v{ver}/orbdrop.exe` 在这里就是 `<base>/gh/assets/v{ver}/orbdrop.exe`。
+ * `assets/v{ver}/OrbDrop_<ver>_windows_x64.exe` 在这里就是
+ * `<base>/gh/assets/v{ver}/OrbDrop_<ver>_windows_x64.exe`。
  */
 export function mirrorsFor(cfg, version, file, { local = false } = {}) {
   const tag = tagOf(cfg, version);
