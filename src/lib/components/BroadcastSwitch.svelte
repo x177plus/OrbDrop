@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '$lib/i18n.svelte';
+
   let {
     shareId,
     enabled,
@@ -15,7 +17,7 @@
   }
 </script>
 
-<label class="switch" title={enabled ? '广播中' : '未广播'}>
+<label class="switch" title={enabled ? t('广播中') : t('未广播')}>
   <input type="checkbox" checked={enabled} onchange={toggle} />
   <span class="track"></span>
 </label>

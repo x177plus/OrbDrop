@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '$lib/i18n.svelte';
+
   /**
    * 会话里文件气泡右端那颗**大图标 + 圆环**（桌面与安卓共用）。
    *
@@ -35,10 +37,10 @@
   const paused = $derived(mode === 'receive' && status === 'paused');
   const label = $derived(
     mode === 'send'
-      ? `停止发送「${name}」`
+      ? t('停止发送「{name}」', { name })
       : paused
-        ? `继续接收「${name}」`
-        : `暂停接收「${name}」`,
+        ? t('继续接收「{name}」', { name })
+        : t('暂停接收「{name}」', { name }),
   );
 
   function activate(e: MouseEvent): void {

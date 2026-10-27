@@ -1306,6 +1306,34 @@ input { font: inherit; }
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field > label { font-size: var(--fs-xs); color: var(--muted); }
 .input { width: 100%; height: 36px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--fg); font-size: var(--fs-sm); }
+/* 界面语言下拉框（`LanguageSelect.svelte`）：收起时是与 `.input` 同高同圆角的按钮，
+   展开时是应用自己的圆角菜单 —— 不用原生 `<select>`，它的选项弹层由系统画、样式收不住，
+   而且 UA 外观会给文字再塞一圈内部缩进。左内边距 12px 与设备名称 / 下载目录输入框一致。 */
+.lang-select { position: relative; width: 100%; }
+.lang-trigger {
+  width: 100%; height: 36px; display: flex; align-items: center;
+  padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); color: var(--fg); font-size: var(--fs-sm); text-align: left;
+  cursor: pointer; transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.lang-trigger:hover { border-color: rgba(14, 18, 23, 0.22); }
+.lang-trigger:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-soft); border-color: var(--accent); }
+.lang-select.open .lang-trigger { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.lang-caret { flex: none; width: 14px; height: 14px; margin-left: auto; color: var(--muted); transition: transform 0.15s ease, color 0.15s ease; }
+.lang-select.open .lang-caret { transform: rotate(180deg); color: var(--accent); }
+.lang-menu {
+  position: absolute; left: 0; right: 0; top: calc(100% + 6px); z-index: 40;
+  display: flex; flex-direction: column; gap: 2px; padding: 5px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: var(--shadow-bubble);
+}
+.lang-option {
+  display: flex; align-items: center; width: 100%; height: 32px; padding: 0 9px;
+  border-radius: 7px; color: var(--fg); font-size: var(--fs-sm); text-align: left; cursor: pointer;
+}
+.lang-option:hover, .lang-option:focus-visible { background: var(--fg-soft); outline: none; }
+.lang-option.active { color: var(--accent-deep); background: var(--accent-soft); }
+.lang-check { flex: none; width: 14px; height: 14px; margin-left: auto; }
 /* 焦点环用 `box-shadow` 画、不用 `outline`：macOS 的 WKWebView（Safari 26 及以前）把非 `auto`
    样式的 outline 画成**直角方框**，不跟 `border-radius`（WebKit #20807/#231433；radii 直到
    Safari 27 才修，见 #174328839）。`.input` / `.chat-input` / `.dev-search` 都是圆角，`outline`
@@ -1934,6 +1962,7 @@ input { font: inherit; }
 /* 富输入区（`.cx`）：里面除了文字还可能有图，所以高度自适应（`min-height` 与老的单行输入等高，
    长到 5 行左右就不再长，改成自己滚）。`pre-wrap` 让文本里那个换行（Shift+回车）真的换行。 */
 .chat-input.cx {
+  position: relative; /* 占位文案（下面的 `::before`）以输入框自己为定位基准 */
   height: auto;
   min-height: 32px;
   max-height: 104px;
@@ -1944,8 +1973,19 @@ input { font: inherit; }
   line-height: 1.5;
 }
 /* 空的时候写占位文案：`:empty` 只认"一个子节点都没有"，而被编辑过的框里往往留着一个空文本节点
-   （甚至一个 `<br>`），所以真正的判据是组件挂的那个 `data-empty`。 */
-.chat-input.cx[data-empty="1"]::before { content: attr(data-placeholder); color: var(--muted); pointer-events: none; }
+   （甚至一个 `<br>`），所以真正的判据是组件挂的那个 `data-empty`。
+   占位文案必须**脱离行内流**（`position: absolute`）：空框被编辑过之后往往只剩一个 `<br>`，
+   光标锚在它前面；`::before` 若仍在流里就是那一行的第一个盒子，光标于是被画在占位文案
+   **右边**（首次聚焦时框里一个子节点都没有，光标不受它影响，才看着在最左）。
+   定位值 = 上面的 `padding`，`line-height` 继承，所以文案与光标的位置和原来看不出差别。 */
+.chat-input.cx[data-empty="1"]::before {
+  content: attr(data-placeholder);
+  position: absolute;
+  top: 6px;
+  left: 12px;
+  color: var(--muted);
+  pointer-events: none;
+}
 /* 框里那张图：既要是"能看见的一张小图"，又要是**一个原子**（一次退格删掉一整张、光标跳得过去）
    —— 原子性由 `contenteditable="false"` 给（见 `lib/composer.ts`），这里只管长相。 */
 .cx-img { display: inline-block; vertical-align: middle; max-width: 96px; max-height: 72px; margin: 2px 3px; border-radius: 6px; border: 1px solid var(--border); object-fit: contain; background: var(--fg-soft); }

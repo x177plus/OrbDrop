@@ -3,6 +3,7 @@ import { formatFileSize } from '$lib/types';
 import { hasContent, revokeSegs, type ComposerSeg } from '$lib/composer';
 import type { ChatDelivery, ChatFileMsg, ChatGroup, ChatGroupMsg, ChatSnapshot, ChatMessage, ChatPeerConvo, ConvoMode, LocalPick, PendingGroup, PushBatch, PushInvite, PushTargetState } from '$lib/types';
 import * as api from '$lib/api';
+import { t } from '$lib/i18n.svelte';
 import { getDevices, deviceById, deviceState, threadDotState, threadTrusted, peerShortName, type DeviceDotState } from './devices.svelte';
 
 /**
@@ -153,7 +154,7 @@ export interface ConvoThread {
 }
 
 function titleOf(mode: ConvoMode, name: string, participants: string[]): string {
-  if (mode === 'broadcast') return `群发 · ${name.trim() || '未命名群发'}`;
+  if (mode === 'broadcast') return t('群发 · {name}', { name: name.trim() || t('未命名群发') });
   return deviceNameOf(participants[0] ?? '');
 }
 
@@ -167,8 +168,8 @@ function titleOf(mode: ConvoMode, name: string, participants: string[]): string 
  * 就是这么写的，那不是本机多出来的错）。
  */
 function groupTitle(g: ChatGroup): string {
-  if (g.name.trim()) return `群聊 · ${g.name.trim()}`;
-  return g.members.map((m) => peerShortName(m.id, m.name.trim() || m.id)).join('、') || '群聊';
+  if (g.name.trim()) return t('群聊 · {name}', { name: g.name.trim() });
+  return g.members.map((m) => peerShortName(m.id, m.name.trim() || m.id)).join(t('、')) || t('群聊');
 }
 
 /** 本机已知的那个群（找不到 = `undefined`：退出了、或这条键本来就过期了）。 */
@@ -387,10 +388,10 @@ function lastOf(peerId: string): ChatItem | null {
 /** 最近一条的摘要（原型 `convoSummarize`）：自己发的加「你：」，文件写 `[文件] 名字`。 */
 function summaryOf(peerId: string): string {
   const last = lastOf(peerId);
-  if (!last) return '还没有消息';
+  if (!last) return t('还没有消息');
   const body =
-    last.kind === 'file' ? `[文件] ${last.name}` : last.image ? '[图片]' : last.text;
-  return (last.fromMe ? '你：' : '') + body;
+    last.kind === 'file' ? t('[文件] {name}', { name: last.name }) : last.image ? t('[图片]') : last.text;
+  return last.fromMe ? t('你：{body}', { body }) : body;
 }
 
 /** 最近一条的时刻（会话列表右端那颗时间）。 */
@@ -402,10 +403,12 @@ function timeOf(peerId: string): string {
 /** 群发那行的预览：先说送到了几台，再说内容（原型 `convoSummarize` 的群发那一档）。 */
 function threadSummary(items: ChatItem[]): string {
   const last = items.length ? items[items.length - 1] : null;
-  if (!last) return '还没有消息';
+  if (!last) return t('还没有消息');
   const r = receiptOf(last);
-  const body = last.kind === 'file' ? `[文件] ${last.name}` : last.image ? '[图片]' : last.text;
-  return (r ? `已送达 ${r.delivered}/${r.total} 台 · ` : '') + body;
+  const body = last.kind === 'file' ? t('[文件] {name}', { name: last.name }) : last.image ? t('[图片]') : last.text;
+  return r
+    ? t('已送达 {delivered}/{total} 台 · {body}', { delivered: r.delivered, total: r.total, body })
+    : body;
 }
 
 /**
@@ -495,42 +498,42 @@ export function convoRows(): ConvoRow[] {
     });
   }
   for (const b of snapshot.batches) {
-    const t = threadOf(batchKey(b.id));
-    if (!t) continue;
+    const thread = threadOf(batchKey(b.id));
+    if (!thread) continue;
     const items = threadItems(b.id);
     const last = items.length ? items[items.length - 1] : null;
     rows.push({
-      key: t.key,
+      key: thread.key,
       mode: 'broadcast',
       at: last?.at ?? 0,
-      label: t.title,
+      label: thread.title,
       sub: threadSummary(items),
       time: last ? clock(last.at) : '',
       unread: 0, // 群发那条只放"我发出去的"：未读在各自的 1:1 里
-      dot: threadDotState(t.participants),
-      trusted: threadTrusted(t.participants),
+      dot: threadDotState(thread.participants),
+      trusted: threadTrusted(thread.participants),
       initial: '',
     });
   }
   for (const g of snapshot.groups) {
     const key = groupKey(g.id);
-    const t = threadOf(key);
-    if (!t) continue;
+    const thread = threadOf(key);
+    if (!thread) continue;
     // 预览取这条视图的**时间线**（群消息 + 本机发到群里的文件），不是光看 `g.messages`：
     // 群里刚传完一个文件时，列表里的"最近一条"就是那条文件。写法与一对一同款。
     const items = itemsOf(key);
     const last = items.length ? items[items.length - 1] : null;
-    const body = !last ? '还没有消息' : last.kind === 'file' ? `[文件] ${last.name}` : last.text;
+    const body = !last ? t('还没有消息') : last.kind === 'file' ? t('[文件] {name}', { name: last.name }) : last.text;
     rows.push({
       key,
       mode: 'group',
       at: last?.at ?? 0,
-      label: t.title,
-      sub: (last?.fromMe ? '你：' : '') + body,
+      label: thread.title,
+      sub: last?.fromMe ? t('你：{body}', { body }) : body,
       time: last ? clock(last.at) : '',
       unread: g.unread,
-      dot: threadDotState(t.participants),
-      trusted: threadTrusted(t.participants),
+      dot: threadDotState(thread.participants),
+      trusted: threadTrusted(thread.participants),
       initial: '',
     });
   }
@@ -552,20 +555,20 @@ export interface PerDevice {
 }
 
 function stateOfDelivery(d: ChatDelivery): { state: PerDeviceState; label: string } {
-  if (d === 'read') return { state: 'ok', label: '已读' };
-  if (d === 'sent') return { state: 'ok', label: '已送达' };
+  if (d === 'read') return { state: 'ok', label: t('已读') };
+  if (d === 'sent') return { state: 'ok', label: t('已送达') };
   // 对方从**别的成员**那里补到了这条（补拉 / 跨段转发）：内容与直投同一份，路径不同 ——
   // 归"到位"那一档（与 `sent`/`read` 同档），但文案要说清它是**绕路到的**，别冒充直投。
-  if (d === 'synced') return { state: 'ok', label: '已同步' };
-  if (d === 'sending') return { state: 'pending', label: '发送中' };
+  if (d === 'synced') return { state: 'ok', label: t('已同步') };
+  if (d === 'sending') return { state: 'pending', label: t('发送中') };
   // 排队等对端上线：**不是"没成"**（它一上线就会发出去），所以不能落进 `off` 那一档
   // （那档在界面上读作"未送达"）。
-  if (d === 'queued') return { state: 'waiting', label: '等待发送' };
-  return { state: 'off', label: d === 'failed' ? '未送达' : '已收到' };
+  if (d === 'queued') return { state: 'waiting', label: t('等待发送') };
+  return { state: 'off', label: d === 'failed' ? t('未送达') : t('已收到') };
 }
 
 function stateOfPush(s: PushTargetState): { state: PerDeviceState; label: string } {
-  if (s === 'done') return { state: 'ok', label: '已送达' };
+  if (s === 'done') return { state: 'ok', label: t('已送达') };
   if (s === 'invited' || s === 'sending') return { state: 'pending', label: pushStateLabel(s) };
   return { state: 'off', label: pushStateLabel(s) };
 }
@@ -610,7 +613,7 @@ export function groupReceiptText(item: ChatItem, declined: readonly string[] = [
   if (!item.fromMe || item.kind !== 'text' || 'targets' in item) return '';
   const states = Object.entries(item.delivery);
   if (!states.length) return '';
-  const parts = [`已读 ${item.readCount}/${states.length}`];
+  const parts = [t('已读 {read}/{total}', { read: item.readCount, total: states.length })];
   const waiting = states.filter(([, s]) => s === 'queued').length;
   const sending = states.filter(([, s]) => s === 'sending').length;
   const failedIds = states.filter(([, s]) => s === 'failed').map(([peerId]) => peerId);
@@ -619,11 +622,11 @@ export function groupReceiptText(item: ChatItem, declined: readonly string[] = [
   // 从别的成员那里补到的那些：也是到了，但走的不是本机这一跳 —— 单说一句，别混进"已读"
   // （它只是拿到了，不等于读过；后端也是等它真读了才把 `readCount` 加上去）。
   const synced = states.filter(([, s]) => s === 'synced').length;
-  if (waiting) parts.push(`${waiting} 台等待发送`);
-  if (sending) parts.push(`${sending} 台发送中`);
-  if (synced) parts.push(`${synced} 台已同步（经其他成员补到）`);
-  if (refused) parts.push(`${refused} 台已拒绝加入`);
-  if (failed) parts.push(`${failed} 台未送达`);
+  if (waiting) parts.push(t('{n} 台等待发送', { n: waiting }));
+  if (sending) parts.push(t('{n} 台发送中', { n: sending }));
+  if (synced) parts.push(t('{n} 台已同步（经其他成员补到）', { n: synced }));
+  if (refused) parts.push(t('{n} 台已拒绝加入', { n: refused }));
+  if (failed) parts.push(t('{n} 台未送达', { n: failed }));
   return parts.join(' · ');
 }
 
@@ -671,12 +674,12 @@ export function receiptOf(item: ChatItem): Receipt | null {
 
 /** 推送那边的一台状态 → 逐台那行小字（文件没有"已读"，用的是推送自己那套状态）。 */
 function pushStateLabel(state: PushTargetState): string {
-  if (state === 'done') return '已送达';
-  if (state === 'failed') return '未送达';
-  if (state === 'rejected') return '已拒绝';
-  if (state === 'cancelled') return '已取消';
-  if (state === 'sending') return '传输中';
-  return '等待同意';
+  if (state === 'done') return t('已送达');
+  if (state === 'failed') return t('未送达');
+  if (state === 'rejected') return t('已拒绝');
+  if (state === 'cancelled') return t('已取消');
+  if (state === 'sending') return t('传输中');
+  return t('等待同意');
 }
 
 /** `HH:MM`（会话列表行用：列表只关心"最近一条是什么时候"，日期在记录里给）。 */
@@ -697,12 +700,14 @@ export function stamp(at: number): string {
   const d = new Date(at);
   const now = new Date();
   const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-  if (d.toDateString() === now.toDateString()) return `今天 ${hm}`;
+  if (d.toDateString() === now.toDateString()) return t('今天 {time}', { time: hm });
   const yesterday = new Date(now);
   yesterday.setDate(now.getDate() - 1);
-  if (d.toDateString() === yesterday.toDateString()) return `昨天 ${hm}`;
-  const md = `${d.getMonth() + 1}月${d.getDate()}日`;
-  return d.getFullYear() === now.getFullYear() ? `${md} ${hm}` : `${d.getFullYear()}年${md} ${hm}`;
+  if (d.toDateString() === yesterday.toDateString()) return t('昨天 {time}', { time: hm });
+  const md = t('{month}月{day}日', { month: d.getMonth() + 1, day: d.getDate() });
+  return d.getFullYear() === now.getFullYear()
+    ? t('{date} {time}', { date: md, time: hm })
+    : t('{year}年{date} {time}', { year: d.getFullYear(), date: md, time: hm });
 }
 
 /**
@@ -804,40 +809,42 @@ export function fileStatusText(f: ChatFileMsg, peerId = ''): string {
       const label = pushStateLabel(target.state);
       // 进度环已经画了百分比，左边这行再给个数 —— 不看环也能读出走到哪了。
       return target.state === 'sending'
-        ? `${label} ${Math.min(100, Math.max(0, Math.round(f.pct)))}%`
+        ? t('传输中 {pct}%', { pct: Math.min(100, Math.max(0, Math.round(f.pct))) })
         : label;
     }
-    if (f.sending) return `传输中 ${Math.min(100, Math.max(0, Math.round(f.pct)))}%`;
+    if (f.sending) return t('传输中 {pct}%', { pct: Math.min(100, Math.max(0, Math.round(f.pct))) });
     if (f.targets === 0) return '';
     const targets = f.perTargets;
     if (!targets.length) {
-      if (f.targets - f.failed <= 0) return '未送达';
-      const done = `已发送至 ${f.targets - f.failed} 台`;
-      return f.failed > 0 ? `${done} · ${f.failed} 台未送达` : done;
+      if (f.targets - f.failed <= 0) return t('未送达');
+      const done = t('已发送至 {n} 台', { n: f.targets - f.failed });
+      return f.failed > 0
+        ? t('已发送至 {sent} 台 · {failed} 台未送达', { sent: f.targets - f.failed, failed: f.failed })
+        : done;
     }
     const count = (state: PushTargetState) => targets.filter((t) => t.state === state).length;
     const done = count('done');
     const cancelled = count('cancelled');
     const rejected = count('rejected');
     const failed = count('failed');
-    if (cancelled === f.targets) return '已取消';
-    if (done === 0 && failed === f.targets) return '未送达';
-    if (done === 0 && rejected === f.targets) return '已拒绝';
+    if (cancelled === f.targets) return t('已取消');
+    if (done === 0 && failed === f.targets) return t('未送达');
+    if (done === 0 && rejected === f.targets) return t('已拒绝');
     const parts: string[] = [];
-    if (done) parts.push(`已发送至 ${done} 台`);
-    if (cancelled) parts.push(`${cancelled} 台已取消`);
-    if (rejected) parts.push(`${rejected} 台已拒绝`);
-    if (failed) parts.push(`${failed} 台未送达`);
+    if (done) parts.push(t('已发送至 {n} 台', { n: done }));
+    if (cancelled) parts.push(t('{n} 台已取消', { n: cancelled }));
+    if (rejected) parts.push(t('{n} 台已拒绝', { n: rejected }));
+    if (failed) parts.push(t('{n} 台未送达', { n: failed }));
     return parts.join(' · ');
   }
-  if (f.inviteState === 'received') return '已接收 · 已保存到下载目录';
-  if (f.inviteState === 'rejected') return '已拒绝接收';
-  if (f.inviteState === 'cancelled') return '已停止接收';
-  if (f.inviteState === 'failed') return '接收失败';
+  if (f.inviteState === 'received') return t('已接收 · 已保存到下载目录');
+  if (f.inviteState === 'rejected') return t('已拒绝接收');
+  if (f.inviteState === 'cancelled') return t('已停止接收');
+  if (f.inviteState === 'failed') return t('接收失败');
   // 接收中：百分比写在状态文字里（右侧圆环同一份进度）；暂停也是一句话，别让环成唯一的信号。
   if (f.inviteState === 'accepted') {
     const pct = Math.min(100, Math.max(0, Math.round(f.pct)));
-    return invitePaused(f.inviteId) ? `已暂停 · ${pct}%` : `接收中 ${pct}%`;
+    return invitePaused(f.inviteId) ? t('已暂停 · {pct}%', { pct }) : t('接收中 {pct}%', { pct });
   }
   return '';
 }
@@ -1311,8 +1318,8 @@ export interface ComposerSendResult {
  *    点一次「接收」。
  */
 export async function sendComposer(key: string): Promise<ComposerSendResult | null> {
-  const t = threadOf(key);
-  if (!t) return null;
+  const thread = threadOf(key);
+  if (!thread) return null;
   const segs = draftSegsOf(key);
   if (!hasContent(segs)) return null;
 
@@ -1324,8 +1331,8 @@ export async function sendComposer(key: string): Promise<ComposerSendResult | nu
 
   // 这条会话该发给谁（与 App.svelte 的 `convoSendTargets` 同一套：名册里那些已经不在本机
   // 设备表里的成员寻不到址），以及这份记录挂在哪份群发名单上。
-  const peers = getDevices().filter((d) => t.participants.includes(d.id)).map((d) => d.id);
-  const chatBatchId = t.mode === 'broadcast' ? t.id : '';
+  const peers = getDevices().filter((d) => thread.participants.includes(d.id)).map((d) => d.id);
+  const chatBatchId = thread.mode === 'broadcast' ? thread.id : '';
 
   const failedSegs: ComposerSeg[] = [];
   const result: ComposerSendResult = {
@@ -1339,9 +1346,9 @@ export async function sendComposer(key: string): Promise<ComposerSendResult | nu
   for (const seg of segs) {
     // 图片那一段要按设备寻址（一对一 / 群发），一台都找不到就把这张留在草稿里等下一次。
     // **群聊不算这一档**：群里发图按名册寻址（成员不必在本机设备表里）。
-    if (seg.kind === 'image' && t.mode !== 'group' && !peers.length) {
+    if (seg.kind === 'image' && thread.mode !== 'group' && !peers.length) {
       result.failed += 1;
-      result.error ??= '这条会话里没有能送达的设备';
+      result.error ??= t('这条会话里没有能送达的设备');
       failedSegs.push(seg);
       continue;
     }
@@ -1359,9 +1366,9 @@ export async function sendComposer(key: string): Promise<ComposerSendResult | nu
       }
       // 图片那一段：这里是"路径 + 名字"两条信息，后端把字节读进来、落成会话内容再发出去。
       const at = nextStamp();
-      if (t.mode === 'group') {
+      if (thread.mode === 'group') {
         // 群聊：与一对一同一套（图片走会话协议，对端直接就能看）。
-        const res = await api.groupSendImage(t.id, seg.path, seg.name, at);
+        const res = await api.groupSendImage(thread.id, seg.path, seg.name, at);
         replace(res.snapshot);
       } else {
         // 图片走**会话协议**（`chat_send_image`）：对端直接就能看，没有同意那一步。
@@ -1484,7 +1491,7 @@ export function noteOutgoingFiles(peerIds: string[], items: LocalPick[], push: P
       name: it.name,
       isDir: it.isDir,
       peerId: '',
-      size: it.isDir ? '文件夹' : formatFileSize(it.size),
+      size: it.isDir ? t('文件夹') : formatFileSize(it.size),
       targets: live.length,
       failed: 0,
       pct: 0,
@@ -1548,7 +1555,7 @@ export function noteInboundInvite(inv: PushInvite) {
     name: inv.name,
     isDir: inv.isDir,
     peerId,
-    size: inv.size > 0 ? formatFileSize(inv.size) : '文件夹',
+    size: inv.size > 0 ? formatFileSize(inv.size) : t('文件夹'),
     targets: 0,
     failed: 0,
     pct: 0,

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { loadAppIcon, peekAppIcon } from "../appIcons";
+  import { t } from "$lib/i18n.svelte";
 
   /**
    * 应用表里那一行的图标（F-119）：**取到之前显示首字母**。
@@ -34,7 +35,7 @@
   });
 
   /** 标签是别的应用给的字符串，空标签（只有包名的裸包）退成「应」。 */
-  const initial = $derived(label.trim().charAt(0) || pkg.charAt(0) || "应");
+  const initial = $derived(label.trim().charAt(0) || pkg.charAt(0) || t("应"));
 </script>
 
 {#if url}

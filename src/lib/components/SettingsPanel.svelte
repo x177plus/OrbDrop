@@ -1,8 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { open as openDialog } from '@tauri-apps/plugin-dialog';
-  import { wipeCredentials, relayTraffic } from '$lib/api';
+  import { wipeCredentials, relayTraffic, setLanguage } from '$lib/api';
+  import { t, setLanguagePreference, adoptLanguagePreference, normalizePreference, type Locale } from '$lib/i18n.svelte';
   import Hint from '$lib/components/Hint.svelte';
+  import LanguageSelect from '$lib/components/LanguageSelect.svelte';
+  import UpdateNotes from '$lib/components/UpdateNotes.svelte';
   import Logo from '$lib/components/Logo.svelte';
   import { getSettings, loadSettings, updateSettings } from '$lib/stores/settings.svelte';
   import { fileManagerLabel, isMac } from '$lib/stores/platform.svelte';
@@ -18,37 +21,37 @@
    * 真实设备相关；项数由组件按 `items.length` 自己算，角标数字由 `notifCount` / `deviceCount` 给。
    * 三页是因为**只有一页时分页点整列不画**：要看全分页点，缩略图就得有得翻。
    */
-  const PREVIEW_PAGES: RectPage[] = [
+  const PREVIEW_PAGES: RectPage[] = $derived([
     {
-      id: 'local', kind: 'local', name: '本机', ip: '192.168.1.23:3890',
+      id: 'local', kind: 'local', name: t('本机'), ip: '192.168.1.23:3890',
       loading: false, error: null, dir: null, up: null,
       // 目录在前、文件在后：两种图标（文件夹 / 文件）与两档元信息（「N 项」/ 大小）都能看到
       items: [
-        { id: 'preview-1-a', path: '', name: '项目资料', isDir: true, meta: '18 项' },
-        { id: 'preview-1-b', path: '', name: '设计素材', isDir: true, meta: '7 项' },
-        { id: 'preview-1-c', path: '', name: '报告.pdf', isDir: false, meta: '2.4 MB' },
-        { id: 'preview-1-d', path: '', name: '截图', isDir: true, meta: '32 项' },
-        { id: 'preview-1-e', path: '', name: '安装包.exe', isDir: false, meta: '86 MB' },
+        { id: 'preview-1-a', path: '', name: t('项目资料'), isDir: true, meta: t('{n} 项', { n: 18 }) },
+        { id: 'preview-1-b', path: '', name: t('设计素材'), isDir: true, meta: t('{n} 项', { n: 7 }) },
+        { id: 'preview-1-c', path: '', name: t('报告.pdf'), isDir: false, meta: '2.4 MB' },
+        { id: 'preview-1-d', path: '', name: t('截图'), isDir: true, meta: t('{n} 项', { n: 32 }) },
+        { id: 'preview-1-e', path: '', name: t('安装包.exe'), isDir: false, meta: '86 MB' },
       ],
     },
     {
-      id: 'preview-2', kind: 'peer', name: '书房·台式机', ip: '192.168.1.42:3890',
+      id: 'preview-2', kind: 'peer', name: t('书房·台式机'), ip: '192.168.1.42:3890',
       loading: false, error: null, dir: null, up: null,
       items: [
-        { id: 'preview-2-a', path: '', name: '资料', isDir: true, meta: '12 项' },
-        { id: 'preview-2-b', path: '', name: '合同.docx', isDir: false, meta: '96 KB' },
-        { id: 'preview-2-c', path: '', name: '备份.zip', isDir: false, meta: '640 MB' },
+        { id: 'preview-2-a', path: '', name: t('资料'), isDir: true, meta: t('{n} 项', { n: 12 }) },
+        { id: 'preview-2-b', path: '', name: t('合同.docx'), isDir: false, meta: '96 KB' },
+        { id: 'preview-2-c', path: '', name: t('备份.zip'), isDir: false, meta: '640 MB' },
       ],
     },
     {
       id: 'preview-3', kind: 'peer', name: 'NAS', ip: '192.168.1.9:3890',
       loading: false, error: null, dir: null, up: null,
       items: [
-        { id: 'preview-3-a', path: '', name: '影音库', isDir: true, meta: '240 项' },
-        { id: 'preview-3-b', path: '', name: '照片', isDir: true, meta: '1 280 项' },
+        { id: 'preview-3-a', path: '', name: t('影音库'), isDir: true, meta: t('{n} 项', { n: 240 }) },
+        { id: 'preview-3-b', path: '', name: t('照片'), isDir: true, meta: t('{n} 项', { n: 1280 }) },
       ],
     },
-  ];
+  ]);
 
   let {
     open = false,
@@ -73,6 +76,8 @@
   let deviceSubdir = $state(true);
   let downloadMode = $state<'Direct' | 'AskEachTime'>('Direct');
   let deviceName = $state('');
+  /** 界面语言（具体语言，没有「跟随系统」）。改它 = 立刻生效并落盘（不等「保存」）。 */
+  let languagePref = $state<Locale>(normalizePreference(null));
   let autoStart = $state(true);
   /**
    * 新添加的目录/文件默认开播（后端 `AppSettings.autoBroadcastNew`，默认关）。
@@ -129,7 +134,7 @@
       await upd.checkUpdate(true);
     } catch (e: any) {
       // 检查失败是**用户主动要求的结果**，必须弹出来（启动那次静默检查失败是不弹的）。
-      onToast(`检查更新失败：${String(e)}`);
+      onToast(t('检查更新失败：{error}', { error: String(e) }));
     } finally {
       checking = false;
     }
@@ -140,7 +145,7 @@
       await upd.installUpdate();
     } catch (e: any) {
       console.error('Update install failed:', e);
-      onToast(`更新失败：${String(e)}`);
+      onToast(t('更新失败：{error}', { error: String(e) }));
     }
   }
 
@@ -149,10 +154,14 @@
     try {
       const n = await wipeCredentials();
       wipeArmed = false;
-      onToast(n > 0 ? `已清空 ${n} 台设备的凭据，需重新配对` : '本机没有配对凭据');
+      onToast(
+        n > 0
+          ? t('已清空 {n} 台设备的凭据，需重新配对', { n })
+          : t('本机没有配对凭据'),
+      );
     } catch (e: any) {
       console.error('Wipe credentials failed:', e);
-      onToast(`清空失败：${String(e)}`);
+      onToast(t('清空失败：{error}', { error: String(e) }));
     } finally {
       wiping = false;
     }
@@ -166,7 +175,7 @@
   async function pickDownloadDir() {
     try {
       const picked = await openDialog({
-        title: '选择下载目录',
+        title: t('选择下载目录'),
         directory: true,
         multiple: false,
         defaultPath: downloadDir || undefined,
@@ -175,7 +184,7 @@
       if (dir) downloadDir = dir;
     } catch (e: any) {
       console.error('Pick directory failed:', e);
-      onToast(`打开目录选择框失败：${String(e)}`);
+      onToast(t('打开目录选择框失败：{error}', { error: String(e) }));
     }
   }
 
@@ -202,6 +211,8 @@
         deviceSubdir = s.deviceSubdir;
         downloadMode = s.downloadMode;
         deviceName = s.deviceName;
+        languagePref = normalizePreference(s.language);
+        adoptLanguagePreference(s.language);
         autoStart = s.autoStart;
         autoBroadcastNew = s.autoBroadcastNew;
         relay = s.allowRelay || s.groupRelay;
@@ -235,6 +246,22 @@
     return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fallback;
   }
 
+  async function changeLanguage(next: Locale): Promise<void> {
+    const previous = languagePref;
+    languagePref = next;
+    // 界面先换（LocalStorage 同步写一份，下一次启动首帧就是对的），再落后端并让托盘跟字。
+    setLanguagePreference(next);
+    try {
+      await setLanguage(next);
+      await loadSettings();
+      onToast(t('界面语言已切换'));
+    } catch (err: any) {
+      languagePref = previous;
+      adoptLanguagePreference(previous);
+      onToast(t('切换语言失败：{error}', { error: String(err) }));
+    }
+  }
+
   async function save() {
     saving = true;
     try {
@@ -244,6 +271,7 @@
         deviceSubdir,
         downloadMode,
         deviceName,
+        language: languagePref,
         autoStart,
         autoBroadcastNew,
         // 一颗开关管两条路：替其它设备盲转字节 + 替群聊转消息（`allowRelay` / `groupRelay`）。
@@ -257,10 +285,10 @@
         orbShape,
       });
       onClose();
-      onToast('设置已保存');
+      onToast(t('设置已保存'));
     } catch (e: any) {
       console.error('Settings save failed:', e);
-      onToast(`保存失败：${String(e)}`);
+      onToast(t('保存失败：{error}', { error: String(e) }));
     } finally {
       saving = false;
     }
@@ -275,6 +303,8 @@
       deviceSubdir = s.deviceSubdir;
       downloadMode = s.downloadMode;
       deviceName = s.deviceName;
+      languagePref = normalizePreference(s.language);
+      adoptLanguagePreference(s.language);
       autoStart = s.autoStart;
       autoBroadcastNew = s.autoBroadcastNew;
       relay = s.allowRelay || s.groupRelay;
@@ -287,12 +317,12 @@
   }
 </script>
 
-<section class="sheet" class:open aria-label="设置">
+<section class="sheet" class:open aria-label={t('设置')}>
   <header class="sheet-head">
     <span class="panel-brand" style="margin-right:auto">
-      <Logo size={20} />设置
+      <Logo size={20} />{t('设置')}
     </span>
-    <button class="icon-btn" onclick={cancel} aria-label="关闭设置">
+    <button class="icon-btn" onclick={cancel} aria-label={t('关闭设置')}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
         <path d="M6 6l12 12M18 6 6 18"/>
       </svg>
@@ -300,34 +330,32 @@
   </header>
   <div class="sheet-body">
     <div class="field">
-      <label for="deviceName">设备名称</label>
+      <label for="language">{t('界面语言')}<Hint>
+        {t('界面正文、托盘菜单与通知栏会立刻切换。首次启动使用系统语言，系统语言不在支持列表里时使用英语。')}
+      </Hint></label>
+      <LanguageSelect id="language" value={languagePref} ariaLabel={t('界面语言')} onChange={changeLanguage} />
+    </div>
+    <div class="field">
+      <label for="deviceName">{t('设备名称')}</label>
       <input class="input" id="deviceName" bind:value={deviceName} />
     </div>
     <div class="field">
-      <label for="downloadDir">下载目录<Hint>
-        手动「下载到本地」和对端「推送」接收都默认存这里（选了「每次询问」时，接收推送那条
-        会先让你挑一个目录，挑的那个就是这次接收的根）；推送默认落在 <strong>发送方名</strong>
-        目录下（可由下面那颗开关关掉），按你选中的那些项各自的名字展开（不会和下载的文件混在一层）。
+      <label for="downloadDir">{t('下载目录')}<Hint>
+        {t('手动「下载到本地」和对端「推送」接收都默认存这里（选了「每次询问」时，接收推送那条会先让你挑一个目录，挑的那个就是这次接收的根）；推送默认落在 发送方名 目录下（可由下面那颗开关关掉），按你选中的那些项各自的名字展开（不会和下载的文件混在一层）。')}
       </Hint></label>
       <div class="path-input">
         <input class="input" id="downloadDir" value={downloadDir} readonly />
-        <button class="btn btn-secondary btn-sm" onclick={pickDownloadDir}>选择</button>
+        <button class="btn btn-secondary btn-sm" onclick={pickDownloadDir}>{t('选择')}</button>
       </div>
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
-      <label>推送按发送方分目录<Hint>
-        <strong>打开（默认）</strong>：对端推来的东西落在 <strong>发送方名</strong> 那一层下面
-        —— <code>下载目录\某某的电脑\…</code>。三件事跟着来：两台设备推同名文件不会互相顶掉；
-        一批东西能按来源整体看、整体清；接收未配对设备的推送时，那颗目录框只授权对方在根里
-        <strong>新建一个自己的目录</strong>，碰不到根里已经有的东西。<br />
-        <strong>关掉</strong>：推送和手动下载的文件落在<strong>同一层</strong>。同名的照旧自动改名
-        <code>xxx (1).ext</code>；代价是别人推来的 <code>D\…</code> 会并进你本来就有的
-        <code>下载目录\D</code>（已配对设备的推送对同名文件是<strong>校验通过后原子替换</strong>），
-        「每次询问」下挑的那个目录也就等于直接让对方往那一层写文件名。
+      <label>{t('推送按发送方分目录')}<Hint>
+        {t('打开（默认）：对端推来的东西落在 发送方名 那一层下面 —— 下载目录\\某某的电脑\\…。三件事跟着来：两台设备推同名文件不会互相顶掉；一批东西能按来源整体看、整体清；接收未配对设备的推送时，那颗目录框只授权对方在根里 新建一个自己的目录，碰不到根里已经有的东西。')}<br />
+        {t('关掉：推送和手动下载的文件落在同一层。同名的照旧自动改名 xxx (1).ext；代价是别人推来的 D\\… 会并进你本来就有的 下载目录\\D（已配对设备的推送对同名文件是校验通过后原子替换），「每次询问」下挑的那个目录也就等于直接让对方往那一层写文件名。')}
       </Hint></label>
       <div style="display:flex; align-items:center; justify-content:space-between;">
-        <span style="font-size:var(--fs-sm); color:var(--muted);">接收推送时放进以发送方命名的子目录</span>
+        <span style="font-size:var(--fs-sm); color:var(--muted);">{t('接收推送时放进以发送方命名的子目录')}</span>
         <label class="switch">
           <input type="checkbox" bind:checked={deviceSubdir} data-device-subdir />
           <span class="track"></span>
@@ -336,52 +364,44 @@
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
-      <label id="dlModeLabel">下载模式</label>
+      <label id="dlModeLabel">{t('下载模式')}</label>
       <div class="radio-group">
         <label class="radio">
           <input type="radio" name="dlMode" bind:group={downloadMode} value="Direct" />
-          <span class="r-label">直接下载<span class="r-sub">收下文件并保存到下载目录（不问）</span></span>
+          <span class="r-label">{t('直接下载')}<span class="r-sub">{t('收下文件并保存到下载目录（不问）')}</span></span>
         </label>
         <label class="radio">
           <input type="radio" name="dlMode" bind:group={downloadMode} value="AskEachTime" />
-          <span class="r-label">每次询问<span class="r-sub">下载、以及接收未配对设备的推送时，都先弹窗选位置</span></span>
+          <span class="r-label">{t('每次询问')}<span class="r-sub">{t('下载、以及接收未配对设备的推送时，都先弹窗选位置')}</span></span>
         </label>
       </div>
     </div>
     <div class="field">
-      <label for="port">服务端口<Hint>被占用时自动 +1 探测，实际端口显示在底部状态栏。</Hint></label>
+      <label for="port">{t('服务端口')}<Hint>{t('被占用时自动 +1 探测，实际端口显示在底部状态栏。')}</Hint></label>
       <input class="input num" id="port" type="number" bind:value={port} />
     </div>
     <div class="field">
-      <label for="transferWorkers">传输并发数<Hint>
-        一次接收同时跑几路传输（一块 / 一个文件算一路）。局域网上 4 就够把千兆喂饱，
-        调到 <strong>8</strong> 以上只会把连接、句柄与磁盘队列都堆起来，反而互相拖。
-        取值 <strong>1–8</strong>，超出范围会在保存时夹住。
+      <label for="transferWorkers">{t('传输并发数')}<Hint>
+        {t('一次接收同时跑几路传输（一块 / 一个文件算一路）。局域网上 4 就够把千兆喂饱，调到 8 以上只会把连接、句柄与磁盘队列都堆起来，反而互相拖。取值 1–8，超出范围会在保存时夹住。')}
       </Hint></label>
       <input class="input num" id="transferWorkers" type="number" min="1" max="8" bind:value={transferWorkers} />
     </div>
     <div class="field">
-      <label for="transferBlockMb">分块大小（MB）<Hint>
-        大文件按它切片、片与片之间并行。<strong>4MB</strong> 在千兆下约 33ms 一块 ——
-        取消 / 失败的可感知延迟就在这个尺度，同时「一块要重传」的代价也不大。
-        取值 <strong>1–32</strong>，超出范围会在保存时夹住；再大就不是并行，而是「一次传半个文件」。
+      <label for="transferBlockMb">{t('分块大小（MB）')}<Hint>
+        {t('大文件按它切片、片与片之间并行。4MB 在千兆下约 33ms 一块 —— 取消 / 失败的可感知延迟就在这个尺度，同时「一块要重传」的代价也不大。取值 1–32，超出范围会在保存时夹住；再大就不是并行，而是「一次传半个文件」。')}
       </Hint></label>
       <input class="input num" id="transferBlockMb" type="number" min="1" max="32" bind:value={transferBlockMb} />
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
-      <label id="orbShapeLabel">悬浮形态<Hint>
-        收起后常驻屏幕上的那件东西长什么样。缩略图就是实物外观（角标、分页点都在），
-        里面的设备名、地址与角标数字是示意数据。<br />
-        <strong>圆球</strong>：62px 的球，贴边会收进屏幕边缘、悬停滑回来。<br />
-        <strong>圆角矩形悬浮框</strong>：一张卡片，第一页是本机、其后每台长连接设备一页，
-        列出各自对本机可见的共享项；贴边会收起成一条竖条（图标 + 设备名 + ip:port），
-        悬停滑回来；直接拖动卡片里的条目可以拖到{fileManagerLabel()}里（与面板里一样），
-        滚轮/点右侧小点换页。
+      <label id="orbShapeLabel">{t('悬浮形态')}<Hint>
+        {t('收起后常驻屏幕上的那件东西长什么样。缩略图就是实物外观（角标、分页点都在），里面的设备名、地址与角标数字是示意数据。')}<br />
+        {t('圆球：62px 的球，贴边会收进屏幕边缘、悬停滑回来。')}<br />
+        {t('圆角矩形悬浮框：一张卡片，第一页是本机、其后每台长连接设备一页，列出各自对本机可见的共享项；贴边会收起成一条竖条（图标 + 设备名 + ip:port），悬停滑回来；直接拖动卡片里的条目可以拖到{target}里（与面板里一样），滚轮/点右侧小点换页。', { target: fileManagerLabel() })}
       </Hint></label>
       <div class="shape-picker" role="radiogroup" aria-labelledby="orbShapeLabel">
-        <label class="shape-opt" title="圆球：贴边收起半颗，悬停滑回来">
-          <input type="radio" name="orbShape" bind:group={orbShape} value="circle" aria-label="圆球" />
+        <label class="shape-opt" title={t('圆球：贴边收起半颗，悬停滑回来')}>
+          <input type="radio" name="orbShape" bind:group={orbShape} value="circle" aria-label={t('圆球')} />
           <!-- 缩略图 = **真组件 + 示例数据**（同一套 CSS/DOM，件件与实物一致），外面套一层
                缩放框（`--s` = 缩放比，`--w`/`--h` = 不含缩放的视觉外框，`--ox`/`--oy` = 组件
                原点在外框里的落点）。
@@ -399,8 +419,8 @@
             </span>
           </span>
         </label>
-        <label class="shape-opt" title="圆角矩形悬浮框：设备分页卡片，贴边收起成竖条，可直接拖出共享项">
-          <input type="radio" name="orbShape" bind:group={orbShape} value="rect" aria-label="圆角矩形悬浮框" />
+        <label class="shape-opt" title={t('圆角矩形悬浮框：设备分页卡片，贴边收起成竖条，可直接拖出共享项')}>
+          <input type="radio" name="orbShape" bind:group={orbShape} value="rect" aria-label={t('圆角矩形悬浮框')} />
           <span class="so-frame" style="--s:0.78; --w:236px; --h:144px; --ox:30px; --oy:5px" inert>
             <span class="so-scale">
               <RectOrb
@@ -421,23 +441,23 @@
       </div>
     </div>
     <div class="field">
-      <label for="bcExePath">BC 可执行文件路径<Hint>
-        用于右键菜单里的「用 BeyondCompare 比较」。{isMac()
-          ? '可以填 .app 包（如 /Applications/Beyond Compare.app），也可以填包内的 bcompare。'
-          : '例如 BCompare.exe 的完整路径。'}
+      <label for="bcExePath">{t('BC 可执行文件路径')}<Hint>
+        {isMac()
+          ? t('用于右键菜单里的「用 BeyondCompare 比较」。可以填 .app 包（如 /Applications/Beyond Compare.app），也可以填包内的 bcompare。')
+          : t('用于右键菜单里的「用 BeyondCompare 比较」。例如 BCompare.exe 的完整路径。')}
       </Hint></label>
       <input
         class="input"
         id="bcExePath"
         bind:value={bcExePath}
-        placeholder={isMac() ? '留空 = 自动探测（.app 也可）' : '留空 = 自动探测'}
+        placeholder={isMac() ? t('留空 = 自动探测（.app 也可）') : t('留空 = 自动探测')}
       />
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
-      <label>开机自启</label>
+      <label>{t('开机自启')}</label>
       <div style="display:flex; align-items:center; justify-content:space-between;">
-        <span style="font-size:var(--fs-sm); color:var(--muted);">登录后自动启动 OrbDrop</span>
+        <span style="font-size:var(--fs-sm); color:var(--muted);">{t('登录后自动启动 OrbDrop')}</span>
         <label class="switch">
           <input type="checkbox" bind:checked={autoStart} data-autostart />
           <span class="track"></span>
@@ -446,14 +466,12 @@
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
-      <label>添加后自动共享<Hint>
-        <strong>打开时</strong>：新添加的目录 / 文件自动打开广播开关，当场就对长连接设备可见
-        （与每一项自己那个开关是同一个东西，加完随时可以单独关掉）。<br />
-        <strong>默认关闭</strong>，只作用于<strong>之后</strong>添加的：已在列表里的共享项开关
-        一个都不动 —— 手动改过的不会被这里翻回来。
+      <label>{t('添加后自动共享')}<Hint>
+        {t('打开时：新添加的目录 / 文件自动打开广播开关，当场就对长连接设备可见（与每一项自己那个开关是同一个东西，加完随时可以单独关掉）。')}<br />
+        {t('默认关闭，只作用于之后添加的：已在列表里的共享项开关一个都不动 —— 手动改过的不会被这里翻回来。')}
       </Hint></label>
       <div style="display:flex; align-items:center; justify-content:space-between;">
-        <span style="font-size:var(--fs-sm); color:var(--muted);">新添加的目录/文件自动开启共享</span>
+        <span style="font-size:var(--fs-sm); color:var(--muted);">{t('新添加的目录/文件自动开启共享')}</span>
         <label class="switch">
           <input type="checkbox" bind:checked={autoBroadcastNew} data-autobroadcast />
           <span class="track"></span>
@@ -462,21 +480,14 @@
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
-      <label>允许中转<Hint>
-        打开后本机替别人做事，两条路都在这**一个**开关里：<br />
-        <strong>① 替其它设备盲转字节</strong>：两台设备在同一张 Wi-Fi 上互相连不上时（有些 AP
-        会把客户端之间的流量隔开），本机连着 A 也连着 B，就替它们搬字节 —— 能直连就直连，
-        数据端到端加密，本机只搬字节、看不到内容。<strong>不限已配对设备</strong>：开着就允许，
-        同网段里能到达本机的任意设备都可以借（强制保留的只有"到对方给的那个地址核实目标身份"
-        这一关，少了它本机就成了给任意局域网地址开隧道的工具）。<br />
-        <strong>② 替群聊中转消息</strong>：群里两个成员互相够不着时（跨网段、只有本机跟它们都
-        连得上），本机替它们把消息转一份，最多 3 跳，同一份转过一次就不再转（不来回绕圈）。<br />
-        <strong>默认打开</strong>：两条路都占本机上行带宽 —— 这笔开销该不该出由你定，
-        首次启动就是开的，不想出这笔开销就关掉；对端之间
-        直连得了时，这个开关开不开都一样。关闭会<strong>立刻收掉</strong>本机正在替别人转的每一条。
+      <label>{t('允许中转')}<Hint>
+        {t('打开后本机替别人做事，两条路都在这一个开关里：')}<br />
+        {t('① 替其它设备盲转字节：两台设备在同一张 Wi-Fi 上互相连不上时（有些 AP 会把客户端之间的流量隔开），本机连着 A 也连着 B，就替它们搬字节 —— 能直连就直连，数据端到端加密，本机只搬字节、看不到内容。不限已配对设备：开着就允许，同网段里能到达本机的任意设备都可以借（强制保留的只有"到对方给的那个地址核实目标身份"这一关，少了它本机就成了给任意局域网地址开隧道的工具）。')}<br />
+        {t('② 替群聊中转消息：群里两个成员互相够不着时（跨网段、只有本机跟它们都连得上），本机替它们把消息转一份，最多 3 跳，同一份转过一次就不再转（不来回绕圈）。')}<br />
+        {t('默认打开：两条路都占本机上行带宽 —— 这笔开销该不该出由你定，首次启动就是开的，不想出这笔开销就关掉；对端之间直连得了时，这个开关开不开都一样。关闭会立刻收掉本机正在替别人转的每一条。')}
       </Hint></label>
       <div style="display:flex; align-items:center; justify-content:space-between;">
-        <span style="font-size:var(--fs-sm); color:var(--muted);">本机替够不着彼此的其它设备搬字节、替够不着的同群成员转消息；会占用本机上行带宽</span>
+        <span style="font-size:var(--fs-sm); color:var(--muted);">{t('本机替够不着彼此的其它设备搬字节、替够不着的同群成员转消息；会占用本机上行带宽')}</span>
         <label class="switch">
           <input type="checkbox" bind:checked={relay} data-relay />
           <span class="track"></span>
@@ -485,51 +496,59 @@
     </div>
     <!-- 中转流量（F-106 / S-09）：替别人搬了多少 —— 只读的累计记录，不随保存写。 -->
     <div class="field">
-      <label>中转流量<Hint>
-        本机替别人中转<strong>累计搬过的数据量</strong>（收发两个方向之和）与连接数 —— 中转方的
-        代价就是上行带宽，这里就是这笔账。<br />
-        只统计<strong>本机当中转方</strong>替别人搬的那部分：替其它设备<strong>盲转的字节</strong>，
-        以及替群聊<strong>转发出去的消息</strong>。本机自己发出去、经别人中转，不在这个数里。<br />
-        连接数只数盲转的连接（消息中转不算一条连接）。它是落了盘的记录（`config.toml` 的
-        `relayBytesTotal` / `relayConnsTotal`），重启接着算。
+      <label>{t('中转流量')}<Hint>
+        {t('本机替别人中转累计搬过的数据量（收发两个方向之和）与连接数 —— 中转方的代价就是上行带宽，这里就是这笔账。')}<br />
+        {t('只统计本机当中转方替别人搬的那部分：替其它设备盲转的字节，以及替群聊转发出去的消息。本机自己发出去、经别人中转，不在这个数里。')}<br />
+        {t('连接数只数盲转的连接（消息中转不算一条连接）。它是落了盘的记录（`config.toml` 的 `relayBytesTotal` / `relayConnsTotal`），重启接着算。')}
       </Hint></label>
       {#if traffic && (traffic.bytes > 0 || traffic.connections > 0)}
         <span style="font-size:var(--fs-sm); color:var(--muted);">
-          累计 {formatFileSize(traffic.bytes)}{traffic.connections > 0 ? ` · ${traffic.connections} 条连接` : ''}
+          {#if traffic.connections > 0}
+            {t('累计 {size} · {n} 条连接', { size: formatFileSize(traffic.bytes), n: traffic.connections })}
+          {:else}
+            {t('累计 {size}', { size: formatFileSize(traffic.bytes) })}
+          {/if}
         </span>
       {:else}
-        <span style="font-size:var(--fs-sm); color:var(--muted);">还没有替别人中转 —— 有设备借本机中转之后才会有</span>
+        <span style="font-size:var(--fs-sm); color:var(--muted);">{t('还没有替别人中转 —— 有设备借本机中转之后才会有')}</span>
       {/if}
     </div>
     <!-- 版本与更新：与上面那些设置项不同，它**不走** `update_settings`、也不参与 `save()` ——
          它是"看 + 点"的一格（与下面「配对凭据」同一个性质），状态由后端推。 -->
     <div class="field">
-      <label>版本与更新<Hint>
-        更新包**先试 GitHub、连不上或太慢（几 KB/s）自动切 Gitee**，两条都是同一个包。<br />
-        装之前会校验 sha256 与开发者签名：签名对不上的一律拒装（发布仓被换包也装不进来）。<br />
-        桌面端是<strong>单文件 exe</strong>：更新时用新版本覆盖当前这个文件并自动重启，更新完
-        依旧只有一个 exe（设置、日志、传输记录都在数据目录里，不受影响）。<br />
-        安卓端下的是 APK，装的时候系统会弹一次确认 —— 非系统应用不能静默安装。
+      <label>{t('版本与更新')}<Hint>
+        {t('更新包先试 GitHub、连不上或太慢（几 KB/s）自动切 Gitee，两条都是同一个包。')}<br />
+        {t('装之前会校验 sha256 与开发者签名：签名对不上的一律拒装（发布仓被换包也装不进来）。')}<br />
+        {t('桌面端是单文件 exe：更新时用新版本覆盖当前这个文件并自动重启，更新完依旧只有一个 exe（设置、日志、传输记录都在数据目录里，不受影响）。')}<br />
+        {t('安卓端下的是 APK，装的时候系统会弹一次确认 —— 非系统应用不能静默安装。')}
       </Hint></label>
       <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-        <span style="font-size:var(--fs-sm); color:var(--muted);">当前 v{update?.current ?? '…'}</span>
+        <span style="font-size:var(--fs-sm); color:var(--muted);">{t('当前 v{version}', { version: update?.current ?? '…' })}</span>
         <button
           class="btn btn-secondary btn-sm"
           onclick={checkUpdateNow}
           disabled={checking || updateBusy}
         >
-          {checking ? '检查中…' : '检查更新'}
+          {checking ? t('检查中…') : t('检查更新')}
         </button>
         {#if update?.phase === 'available'}
           <button class="btn btn-primary btn-sm" onclick={installUpdateNow} disabled={upd.isApplying()}>
-            {upd.isApplying() ? '准备中…' : '立即更新'}
+            {upd.isApplying() ? t('准备中…') : t('立即更新')}
           </button>
         {/if}
       </div>
       {#if update?.phase === 'available'}
         <span style="font-size:var(--fs-sm); color:var(--muted);">
-          有新版 v{update.version}{update.size ? ` · ${formatFileSize(update.size)}` : ''}{update.notes ? ` · ${update.notes}` : ''}
+          {#if update.size}
+            {t('有新版 v{version} · {size}', { version: update.version ?? '', size: formatFileSize(update.size) })}
+          {:else}
+            {t('有新版 v{version}', { version: update.version ?? '' })}
+          {/if}
         </span>
+        <UpdateNotes
+          notes={update.notes}
+          empty={t('下载完会用新版本覆盖当前程序并重启。')}
+        />
       {/if}
       {#if update?.phase === 'downloading' || update?.phase === 'verifying'}
         <div style="height:6px; border-radius:3px; background:var(--fg-soft); overflow:hidden;">
@@ -546,27 +565,26 @@
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
-      <label>配对凭据<Hint>
-        全部设备的 token 存在本机数据目录的一个文件里（仅遮挡、非加密）。这里是唯一的删除入口：
-        清空后所有设备回到「未配对」需重新配对，已写进 Beyond Compare 的 WebDAV profile 也一并清掉。
+      <label>{t('配对凭据')}<Hint>
+        {t('全部设备的 token 存在本机数据目录的一个文件里（仅遮挡、非加密）。这里是唯一的删除入口：清空后所有设备回到「未配对」需重新配对，已写进 Beyond Compare 的 WebDAV profile 也一并清掉。')}
       </Hint></label>
       {#if wipeArmed}
         <div style="display:flex; align-items:center; gap:8px;">
-          <span style="font-size:var(--fs-sm); color:var(--muted);">确认清空？所有设备需重新配对</span>
-          <button class="btn btn-ghost btn-sm" onclick={() => (wipeArmed = false)} disabled={wiping}>取消</button>
+          <span style="font-size:var(--fs-sm); color:var(--muted);">{t('确认清空？所有设备需重新配对')}</span>
+          <button class="btn btn-ghost btn-sm" onclick={() => (wipeArmed = false)} disabled={wiping}>{t('取消')}</button>
           <button class="btn btn-primary btn-sm" onclick={wipeNow} disabled={wiping}>
-            {wiping ? '清空中…' : '确认清空'}
+            {wiping ? t('清空中…') : t('确认清空')}
           </button>
         </div>
       {:else}
-        <button class="btn btn-secondary btn-sm" onclick={() => (wipeArmed = true)}>清空全部凭据</button>
+        <button class="btn btn-secondary btn-sm" onclick={() => (wipeArmed = true)}>{t('清空全部凭据')}</button>
       {/if}
     </div>
   </div>
   <footer class="sheet-foot">
-    <button class="btn btn-ghost" onclick={cancel}>取消</button>
+    <button class="btn btn-ghost" onclick={cancel}>{t('取消')}</button>
     <button class="btn btn-primary" onclick={save} disabled={saving}>
-      {saving ? '保存中…' : '保存设置'}
+      {saving ? t('保存中…') : t('保存设置')}
     </button>
   </footer>
 </section>

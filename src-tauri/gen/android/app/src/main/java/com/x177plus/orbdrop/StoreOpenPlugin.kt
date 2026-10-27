@@ -46,7 +46,7 @@ class StoreOpenPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.resolve()
       return
     }
-    invoke.reject("这台设备上没有能接手 ${args.url} 的应用")
+    invoke.reject(activity.getString(R.string.store_no_handler, args.url))
   }
 
   /** 交给系统打开。这个包名（或任意应用）接不了就回 `false` —— 由调用方决定退到哪一档。 */

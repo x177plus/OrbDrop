@@ -185,20 +185,26 @@ macOS 的 `ignoresMouseEvents` 是整窗级开关，做不到「只让余量穿�
 
 - 可执行文件：`locate_exe` 除常见路径外，接受用户填的 `.app` 包（自动取
   `Contents/MacOS/bcomp`，兼容部分包里的 `bcompare`）；
-- 配置目录：`~/Library/Application Support/Beyond Compare`（官方文档；Windows 才是
-  `Scooter Software\Beyond Compare 5`）；
+- 配置目录：默认 `~/Library/Application Support/Beyond Compare`，但 BC 装过多个大版本
+  （或按官方说明重命名过）时，**BC5 真正读写的是 `Beyond Compare 5`**、BC4 是
+  `Beyond Compare 4`。`config_dir` 从 `.app/Contents/Info.plist` 读
+  `CFBundleShortVersionString`，优先用与 exe 大版本匹配的版本化目录，再退回默认目录。
+  走错目录的表现是 BC 报「配置文件找不到」/「文件夹不可用」（真机 BC 5.2.6 踩到）。
+  BC 只在启动时登记 `BCProfiles.xml`，更新后第一次需要**重启一次 BC**；服务监听是异步起的，
+  启动预写可能只写下骨架，服务端口落下来后会再补写一次；
 - 左侧比较位：macOS 没有资源管理器右键扩展，应用自己维护
   `<数据目录>/bc-left.json`（原子写入），菜单里的「添加到左侧比较位 / 与左侧比较」照旧；
 - WebDAV profile 的注入、加密信封与回环代理与 Windows 共用 `bc.rs` / `server::proxy`，
   新增的只是 macOS 的路径与槽存储。
 
-本机实测（BC 4.2.8）的入口是 `/Applications/Beyond Compare.app/Contents/MacOS/bcomp`，
-不是文档里偶尔出现的 `bcompare`；`locate_exe` 两个名字都会试。`BCProfiles.xml` 会落在
-`~/Library/Application Support/Beyond Compare/`。
+真机实测（BC 5.2.6，macOS 12.7.6，Intel）：入口是
+`/Applications/Beyond Compare.app/Contents/MacOS/bcomp`，设置目录是
+`~/Library/Application Support/Beyond Compare 5/`（不是不带版本号的那个）。
+`bcomp` 两个参数 + `profile:<ip:端口>?<共享项id>` 经本机回环代理读取对端 `/dav/`
+已跑通（PROPFIND Depth 0/1、Basic 鉴权、`href` 改写都正常）；`BCmp|1|` 信封也能被
+BC 5.2.6 解开。BC 4.2.8 的入口与信封仍未验证。
 
-仍**未在真机 BC 上验证**：profile 注入后的读/写回、`bcomp` 两个参数启动，以及 BC4 是否
-接受本实现写出的 BC5 `BCmp|1|`/`Version="2"` 信封。这些与 Windows 的差异只可能在
-「BC 的 macOS 版本行为」上，不在协议层。
+写回（BC 保存时的 `PUT` / `DELETE` / `MKCOL` / `MOVE`）仍未用真机 BC 实际保存验证。
 
 ## 5. 自更新
 

@@ -1,6 +1,7 @@
 import { listen } from '@tauri-apps/api/event';
 import type { PeerDevice } from '$lib/types';
 import * as api from '$lib/api';
+import { t } from '$lib/i18n.svelte';
 
 let devices = $state<PeerDevice[]>([]);
 /**
@@ -278,7 +279,10 @@ export function unicastBlocked(d: PeerDevice | undefined): boolean {
  */
 export function unicastBlockedTip(d: PeerDevice | undefined): string | null {
   if (!d || !unicastBlocked(d)) return null;
-  return `「${deviceShortName(d)}」直连不通：它在同一网段（能收到它的 mDNS 记录），但这张 Wi-Fi 可能把客户端之间的单播隔开了。要立刻连上它，得有一台两端都够得着的设备打开设置里的「允许为其它设备中转」。`;
+  return t(
+    '「{name}」直连不通：它在同一网段（能收到它的 mDNS 记录），但这张 Wi-Fi 可能把客户端之间的单播隔开了。要立刻连上它，得有一台两端都够得着的设备打开设置里的「允许为其它设备中转」。',
+    { name: deviceShortName(d) },
+  );
 }
 
 /**
@@ -350,18 +354,18 @@ export function deviceState(d: PeerDevice | undefined): DeviceState {
   const dot = deviceDotState(d);
   if (!d || !d.paired) {
     // 关系还没建立：点照旧按链路画（蓝环/灰环），但永远是空心。
-    return { dot, chip: 'unbound', label: '未配对', trusted: false };
+    return { dot, chip: 'unbound', label: t('未配对'), trusted: false };
   }
   // 长连接本身已经证明过指纹，是最强的一档。
-  if (d.connected) return { dot: 'live', chip: 'live', label: '长连接', trusted: true };
+  if (d.connected) return { dot: 'live', chip: 'live', label: t('长连接'), trusted: true };
   // 已配对但指纹为空（老记录），或链路明确失效：关系需要重建，画空心红。
   // 提前把这一档露出来，别等下一次拨号失败才告诉用户。
   if (!d.verified || dot === 'repair') {
-    return { dot: 'repair', chip: 'repair', label: '需配对', trusted: false };
+    return { dot: 'repair', chip: 'repair', label: t('需配对'), trusted: false };
   }
-  if (dot === 'offline') return { dot, chip: 'offline', label: '离线', trusted: true };
-  if (dot === 'retrying') return { dot, chip: 'retrying', label: '重连中', trusted: true };
-  return { dot, chip: 'online', label: '已配对', trusted: true };
+  if (dot === 'offline') return { dot, chip: 'offline', label: t('离线'), trusted: true };
+  if (dot === 'retrying') return { dot, chip: 'retrying', label: t('重连中'), trusted: true };
+  return { dot, chip: 'online', label: t('已配对'), trusted: true };
 }
 
 export function addDevice(d: PeerDevice) {

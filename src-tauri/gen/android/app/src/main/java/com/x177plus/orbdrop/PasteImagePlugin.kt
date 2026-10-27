@@ -58,7 +58,7 @@ class PasteImagePlugin(private val activity: Activity) : Plugin(activity) {
     val resolver = activity.contentResolver
     val dir = File(activity.cacheDir, "paste")
     if (!dir.exists() && !dir.mkdirs()) {
-      throw IllegalStateException("建不了粘贴暂存目录：${dir.absolutePath}")
+      throw IllegalStateException(activity.getString(R.string.paste_cache_dir_failed, dir.absolutePath))
     }
     // 名字带时间戳 + 一串随机数：同一秒里粘两张也不会互相盖掉；扩展名按 URI 声明的 MIME 取
     // （取不到就按 png —— 后端 `paste::read_data_url` 只认那几个图片扩展名，不认识的会被它挡掉）。
@@ -66,13 +66,13 @@ class PasteImagePlugin(private val activity: Activity) : Plugin(activity) {
     val name = "图片-$stamp-${UUID.randomUUID().toString().take(4)}.${extOf(resolver.getType(parsed))}"
     val out = File(dir, name)
     val input = resolver.openInputStream(parsed)
-      ?: throw IllegalArgumentException("读不到剪贴板里这张图：$uri")
+      ?: throw IllegalArgumentException(activity.getString(R.string.paste_read_failed, uri))
     input.use { ins ->
       out.outputStream().use { outs -> ins.copyTo(outs) }
     }
     if (out.length() <= 0L) {
       out.delete()
-      throw IllegalArgumentException("剪贴板里这张图是空的")
+      throw IllegalArgumentException(activity.getString(R.string.paste_empty))
     }
     return out
   }

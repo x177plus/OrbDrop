@@ -98,6 +98,20 @@ class MainActivity : TauriActivity() {
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
     this.webView = webView
+
+    // **这是应用界面，不是网页：整页缩放必须关掉。**
+    // WebView 的 `supportZoom` 默认是 true（手势缩放）；`builtInZoomControls` 默认 false
+    // 只关掉了内置那套 +/- 控件，**不挡双指** —— 真机（Huawei WebView 114）实测：默认值下
+    // 在列表/会话里双指一捏，整页（含底栏、固定定位层）按视觉视口放大，布局不重排、
+    // 边缘被裁，用户没有退出的手势。关键是显式 `setSupportZoom(false)`；另外两项一起关，
+    // 避免不同 WebView 实现拿自己的默认值把内置缩放重新打开。页面侧的 `user-scalable=no`
+    // 只是第二道保险（Chrome 系为无障碍会忽略它），原生这一层才是准的。
+    webView.settings.apply {
+      setSupportZoom(false)
+      setBuiltInZoomControls(false)
+      setDisplayZoomControls(false)
+    }
+
     // WebView 是建在这里的（Rust 那边 `setContentView`），而 inset 是在窗口刚起来时就派发的 ——
     // 补一次派发，免得第一帧少了状态栏那份留白。
     ViewCompat.requestApplyInsets(window.decorView)

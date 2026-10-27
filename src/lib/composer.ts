@@ -15,6 +15,7 @@
  */
 
 import { readImageDataUrl, savePastedImage, resolveImageUri } from './api';
+import { t } from '$lib/i18n.svelte';
 
 /** 输入区里的一段。`image` 的 `url` 只是框里的预览（blob: 或 data:），发出去用的是 `path`。 */
 export type ComposerSeg =
@@ -108,7 +109,7 @@ export function serializeComposer(el: HTMLElement): ComposerSeg[] {
           kind: 'image',
           path,
           url: (e as HTMLImageElement).src,
-          name: e.dataset.name ?? '图片',
+          name: e.dataset.name ?? t('图片'),
           size: Number(e.dataset.size ?? 0),
         });
         continue;
@@ -294,7 +295,7 @@ async function bytesOfBlob(blob: Blob): Promise<{ bytes: Bytes; ext: string; mim
  */
 async function stageBlob(blob: Blob): Promise<ComposerSeg & { kind: 'image' }> {
   const got = await bytesOfBlob(blob);
-  if (!got) throw new Error('这个图片格式读不出来');
+  if (!got) throw new Error(t('这个图片格式读不出来'));
   const base64 = bytesToBase64(got.bytes);
   const path = await savePastedImage(base64, got.ext);
   const url = URL.createObjectURL(new Blob([got.bytes], { type: got.mime }));
@@ -304,7 +305,7 @@ async function stageBlob(blob: Blob): Promise<ComposerSeg & { kind: 'image' }> {
 /** 暂存文件的文件名就是这条消息的名字（"图片-20261013-153012.png"）。 */
 function fileNameOf(path: string): string {
   const parts = path.split(/[\\/]/);
-  return parts[parts.length - 1] || '图片';
+  return parts[parts.length - 1] || t('图片');
 }
 
 // ── 粘贴 ──────────────────────────────────────────────────────────────────

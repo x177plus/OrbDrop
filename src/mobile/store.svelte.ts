@@ -11,6 +11,7 @@ import * as api from "$lib/api";
 import type { ChatFileMsg, InboxEntry, InstalledApp, LocalPick, PeerShareItem, PickedFile, TreeEntry } from "$lib/types";
 import * as chat from "$lib/stores/chat.svelte";
 import * as devices from "$lib/stores/devices.svelte";
+import { t } from "$lib/i18n.svelte";
 import type { IconName } from "./icons";
 
 // ── 导航 ────────────────────────────────────────────────────────────────────
@@ -110,7 +111,12 @@ export function toast(text: string, icon?: IconName): void {
 
 /** 动作失败时统一出口：提示原文（后端已经写好了给人看的话），不吞、不改写。 */
 export function failed(what: string, e: unknown): void {
-  toast(`${what}失败：${e instanceof Error ? e.message : String(e)}`);
+  toast(
+    t("{what}失败：{error}", {
+      what,
+      error: e instanceof Error ? e.message : String(e),
+    }),
+  );
 }
 
 // ── 收件目录（移动端才有的视图）──────────────────────────────────────────────
@@ -214,7 +220,7 @@ export function activeTransfers(): TransferRow[] {
         dir: sending ? "out" : "in",
         who:
           sending && targets.length > 1
-            ? `${targets.length} 台设备`
+            ? t("{n} 台设备", { n: targets.length })
             : chat.deviceNameOf((sending ? targets[0]?.peerId : item.peerId) ?? ""),
         pct: item.pct,
         received: item.received,
@@ -232,7 +238,7 @@ export async function answerInvite(msg: ChatFileMsg, accept: boolean): Promise<v
     if (accept) await api.acceptPush(msg.inviteId);
     else await api.rejectPush(msg.inviteId);
   } catch (e) {
-    failed(accept ? "接收" : "拒绝", e);
+    failed(t(accept ? "接收" : "拒绝"), e);
   }
 }
 
@@ -263,11 +269,11 @@ export async function toggleReceivePause(msg: ChatFileMsg): Promise<void> {
     }
     // 命令往返途中这条可能已经收完（`push://done` 先到）：那时不再补一句"已暂停"。
     if (chat.inviteReceiving(msg.inviteId)) {
-      toast(want ? "已暂停接收" : "已继续接收", want ? "stop" : "download");
+      toast(t(want ? "已暂停接收" : "已继续接收"), want ? "stop" : "download");
     }
   } catch (e) {
     chat.setInvitePaused(msg.inviteId, before);
-    failed(want ? "暂停接收" : "继续接收", e);
+    failed(t(want ? "暂停接收" : "继续接收"), e);
   }
 }
 
@@ -280,8 +286,8 @@ export async function toggleReceivePause(msg: ChatFileMsg): Promise<void> {
  */
 export async function stopOutgoingFile(msg: ChatFileMsg): Promise<void> {
   if (!msg.fromMe) return;
-  const t = chat.activeThread();
-  const peerId = t?.mode === "direct" ? t.participants[0] : "";
+  const thread = chat.activeThread();
+  const peerId = thread?.mode === "direct" ? thread.participants[0] : "";
   const invites = chat.outgoingWaitingInvites(msg, peerId);
   if (invites.length === 0) return;
   try {
@@ -291,7 +297,7 @@ export async function stopOutgoingFile(msg: ChatFileMsg): Promise<void> {
     }
     for (const inviteId of invites) await api.cancelPush(inviteId);
   } catch (e) {
-    failed("停止发送", e);
+    failed(t("停止发送"), e);
   }
 }
 
@@ -329,23 +335,23 @@ export function takePendingImages(key: string): PickedFile[] | null {
  * 子屏上，没有会话时这个动作根本不会被调到。
  */
 export async function pickAttach(kind: "image" | "file"): Promise<void> {
-  const t = chat.activeThread();
-  if (!t) return;
+  const thread = chat.activeThread();
+  if (!thread) return;
   let files: PickedFile[];
   try {
     files = await api.pickFiles(kind);
   } catch (e) {
-    failed("选择文件", e);
+    failed(t("选择文件"), e);
     return;
   }
   // 取消（空表）什么都不做：用户反悔是正常操作，不该看到任何提示。
   if (files.length === 0) return;
   if (kind === "image") {
-    pendingImages = { key: t.key, files };
+    pendingImages = { key: thread.key, files };
     return;
   }
   await sendFilesToConvo(
-    t,
+    thread,
     files.map((f) => ({ path: f.path, name: f.name, size: f.size })),
   );
 }
@@ -374,14 +380,14 @@ interface PushItem {
  * 只发给**此刻在线**的那几台（与桌面端同一条判据）：推送不会排队，一台都够不着时当场说清楚，
  * 而不是让用户对着一张永远不动的进度条等。
  */
-async function sendFilesToConvo(t: chat.ConvoThread, files: PushItem[]): Promise<void> {
-  const peers = devices.devicesById(t.participants);
+async function sendFilesToConvo(thread: chat.ConvoThread, files: PushItem[]): Promise<void> {
+  const peers = devices.devicesById(thread.participants);
   const live = peers.filter((d) => d.online);
   if (live.length === 0) {
     toast(
       peers.length === 1
-        ? `「${devices.deviceShortName(peers[0])}」不在网上，推送未发送`
-        : "所选设备都不在网上，推送未发送",
+        ? t("「{name}」不在网上，推送未发送", { name: devices.deviceShortName(peers[0]) })
+        : t("所选设备都不在网上，推送未发送"),
     );
     return;
   }
@@ -402,17 +408,17 @@ async function sendFilesToConvo(t: chat.ConvoThread, files: PushItem[]): Promise
       live.map((d) => d.id),
       items,
       batch,
-      t.mode === "broadcast" ? t.id : "",
-      t.mode === "group" ? t.id : "",
+      thread.mode === "broadcast" ? thread.id : "",
+      thread.mode === "group" ? thread.id : "",
     );
     toast(
       live.length === 1
-        ? `正在推送到「${devices.deviceShortName(live[0])}」`
-        : `正在推送到 ${live.length} 台设备`,
+        ? t("正在推送到「{name}」", { name: devices.deviceShortName(live[0]) })
+        : t("正在推送到 {n} 台设备", { n: live.length }),
       "file",
     );
   } catch (e) {
-    failed("推送", e);
+    failed(t("推送"), e);
   }
 }
 
@@ -457,9 +463,9 @@ export async function loadApps(): Promise<void> {
  * **不拷文件**：本机从 `/data/app/…/base.apk` 直接读，名字只写在清单里（见 `PushItem.rename`）。
  */
 export async function sendApp(app: InstalledApp): Promise<void> {
-  const t = chat.activeThread();
-  if (!t) return;
-  await sendFilesToConvo(t, [{ path: app.path, name: app.fileName, size: app.size, rename: true }]);
+  const thread = chat.activeThread();
+  if (!thread) return;
+  await sendFilesToConvo(thread, [{ path: app.path, name: app.fileName, size: app.size, rename: true }]);
 }
 
 // ── 浏览对端共享项 ──────────────────────────────────────────────────────────
@@ -540,7 +546,7 @@ export async function toggleShare(shareId: string): Promise<void> {
     const entries = await api.peerTree(peerId, shareId, "");
     browseChildren = { ...browseChildren, [shareId]: entries };
   } catch (e) {
-    failed("列出共享项", e);
+    failed(t("列出共享项"), e);
   }
 }
 
@@ -611,7 +617,7 @@ function finishBrowseDownload(key: string, received: number, dest: string): void
   const cur = browseDownloads[key];
   if (!cur || cur.status === "done") return;
   putBrowseDownload(key, { ...cur, received, status: "done", dest, error: null });
-  toast("已下载", "download");
+  toast(t("已下载"), "download");
   // 收件页签那颗数就是收件目录的长度（`list_inbox`）：不重拉，下载完它不会 +1。
   void loadInbox();
 }
@@ -638,7 +644,7 @@ export function noteBrowseDownload(ev: {
       peerId: ev.peerId,
       shareId: ev.shareId,
       path: ev.path,
-      name: ev.name || cur?.name || "文件",
+      name: ev.name || cur?.name || t("文件"),
       total: cur?.total ?? 0,
       received: Math.max(0, ev.received),
       status: cur?.status === "paused" ? "paused" : "running",
@@ -652,7 +658,7 @@ export function noteBrowseDownload(ev: {
     return;
   }
   // 失败：圆环退回下载键，点它可以重试（`activateBrowseEntry` 把状态改回 running）。
-  if (cur) putBrowseDownload(key, { ...cur, status: "failed", error: ev.error ?? "下载失败" });
+  if (cur) putBrowseDownload(key, { ...cur, status: "failed", error: ev.error ?? t("下载失败") });
 }
 
 /**
@@ -683,18 +689,18 @@ async function setBrowsePaused(
       if (now && now.status === want) putBrowseDownload(key, { ...now, status: before });
       // 终局事件如果已经先到（下完了 / 失败了），那句"已不在下载中"就是多余的。
       if (!now || (now.status !== "done" && now.status !== "failed")) {
-        toast("这项已不在下载中");
+        toast(t("这项已不在下载中"));
       }
       return;
     }
     const now = browseDownloads[key];
     if (now && now.status === want) {
-      toast(paused ? "已暂停下载" : "已继续下载", paused ? "stop" : "download");
+      toast(t(paused ? "已暂停下载" : "已继续下载"), paused ? "stop" : "download");
     }
   } catch (e) {
     const now = browseDownloads[key];
     if (now && now.status === want) putBrowseDownload(key, { ...now, status: before });
-    failed(paused ? "暂停下载" : "继续下载", e);
+    failed(t(paused ? "暂停下载" : "继续下载"), e);
   }
 }
 
@@ -738,7 +744,7 @@ export async function activateBrowseEntry(
   const key = browseKey(peerId, shareId, path);
   const cur = browseDownloads[key];
   if (cur?.status === "running") {
-    toast("正在下载");
+    toast(t("正在下载"));
     return;
   }
   if (cur?.status === "paused") {
@@ -748,13 +754,13 @@ export async function activateBrowseEntry(
   if (cur?.status === "done" && cur.dest) {
     try {
       await api.openPath(cur.dest);
-      toast("已打开文件", "file");
+      toast(t("已打开文件"), "file");
     } catch (e) {
       // 文件被删 / 被移走：这一行退回「可下载」，否则它永远指着不存在的路径。
       const next = { ...browseDownloads };
       delete next[key];
       browseDownloads = next;
-      failed("打开", e);
+      failed(t("打开"), e);
     }
     return;
   }
@@ -791,7 +797,7 @@ export async function activateBrowseEntry(
         error: e instanceof Error ? e.message : String(e),
       });
     }
-    failed("下载", e);
+    failed(t("下载"), e);
   }
 }
 
@@ -800,7 +806,7 @@ export async function activateBrowseEntry(
 /** 连接/断开、解除配对、手动添加：全部转发到后端，再由设备 store 的事件刷新列表。 */
 export async function toggleConnection(peerId: string, connected: boolean): Promise<void> {
   const peer = devices.deviceById(peerId);
-  const name = peer ? devices.deviceShortName(peer) : "设备";
+  const name = peer ? devices.deviceShortName(peer) : t("设备");
   // 这一台此刻"看得见却直连不通"时，那句解释在这里说（连接是一个动作，不是一个常驻状态）。
   const tip = connected ? null : devices.unicastBlockedTip(peer);
   try {
@@ -814,14 +820,14 @@ export async function toggleConnection(peerId: string, connected: boolean): Prom
     if (outcome.kind === "asked") {
       // 真 requestId 由 `link://request_sent` 补上（后端不从这个返回里给 id，见 `connect_peer`）；
       // 这里只在事件还没到时先占一档，好让"在等谁同意"当场可见、可取消。
-      if (!pendingLinkRequest()) setPendingLinkRequest("", peer ? devices.deviceShortName(peer) : "设备");
-      toast(`已把连接请求发给「${name}」：等它在自己的通知里点「接受」`);
+      if (!pendingLinkRequest()) setPendingLinkRequest("", peer ? devices.deviceShortName(peer) : t("设备"));
+      toast(t("已把连接请求发给「{name}」：等它在自己的通知里点「接受」", { name }));
       return;
     }
     // 对端不在网上 / 链路本就在：后端直接拨号，与旧行为同一句（那儿还有"看得见却连不上"的解释）。
-    toast(tip ?? `正在与「${name}」建立长连接`);
+    toast(tip ?? t("正在与「{name}」建立长连接", { name }));
   } catch (e) {
-    failed(connected ? "断开" : "连接", e);
+    failed(t(connected ? "断开" : "连接"), e);
   }
 }
 
@@ -834,18 +840,18 @@ export async function toggleConnection(peerId: string, connected: boolean): Prom
  */
 export async function unpair(peerId: string, name: string): Promise<boolean> {
   const ok = await confirmAction({
-    title: "解除配对",
-    desc: `解除与「${name}」的配对？对端将不再认得本机，需要重新配对。`,
-    confirmLabel: "解除配对",
+    title: t("解除配对"),
+    desc: t("解除与「{name}」的配对？对端将不再认得本机，需要重新配对。", { name }),
+    confirmLabel: t("解除配对"),
     danger: true,
   });
   if (!ok) return false;
   try {
     await api.removePeer(peerId);
-    toast(`已解除与「${name}」的配对`);
+    toast(t("已解除与「{name}」的配对", { name }));
     return true;
   } catch (e) {
-    failed("解除配对", e);
+    failed(t("解除配对"), e);
     return false;
   }
 }
@@ -865,16 +871,20 @@ export async function saveRemark(
   remark: string,
 ): Promise<string | null> {
   const stored = await devices.saveDeviceRemark(peerId, remark);
-  toast(stored ? `已把「${rawName}」的备注设为「${stored}」` : `已清除「${rawName}」的备注`);
+  toast(
+    stored
+      ? t("已把「{name}」的备注设为「{remark}」", { name: rawName, remark: stored })
+      : t("已清除「{name}」的备注", { name: rawName }),
+  );
   return stored;
 }
 
 export async function addManualPeer(host: string, port: number): Promise<void> {
   try {
     await api.addPeer(host, port);
-    toast(`已添加 ${host}:${port}，等待配对`);
+    toast(t("已添加 {host}:{port}，等待配对", { host, port }));
   } catch (e) {
-    failed("添加设备", e);
+    failed(t("添加设备"), e);
   }
 }
 
@@ -1082,13 +1092,13 @@ export async function answerPairInvite(accept: boolean): Promise<void> {
   try {
     if (accept) {
       const peerName = await api.acceptPairInvite(invite.inviteId);
-      toast(`已与「${peerName}」完成配对`);
+      toast(t("已与「{name}」完成配对", { name: peerName }));
     } else {
       await api.rejectPairInvite(invite.inviteId);
-      toast(`已拒绝「${invite.peerName}」的配对邀请`, "x");
+      toast(t("已拒绝「{name}」的配对邀请", { name: invite.peerName }), "x");
     }
   } catch (e) {
-    failed(accept ? "接受配对邀请" : "拒绝配对邀请", e);
+    failed(t(accept ? "接受配对邀请" : "拒绝配对邀请"), e);
   }
 }
 
@@ -1114,9 +1124,9 @@ export async function cancelPendingPairInvite(): Promise<void> {
   pairWait = null;
   try {
     await api.cancelPairInvite(pending.inviteId);
-    toast(`已取消对「${pending.peerName}」的配对邀请`, "x");
+    toast(t("已取消对「{name}」的配对邀请", { name: pending.peerName }), "x");
   } catch (e) {
-    failed("取消配对邀请", e);
+    failed(t("取消配对邀请"), e);
   }
 }
 
@@ -1164,13 +1174,13 @@ export async function answerLinkRequest(accept: boolean): Promise<void> {
   try {
     if (accept) {
       const peerName = await api.acceptLinkRequest(req.requestId);
-      toast(`已同意「${peerName}」建立长连接`);
+      toast(t("已同意「{name}」建立长连接", { name: peerName }));
     } else {
       await api.rejectLinkRequest(req.requestId);
-      toast(`已拒绝「${req.peerName}」的连接请求`, "x");
+      toast(t("已拒绝「{name}」的连接请求", { name: req.peerName }), "x");
     }
   } catch (e) {
-    failed(accept ? "接受连接请求" : "拒绝连接请求", e);
+    failed(t(accept ? "接受连接请求" : "拒绝连接请求"), e);
   }
 }
 
@@ -1198,9 +1208,9 @@ export async function cancelPendingLinkRequest(): Promise<void> {
     // 真 id 来自 `link://request_sent`；万一还没到（极短的一瞬），就只收掉本机这一档，
     // 不拿空 id 去撞后端。
     if (pending.requestId) await api.cancelLinkRequest(pending.requestId);
-    toast(`已取消对「${pending.peerName}」的连接请求`, "x");
+    toast(t("已取消对「{name}」的连接请求", { name: pending.peerName }), "x");
   } catch (e) {
-    failed("取消连接请求", e);
+    failed(t("取消连接请求"), e);
   }
 }
 

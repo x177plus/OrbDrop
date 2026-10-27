@@ -7,6 +7,7 @@
   import { ctxPlacement } from '$lib/ctxPlacement';
   import { computerLabel } from '$lib/stores/platform.svelte';
   import Hint from '$lib/components/Hint.svelte';
+  import { t } from '$lib/i18n.svelte';
 
   /**
    * 本机文件选择框：**文件和文件夹在同一个框里混选**。
@@ -25,7 +26,7 @@
   let {
     title,
     sub,
-    confirmLabel = '选择',
+    confirmLabel = t('选择'),
     onConfirm,
     onClose,
   }: {
@@ -213,11 +214,15 @@
 
   function meta(r: Row): string {
     if (r.drive) {
-      const kind = r.drive.removable ? '可移动磁盘' : '本地磁盘';
+      const kind = r.drive.removable ? t('可移动磁盘') : t('本地磁盘');
       if (r.drive.total <= 0) return kind;
-      return `${kind} · ${formatFileSize(r.drive.free)} 可用 / ${formatFileSize(r.drive.total)}`;
+      return t('{kind} · {free} 可用 / {total}', {
+        kind,
+        free: formatFileSize(r.drive.free),
+        total: formatFileSize(r.drive.total),
+      });
     }
-    return r.isDir ? '文件夹' : `文件 · ${formatFileSize(r.size)}`;
+    return r.isDir ? t('文件夹') : t('文件 · {size}', { size: formatFileSize(r.size) });
   }
 
   /** 盘占用条：画"已用"的比例（与原型一致）。 */
@@ -241,7 +246,7 @@
       favorites = await setPickerFavorites(next);
     } catch (e) {
       favorites = before;
-      document.dispatchEvent(new CustomEvent('od:toast', { detail: `常用位置没能保存：${e}` }));
+      document.dispatchEvent(new CustomEvent('od:toast', { detail: t('常用位置没能保存：{error}', { error: String(e) }) }));
     }
   }
 
@@ -422,21 +427,21 @@
     <header class="picker-head">
       <h3>{title}</h3>
       <Hint>{sub}</Hint>
-      <button class="icon-btn" id="pickerCloseBtn" onclick={onClose} aria-label="关闭选择框">
+      <button class="icon-btn" id="pickerCloseBtn" onclick={onClose} aria-label={t('关闭选择框')}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
       </button>
     </header>
 
     <div class="picker-places">
-      <div class="picker-rail" aria-label="常用位置" bind:this={railEl} use:scrollRail>
+      <div class="picker-rail" aria-label={t('常用位置')} bind:this={railEl} use:scrollRail>
         {#if favorites.length === 0}
-          <span class="picker-empty-fav">还没有常用位置 · 右键目录即可添加到常用</span>
+          <span class="picker-empty-fav">{t('还没有常用位置 · 右键目录即可添加到常用')}</span>
         {:else}
           {#each favorites as f (f.path)}
             <button
               class="place"
               class:active={f.path === cwd}
-              title={`${f.path} · 右键可移出常用`}
+              title={t('{path} · 右键可移出常用', { path: f.path })}
               onclick={() => void go(f.path)}
               oncontextmenu={(e) => openFavCtx(e, f)}
             >
@@ -448,7 +453,7 @@
     </div>
 
     <div class="picker-crumbs">
-      <button class="crumb-up" onclick={up} disabled={cwd === ''} aria-label="返回上一级">{@html ICON_UP}</button>
+      <button class="crumb-up" onclick={up} disabled={cwd === ''} aria-label={t('返回上一级')}>{@html ICON_UP}</button>
       <div class="crumb-trail">
         <button class="crumb" class:current={cwd === ''} onclick={() => void go('')}>{computerLabel()}</button>
         {#each crumbs as c, i (c.path)}
@@ -461,31 +466,31 @@
     <!-- 右键菜单开在列表里、点空白就关：滚动时它必须跟着走（跟着的代价是位置会飘） -->
     <div class="picker-body" onscroll={hideCtx}>
       {#if loading}
-        <div class="picker-state">{@html ICON_SPIN}<p>正在读取…</p></div>
+        <div class="picker-state">{@html ICON_SPIN}<p>{t('正在读取…')}</p></div>
       {:else if failed}
         <div class="picker-state">
           {@html failed.kind === 'denied' ? ICON_LOCK : ICON_WARN}
-          <p>{failed.kind === 'denied' ? '无权访问' : failed.kind === 'missing' ? '找不到这个位置' : '打不开这个位置'}</p>
+          <p>{failed.kind === 'denied' ? t('无权访问') : failed.kind === 'missing' ? t('找不到这个位置') : t('打不开这个位置')}</p>
           <p class="ps-sub">
             {failed.kind === 'denied'
-              ? '这个文件夹需要更高的系统权限，请选择一个你有权限的文件夹。'
+              ? t('这个文件夹需要更高的系统权限，请选择一个你有权限的文件夹。')
               : failed.kind === 'missing'
-                ? '它可能被移走或改名了。请返回上一级后重试。'
+                ? t('它可能被移走或改名了。请返回上一级后重试。')
                 : failed.message}
           </p>
         </div>
       {:else if rows.length === 0}
         <div class="picker-state">
           {@html ICON_FOLDER}
-          <p>{cwd === '' ? '没有找到磁盘' : '这个文件夹是空的'}</p>
-          <p class="ps-sub">{cwd === '' ? '系统没有返回任何可用的驱动器。' : '返回上一级，或选择其他文件夹。'}</p>
+          <p>{cwd === '' ? t('没有找到磁盘') : t('这个文件夹是空的')}</p>
+          <p class="ps-sub">{cwd === '' ? t('系统没有返回任何可用的驱动器。') : t('返回上一级，或选择其他文件夹。')}</p>
         </div>
       {:else}
         <div
           class="picker-list"
           role="listbox"
           aria-multiselectable="true"
-          aria-label="当前位置内容"
+          aria-label={t('当前位置内容')}
           tabindex="-1"
           bind:this={listEl}
           onclick={onListClick}
@@ -502,7 +507,7 @@
           }}
         >
           {#if cwd === ''}
-            <div class="picker-group" role="presentation">设备和驱动器</div>
+            <div class="picker-group" role="presentation">{t('设备和驱动器')}</div>
           {/if}
           {#each rows as r (r.path)}
             <div
@@ -513,7 +518,7 @@
               aria-selected={isSelected(r.path)}
               tabindex="0"
               data-path={r.path}
-              title={r.isDir ? (isFav(r.path) ? '右键可移出常用' : '右键可添加到常用') : ''}
+              title={r.isDir ? (isFav(r.path) ? t('右键可移出常用') : t('右键可添加到常用')) : ''}
             >
               <span class="pr-check">{@html ICON_CHECK}</span>
               <span class="f-icon">{@html r.drive ? ICON_DRIVE : r.isDir ? ICON_FOLDER : ICON_FILE}</span>
@@ -538,10 +543,10 @@
         挂到框外必被裁。它是选中集的**唯一**呈现处：选中的项可能不在当前目录、在列表里
         一个像素都不占，只有这儿能看到全量、能逐项摘、能全部取消。 -->
     {#if cartOpen && selection.length > 0}
-      <div class="picker-cart" id="pickerCart" bind:this={cartPanelEl} aria-label="已选项目">
+      <div class="picker-cart" id="pickerCart" bind:this={cartPanelEl} aria-label={t('已选项目')}>
         <div class="cart-head">
-          <span class="cart-count">已选 <b>{selection.length}</b> 项</span>
-          <button class="cart-clear" onclick={clearSelection}>全部取消</button>
+          <span class="cart-count">{t('已选 {n} 项', { n: selection.length })}</span>
+          <button class="cart-clear" onclick={clearSelection}>{t('全部取消')}</button>
         </div>
         <div class="cart-list">
           {#each selection as s, i (s.path)}
@@ -549,12 +554,12 @@
               <span class="f-icon">{@html s.isDir ? ICON_FOLDER : ICON_FILE}</span>
               <span class="cart-name">{s.name}</span>
               <span class="cart-from" title={s.from}>{s.fromName}</span>
-              <span class="cart-meta">{s.isDir ? '文件夹' : formatFileSize(s.size)}</span>
+              <span class="cart-meta">{s.isDir ? t('文件夹') : formatFileSize(s.size)}</span>
               <button
                 class="cart-x"
                 onclick={() => removePick(s.path, i)}
-                aria-label="取消选择 {s.name}"
-                title="取消选择「{s.name}」"
+                aria-label={t('取消选择 {name}', { name: s.name })}
+                title={t('取消选择「{name}」', { name: s.name })}
               >{@html ICON_X}</button>
             </div>
           {/each}
@@ -564,7 +569,7 @@
 
     <footer class="picker-foot">
       {#if selection.length === 0}
-        <div class="picker-sel">未选择任何项目</div>
+        <div class="picker-sel">{t('未选择任何项目')}</div>
       {:else}
         <!-- 角标 + 首项名字 + 箭头，整块是车的开关。收起时箭头朝上（点开是往上长） -->
         <button
@@ -577,11 +582,11 @@
           title={selection.map((s) => s.path).join('\n')}
         >
           <span class="cart-badge num">{selection.length}</span>
-          <span class="cart-label">{selection[0].name}{#if selection.length > 1}<span class="cart-etc">等 {selection.length} 项</span>{/if}</span>
+          <span class="cart-label">{selection[0].name}{#if selection.length > 1}<span class="cart-etc">{t('等 {n} 项', { n: selection.length })}</span>{/if}</span>
           <span class="cart-caret">{@html ICON_CHEVRON}</span>
         </button>
       {/if}
-      <button class="btn btn-secondary btn-sm" onclick={onClose}>取消</button>
+      <button class="btn btn-secondary btn-sm" onclick={onClose}>{t('取消')}</button>
       <button class="btn btn-primary btn-sm" onclick={confirm} disabled={selection.length === 0}>{confirmLabel}</button>
     </footer>
   </div>
@@ -597,29 +602,29 @@
     >
       {#if cur.row?.isDir}
         <button class="ctx-item" onclick={() => { hideCtx(); void go(cur.row!.path); }}>
-          {@html ICON_CHEVRON}进入此文件夹
+          {@html ICON_CHEVRON}{t('进入此文件夹')}
         </button>
         <div class="ctx-sep"></div>
         {#if isFav(cur.row!.path)}
           <button class="ctx-item danger" onclick={() => { const p = cur.row!.path; hideCtx(); removeFav(p); }}>
-            {@html ICON_TRASH}从常用中移除
+            {@html ICON_TRASH}{t('从常用中移除')}
           </button>
         {:else}
           <button class="ctx-item" onclick={() => { const r = cur.row!; hideCtx(); addFav(r); }}>
-            {@html ICON_STAR}添加到常用
+            {@html ICON_STAR}{t('添加到常用')}
           </button>
         {/if}
       {:else if cur.row}
         <button class="ctx-item" onclick={() => { const r = cur.row!; hideCtx(); toggle(r); }}>
-          {@html ICON_PICK}选择此文件
+          {@html ICON_PICK}{t('选择此文件')}
         </button>
       {:else if cur.fav}
         <button class="ctx-item" onclick={() => { const p = cur.fav!.path; hideCtx(); void go(p); }}>
-          {@html ICON_CHEVRON}进入「{cur.fav!.name}」
+          {@html ICON_CHEVRON}{t('进入「{name}」', { name: cur.fav!.name })}
         </button>
         <div class="ctx-sep"></div>
         <button class="ctx-item danger" onclick={() => { const p = cur.fav!.path; hideCtx(); removeFav(p); }}>
-          {@html ICON_TRASH}从常用中移除
+          {@html ICON_TRASH}{t('从常用中移除')}
         </button>
       {/if}
     </div>

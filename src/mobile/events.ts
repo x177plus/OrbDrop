@@ -47,6 +47,7 @@ import { listen } from "@tauri-apps/api/event";
 import * as chat from "$lib/stores/chat.svelte";
 import { peerShortName } from "$lib/stores/devices.svelte";
 import { undeliverableText, type PushBatch, type PushInvite, type Undeliverable } from "$lib/types";
+import { t } from "$lib/i18n.svelte";
 import * as store from "./store.svelte";
 
 export const ready: Promise<void> = (async () => {
@@ -56,7 +57,9 @@ export const ready: Promise<void> = (async () => {
     const inv = ev.payload;
     chat.noteInboundInvite(inv);
     store.toast(
-      inv.auto ? "正在接收文件" : `「${peerShortName(inv.sender.id, inv.sender.name)}」发来文件`,
+      inv.auto
+        ? t("正在接收文件")
+        : t("「{name}」发来文件", { name: peerShortName(inv.sender.id, inv.sender.name) }),
       "download",
     );
   });
@@ -97,18 +100,18 @@ export const ready: Promise<void> = (async () => {
     chat.noteInviteDone(inviteId, outcome, dest);
     if (status === "completed") {
       if (!incoming) return;
-      store.toast("已收到文件", "download");
+      store.toast(t("已收到文件"), "download");
       // 收件目录里刚多了一项，而「文件」页那份列表只在挂载/手动刷新/删除时才拉 ——
       // 不在这儿补一次，用户会看到会话里写着"已接收"、文件页却还是"还没有收到的文件"。
       void store.loadInbox();
     } else if (status === "cancelled") {
       // 取消/拒绝是自己点的或对方点的，不必再报一次错。
       if (!incoming) return;
-      store.toast("传输已取消", "x");
+      store.toast(t("传输已取消"), "x");
     } else {
       if (!incoming) return;
       // 失败要给原因（磁盘满了、对端走了都在这里）。
-      store.failed("接收文件", reason ?? "接收失败");
+      store.failed(t("接收文件"), reason ?? t("原因不明"));
     }
   });
 
@@ -136,13 +139,17 @@ export const ready: Promise<void> = (async () => {
       // 等对方确认的那一档到此结束（表里那颗「取消邀请」跟着收掉）。
       store.clearPendingPairInvite(ev.payload.inviteId ?? undefined);
       if (!ev.payload.inviteId) return;
-      store.toast(`已与「${peerShortName(ev.payload.peerId, ev.payload.peerName ?? "设备")}」配对成功`);
+      store.toast(
+        t("已与「{name}」配对成功", {
+          name: peerShortName(ev.payload.peerId, ev.payload.peerName ?? t("设备")),
+        }),
+      );
     },
   );
   await listen<{ inviteId: string; reason?: string | null }>("pair://invite_failed", (ev) => {
     // 对方拒绝 / 超时 / 已撤回 / 联系不上：等待那一档收掉，并把原因说出来。
     store.clearPendingPairInvite(ev.payload.inviteId);
-    store.failed("配对邀请", ev.payload.reason ?? "对方未接受");
+    store.failed(t("配对邀请"), ev.payload.reason ?? t("对方未接受"));
   });
 
   // **别人发来的**配对邀请（P1-13⑤）：桌面端挂一条带「接收/拒绝」的通知，移动端用一张底板
@@ -165,7 +172,12 @@ export const ready: Promise<void> = (async () => {
     const { inviteId, reason } = ev.payload;
     const wasOpen = store.incomingPairInvite()?.inviteId === inviteId;
     store.dropPairInvite(inviteId);
-    if (wasOpen) store.toast(`配对邀请已作废：${reason ?? "超时未处理"}`, "x");
+    if (wasOpen) {
+      store.toast(
+        t("配对邀请已作废：{reason}", { reason: reason ?? t("超时未处理") }),
+        "x",
+      );
+    }
   });
 
   // **别人发来的**长连接请求（F-16 的同意制）：点「连接」不再直接拨号，先到对方这里问一声。
@@ -175,7 +187,10 @@ export const ready: Promise<void> = (async () => {
   await listen<{ requestId: string; peerId: string; peerName: string }>("link://request", (ev) => {
     const p = ev.payload;
     store.noteLinkRequest({ requestId: p.requestId, peerId: p.peerId, peerName: peerShortName(p.peerId, p.peerName) });
-    store.toast(`「${peerShortName(p.peerId, p.peerName)}」请求与本机建立长连接`, "link");
+    store.toast(
+      t("「{name}」请求与本机建立长连接", { name: peerShortName(p.peerId, p.peerName) }),
+      "link",
+    );
   });
 
   // 本机刚把一条请求发出去（`connect_peer` 返回 `asked` 时后端发的）：挂上"在等谁同意"
@@ -196,7 +211,12 @@ export const ready: Promise<void> = (async () => {
     const wasOpen = store.incomingLinkRequest()?.requestId === requestId;
     store.dropLinkRequest(requestId);
     store.clearPendingLinkRequest(requestId);
-    if (wasOpen) store.toast(`连接请求已作废：${reason ?? "超时未处理"}`, "x");
+    if (wasOpen) {
+      store.toast(
+        t("连接请求已作废：{reason}", { reason: reason ?? t("超时未处理") }),
+        "x",
+      );
+    }
   });
 
   // 本机发出的请求有结果了。三档要如实对应：同意 → 正在建链；拒绝（或对方没处理）→ 把
@@ -208,14 +228,17 @@ export const ready: Promise<void> = (async () => {
     reason?: string | null;
   }>("link://request_result", (ev) => {
     const { requestId, outcome, reason } = ev.payload;
-    const name = store.pendingLinkRequest()?.peerName ?? "设备";
+    const name = store.pendingLinkRequest()?.peerName ?? t("设备");
     store.clearPendingLinkRequest(requestId);
     if (outcome === "granted") {
-      store.toast(`「${name}」已同意：正在建立长连接`);
+      store.toast(t("「{name}」已同意：正在建立长连接", { name }));
     } else if (outcome === "denied") {
-      store.toast(`「${name}」没有接受连接请求：${reason ?? "对方未处理"}`, "x");
+      store.toast(
+        t("「{name}」没有接受连接请求：{reason}", { name, reason: reason ?? t("对方未处理") }),
+        "x",
+      );
     } else {
-      store.toast(`正在与「${name}」建立长连接`);
+      store.toast(t("正在与「{name}」建立长连接", { name }));
     }
   });
 

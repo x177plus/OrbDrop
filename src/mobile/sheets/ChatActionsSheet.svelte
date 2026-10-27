@@ -4,11 +4,12 @@
   import Icon from "../Icon.svelte";
   import Sheet from "../components/Sheet.svelte";
   import * as store from "../store.svelte";
+  import { t } from "$lib/i18n.svelte";
 
   let { convoKey, onClose }: { convoKey: string; onClose: () => void } = $props();
 
   const thread = $derived(chat.activeThread());
-  const title = $derived(thread?.title ?? "会话");
+  const title = $derived(thread?.title ?? t("会话"));
   const isThread = $derived(!!thread && thread.mode !== "direct");
   /**
    * 一对一会话对着哪台设备（多台会话是空串）：「修改备注」与「配对」两项长在它身上。
@@ -28,7 +29,7 @@
   function markRead(): void {
     chat.openConversation(convoKey);
     onClose();
-    store.toast("已标记为已读", "check");
+    store.toast(t("已标记为已读"), "check");
   }
 
   function editRecipients(): void {
@@ -40,40 +41,40 @@
   async function clearGroupHistory(): Promise<void> {
     const key = convoKey;
     const ok = await store.confirmAction({
-      title: "清空聊天记录",
-      desc: `清空「${title}」的本地聊天记录？不会退群，之后的新消息仍会收到；其他成员不受影响。`,
-      confirmLabel: "清空",
+      title: t("清空聊天记录"),
+      desc: t("清空「{title}」的本地聊天记录？不会退群，之后的新消息仍会收到；其他成员不受影响。", { title }),
+      confirmLabel: t("清空"),
       danger: true,
     });
     if (!ok) return;
     try {
       await chat.clearGroupHistory(key);
     } catch (e) {
-      store.failed("清空聊天记录", e);
+      store.failed(t("清空聊天记录"), e);
       return;
     }
     onClose();
-    store.toast("已清空本地聊天记录（未退群）", "trash");
+    store.toast(t("已清空本地聊天记录（未退群）"), "trash");
   }
 
   async function clearHistory(): Promise<void> {
     const peerId = thread?.participants[0];
     if (!peerId) return;
     const ok = await store.confirmAction({
-      title: "清空聊天记录",
-      desc: `清空与「${title}」的本机聊天记录？不会影响对方，删掉后不能恢复。`,
-      confirmLabel: "清空",
+      title: t("清空聊天记录"),
+      desc: t("清空与「{title}」的本机聊天记录？不会影响对方，删掉后不能恢复。", { title }),
+      confirmLabel: t("清空"),
       danger: true,
     });
     if (!ok) return;
     try {
       await chat.clearPeer(peerId);
     } catch (e) {
-      store.failed("清空聊天记录", e);
+      store.failed(t("清空聊天记录"), e);
       return;
     }
     onClose();
-    store.toast("已清空聊天记录", "trash");
+    store.toast(t("已清空聊天记录"), "trash");
   }
 
   /**
@@ -91,17 +92,17 @@
    * - 提示用 `exitThread` 回来的标题（那是离开前快照里的名字），不是这里 `$derived` 的那份。
    */
   async function exitThread(): Promise<void> {
-    const t = thread;
-    if (!t || t.mode === "direct") return;
+    const target = thread;
+    if (!target || target.mode === "direct") return;
     const key = convoKey;
-    const isGroup = t.mode === "group";
+    const isGroup = target.mode === "group";
     const ask = isGroup
-      ? `退出「${title}」？本机不再收发这个群的消息，本机这份聊天记录也会一起删掉；其他成员不受影响。`
-      : `删除群发「${title}」？消息仍留在与各台设备的单独会话里，名单不再保留。`;
+      ? t("退出「{title}」？本机不再收发这个群的消息，本机这份聊天记录也会一起删掉；其他成员不受影响。", { title })
+      : t("删除群发「{title}」？消息仍留在与各台设备的单独会话里，名单不再保留。", { title });
     const ok = await store.confirmAction({
-      title: isGroup ? "退出群聊" : "删除群发",
+      title: isGroup ? t("退出群聊") : t("删除群发"),
       desc: ask,
-      confirmLabel: isGroup ? "退出" : "删除",
+      confirmLabel: isGroup ? t("退出") : t("删除"),
       danger: true,
     });
     if (!ok) return;
@@ -109,22 +110,22 @@
     try {
       gone = await chat.exitThread(key);
     } catch (e) {
-      store.failed(isGroup ? "退出群聊" : "删除群发", e);
+      store.failed(isGroup ? t("退出群聊") : t("删除群发"), e);
       return;
     }
     if (!gone) return;
     onClose();
     store.navigateBackToList();
-    store.toast(isGroup ? `已退出「${gone.title}」` : `已删除「${gone.title}」`, "trash");
+    store.toast(isGroup ? t("已退出「{title}」", { title: gone.title }) : t("已删除「{title}」", { title: gone.title }), "trash");
   }
 </script>
 
-<Sheet title={title} desc="{thread?.participants.length ?? 0} 台设备" label="会话操作" {onClose}>
+<Sheet title={title} desc={t("{n} 台设备", { n: thread?.participants.length ?? 0 })} label={t("会话操作")} {onClose}>
   <button class="opt" type="button" onclick={markRead}>
     <span class="oi"><Icon name="check" /></span>
     <span class="om">
-      <span class="on">标记为已读</span>
-      <span class="od">清空此会话的未读计数。</span>
+      <span class="on">{t("标记为已读")}</span>
+      <span class="od">{t("清空此会话的未读计数。")}</span>
     </span>
   </button>
 
@@ -132,8 +133,8 @@
     <button class="opt" type="button" onclick={editRecipients}>
       <span class="oi"><Icon name="group" /></span>
       <span class="om">
-        <span class="on">编辑收件人</span>
-        <span class="od">调整群发或群聊的参与设备。</span>
+        <span class="on">{t("编辑收件人")}</span>
+        <span class="od">{t("调整群发或群聊的参与设备。")}</span>
       </span>
     </button>
   {/if}
@@ -147,8 +148,8 @@
     <button class="opt" type="button" onclick={() => store.openSheet({ kind: "remarkDevice", peerId: dev.id })}>
       <span class="oi"><Icon name="settings" /></span>
       <span class="om">
-        <span class="on">修改备注{dev.remark ? ` · ${dev.remark}` : ""}</span>
-        <span class="od">给这台设备起一个只存在本机的名字（不发给对端）：会话与标题只写备注本身，设备页那一行显示「备注(设备名)」。</span>
+        <span class="on">{dev.remark ? t("修改备注 · {remark}", { remark: dev.remark }) : t("修改备注")}</span>
+        <span class="od">{t("给这台设备起一个只存在本机的名字（不发给对端）：会话与标题只写备注本身，设备页那一行显示「备注(设备名)」。")}</span>
       </span>
     </button>
 
@@ -156,11 +157,11 @@
       <button class="opt" type="button" onclick={() => store.openSheet({ kind: "pair", peerId: dev.id })}>
         <span class="oi"><Icon name="plus" /></span>
         <span class="om">
-          <span class="on">{dev.paired ? "重新配对" : "配对"}</span>
+          <span class="on">{dev.paired ? t("重新配对") : t("配对")}</span>
           <span class="od">
             {dev.paired
-              ? "对端不认本机的凭据（它清过数据，或换了机器）：拨号必然被拒，重新配对换一枚新 token。"
-              : "到配对表里完成配对。未配对也能发消息（HTTP 兜底），但拨不动长连接、也读不到对方的共享项。"}
+              ? t("对端不认本机的凭据（它清过数据，或换了机器）：拨号必然被拒，重新配对换一枚新 token。")
+              : t("到配对表里完成配对。未配对也能发消息（HTTP 兜底），但拨不动长连接、也读不到对方的共享项。")}
           </span>
         </span>
       </button>
@@ -173,16 +174,16 @@
     <button class="opt danger" type="button" onclick={() => void clearHistory()}>
       <span class="oi"><Icon name="trash" /></span>
       <span class="om">
-        <span class="on">清空聊天记录</span>
-        <span class="od">只清理本机记录，不影响对方。</span>
+        <span class="on">{t("清空聊天记录")}</span>
+        <span class="od">{t("只清理本机记录，不影响对方。")}</span>
       </span>
     </button>
   {:else if thread?.mode === "group"}
     <button class="opt" type="button" onclick={() => void clearGroupHistory()}>
       <span class="oi"><Icon name="trash" /></span>
       <span class="om">
-        <span class="on">清空聊天记录</span>
-        <span class="od">只清本机记录，不退群；之后的新消息照常收。</span>
+        <span class="on">{t("清空聊天记录")}</span>
+        <span class="od">{t("只清本机记录，不退群；之后的新消息照常收。")}</span>
       </span>
     </button>
   {/if}
@@ -192,11 +193,11 @@
     <button class="opt danger" type="button" onclick={() => void exitThread()}>
       <span class="oi"><Icon name="trash" /></span>
       <span class="om">
-        <span class="on">{thread.mode === "group" ? "退出群聊" : "删除群发"}</span>
+        <span class="on">{thread.mode === "group" ? t("退出群聊") : t("删除群发")}</span>
         <span class="od">
           {thread.mode === "group"
-            ? "本机退出这个群，本机这份记录也随之删除；其他成员不受影响。"
-            : "只删这份名单，消息仍留在各台设备的单独会话里。"}
+            ? t("本机退出这个群，本机这份记录也随之删除；其他成员不受影响。")
+            : t("只删这份名单，消息仍留在各台设备的单独会话里。")}
         </span>
       </span>
     </button>

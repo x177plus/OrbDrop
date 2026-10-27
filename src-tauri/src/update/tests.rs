@@ -299,3 +299,120 @@ async fn download_stops_when_the_body_exceeds_the_declared_size() {
     assert!(len <= 1024, "落盘不能超过清单声明的大小（实际 {len}）");
     let _ = std::fs::remove_file(&dest);
 }
+
+// ---------------------------------------------------------------------------
+// 调度：退避、抖动、跨进程状态
+// ---------------------------------------------------------------------------
+
+/// 连续失败按 5m → 30m → 2h 退避，之后回到常态间隔（6 小时封顶）。
+#[test]
+fn retry_backoff_grows_then_falls_back_to_the_periodic_interval() {
+    assert_eq!(retry_delay(1), Duration::from_secs(5 * 60));
+    assert_eq!(retry_delay(2), Duration::from_secs(30 * 60));
+    assert_eq!(retry_delay(3), Duration::from_secs(2 * 3600));
+    assert_eq!(retry_delay(4), CHECK_INTERVAL);
+    assert_eq!(retry_delay(99), CHECK_INTERVAL);
+}
+
+/// 成功后下一次以**上次成功时刻**为基准：启动时命中缓存不会把周期往后推 6 小时。
+#[test]
+fn due_after_success_is_anchored_to_the_last_success() {
+    let now = 1_700_000_000_000i64;
+    let jitter = Duration::from_secs(60);
+    let interval = CHECK_INTERVAL.as_millis() as i64;
+
+    let last = now - 20 * 60 * 1000;
+    assert_eq!(
+        due_after_success(now, Some(last), CHECK_INTERVAL, jitter),
+        last + interval + 60_000,
+        "20 分钟前成功过，下一次应当仍是那次 + 6h"
+    );
+
+    assert_eq!(
+        due_after_success(now, None, CHECK_INTERVAL, jitter),
+        now + interval + 60_000,
+        "从没成功过就从现在起算"
+    );
+
+    let future = now + 10 * 24 * 3600 * 1000;
+    assert_eq!(
+        due_after_success(now, Some(future), CHECK_INTERVAL, jitter),
+        now + interval + 60_000,
+        "时钟往回跳（上次成功在未来）不能把检查推到更远"
+    );
+
+    // 演练间隔（15 秒）不能被 60 秒下限压住：从没成功过 → 约 15 秒后就该查。
+    let short = Duration::from_secs(15);
+    assert_eq!(
+        due_after_success(now, None, short, Duration::from_secs(1)),
+        now + 16_000,
+        "短间隔演练要真的按短间隔排"
+    );
+}
+
+/// 抖动落在 `[0, 2 × CHECK_JITTER)` 里。
+#[test]
+fn jitter_stays_within_the_declared_window() {
+    let span = CHECK_JITTER * 2;
+    for _ in 0..64 {
+        let j = random_jitter(span);
+        assert!(j < span, "抖动越界：{j:?}");
+    }
+}
+
+/// 落盘状态要能原样读回，也要能容忍缺字段（老文件）与多字段（新版留下的）。
+#[test]
+fn persisted_state_roundtrips_and_tolerates_unknown_fields() {
+    let p = Persisted {
+        last_success_ms: Some(123),
+        latest_version: Some("0.0.3".into()),
+        available: Some(PersistedAvailable {
+            version: "0.0.3".into(),
+            notes: Some("修了几个问题".into()),
+            pub_date: Some("2026-10-01T00:00:00Z".into()),
+            size: 13_000_000,
+        }),
+        dismissed_version: Some("0.0.3".into()),
+    };
+    let json = serde_json::to_string(&p).unwrap();
+    assert_eq!(serde_json::from_str::<Persisted>(&json).unwrap(), p);
+
+    let old: Persisted = serde_json::from_str(r#"{"lastSuccessMs":123}"#).unwrap();
+    assert_eq!(old.last_success_ms, Some(123));
+    assert!(old.available.is_none() && old.dismissed_version.is_none());
+
+    let newer: Persisted =
+        serde_json::from_str(r#"{"lastSuccessMs":1,"somethingNew":true}"#).unwrap();
+    assert_eq!(newer.last_success_ms, Some(1));
+}
+
+/// 只有远端确实更高时才恢复"待安装"：装上了（或升过头）就把旧记录丢掉。
+#[test]
+fn restored_available_only_when_it_is_newer_than_the_installed_version() {
+    let p = Persisted {
+        available: Some(PersistedAvailable {
+            version: "0.0.3".into(),
+            notes: None,
+            pub_date: None,
+            size: 1,
+        }),
+        ..Persisted::default()
+    };
+    assert!(restored_available(&p, "0.0.2").is_some());
+    assert!(restored_available(&p, "0.0.3").is_none());
+    assert!(restored_available(&p, "0.1.0").is_none());
+}
+
+/// 「稍后」同时改快照与落盘那份，且字段名是前端认的 `dismissedVersion`。
+#[test]
+fn mark_dismissed_updates_both_copies() {
+    let mut c = Ctl::default();
+    mark_dismissed(&mut c, "0.2.0".into());
+    assert_eq!(c.state.dismissed_version.as_deref(), Some("0.2.0"));
+    assert_eq!(c.persisted.dismissed_version.as_deref(), Some("0.2.0"));
+    let json = serde_json::to_string(&c.persisted).unwrap();
+    assert!(
+        json.contains("\"dismissedVersion\":\"0.2.0\""),
+        "落盘字段名必须与前端/清单一致：{json}"
+    );
+}

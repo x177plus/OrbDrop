@@ -61,7 +61,12 @@
     if (m) return m[1] + " " + m[2];
     m = /Version\/([0-9.]+)[^)]*Safari/.exec(ua);
     if (m) return "Safari " + m[1];
-    return "未知内核";
+    return isChinese() ? "未知内核" : "Unknown engine";
+  }
+
+  /** 这一层比 i18n 运行时更早（入口脚本还解析不了），所以只按系统语言二选一。 */
+  function isChinese() {
+    return /^zh\b/i.test(navigator.language || navigator.userLanguage || "");
   }
 
   /**
@@ -146,6 +151,33 @@
   function notice() {
     if (!document.body || document.getElementById("engine-floor")) return;
     var android = (navigator.userAgent || "").indexOf("Android") >= 0;
+    var zh = isChinese();
+    var copy = zh
+      ? {
+          update: "到应用商店更新系统 WebView",
+          hintAndroid:
+            "没反应的话：在「应用商店 / 华为应用市场 / Play 商店」里搜 “Android System WebView” 更新，" +
+            "再回来重开 OrbDrop。",
+          hintOther: "请更新本机的 WebView / 浏览器内核，或升级 OrbDrop 之后再打开。",
+          title: "界面没能启动",
+          bodyBefore: "这台设备的内核是 ",
+          bodyAfter:
+            "，连 OrbDrop 界面需要的 ES2020 语法都没有 —— 入口脚本解析不过去，所以一个字也画不出来。",
+          retry: "重试",
+        }
+      : {
+          update: "Update system WebView",
+          hintAndroid:
+            "If nothing happens, search for “Android System WebView” in the app store " +
+            "(Play Store, Huawei AppGallery, etc.), update it, then reopen OrbDrop.",
+          hintOther:
+            "Update this device's WebView / browser engine, or upgrade OrbDrop, then open it again.",
+          title: "The interface couldn't start",
+          bodyBefore: "This device's engine is ",
+          bodyAfter:
+            ", which lacks the ES2020 syntax OrbDrop's interface needs — the entry script cannot be parsed, so nothing can be drawn.",
+          retry: "Retry",
+        };
     var box = document.createElement("div");
     box.id = "engine-floor";
     // 全部内联：这一层必须与产物里那份样式表（及其下限）无关。
@@ -159,20 +191,27 @@
     var link = android
       ? '<a href="market://details?id=com.google.android.webview" style="display:block;margin:22px 0 0;' +
         "padding:14px 18px;border-radius:12px;background:#2779e1;color:#fff;font-size:17px;" +
-        'font-weight:600;text-align:center;text-decoration:none">到应用商店更新系统 WebView</a>'
+        'font-weight:600;text-align:center;text-decoration:none">' +
+        copy.update +
+        "</a>"
       : "";
-    var hint = android
-      ? "没反应的话：在「应用商店 / 华为应用市场 / Play 商店」里搜 “Android System WebView” 更新，" +
-        "再回来重开 OrbDrop。"
-      : "请更新本机的 WebView / 浏览器内核，或升级 OrbDrop 之后再打开。";
+    var hint = android ? copy.hintAndroid : copy.hintOther;
     box.innerHTML =
-      '<div style="font-size:21px;font-weight:700">界面没能启动</div>' +
-      '<div style="margin-top:10px;color:#5a6068">这台设备的内核是 <b>' +
+      '<div style="font-size:21px;font-weight:700">' +
+      copy.title +
+      "</div>" +
+      '<div style="margin-top:10px;color:#5a6068">' +
+      copy.bodyBefore +
+      "<b>" +
       engineName() +
-      "</b>，连 OrbDrop 界面需要的 ES2020 语法都没有 —— 入口脚本解析不过去，所以一个字也画不出来。</div>" +
+      "</b>" +
+      copy.bodyAfter +
+      "</div>" +
       link +
       '<button id="engine-floor-retry" style="margin-top:14px;padding:13px 18px;border:1px solid #d7dade;' +
-      'border-radius:12px;background:#fff;color:#0e1217;font-size:17px">重试</button>' +
+      'border-radius:12px;background:#fff;color:#0e1217;font-size:17px">' +
+      copy.retry +
+      "</button>" +
       '<div style="margin-top:16px;color:#8a9099;font-size:13px">' +
       hint +
       "</div>";

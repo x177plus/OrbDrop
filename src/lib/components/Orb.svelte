@@ -1,6 +1,7 @@
 <script lang="ts">
   import Logo from '$lib/components/Logo.svelte';
   import type { OrbDragInfo } from '$lib/types';
+  import { t } from '$lib/i18n.svelte';
 
   let {
     badgeCount = 0,
@@ -49,9 +50,9 @@
   function isSliding(): boolean {
     if (!orbEl) return false;
     return orbEl.getAnimations().some((a) => {
-      const t = a as CSSTransition;
-      return typeof t.transitionProperty === 'string'
-        && SLIDE_PROPS.includes(t.transitionProperty)
+      const tr = a as CSSTransition;
+      return typeof tr.transitionProperty === 'string'
+        && SLIDE_PROPS.includes(tr.transitionProperty)
         && a.playState !== 'finished';
     });
   }
@@ -111,7 +112,7 @@
 <button
   class="orb"
   bind:this={orbEl}
-  aria-label={expanded ? '收起 OrbDrop 面板' : '展开 OrbDrop 面板'}
+  aria-label={expanded ? t('收起 OrbDrop 面板') : t('展开 OrbDrop 面板')}
   aria-expanded={expanded}
   onpointerdown={handlePointerDown}
   onpointermove={handlePointerMove}

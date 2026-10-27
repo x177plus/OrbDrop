@@ -9,6 +9,7 @@
   import Sheet from "../components/Sheet.svelte";
   import Icon from "../Icon.svelte";
   import * as store from "../store.svelte";
+  import { t } from "$lib/i18n.svelte";
 
   let { onClose }: { onClose: () => void } = $props();
 
@@ -32,20 +33,25 @@
   }
 </script>
 
-<Sheet title="连接请求" desc={req ? `来自「${req.peerName}」` : ""} label="连接请求" onClose={onClose}>
+<Sheet
+  title={t("连接请求")}
+  desc={req ? t("来自「{name}」", { name: req.peerName }) : ""}
+  label={t("连接请求")}
+  onClose={onClose}
+>
   {#if req}
     <div class="opt">
       <span class="oi"><Icon name="link" /></span>
       <span class="om">
-        <span class="on">接受后对方会与本机建立长连接</span>
-        <span class="od">实时通道：共享项变更广播、消息即时送达。</span>
+        <span class="on">{t("接受后对方会与本机建立长连接")}</span>
+        <span class="od">{t("实时通道：共享项变更广播、消息即时送达。")}</span>
       </span>
     </div>
-    <p class="field-hint">60 秒内未处理自动作废（剩余 {left} 秒）。</p>
+    <p class="field-hint">{t("60 秒内未处理自动作废（剩余 {n} 秒）。", { n: left })}</p>
   {/if}
 
   {#snippet foot()}
-    <button class="btn btn-secondary" type="button" onclick={() => void answer(false)}>拒绝</button>
-    <button class="btn btn-primary" type="button" onclick={() => void answer(true)}>接受</button>
+    <button class="btn btn-secondary" type="button" onclick={() => void answer(false)}>{t("拒绝")}</button>
+    <button class="btn btn-primary" type="button" onclick={() => void answer(true)}>{t("接受")}</button>
   {/snippet}
 </Sheet>

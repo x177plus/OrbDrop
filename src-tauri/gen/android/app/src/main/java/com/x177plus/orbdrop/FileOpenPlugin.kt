@@ -72,18 +72,18 @@ class FileOpenPlugin(private val activity: Activity) : Plugin(activity) {
     val allowed = roots.any { root ->
       file == root || file.path.startsWith(root.path + File.separator)
     }
-    if (!allowed) throw IllegalArgumentException("只能打开应用自己的文件：$path")
+    if (!allowed) throw IllegalArgumentException(activity.getString(R.string.file_open_not_owned, path))
     return file
   }
 
   private fun intentFor(path: String): Intent {
     val file = appOwnedFile(path)
-    if (!file.exists()) throw IllegalArgumentException("文件不在了：$path")
+    if (!file.exists()) throw IllegalArgumentException(activity.getString(R.string.file_open_missing, path))
     // 文件夹这一档没有出路：收件落在应用私有目录里，`content://` 也换不来一个"能浏览它"的应用
     // （FileProvider 给不出目录枚举）。与其丢一个系统解析不出的 Intent 让用户看到
     // "没有应用可执行此操作"，不如把话说明白。
     if (file.isDirectory) {
-      throw IllegalArgumentException("这是文件夹：安卓上没有能打开应用私有目录的应用")
+      throw IllegalArgumentException(activity.getString(R.string.file_open_is_directory))
     }
     val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", file)
     return Intent(Intent.ACTION_VIEW).apply {

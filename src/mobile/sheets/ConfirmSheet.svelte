@@ -2,6 +2,7 @@
   import Sheet from "../components/Sheet.svelte";
   import * as store from "../store.svelte";
   import type { ConfirmPrompt } from "../store.svelte";
+  import { t } from "$lib/i18n.svelte";
 
   /**
    * 应用内确认框：与其它底板同一套 `.sheet` 外壳、同一套按钮与遮罩。
@@ -16,7 +17,7 @@
 <Sheet title={prompt.title} desc={prompt.desc} label={prompt.title} {onClose}>
   {#snippet foot()}
     <button class="btn btn-secondary" type="button" onclick={onClose}>
-      {prompt.cancelLabel ?? "取消"}
+      {prompt.cancelLabel ?? t("取消")}
     </button>
     <button
       class="btn {prompt.danger ? "btn-danger" : "btn-primary"}"

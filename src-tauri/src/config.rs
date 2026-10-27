@@ -398,6 +398,11 @@ pub struct AppSettings {
     pub device_subdir: bool,
     pub download_mode: DownloadMode,
     pub device_name: String,
+    /// 界面语言（具体语言：`en` / `zh-CN`），见 `Config::language`。
+    ///
+    /// 旧配置里的 `auto` 在 `settings()` 中解析成系统语言（启动阶段写回配置），
+    /// 不会原样交给界面。
+    pub language: String,
     pub auto_start: bool,
     /// BeyondCompare 可执行文件路径；空 = 自动探测（注册表 / 常见安装路径）。
     pub bc_exe_path: String,
@@ -427,6 +432,7 @@ impl Default for AppSettings {
             device_subdir: default_device_subdir(),
             download_mode: DownloadMode::Direct,
             device_name: default_device_name(),
+            language: default_language(),
             auto_start: true,
             bc_exe_path: String::new(),
             online: true,
@@ -533,6 +539,15 @@ pub struct Config {
     pub download_mode: DownloadMode,
     #[serde(default = "default_device_name")]
     pub device_name: String,
+    /// 界面语言（具体语言）：`"en"` / `"zh-CN"`。
+    ///
+    /// **没有「跟随系统」这一档**：[`default_language`] 只写迁移标记 `auto`，启动阶段
+    /// `i18n::canonical_preference` 把它解析成具体系统语言（不支持时英语）并写回本字段；
+    /// 之后由用户在设置里手动切换。旧配置里的 `"auto"` 走同一条迁移。
+    ///
+    /// 前端负责界面正文；后端的托盘菜单与安卓通知栏按它换字（见 `crate::i18n`）。
+    #[serde(default = "default_language")]
+    pub language: String,
     #[serde(default = "default_auto_start")]
     pub auto_start: bool,
     #[serde(default)]
@@ -753,6 +768,7 @@ impl Config {
             device_subdir: self.device_subdir,
             download_mode: self.download_mode,
             device_name: self.device_name.clone(),
+            language: crate::i18n::canonical_preference(&self.language),
             auto_start: self.auto_start,
             bc_exe_path: self
                 .bc_exe_path
@@ -940,6 +956,46 @@ impl Config {
     // 中转记忆（F-107）：设备级链路 + 网段级策略
     // ------------------------------------------------------------------
 
+    /// 从落盘的记忆里清掉**本机自己**：旧版本会把本机的 id/地址写进反向记录池
+    /// （`relayRoutes` 的 `viaDevices` / `viaAddrs`）、设备级链路与观察记忆里。
+    ///
+    /// 返回是否真的动了（调用方据此决定要不要写回）。启动时跑一次 —— 运行期各入口
+    /// 自己已经挡了（`AppState::upsert_peer` / `merge_pool` / `relay_candidates`），
+    /// 但已经写进盘里的那一份不清掉，下一次启动还会被当成"最后已知事实"读出来：
+    /// 池里留着本机 → 第一拍向自己请中转 → 设备列表里出现一台"自己"。
+    pub fn scrub_self_identities(&mut self) -> bool {
+        let own = self.device_id.clone();
+        if own.is_empty() {
+            return false;
+        }
+        let own = own.as_str();
+        let mut changed = false;
+        // 地址簿 / 观察记忆 / 备注 / 观察指纹：本机自己从来不是一台对端。
+        changed |= self.peers.iter().any(|p| p.id.as_str() == own);
+        self.peers.retain(|p| p.id.as_str() != own);
+        changed |= self.known_peers.remove(own).is_some();
+        changed |= self.device_remarks.remove(own).is_some();
+        changed |= self.observed_fingerprints.remove(own).is_some();
+        // 设备级链路：键是目标、值是"经谁中转" —— 两边都可能是本机。
+        let before = self.relay_links.len();
+        self.relay_links
+            .retain(|id, link| id.as_str() != own && link.via_id.as_str() != own);
+        changed |= self.relay_links.len() != before;
+        // 网段级策略：池的 id 半份与地址半份里都可能是本机（对端把"经过你"的记录推回来）。
+        for route in &mut self.relay_routes {
+            let ids = route.via_devices.len();
+            route.via_devices.retain(|id| id.as_str() != own);
+            let paired = route.via_paired.len();
+            route.via_paired.retain(|id| id.as_str() != own);
+            let addrs = route.via_addrs.len();
+            route.via_addrs.retain(|d| d.id.as_str() != own);
+            changed |= ids != route.via_devices.len()
+                || paired != route.via_paired.len()
+                || addrs != route.via_addrs.len();
+        }
+        changed
+    }
+
     /// 这台设备上一次是怎么够着的（设备级链路记忆）。
     pub fn relay_link(&self, peer_id: &str) -> Option<&RelayLink> {
         self.relay_links
@@ -1026,6 +1082,7 @@ impl Default for Config {
             device_subdir: default_device_subdir(),
             download_mode: DownloadMode::Direct,
             device_name: default_device_name(),
+            language: default_language(),
             auto_start: true,
             shares: Vec::new(),
             bc_exe_path: None,
@@ -1170,6 +1227,15 @@ pub(crate) fn default_download_dir() -> PathBuf {
 /// 以来的落盘形状（`<落盘根>/<发送方名>/…`），升级不该把用户的东西挪个地方。
 pub fn default_device_subdir() -> bool {
     true
+}
+
+/// 配置文件里的缺省值：**`auto` 只是迁移标记，不是设置项**。
+///
+/// 首次启动 / 老配置没有这一项时先落成 `auto`；`boot_state` 随后用
+/// `i18n::canonical_preference` 解析成**具体系统语言**并写回（系统不支持时英语）。
+/// 这样磁盘上最终存的是 `en` / `zh-CN`，设置页也只列这两种，没有「跟随系统」。
+pub fn default_language() -> String {
+    "auto".to_string()
 }
 
 pub(crate) fn default_device_name() -> String {
@@ -1438,6 +1504,8 @@ pub fn load_config_at(path: &Path) -> Config {
     // 两处收口：地址簿里 id 不合法的行（对端自报的，见 `crate::ids`）与按路径重复的共享项。
     // 都只在**真的动了**才写回，不然每次启动都把配置重写一遍。
     let mut scrubbed = drop_invalid_peer_ids(&mut config.peers);
+    // 旧版本会把本机自己的 id/地址写进反向记录池与观察记忆：启动时清掉（见该方法的说明）。
+    scrubbed |= config.scrub_self_identities();
     scrubbed |= dedupe_shares(&mut config.shares);
     if scrubbed {
         if let Err(e) = save_config_at(path, &config) {
@@ -1898,6 +1966,7 @@ mod tests {
             device_subdir: false,
             download_mode: DownloadMode::AskEachTime,
             device_name: "TestPC".into(),
+            language: "en".into(),
             auto_start: false,
             device_id: "device-test-1".into(),
             peers: vec![],
@@ -2825,5 +2894,80 @@ mod tests {
 
         let back: PeerDevice = toml::from_str(&toml).expect("反序列化");
         assert!(back.relay.is_none(), "读回来没有中转（重启后由探活重算）");
+    }
+
+    /// 启动时的自清：旧版本写进盘里的"本机自己"（地址簿 / 观察记忆 / 观察指纹 / 链路 /
+    /// 网段策略的池）一次清干净，第二次调用不再算"动过"（不重复写盘）。
+    #[test]
+    fn self_identities_are_scrubbed_from_persisted_memory() {
+        let mut config = Config {
+            device_id: "own".into(),
+            ..Config::default()
+        };
+        config.peers.push(PeerDevice {
+            id: "own".into(),
+            name: "ME".into(),
+            ..Default::default()
+        });
+        config.known_peers.insert(
+            "own".into(),
+            KnownPeer {
+                name: "ME".into(),
+                ip: "10.0.0.1".into(),
+                port: 3890,
+                seen_at: "2026-10-27T00:00:00Z".into(),
+            },
+        );
+        config.device_remarks.insert("own".into(), "me".into());
+        config.observed_fingerprints.insert("own".into(), "FP".into());
+        config.relay_links.insert(
+            "own".into(),
+            RelayLink {
+                via_id: "peer-c".into(),
+                ..Default::default()
+            },
+        );
+        config.relay_links.insert(
+            "peer-x".into(),
+            RelayLink {
+                via_id: "own".into(),
+                ..Default::default()
+            },
+        );
+        let route = config.relay_route_mut("10.0.0.0/24");
+        route.via_devices = vec!["own".into(), "peer-c".into()];
+        route.via_paired = vec!["own".into()];
+        route.via_addrs = vec![
+            crate::relay::RouteDevice {
+                id: "own".into(),
+                name: "ME".into(),
+                ip: "10.0.0.1".into(),
+                port: 3890,
+            },
+            crate::relay::RouteDevice {
+                id: "peer-c".into(),
+                name: "C".into(),
+                ip: "10.0.0.2".into(),
+                port: 3890,
+            },
+        ];
+
+        assert!(config.scrub_self_identities(), "确实有东西要清");
+        assert!(config.peers.is_empty(), "地址簿里的自己");
+        assert!(config.known_peers.is_empty(), "观察记忆里的自己");
+        assert!(config.device_remarks.is_empty(), "备注表里的自己");
+        assert!(config.observed_fingerprints.is_empty(), "观察指纹里的自己");
+        assert!(config.relay_links.is_empty(), "链路的键和 via 都可能是自己");
+        let route = config.relay_route("10.0.0.0/24").expect("策略还在");
+        assert_eq!(route.via_devices, vec!["peer-c".to_string()]);
+        assert!(route.via_paired.is_empty());
+        assert_eq!(
+            route.via_addrs.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            vec!["peer-c"]
+        );
+        assert!(
+            !config.scrub_self_identities(),
+            "第二次没有可动的，不该再触发写盘"
+        );
     }
 }

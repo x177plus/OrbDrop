@@ -2,6 +2,7 @@
   import Sheet from "../components/Sheet.svelte";
   import * as api from "$lib/api";
   import * as store from "../store.svelte";
+  import { t } from "$lib/i18n.svelte";
 
   let { onClose }: { onClose: () => void } = $props();
 
@@ -16,12 +17,12 @@
     // 会顺延到 3891-3899）。
     const m = /^([\w.\-]+)(?::(\d{1,5}))?$/.exec(v);
     if (!m) {
-      store.toast("请输入 IP（或 IP:端口），例如 192.168.1.20 或 192.168.1.20:3890");
+      store.toast(t("请输入 IP（或 IP:端口），例如 192.168.1.20 或 192.168.1.20:3890"));
       return;
     }
     const port = m[2] ? Number(m[2]) : 0;
     if (port && (port < 1 || port > 65535)) {
-      store.toast("端口要在 1–65535 之间");
+      store.toast(t("端口要在 1–65535 之间"));
       return;
     }
     busy = true;
@@ -30,24 +31,24 @@
       // 那条包装把成败吞在内部，失败时这张表也会被关掉，用户刚敲进去的地址就没了。
       await api.addPeer(m[1], port);
     } catch (e) {
-      store.failed("添加设备", e);
+      store.failed(t("添加设备"), e);
       return;
     } finally {
       busy = false;
     }
-    store.toast(`已添加 ${m[1]}${port ? `:${port}` : ''}，等待配对`);
+    store.toast(t("已添加 {address}，等待配对", { address: `${m[1]}${port ? `:${port}` : ""}` }));
     onClose();
   }
 </script>
 
-<Sheet title="手动添加设备" desc="mDNS 不能跨网段，跨网段时输入对方 IP（端口留空自动扫 3890-3899）。" onClose={onClose}>
+<Sheet title={t("手动添加设备")} desc={t("mDNS 不能跨网段，跨网段时输入对方 IP（端口留空自动扫 3890-3899）。")} onClose={onClose}>
   <div class="field">
-    <label for="ipInput">设备地址</label>
+    <label for="ipInput">{t("设备地址")}</label>
     <input class="input num" id="ipInput" placeholder="192.168.1.20" bind:value={input} />
   </div>
 
   {#snippet foot()}
-    <button class="btn btn-secondary" type="button" onclick={onClose}>取消</button>
-    <button class="btn btn-primary" type="button" onclick={() => void add()}>添加</button>
+    <button class="btn btn-secondary" type="button" onclick={onClose}>{t("取消")}</button>
+    <button class="btn btn-primary" type="button" onclick={() => void add()}>{t("添加")}</button>
   {/snippet}
 </Sheet>

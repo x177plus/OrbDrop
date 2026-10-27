@@ -47,6 +47,13 @@ impl LinkIntent {
 pub struct AppState {
     pub config_path: PathBuf,
     pub config: Mutex<Config>,
+    /// 本机自己的 device id。启动时由 `Config` 决定，**运行期没有任何写点**（见
+    /// `config::load_config_at` 的 `device.id` 旁注），所以缓存一份而不是每次读配置锁。
+    ///
+    /// 这个值在本文件里是"对端 id 的排除项"：路由池、反向记录、中转候选与控制面都出现过
+    /// **本机自己**（对端把"经过你"的记录推回来，或池里留着一条指向本机的旧地址）。那些
+    /// 路径上一律用 `self.own_id()` 挡掉 —— 自己永远不是一台"对端设备"。
+    own_id: String,
     /// Known devices: paired + discovered + manual (merged view).
     pub peers: Mutex<Vec<PeerDevice>>,
     pub server_port: AtomicU16,
@@ -328,18 +335,29 @@ fn merge_pool(
     target: &str,
     fresh: Vec<PoolEntry>,
     gone: &HashSet<String>,
+    own_id: &str,
 ) -> Vec<PoolEntry> {
     let now = Instant::now();
     let old = pool.remove(target).unwrap_or_default();
     // `fresh_ids` 用拥有型 String（下面的循环会把 `fresh` 移走）。
-    let fresh_ids: HashSet<String> = fresh.iter().map(|e| e.id.clone()).collect();
+    let fresh_ids: HashSet<String> = fresh
+        .iter()
+        .filter(|e| e.id != own_id)
+        .map(|e| e.id.clone())
+        .collect();
     let mut merged: Vec<PoolEntry> = Vec::with_capacity(fresh.len() + old.len());
     for mut e in fresh {
+        // 本机自己永远不是中转候选：对端把"经过你"的记录推回来时，池里会出现自己的
+        // id 与地址（见 `maybe_send_route` 的收件人过滤与 `apply_relay_routes` 的 own-id
+        // 闸）。这里再兜一层 —— 池是三条路（活视野 / 中转方自报 / 反向记录）的共同落点。
+        if e.id == own_id {
+            continue;
+        }
         e.seen_at = Some(now);
         merged.push(e);
     }
     for e in old {
-        if fresh_ids.contains(&e.id) || gone.contains(&e.id) {
+        if e.id == own_id || fresh_ids.contains(&e.id) || gone.contains(&e.id) {
             continue;
         }
         merged.push(e);
@@ -478,6 +496,11 @@ pub(crate) fn accepts_peer_id(id: &str) -> bool {
 }
 
 impl AppState {
+    /// 本机自己的 device id（运行期不变，见字段说明）。
+    pub fn own_id(&self) -> &str {
+        &self.own_id
+    }
+
     pub fn new(mut config: Config, config_path: PathBuf) -> Self {
         // Peers: config address book + paired entries from the credential store.
         // Our own device id is never a peer: two instances sharing one credential
@@ -665,6 +688,7 @@ impl AppState {
 
         let state = Self {
             config_path,
+            own_id: own_id.clone(),
             config: Mutex::new(config),
             peers: Mutex::new(peers),
             server_port: AtomicU16::new(0),
@@ -715,6 +739,13 @@ impl AppState {
     /// entry (config.peers) if the peer is paired or was manually added.
     pub fn upsert_peer(&self, peer: &PeerDevice) {
         if !accepts_peer_id(&peer.id) {
+            return;
+        }
+        // 本机自己永远不是"对端"：反向路由记录/中转池里出现过把自己的 id 当成一台设备
+        // 的情形（对端把"经过你"的记录推回来），建出来的行会在设备列表里显示成"自己"。
+        // 所有建行/改行的入口都必须过这一关（`observe_verified_addr` / `mark_paired` 同）。
+        if peer.id == self.own_id {
+            debug!(peer_id = %peer.id, "忽略指向本机自己的设备行");
             return;
         }
         let mut created = false;
@@ -786,7 +817,7 @@ impl AppState {
     /// 于是"添加设备"填的地址会被静默忽略 —— 之后配对学到的地址也是空的，长连接
     /// 永远拨不出去（表现为设备行显示 `:0`）。
     pub fn add_peer_book(&self, peer: PeerDevice) {
-        if !accepts_peer_id(&peer.id) {
+        if !accepts_peer_id(&peer.id) || peer.id == self.own_id {
             return;
         }
         let peer_id = peer.id.clone();
@@ -842,6 +873,12 @@ impl AppState {
     /// 搬到别处去），也**不声明在线**（可达性由 5s 探活自己判）。
     pub fn observe_verified_addr(&self, peer_id: &str, ip: &str, port: u16) {
         if peer_id.is_empty() || ip.is_empty() || port == 0 {
+            return;
+        }
+        // 与 `upsert_peer` 同一道闸：`/relay/open`、`/relay/route` 的自报核实会把"请求方"
+        // 记成一行设备，而请求方完全可能是本机自己（选路时把自己当成了中转候选）。
+        if peer_id == self.own_id {
+            debug!(peer_id = %peer_id, addr = %format!("{ip}:{port}"), "忽略指向本机自己的地址观察");
             return;
         }
         let mut created = false;
@@ -1098,6 +1135,9 @@ impl AppState {
     /// 占位名（空串 / 等于设备 id）任何一条路都能改写；**真名只有核实过的那条路能改**
     /// （`trusted`）—— 这就是上面两条入口唯一的区别。
     fn merge_peer_name(&self, peer_id: &str, name: &str, trusted: bool) {
+        if peer_id == self.own_id {
+            return;
+        }
         let name = name.trim();
         if name.is_empty() || name == peer_id {
             return;
@@ -1143,6 +1183,9 @@ impl AppState {
     /// 调用点：学到名字那条路（`merge_peer_name`）与学到地址那条路（`upsert_peer` /
     /// `observe_verified_addr`）的尾巴上各一次 —— 于是"见过它"这件事三处都收得住。
     pub fn note_known_peer(&self, peer_id: &str) {
+        if peer_id == self.own_id {
+            return;
+        }
         let Some(p) = self.get_peer(peer_id) else {
             return;
         };
@@ -1161,7 +1204,7 @@ impl AppState {
 
     /// Mark a peer paired in both lists and persist the address book.
     pub fn mark_paired(&self, peer: &PeerDevice) {
-        if !accepts_peer_id(&peer.id) {
+        if !accepts_peer_id(&peer.id) || peer.id == self.own_id {
             return;
         }
         {
@@ -1396,7 +1439,7 @@ impl AppState {
     /// 记下对端**自报**的网段（F-107 §5）。空列表不动已有值 —— `nets` 是"活回话优先"的
     /// 一份知识，别让一次缺字段的 TXT 把它抹成空。
     pub fn note_peer_nets(&self, peer_id: &str, nets: &[String]) {
-        if peer_id.is_empty() || nets.is_empty() {
+        if peer_id.is_empty() || peer_id == self.own_id || nets.is_empty() {
             return;
         }
         let mut table = self.peer_nets.lock();
@@ -1504,7 +1547,7 @@ impl AppState {
                 .parse::<std::net::Ipv4Addr>()
                 .map(|vip| cidr.contains(vip))
                 .unwrap_or(false);
-            if voucher_here {
+            if voucher_here && voucher.id != self.own_id {
                 if voucher_relay {
                     devices.push(PoolEntry {
                         id: voucher.id.clone(),
@@ -1553,7 +1596,7 @@ impl AppState {
                 .cloned()
                 .unwrap_or_default()
             {
-                let merged = merge_pool(&mut pool, &target, devices.clone(), &gone);
+                let merged = merge_pool(&mut pool, &target, devices.clone(), &gone, &self.own_id);
                 addr_updates.push((
                     target,
                     merged.iter().map(PoolEntry::to_route_device).collect(),
@@ -1580,7 +1623,7 @@ impl AppState {
     /// （真机上就是这个表现：日志里 `via_cidr=` 是空的），"同段其他设备复用"与"把这条路由
     /// 推给对端"两件事都跟着落空。
     pub fn note_relay_net(&self, peer_id: &str, cidr: &str) {
-        if peer_id.is_empty() || crate::subnet::parse(cidr).is_none() {
+        if peer_id.is_empty() || peer_id == self.own_id || crate::subnet::parse(cidr).is_none() {
             return;
         }
         let mut table = self.peer_nets.lock();
@@ -1935,6 +1978,9 @@ impl AppState {
                     .via_devices
                     .iter()
                     .filter(|d| !d.id.is_empty() && !d.ip.is_empty() && d.port != 0)
+                    // 记录里点名**本机自己**当 via：对端把"经过你"的记录推回来时就是这样
+                    // （它那份池里还留着你的地址），收下等于把自己的 id/地址写进自己的池。
+                    .filter(|d| d.id != self.own_id)
                     .take(crate::relay::MAX_ROUTE_DEVICES)
                     .cloned()
                     .collect();
@@ -1972,7 +2018,7 @@ impl AppState {
                 let merged = {
                     // 加锁顺序统一为 config → pool。
                     let mut pool = self.relay_pool.lock();
-                    merge_pool(&mut pool, &r.target_cidr, fresh, &HashSet::new())
+                    merge_pool(&mut pool, &r.target_cidr, fresh, &HashSet::new(), &self.own_id)
                 };
                 let route = config.relay_route_mut(&r.target_cidr);
                 route.via_cidr = r.via_cidr.clone();
@@ -2114,6 +2160,7 @@ impl AppState {
                 !d.id.is_empty()
                     && !d.ip.is_empty()
                     && d.port != 0
+                    && d.id != self.own_id
                     && !known.contains(&d.id)
                     && !exclude.contains(&d.id.as_str())
             })
@@ -2177,10 +2224,15 @@ impl AppState {
         let Some(target_cidr) = self.cidr_of(target_id, &target_ip) else {
             return 0; // 目标的段都算不出来：这条池没有落点
         };
-        let adopted = self.adopt_devices(devices, &[target_id]);
+        let devices: Vec<crate::relay::RouteDevice> = devices
+            .iter()
+            .filter(|d| d.id != self.own_id)
+            .cloned()
+            .collect();
+        let adopted = self.adopt_devices(&devices, &[target_id]);
         // 这些设备是**别人报来的地址**，它们不会自报网段（adopted 不进探活队列）——
         // 由报出方说的这一段就是它们唯一的归属信息（见 `note_relay_net`）。
-        for d in devices {
+        for d in &devices {
             self.note_relay_net(&d.id, via_cidr);
         }
         let paired: HashSet<String> = self
@@ -2216,6 +2268,7 @@ impl AppState {
             &target_cidr,
             fresh,
             &HashSet::new(),
+            &self.own_id,
         );
         {
             // 中转方报来的这一池，地址也要跟着记（锚点离散之后仍要拨得动它 —— 这正是这份
@@ -2656,6 +2709,9 @@ impl AppState {
     /// 只对**已经在设备表里的行**生效（`set_peer_online` 就是这样：表里没有那一行时它什么
     /// 都不做）—— 入站载荷里的 id 不配凭空造出一行"在线设备"。
     pub fn note_heard_online(self: &Arc<Self>, peer_id: &str) {
+        if peer_id == self.own_id {
+            return;
+        }
         self.note_heard(peer_id);
         self.set_peer_online(peer_id, true);
     }
@@ -2835,6 +2891,11 @@ impl AppState {
     /// 设备在新 id 上重新变成"要这条链"（`to` 是发现形状的行，两个字段恒为 false）。
     /// 意图跟着这一行走，不跟着 `to` 走。
     pub fn rekey_peer(&self, from: &str, to: &PeerDevice) {
+        // 这个地址上答话的是本机自己（`apply_identity_reconcile` 先在前面挡了）：
+        // 把任何一行迁成"自己"都只会造出一台假设备。
+        if to.id == self.own_id || from == self.own_id {
+            return;
+        }
         {
             let mut peers = self.peers.lock();
             let Some(pos) = peers.iter().position(|p| p.id == from) else {
@@ -3999,7 +4060,7 @@ pub async fn probe_peers_once(state: &Arc<AppState>) {
     // 反向记录带进来的行也快照成一份：不能在持 `peers` 守卫时去锁 `adopted`（`sweep` 是反过来
     // 先 `adopted` 再 `peers` 的，两处抢锁顺序必须一致）。
     let adopted: HashSet<String> = state.adopted.lock().keys().cloned().collect();
-    let own_id = state.config.lock().device_id.clone();
+    let own_id = state.own_id().to_string();
 
     let candidates: Vec<PeerDevice> = {
         // 同一个 `ip:port` 只探一次：`knownPeers` 按 device id 存，对端换 id 后可能有多条
@@ -4340,7 +4401,19 @@ pub fn apply_identity_reconcile(
     if seen.id.is_empty() || seen.id == stale_id {
         return false; // 还是它自己：没有什么可收拾的
     }
-    let own_id = state.config.lock().device_id.clone();
+    let own_id = state.own_id().to_string();
+    // 这个地址上答话的是**本机自己**（路由池里留着自己一条旧地址、或一次自请求）：
+    // 那不是"对端换了 device id"，把旧行迁到自己名下只会造出一台假设备。
+    // 作废旧行的地址就够 —— 它本来指向的就是本机的监听端点。
+    if seen.id == own_id {
+        warn!(
+            stale = %stale_id,
+            addr = %format!("{}:{}", stale.ip, stale.port),
+            "地址上答话的是本机自己：作废这一行存的地址"
+        );
+        state.forget_peer_address(stale_id);
+        return false;
+    }
     // 这一步直接决定要不要动这一行（迁 id / 作废地址），所以读失败必须**什么都不做**：
     // 把"读不到"当成"它不认我们"，会拿瞬时故障去删一条有效的地址。
     let token = match crate::credential::get_peer_token(stale_id) {
@@ -4495,6 +4568,111 @@ mod tests {
             .map(|p| p.id)
             .collect();
         assert_eq!(ids, vec!["d".to_string()], "锚点关掉开关就不该再被当候选");
+    }
+
+    /// 反向记录/中转池里点名**本机自己**时：一行都不建、观察记忆里也不留。
+    ///
+    /// 真机回归（2026-10-27）：更新重启后，已配对的对端把"经过你"的反向记录推回来，
+    /// 池里带着本机的 id 与地址。旧代码把它并进设备表，下一拍向自己请中转，服务端核实
+    /// "请求方 = 本机"后把自己登记成**在线设备** —— 设备列表里出现一台自己，15 分钟后
+    /// 才随 adopted TTL 收走。
+    #[test]
+    fn a_route_naming_itself_never_becomes_a_peer() {
+        let state = memory_state();
+        let own = state.own_id().to_string();
+        let devices = vec![
+            crate::relay::RouteDevice {
+                id: own.clone(),
+                name: "OWN".into(),
+                ip: "10.20.30.40".into(),
+                port: 3890,
+            },
+            crate::relay::RouteDevice {
+                id: "peer-c".into(),
+                name: "C".into(),
+                ip: "10.20.30.41".into(),
+                port: 3890,
+            },
+        ];
+        assert_eq!(state.adopt_devices(&devices, &[]), 1, "只并进另一台");
+        assert!(state.get_peer(&own).is_none(), "本机自己永远不是一台对端");
+        assert!(state.get_peer("peer-c").is_some());
+        assert!(
+            !state.config.lock().known_peers.contains_key(&own),
+            "观察记忆里也不该留下自己"
+        );
+    }
+
+    /// 所有"观察到一个地址/听到它"的入口都挡本机自己（`/relay/open`、`/relay/route`
+    /// 的核实与入站会话）。
+    #[test]
+    fn observing_own_id_never_creates_or_marks_a_row() {
+        let state = memory_state();
+        let own = state.own_id().to_string();
+        state.observe_verified_addr(&own, "10.20.30.40", 3890);
+        state.note_heard_online(&own);
+        state.upsert_peer(&PeerDevice {
+            id: own.clone(),
+            name: "OWN".into(),
+            ip: "10.20.30.40".into(),
+            port: 3890,
+            online: true,
+            ..Default::default()
+        });
+        assert!(state.get_peer(&own).is_none());
+        assert!(!state.heard_recently(&own), "也不该进「刚听到过」那一档");
+    }
+
+    /// 活视野/反向记录的中转池里出现本机 id 时，`merge_pool` 直接丢掉。
+    #[test]
+    fn pool_never_contains_the_local_device() {
+        let state = memory_state();
+        state
+            .config
+            .lock()
+            .relay_route_mut("192.168.1.0/24")
+            .via_cidr = "192.168.50.0/24".into();
+        let own = state.own_id().to_string();
+        let voucher = discovered("c", "192.168.50.7", None, true);
+        let entries = vec![
+            discovered("d", "192.168.50.8", Some("192.168.50.0/24"), true),
+            discovered(own.as_str(), "192.168.50.9", Some("192.168.50.0/24"), true),
+        ];
+        state.absorb_view("c", &["192.168.50.0/24".into()], true, &voucher, &entries);
+        let ids: Vec<String> = state
+            .pool_for("192.168.1.0/24")
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids, vec!["c".to_string(), "d".to_string()]);
+    }
+
+    /// 身份核对时地址上答话的是**本机自己**：不是"对端换了 id"，作废旧行地址即可，
+    /// 绝不能把旧行迁成一行"自己"。
+    #[test]
+    fn identity_reconcile_does_not_migrate_a_row_onto_the_local_device() {
+        let state = memory_state();
+        state.upsert_peer(&PeerDevice {
+            id: "stale".into(),
+            name: "S".into(),
+            ip: "10.20.30.41".into(),
+            port: 3890,
+            online: true,
+            ..Default::default()
+        });
+        let own = state.own_id().to_string();
+        let seen = PeerIdentity {
+            id: own.clone(),
+            name: "OWN".into(),
+            paired_as: None,
+            relay: false,
+            nets: Vec::new(),
+            port: Some(3890),
+        };
+        assert!(!apply_identity_reconcile(&state, "stale", &seen));
+        assert!(state.get_peer(&own).is_none(), "不许迁出一台自己");
+        let stale = state.get_peer("stale").expect("旧行还在");
+        assert!(stale.ip.is_empty() && stale.port == 0, "旧地址作废");
     }
 
     /// 池的地址要跟着**活视野**走进策略里（`RelayRoute::via_addrs`）—— 锚点不再供表之后，

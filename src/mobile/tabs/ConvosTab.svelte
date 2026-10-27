@@ -1,6 +1,7 @@
 <script lang="ts">
   import * as chat from "$lib/stores/chat.svelte";
   import Icon from "../Icon.svelte";
+  import { t } from "$lib/i18n.svelte";
   import * as store from "../store.svelte";
 
   // 列表的行、未读数、最近一条的摘要与时刻都在会话 store 里算好了（原型那套 `summary` /
@@ -13,7 +14,7 @@
     try {
       await chat.joinGroup(id);
     } catch (e) {
-      store.failed("加入群聊", e);
+      store.failed(t("加入群聊"), e);
       return;
     }
     // `joinGroup` 自己会打开这个群，但那次打开没走 hash 路由：不把 hash 跟上去，"返回"就落到
@@ -27,7 +28,7 @@
     try {
       await chat.dismissGroup(id);
     } catch (e) {
-      store.failed("拒绝群邀请", e);
+      store.failed(t("拒绝群邀请"), e);
     }
   }
 </script>
@@ -37,23 +38,24 @@
        拼出来 —— 一张 `.card.list` 里一行 `.frow`，右侧两颗小按钮。 -->
   {#if invites.length}
     <div class="sec">
-      <div class="sec-label"><span>群邀请</span><span class="num">{invites.length} 个</span></div>
+      <div class="sec-label"><span>{t("群邀请")}</span><span class="num">{t("{n} 个", { n: invites.length })}</span></div>
       <div class="stack">
         {#each invites as invite (invite.id)}
-          {@const wait = invite.buffered > 0 ? ` · 已有 ${invite.buffered} 条消息在等你` : ''}
+          {@const extra =
+            invite.buffered > 0 ? t(" · 已有 {n} 条消息在等你", { n: invite.buffered }) : ''}
           <div class="card list">
             <div class="frow">
               <span class="av grp"><Icon name="group" /></span>
               <span class="fmain">
                 <span class="fname2">{invite.name}</span>
-                <span class="fmeta">来自 {invite.fromName} · {invite.members.length} 台设备{wait}</span>
+                <span class="fmeta">{t("来自 {from} · {n} 台设备{extra}", { from: invite.fromName, n: invite.members.length, extra })}</span>
               </span>
               <span class="dacts">
                 <button class="btn btn-secondary btn-sm" type="button" onclick={() => void dismiss(invite.id)}>
-                  拒绝
+                  {t("拒绝")}
                 </button>
                 <button class="btn btn-primary btn-sm" type="button" onclick={() => void join(invite.id)}>
-                  加入
+                  {t("加入")}
                 </button>
               </span>
             </div>
@@ -84,9 +86,9 @@
               <span class="cv-top">
                 <span class="cv-name">{row.label}</span>
                 {#if row.mode === "broadcast"}
-                  <span class="cv-mode bc"><Icon name="bc" />群发</span>
+                  <span class="cv-mode bc"><Icon name="bc" />{t("群发")}</span>
                 {:else if row.mode === "group"}
-                  <span class="cv-mode grp"><Icon name="group" />群聊</span>
+                  <span class="cv-mode grp"><Icon name="group" />{t("群聊")}</span>
                 {/if}
                 <span class="cv-dot {row.dot} {row.trusted ? 'solid' : 'hollow'}"></span>
                 <span class="cv-time num">{row.time}</span>
@@ -104,10 +106,10 @@
     <!-- 有邀请卡时不画这颗鸡蛋："先在设备页配对或连接一台设备"对着一张已经能点的邀请卡是句废话。 -->
     <div class="empty">
       <Icon name="chat" />
-      <p>还没有会话</p>
+      <p>{t("还没有会话")}</p>
       <!-- 只列**有过消息**的会话（见 `chat.convoRows`）：所以这里不能再说"先去配对" ——
            配对了也不会自己冒出一行，得先开一条会话或等对方先说话。 -->
-      <p class="es">点右上「＋」选一台设备开始；设备发来消息也会出现在这里。</p>
+      <p class="es">{t("点右上「＋」选一台设备开始；设备发来消息也会出现在这里。")}</p>
     </div>
   {/if}
 </div>

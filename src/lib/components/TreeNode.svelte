@@ -6,6 +6,7 @@
   import { getServerPort } from '$lib/stores/shares.svelte';
   import { dragOut } from '$lib/dragOut';
   import { peerDownloadActive, peerDownloadOf, peerDownloadPct, togglePeerDownloadPause } from '$lib/stores/peerDownloads.svelte';
+  import { t } from '$lib/i18n.svelte';
   import TreeNode from './TreeNode.svelte';
 
   let {
@@ -64,8 +65,8 @@
     e.preventDefault();
     e.stopPropagation();
     const result = await togglePeerDownloadPause(peerId, shareId, ownPath);
-    if (result === 'missing') notify('这项已不在下载中');
-    else if (result === 'error') notify('暂停 / 继续下载失败');
+    if (result === 'missing') notify(t('这项已不在下载中'));
+    else if (result === 'error') notify(t('暂停 / 继续下载失败'));
   }
 
   let expanded = $state(false);
@@ -85,7 +86,7 @@
       }
       loaded = true;
     } catch (e: any) {
-      error = e?.message ?? '加载失败';
+      error = e?.message ?? t('加载失败');
     } finally {
       loading = false;
     }
@@ -128,7 +129,7 @@
 {#if entry.isDir}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="node" class:sub={level > 1} oncontextmenu={openCtx} use:dragOut={{ source: dragSource, onMessage: notify }}>
-    <button class="chev" style="width:18px; height:18px; flex:none; margin-left:-22px" onclick={toggle} aria-label="展开">
+    <button class="chev" style="width:18px; height:18px; flex:none; margin-left:-22px" onclick={toggle} aria-label={t('展开')}>
       {@html ICON_CHEVRON}
     </button>
     <span class="f-icon">{@html ICON_FOLDER}</span>
@@ -137,11 +138,11 @@
   {#if expanded}
     <div style="padding-left:16px">
       {#if loading}
-        <div class="node sub"><span class="n-name" style="color:var(--muted)">加载中…</span></div>
+        <div class="node sub"><span class="n-name" style="color:var(--muted)">{t('加载中…')}</span></div>
       {:else if error}
         <div class="node sub"><span class="n-name" style="color:var(--warn)">{error}</span></div>
       {:else if children.length === 0}
-        <div class="node sub"><span class="n-name" style="color:var(--muted)">空目录</span></div>
+        <div class="node sub"><span class="n-name" style="color:var(--muted)">{t('空目录')}</span></div>
       {:else}
         {#each children as child (child.name)}
           <TreeNode {shareId} entry={child} level={level + 1} parentPath={ownPath} {peerId} {refreshSignal} />
@@ -158,8 +159,8 @@
     class:dl-paused={download?.status === 'paused'}
     style="--dl-pct: {downloadPct / 100}"
     title={download?.status === 'paused'
-      ? `已暂停 · 双击继续「${entry.name}」`
-      : download?.status === 'running' ? `双击暂停「${entry.name}」` : undefined}
+      ? t('已暂停 · 双击继续「{name}」', { name: entry.name })
+      : download?.status === 'running' ? t('双击暂停「{name}」', { name: entry.name }) : undefined}
     ondblclick={toggleDownload}
     oncontextmenu={openCtx}
     use:dragOut={{ source: dragSource, onMessage: notify }}

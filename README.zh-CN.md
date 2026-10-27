@@ -101,7 +101,7 @@ APK 装不上时按机型选包：手机上绝大多数是 arm64（`OrbDrop_<版
 | 传输加密 | 首启生成一次自签身份，加上对端证书**指纹 pinning**（TOFU —— 记住的是指纹，不是主机名）。明文只存在于回环。token 与指纹存在数据目录里同一份凭据文件；App 内「清空全部凭据」同时清掉 Beyond Compare 里的 profile。 |
 | 传输内核 | 按文件身份记的**块级续传**（传失败重推是接着传；接收端重启后还会自己接着收）、每块 SHA-256 校验、先写 `<名字>.orbdrop-part` 再原子改名，并发数（1–8）与分块大小（1–32 MB）可配。本机回环 TLS、热缓存实测：3000 个 4 KB 小文件 1.72 s，单个 128 MB 文件 101 MB/s。 |
 | 设备管理 | 设备备注**只存在本机**（不随任何报文发出去）、按名字或 IP 搜索、待处理角标、随时解除配对（不需要对方在线）。 |
-| 设置 | 下载目录与下载模式、推送按发送方分目录、本机名称、端口、开机自启、中转开关、传输并发与分块。日志按天轮转，落在数据目录。 |
+| 设置 | 下载目录与下载模式、推送按发送方分目录、本机名称、端口、开机自启、中转开关、传输并发与分块，以及**界面语言**（首次启动直接采用系统语言，不支持时回退英语；之后可随时在 English / 简体中文之间手动切换）。选中即刻生效，并同步切换托盘菜单与安卓通知。日志按天轮转，落在数据目录。 |
 | 安卓端 | 前台服务保活（后台仍在线、仍能收到推送），消息通知与保活通知是**两个渠道**（能单独关掉提醒而保住在线），可以在会话里发文件、也可以把一个已安装应用的安装包发过去（落盘名带应用名、版本与包名），收件点一下用系统程序打开（`.apk` 直接进系统安装器），手机也能当中转方。 |
 | 自更新 | 清单里的产物同时带 `sha256` 与 minisign 签名；桌面端单文件 exe 用刚下好的新 exe 当 helper 覆盖自己（失败回滚回旧版）；下载按 GitHub → Gitee 顺序测速切换，并记住 24 小时内的优选镜像。 |
 
@@ -139,6 +139,10 @@ npm run android:build:arm64  # 只编 arm64 的安卓 release 包
 
 发行版产物与更新清单见本仓的[发行版](https://github.com/x177plus/OrbDrop/releases/latest)。
 
+## 社区与致谢
+
+- [LINUX DO](https://linux.do) —— 新的理想型社区，Where possible begins。
+
 ## 许可证
 
 **GNU General Public License v3.0 或更高版本**（`GPL-3.0-or-later`），全文见 [LICENSE](./LICENSE)。
@@ -150,3 +154,7 @@ GNU General Public License as published by the Free Software Foundation, either 
 License, or (at your option) any later version. This program is distributed in the hope that it
 will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=x177plus/OrbDrop&type=Date)](https://star-history.com/#x177plus/OrbDrop&Date)

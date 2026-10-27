@@ -1,6 +1,6 @@
 {
   "name": "orbdrop",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "OrbDrop — LAN file sharing tool",
   "type": "module",
   "scripts": {
@@ -11,6 +11,7 @@
     "tokens:gen": "node scripts/gen-color-tokens.mjs src/mobile/mobile.css && node scripts/gen-color-tokens.mjs src/styles/main.css",
     "tokens:check": "node scripts/gen-color-tokens.mjs --check src/mobile/mobile.css && node scripts/gen-color-tokens.mjs --check src/styles/main.css",
     "check:compat": "node scripts/check-compat.mjs",
+    "check:i18n": "node scripts/check-i18n.mjs",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test:snapshot": "node scripts/test-snapshot-order.mjs",

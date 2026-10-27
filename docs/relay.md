@@ -328,6 +328,14 @@ POST /relay/route                      # 已配对：Bearer；未配对：自报
   **不进探活队列**（本机跟它们之间没有关系；要借中转时按需拨，那一次就验证了可达性）。
   条数也有上限：单条记录最多 16 台、一次最多并 64 台 —— 不设限时一个 64MB 的请求体就能把
   设备表灌满，还得每 5s 逐个探活。
+- **本机自己永远不是中转方、也不是对端**（2026-10-27 修）：反向推回来的记录里可能点着**收件人
+  自己**（发送方的池里还留着你的地址）。推送前 `relay::without_recipient` 把收件人剔掉、池被
+  剔空的记录整条不发；接收侧 `apply_relay_routes` / `adopt_devices` / `merge_pool` 丢弃 own id；
+  选路 `relay_candidates` 排除 own id 与**本机监听端点**（池里那条可能挂着别的 id、地址却是
+  本机）；`/relay/open` / `/relay/route` 对自称本机的请求直接 400。启动时
+  `Config::scrub_self_identities` 清掉旧版本写进盘里的自己（池、观察记忆、观察指纹、链路）。
+  **真机回归**：更新重启后池里带着本机 → 第一拍向自己请中转 → 服务端把自己登记成**在线设备**，
+  设备列表里出现"自己"（`adopted` 档，15 分钟后才随 TTL 收走）。
 - **`adopted` 那一档能被"担保人的转述"升格**（2026-10-15 修）：这些行不探活、也不打 `seen`，
   界面的准入（`online || paired || seen`）一条都不满足 —— 所以**已配对的对端**在它自己的
   `/discover` 表里报来同一台时，`learn_peers` 把它按"学来的"接管（写存活/地址/名字、并从
@@ -449,6 +457,14 @@ B 落库后：`relayRoutes[AB 段] = { viaCidr: CD 段, viaDevices: [C, D] }` �
 | `state::tests::route_record_rejected_when_target_cidr_excludes_self` | 目标段不含本机地址 / 没有可拨设备 → 丢弃；采纳时只记**本机自己**的配对状态；池里设备进列表但**不写地址簿** |
 | `state::tests::relay_report_fills_the_pool_without_pairing` | 中转方自报的那一段池：不配对也能拿到，池按**目标段**记；段算不出来时不记 |
 | `state::tests::route_record_never_rewrites_known_rows` | 回归：记录里点名**已有**的设备时，名字 / 地址 / 配对状态一个字都不动（内存与地址簿都一样）；新 id 才并进来并归 `adopted` |
+| `state::tests::a_route_naming_itself_never_becomes_a_peer`（§10.3） | 记录里点名本机自己：一行都不建、观察记忆里也不留 |
+| `state::tests::observing_own_id_never_creates_or_marks_a_row`（§10.3） | `observe_verified_addr` / `note_heard_online` / `upsert_peer` 都挡本机自己的 id |
+| `state::tests::pool_never_contains_the_local_device`（§10.3） | 活视野/反向记录的中转池里出现本机 id 时，`merge_pool` 直接丢掉 |
+| `state::tests::identity_reconcile_does_not_migrate_a_row_onto_the_local_device`（§10.3） | 地址上答话的是本机自己：作废旧行地址，绝不迁移出一行"自己" |
+| `relay::tests::a_route_pushed_to_a_peer_never_names_that_peer`（§10.3） | 推给 P 的记录里剔掉 P；池被剔空的记录整条不发 |
+| `relay::tests::relay_candidates_never_include_the_local_device`（§10.3） | 池里留着本机 id 时，选路永远不返回自己 |
+| `relay::tests::relay_candidates_skip_addresses_that_are_our_own_listener`（§10.3） | 地址是本机监听端点的候选被跳过；同机多开的另一个端口不误伤 |
+| `config::tests::self_identities_are_scrubbed_from_persisted_memory`（§10.3） | 启动自清：地址簿 / 观察记忆 / 备注 / 观察指纹 / 链路 / 策略池里的自己一次清干净，第二次不再算"动过" |
 | `state::tests::pool_refresh_keeps_the_addresses_on_the_route`（§19 新增） | 活池刷新要把**地址**写进策略（`RelayRoute.viaAddrs`）：锚点离散后"拨得动池里那台"全靠它 |
 | `state::tests::relay_capability_refreshes_from_the_live_discover_reply`（§19 新增） | 已配对 + 长连接活着的对端（不走 `probe_addr`）也要在 `/discover` 活回话里刷新 `relay` 位 —— 否则锚点表里那台永远 `relay:false`，请求方那边没有可换的第二台 |
 

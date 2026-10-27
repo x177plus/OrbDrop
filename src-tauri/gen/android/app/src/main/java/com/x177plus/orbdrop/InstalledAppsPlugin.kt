@@ -144,7 +144,7 @@ class InstalledAppsPlugin(private val activity: Activity) : Plugin(activity) {
   fun icon(invoke: Invoke) {
     val pkg = invoke.parseArgs(AppIconArgs::class.java).packageName
     if (pkg.isNullOrEmpty()) {
-      invoke.reject("没有给包名")
+      invoke.reject(activity.getString(R.string.apps_missing_package))
       return
     }
     iconCache[pkg]?.let {
