@@ -208,8 +208,8 @@ macOS 的更新单位是整个 `.app`：
 
 ```bash
 npm run mac:artifact
-# → assets/v<版本>/orbdrop-macos-universal.app.zip   （自更新）
-# → assets/v<版本>/OrbDrop_<版本>_universal.dmg      （直接安装）
+# → assets/v<版本>/OrbDrop_<版本>_macos_universal.app.zip   （自更新）
+# → assets/v<版本>/OrbDrop_<版本>_macos_universal.dmg      （直接安装）
 ```
 
 `macos-artifact.mjs` 只让 Tauri 出 `.app`（`--bundles app`），然后：
@@ -246,7 +246,7 @@ DMG 不走 Tauri 自带的 dmg bundler：那个 bundler 会调 Finder/AppleScrip
   "size": 18874368,
   "sha256": "…",
   "sig": "…",
-  "mirrors": ["https://github.com/…/orbdrop-macos-universal.app.zip", "https://gitee.com/…"]
+  "mirrors": ["https://github.com/…/OrbDrop_X.Y.Z_macos_universal.app.zip", "https://gitee.com/…"]
 }
 ```
 
@@ -254,15 +254,15 @@ DMG 不走 Tauri 自带的 dmg bundler：那个 bundler 会调 Finder/AppleScrip
 
 ```bash
 node scripts/release.mjs --version X.Y.Z --notes "..." \
-  --macos-zip assets/vX.Y.Z/orbdrop-macos-universal.app.zip \
-  --macos-dmg assets/vX.Y.Z/OrbDrop_X.Y.Z_universal.dmg
+  --macos-zip assets/vX.Y.Z/OrbDrop_X.Y.Z_macos_universal.app.zip \
+  --macos-dmg assets/vX.Y.Z/OrbDrop_X.Y.Z_macos_universal.dmg
 ```
 
 `--macos-zip` 是自更新单元，会写进 `update.json` 并被客户端校验/解压；`--macos-dmg` 只随
 Release 上传（GitHub/Gitee 各一份）并落进 `assets/vX.Y.Z/`，**不进清单**，供用户首次安装。
 
 macOS 包只能在 Mac 上构建：用 `macos-artifact.mjs` 或
-`.github/workflows/macos.yml`（手动触发，上传 `orbdrop-macos-universal.app.zip` 与 dmg）。
+`.github/workflows/macos.yml`（手动触发，上传 `OrbDrop_<版本>_macos_universal.app.zip` 与 dmg）。
 
 ## 6. 构建
 

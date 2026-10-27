@@ -29,20 +29,26 @@ LAN only: no NAT traversal, no relay servers, no cloud, no accounts.
 
 ## Download
 
-| Platform | File | GitHub | Gitee |
-| --- | --- | --- | --- |
-| Windows desktop (x86_64) | `orbdrop.exe` | [latest](https://github.com/x177plus/OrbDrop/releases/latest) | [latest](https://gitee.com/x177plus/OrbDrop/releases) |
-| macOS 11+ (universal) | `orbdrop-macos-universal.app.zip` | [latest](https://github.com/x177plus/OrbDrop/releases/latest) | [latest](https://gitee.com/x177plus/OrbDrop/releases) |
-| Android (universal) | `app-universal-release.apk` | [latest](https://github.com/x177plus/OrbDrop/releases/latest) | [latest](https://gitee.com/x177plus/OrbDrop/releases) |
-| Android (arm64) | `app-arm64-release.apk` | [latest](https://github.com/x177plus/OrbDrop/releases/latest) | [latest](https://gitee.com/x177plus/OrbDrop/releases) |
+Pick your platform, then take the file in the “Download this” column; `<version>` is the release
+version (for example `0.1.1`). Release pages:
+[GitHub latest](https://github.com/x177plus/OrbDrop/releases/latest) ·
+[Gitee latest](https://gitee.com/x177plus/OrbDrop/releases).
 
-The Windows desktop build is a single portable exe (no installer). The macOS build is a universal
-`.app` (Apple Silicon + Intel); unsigned CI builds need one right-click → **Open** on first launch,
-and self-update requires the app to live in a writable location (normally `/Applications`). See
+| Platform | Download this | Notes |
+| --- | --- | --- |
+| Windows desktop (x86_64) | `OrbDrop_<version>_windows_x64.exe` | Single portable exe, no installer |
+| macOS 11+ (universal) | `OrbDrop_<version>_macos_universal.dmg` | **Use this for first install**; unsigned builds need one right-click → **Open** |
+| Android (arm64) | `OrbDrop_<version>_android_arm64.apk` | Most phones; smaller and lighter |
+| Android (universal) | `OrbDrop_<version>_android_universal.apk` | Older devices/emulators; pick this if unsure |
+
+`OrbDrop_<version>_macos_universal.app.zip` and `update.json` are for **in-app auto-update** — you do
+not need to download them by hand; the app fetches them when an update is available. The Windows
+build is a single portable exe (no installer). The macOS build is a universal `.app` (Apple Silicon +
+Intel); self-update requires the app to live in a writable location (normally `/Applications`). See
 [`docs/macos.md`](./docs/macos.md) for the platform notes and the real-Mac verification checklist.
 
-If an APK refuses to install, pick by device:
-almost every phone is arm64 (`app-arm64-release.apk`, smaller and lighter); if unsure, use the universal build.
+If an APK refuses to install, pick by device: almost every phone is arm64
+(`OrbDrop_<version>_android_arm64.apk`, smaller and lighter); if unsure, use the universal build.
 
 ### Update manifest and verification
 
@@ -53,7 +59,8 @@ The manifest URL is a compile-time constant in the client, so this repository se
 
 Every artifact URL inside the manifest is pinned to a tag (`releases/download/vX.Y.Z/...`), so an old client
 never fetches the wrong build after a new release. Each artifact carries `size` and `sha256` (Windows builds
-additionally carry a Tauri update signature in `sig`), so a download can be checked by hand: `sha256sum orbdrop.exe`.
+additionally carry a Tauri update signature in `sig`), so a download can be checked by hand:
+`sha256sum OrbDrop_<version>_windows_x64.exe` or `shasum -a 256 OrbDrop_<version>_macos_universal.app.zip`.
 
 ## Highlights
 

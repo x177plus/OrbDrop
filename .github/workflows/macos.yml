@@ -63,8 +63,8 @@ jobs:
       - name: Collect artifacts
         run: |
           mkdir -p out
-          cp assets/v*/orbdrop-macos-universal.app.zip out/
-          cp assets/v*/OrbDrop_*_universal.dmg out/
+          cp assets/v*/OrbDrop_*_macos_universal.app.zip out/
+          cp assets/v*/OrbDrop_*_macos_universal.dmg out/
           shasum -a 256 out/* | tee out/SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4

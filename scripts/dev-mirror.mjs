@@ -256,6 +256,6 @@ server.listen(port, "127.0.0.1", () => {
     note(`/manifest.json → 还没有 update.json（先跑 node scripts/release.mjs --local --skip-build --version <版本>）`);
   }
   note(`客户端：ORBDROP_UPDATE_MANIFEST=http://127.0.0.1:${port}/manifest.json npm run tauri dev`);
-  note(`演练 Gitee 附件路径：http://127.0.0.1:${port}/gitee/assets/v${wantVersion ?? "<版本>"}/orbdrop.exe`);
+  note(`演练 Gitee 附件路径：http://127.0.0.1:${port}/gitee/assets/v${wantVersion ?? "<版本>"}/OrbDrop_${wantVersion ?? "<版本>"}_windows_x64.exe`);
   note("Ctrl+C 结束。");
 });

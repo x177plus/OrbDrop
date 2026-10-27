@@ -36,6 +36,7 @@ import process from "node:process";
 import {
   ASSET_NAMES,
   ROOT,
+  assetNames,
   die,
   fileSize,
   humanSize,
@@ -138,6 +139,8 @@ const keyPath = requireSigningKey(cfg);
 const git = (args, opts = {}) => run("git", ["-C", cfg.repoPath, ...args], opts);
 
 const ver = parseVersion(opt("--version") ?? tauriVersion());
+/** 本次发布的统一附件名（`OrbDrop_<版本>_<平台>_<架构>.<扩展名>`）。 */
+const NAMES = assetNames(ver.raw);
 const versions = readVersions();
 const drifted = Object.entries(versions).filter(([, v]) => v !== ver.raw);
 
@@ -196,9 +199,9 @@ if (SKIP_BUILD) {
 /* ---------- 产物定位与核对 ---------- */
 
 const ARTIFACTS = [
-  { kind: "exe", label: "Windows 桌面端 exe", src: path.resolve(ROOT, cfg.artifacts.desktopExe), name: ASSET_NAMES.exe },
-  { kind: "universal", label: "Android 通用包 APK", src: path.resolve(ROOT, cfg.artifacts.androidUniversalApk), name: ASSET_NAMES.universal },
-  { kind: "arm64", label: "Android arm64 APK", src: path.resolve(ROOT, cfg.artifacts.androidArm64Apk), name: ASSET_NAMES.arm64 },
+  { kind: "exe", label: "Windows 桌面端 exe", src: path.resolve(ROOT, cfg.artifacts.desktopExe), name: NAMES.exe },
+  { kind: "universal", label: "Android 通用包 APK", src: path.resolve(ROOT, cfg.artifacts.androidUniversalApk), name: NAMES.universal },
+  { kind: "arm64", label: "Android arm64 APK", src: path.resolve(ROOT, cfg.artifacts.androidArm64Apk), name: NAMES.arm64 },
 ];
 if (MACOS_ZIP) {
   ARTIFACTS.push({
@@ -206,7 +209,7 @@ if (MACOS_ZIP) {
     label: "macOS 通用包 zip",
     // 允许相对路径（相对仓库根）与绝对路径；`path.resolve` 对两者都成立。
     src: path.resolve(ROOT, MACOS_ZIP),
-    name: ASSET_NAMES.macos,
+    name: NAMES.macos,
   });
 }
 /**
@@ -218,7 +221,8 @@ if (MACOS_ZIP) {
 const EXTRA_ASSETS = [];
 if (MACOS_DMG) {
   const src = path.resolve(ROOT, MACOS_DMG);
-  EXTRA_ASSETS.push({ kind: "macos-dmg", label: "macOS 安装 DMG", src, name: path.basename(src) });
+  // 传进来的本地文件可能还是旧名字；Release 附件统一用 `NAMES.macosDmg`。
+  EXTRA_ASSETS.push({ kind: "macos-dmg", label: "macOS 安装 DMG", src, name: NAMES.macosDmg });
 }
 const UPLOAD_ARTIFACTS = [...ARTIFACTS, ...EXTRA_ASSETS];
 
@@ -496,11 +500,16 @@ async function publishRemote(cfg, tokens, ver, tag, notes, branch, files) {
   }
   // 只加发布相关路径：本仓工作树里常年有源码改动，`add -A` 会把它们一起卷进
   // `Released vX（产物与更新清单）` 这个提交里。assets/ 由根 `.gitignore` 忽略，不进 git。
+  // 提交也必须带 `--only <路径>`：工作区里可能有**已暂存**的源码改动（用户正在做的事），
+  // 裸 `git commit` 会把它们一并卷进发布提交，然后跟着推送出去。
   git(["add", "--", ASSET_NAMES.manifest, "CHANGELOG.md"]);
   if (!git(["status", "--porcelain", "--", ASSET_NAMES.manifest, "CHANGELOG.md"]).stdout.trim()) {
     die("本仓没有任何变更（要发的内容跟已提交的一模一样）", "换个版本号，或确认产物/清单确实更新了。");
   }
-  git(["commit", "-m", `Released ${tag}（产物与更新清单）`], { inherit: true, label: "git commit" });
+  git(["commit", "--only", "-m", `Released ${tag}（产物与更新清单）`, "--", ASSET_NAMES.manifest, "CHANGELOG.md"], {
+    inherit: true,
+    label: "git commit",
+  });
   // 重发不碰 tag：它已经指向这一版最初那次提交，"移动已发布的 tag"会把两条历史打乱。
   if (!REPUBLISH) {
     git(["tag", "-a", tag, "-m", `OrbDrop ${tag}`], { inherit: true, label: "git tag" });
@@ -527,9 +536,32 @@ async function publishRemote(cfg, tokens, ver, tag, notes, branch, files) {
     ok(`已推送 ${remote} → ${url.stdout.trim()}`);
   }
 
-  await publishGithub(cfg, tokens.github, tag, notes, files);
-  await publishGitee(cfg, tokens.gitee, tag, notes, branch, files);
+  // Release 页面顶部先说清“下哪个”：清单/CHANGELOG 仍是纯更新说明，不掺下载指引。
+  const releaseBody = `${downloadGuide(ver, files)}\n---\n\n${notes}`;
+  await publishGithub(cfg, tokens.github, tag, releaseBody, files);
+  await publishGitee(cfg, tokens.gitee, tag, releaseBody, branch, files);
   await verifyRemote(cfg, ver);
+}
+
+/** Release 页面顶部的“下载哪个”指引；只列本次真的上传了的附件。 */
+function downloadGuide(ver, files) {
+  const n = assetNames(ver.raw);
+  const have = new Set(files.map((f) => f.name));
+  const lines = ["**下载哪个？**", ""];
+  if (have.has(n.exe)) lines.push(`- Windows：\`${n.exe}\`（单文件绿色版，无需安装）`);
+  if (have.has(n.macosDmg)) {
+    lines.push(
+      `- macOS 首次安装：\`${n.macosDmg}\`${have.has(n.macos) ? `（\`${n.macos}\` 仅供应用内自动更新）` : ""}`,
+    );
+  } else if (have.has(n.macos)) {
+    lines.push(`- macOS：\`${n.macos}\`（应用内自动更新包）`);
+  }
+  const android = [];
+  if (have.has(n.arm64)) android.push(`\`${n.arm64}\`（绝大多数手机）`);
+  if (have.has(n.universal)) android.push(`\`${n.universal}\`（老机型/模拟器，拿不准选这个）`);
+  if (android.length) lines.push(`- Android：${android.join("；")}`);
+  lines.push("- `update.json` 供客户端读取，不需要手动下载。", "");
+  return lines.join("\n");
 }
 
 /* ---------- GitHub ---------- */

@@ -29,18 +29,24 @@ OrbDrop 是一个局域网文件工具，界面主体是一个始终置顶的悬
 
 ## 下载
 
-| 平台 | 文件 | GitHub | Gitee |
-| --- | --- | --- | --- |
-| Windows 桌面端（x86_64） | `orbdrop.exe` | [最新版](https://github.com/x177plus/OrbDrop/releases/latest) | [最新版](https://gitee.com/x177plus/OrbDrop/releases) |
-| macOS 11+（通用包） | `orbdrop-macos-universal.app.zip` | [最新版](https://github.com/x177plus/OrbDrop/releases/latest) | [最新版](https://gitee.com/x177plus/OrbDrop/releases) |
-| 安卓（通用包） | `app-universal-release.apk` | [最新版](https://github.com/x177plus/OrbDrop/releases/latest) | [最新版](https://gitee.com/x177plus/OrbDrop/releases) |
-| 安卓（arm64） | `app-arm64-release.apk` | [最新版](https://github.com/x177plus/OrbDrop/releases/latest) | [最新版](https://gitee.com/x177plus/OrbDrop/releases) |
+先选平台，再按“应该下载”那一列拿文件；`<版本>` 是 Release 的版本号（例如 `0.1.1`）。
+GitHub / Gitee 的下载页：[GitHub 最新版](https://github.com/x177plus/OrbDrop/releases/latest) ·
+[Gitee 最新版](https://gitee.com/x177plus/OrbDrop/releases)。
 
-Windows 桌面端是单文件绿色版（不带安装器）。macOS 是通用 `.app`（Apple Silicon + Intel）；
-CI 出的未签名包首次运行需要右键「打开」一次，自更新要求应用放在可写位置（通常是 `/Applications`）。
+| 平台 | 应该下载 | 说明 |
+| --- | --- | --- |
+| Windows 桌面端（x86_64） | `OrbDrop_<版本>_windows_x64.exe` | 单文件绿色版，无需安装 |
+| macOS 11+（通用包） | `OrbDrop_<版本>_macos_universal.dmg` | **首次安装用这个**；未签名包首次运行需右键「打开」 |
+| 安卓（arm64） | `OrbDrop_<版本>_android_arm64.apk` | 绝大多数手机，体积更小、更省内存 |
+| 安卓（通用包） | `OrbDrop_<版本>_android_universal.apk` | 老机型/模拟器；拿不准就选这个 |
+
+`OrbDrop_<版本>_macos_universal.app.zip` 与 `update.json` 是**应用内自动更新**用的，
+不需要手动下载；应用检查到新版本会自己取。Windows 桌面端是单文件绿色版（不带安装器）。
+macOS 是通用 `.app`（Apple Silicon + Intel）；自更新要求应用放在可写位置（通常是 `/Applications`）。
 平台差异与真机验证清单见 [`docs/macos.md`](./docs/macos.md)。
 
-APK 装不上时按机型选包：手机上绝大多数是 arm64（`app-arm64-release.apk` 更小、更省内存），拿不准就用通用包。
+APK 装不上时按机型选包：手机上绝大多数是 arm64（`OrbDrop_<版本>_android_arm64.apk` 更小、更省内存），
+拿不准就用通用包。
 
 ### 更新清单与校验
 
@@ -49,7 +55,7 @@ APK 装不上时按机型选包：手机上绝大多数是 arm64（`app-arm64-re
 - GitHub：Release 附件 `update.json` —— `https://github.com/x177plus/OrbDrop/releases/latest/download/update.json`
 - Gitee：仓库根目录 `update.json` —— `https://gitee.com/x177plus/OrbDrop/raw/master/update.json`
 
-清单里的下载地址都钉了 tag（`releases/download/vX.Y.Z/...`），老版本客户端不会因为新版本发布而下错包。每个产物都带 `size` 与 `sha256`（Windows / macOS 版另有 Tauri 更新签名 `sig`），下载后可以自己核对：`sha256sum orbdrop.exe` 或 `shasum -a 256 orbdrop-macos-universal.app.zip`。
+清单里的下载地址都钉了 tag（`releases/download/vX.Y.Z/...`），老版本客户端不会因为新版本发布而下错包。每个产物都带 `size` 与 `sha256`（Windows / macOS 版另有 Tauri 更新签名 `sig`），下载后可以自己核对：`sha256sum OrbDrop_<版本>_windows_x64.exe` 或 `shasum -a 256 OrbDrop_<版本>_macos_universal.app.zip`。
 
 ## 功能亮点
 
