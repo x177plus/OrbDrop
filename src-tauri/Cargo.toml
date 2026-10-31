@@ -1,6 +1,6 @@
 [package]
 name = "orbdrop"
-version = "0.1.2"
+version = "0.2.0"
 description = "OrbDrop — LAN file sharing tool"
 authors = ["you"]
 license = "GPL-3.0-or-later"
