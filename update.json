@@ -1,43 +1,43 @@
 {
-  "version": "0.1.2",
-  "versionCode": 1002,
-  "notes": "新增：**中英双语界面（桌面端 + 安卓端 + 原生层）**。首次启动**直接采用系统语言**（支持\nEnglish / 简体中文；系统语言不在支持列表里时用英语），并把解析结果写成具体语言保存 —— 设置页\n只列「English / 简体中文」，没有「跟随系统」这一档，选中即刻生效并落盘，下一次启动首帧就是该语言。\n旧版本配置里的 `auto` 会在启动时解析成系统语言并写回。前端文案走 `src/lib/i18n.svelte.ts`：**消息键就是简体中文原文**（gettext 风格），\n英文词条按域放在 `src/lib/i18n/locales/en/*.json`；`npm run check:i18n` 校验缺译、占位符与词典冲突。\n后端原生文案同一份语言偏好：托盘菜单/tooltip 就地换字（不重建图标），安卓通知渠道名、常驻通知与\n插件错误走 `values` / `values-zh-rCN` 资源（按系统语言选择）。英文目录、移动端与所有对话框、气泡、空态、无障碍标签\n都已覆盖；后端日志保持中文，命令返回的底层错误文本也可能仍是中文（界面提示前缀会本地化）。\n\n新增：**后台更新检查不再只有「启动后一次」**。后端由一个调度循环管四档：启动 8 秒后查一次；\n运行期间每 **6 小时 ± 30 分钟**一次；安卓回前台 / 桌面单实例 / macOS `Reopen` 时，距上次成功\n**≥1 小时**才查；静默检查失败按 **5 分钟 → 30 分钟 → 2 小时 → 6 小时** 退避，成功一次归零。\n调度用**墙钟**判定（`<数据目录>/update.json` 的 `lastSuccessMs`），系统休眠/挂起醒来不会把周期\n推后。查到的新版本与按掉的版本都落盘：重启后第一帧就有气泡/角标；按过「稍后」只压住**当前这一版**\n（换新版照弹，手动「检查更新」清掉记录），后台那趟失败也不会把已经查到的「有新版本」抹掉。\n更新日志在所有出现说明的地方默认折叠成两行（`UpdateNotes.svelte`），点「查看完整更新日志」展开。\n\n修复（安卓）：应用界面能像网页一样**双指缩放**（整页连同底栏、固定层一起被放大，布局不重排，\n边缘被裁、退不回去）。根因在 WebView：`WebSettings.supportZoom` 默认是 `true`，而页面\nviewport 只写了 `width=device-width, initial-scale=1`，等于告诉引擎\"允许缩放\"。现在\n`MainActivity.onWebViewCreate` 里显式关掉 `supportZoom` / `builtInZoomControls` /\n`displayZoomControls`，`index.html` 的 viewport 同时补上\n`maximum-scale=1.0, user-scalable=no`。前者是准的（WebView 原生手势），后者只是第二道保险\n（Chrome 系为无障碍会忽略 `user-scalable=no`）。系统设置里的字体/显示大小与无障碍放大不受影响。\n\n修复（macOS）：Beyond Compare 的 profile 写错设置目录，导致「用 BeyondCompare 比较」对端共享项\n报「配置文件找不到 / 文件夹不可用」（本机路径正常）。BC5 的机器上如果存在\n`~/Library/Application Support/Beyond Compare 5`，它只读这个目录；OrbDrop 却一直写不带版本号的\n`Beyond Compare`。现在 `config_dir` 从 `.app/Contents/Info.plist` 的\n`CFBundleShortVersionString` 取大版本号，优先匹配的 `Beyond Compare 5` / `Beyond Compare 4`\n目录，没有版本目录才退回默认；Windows 分支不变。真机 BC 5.2.6 实测：把 profile 放进\n`Beyond Compare 5` 后，`bcomp` 加载 `profile:<ip:端口>?<共享项id>`、PROPFIND Depth 0/1、\nBasic 鉴权与 `href` 改写都正常。BC 只在启动时登记 `BCProfiles.xml`，所以更新后第一次需要\n**重启一次 BC**。另外服务监听是异步起的，预写可能跑在端口落下来之前，只写下骨架；\n现在服务起来后会再补写一次，避免更新后首次启动 profile 为空。回归见\n`bc::tests::macos_config_dir_prefers_the_versioned_folder_matching_the_exe`。\n\n修复：更新重启后设备列表里会短暂出现**本机自己**（macOS 上最容易看到，Windows 重启后同样可能）。根因在中转记忆，不在 mDNS：已配对对端推回来的反向路由记录里点名了**收件人自己**（它那份中转池还留着你的地址），本机把它并进设备表与池；第一拍探活够不着某台设备时，选路又把\"自己\"当成中转候选，向自己的监听端点发了一次 `/relay/open`，服务端核实\"请求方 = 本机\"后把本机登记成一台**在线**设备（`adopted` 档，15 分钟后才随 TTL 收走）。现在推记录前剔掉收件人自己；接收、池合并与选路都排除 own id（含本机监听端点）；`/relay/open` / `/relay/route` 对自称本机的请求直接 400；启动时清掉旧配置里写下的自己（`relayRoutes` 的池、`knownPeers`、观察指纹、链路）。回归见 `a_route_naming_itself_never_becomes_a_peer`、`pool_never_contains_the_local_device`、`relay_candidates_never_include_the_local_device`、`relay_candidates_skip_addresses_that_are_our_own_listener`、`a_route_pushed_to_a_peer_never_names_that_peer`、`self_identities_are_scrubbed_from_persisted_memory`、`observing_own_id_never_creates_or_marks_a_row`、`identity_reconcile_does_not_migrate_a_row_onto_the_local_device`、`open_refuses_to_target_ourselves_or_loopback`。\n\n修复：会话输入框在占位文案状态下，**输入过内容再清空**之后光标会跑到占位文案右侧（首次聚焦时正常在最左）。根因不是清空逻辑：清空后 Chromium 会在框里留下一个 `<br>`，光标锚在它前面，而占位文案的 `::before` 仍在行内流里、是那一行的第一个盒子。现在占位文案改为绝对定位（桌面与安卓两份样式同步），光标不再跟着它走；实际 CSS 在 Chromium 上实测清空后光标仍在内容左缘。",
-  "pubDate": "2026-10-27T12:10:16Z",
+  "version": "0.2.0",
+  "versionCode": 2000,
+  "notes": "改动：**下载模式默认改为「每次选择位置」**（Android 保持「直接保存到下载目录」：系统选择器返回 `content://`，落盘层只接受文件系统路径）；设置里新增**「已配对设备自动接收」**（**默认关**）。\n桌面端手动下载、以及未配对设备的推送，默认都会先让你选保存位置；已配对设备推来的文件默认也要你点\n「接收」（和未配对设备同一条同意路）。**老配置也走这个新默认**：`config.toml` 加了格式版本，\n升级后的第一次启动把旧版本写下的 `Direct` 一次性迁移成「每次选择位置」并落盘（只迁这一次；\n之后你在设置里改回「直接保存」，重启也不会再被翻回来）。只有显式打开「已配对设备自动接收」后，已配对设备的推送\n才免同意、直接落到下载目录 —— 此时「保存位置」对这条不生效。认证口径不变：已配对设备仍必须带\n有效 token，凭据失效照样拒收；未配对设备永远没有「自动接收」这一档。\n\n变更：**Android 端不再提供「每次选择位置」**，固定「直接保存到下载目录」（系统选择器返回\n`content://`，而落盘层只接受文件系统路径，选过一次就注定写不进去）。从别的机器同步/拷贝来的\n配置、或旧版本在手机上选过的那一档，会在启动读取配置、保存设置、以及两条下载命令里收回\n「直接保存」；设置页在安卓上只画这一档，并说明原因。\n\n新增：**可选的 LocalSend v2.2 兼容**（设置 →「支持 LocalSend 协议」，默认关闭）。\n开启且本机在线时：加入 UDP `224.0.0.167:53317` 组播，与同一局域网的 LocalSend 设备互相发现、\n注册，并能在 LocalSend 设备与 OrbDrop 之间互发消息与文件/文件夹。文本消息（单文件 +\n`text/plain` + `preview`）和**整批图片**自动接收、直接落进会话显示（静默落盘有小时预算：\n跨发送方每小时 2 GiB，超出后那一批退回普通文件的确认路，\n普通文件始终要确认）；会话输入框可以对 LocalSend 设备发纯文本，图片/文件继续用「＋」走 LocalSend\n文件传输。设备列表会多出带 `LS` 徽标的行（协议缩写，全名在悬停提示里），点开是对应的一对一会话；LocalSend 设备不配对、\n不进聊天群、不参与长连接、共享浏览和中转。切到「离线」时 mDNS 与 LocalSend 一起停；关闭开关后\n不再监听 UDP、路由返回 404。原有 OrbDrop 的 mDNS/配对/推送/聊天/DAV 协议不变，LocalSend 消息\n单独存一列，不进入 OrbDrop 的排队、已读回执与群聊逻辑。\n\n变更：LocalSend 兼容开关改为**立即生效**（不等「保存设置」）；设置页开关下方显示运行时状态：\n运行中 / 53317 被占用并回落主端口 / 本机离线暂停 / 发现服务未启动，后三档可点「重试」。\n「重试」只叫醒后台 guard 补缺的那一份监听，**不重启兼容层**，在途传输不会被掐断。\n53317 被占用**不再当成打开失败**，开关不会被自动关闭；后台按 5s→60s 退避重试，端口空出后\n自动接管 53317，并立刻补发一轮公告。UDP 53317 被独占、发现起不来时，仍会用临时端口发送公告\n（官方 LocalSend 自己也是这么发的），对端可通过 TCP `register` 回来。公告里的 `port` 统一为\n“对端该拨的端口”：53317 在监听就写它，否则写主端口 —— 修掉此前公告一直写主端口、\n与 `advertised_port` 不一致的问题。同机 LocalSend 的公告不会再把自己登记成一台设备行。\n\n修复：第三方 LocalSend 实现会把**设备 UUID**（而不是证书指纹）填进公告的 `fingerprint`，\n此前被当成证书指纹钉进 TLS，表现为该设备每次 `register` 都报「证书指纹与钉住的不一致」、\n永远发现不了（即使对端在跑一个正常的第三方 LocalSend，同一地址上还住着一台本机见过的\nOrbDrop 设备时尤其明显）。现在只有 64 位 hex 的自报值才用来钉证书；其余形状退回 TOFU，\n以握手证书的指纹作为后续探活/发送的身份。同时 LocalSend 的拨号使用独立的信任表，握手\n见到的证书不再写进 OrbDrop 的观察指纹（两套协议在同一地址上各记各的，不会互相污染）。\n\n修复：LocalSend 兼容面现在同时监听 **TCP 53317**（协议默认 HTTP 端口），公告里也写这个端口。\n部分第三方实现发送时把目标端口写死成 53317、不读公告里的 `port`，此前本机只监听 OrbDrop\n主端口，表现成\"我能发给它、它发不过来\"。53317 被别的程序占用时自动回落到主端口（官方\n实现会读公告里的 `port`，仍能互通）。同一端点没有客户端证书、自报值又不是证书哈希时，\n入站请求沿用公告登记的那一行身份，不再为同一台设备多造一条以 IP 为 id 的记录。\n\n修复：在设置页打开/关闭 LocalSend 兼容**不再闪退**（安卓上尤其明显：点一下开关 App 直接退出，\n重开之后因为开关已经落盘、由启动链路把它起起来，状态行显示\"已启动\"）。原因不在安卓：开关是\n**同步** Tauri 命令，走主线程、没有 Tokio reactor；启动发现时在那条同步路径上把 std UDP socket\n转成 tokio socket（`UdpSocket::from_std`）会 panic（\"there is no reactor running\"），而 release 档\n`panic = \"abort\"` 是整个进程倒地。托盘的「在线 / 离线」走同一个入口，同样会踩。现在 socket 绑定\n这一层只碰 `std`，tokio 的转换全部挪到异步任务里（`discovery::run` / `announce_ephemeral`）——\n同步命令、托盘回调、启动链路三种上下文都一样安全。回归：`tests/localsend_no_reactor.rs`\n在**普通线程**（无 reactor）上调用 `localsend::start`。\n\n修复：连续给同一台 LocalSend 设备发多条文本/图片时，后两条不再「未送达」。LocalSend\n接收端只有一个上传会话槽：第一条 `prepare-upload` 会一直占着等用户点「接受」，此前每条\n消息各自起一个后台任务并发请求，第二、三条当场收到 `409 Blocked by another session`，\n对端 App 里永远不会出现，发送端只能落「未送达」。现在同一台设备有一条出站 FIFO 队列：\n上一条收尾（文本 = 用户点了接受；图片 = 上传完成；文件推送 = 传输走完或失败）之后才发下一条，\n顺序与输入框里一致。文本、图片与文件推送共用这条队列，混合发送也不会互相抢槽；排队期间点\n「取消」同样能收掉（令牌在入队时就登记）。\n\n修复：LocalSend 设备离线后不再长期挂在设备列表里。此前前端对所有 `transport === 'localsend'`\n的行**无条件放行**（后端还会按 10 分钟未接触才清），于是对端退出、探活已经判定离线之后，\n这一行仍以「离线」留在列表里，和发现结果不一致。现在 LocalSend 行与其它设备同一套可见性：\n只列**在线**或仍在**发现窗口**（`seen`，90 秒）内的行；设备真的走了，行随之消失。后端仍会在\n内存里保留最多 10 分钟（供恢复/复用身份），但不再影响界面；会话记录本身留在会话列表里。\n\n变更：设备列表里**点击整行 = 打开这台设备的会话**，不再只对 LocalSend 行生效。OrbDrop 设备\n（在线 / 离线 / 未配对）与 LocalSend 设备同一套：点行的非按钮区域打开会话；行内「配对 / 连接 /\n断开 / 发消息 / 解除配对」各管各的动作，不会顺带开会话。桌面端整行可点（鼠标指针随之变化），\n安卓端短按整行同义（长按仍是设备操作）；安卓端的行是 `role=\"button\"`，键盘 Enter / 空格也能打开。\n\n新增：安卓端会话消息支持**长按复制整条**（桌面端右键菜单的对应手势）。长按一条文字 / 图片 /\n文件消息会弹出「复制整条消息」底板，复制内容与桌面端共用同一份（文件 = `名字（大小）`，\n图片 = `[图片] 名字`，文字 = 原文）。消息气泡因此关掉了 WebView 的系统长按选字 —— 整条复制\n取代了选中片段；桌面端的选中后右键不受影响。\n\n修复：**同一台机器同时跑 OrbDrop 与 LocalSend 时，设备列表不再出现两条**。此前只按\n`ip:port` 合并，而两条协议的监听端口不同（LocalSend 53317 / OrbDrop 主端口），于是自家\n两端各成一行的设备会同时以 OrbDrop 和 `LS` 出现。现在 mDNS TXT 额外带本机 TLS 证书指纹\n（`fp`），LocalSend 行的 `ls-<指纹>` 命中任何一台已知 OrbDrop 设备的指纹（mDNS 自报 /\n凭据库 / 未配对观察指纹）就只保留 OrbDrop 行：用户看到的是一台设备，发送也自然走 OrbDrop\n协议。第三方 LocalSend、以及只开了 LocalSend 的邻居不受影响（证书指纹不同）。TXT 未经认证，\n该指纹只用于展示层去重，不参与任何信任判断。\n\n变更：**应用日志收口为\"关键事件\"**。此前稳态下每 30s 的中转端点开关/复用、中转池自报、\n同地址证书的重复 TOFU、每次 LocalSend 公告、每条 HTTP 会话消息和补拉拒绝都会写 `info`，\n单日日志可达数 MB（实测一天 `开了中转端点` 上千条、补拉拒绝数百条）。现在这些重复行降为\n`debug`（排障时 `RUST_LOG=debug` 仍可看到），默认 `info` 只保留启动、连接/离线切换、\n首次中转切换、配对/认证失败、传输完成与真正的错误；启动时重复的 `HTTP server started`\n也删掉了第二条，没有实际写入的 BeyondCompare profile 预写不再留日志。",
+  "pubDate": "2026-10-31T12:27:46Z",
   "desktop": {
     "windows-x86_64": {
-      "size": 17082368,
-      "sha256": "af2210cd997c2510290b36ee9ec2b14b3c65d116502fa9f54227e156cd0db4de",
-      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NGhvblVxQXpDemg5Mk10b3BSK2tlenRpV3RaQllYTFUvQy9HdDcvcVBpd1NRakw0YzJ1REwrZ3lrY2tkOGl5VUdpUHZYM2ZCNzJlRkdTdmM4dEI1NXdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMTAzMDE1CWZpbGU6b3JiZHJvcC5leGUKb2dZMVNRSlR2Q3RUbk9NYnVlMkN3Q1VkcDRtQ0hnSGNnQjFKSXBpcS9VMXNQZTNhdFY4SExMSjZHSFRtVHZQQzFsMlJWeDFoNlhNTVRidk5PRmpqRHc9PQo=",
+      "size": 17830400,
+      "sha256": "47db2ed9eda5144badf0778b69270670262e2048ed10bf80f7c0c5bd55e28f1f",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NG9mWURlRFR0YS9OVzdyK29xQ3JkNUUzYlFEb05sSDB6eHloYjZtZDVRZU1KVW9rVG9UL1Q2T2R2eGJqMG1qeElLQnZlbmpYSG9wQ3FMSXhscmdHNWdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNDQ5NjY2CWZpbGU6b3JiZHJvcC5leGUKZ0ZUSHk0bXhhSUx3T2RqaWJSWm12dGV4SzBmRlpMRy95SHExbkp3Y2Q5WTMxNlNhY01hL2NXOWlXNWV4ck5ONmNHSVI0ekNVQVhlZUluZTRJM2dHQ1E9PQo=",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.1.2/OrbDrop_0.1.2_windows_x64.exe",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.1.2/OrbDrop_0.1.2_windows_x64.exe"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.2.0/OrbDrop_0.2.0_windows_x64.exe",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.2.0/OrbDrop_0.2.0_windows_x64.exe"
       ]
     },
     "macos-universal": {
-      "size": 14088626,
-      "sha256": "e1e5f5840a07f4229dfa51dc6610dfa74b441e5bc6fb73bbffccf5cf5fff6276",
-      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NG8wZjhkWTlnaDR2VWZLUTE2ZStFZnVpenR0eXNPQmZVbEs0VlcvdGtEa29qcVZ2ZHVPaVhjRFdHNTFPOFJTWTNpbXRVVzlYQXd5emRFUlIxb0RQOEFJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMTAzMDE2CWZpbGU6T3JiRHJvcF8wLjEuMl9tYWNvc191bml2ZXJzYWwuYXBwLnppcApnMnNPd0tyeS9ZdEkvWVF1R09UOHRieW5COUt6VExOeWtSdFNXUlBITG9xRXpDUzZ1K1BKV2N6YXFmUHFoci9Nb0lYK1dmbldWVmxBVTFWZW95UmxEdz09Cg==",
+      "size": 14472057,
+      "sha256": "aea0e73bf1cf8b569b021fa9b83c0b069774da16312208b2514d454389a292c0",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NHJodUpYL0NXWVI4SFBIQk1RdFlReWVNMGZ2Ti93NXBrSHM4YzJJai9YZzRiN2xRU2xDVVdxYU5DTUo0Ykc1aEJNZXRvRitEeTFFWUs0bWtQcmFacWdRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNDQ5NjY2CWZpbGU6T3JiRHJvcF8wLjIuMF9tYWNvc191bml2ZXJzYWwuYXBwLnppcApYYWhGMDhYRWhpeUlmMHBlODU3ZUZyRll0OHBWWXVBZEkxaXBoVWZtQTNIK012SUliWDgxSkRIN0YwMS85NkVVbXNXazE1ZU9jTHEydXFFbVk3V3REdz09Cg==",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.1.2/OrbDrop_0.1.2_macos_universal.app.zip",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.1.2/OrbDrop_0.1.2_macos_universal.app.zip"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.2.0/OrbDrop_0.2.0_macos_universal.app.zip",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.2.0/OrbDrop_0.2.0_macos_universal.app.zip"
       ]
     }
   },
   "android": {
     "universal": {
-      "size": 29258567,
-      "sha256": "4700454d84c5e0421fae5bf5fc08a0157c3cbd19f14429b710998c992b8fafa8",
+      "size": 30042343,
+      "sha256": "b4d5482d262224f94cc4ad27d46e2780546a39516ac62ec08c15115898e3fcf6",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.1.2/OrbDrop_0.1.2_android_universal.apk",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.1.2/OrbDrop_0.1.2_android_universal.apk"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.2.0/OrbDrop_0.2.0_android_universal.apk",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.2.0/OrbDrop_0.2.0_android_universal.apk"
       ]
     },
     "arm64-v8a": {
-      "size": 9166063,
-      "sha256": "ce4773be13fd90006f49c9be7a5284197981c8309e62a756b6f21120c52d1625",
+      "size": 9383543,
+      "sha256": "333dc82d3b685681af990055f74aa5d3aa7a1ad1d1fa0b5285a968ddaad2a8e6",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.1.2/OrbDrop_0.1.2_android_arm64.apk",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.1.2/OrbDrop_0.1.2_android_arm64.apk"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.2.0/OrbDrop_0.2.0_android_arm64.apk",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.2.0/OrbDrop_0.2.0_android_arm64.apk"
       ]
     }
   }
