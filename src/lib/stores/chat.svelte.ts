@@ -82,6 +82,19 @@ export type ChatItem =
   | ({ kind: 'text' } & ChatGroupMsg)
   | ({ kind: 'file' } & ChatFileMsg);
 
+/**
+ * 一条消息**整条复制**的那串文字（桌面端右键菜单与移动端长按菜单共用）。
+ *
+ * 文件消息 = `名字（大小）`；图片消息 = `[图片] 名字`；文字消息 = 原文。
+ * 这两档与原型同一套写法，两端不许各拼一份 —— 否则同一条消息在桌面与手机上复制出来的
+ * 内容会不一样。
+ */
+export function copyTextOf(item: ChatItem): string {
+  if (item.kind === 'file') return t('{name}（{size}）', { name: item.name, size: item.size });
+  if (item.image) return t('[图片] {name}', { name: item.name ?? '' }).trim();
+  return item.text;
+}
+
 function convoOf(peerId: string): ChatPeerConvo | undefined {
   return snapshot.convos.find((c) => c.peerId === peerId);
 }
@@ -89,6 +102,18 @@ function convoOf(peerId: string): ChatPeerConvo | undefined {
 /** 这台设备还在不在**设备表**里（设备页那一份，见 `devices.visibleDevices`）。 */
 function known(peerId: string): boolean {
   return getDevices().some((d) => d.id === peerId);
+}
+
+/**
+ * 这台设备走的是 LocalSend 协议（不是 OrbDrop 的关系）。
+ *
+ * LocalSend 只有 direct 会话：文本/图片走 `sendLocalSendComposer`（各是一条 LocalSend 消息），
+ * 普通文件走 LocalSend 文件传输；它不能进群发/群聊名册。
+ */
+function localSendPeer(peerId: string): boolean {
+  // 设备表是临时观察值：重启后对方不在线时 LocalSend 行会消失，但 `ls-` 前缀是稳定的
+  // LocalSend 身份（见后端 `id_for_fingerprint`），会话还在时就按 LocalSend 处理。
+  return deviceById(peerId)?.transport === 'localsend' || peerId.startsWith('ls-');
 }
 
 /**
@@ -1278,9 +1303,14 @@ export async function sendText(
     replace(res.snapshot);
     return { id: res.id, batchId: null };
   }
+  // OrbDrop 的 `chat_send` 不能发给 LocalSend：文本/图片走 `sendLocalSendComposer`，
+  // 普通文件走 LocalSend 文件传输。群发名单里理论上不会有 LocalSend（收件人选择框已过滤），
+  // 这里防御性地把它剔掉。
+  const peers = t.participants.filter((id) => !localSendPeer(id));
+  if (!peers.length) return null;
   const res = t.mode === 'direct'
-    ? await api.chatSend([t.participants[0]], body, null, at)
-    : await api.chatSend(t.participants, body, t.id, at);
+    ? await api.chatSend([peers[0]], body, null, at)
+    : await api.chatSend(peers, body, t.id, at);
   replace(res.snapshot);
   return { id: res.id, batchId: res.batchId };
 }
@@ -1322,6 +1352,18 @@ export async function sendComposer(key: string): Promise<ComposerSendResult | nu
   if (!thread) return null;
   const segs = draftSegsOf(key);
   if (!hasContent(segs)) return null;
+  // LocalSend 会话有专用发送路径（`sendLocalSendComposer`）；这里拦住误走 OrbDrop
+  // `sendComposer` 的调用。草稿原样留着，不写回（用户没发出去的东西不该被这里吞掉）。
+  if (thread.mode !== 'group' && thread.participants.length > 0 && thread.participants.every(localSendPeer)) {
+    return {
+      textId: null,
+      batchId: null,
+      texts: 0,
+      images: 0,
+      failed: segs.filter((s) => s.kind === 'text').length,
+      error: t('LocalSend 会话请使用专用文本输入'),
+    };
+  }
 
   // 这一整条的时间戳：从"现在"起严格递增，且**排在已有消息之后**（同一毫秒里发第二条时，
   // 不能让它落到上一条前面去）。
@@ -1390,6 +1432,87 @@ export async function sendComposer(key: string): Promise<ComposerSendResult | nu
   // 回收的判据用**开始时捕获的 `segs`**（不是此刻的 `draft[key]`）：发送是异步的，期间用户
   // 若又粘了一张图，那张不在 `segs` 里、也不该被这里回收 —— 所以这里只 `writeDraft`，回收交给
   // 上面那趟显式循环（按 `segs` 逐段判），不用 `setDraftSegs` 的"按当前草稿差值回收"。
+  for (const seg of segs) {
+    if (!failedSegs.includes(seg)) revokeSegs([seg]);
+  }
+  writeDraft(key, failedSegs);
+  return result;
+}
+
+/**
+ * LocalSend 会话里选择/粘贴的图片：按**图片消息**发出去（输入区整条发送走
+ * `sendLocalSendComposer`；这个函数给“只选图片、立刻发”的入口用）。
+ *
+ * 线上仍是 LocalSend 文件传输（协议没有图片消息类型），但本机记录走
+ * `localsend_messages`，只有 `发送中/已送达/未送达` 三档；**不建推送批次、没有停止按钮**。
+ * 与 OrbDrop 的 `chat_send_image` 是同一个界面语义，只是传输协议不同。
+ */
+export async function sendLocalSendImages(
+  peerId: string,
+  images: { path: string; name: string; size: number }[],
+): Promise<void> {
+  let firstError: string | null = null;
+  for (const img of images) {
+    try {
+      const res = await api.localsendSendImage(peerId, img.path, img.name);
+      replace(res.snapshot);
+    } catch (e) {
+      firstError ??= e instanceof Error ? e.message : String(e);
+    }
+  }
+  if (firstError) throw new Error(firstError);
+}
+
+/**
+ * 把 LocalSend 会话输入区里的整条内容发出去。
+ *
+ * 输入区与 OrbDrop 共用同一份富文本草稿（文字/图片按框里的顺序排列）；LocalSend 没有
+ * 混合消息类型，所以这里按段依次发：文字走 `localsend_send_text`，图片走
+ * `localsend_send_image`（本机是图片消息，线上是文件传输）。时间戳由这里统一递增，
+ * 两端看到的就是用户在框里排的顺序。
+ */
+export async function sendLocalSendComposer(key: string): Promise<ComposerSendResult | null> {
+  const thread = threadOf(key);
+  if (!thread || thread.mode !== 'direct') return null;
+  const segs = draftSegsOf(key);
+  if (!hasContent(segs)) return null;
+  const peerId = thread.participants[0];
+  if (!peerId) return null;
+
+  const lastAt = itemsOf(key).reduce((max, i) => Math.max(max, i.at), 0);
+  let stamp = Math.max(Date.now(), lastAt + 1);
+  const nextStamp = () => stamp++;
+
+  const failedSegs: ComposerSeg[] = [];
+  const result: ComposerSendResult = {
+    textId: null,
+    batchId: null,
+    texts: 0,
+    images: 0,
+    failed: 0,
+    error: null,
+  };
+  for (const seg of segs) {
+    try {
+      if (seg.kind === 'text') {
+        if (!seg.text.trim()) continue;
+        const res = await api.localsendSendText(peerId, seg.text, nextStamp());
+        replace(res.snapshot);
+        result.textId = res.id;
+        result.texts += 1;
+      } else {
+        const res = await api.localsendSendImage(peerId, seg.path, seg.name, nextStamp());
+        replace(res.snapshot);
+        result.images += 1;
+      }
+    } catch (e) {
+      result.failed += 1;
+      result.error ??= e instanceof Error ? e.message : String(e);
+      failedSegs.push(seg);
+    }
+  }
+
+  // 发出去的那几段连同预览 URL 一起丢掉；没发出去的留在草稿里。
   for (const seg of segs) {
     if (!failedSegs.includes(seg)) revokeSegs([seg]);
   }
@@ -1565,7 +1688,7 @@ export function noteInboundInvite(inv: PushInvite) {
     groupId: '',
     perTargets: [],
     inviteId: inv.inviteId,
-    // 已配对设备的推送后端直接收下了（`auto`）：卡片直接是"接收中"。
+    // 后端自动收下了（`auto` = 已配对且开着「自动接收」）：卡片直接是"接收中"。
     inviteState: inv.auto ? 'accepted' : 'pending',
     received: 0,
     bytes: inv.size,

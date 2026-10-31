@@ -8,6 +8,13 @@
   import UpdateNotes from '$lib/components/UpdateNotes.svelte';
   import Logo from '$lib/components/Logo.svelte';
   import { getSettings, loadSettings, updateSettings } from '$lib/stores/settings.svelte';
+  import {
+    getLocalSendStatus,
+    localSendStatusView,
+    refreshLocalSendStatus,
+    retryLocalSendNow,
+    setLocalSendEnabled,
+  } from '$lib/stores/localsend.svelte';
   import { fileManagerLabel, isMac } from '$lib/stores/platform.svelte';
   import * as upd from '$lib/stores/update.svelte';
   import { formatFileSize, updateStatusText } from '$lib/types';
@@ -70,11 +77,16 @@
    * 推送接收是否再放一层 `<发送方名>/`（后端 `AppSettings.deviceSubdir`，**默认开**，S-12）。
    *
    * 开着 = 对端推来的东西落在 `<下载目录>/<发送方名>/…` 下：两台设备推同名文件不会互相
-   * 顶掉、一批东西能按来源整体看/整体清、接收未配对设备的推送时那颗目录框只把"根的里面
+   * 顶掉、一批东西能按来源整体看/整体清、接收需要同意的推送时那颗目录框只把"根的里面
    * 一个自己的目录"授权出去。关掉 = 和手动下载的文件落到同一层。
    */
   let deviceSubdir = $state(true);
-  let downloadMode = $state<'Direct' | 'AskEachTime'>('Direct');
+  /**
+   * 已配对设备推送是否免确认自动收（后端 `AppSettings.autoAcceptPaired`，**默认关**）。
+   * 开着时直接落下载目录；关着时和未配对设备一样先点「接收」，再按「保存位置」决定落点。
+   */
+  let autoAcceptPaired = $state(false);
+  let downloadMode = $state<'Direct' | 'AskEachTime'>('AskEachTime');
   let deviceName = $state('');
   /** 界面语言（具体语言，没有「跟随系统」）。改它 = 立刻生效并落盘（不等「保存」）。 */
   let languagePref = $state<Locale>(normalizePreference(null));
@@ -96,6 +108,31 @@
    * 暴露本机的新能力，只是本机自己的选路提示，**默认开、不给控制**（保存时一律写成开）。
    */
   let relay = $state(true);
+  /**
+   * 支持 LocalSend v2.2 协议（后端 `AppSettings.localsendEnabled`，**默认关**）。
+   *
+   * 开着且本机在线：监听 UDP 53317、收发 LocalSend 公告、提供 `/api/localsend/*` 路由，
+   * 设备列表多出 LocalSend 行。离线时自动停（socket 关掉、路由 503）。LocalSend 设备
+   * 不配对、不进聊天群，只走 direct 会话：文本/图片可自动接收，普通文件仍要确认。
+   */
+  let localsendEnabled = $state(false);
+  /** LocalSend 开关的命令还没返回（防连点）。 */
+  let localSendBusy = $state(false);
+  const localSendStatus = $derived(getLocalSendStatus());
+  const localSendView = $derived(localSendStatusView(localSendStatus));
+  /** 状态行的颜色：绿=正常，琥珀=降级，红=发现没起来，灰=离线暂停。 */
+  function localSendTone(tone: 'ok' | 'warn' | 'error' | 'muted'): string {
+    switch (tone) {
+      case 'ok':
+        return 'var(--ok)';
+      case 'warn':
+        return 'var(--warn)';
+      case 'error':
+        return 'var(--danger)';
+      default:
+        return 'var(--muted)';
+    }
+  }
   /** 本机替别人中转的累计流量（`relay_traffic`）：只读的用量记录，打开面板时现拉。 */
   let traffic = $state<RelayTraffic | null>(null);
   /**
@@ -203,12 +240,14 @@
   onMount(() => {
     // 订阅一次自更新状态（重复调用没有副作用）：设置面板是唯一能看到"有新版 / 下载进度"的地方。
     void upd.watchUpdate();
+    void refreshLocalSendStatus();
     loadSettings().then(() => {
       const s = getSettings();
       if (s) {
         port = s.port;
         downloadDir = s.downloadDir;
         deviceSubdir = s.deviceSubdir;
+        autoAcceptPaired = s.autoAcceptPaired;
         downloadMode = s.downloadMode;
         deviceName = s.deviceName;
         languagePref = normalizePreference(s.language);
@@ -216,6 +255,7 @@
         autoStart = s.autoStart;
         autoBroadcastNew = s.autoBroadcastNew;
         relay = s.allowRelay || s.groupRelay;
+        localsendEnabled = s.localsendEnabled;
         transferWorkers = s.transferWorkers;
         transferBlockMb = s.transferBlockMb;
         bcExePath = s.bcExePath ?? '';
@@ -262,6 +302,35 @@
     }
   }
 
+  async function toggleLocalSend(next: boolean): Promise<void> {
+    const previous = localsendEnabled;
+    localsendEnabled = next;
+    localSendBusy = true;
+    try {
+      const s = await setLocalSendEnabled(next);
+      localsendEnabled = s.enabled;
+      onToast(next ? t('LocalSend 兼容已开启') : t('LocalSend 兼容已关闭'));
+    } catch (e: any) {
+      // 只有写盘失败才把开关弹回去；53317 被占用/离线都在状态行里说。
+      localsendEnabled = previous;
+      onToast(t('切换 LocalSend 兼容失败：{error}', { error: String(e) }));
+    } finally {
+      localSendBusy = false;
+    }
+  }
+
+  /** 状态行的「重试」：叫醒后台 guard 补一拍（不重启，在途传输不断）。 */
+  async function retryLocalSend(): Promise<void> {
+    localSendBusy = true;
+    try {
+      await retryLocalSendNow();
+    } catch (e: any) {
+      onToast(t('切换 LocalSend 兼容失败：{error}', { error: String(e) }));
+    } finally {
+      localSendBusy = false;
+    }
+  }
+
   async function save() {
     saving = true;
     try {
@@ -269,6 +338,7 @@
         port,
         downloadDir,
         deviceSubdir,
+        autoAcceptPaired,
         downloadMode,
         deviceName,
         language: languagePref,
@@ -277,6 +347,8 @@
         // 一颗开关管两条路：替其它设备盲转字节 + 替群聊转消息（`allowRelay` / `groupRelay`）。
         groupRelay: relay,
         allowRelay: relay,
+        // LocalSend 开关是**立即生效**的（`set_localsend_enabled`），不走这里：
+        // 这里不带它 = 后端保持原值，避免保存时把刚切过的开关又写回表单里的旧状态。
         // 「记住并自动复用跨网段中转」不给控制、默认开：一律写开。
         relayMemory: true,
         transferWorkers: clampNum(transferWorkers, 1, 8, 4),
@@ -301,6 +373,7 @@
       port = s.port;
       downloadDir = s.downloadDir;
       deviceSubdir = s.deviceSubdir;
+      autoAcceptPaired = s.autoAcceptPaired;
       downloadMode = s.downloadMode;
       deviceName = s.deviceName;
       languagePref = normalizePreference(s.language);
@@ -308,6 +381,8 @@
       autoStart = s.autoStart;
       autoBroadcastNew = s.autoBroadcastNew;
       relay = s.allowRelay || s.groupRelay;
+      // LocalSend 开关是立即生效的，**不参与取消**（`cancel` 不能把它拨回旧值；
+      // 否则面板关掉前会闪一下与后端不一致的状态）。
       transferWorkers = s.transferWorkers;
       transferBlockMb = s.transferBlockMb;
       bcExePath = s.bcExePath ?? '';
@@ -341,7 +416,7 @@
     </div>
     <div class="field">
       <label for="downloadDir">{t('下载目录')}<Hint>
-        {t('手动「下载到本地」和对端「推送」接收都默认存这里（选了「每次询问」时，接收推送那条会先让你挑一个目录，挑的那个就是这次接收的根）；推送默认落在 发送方名 目录下（可由下面那颗开关关掉），按你选中的那些项各自的名字展开（不会和下载的文件混在一层）。')}
+        {t('手动「下载到本地」和对端「推送」接收都默认存这里（选了「每次选择位置」时，接收需要同意的推送会先让你挑一个目录，挑的那个就是这次接收的根）；推送默认落在 发送方名 目录下（可由下面那颗开关关掉），按你选中的那些项各自的名字展开（不会和下载的文件混在一层）。')}
       </Hint></label>
       <div class="path-input">
         <input class="input" id="downloadDir" value={downloadDir} readonly />
@@ -351,8 +426,8 @@
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
       <label>{t('推送按发送方分目录')}<Hint>
-        {t('打开（默认）：对端推来的东西落在 发送方名 那一层下面 —— 下载目录\\某某的电脑\\…。三件事跟着来：两台设备推同名文件不会互相顶掉；一批东西能按来源整体看、整体清；接收未配对设备的推送时，那颗目录框只授权对方在根里 新建一个自己的目录，碰不到根里已经有的东西。')}<br />
-        {t('关掉：推送和手动下载的文件落在同一层。同名的照旧自动改名 xxx (1).ext；代价是别人推来的 D\\… 会并进你本来就有的 下载目录\\D（已配对设备的推送对同名文件是校验通过后原子替换），「每次询问」下挑的那个目录也就等于直接让对方往那一层写文件名。')}
+        {t('打开（默认）：对端推来的东西落在 发送方名 那一层下面 —— 下载目录\\某某的电脑\\…。三件事跟着来：两台设备推同名文件不会互相顶掉；一批东西能按来源整体看、整体清；接收需要同意的推送时，那颗目录框只授权对方在根里 新建一个自己的目录，碰不到根里已经有的东西。')}<br />
+        {t('关掉：推送和手动下载的文件落在同一层。同名的照旧自动改名 xxx (1).ext；代价是别人推来的 D\\… 会并进你本来就有的 下载目录\\D（已配对设备的推送对同名文件是校验通过后原子替换），「每次选择位置」下挑的那个目录也就等于直接让对方往那一层写文件名。')}
       </Hint></label>
       <div style="display:flex; align-items:center; justify-content:space-between;">
         <span style="font-size:var(--fs-sm); color:var(--muted);">{t('接收推送时放进以发送方命名的子目录')}</span>
@@ -364,15 +439,28 @@
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
-      <label id="dlModeLabel">{t('下载模式')}</label>
+      <label>{t('已配对设备自动接收')}<Hint>
+        {t('开启：已配对设备推来的文件不再询问，直接保存到下载目录（此时下面的「保存位置」对这条不生效）。关闭（默认）：和未配对设备一样，先点「接收」，再按「保存位置」决定放到哪里。已配对设备仍必须带有效 token，凭据失效照样拒收；未配对设备始终需要你确认。')}
+      </Hint></label>
+      <div style="display:flex; align-items:center; justify-content:space-between;">
+        <span style="font-size:var(--fs-sm); color:var(--muted);">{t('已配对设备推送免确认，直接落下载目录')}</span>
+        <label class="switch">
+          <input type="checkbox" bind:checked={autoAcceptPaired} data-auto-accept-paired />
+          <span class="track"></span>
+        </label>
+      </div>
+    </div>
+    <!-- svelte-ignore a11y_label_has_associated_control -->
+    <div class="field">
+      <label id="dlModeLabel">{t('保存位置')}</label>
       <div class="radio-group">
         <label class="radio">
           <input type="radio" name="dlMode" bind:group={downloadMode} value="Direct" />
-          <span class="r-label">{t('直接下载')}<span class="r-sub">{t('收下文件并保存到下载目录（不问）')}</span></span>
+          <span class="r-label">{t('直接保存到下载目录')}<span class="r-sub">{t('手动下载直接存；推送在你点接收后也直接存，不再问位置。')}</span></span>
         </label>
         <label class="radio">
           <input type="radio" name="dlMode" bind:group={downloadMode} value="AskEachTime" />
-          <span class="r-label">{t('每次询问')}<span class="r-sub">{t('下载、以及接收未配对设备的推送时，都先弹窗选位置')}</span></span>
+          <span class="r-label">{t('每次选择位置')}<span class="r-sub">{t('手动下载、以及你点接收后的推送，都先选保存位置。')}</span></span>
         </label>
       </div>
     </div>
@@ -494,6 +582,45 @@
         </label>
       </div>
     </div>
+    <!-- svelte-ignore a11y_label_has_associated_control -->
+    <div class="field">
+      <label>{t('支持 LocalSend 协议')}<Hint>
+        {t('默认关闭。打开且本机在线时，会加入 UDP 53317 组播，与局域网里的 LocalSend 设备互相发现并收发消息/文件；本机离线时自动停止，关掉后不再监听。')}<br />
+        {t('LocalSend 设备不配对、不进聊天群，只走一对一；文本和图片始终自动接收并显示在会话里，普通文件仍要你确认。')}
+      </Hint></label>
+      <div style="display:flex; align-items:center; justify-content:space-between;">
+        <span style="font-size:var(--fs-sm); color:var(--muted);">{t('与局域网里的 LocalSend 设备互相发现、收发消息与文件（UDP 53317）')}</span>
+        <label class="switch">
+          <input
+            type="checkbox"
+            checked={localsendEnabled}
+            disabled={localSendBusy}
+            data-localsend
+            onchange={(e: Event) =>
+              void toggleLocalSend((e.currentTarget as HTMLInputElement).checked)}
+          />
+          <span class="track"></span>
+        </label>
+      </div>
+      <p style="margin:4px 0 0; font-size:var(--fs-sm); color:var(--muted);">
+        {t('开启后立即生效，不等「保存设置」。53317 被占用时先回落主端口，端口空出后自动接管；不会因此自动关闭。')}
+      </p>
+      {#if localSendView}
+        <div style="display:flex; align-items:flex-start; gap:8px; margin-top:4px;">
+          <span style="font-size:var(--fs-sm); color:{localSendTone(localSendView.tone)};">
+            {localSendView.text}
+          </span>
+          {#if localSendView.retry}
+            <button
+              class="btn btn-ghost btn-sm"
+              style="flex:none;"
+              disabled={localSendBusy}
+              onclick={() => void retryLocalSend()}
+            >{t('重试')}</button>
+          {/if}
+        </div>
+      {/if}
+    </div>
     <!-- 中转流量（F-106 / S-09）：替别人搬了多少 —— 只读的累计记录，不随保存写。 -->
     <div class="field">
       <label>{t('中转流量')}<Hint>
@@ -583,7 +710,7 @@
   </div>
   <footer class="sheet-foot">
     <button class="btn btn-ghost" onclick={cancel}>{t('取消')}</button>
-    <button class="btn btn-primary" onclick={save} disabled={saving}>
+    <button class="btn btn-primary" onclick={save} disabled={saving || localSendBusy}>
       {saving ? t('保存中…') : t('保存设置')}
     </button>
   </footer>

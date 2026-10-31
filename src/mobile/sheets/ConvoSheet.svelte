@@ -14,7 +14,8 @@
   // "长连接优先、HTTP 兜底"（对方名字是它自报的），群聊的名册里本来就只存 `{id, 名字}`。
   // 以前这里只列已配对的，于是"设备页没有发消息入口 + 新建会话里看不见这台"叠在一起，
   // 未配对的设备在移动端一条会话也开不出来。
-  const candidates = $derived(getDevices());
+  // LocalSend 设备不进收件人候选：它只有一对一的文件会话，不能进群发/群聊。
+  const candidates = $derived(getDevices().filter((d) => d.transport !== 'localsend'));
 
   let picked = $state<string[]>([]);
   // 原型两张卡初始都不勾、但语义回落到"群聊"，于是按钮写「进入群聊」而高亮的却是空 —— 这里预选群聊，

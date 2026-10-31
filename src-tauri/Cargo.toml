@@ -45,7 +45,10 @@ uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
 thiserror = "1"
 anyhow = "1"
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+# LocalSend 的发现端要按网卡绑定/加入组播组：`UdpSocket` 本身没有
+# `set_reuse_address` / `join_multicast_v4`，只能经 socket2 建好再转成 tokio 的 socket。
+socket2 = { version = "0.6", features = ["all"] }
 # 传输加密（TLS + 证书指纹 pinning）。**crypto provider 一律用 `ring`**：rustls 0.23 的默认
 # provider 是 aws-lc-rs，它要现编一份 C（Windows 上还得有 NASM/CMake），为了一个自签证书把
 # 构建链拉长不划算；ring 是纯 Rust 构建。三处（rustls / tokio-rustls / reqwest）选同一个，

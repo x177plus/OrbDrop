@@ -75,5 +75,8 @@
   "继续{verb}「{name}」": "Resume {verb} “{name}”",
   "{verb}失败：{error}，点击重试": "{verb} failed: {error}. Tap to retry",
   "{verb}「{name}」": "{verb} “{name}”",
-  "应": "A"
+  "应": "A",
+  "发一条消息，或用「＋」发送图片/文件，开始和这台 LocalSend 设备对话。": "Send a message, or use “+” for images/files, to start talking to this LocalSend device.",
+  "发送图片": "Send image",
+  "发一条消息或粘贴图片；普通文件用「＋」发送。": "Send a message or paste an image; use “+” for ordinary files."
 }

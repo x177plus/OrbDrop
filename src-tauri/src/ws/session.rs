@@ -202,14 +202,17 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             // 下面那句"设备表优先"取到的是占位名（= 设备 id），一张推送卡上就会顶着一串 deviceid。
             state.note_peer_name(peer_id, &sender.name);
             let known = state.get_peer(peer_id);
-            // 已绑定（已配对）的设备：身份是这条会话用 token 换来的，无需再问用户一次。
+            // 已绑定（已配对）只说明身份是这条会话用 token 换来的；要不要免确认自动收，
+            // 由设置决定（默认关）。
             let paired = known.as_ref().is_some_and(|p| p.paired);
+            let auto_accept_paired = state.config.lock().auto_accept_paired;
+            let auto = paired && auto_accept_paired;
             let display_name = known
                 .as_ref()
                 .map(|p| p.name.clone())
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| sender.name.clone());
-            info!(%invite_id, peer_id, sender = %display_name, paired, "inbound push invite (ws)");
+            info!(%invite_id, peer_id, sender = %display_name, paired, auto, "inbound push invite (ws)");
             let total = if is_dir {
                 files.iter().map(|f| f.size).sum::<u64>()
             } else {
@@ -231,7 +234,8 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 count,
                 files,
                 caps,
-                // 已配对设备的推送免同意自动收，没有"先挑目录"的时机 → 落盘根恒为下载目录。
+                // 自动收的时候没有"先挑目录"的时机 → 落盘根恒为下载目录；
+                // 关了自动接收就等用户点「接收」，那时 `accept_invite` 才带上选的根。
                 root: None,
                 callback,
                 responder: None,
@@ -259,14 +263,14 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                     "size": total,
                     "isDir": is_dir,
                     "count": count,
-                    "auto": paired,
+                    "auto": auto,
                     // 这条文件消息在会话时间线上的位置（发送方点的，见 `WsEvent::PushInvite::at`）。
                     "at": at,
                 }),
             );
-            // 已配对的设备推送**不需要接收方同意**（token 就是那份信任）：直接开收 —
-            // 界面那条通知是"正在接收"而不是"要不要收"。未绑定的才挂卡片等用户点。
-            if paired {
+            // 开了「已配对设备自动接收」才免同意：直接开收 —— 界面那条通知是"正在接收"
+            // 而不是"要不要收"。其余情况（未绑定、或已配对但关了自动接收）挂卡片等用户点。
+            if auto {
                 if let Err(reason) = transfer::accept_invite(state.clone(), &invite_id, None) {
                     warn!(%invite_id, %reason, "auto-accept failed");
                     // 本机那条"正在接收"的通知得收尾：这条邀请已经不可能变成完成了。

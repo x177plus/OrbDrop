@@ -18,6 +18,7 @@
   import * as chat from "$lib/stores/chat.svelte";
   import * as devices from "$lib/stores/devices.svelte";
   import * as upd from "$lib/stores/update.svelte";
+  import { loadPlatform } from "$lib/stores/platform.svelte";
   import type { IconName } from "./icons";
 
   const tab = $derived(store.currentTab());
@@ -94,6 +95,9 @@
   }
 
   onMount(() => {
+    // 平台探测（`runtimeInfo`）：设置页据此隐藏"每次选择位置"（安卓的选择器给的是
+    // `content://`，写不进去）。不阻塞启动，回来之后文案/选项自动重算。
+    void loadPlatform();
     // 路由真相就是 hash：安卓的返回键走 webview 历史栈时，这一条链不用另写一套。
     // 安卓返回键：MainActivity 注册的回调会调 `window.__orbdropBack`（见那个 Kotlin 文件）。
     // 顺序就是"从最上面一层开始收"：底板 → 会话子屏 → 非首层 tab；都没有才返回 false，

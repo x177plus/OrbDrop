@@ -20,7 +20,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use parking_lot::Mutex;
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::PeerDevice;
 use crate::net;
@@ -430,7 +430,8 @@ pub async fn group_sync_ask_handler(
             &body.sig,
         )
         .map_err(|e| {
-            info!(sender = %body.sender.id, group = %body.group_id, reason = e.reason(), "补拉请求被拒：身份证明失败");
+            // 对端会按补拉节奏反复重试：拒绝本身不是状态变化，重复刷 INFO 只会淹没真正的故障。
+            debug!(sender = %body.sender.id, group = %body.group_id, reason = e.reason(), "补拉请求被拒：身份证明失败");
             (StatusCode::FORBIDDEN, format!("group sync refused: {}", e.reason()))
         })?;
         if !state
@@ -485,7 +486,7 @@ pub async fn group_sync_post_handler(
             &body.sig,
         )
         .map_err(|e| {
-            info!(sender = %body.sender.id, group = %body.group_id, reason = e.reason(), "补拉回答被拒：身份证明失败");
+            debug!(sender = %body.sender.id, group = %body.group_id, reason = e.reason(), "补拉回答被拒：身份证明失败");
             (StatusCode::FORBIDDEN, format!("group sync post refused: {}", e.reason()))
         })?;
     }
@@ -669,14 +670,16 @@ async fn accept_with(
         }
     }
     if existing.is_some() && !addr_trusted {
-        info!(
+        debug!(
             sender = %sender.id,
             from = %addr.ip(),
             "未配对来源的地址变更未被采信：身份连续性不匹配（旧地址保持不动）"
         );
     }
 
-    info!(sender = %sender.id, name = %sender.name, paired, addr_trusted, "inbound chat over http");
+    // 每一条走 HTTP 的会话消息都会到这里；消息级细节在默认日志里没有留存价值
+    // （长连接那条路同样只记 `debug`）。
+    debug!(sender = %sender.id, name = %sender.name, paired, addr_trusted, "inbound chat over http");
     // **群消息这一条要看落账结果**：收不下（本机拒绝过这个群 / 名册没到）就回 409 ——
     // 恒回 204 会让发送方把那一条记成「已送达」，而它实际被丢掉了（长连接那条路靠
     // `group_text_rejected` 反向纠正，HTTP 这一跳就靠这个状态码）。理由代码同时带上：

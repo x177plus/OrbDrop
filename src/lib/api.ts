@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, PickedFile, InstalledApp, ChatFileMsg, ChatSnapshot, InboxEntry, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState } from './types';
+import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, PickedFile, InstalledApp, ChatFileMsg, ChatSnapshot, InboxEntry, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState, LocalSendStatus } from './types';
 import type { ScreenMetrics, ScreenRect } from './orbLayout';
 
 // Share management
@@ -30,8 +30,36 @@ export function getSettings(): Promise<AppSettings> {
   return invoke('get_settings');
 }
 
-export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; deviceSubdir: boolean; downloadMode: string; deviceName: string; language: string; autoStart: boolean; bcExePath: string; autoBroadcastNew: boolean; groupRelay: boolean; allowRelay: boolean; relayMemory: boolean; transferWorkers: number; transferBlockMb: number }): Promise<AppSettings> {
+export function updateSettings(s: Partial<AppSettings> & { port: number; downloadDir: string; deviceSubdir: boolean; autoAcceptPaired: boolean; downloadMode: string; deviceName: string; language: string; autoStart: boolean; bcExePath: string; autoBroadcastNew: boolean; groupRelay: boolean; allowRelay: boolean; relayMemory: boolean; transferWorkers: number; transferBlockMb: number }): Promise<AppSettings> {
   return invoke('update_settings', { req: s });
+}
+
+/**
+ * LocalSend 兼容面的运行时状态：发现是否在跑、53317 是监听/被占/回落。
+ *
+ * 与 `getSettings().localsendEnabled` 分开：那是用户意图，这是运行结果。
+ */
+export function localsendStatus(): Promise<LocalSendStatus> {
+  return invoke('localsend_status');
+}
+
+/**
+ * 立即开/关 LocalSend 兼容（**不等设置页的「保存设置」**）。
+ *
+ * 后端落盘后立刻起停；返回最新运行状态。只有写盘失败才 reject —— 53317 被占用、
+ * 本机离线都属于返回状态里的“降级/暂停”，不是失败（不要因此把开关弹回）。
+ */
+export function setLocalsendEnabled(enabled: boolean): Promise<LocalSendStatus> {
+  return invoke('set_localsend_enabled', { enabled });
+}
+
+/**
+ * 让后台 guard 立刻补一拍（重新尝试 53317 / UDP 发现）。
+ *
+ * **不重启兼容层**：在途传输不会被掐断。不返回状态 —— 随后由 `localsend://status` 推。
+ */
+export function localsendRetry(): Promise<void> {
+  return invoke('localsend_retry');
 }
 
 /**
@@ -350,8 +378,8 @@ export function cancelPushBatch(batchId: string): Promise<void> {
 /**
  * 接收方点「同意接收」：起下载任务。
  *
- * `root` = 这次的落盘根目录（设置里「每次询问」时，界面先弹目录选择框再带上来）；
- * 不带就用设置里的下载目录。**已配对设备那条免同意自动收的路不问**，也就恒不带它。
+ * `root` = 这次的落盘根目录（设置里「每次选择位置」时，界面先弹目录选择框再带上来）；
+ * 不带就用设置里的下载目录。**已配对且开着「自动接收」那条免同意的路不问**，也就恒不带它。
  */
 export function acceptPush(inviteId: string, root?: string): Promise<void> {
   return invoke('accept_push', { inviteId, root: root ?? null });
@@ -461,6 +489,34 @@ export function chatSendImage(
   return invoke('chat_send_image', { peerIds, path, name, at: at ?? null, batchId: batchId ?? null });
 }
 
+/**
+ * 发一条 LocalSend 文本消息（**只走 LocalSend 协议**）。
+ *
+ * 与 `chatSend` 分开：LocalSend 没有长连接/离线队列/已读回执，后端也不把这条写进
+ * OrbDrop 的 `messages`。命令先把消息以 `sending` 记进 LocalSend 子列表并返回快照，
+ * 后台完成 `prepare-upload` 后再推 `chat://changed` 落终态。
+ */
+export function localsendSendText(
+  peerId: string,
+  text: string,
+  at?: number,
+): Promise<{ id: string; batchId: string | null; snapshot: ChatSnapshot }> {
+  return invoke('localsend_send_text', { peerId, text, at: at ?? null });
+}
+
+/**
+ * 发一张 LocalSend **图片消息**：会话里是图片气泡 + 发送状态，线上走 LocalSend 文件传输。
+ * 不经过 `push_paths`，所以没有批次卡、没有停止按钮。
+ */
+export function localsendSendImage(
+  peerId: string,
+  path: string,
+  name: string,
+  at?: number,
+): Promise<{ id: string; batchId: string | null; snapshot: ChatSnapshot }> {
+  return invoke('localsend_send_image', { peerId, path, name, at: at ?? null });
+}
+
 // 共享群聊：一份"所有人的同一个"消息流（与群发相反 —— 群消息不镜像进各台的 1:1）。
 // 与上面几条同一个路数：命令一律返回**整份会话状态**，界面拿来就换。
 /**
@@ -561,7 +617,7 @@ export function bcCompare(a: BcTarget, b: BcTarget): Promise<null> {
 }
 
 // Download
-/** 三条都返回落盘路径；**「每次询问」下用户在保存框里取消时返回 `null`** —— 不落盘，
+/** 三条都返回落盘路径；**「每次选择位置」下用户在保存框里取消时返回 `null`** —— 不落盘，
  *  调用方当"什么都没发生"（别弹失败提示，也别打开不存在的路径）。 */
 export function downloadFile(shareId: string, pathInShare: string): Promise<string | null> {
   return invoke('download_file', { shareId, pathInShare });

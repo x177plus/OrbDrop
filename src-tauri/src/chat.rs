@@ -8,9 +8,10 @@
 //! 聊天记录撑大，也不该因为手改一次配置被连带丢掉。文件是封装格式（`envelope`，
 //! **不是加密**）：双击看不到明文。
 //!
-//! **落盘的两种消息**：文本（`ChatMessage`，这一层的线上协议产生）与**文件消息**
-//! （`ChatFileMsg`，会话里那条"发了/收到了一个文件"的气泡）。文件消息的实时状态由前端
-//! 掌握（进度每 200ms 一跳），前端只在能定下来的时刻把整份列表写回来（`chat_files_set`）——
+//! **落盘的消息**：文本（`ChatMessage`，这一层的线上协议产生）、**文件消息**
+//! （`ChatFileMsg`，会话里那条"发了/收到了一个文件"的气泡），以及 LocalSend 的文本/图片
+//! 消息（`PeerConvo::localsend_messages`，单独一列）。文件消息的实时状态由前端掌握
+//! （进度每 200ms 一跳），前端只在能定下来的时刻把整份列表写回来（`chat_files_set`）——
 //! 它以前只活在内存里，重启就丢，害得"只发过文件"的会话整条从列表里消失。
 //!
 //! **模型**：消息按**对端设备**存（`peer_id → 消息`）——这是唯一的消息存储。
@@ -225,6 +226,14 @@ struct PeerConvo {
     /// 这台设备会话里的文件消息（老文件里没有这个键 = 空）。
     #[serde(default)]
     files: Vec<ChatFileMsg>,
+    /// LocalSend 文本与**自动接收的图片**消息。单独一列，**绝不并入 `messages`**：
+    /// `messages` 会进入 OrbDrop 的排队、补发、已读回执与群聊逻辑；LocalSend 没有那些语义。
+    /// 快照组装时再追加到界面那一份 `PeerConvoView.messages`，所以会话里看起来是一条时间线。
+    #[serde(default)]
+    localsend_messages: Vec<ChatMessage>,
+    /// LocalSend 消息的已读水位（本机时间）；与 OrbDrop 的 `read_at` 分开。
+    #[serde(default)]
+    localsend_read_at: u64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -241,6 +250,8 @@ struct ChatFile {
 #[serde(rename_all = "camelCase")]
 pub struct PeerConvoView {
     pub peer_id: String,
+    /// OrbDrop 消息 + LocalSend 文本/自动图片（后者来自 `localsend_messages`），
+    /// 顺序是两列原顺序相接；界面时间线由前端按 `at` 排。
     pub messages: Vec<ChatMessageView>,
     /// 这台设备会话里的文件消息（记录，不是实时视图 —— 见 `ChatFileMsg`）。
     pub files: Vec<ChatFileMsg>,
@@ -386,17 +397,23 @@ impl ChatStore {
         let mut views: Vec<PeerConvoView> = guard
             .convos
             .iter()
-            .map(|(peer_id, c)| PeerConvoView {
-                peer_id: peer_id.clone(),
-                messages: c
-                    .messages
-                    .iter()
-                    .cloned()
-                    .map(|m| ChatMessageView::of(m, &root))
-                    .collect(),
-                files: c.files.clone(),
-                read_at: c.read_at,
-                unread: unread_of(c),
+            .map(|(peer_id, c)| {
+                // OrbDrop 消息与 LocalSend 消息在界面上是同一条时间线，但存储上仍是两列。
+                // 这里只追加，不改变 OrbDrop 原本的落盘顺序；界面时间线由前端按 `at` 排。
+                let mut messages: Vec<ChatMessage> = c.messages.iter().cloned().collect();
+                messages.extend(c.localsend_messages.iter().cloned());
+                // **不在这里重排**：OrbDrop 的 `messages` 一直按落盘顺序给快照，既有的
+                // 逐台状态与测试都按那个顺序读；界面时间线由前端 `itemsOf` 按 `at` 排。
+                PeerConvoView {
+                    peer_id: peer_id.clone(),
+                    messages: messages
+                        .into_iter()
+                        .map(|m| ChatMessageView::of(m, &root))
+                        .collect(),
+                    files: c.files.clone(),
+                    read_at: c.read_at,
+                    unread: unread_of(c),
+                }
             })
             .collect();
         // 稳定顺序：界面上"哪台有未读"不该随机跳动（会话列表自己按最近一条排）。
@@ -560,6 +577,189 @@ impl ChatStore {
             persist(&self.path, &guard);
         }
         (true, self.snapshot())
+    }
+
+    /// 收到一条 LocalSend 文本消息。
+    ///
+    /// 与 OrbDrop 的 `record_inbound` 同一个幂等口径，但消息写进 `localsend_messages`：
+    /// 它不参与 OrbDrop 的排队/已读回执/群聊，界面由快照合并看到。
+    pub fn record_localsend_inbound_text(
+        &self,
+        peer_id: &str,
+        from_name: &str,
+        id: &str,
+        text: &str,
+        at: u64,
+    ) -> (bool, Snapshot) {
+        self.record_localsend_inbound_msg(peer_id, from_name, id, blobs::Content::text(text), at)
+    }
+
+    /// 收到一张 LocalSend **自动接收**的图片（内容已经写进 blobs）。
+    ///
+    /// 与文本走同一个子列表；图片是消息内容（`ChatMessage.image`），不是 `ChatFileMsg`。
+    pub fn record_localsend_inbound_image(
+        &self,
+        peer_id: &str,
+        from_name: &str,
+        id: &str,
+        name: &str,
+        size: u64,
+        at: u64,
+    ) -> (bool, Snapshot) {
+        self.record_localsend_inbound_msg(
+            peer_id,
+            from_name,
+            id,
+            blobs::Content::image(name, size),
+            at,
+        )
+    }
+
+    fn record_localsend_inbound_msg(
+        &self,
+        peer_id: &str,
+        from_name: &str,
+        id: &str,
+        content: blobs::Content,
+        at: u64,
+    ) -> (bool, Snapshot) {
+        let duplicate = {
+            let guard = self.inner.lock();
+            guard
+                .convos
+                .get(peer_id)
+                .is_some_and(|c| c.localsend_messages.iter().any(|m| !m.from_me && m.id == id))
+        };
+        if duplicate {
+            debug!(id, %peer_id, "inbound LocalSend message already recorded (redelivery)");
+            return (false, self.snapshot());
+        }
+        let image = content.image.clone();
+        {
+            let mut guard = self.inner.lock();
+            if !guard.convos.contains_key(peer_id) && guard.convos.len() >= MAX_CONVOS {
+                drop(guard);
+                warn!(%peer_id, limit = MAX_CONVOS, "收到新 LocalSend 会话但会话数已达上限，丢弃这条消息");
+                return (false, self.snapshot());
+            }
+            let convo = guard.convos.entry(peer_id.to_string()).or_default();
+            convo.localsend_messages.push(ChatMessage {
+                id: id.to_string(),
+                from_me: false,
+                from_name: from_name.to_string(),
+                text: content.text,
+                at,
+                delivery: Delivery::Received,
+                // LocalSend 没有群发/逐台回执：目标留空，别让 OrbDrop 的逐台逻辑把它算进去。
+                targets: Vec::new(),
+                batch_id: None,
+                image: image.is_some(),
+                name: image.as_ref().map(|(n, _)| n.clone()).unwrap_or_default(),
+                size: image.as_ref().map(|(_, s)| *s).unwrap_or(0),
+            });
+            prune(convo, &self.blobs_root);
+            persist(&self.path, &guard);
+        }
+        (true, self.snapshot())
+    }
+
+    /// 本机发出一条 LocalSend 消息（文本或图片消息）。初态通常是 `Sending`，等
+    /// `prepare-upload` / `/upload` 回来再落终态。
+    pub fn record_localsend_outbound(
+        &self,
+        id: &str,
+        peer_id: &str,
+        content: impl Into<blobs::Content>,
+        at: u64,
+        delivery: Delivery,
+    ) -> Snapshot {
+        let content = content.into();
+        let image = content.image.clone();
+        {
+            let mut guard = self.inner.lock();
+            let convo = guard.convos.entry(peer_id.to_string()).or_default();
+            convo.localsend_messages.push(ChatMessage {
+                id: id.to_string(),
+                from_me: true,
+                from_name: String::new(),
+                text: content.text,
+                at,
+                delivery,
+                targets: Vec::new(),
+                batch_id: None,
+                image: image.is_some(),
+                name: image.as_ref().map(|(n, _)| n.clone()).unwrap_or_default(),
+                size: image.as_ref().map(|(_, s)| *s).unwrap_or(0),
+            });
+            prune(convo, &self.blobs_root);
+            persist(&self.path, &guard);
+        }
+        self.snapshot()
+    }
+
+    /// LocalSend 出站消息的终态（只从 `Sending` 往终态走；晚到的失败不会洗掉已送达）。
+    pub fn set_localsend_delivery(
+        &self,
+        peer_id: &str,
+        msg_id: &str,
+        delivery: Delivery,
+    ) -> Snapshot {
+        {
+            let mut guard = self.inner.lock();
+            if let Some(convo) = guard.convos.get_mut(peer_id) {
+                if let Some(m) = convo
+                    .localsend_messages
+                    .iter_mut()
+                    .find(|m| m.from_me && m.id == msg_id)
+                {
+                    if m.delivery == Delivery::Sending {
+                        m.delivery = delivery;
+                        persist(&self.path, &guard);
+                    }
+                }
+            }
+        }
+        self.snapshot()
+    }
+
+    /// 本机读过一条 LocalSend 会话：只推进本地水位，**不产生回执**。
+    pub fn mark_localsend_read_local(&self, peer_id: &str, at: u64) -> Snapshot {
+        {
+            let mut guard = self.inner.lock();
+            let convo = guard.convos.entry(peer_id.to_string()).or_default();
+            if at > convo.localsend_read_at {
+                convo.localsend_read_at = at;
+                persist(&self.path, &guard);
+            }
+        }
+        self.snapshot()
+    }
+
+    /// LocalSend 对端发来的最大一条 `at`（没有 = 0）。
+    pub fn localsend_inbound_watermark(&self, peer_id: &str) -> u64 {
+        self.inner
+            .lock()
+            .convos
+            .get(peer_id)
+            .map(|c| {
+                c.localsend_messages
+                    .iter()
+                    .filter(|m| !m.from_me)
+                    .map(|m| m.at)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+
+    /// 本机在 LocalSend 会话上读到哪了。
+    pub fn localsend_read_watermark(&self, peer_id: &str) -> u64 {
+        self.inner
+            .lock()
+            .convos
+            .get(peer_id)
+            .map(|c| c.localsend_read_at)
+            .unwrap_or(0)
     }
 
     /// 把一条副本的送达状态落定（HTTP 兜底那一跳、补发那一跳回来时用）。
@@ -740,6 +940,15 @@ impl ChatStore {
                     changed = true;
                 }
             }
+            // LocalSend 没有离线队列/补发：上次进程里还在等对端确认的那条，重启后不可能
+            // 再续上，直接落成「未送达」。绝不把它改成 `Queued` —— 那会让 OrbDrop 的
+            // `flush_queued` 拿它去走 OrbDrop 协议的 `deliver()`。
+            for m in convo.localsend_messages.iter_mut() {
+                if m.from_me && m.delivery == Delivery::Sending {
+                    m.delivery = Delivery::Failed;
+                    changed = true;
+                }
+            }
             // 文件消息同理：上次进程里还在传的那些随进程没了（推送不做离线排队，F-53），
             // 留成"还在传"就是让界面永远挂着一个不会动的进度 —— 落成终态（发送侧「未送达」、
             // 接收侧「接收失败」）。已经定下来的那些（已送达 / 已收完 / 已拒绝 / 未送达）不动。
@@ -834,10 +1043,12 @@ impl ChatStore {
             let mut guard = self.inner.lock();
             if let Some(convo) = guard.convos.get_mut(peer_id) {
                 dropped.extend(convo.messages.drain(..));
+                dropped.extend(convo.localsend_messages.drain(..));
                 // 文件消息也是这台设备的会话记录：清一半的话，列表里"最近一条"还会挂着
                 // 一条已经不该在的记录（前端 `dropLocalFiles` 清的是同一件事的另一半）。
                 convo.files.clear();
                 convo.read_at = 0;
+                convo.localsend_read_at = 0;
                 persist(&self.path, &guard);
             }
         }
@@ -869,6 +1080,7 @@ impl ChatStore {
             let mut guard = self.inner.lock();
             if let Some(convo) = guard.convos.remove(peer_id) {
                 dropped = convo.messages;
+                dropped.extend(convo.localsend_messages);
                 persist(&self.path, &guard);
             }
         }
@@ -882,7 +1094,7 @@ impl ChatStore {
             .lock()
             .convos
             .values()
-            .flat_map(|c| c.messages.iter())
+            .flat_map(|c| c.messages.iter().chain(c.localsend_messages.iter()))
             .filter(|m| m.image)
             .map(|m| m.id.clone())
             .collect()
@@ -904,11 +1116,18 @@ fn batch_sig(members: &[String]) -> Vec<String> {
 }
 
 fn unread_of(convo: &PeerConvo) -> u32 {
-    convo
+    let orb = convo
         .messages
         .iter()
         .filter(|m| !m.from_me && m.at > convo.read_at)
-        .count() as u32
+        .count();
+    // LocalSend 的已读水位是独立的一列：它的消息不参与 OrbDrop 的 `read_at` 回执。
+    let localsend = convo
+        .localsend_messages
+        .iter()
+        .filter(|m| !m.from_me && m.at > convo.localsend_read_at)
+        .count();
+    (orb + localsend) as u32
 }
 
 fn prune(convo: &mut PeerConvo, root: &std::path::Path) {
@@ -924,6 +1143,15 @@ fn prune(convo: &mut PeerConvo, root: &std::path::Path) {
     let excess = convo.files.len().saturating_sub(MAX_PER_PEER);
     if excess > 0 {
         convo.files.drain(..excess);
+    }
+    // LocalSend 文本/图片也按同一上限裁剪；裁掉的图片内容一起删。
+    let excess = convo
+        .localsend_messages
+        .len()
+        .saturating_sub(MAX_PER_PEER);
+    if excess > 0 {
+        let dropped: Vec<ChatMessage> = convo.localsend_messages.drain(..excess).collect();
+        drop_blobs(&dropped, root);
     }
 }
 
@@ -1500,6 +1728,20 @@ pub fn mark_read(state: &Arc<AppState>, peer_ids: &[String]) {
         }
         state.chat.mark_read_local(peer_id, watermark);
         send_receipt(state, peer_id, watermark);
+    }
+}
+
+/// LocalSend 一侧的“读过”：只推进本地水位，**不向对端发 OrbDrop 的 `ChatRead` 回执**。
+///
+/// 与 `mark_read` 分开，是因为 LocalSend 没有回执通道；把两者混在一条函数里，迟早
+/// 会有人给 LocalSend 对端发出一条它不认识的报文。
+pub fn mark_localsend_read(state: &Arc<AppState>, peer_ids: &[String]) {
+    for peer_id in peer_ids {
+        let watermark = state.chat.localsend_inbound_watermark(peer_id);
+        if watermark == 0 || watermark <= state.chat.localsend_read_watermark(peer_id) {
+            continue;
+        }
+        state.chat.mark_localsend_read_local(peer_id, watermark);
     }
 }
 
@@ -2297,5 +2539,67 @@ mod tests {
         // 砍掉的是最早的，留下的是最新的。
         assert_eq!(convo.messages.last().unwrap().at, MAX_PER_PEER as u64 + 10);
         assert_eq!(convo.messages[0].at, 11);
+    }
+
+    #[test]
+    fn localsend_messages_are_isolated_but_visible_in_the_same_convo() {
+        let s = store("localsend");
+        s.record_inbound("a", "OrbDrop A", "m1", "orbdrop", 100);
+        s.record_localsend_inbound_text("a", "LocalSend A", "ls:1", "localsend", 200);
+        s.record_localsend_inbound_image("a", "LocalSend A", "ls:2", "photo.png", 4, 300);
+
+        let convo = s
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == "a")
+            .unwrap();
+        // 界面上是一条时间线：OrbDrop + LocalSend 文本 + LocalSend 图片。
+        assert_eq!(convo.messages.len(), 3);
+        assert_eq!(convo.messages[0].text, "orbdrop");
+        assert_eq!(convo.messages[1].text, "localsend");
+        assert!(convo.messages[2].image);
+        // 未读把两套消息都算进来；LocalSend 有独立水位，不会碰 OrbDrop 的 read_at。
+        assert_eq!(convo.unread, 3);
+        s.mark_localsend_read_local("a", 300);
+        let convo = s
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == "a")
+            .unwrap();
+        assert_eq!(convo.unread, 1);
+        assert_eq!(s.read_watermark("a"), 0);
+        assert!(s.image_ids().contains("ls:2"));
+    }
+
+    #[test]
+    fn localsend_inflight_messages_fail_instead_of_joining_the_orbdrop_queue() {
+        let s = store("localsend_inflight");
+        s.record_localsend_outbound(
+            "ls:out",
+            "a",
+            "hello",
+            100,
+            Delivery::Sending,
+        );
+        s.requeue_inflight(&std::collections::HashSet::new());
+        let convo = s
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == "a")
+            .unwrap();
+        assert_eq!(convo.messages[0].delivery, Delivery::Failed);
+        assert!(s.peers_with_backlog().is_empty());
+        s.clear_peer("a");
+        let convo = s
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == "a")
+            .unwrap();
+        assert!(convo.messages.is_empty());
+        assert!(convo.files.is_empty());
     }
 }

@@ -62,5 +62,8 @@
   "文件管理器": "File manager",
   "此电脑": "This PC",
   "这个图片格式读不出来": "This image format can't be read",
-  "正在准备「{name}」…（请按住不放）": "Preparing “{name}”… (keep holding)"
+  "正在准备「{name}」…（请按住不放）": "Preparing “{name}”… (keep holding)",
+  "LocalSend 会话只支持文件": "LocalSend conversations support files only",
+  "消息为空": "The message is empty",
+  "LocalSend 会话请使用专用文本输入": "Use the dedicated LocalSend text box for this conversation"
 }

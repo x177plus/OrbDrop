@@ -29,7 +29,7 @@ use aes_gcm::AesGcm;
 use base64::Engine as _;
 use rand::RngCore;
 use serde::Serialize;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(target_os = "windows")]
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
@@ -684,7 +684,7 @@ pub fn prune_webdav_profiles(dir: &Path, keep: &[String]) -> usize {
         .unwrap_or_else(|| random_bytes::<32>().to_vec());
     match write_profile_file(&path, &file, &key, None) {
         Ok(()) => {
-            info!(path = %path.display(), removed, "已清理失效的 BeyondCompare WebDAV profile");
+            debug!(path = %path.display(), removed, "已清理失效的 BeyondCompare WebDAV profile");
             removed
         }
         Err(e) => {

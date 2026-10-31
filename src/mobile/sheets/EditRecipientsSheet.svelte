@@ -31,11 +31,15 @@
   // 一对一的普通消息，未配对的对端同样收得下（长连接优先、HTTP 兜底）。
   // 只列已配对的会让名册里那台未配对的成员在表上**看不见**——标记还留在 `picked` 里，
   // 用户既看不到也改不掉它。
-  const candidates = $derived(getDevices());
+  // LocalSend 设备不进群发/群聊名册（它只有一对一的文件会话）。
+  const candidates = $derived(getDevices().filter((d) => d.transport !== 'localsend'));
 
   // 勾选是**开表那一刻**拍下来的快照，不是跟着视图走的派生值：会话里随时可能来新消息，
   // 视图一重算就把用户刚改的勾选冲掉。保存时再回头看视图要最新的 id 与名字。
-  let picked = $state<string[]>(initialPicked());
+  // 只剔除 LocalSend（不在设备表里的旧成员照旧保留，否则一保存就把名册里那台删了）。
+  let picked = $state<string[]>(
+    initialPicked().filter((id) => getDevices().find((d) => d.id === id)?.transport !== 'localsend'),
+  );
 
   function initialPicked(): string[] {
     const th = chat.activeThread();

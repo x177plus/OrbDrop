@@ -5,7 +5,15 @@
   import { t, setLanguagePreference, adoptLanguagePreference, normalizePreference, type Locale } from "$lib/i18n.svelte";
   import type { AppSettings, KeepAliveState, RelayTraffic } from "$lib/types";
   import * as devices from "$lib/stores/devices.svelte";
+  import {
+    getLocalSendStatus,
+    localSendStatusView,
+    refreshLocalSendStatus,
+    retryLocalSendNow,
+    setLocalSendEnabled,
+  } from "$lib/stores/localsend.svelte";
   import * as upd from "$lib/stores/update.svelte";
+  import { platform } from "$lib/stores/platform.svelte";
   import UpdateNotes from "$lib/components/UpdateNotes.svelte";
   import LanguageSelect from "$lib/components/LanguageSelect.svelte";
   import Icon from "../Icon.svelte";
@@ -23,6 +31,8 @@
   // 不在 `store.form()` 里的两项：表单只装"用户正在改的那几个"（见 store 里 resetForm 的注释），
   // 下载模式与"添加后自动共享"是本页自己的编辑态，保存时一起写回。
   let downloadMode = $state<AppSettings["downloadMode"]>("Direct");
+  /** 已配对设备推送是否免确认自动收（后端 `AppSettings.autoAcceptPaired`，**默认关**）。 */
+  let autoAcceptPaired = $state(false);
   /**
    * 推送接收是否再放一层 `<发送方名>/`（后端 `AppSettings.deviceSubdir`，默认开，S-12）。
    * 与桌面端同一个后端位、同一套落盘形状：开着时「文件」页那两层铺平就是"根下的散文件 +
@@ -51,6 +61,35 @@
    * 后台被系统冻结就没人借得到，见下面「后台与通知」那一格。
    */
   let relay = $state(true);
+
+  /**
+   * 支持 LocalSend v2.2 协议（后端 `AppSettings.localsendEnabled`，**默认关**）：与桌面端同一个
+   * 后端位。开着且本机在线时监听 UDP 53317、与局域网里的 LocalSend 设备互相发现；离线自动停。
+   */
+  let localsendEnabled = $state(false);
+  /** 开关命令还没返回（防连点）。 */
+  let localSendBusy = $state(false);
+  const localSendStatus = $derived(getLocalSendStatus());
+  const localSendView = $derived(localSendStatusView(localSendStatus));
+  /** 安卓只有「直接保存」一档（平台探测回来之前先按桌面画，回来后再收掉）。 */
+  const isAndroid = $derived(platform().os === "android");
+  // 平台探测回来后把可能残留的「每次选择位置」收回「直接保存」（例如从别的机器拷来的配置）。
+  $effect(() => {
+    if (isAndroid && downloadMode !== "Direct") downloadMode = "Direct";
+  });
+  /** 状态行的颜色：绿=正常，琥珀=降级，红=发现没起来，灰=离线暂停。 */
+  function localSendTone(tone: "ok" | "warn" | "error" | "muted"): string {
+    switch (tone) {
+      case "ok":
+        return "var(--ok)";
+      case "warn":
+        return "var(--warn)";
+      case "error":
+        return "var(--danger)";
+      default:
+        return "var(--muted)";
+    }
+  }
 
   /**
    * 本机替别人中转的**累计流量**（S-11，后端 `relay_traffic` 命令）：只读的用量记录 —— 它是
@@ -124,12 +163,14 @@
       languagePref = normalizePreference(s.language);
       adoptLanguagePreference(s.language);
       downloadMode = s.downloadMode;
+      autoAcceptPaired = s.autoAcceptPaired;
       deviceSubdir = s.deviceSubdir;
       autoBroadcast = s.autoBroadcastNew;
       transferWorkers = String(s.transferWorkers);
       transferBlockMb = String(s.transferBlockMb);
       // 一颗开关两条后端位：任一条开着就显示成开（与桌面端读法一致）。
       relay = s.allowRelay || s.groupRelay;
+      localsendEnabled = s.localsendEnabled;
       store.resetForm({ deviceName: s.deviceName, port: s.port });
     } catch (e) {
       loadError = e instanceof Error ? e.message : String(e);
@@ -143,6 +184,7 @@
     online = devices.isLocalOnline();
     // 自更新状态：订阅一次（重复调用没有副作用）。
     void upd.watchUpdate();
+    void refreshLocalSendStatus();
     void load();
     // 电池优化白名单：读不到（命令没注册 / 平台没有）就保持"读取中…"，不弹错误 —— 那一行是提示，不是功能。
     void api
@@ -222,6 +264,40 @@
     }
   }
 
+  async function toggleLocalSend(next: boolean): Promise<void> {
+    const previous = localsendEnabled;
+    localsendEnabled = next;
+    localSendBusy = true;
+    try {
+      const s = await setLocalSendEnabled(next);
+      localsendEnabled = s.enabled;
+      // 保存时 `...saved` 会整份回写；把这一位同步成刚落盘的值。
+      if (saved) saved = { ...saved, localsendEnabled: s.enabled };
+      store.toast(
+        next ? t("LocalSend 兼容已开启") : t("LocalSend 兼容已关闭"),
+        "check",
+      );
+    } catch (e) {
+      // 只有写盘失败才弹回；53317 被占用/离线都在状态行里说。
+      localsendEnabled = previous;
+      store.failed(t("切换 LocalSend 兼容"), e);
+    } finally {
+      localSendBusy = false;
+    }
+  }
+
+  /** 状态行的「重试」：叫醒后台 guard 补一拍（不重启，在途传输不断）。 */
+  async function retryLocalSend(): Promise<void> {
+    localSendBusy = true;
+    try {
+      await retryLocalSendNow();
+    } catch (e) {
+      store.failed(t("切换 LocalSend 兼容"), e);
+    } finally {
+      localSendBusy = false;
+    }
+  }
+
   async function save(): Promise<void> {
     const f = form;
     if (!saved || !f || saving) return;
@@ -233,22 +309,27 @@
         deviceName: f.deviceName.trim() || saved.deviceName,
         language: languagePref,
         port: digits ? Number(digits) : saved.port,
-        downloadMode,
+        downloadMode: isAndroid ? "Direct" : downloadMode,
+        autoAcceptPaired,
         deviceSubdir,
         autoBroadcastNew: autoBroadcast,
         online,
         // 一颗开关管两条路（与桌面端同一个口径）：替其它设备盲转字节 + 替群聊转消息。
         groupRelay: relay,
         allowRelay: relay,
+        // LocalSend 开关是**立即生效**的（`toggleLocalSend` 自己落盘）：保存表单时
+        // 不再带它，否则表单里那份旧值会把用户刚点的开关覆盖回去（桌面端同一口径）。
         transferWorkers: clampNum(transferWorkers, 1, 8, saved.transferWorkers),
         transferBlockMb: clampNum(transferBlockMb, 1, 32, saved.transferBlockMb),
       });
       // 后端会规范化（端口被占时顺延、名字裁剪），保存后再读一次让表单跟着真值走。
       saved = next;
       downloadMode = next.downloadMode;
+      autoAcceptPaired = next.autoAcceptPaired;
       deviceSubdir = next.deviceSubdir;
       autoBroadcast = next.autoBroadcastNew;
       relay = next.allowRelay || next.groupRelay;
+      localsendEnabled = next.localsendEnabled;
       transferWorkers = String(next.transferWorkers);
       transferBlockMb = String(next.transferBlockMb);
       store.resetForm({ deviceName: next.deviceName, port: next.port });
@@ -348,22 +429,44 @@
           </p>
         </div>
         <div class="srow">
-          <span class="slabel">{t("下载模式")}</span>
+          <div class="srow-top">
+            <span class="slabel">{t("已配对设备自动接收")}</span>
+            <label class="switch">
+              <input type="checkbox" bind:checked={autoAcceptPaired} aria-label={t("已配对设备自动接收")} />
+              <span class="track"></span>
+            </label>
+          </div>
+          <p class="shelp">
+            {t(
+              "开启：已配对设备推来的文件不再询问，直接保存到下载目录。关闭（默认）：和未配对设备一样，先点「接收」，接收后保存到下载目录。未配对设备始终需要你确认。",
+            )}
+          </p>
+        </div>
+        <div class="srow">
+          <span class="slabel">{t("保存位置")}</span>
           <!-- 取值是后端的 `DownloadMode`（`Direct` / `AskEachTime`），原型里那两个小写字面量是 mock。 -->
           <label class="radio" class:is-checked={downloadMode === "Direct"}>
             <input type="radio" name="dlMode" value="Direct" bind:group={downloadMode} />
             <span class="rmain">
-              <span class="rname">{t("直接存下载目录")}</span>
-              <span class="rdesc">{t("引用下载时不再询问位置。")}</span>
+              <span class="rname">{t("直接保存到下载目录")}</span>
+              <span class="rdesc">{t("手动下载直接存；接收推送也直接存到下载目录。")}</span>
             </span>
           </label>
+          {#if !isAndroid}
           <label class="radio" class:is-checked={downloadMode === "AskEachTime"}>
             <input type="radio" name="dlMode" value="AskEachTime" bind:group={downloadMode} />
             <span class="rmain">
-              <span class="rname">{t("每次弹窗选位置")}</span>
-              <span class="rdesc">{t("每次下载前选择保存位置。")}</span>
+              <span class="rname">{t("每次选择位置")}</span>
+              <span class="rdesc">{t("手动下载前选择保存位置；接收推送仍保存到下载目录（手机没有可写的目录选择器）。")}</span>
             </span>
           </label>
+          {:else}
+            <p class="shelp">
+              {t(
+                "安卓上固定为「直接保存到下载目录」：系统选择器返回的是 content://，落盘层只能写文件系统路径。",
+              )}
+            </p>
+          {/if}
         </div>
       </div>
     </div>
@@ -412,6 +515,47 @@
               "替够不着彼此的其它设备搬字节（有些 Wi‑Fi 把同网段客户端之间的单播隔开），也替够不着的同群成员转消息；不限已配对设备。会占用本机上行带宽（手机上是流量），默认打开（首次启动就是开的，不想出这笔开销就关掉），关掉立刻收掉正在替别人转的每一条。",
             )}
           </p>
+        </div>
+        <div class="srow">
+          <div class="srow-top">
+            <span class="slabel">{t("支持 LocalSend 协议")}</span>
+            <label class="switch">
+              <input
+                type="checkbox"
+                checked={localsendEnabled}
+                disabled={localSendBusy}
+                data-localsend
+                aria-label={t("支持 LocalSend 协议")}
+                onchange={(e: Event) =>
+                  void toggleLocalSend((e.currentTarget as HTMLInputElement).checked)}
+              />
+              <span class="track"></span>
+            </label>
+          </div>
+          <p class="shelp">
+            {t(
+              "默认关闭。打开且本机在线时，会加入 UDP 53317 组播，与局域网里的 LocalSend 设备互相发现并收发消息/文件；离线时自动停止，关掉后不再监听。LocalSend 设备不配对、不进聊天群，只走一对一；文本和图片始终自动接收，普通文件仍需确认。",
+            )}
+          </p>
+          <p class="shelp">
+            {t("开启后立即生效，不等「保存设置」。53317 被占用时先回落主端口，端口空出后自动接管；不会因此自动关闭。")}
+          </p>
+          {#if localSendView}
+            <div style="display:flex; align-items:flex-start; gap:8px;">
+              <p class="shelp" style="margin:0; color:{localSendTone(localSendView.tone)};">
+                {localSendView.text}
+              </p>
+              {#if localSendView.retry}
+                <button
+                  class="btn btn-secondary btn-sm"
+                  type="button"
+                  style="flex:none;"
+                  disabled={localSendBusy}
+                  onclick={() => void retryLocalSend()}
+                >{t("重试")}</button>
+              {/if}
+            </div>
+          {/if}
         </div>
         <div class="srow">
           <span class="slabel">{t("中转流量")}</span>
@@ -556,7 +700,7 @@
 
     <div class="sec">
       <!-- 原型末尾还有一颗「清空全部凭据」（`wipe_credentials`）：危险操作，移动端本阶段不做。 -->
-      <button class="btn btn-primary btn-block" type="button" disabled={saving} onclick={() => void save()}>
+      <button class="btn btn-primary btn-block" type="button" disabled={saving || localSendBusy} onclick={() => void save()}>
         {t("保存设置")}
       </button>
     </div>

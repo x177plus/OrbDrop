@@ -197,11 +197,17 @@ impl RelayRegistry {
     }
 
     /// 记一次"目标地址连不上"：冷却期内 `open` 不再为它新开端点。
-    fn target_failed(&self, addr: SocketAddr) {
+    ///
+    /// 返回这次失败是不是冷却期里的**第一次**：调用点据此只把第一条记成 `warn` ——
+    /// 端点还活着时同一目标会被反复重连，每一次都刷一条相同的超时没有信息量
+    /// （实测一天上千条）。
+    fn target_failed(&self, addr: SocketAddr) -> bool {
         let now = Instant::now();
         let mut f = self.failures.lock();
         f.retain(|_, at| now.saturating_duration_since(*at) < RELAY_FAIL_COOLDOWN);
+        let first = !f.contains_key(&addr);
         f.insert(addr, now);
+        first
     }
 
     fn target_cooling(&self, addr: SocketAddr) -> bool {
@@ -497,7 +503,8 @@ pub async fn open(
     // 请求方（`ensure_for`）在目标暂时不可达时每 30s 重问一次控制面；每次都新开监听器 +
     // 出站连接，旧端点还要空转 120s，日志里就是一串不同端口。复用只花一次查表。
     if let Some((port, host, target_addr)) = state.relays.find(requester, target) {
-        info!(%requester, %target, port, "复用已开的中转端点");
+        // 每 30s 一次的复用是稳态，不是事件；端点开/关那两条（也降为 debug）才是。
+        debug!(%requester, %target, port, "复用已开的中转端点");
         return Ok(Opened {
             host,
             port,
@@ -541,7 +548,9 @@ pub async fn open(
         })
         .map_err(|_| OpenError::Busy(format!("本机同时在转的中转已达上限（{MAX_RELAYS}）")))?;
 
-    info!(
+    // 端点开一次就是一条监听 + 一条出站连接，稳态下每 30s 会开一次；这是内部动作，
+    // 不是用户事件（实测一天上千条）。排障时用 `RUST_LOG=debug` 看。
+    debug!(
         requester = %requester,
         target = %target,
         target_name = %target_name,
@@ -816,13 +825,20 @@ async fn pump(
                 stream
             }
             Ok(Err(e)) => {
-                warn!(target = %target_addr, "中转连目标失败: {e}");
-                state.relays.target_failed(target_addr);
+                // 冷却期内只有第一次是 `warn`：同一目标的重连会走同一条失败路径。
+                if state.relays.target_failed(target_addr) {
+                    warn!(target = %target_addr, "中转连目标失败: {e}");
+                } else {
+                    debug!(target = %target_addr, "中转连目标失败（冷却中，重复）: {e}");
+                }
                 return;
             }
             Err(_) => {
-                warn!(target = %target_addr, "中转连目标超时");
-                state.relays.target_failed(target_addr);
+                if state.relays.target_failed(target_addr) {
+                    warn!(target = %target_addr, "中转连目标超时");
+                } else {
+                    debug!(target = %target_addr, "中转连目标超时（冷却中，重复）");
+                }
                 return;
             }
         };
@@ -1251,14 +1267,31 @@ pub async fn ensure_for(state: &Arc<AppState>, target: &str) -> Option<RelayAddr
         if !opened.via_cidr.is_empty() {
             state.absorb_relay_report(target, &opened.via_cidr, &opened.via_devices);
         }
-        info!(
-            target = %target,
-            via = %c.name,
-            paired = c.paired,
-            host = %relay.host,
-            port = relay.port,
-            "直连不通，改走中转"
-        );
+        // 稳态下 `ensure_for` 每 30s 重问一次、每次都走这里：只有**从直连切到中转**
+        // 那一次是用户能感知的状态变化，之后的重问只记 debug。
+        let was_relayed = state
+            .get_peer(target)
+            .and_then(|p| p.relay)
+            .is_some();
+        if was_relayed {
+            debug!(
+                target = %target,
+                via = %c.name,
+                paired = c.paired,
+                host = %relay.host,
+                port = relay.port,
+                "直连仍不通，继续走中转"
+            );
+        } else {
+            info!(
+                target = %target,
+                via = %c.name,
+                paired = c.paired,
+                host = %relay.host,
+                port = relay.port,
+                "直连不通，改走中转"
+            );
+        }
         // 中转方在回话里带回了**目标此刻的地址**（它刚核实过）：只经由中转见过一面的那一侧
         // 手里从来没有这个地址 —— 补上它，设备行才说得清"它在哪"，下一次借中转也才有 `addr` 提示。
         if let Some((ip, port)) = opened

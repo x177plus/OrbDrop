@@ -46,6 +46,7 @@
   "已发送 · {name}": "Sent · {name}",
   "正在发送 · {name}": "Sending · {name}",
   "等待对方同意": "Waiting for approval",
+  "等待对方接收": "Waiting for the peer to receive",
   "、": ", ",
   "{n} 台全部完成": {
     "one": "All {n} device done",
@@ -73,7 +74,7 @@
   "「{name}」不在网上，推送未发送": "“{name}” is offline; nothing was pushed",
   "所选设备都不在网上，推送未发送": "None of the selected devices are online; nothing was pushed",
   "推送到{targets}": "Send to {targets}",
-  "文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。同一份内容会分别发给每台设备：已配对的直接收，未配对的各自点同意，进度与成败都记在右下角那张卡片上。": "Pick files and folders together; double-click a folder to open it, and selections accumulate across folders. Review, remove items or clear all from the badge at the bottom. The same content goes to every device: paired devices receive it directly, unpaired ones each approve it, and progress and results are shown on the card in the bottom-right corner.",
+  "文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。同一份内容会分别发给每台设备：已配对且开着「自动接收」的直接收，其余各自点同意，进度与成败都记在右下角那张卡片上。": "Pick files and folders together; double-click a folder to open it, and selections accumulate across folders. Review, remove items or clear all from the badge at the bottom. The same content goes to every device: paired devices with \"Auto-receive from paired devices\" on receive it directly, everyone else approves it, and progress and results are shown on the card in the bottom-right corner.",
   "推送到 {n} 台设备": {
     "one": "Send to {n} device",
     "other": "Send to {n} devices"
@@ -260,5 +261,6 @@
   "本机有 {n} 个内网地址（点一下复制第一个）：{list}": {
     "one": "This device has {n} LAN address (click to copy the first one):{list}",
     "other": "This device has {n} LAN addresses (click to copy the first one):{list}"
-  }
+  },
+  "从列表移除": "Remove from list"
 }

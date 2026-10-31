@@ -3,6 +3,7 @@
   import Icon from "../Icon.svelte";
   import * as store from "../store.svelte";
   import * as devices from "$lib/stores/devices.svelte";
+  import * as api from "$lib/api";
   import { t } from "$lib/i18n.svelte";
 
   let { peerId, onClose }: { peerId: string; onClose: () => void } = $props();
@@ -27,6 +28,25 @@
     if (!d) return;
     if (await store.unpair(d.id, devices.deviceShortName(d))) onClose();
   }
+
+  /** LocalSend 行只是本机发现结果：移除后它在网上会重新出现，所以文案不说"忘记/解除配对"。 */
+  async function removeLocalSend(): Promise<void> {
+    if (!d) return;
+    const name = devices.deviceShortName(d);
+    if (!(await store.confirmAction({
+      title: t("从列表移除"),
+      desc: t("从本机列表移除「{name}」？它还在网上时会重新出现。", { name }),
+      confirmLabel: t("移除"),
+      danger: true,
+    }))) return;
+    try {
+      await api.removePeer(d.id);
+      store.toast(t("已从列表移除「{name}」", { name }), "check");
+      onClose();
+    } catch (e) {
+      store.failed(t("移除失败"), e);
+    }
+  }
 </script>
 
 <!-- 这一张表就是移动端的**设备右键菜单**（桌面端那份见 `ContextMenu.svelte` 的 `kind === 'device'`）：
@@ -44,6 +64,7 @@
       </span>
     </button>
 
+    {#if d.transport !== "localsend"}
     <!-- 长连接只给"在线 + 已配对 + 凭据还能用"这一档：剩下三档各拨不动 ——
          未配对（拨号要求 paired）、对端不在网上（只会开一个空转的拨号循环）、
          token 已被对端作废（必 401，出路是重新配对）。 -->
@@ -83,8 +104,25 @@
       {/if}
     {/if}
 
-    <!-- 发消息：在线的三档都有（F-59，「长连接 / 已配对 / 未绑定」各一颗，离线行不给）。 -->
-    {#if d.online || !d.paired}
+    {/if}
+
+    <!-- 发消息/发文件：LocalSend 只有 direct 文件会话；OrbDrop 才给文本会话。 -->
+    {#if d.transport === "localsend"}
+      <button class="opt" type="button" onclick={() => { store.openChat(d.id); onClose(); }}>
+        <span class="oi"><Icon name="file" /></span>
+        <span class="om">
+          <span class="on">{t("发消息")}</span>
+          <span class="od">{t("打开与「{name}」的 LocalSend 会话：可以发文字；图片/文件按 LocalSend 文件传输，每批需要对方确认。", { name: devices.deviceShortName(d) })}</span>
+        </span>
+      </button>
+      <button class="opt danger" type="button" onclick={() => void removeLocalSend()}>
+        <span class="oi"><Icon name="trash" /></span>
+        <span class="om">
+          <span class="on">{t("从列表移除")}</span>
+          <span class="od">{t("只清本机这一行；它还在网上时会重新出现。")}</span>
+        </span>
+      </button>
+    {:else if d.online || !d.paired}
       <button class="opt" type="button" onclick={() => { store.openChat(d.id); onClose(); }}>
         <span class="oi"><Icon name="send" /></span>
         <span class="om">
@@ -94,8 +132,8 @@
       </button>
     {/if}
 
-    <!-- 解除配对只给已配对的（未绑定的行没有关系可解，桌面端也不给这一项）。 -->
-    {#if d.paired}
+    <!-- 解除配对只给已配对的 OrbDrop 设备（LocalSend 没有关系可解）。 -->
+    {#if d.paired && d.transport !== "localsend"}
       <button class="opt danger" type="button" onclick={() => void unpair()}>
         <span class="oi"><Icon name="trash" /></span>
         <span class="om">

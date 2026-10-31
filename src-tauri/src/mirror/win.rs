@@ -34,7 +34,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 
 use parking_lot::Mutex;
 
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Foundation::{
     ERROR_CLOUD_FILE_REQUEST_ABORTED, ERROR_CLOUD_FILE_REQUEST_CANCELED,
@@ -247,7 +247,7 @@ pub fn ensure_ready(state: Arc<AppState>) -> Result<(), String> {
         // 在 async 上下文里调用时就是当前运行时；启动时（Tauri setup，同步上下文）退回
         // Tauri 的全局运行时 —— 那本来就是应用自己的那一个。
         let rt = tokio::runtime::Handle::try_current().unwrap_or_else(|_| crate::task::handle());
-        info!("水合用的 HTTP 客户端按对端延迟建立（同一目标复用同一条 TLS 连接）");
+        debug!("水合用的 HTTP 客户端按对端延迟建立（同一目标复用同一条 TLS 连接）");
         Box::leak(Box::new(Provider { state, rt }))
     });
     let key = connect(provider, &wide_root)?;

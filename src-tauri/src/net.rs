@@ -359,25 +359,44 @@ impl Trust {
     pub fn scoped(host: &str, pin: &DialPin) -> Arc<Trust> {
         let mut scoped = Trust::new();
         scoped.observed = trust().observed.clone();
-        let Some(ip) = parse_host(host) else {
-            return Arc::new(scoped);
-        };
-        if ip.is_loopback() {
+        // 回环沿用既有豁免：本机 UI / 测试 / 同机多实例没有"局域网地址被投毒"这一层。
+        if parse_host(host).is_some_and(|ip| ip.is_loopback()) {
             return Arc::new(scoped);
         }
+        scoped.seed_pin(host, pin);
+        Arc::new(scoped)
+    }
+
+    /// 只属于这次拨号的信任表，且**不共享**进程级 `observed`。
+    ///
+    /// 与 [`Trust::scoped`] 的唯一区别是观察值不再并进全局表。LocalSend 是另一套协议：
+    /// 同一个地址上常常同时住着一台 OrbDrop 设备（真机场景：对端既跑 OrbDrop 又开着
+    /// 第三方 LocalSend）。LocalSend 握手见到的证书如果写进全局观察值，
+    /// `state::remember_peer_fingerprint` 就可能把**另一套证书**记到 OrbDrop 设备名下
+    /// （那格观察值是未配对设备地址变更的连续性锚）。两套协议的握手因此各记各的。
+    ///
+    /// **回环也照钉**：LocalSend 对端没有配对关系，回环上的另一份实例同样是陌生人，
+    /// 不该退回 TOFU。
+    pub fn isolated(host: &str, pin: &DialPin) -> Arc<Trust> {
+        let isolated = Trust::new();
+        isolated.seed_pin(host, pin);
+        Arc::new(isolated)
+    }
+
+    /// 按 `pin` 决定这张临时表钉什么。`Tofu` 留空（校验器接受任何证书并记下它）。
+    fn seed_pin(&self, host: &str, pin: &DialPin) {
         match pin {
             DialPin::Fingerprint(fp) => {
-                scoped.seed(std::iter::once((host.to_string(), fp.clone())));
+                self.seed(std::iter::once((host.to_string(), fp.clone())));
             }
             DialPin::Tofu => {}
             DialPin::Deny => {
-                scoped.seed(std::iter::once((
+                self.seed(std::iter::once((
                     host.to_string(),
                     DENY_FINGERPRINT.to_string(),
                 )));
             }
         }
-        Arc::new(scoped)
     }
 
     /// 用「地址 → 指纹」重建这份表（启动时、配对成功/解除配对后各调一次）。
@@ -499,22 +518,28 @@ impl ServerCertVerifier for PinnedVerifier {
 
         let pinned = self.trust.get(ip);
         if pinned.is_empty() {
-            // 只在"这个地址上见到的证书变了"（含第一次）时说一句 —— 与 `state::remember_peer_fingerprint`
-            // 那条刷屏同一个毛病，同一种修法：**未配对**的设备永远进不了 `pinned`（那张表只从
-            // 凭据库来，见 `seed`），于是它的**每一次握手**都落在这一支。按 `info` 记就等于
-            // "每次连接一条"，而重复同一枚证书不是新闻 —— 这一跳上"换了"才是。
-            if self.trust.observed.lock().get(&ip) != Some(&seen) {
-                info!(
+            // **未配对**的设备永远进不了 `pinned`（那张表只从凭据库来，见 `seed`），
+            // 于是它的每一次握手都落在这一支。LocalSend 的信任表还是每个客户端一份
+            // （`Trust::isolated`），"第一次"对它来说每拨一次都成立 —— 按 `info` 记就是
+            // 每天上千条。重复同一枚证书不是新闻，"这个地址上的证书换了"才是。
+            let before = self.trust.observed.lock().get(&ip).cloned();
+            match before.as_deref() {
+                None => debug!(
                     %ip,
                     seen = %short_fingerprint(&seen),
                     "首次见到该地址的证书，按 TOFU 认下并记住"
-                );
-            } else {
-                debug!(
+                ),
+                Some(prev) if prev != seen.as_str() => info!(
+                    %ip,
+                    was = %short_fingerprint(prev),
+                    seen = %short_fingerprint(&seen),
+                    "该地址上的证书变了（未配对），按 TOFU 更新"
+                ),
+                Some(_) => debug!(
                     %ip,
                     seen = %short_fingerprint(&seen),
                     "这一跳仍是那枚没钉住的证书（这个地址上已经见过）"
-                );
+                ),
             }
         } else if !self.trust.accepts(ip, &seen) {
             warn!(
@@ -839,6 +864,15 @@ static DIAL_CLIENTS: LazyLock<Mutex<HashMap<(String, String, u64, u64, u64), req
 /// 重建一次握手而已，比维护 LRU 简单。
 const DIAL_CLIENT_CACHE_MAX: usize = 128;
 
+/// [`DialPin`] 在客户端缓存键里的写法。
+fn pin_cache_key(pin: &DialPin) -> String {
+    match pin {
+        DialPin::Fingerprint(fp) => format!("fp:{fp}"),
+        DialPin::Tofu => "tofu".to_string(),
+        DialPin::Deny => "deny".to_string(),
+    }
+}
+
 /// 到**这一台目标设备**的客户端（见 [`DialPin`] 与 [`Trust::scoped`]）。
 ///
 /// 所有**带 token** 的对端拨号都必须用它，不能复用全局 [`client`]：全局表的键只有 IP，
@@ -897,11 +931,7 @@ fn dial_client_inner(
     } else {
         pin.clone()
     };
-    let pin_key = match &pin {
-        DialPin::Fingerprint(fp) => format!("fp:{fp}"),
-        DialPin::Tofu => "tofu".to_string(),
-        DialPin::Deny => "deny".to_string(),
-    };
+    let pin_key = pin_cache_key(&pin);
     let key = (
         host.to_string(),
         pin_key,
@@ -937,6 +967,63 @@ fn dial_client_inner(
     }
     clients.insert(key, client.clone());
     client
+}
+
+/// 按 `(地址, 端口, 期望指纹)` 缓存的 **LocalSend 专用**客户端，**不带** OrbDrop 的观察值。
+///
+/// 与 [`dial_client`] 的两点不同（都见 [`Trust::isolated`]）：
+/// - 握手见到的证书不写进程级 `observed` —— 同一地址上的 OrbDrop 设备有自己的一格；
+/// - 回环也照钉（LocalSend 对端没有配对关系）。
+///
+/// **端口进缓存键**：LocalSend 的身份是 `ip:port`（同一台机器可以开多份实例），而
+/// `Trust` 的观察值按 IP 记 —— 每份实例一张独立的临时表，读到的才是**这个端点**的
+/// 证书（共表会让后一次握手覆盖前一个端点的记录）。
+///
+/// 返回值带上这次拨号用的信任表：握手成功后调用方从 [`Trust::observed_at`] 读到对端
+/// **真实证书**的指纹。第三方实现的自报值不一定是证书 SHA-256（真有填设备 UUID 的），
+/// 那一档无法按公告钉，只能以握手证书为准。
+pub fn dial_client_isolated(
+    host: &str,
+    port: u16,
+    pin: &DialPin,
+) -> Result<(reqwest::Client, Arc<Trust>), String> {
+    let key = (host.to_string(), port, pin_cache_key(pin));
+    if let Some((client, trust)) = ISOLATED_CLIENTS.lock().get(&key) {
+        return Ok((client.clone(), trust.clone()));
+    }
+    let trust = Trust::isolated(host, pin);
+    let client = client_builder_with_trust(trust.clone())
+        .build()
+        .map_err(|e| format!("建 HTTPS 客户端失败：{e}"))?;
+    let mut clients = ISOLATED_CLIENTS.lock();
+    if clients.len() >= DIAL_CLIENT_CACHE_MAX {
+        clients.clear();
+    }
+    clients.insert(key, (client.clone(), trust.clone()));
+    Ok((client, trust))
+}
+
+/// [`dial_client_isolated`] 的缓存：键是「地址 + 端口 + 期望指纹」，超时写在请求上。
+static ISOLATED_CLIENTS: LazyLock<
+    Mutex<HashMap<(String, u16, String), (reqwest::Client, Arc<Trust>)>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// LocalSend `/upload` 的数据面客户端：同 [`dial_client_streaming`] 的超时组合，但信任表
+/// 用 [`Trust::isolated`] —— 上传那一跳见到的证书同样不能写进 OrbDrop 的观察值。
+///
+/// 按批建一次（每条发送流水线复用同一条），不做缓存：上传本来就要占住一条连接，
+/// 复用客户端省下的那次握手可以忽略。
+pub fn dial_client_streaming_isolated(
+    host: &str,
+    pin: &DialPin,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<reqwest::Client, String> {
+    client_builder_with_trust(Trust::isolated(host, pin))
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .build()
+        .map_err(|e| format!("建 HTTPS 客户端失败：{e}"))
 }
 
 /// 对端的入口：`https://ip:port`。
@@ -1449,6 +1536,31 @@ mod tests {
         assert!(
             scoped.get(ip).is_empty(),
             "回环不钉指纹：空表让校验器走 TOFU 那一支"
+        );
+    }
+
+    /// LocalSend 的信任表与 OrbDrop 的观察值**各记各的**：同一地址上既可能是一台 OrbDrop
+    /// 设备，也可能是一台第三方 LocalSend；把后者的证书写进前者那格，会让
+    /// `remember_peer_fingerprint` 把错的身份锚记到 OrbDrop 设备名下。
+    #[test]
+    fn isolated_trust_does_not_write_the_shared_observed_map() {
+        let host = "203.0.113.254";
+        let ip: StdIpAddr = host.parse().unwrap();
+        let isolated = Trust::isolated(host, &DialPin::Tofu);
+        isolated.observe(ip, "aa".repeat(32));
+        assert!(
+            isolated.observed_at(host).is_some(),
+            "这次拨号自己的观察值要留着给调用方读"
+        );
+        assert!(
+            trust().observed_at(host).is_none(),
+            "LocalSend 的握手不能污染 OrbDrop 的进程级观察值"
+        );
+        // 回环也照钉：LocalSend 对端没有配对关系，回环上的另一个实例同样是陌生人。
+        let loopback = Trust::isolated("127.0.0.1", &DialPin::Deny);
+        assert_eq!(
+            loopback.get("127.0.0.1".parse().unwrap()),
+            vec![DENY_FINGERPRINT.to_string()]
         );
     }
 

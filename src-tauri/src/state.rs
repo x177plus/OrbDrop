@@ -56,6 +56,8 @@ pub struct AppState {
     own_id: String,
     /// Known devices: paired + discovered + manual (merged view).
     pub peers: Mutex<Vec<PeerDevice>>,
+    /// LocalSend 兼容面（设备表 + 会话 + 出站取消令牌）。默认空；开关打开且在线时才起。
+    pub localsend: crate::localsend::LocalSendState,
     pub server_port: AtomicU16,
     pub server_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     pub server_task: Mutex<Option<JoinHandle<()>>>,
@@ -63,6 +65,14 @@ pub struct AppState {
     /// **必须整体换掉并释放旧的那一份**（见 `discover::release`）：只丢句柄不注销，对端会
     /// 一直解析到旧记录 —— 用户改了设备名，别人的设备行还是旧名。
     pub mdns_reg: Mutex<Option<crate::discover::Registration>>,
+    /// 对端在 mDNS TXT 里自报的 TLS 证书指纹（`设备 id → 小写 hex`）。
+    ///
+    /// **只用于跨协议去重**：同一台机器既播 `_orbdrop` 又播 `_localsend` 时，它的
+    /// LocalSend 公告里的证书指纹与这一项相同，`list_devices` 据此把重复行藏掉。
+    /// TXT 是未认证信道，这一项**绝不能**写进 [`Config::observed_fingerprints`] 或参与
+    /// 任何信任判断 —— 那会把"身份连续性"的锚交给一个谁都能伪造的广播。
+    /// 只活在内存里（重启重新发现），与 `seen` / `heard` 同一档。
+    pub mdns_fingerprints: Mutex<HashMap<String, String>>,
     /// WebSocket manager (peer links).
     pub ws: WsManager,
     /// Push jobs (sender + receiver) and resume store.
@@ -691,10 +701,12 @@ impl AppState {
             own_id: own_id.clone(),
             config: Mutex::new(config),
             peers: Mutex::new(peers),
+            localsend: crate::localsend::LocalSendState::new(),
             server_port: AtomicU16::new(0),
             server_shutdown: Mutex::new(None),
             server_task: Mutex::new(None),
             mdns_reg: Mutex::new(None),
+            mdns_fingerprints: Mutex::new(HashMap::new()),
             ws,
             push: PushStore::new(),
             drag: crate::drag::DragStore::new(),
@@ -1464,6 +1476,31 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// 记下对端在 mDNS TXT 里自报的证书指纹（**只用于跨协议去重**）。
+    ///
+    /// 形状不对（不是 64 位 hex）的值直接丢掉：老版本不报、第三方实现可能把别的标识
+    /// 塞进同一格，拿它去和 LocalSend 的握手证书比只会得出"不是同一台"的结论。
+    pub fn note_mdns_fingerprint(&self, peer_id: &str, fingerprint: &str) {
+        if peer_id.is_empty() || peer_id == self.own_id {
+            return;
+        }
+        let fingerprint = fingerprint.trim().to_ascii_lowercase();
+        if fingerprint.len() != 64 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return;
+        }
+        let mut table = self.mdns_fingerprints.lock();
+        // 与 `peer_nets` 同一个理由：这张表没有删除路径，键数要在这里把住。
+        if !table.contains_key(peer_id) && table.len() >= MAX_PEER_NET_IDS {
+            return;
+        }
+        table.insert(peer_id.to_string(), fingerprint);
+    }
+
+    /// 对端自报的证书指纹（没有 / 老版本 = `None`）。
+    pub fn mdns_fingerprint_of(&self, peer_id: &str) -> Option<String> {
+        self.mdns_fingerprints.lock().get(peer_id).cloned()
+    }
+
     /// 这台设备属于哪一段（F-107 §5）：优先**它对端自报**的、能覆盖它地址的那一段；
     /// 没有自报（老版本、或还没换到视野）时退回"它落在本机哪块网卡的段里"（同段场景，
     /// 那种情形两台设备本来就同 L2，本机掩码是对的）。都不知道 → `None`（只记设备级）。
@@ -1959,6 +1996,9 @@ impl AppState {
         // 重启后手里没有这条记忆"的刷新，不是事件 —— 不能让它按 INFO 复述一遍，也不该让它
         // 再写一次盘（`seen_at` 只留在内存里；下一次内容变化会一起落盘）。
         let mut changed = 0usize;
+        // 这一批里有没有"从无到有"或"临时提示升格"的路线：那才是值得按 INFO 记的
+        // 状态变化，其余内容刷新只记 `debug`（同一段路会被反复重推）。
+        let mut noteworthy = false;
         // 采纳的那些设备（出了 config 作用域再并进设备表 + 记它们的段）。
         // 二元组是 (记录说的中转段, 设备)：第一个用于 `note_relay_net`。
         let mut seed: Vec<(String, Vec<crate::relay::RouteDevice>)> = Vec::new();
@@ -2046,6 +2086,9 @@ impl AppState {
                 if differs || upgrading {
                     changed += 1;
                 }
+                if before.is_none() || upgrading {
+                    noteworthy = true;
+                }
                 accepted.push(r.target_cidr.clone());
                 seed.push((r.via_cidr.clone(), devices));
             }
@@ -2075,9 +2118,10 @@ impl AppState {
             // `changed > 0`（内容真的变了）时才走。对端每 5 分钟还会把**没变过**的记录
             // 重推一次（`ROUTE_REFRESH_MIN`，防对端重启丢记忆）—— 那一趟照样采纳、照样
             // 刷新 `seen_at`，但日志里不该多一条"什么都没发生"的 INFO（实测一天几百条）。
-            // 未认证来源的提示只记 `debug`：它的内容变化不值得按 INFO 复述（可能是别人在刷）。
+            // 内容变了的刷新同样不是新闻（池里设备上下线就会变），只有**新路线**或
+            // 临时提示升格才按 INFO 记；未认证来源的提示只记 `debug`。
             if changed > 0 {
-                if persist {
+                if persist && noteworthy {
                     info!(
                         from = %from,
                         accepted = accepted.len(),
@@ -2091,7 +2135,7 @@ impl AppState {
                         accepted = accepted.len(),
                         changed,
                         ignored = ignored.len(),
-                        "收到未认证来源的反向中转提示（只在本进程内有效）"
+                        "反向中转路由记录已刷新"
                     );
                 }
             }
@@ -2277,14 +2321,26 @@ impl AppState {
             config.relay_route_mut(&target_cidr).via_addrs =
                 merged.iter().map(PoolEntry::to_route_device).collect();
         }
-        info!(
-            target = %target_id,
-            target_cidr = %target_cidr,
-            via_cidr = %via_cidr,
-            devices = devices.len(),
-            adopted,
-            "中转方报来它那一段的中转池"
-        );
+        // 每次借中转都会带回同一份池（稳态下每 30s 一次）；只有**其中真有新设备被采纳**
+        // 才是值得在默认日志里留一行的事件。
+        if adopted > 0 {
+            info!(
+                target = %target_id,
+                target_cidr = %target_cidr,
+                via_cidr = %via_cidr,
+                devices = devices.len(),
+                adopted,
+                "中转方报来它那一段的中转池"
+            );
+        } else {
+            debug!(
+                target = %target_id,
+                target_cidr = %target_cidr,
+                via_cidr = %via_cidr,
+                devices = devices.len(),
+                "中转方报来它那一段的中转池（没有新设备）"
+            );
+        }
         adopted
     }
 
@@ -4492,6 +4548,31 @@ mod tests {
             },
             dir.join("config.toml"),
         ))
+    }
+
+    /// mDNS TXT 里的 `fp` 只当展示层去重线索：形状不合法的值丢掉，合法的归一化成小写。
+    /// 它**不进** `observed_fingerprints`（那是未配对设备换 IP 时的身份锚）。
+    #[test]
+    fn mdns_fingerprint_is_normalized_and_not_a_trust_anchor() {
+        let state = memory_state();
+        let fp = "AB".repeat(32);
+        state.note_mdns_fingerprint("peer-a", &fp);
+        assert_eq!(
+            state.mdns_fingerprint_of("peer-a"),
+            Some("ab".repeat(32)),
+            "TXT 指纹要归一化成小写"
+        );
+        assert!(
+            state.observed_fingerprint("peer-a").is_none(),
+            "未认证的 TXT 不能写进身份锚"
+        );
+
+        state.note_mdns_fingerprint("peer-b", "not-a-fingerprint");
+        assert_eq!(state.mdns_fingerprint_of("peer-b"), None);
+        // 本机自己的 id 永远不登记。
+        let own = state.own_id().to_string();
+        state.note_mdns_fingerprint(&own, &fp);
+        assert_eq!(state.mdns_fingerprint_of(&own), None);
     }
 
     fn discovered(id: &str, ip: &str, cidr: Option<&str>, relay: bool) -> DiscoveredPeer {

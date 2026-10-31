@@ -161,6 +161,10 @@ fn collect_parts(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 
 /// 两侧"已配对但没有长连接"：邀请走 HTTP、已绑定设备不用点同意、要带 token 认人。
 /// 这是最常见的真实组合，也把新端点那条路的认人规则一起测了。
+///
+/// 「已配对设备自动接收」现在**默认关**；这些用例测的是传输/续传本身，所以在这里显式
+/// 打开自动接收，保持"邀请一到就开收"的前提。同意路本身由 `p1_integration` 里那条
+/// `paired_push_needs_consent_when_auto_receive_is_off` 钉住。
 fn pair_without_ws(
     state_a: &Arc<AppState>,
     state_b: &Arc<AppState>,
@@ -202,6 +206,8 @@ fn pair_without_ws_with_token(
 ) {
     credential::set_peer(id_b, token).unwrap();
     credential::set_peer(id_a, token).unwrap();
+    state_a.config.lock().auto_accept_paired = true;
+    state_b.config.lock().auto_accept_paired = true;
     state_a.add_peer_book(PeerDevice {
         id: id_b.into(),
         name: "PC-B".into(),

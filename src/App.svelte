@@ -20,9 +20,10 @@
   import type { ConvoThread, ChatItem } from '$lib/stores/chat.svelte';
   import * as upd from '$lib/stores/update.svelte';
   import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, setPushReceivePaused, pushPaths, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, forgetPeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
-  import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem } from '$lib/types';
+  import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem, PeerTransport } from '$lib/types';
   import { shareMeta, updateStatusText, updateTitleText } from '$lib/types';
   import { adoptLanguagePreference, t } from '$lib/i18n.svelte';
+  import { isImageName } from '$lib/composer';
   import { planExpansion, planCollapse, planDock, planRectDock, spinForDock, type BadgeSpin, type DockAxis, type DockPlan, type ScreenRect } from '$lib/orbLayout';
   import { circleLayout, collapsedLayout, ORB_SIZE, RECT_CARD_W, RECT_DOCK_W } from '$lib/orbShape';
   import Orb from '$lib/components/Orb.svelte';
@@ -267,6 +268,8 @@
     unproven?: boolean;
     /** 邀请路径的 8 位 SAS：两端应显示同一串；`undefined` = 对端版本过旧，无法核对。 */
     sas?: string;
+    /** 这条推送走哪套协议（缺省 = `orbdrop`）。LocalSend 的通知要带徽标。 */
+    transport?: PeerTransport;
   };
   let notices = $state<PushNotice[]>([]);
   // 铃铛：展开/收起右下角那组"等你确认"的气泡。收起 ≠ 已读 —— 角标照旧挂着。
@@ -1749,12 +1752,12 @@
   /**
    * 一行目标设备的行内文案。
    *
-   * 已配对的目标**不问同意**直接收（token 就是那份信任），所以它那一行不能说
-   * 「等待对方同意」—— 对面根本没点过任何东西，说成"等同意"是在编一个没发生的事。
+   * 已配对只说明身份可信，不再等于"对方一定自动收"（取决于对面的「已配对设备自动接收」
+   * 开关）。所以邀请阶段统一说「等待对方接收」，不替对面编"同意"或"自动接收"。
    */
   function targetLabel(target: PushTarget, total: number): string {
     switch (target.state) {
-      case 'invited': return target.paired ? t('等待开始（对方自动接收）') : t('等待对方同意');
+      case 'invited': return target.paired ? t('等待对方接收') : t('等待对方同意');
       case 'sending': return t('传输中 {percent}%', { percent: pushPercent(target.received, total) });
       case 'done': return t('已发送 {size}', { size: fmtBytes(target.received) });
       case 'cancelled': return t('已取消');
@@ -1899,7 +1902,7 @@
     }
     picker = {
       title: t('推送到{targets}', { targets: pushTargetsLabel(live) }),
-      sub: t('文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。同一份内容会分别发给每台设备：已配对的直接收，未配对的各自点同意，进度与成败都记在右下角那张卡片上。'),
+      sub: t('文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。同一份内容会分别发给每台设备：已配对且开着「自动接收」的直接收，其余各自点同意，进度与成败都记在右下角那张卡片上。'),
       confirmLabel: live.length > 1 ? t('推送到 {n} 台设备', { n: live.length }) : t('推送'),
       onConfirm: (items) => void pushPicked(items, live, chatBatchId, groupId),
     };
@@ -1921,6 +1924,20 @@
   async function pushPicked(items: LocalPick[], devices: PeerDevice[], chatBatchId: string, groupId = '') {
     closePicker();
     if (items.length === 0) return;
+    // LocalSend 的图片按**图片消息**发：没有推送批次、没有停止按钮，只有发送状态。
+    // 只有在"全是 LocalSend 设备、且全是图片"时才走这条；混了文件/目录就仍按文件推送。
+    if (
+      devices.length > 0 &&
+      devices.every((d) => d.transport === 'localsend') &&
+      items.every((i) => !i.isDir && isImageName(i.name))
+    ) {
+      try {
+        for (const d of devices) await chat.sendLocalSendImages(d.id, items);
+      } catch (e) {
+        toast(String(e));
+      }
+      return;
+    }
     try {
       // 同一份清单发给每台：多选合并成**每台一条**推送（对端一张卡、一次同意、一条进度）。
       const batch = await pushPaths(items.map((i) => i.path), devices.map((d) => d.id));
@@ -2162,6 +2179,9 @@
     // 查两份表（`deviceById`）：设备页列不出来的那几台（解绑又离线、会话还留着）也在
     // 会话这一侧要算状态 —— 只查可见那份会把"查看该设备文件"这类项判错。
     const dev = directId ? deviceById(directId) : undefined;
+    // LocalSend 不走 OrbDrop 的配对/长连接：会话菜单里那两项（修改备注 / 配对）与
+    // 「查看该设备文件」都不该出现 —— `deviceState` 留空即可让 ContextMenu 跳过整段。
+    const ls = dev?.transport === 'localsend';
     // 「查看该设备文件」要有对方的**浏览标签**才成立（那个标签只给长连接设备开）：
     // 没长连接时挂上去只是个点了没反应的项。
     const browse = dev?.connected === true;
@@ -2173,14 +2193,14 @@
       convoPeerId: directId || undefined,
       convoThread: t.mode !== 'direct',
       convoBc: t.mode === 'broadcast',
-      convoBrowse: t.mode === 'direct' && browse,
+      convoBrowse: t.mode === 'direct' && browse && !ls,
       // 设备那一档（与 `DeviceTab` 交给右键菜单的字段同一套取法）：一对一才填。
       // 这台设备已经不在设备表里（会话还留着，但备注/配对都没有主语）时留空 ——
       // `ContextMenu` 靠 `deviceState` 有值来决定摆不摆那两项。
       deviceId: dev?.id,
-      deviceState: dev ? (dev.connected ? 'connected' : dev.paired ? 'paired' : 'unbound') : undefined,
-      deviceOnline: dev?.online,
-      deviceNeedsPair: dev ? (needsRepair(dev) || !dev.verified) : undefined,
+      deviceState: dev && !ls ? (dev.connected ? 'connected' : dev.paired ? 'paired' : 'unbound') : undefined,
+      deviceOnline: ls ? false : dev?.online,
+      deviceNeedsPair: dev && !ls ? (needsRepair(dev) || !dev.verified) : undefined,
     };
   }
 
@@ -2494,15 +2514,17 @@
   }
 
   /**
-   * 接收一条**需要同意**的推送（未绑定设备那条）：设置了「每次询问」就先问落盘目录。
+   * 接收一条**需要同意**的推送（未绑定设备，或已配对但关了「自动接收」）：设置了
+   * 「每次选择位置」就先问落盘目录。
    *
    * - 目录选择框打开即设置里的下载目录（`defaultPath`），省掉一层层点；
    * - 框里取消 = **拒绝**这次接收（返回 false）—— 发送方那边一直挂着等一个决定，不能让它
    *   干等（邀请没有时钟：对方不点、我也不点，两边就都停在那儿）；调用方接着走
    *   `rejectNotice` / `chatRejectInvite` 把话带回去；
-   * - 「直接下载」那一档照旧不问，`root` 不带 → 后端落在设置里的下载目录。
+   * - 「直接保存到下载目录」那一档照旧不问，`root` 不带 → 后端落在设置里的下载目录。
    *
-   * **已配对设备那条路根本不会走到这里**：它免同意自动收，界面上连「接收」按钮都没有。
+   * **已配对且开着「自动接收」那条路不会走到这里**：它免同意直接收，界面上连「接收」
+   * 按钮都没有。
    */
   async function acceptInviteWithAsk(inviteId: string): Promise<boolean> {
     const s = getSettings();
@@ -2855,6 +2877,25 @@
 
   function hideCtx() { ctxState = null; }
 
+  /**
+   * LocalSend 设备的右键菜单要**另画一份**：它没有连接 / 配对 / 浏览这些 OrbDrop 的
+   * 动作，而 `ContextMenu` 的设备那一档是按关系与链路分档的（这里不改那个组件，免得和别的
+   * 改动打架）。能做的事只有三件：发文件（= 打开这条 1:1 并选文件）、改备注、从列表移除。
+   */
+  const lsCtxDevice = $derived(
+    ctxState?.kind === 'device' && ctxState.deviceId ? deviceById(ctxState.deviceId) : undefined,
+  );
+  const lsCtx = $derived(lsCtxDevice?.transport === 'localsend');
+
+  /** LocalSend 设备菜单的「发送文件」：打开它与本机的一对一会话，再走「＋」那条推送路。 */
+  function ctxLocalSendFiles() {
+    const device = lsCtxDevice;
+    hideCtx();
+    if (!device) return;
+    chat.openDeviceChat(device.id);
+    requestPushMany([device]);
+  }
+
   /** 本机共享项在磁盘上的真实位置（绝对路径 + 是不是目录）。
  *
  *  树节点传的是**共享项内**的相对路径（用 `/` 分隔，见 `TreeNode` 的 `ownPath`），共享项根
@@ -3188,7 +3229,8 @@
     // ── 推送事件：发送侧一张进度卡，接收侧一串通知（面板右下角的气泡组）──────
     // 邀请：接收方收到别人的推送 → 挂一条通知（悬浮球左上角的数字 +1）。
     // **不主动弹面板**：人来点，球上那个黄色数字就是"有事等你"的信号。
-    // 未绑定设备发的邀请带「接收/拒绝」按钮，已绑定（`auto`）的已经直接开收、只显示进度。
+    // 需要同意的邀请带「接收/拒绝」按钮；`auto`（已配对 + 开着自动接收）的已经直接开收、
+    // 只显示进度。
     const unPushInvite = listen<PushInvite>('push://invite', (ev) => {
       const inv = ev.payload;
       notices = [...notices, {
@@ -3201,6 +3243,8 @@
         isDir: inv.isDir,
         count: inv.count ?? 1,
         received: 0,
+        // LocalSend 发来的文件必须问用户收不收（文本消息由后端直接落进会话，不会走到这里）。
+        transport: inv.transport,
       }];
       // 会话里也落一张卡（同一件事的另一处呈现：右下角是"顺带看一眼"，会话是"跟这台设备的往来"）。
       chat.noteInboundInvite(inv);
@@ -3234,11 +3278,10 @@
         if (notice) notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'receiving' } : n));
         const b = batchForInvite(inviteId);
         if (b && b.targets.length === 1) {
-          // 已绑定设备那条路上没有"对方同意"这一步，说"已同意"会让人以为对面点过。
+          // 这条回执既可能来自用户点「接收」，也可能来自对面的自动接收（已配对 + 开着
+          // 自动接收）：不替对面编"同意"，只报"开始了"。
           const target = b.targets[0];
-          toast(target.paired
-            ? t('开始向「{name}」传输', { name: targetName(target) })
-            : t('「{name}」已同意接收，开始传输', { name: targetName(target) }));
+          toast(t('开始向「{name}」传输', { name: targetName(target) }));
         }
         return;
       }
@@ -3784,6 +3827,9 @@
             >
               <div class="p-top">
                 <span class="nb-title">{noticeTitle(n)}</span>
+                {#if n.transport === 'localsend'}
+                  <span class="state-chip unbound" style="flex:none; font-size:9px; padding:1px 5px" title="LocalSend">LS</span>
+                {/if}
                 <span class="nb-size num">
                   {#if n.kind === 'pair' || n.kind === 'link' || n.kind === 'linkWait'}{:else if n.kind === 'receiving'}{pushPercent(n.received, n.size)}%{:else}{fmtBytes(n.size)}{/if}
                 </span>
@@ -3912,6 +3958,9 @@
                     <div class="batch-row" class:bad={target.state === 'failed' || target.state === 'rejected'}>
                       <span class={targetDot(target)}></span>
                       <span class="br-name" title={targetName(target)}>{targetName(target)}</span>
+                      {#if target.transport === 'localsend'}
+                        <span class="state-chip localsend" style="flex:none; font-size:9px; padding:1px 5px" title="LocalSend">LS</span>
+                      {/if}
                       <span class="br-state">{targetLabel(target, batchPerTarget(b))}</span>
                       {#if target.state === 'invited' || target.state === 'sending'}
                         <button
@@ -4118,51 +4167,83 @@
 
 <!-- Context menu -->
 {#if ctxState}
-  <ContextMenu
-    x={ctxState.x}
-    y={ctxState.y}
-    kind={ctxState.kind}
-    shareId={ctxState.shareId}
-    path={ctxState.path}
-    isDir={ctxState.isDir}
-    deviceState={ctxState.deviceState}
-    deviceOnline={ctxState.deviceOnline}
-    deviceNeedsPair={ctxState.deviceNeedsPair}
-    deviceRemark={ctxState.deviceId ? deviceById(ctxState.deviceId)?.remark ?? null : null}
-    peerName={ctxState.peerId ? chat.deviceNameOf(ctxState.peerId) : undefined}
-    bcAvailable={bcMenu.available}
-    bcLeftLabel={bcMenu.leftLabel}
-    bcLeftExists={bcMenu.leftExists}
-    bcCompareLabel={bcMenu.compareLabel}
-    bcCompareEnabled={bcMenu.compareEnabled}
-    chatSel={!!ctxState.chatSel}
-    convoBrowse={ctxState.convoBrowse === true}
-    convoThread={ctxState.convoThread === true}
-    convoBc={ctxState.convoBc === true}
-    compact={ctxState.orb === true}
-    pending={ctxState.orb === true && ctxState.placed === false}
-    pinned={ctxState.orb === true}
-    onClose={hideCtx}
-    onToast={toast}
-    onDownload={ctxDownload}
-    onOpen={ctxOpen}
-    onCopy={ctxCopy}
-    onRemove={ctxRemove}
-    onConnect={ctxConnect}
-    onDisconnect={ctxDisconnect}
-    onPair={ctxPair}
-    onUnpair={ctxUnpair}
-    onForget={ctxForget}
-    onRemark={ctxRemark}
-    onMessage={ctxMessage}
-    onChatCopy={ctxChatCopy}
-    onConvoFiles={ctxConvoFiles}
-    onConvoEdit={ctxConvoEdit}
-    onConvoUpgrade={() => void ctxConvoUpgrade()}
-    onConvoClear={() => void ctxConvoClear()}
-    onConvoExit={() => void ctxConvoExit()}
-    onPeerDownload={ctxPeerDownload}
-    onBcCompare={ctxBcCompare}
-    onBcAddLeft={() => void ctxBcPlaceLeft()}
-  />
+  {#if lsCtx}
+    <!-- scrim：点空白关菜单（与 `ContextMenu` 自己那份 pointerdown 同一个手感）。 -->
+    <button
+      type="button"
+      aria-label={t('关闭')}
+      style="position:fixed;inset:0;z-index:59;background:transparent;border:0;padding:0"
+      onclick={hideCtx}
+      oncontextmenu={(e) => { e.preventDefault(); hideCtx(); }}
+    ></button>
+    <div
+      class="ctx show"
+      style="left:{Math.max(8, Math.min(ctxState.x, window.innerWidth - 190))}px; top:{Math.max(8, Math.min(ctxState.y, window.innerHeight - 150))}px"
+      role="menu"
+      tabindex="-1"
+    >
+      <button class="ctx-item" onclick={ctxLocalSendFiles}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
+        {t('发送文件')}
+      </button>
+      <button class="ctx-item" title={lsCtxDevice?.remark ?? undefined} onclick={ctxRemark}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M4 10h10M4 15h16M4 20h7"/></svg>
+        {t('修改备注')}
+        {#if lsCtxDevice?.remark}<span class="ctx-current">{lsCtxDevice.remark}</span>{/if}
+      </button>
+      <div class="ctx-sep"></div>
+      <button class="ctx-item danger" onclick={ctxForget}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
+        {t('从列表移除')}
+      </button>
+    </div>
+  {:else}
+    <ContextMenu
+      x={ctxState.x}
+      y={ctxState.y}
+      kind={ctxState.kind}
+      shareId={ctxState.shareId}
+      path={ctxState.path}
+      isDir={ctxState.isDir}
+      deviceState={ctxState.deviceState}
+      deviceOnline={ctxState.deviceOnline}
+      deviceNeedsPair={ctxState.deviceNeedsPair}
+      deviceRemark={ctxState.deviceId ? deviceById(ctxState.deviceId)?.remark ?? null : null}
+      peerName={ctxState.peerId ? chat.deviceNameOf(ctxState.peerId) : undefined}
+      bcAvailable={bcMenu.available}
+      bcLeftLabel={bcMenu.leftLabel}
+      bcLeftExists={bcMenu.leftExists}
+      bcCompareLabel={bcMenu.compareLabel}
+      bcCompareEnabled={bcMenu.compareEnabled}
+      chatSel={!!ctxState.chatSel}
+      convoBrowse={ctxState.convoBrowse === true}
+      convoThread={ctxState.convoThread === true}
+      convoBc={ctxState.convoBc === true}
+      compact={ctxState.orb === true}
+      pending={ctxState.orb === true && ctxState.placed === false}
+      pinned={ctxState.orb === true}
+      onClose={hideCtx}
+      onToast={toast}
+      onDownload={ctxDownload}
+      onOpen={ctxOpen}
+      onCopy={ctxCopy}
+      onRemove={ctxRemove}
+      onConnect={ctxConnect}
+      onDisconnect={ctxDisconnect}
+      onPair={ctxPair}
+      onUnpair={ctxUnpair}
+      onForget={ctxForget}
+      onRemark={ctxRemark}
+      onMessage={ctxMessage}
+      onChatCopy={ctxChatCopy}
+      onConvoFiles={ctxConvoFiles}
+      onConvoEdit={ctxConvoEdit}
+      onConvoUpgrade={() => void ctxConvoUpgrade()}
+      onConvoClear={() => void ctxConvoClear()}
+      onConvoExit={() => void ctxConvoExit()}
+      onPeerDownload={ctxPeerDownload}
+      onBcCompare={ctxBcCompare}
+      onBcAddLeft={() => void ctxBcPlaceLeft()}
+    />
+  {/if}
 {/if}

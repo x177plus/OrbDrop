@@ -341,13 +341,18 @@ a { color: inherit; text-decoration: none; }
 }
 .chatlog::-webkit-scrollbar { display: none; }
 .chatlog > .empty { margin: auto; }
-.msg { display: flex; flex-direction: column; max-width: 84%; }
+/* 消息气泡上的长按 = 复制整条（移动端的"右键菜单"，见 `ChatScreen.pressStart`）。
+   不挡住 WebView 自己的长按，手指按住时会先走去选文字 / 弹系统菜单，那 500ms 的自定义计时
+   永远等不到；`-webkit-touch-callout` 再挡掉图片/链接的系统长按菜单。桌面端仍可选中文字后
+   右键（只复制选中的那段），手机这条手势让位给整条复制。 */
+.msg { display: flex; flex-direction: column; max-width: 84%; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+/* 待接收的推送邀请也走同一条长按（卡片不在 `.msg` 里，见 `ChatScreen.pressStart`）。 */
+.chatlog .invite { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
 .msg.me { align-self: flex-end; align-items: flex-end; }
 .msg.peer { align-self: flex-start; align-items: flex-start; }
 .bubble {
   max-width: 100%; padding: calc(9 * var(--u)) calc(12 * var(--u)); border-radius: calc(16 * var(--u));
   font-size: var(--fs-md); line-height: 1.55; overflow-wrap: anywhere;
-  user-select: text; -webkit-user-select: text;
 }
 .msg.peer .bubble { background: var(--surface-2); color: var(--fg); border-bottom-left-radius: calc(6 * var(--u)); }
 .msg.me .bubble { background: var(--accent-deep); color: #fff; border-bottom-right-radius: calc(6 * var(--u)); }
@@ -426,6 +431,7 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .rc-dev.off .rc-ic { color: var(--muted); }
 
 .compose { flex: none; display: flex; align-items: flex-end; gap: calc(8 * var(--u)); padding: calc(10 * var(--u)) calc(12 * var(--u)); background: var(--bg); border-top: 1px solid var(--border); }
+
 .cbtn { flex: none; width: calc(40 * var(--u)); height: calc(40 * var(--u)); border-radius: 50%; display: grid; place-items: center; transition: background .15s ease, transform .08s ease; }
 .cbtn .ic { width: calc(19 * var(--u)); height: calc(19 * var(--u)); }
 .cplus { background: var(--fg-soft); color: var(--muted); }
@@ -444,6 +450,7 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 }
 .cinput::placeholder { color: var(--muted); }
 .cinput:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+
 /* 富输入区（`.cx`）：里面除了文字还可能有图，所以高度自适应。上下留白取 7u —— 一行文字的
    行盒（约 25.6u）加上它正好落回 40u（`min-height`）：**空着的时候与原来的单行输入一模一样
    （一颗 20u 圆角的胶囊，与两颗圆按钮同高）**，长高之后圆角仍是 20u，于是成了一张圆角矩形。
@@ -590,7 +597,7 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
    所以这一行要挡住 WebView 自己的长按：
    `user-select` 挡文本选择、`-webkit-touch-callout` 挡长按弹窗（不挡的话长按只会选中文字，
    我们那条手势永远轮不上）。`is-pressing` 是按住 500ms 期间的浅底 —— 这条手势唯一的可见提示。 */
-.drow { width: 100%; display: flex; align-items: center; gap: calc(12 * var(--u)); padding: calc(11 * var(--u)) calc(12 * var(--u)); text-align: left; user-select: none; -webkit-touch-callout: none; }
+.drow { width: 100%; display: flex; align-items: center; gap: calc(12 * var(--u)); padding: calc(11 * var(--u)) calc(12 * var(--u)); text-align: left; cursor: pointer; user-select: none; -webkit-touch-callout: none; }
 .drow + .drow { border-top: 1px solid var(--border); }
 .drow:hover { background: var(--fg-soft); }
 .drow.is-pressing { background: var(--fg-soft); }

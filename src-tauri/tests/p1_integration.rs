@@ -147,6 +147,8 @@ async fn pairing_then_push_transfers_file_to_receiver() {
     // Two instances (same process): A and B.
     let state_a = make_state(3990, "device-a", "PC-A", save_dir.clone());
     let state_b = make_state(3991, "device-b", "PC-B", save_dir.clone());
+    // 这条用例测配对 + WS 推送的整条链路，前提是"已配对设备自动接收"开着。
+    state_b.config.lock().auto_accept_paired = true;
 
     // Give A a share.
     state_a
@@ -264,9 +266,9 @@ async fn pairing_then_push_transfers_file_to_receiver() {
     std::fs::write(&big, vec![0x5Au8; 32 * 1024 * 1024]).unwrap();
 
     // A pushes a local directory to B (推送的是用户选的本机路径，与共享项无关）。
-    // B 是**已绑定**（已配对）设备 → 这条推送不需要它点同意：整条链路里没有一处调用
-    // `accept_invite`，下面"文件真的落了盘"就是"自动收下"的证明（下载循环唯一的入口
-    // 就是它 —— 界面点「接收」，或已绑定设备在收到邀请时自动放行）。
+    // B 是**已绑定**（已配对）设备且开着「自动接收」→ 这条推送不需要它点同意：整条链路里
+    // 没有一处调用 `accept_invite`，下面"文件真的落了盘"就是"自动收下"的证明（下载循环
+    // 唯一的入口就是它 —— 界面点「接收」，或已配对设备在收到邀请时自动放行）。
     let invite_id = push_invite(
         state_a.clone(),
         vec![root.to_string_lossy().to_string()],
@@ -622,8 +624,8 @@ async fn a_waiting_invite_never_expires_on_its_own() {
     let _ = std::fs::remove_dir_all(&save_dir);
 }
 
-/// 已绑定（已配对）但**没建长连接**的设备：推送走 HTTP 直达，同样不需要接收方同意 ——
-/// token 就是那份信任。"自动收下"在长连接那条路和 HTTP 这条路上是两段代码
+/// 已绑定（已配对）、开着「已配对设备自动接收」、但**没建长连接**的设备：推送走 HTTP
+/// 直达，不需要接收方同意。"自动收下"在长连接那条路和 HTTP 这条路上是两段代码
 /// （`ws::session` 的 `push_invite` 分支 / `routes_push::push_invite_handler`），两条都得测。
 #[tokio::test]
 async fn paired_push_without_a_long_connection_skips_consent_http() {
@@ -633,6 +635,7 @@ async fn paired_push_without_a_long_connection_skips_consent_http() {
     let (port_a, port_b) = two_free_ports();
     let state_a = make_state(port_a, "device-pha", "PC-PHA", save_dir.clone());
     let state_b = make_state(port_b, "device-phb", "PC-PHB", save_dir.clone());
+    state_b.config.lock().auto_accept_paired = true;
     let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
         .await
         .expect("A server");
@@ -712,6 +715,95 @@ async fn paired_push_without_a_long_connection_skips_consent_http() {
     credential::remove_peer("device-phb").ok();
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&save_dir);
+}
+
+/// 已配对但**没开**「已配对设备自动接收」（新默认）：邀请和未绑定设备一样挂着等用户点头，
+/// 不会因为"配过对"就自动落盘；用户同意后按这次挑的根落。
+#[tokio::test]
+async fn paired_push_needs_consent_when_auto_receive_is_off() {
+    let src = temp_share_dir("PCA");
+    let save_dir =
+        std::env::temp_dir().join(format!("orbdrop_it_pcasave_{}", uuid::Uuid::new_v4()));
+    let chosen = std::env::temp_dir().join(format!("orbdrop_it_pcapick_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&save_dir).unwrap();
+    let (port_a, port_b) = two_free_ports();
+    let state_a = make_state(port_a, "device-pca", "PC-PCA", save_dir.clone());
+    let state_b = make_state(port_b, "device-pcb", "PC-PCB", save_dir.clone());
+    assert!(
+        !state_b.config.lock().auto_accept_paired,
+        "新默认：已配对设备不自动接收"
+    );
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
+        .await
+        .expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b)
+        .await
+        .expect("B server");
+
+    // 每对设备一枚独立 token：凭据库是整个测试进程共用的，同一枚 token 对上多台设备时
+    // 解析结果取决于谁先命中；复用常量会把别的用例的邀请认到这台身上。
+    let shared_token = uuid::Uuid::new_v4().simple().to_string();
+    credential::set_peer("device-pcb", &shared_token).unwrap();
+    credential::set_peer("device-pca", &shared_token).unwrap();
+    state_a.add_peer_book(PeerDevice {
+        id: "device-pcb".into(),
+        name: "PC-PCB".into(),
+        ip: "127.0.0.1".into(),
+        port: port_b,
+        online: true,
+        paired: true,
+        auto_connect: false,
+        paused: false,
+        relay: None,
+    });
+    state_b.add_peer_book(PeerDevice {
+        id: "device-pca".into(),
+        name: "PC-PCA".into(),
+        ip: "127.0.0.1".into(),
+        port: port_a,
+        online: true,
+        paired: true,
+        auto_connect: false,
+        paused: false,
+        relay: None,
+    });
+
+    let invite_id = push_invite(
+        state_a.clone(),
+        vec![src.to_string_lossy().to_string()],
+        "device-pcb",
+    )
+    .await
+    .expect("已配对设备的邀请应该直接发出去")
+    .targets[0]
+        .invite_id
+        .clone();
+    wait_until("B 收到推送邀请（没有自动收）", || {
+        state_b.push.inbound.lock().contains_key(&invite_id)
+    })
+    .await;
+    assert!(
+        !save_dir.join("PC-PCA").exists(),
+        "没点接收之前不该有任何文件落盘"
+    );
+
+    transfer::accept_invite(state_b.clone(), &invite_id, Some(chosen.clone())).expect("B 同意");
+    let name = src.file_name().unwrap().to_string_lossy().to_string();
+    let expected = chosen.join("PC-PCA").join(&name).join("hello.txt");
+    wait_until("同意后收进挑的那个根", || {
+        std::fs::read(&expected)
+            .map(|c| c == b"hello world from A")
+            .unwrap_or(false)
+    })
+    .await;
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    credential::remove_peer("device-pca").ok();
+    credential::remove_peer("device-pcb").ok();
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&save_dir);
+    let _ = std::fs::remove_dir_all(&chosen);
 }
 
 /// 「每次询问」（S-02）选定的落盘根：未绑定设备那条同意路上，用户在目录选择框里挑的目录就是
@@ -834,6 +926,8 @@ async fn multi_device_push_isolates_targets_and_shares_one_manifest() {
     let (port_a, port_b, port_c) = (ports[0], ports[1], ports[2]);
     let state_a = make_state(port_a, "device-mda", "PC-MDA", save_b.clone());
     let state_b = make_state(port_b, "device-mdb", "PC-MDB", save_b.clone());
+    // B 这条"收到就收、不问人"的前提是打开了「已配对设备自动接收」（默认关）。
+    state_b.config.lock().auto_accept_paired = true;
     let state_c = make_state(port_c, "device-mdc", "PC-MDC", save_c.clone());
     let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
         .await
