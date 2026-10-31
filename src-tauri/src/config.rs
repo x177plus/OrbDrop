@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 /// `update_settings` 请求里的同名字段都是 PascalCase。这里再用 `camelCase` 序列化就会
 /// 变成 `"direct"`，前端单选框一个都对不上（面板显示成"两个都没选"），保存时又把
 /// `"direct"` 发回来 —— 后端只认 `"Direct"`/`"AskEachTime"`，于是**整个设置面板存不下去**。
+///
 /// alias 保留旧配置里的 `"direct"` / `"askEachTime"`，已落盘的 config.toml 不会解析失败
 /// （解析失败 = 改名成 `.toml.bad` 再写默认值，用户的共享项和配对表就没了）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,9 +28,41 @@ pub enum DownloadMode {
     AskEachTime,
 }
 
+/// `config.toml` 的**格式**版本（不是产品版本）。缺失/0 = 0.1.x 及更早写的。
+///
+/// 0.2.0 起 `downloadMode` 的缺省值从「直接保存」改成「每次选择位置」；旧配置里那份
+/// `Direct` 是旧默认写进去的，分不清"用户选的"还是"默认"，所以按新默认统一迁移一次
+/// （见 `migrate_config`）。写入 1 之后不再迁移，用户改回 `Direct` 会一直生效。
+pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+
 impl Default for DownloadMode {
     fn default() -> Self {
-        Self::Direct
+        // 桌面默认「每次选择位置」。Android 保持「直接保存到下载目录」：系统选择器返回的是
+        // `content://` URI，而落盘层（`download_from_peer` / `download_file` / 推送接收）
+        // 只接受文件系统路径 —— 设成 Ask 会让默认路径直接写不进去。
+        #[cfg(target_os = "android")]
+        {
+            Self::Direct
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Self::AskEachTime
+        }
+    }
+}
+
+/// Android 只能「直接保存」：系统选择器返回的是 `content://` URI，而落盘层
+/// （`download_from_peer` / `download_file` / 推送接收）只接受文件系统路径。
+/// 其他平台原样返回。
+pub fn clamp_download_mode(mode: DownloadMode) -> DownloadMode {
+    clamp_download_mode_for(mode, cfg!(target_os = "android"))
+}
+
+pub fn clamp_download_mode_for(mode: DownloadMode, android: bool) -> DownloadMode {
+    if android {
+        DownloadMode::Direct
+    } else {
+        mode
     }
 }
 
@@ -51,6 +84,24 @@ pub enum OrbShape {
 impl Default for OrbShape {
     fn default() -> Self {
         Self::Circle
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PeerTransport {
+    #[default]
+    #[serde(rename = "orbdrop")]
+    OrbDrop,
+    #[serde(rename = "localsend")]
+    LocalSend,
+}
+
+impl PeerTransport {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::OrbDrop => "orbdrop",
+            Self::LocalSend => "localsend",
+        }
     }
 }
 
@@ -396,6 +447,9 @@ pub struct AppSettings {
     pub download_dir: PathBuf,
     /// 推送接收是否再放一层 `<发送方名>/`（设置里的「推送按发送方分目录」，默认开）。见 `Config::device_subdir`。
     pub device_subdir: bool,
+    /// 已配对设备推送是否**免确认自动收**（设置里的「已配对设备自动接收」，**默认关**）。
+    /// 见 `Config::auto_accept_paired`。
+    pub auto_accept_paired: bool,
     pub download_mode: DownloadMode,
     pub device_name: String,
     /// 界面语言（具体语言：`en` / `zh-CN`），见 `Config::language`。
@@ -408,6 +462,11 @@ pub struct AppSettings {
     pub bc_exe_path: String,
     /// 本机「在线 / 离线」状态（面板右上角那个状态框）。见 `Config::online`。
     pub online: bool,
+    /// 是否启用 LocalSend v2.2 兼容（设置里的「支持 LocalSend 协议」，**默认关**）。
+    ///
+    /// 只控制 LocalSend 那一面：UDP 53317 发现、`/api/localsend/*` 路由、LocalSend
+    /// 设备行与传输。OrbDrop 自己的 mDNS/配对/推送不受它影响；`online=false` 时两者一起停。
+    pub localsend_enabled: bool,
     /// 折叠态悬浮形态（设置里的「悬浮形态」）。见 `OrbShape`。
     pub orb_shape: OrbShape,
     /// 新添加的目录/文件是否默认开播（设置里的「添加后自动共享」，默认关）。见 `Config::auto_broadcast_new`。
@@ -430,12 +489,14 @@ impl Default for AppSettings {
             port: 3890,
             download_dir: default_download_dir(),
             device_subdir: default_device_subdir(),
-            download_mode: DownloadMode::Direct,
+            auto_accept_paired: false,
+            download_mode: DownloadMode::default(),
             device_name: default_device_name(),
             language: default_language(),
             auto_start: true,
             bc_exe_path: String::new(),
             online: true,
+            localsend_enabled: false,
             orb_shape: OrbShape::default(),
             auto_broadcast_new: false,
             group_relay: default_relay_enabled(),
@@ -514,29 +575,42 @@ pub struct Config {
     /// 路径由发送方给的清单决定（选中项各自的名字，见 `transfer::manifest_for_paths`）
     /// —— 没有"推送名子目录"那一层。不再单设「收件目录」——两个预设位置对用户是同一种操作。
     ///
-    /// **例外**：`download_mode = AskEachTime` 时，接收**未绑定设备**的推送会先让用户挑一个
-    /// 目录，挑的那个只是这次接收的**根**（`InboundInvite::root`；S-12 开着时
-    /// `<根>/<发送方名>/…` 那层照旧）—— 已配对设备免同意自动收，永远用这里。
+    /// **例外**：`download_mode = AskEachTime` 时，接收**需要用户同意**的推送（未绑定设备，
+    /// 或已配对但关了「自动接收」）会先让用户挑一个目录，挑的那个只是这次接收的**根**
+    /// （`InboundInvite::root`；S-12 开着时 `<根>/<发送方名>/…` 那层照旧）—— 已配对且开着
+    /// 自动接收的推送免同意直接收，永远用这里。
     #[serde(default = "default_download_dir")]
     pub download_dir: PathBuf,
     /// 推送接收时是否**再放一层 `<发送方名>/`**（S-12，默认**开**）。
     ///
     /// 开着（默认）= 现在这套：落盘根 = `<落盘根>/<净化过的发送方名>`，对端清单里的相对路径
     /// 在它下面展开（`resume::landing_dir`）。它买来三件事：两台设备推同名文件不会互相顶掉、
-    /// 一批东西能按来源整体看/整体清、以及「每次询问」那次点击只授权对方在根里**新建一个自己
+    /// 一批东西能按来源整体看/整体清、以及「每次选择位置」那次点击只授权对方在根里**新建一个自己
     /// 的目录**（碰不到根里已有的东西）。
     ///
     /// 关掉 = 推送直接落在落盘根里（和手动下载的文件同一层）。代价如实写在这里：别人的
     /// `报告.docx` 会和你的同名文件在同一层比 `unique_path` 改名；推一个目录 `D/` 会并进
     /// 你可能本来就有的 `<落盘根>/D`（已配对设备的推送对同名文件是**校验通过后原子替换**）；
-    /// 「每次询问」下挑的根就等于直接授权对方往那一层写文件名。
+    /// 「每次选择位置」下挑的根就等于直接授权对方往那一层写文件名。
     #[serde(default = "default_device_subdir")]
     pub device_subdir: bool,
+    /// 已配对设备推送是否**免确认自动收**（设置里的「已配对设备自动接收」，**默认关**）。
+    ///
+    /// 开：已配对设备的推送不问用户，直接落到下载目录；`download_mode` 对这条不生效
+    /// （自动收的时候没有人可以回答"存哪儿"）。
+    /// 关：已配对设备与未绑定设备走同一条同意路 —— 通知卡上点「接收」；`download_mode =
+    /// AskEachTime` 时再选这次的落盘根。认证口径不变：已配对设备仍必须带有效 token，
+    /// 凭据失效照样 401。
+    #[serde(default)]
+    pub auto_accept_paired: bool,
     /// 下载模式（S-02）：手动下载弹出保存框；`AskEachTime` 时，接收**需要同意的**推送
-    /// （未绑定设备那条）也会先弹一次目录选择框，取消即拒绝这次接收。已配对设备的推送
-    /// 免同意、到了就收，与它无关。
+    /// （未绑定设备，或已配对但关了「自动接收」）也会先弹一次目录选择框，取消即拒绝这次
+    /// 接收。已配对且开着自动接收的推送不问，与它无关。
     #[serde(default)]
     pub download_mode: DownloadMode,
+    /// `config.toml` 的格式版本；见 [`CONFIG_SCHEMA_VERSION`]。
+    #[serde(default)]
+    pub schema_version: u32,
     #[serde(default = "default_device_name")]
     pub device_name: String,
     /// 界面语言（具体语言）：`"en"` / `"zh-CN"`。
@@ -591,6 +665,12 @@ pub struct Config {
     /// 这是**用户意图**，所以落在配置文件里跨重启生效（和「断开」的记忆同一个道理）。
     #[serde(default = "default_online")]
     pub online: bool,
+    /// 是否启用 LocalSend v2.2 兼容（见 [`AppSettings::localsend_enabled`]）。
+    ///
+    /// 默认关：这是新增的一整面公开 HTTP 路由 + UDP 组播，必须由用户显式打开。
+    /// 它不改变 OrbDrop 自己的发现/配对/推送；离线时两者一起停。
+    #[serde(default)]
+    pub localsend_enabled: bool,
     /// 新添加的目录/文件**默认是否开播**（设置里的「添加后自动共享」，**默认关**）。
     ///
     /// 只作用于**之后新登记**的共享项：`lib.rs::add_share_impl` 建条目时把这个值抄进
@@ -766,7 +846,8 @@ impl Config {
             port: self.port,
             download_dir: self.download_dir.clone(),
             device_subdir: self.device_subdir,
-            download_mode: self.download_mode,
+            auto_accept_paired: self.auto_accept_paired,
+            download_mode: clamp_download_mode(self.download_mode),
             device_name: self.device_name.clone(),
             language: crate::i18n::canonical_preference(&self.language),
             auto_start: self.auto_start,
@@ -776,6 +857,7 @@ impl Config {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default(),
             online: self.online,
+            localsend_enabled: self.localsend_enabled,
             orb_shape: self.orb_shape,
             auto_broadcast_new: self.auto_broadcast_new,
             group_relay: self.group_relay,
@@ -1080,7 +1162,9 @@ impl Default for Config {
             port: 3890,
             download_dir: default_download_dir(),
             device_subdir: default_device_subdir(),
-            download_mode: DownloadMode::Direct,
+            auto_accept_paired: false,
+            download_mode: DownloadMode::default(),
+            schema_version: CONFIG_SCHEMA_VERSION,
             device_name: default_device_name(),
             language: default_language(),
             auto_start: true,
@@ -1093,6 +1177,7 @@ impl Default for Config {
             orb_shape: OrbShape::default(),
             picker_favorites: Vec::new(),
             online: true,
+            localsend_enabled: false,
             auto_broadcast_new: false,
             keepalive_guided: false,
             group_relay: default_relay_enabled(),
@@ -1439,6 +1524,18 @@ pub fn load_config() -> Config {
     load_config_at(&config_file_path())
 }
 
+/// 旧配置的一次性迁移（见 [`CONFIG_SCHEMA_VERSION`]）。返回是否改了东西。
+fn migrate_config(config: &mut Config) -> bool {
+    if config.schema_version >= CONFIG_SCHEMA_VERSION {
+        return false;
+    }
+    // 桌面端翻成「每次选择位置」，Android 的 `DownloadMode::default()` 本来就是 `Direct`
+    // （系统选择器给的是 `content://`，落盘层只认文件系统路径）。
+    config.download_mode = DownloadMode::default();
+    config.schema_version = CONFIG_SCHEMA_VERSION;
+    true
+}
+
 /// 读一份配置（路径可给，便于测试）。文件不存在时落一份默认配置；损坏时改名成 `.toml.bad`
 /// 再落一份默认 —— 两条都保住设备身份，也绝不静默丢掉旧文件。
 ///
@@ -1503,7 +1600,15 @@ pub fn load_config_at(path: &Path) -> Config {
     }
     // 两处收口：地址簿里 id 不合法的行（对端自报的，见 `crate::ids`）与按路径重复的共享项。
     // 都只在**真的动了**才写回，不然每次启动都把配置重写一遍。
-    let mut scrubbed = drop_invalid_peer_ids(&mut config.peers);
+    let mut scrubbed = migrate_config(&mut config);
+    // Android 上「每次选择位置」写不进去（选择器给 `content://`）：别的机器同步/拷贝过来的
+    // 配置、或 0.1.x 在手机上选过的那一档，都在这里收回「直接保存」。
+    let clamped = clamp_download_mode(config.download_mode);
+    if clamped != config.download_mode {
+        config.download_mode = clamped;
+        scrubbed = true;
+    }
+    scrubbed |= drop_invalid_peer_ids(&mut config.peers);
     // 旧版本会把本机自己的 id/地址写进反向记录池与观察记忆：启动时清掉（见该方法的说明）。
     scrubbed |= config.scrub_self_identities();
     scrubbed |= dedupe_shares(&mut config.shares);
@@ -1852,7 +1957,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("orbdrop_cleanshares_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        let original = "deviceId = \"device-1\"\n\n[[shares]]\nid = \"only\"\nname = \"one\"\npath = 'C:/One'\nbroadcastEnabled = false\ncreatedAt = \"2026-09-01T00:00:00Z\"\n";
+        let original = "deviceId = \"device-1\"\nschemaVersion = 1\n\n[[shares]]\nid = \"only\"\nname = \"one\"\npath = 'C:/One'\nbroadcastEnabled = false\ncreatedAt = \"2026-09-01T00:00:00Z\"\n";
         std::fs::write(&path, original).unwrap();
         let before = std::fs::metadata(&path).unwrap().modified().unwrap();
 
@@ -1964,7 +2069,9 @@ mod tests {
             port: 3895,
             download_dir: PathBuf::from("C:/test/downloads"),
             device_subdir: false,
+            auto_accept_paired: true,
             download_mode: DownloadMode::AskEachTime,
+            schema_version: CONFIG_SCHEMA_VERSION,
             device_name: "TestPC".into(),
             language: "en".into(),
             auto_start: false,
@@ -1977,6 +2084,7 @@ mod tests {
             transfer_block_mb: default_transfer_block_mb(),
             orb_shape: OrbShape::Rect,
             online: false,
+            localsend_enabled: false,
             auto_broadcast_new: true,
             keepalive_guided: true,
             group_relay: true,
@@ -2063,6 +2171,10 @@ mod tests {
         assert_eq!(loaded.port, 3895);
         assert_eq!(loaded.download_dir, PathBuf::from("C:/test/downloads"));
         assert_eq!(loaded.device_subdir, false, "S-12 的开关也要跨重启保留");
+        assert_eq!(
+            loaded.auto_accept_paired, true,
+            "「已配对设备自动接收」也要跨重启保留"
+        );
         assert_eq!(loaded.download_mode, DownloadMode::AskEachTime);
         assert_eq!(loaded.device_name, "TestPC");
         assert_eq!(loaded.auto_start, false);
@@ -2194,6 +2306,75 @@ mod tests {
 
         let current: Config = toml::from_str("downloadMode = \"AskEachTime\"\n").unwrap();
         assert_eq!(current.download_mode, DownloadMode::AskEachTime);
+
+        // 缺省值：桌面默认「每次选择位置」，Android 仍默认「直接保存到下载目录」
+        //（content:// 不是文件系统路径）；「已配对设备自动接收」默认关。
+        let expected = if cfg!(target_os = "android") {
+            DownloadMode::Direct
+        } else {
+            DownloadMode::AskEachTime
+        };
+        assert_eq!(DownloadMode::default(), expected);
+        let missing: Config = toml::from_str("deviceId = \"device-1\"\n").unwrap();
+        assert_eq!(missing.download_mode, expected);
+        assert!(
+            !missing.auto_accept_paired,
+            "已配对设备默认不自动接收：仍要用户点一次"
+        );
+    }
+
+    /// Android 上「每次选择位置」必须被收回「直接保存」（选择器给 `content://`）；
+    /// 其他平台不动用户的选择。
+    #[test]
+    fn android_clamps_download_mode_to_direct() {
+        assert_eq!(
+            clamp_download_mode_for(DownloadMode::AskEachTime, true),
+            DownloadMode::Direct
+        );
+        assert_eq!(
+            clamp_download_mode_for(DownloadMode::Direct, true),
+            DownloadMode::Direct
+        );
+        assert_eq!(
+            clamp_download_mode_for(DownloadMode::AskEachTime, false),
+            DownloadMode::AskEachTime
+        );
+    }
+
+    /// 0.1.x 配置里的 `downloadMode = "Direct"` 是**旧默认**写进去的：升级时按新默认
+    /// 一次性翻成「每次选择位置」，并立刻落盘；翻过之后用户改回 `Direct` 不会再被翻。
+    #[test]
+    fn an_old_config_migrates_download_mode_exactly_once() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_cfg_migrate_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "deviceId = \"device-old\"\ndownloadMode = \"Direct\"\n",
+        )
+        .unwrap();
+
+        let cfg = load_config_at(&path);
+        let expected = if cfg!(target_os = "android") {
+            DownloadMode::Direct
+        } else {
+            DownloadMode::AskEachTime
+        };
+        assert_eq!(cfg.download_mode, expected);
+        assert_eq!(cfg.schema_version, CONFIG_SCHEMA_VERSION);
+        let on_disk: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk.schema_version, CONFIG_SCHEMA_VERSION,
+            "迁移结果要落盘，否则每次启动都会重翻"
+        );
+
+        // 升级后用户自己选回「直接保存」：版本号已是 1，不能再被缺省翻回来。
+        let mut cfg = cfg;
+        cfg.download_mode = DownloadMode::Direct;
+        save_config_at(&path, &cfg).unwrap();
+        assert_eq!(load_config_at(&path).download_mode, DownloadMode::Direct);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// S-12 的开关在旧配置里没有：读出来必须是**开** —— 那正是这些配置一直以来的落盘形状

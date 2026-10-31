@@ -26,6 +26,15 @@ let remarks = $state<Record<string, string>>({});
 let loading = $state(false);
 
 export function getDevices() { return devices; }
+
+/**
+ * 只看 **OrbDrop 自己的**设备（F-124）：配对候选、群/群发收件人、配对表、编辑收件人这些
+ * "要跟对端建立 OrbDrop 关系"的地方都得用它 —— LocalSend 设备不配对、不进群，混进去只会
+ * 得到一条永远配不上的行。设备列表本身（`getDevices`）两份都含。
+ */
+export function orbdropDevices(): PeerDevice[] {
+  return getDevices().filter((d) => d.transport !== 'localsend');
+}
 export function isDevicesLoading() { return loading; }
 
 /**
@@ -34,6 +43,10 @@ export function isDevicesLoading() { return loading; }
  * （`unpair_peer` 只是"尽力通知对端"，对端离线照样清干净本机 token）。
  *
  * 离线且未绑定的不列：它没有任何可做的动作，只会堆积曾经扫到的设备。
+ * **LocalSend 行与其它设备同一套可见性**：在线、或仍在发现窗口内（`seen`）才列。
+ * 它们不配对、不进群；对端真的走了，发现机制看不见它，这一行就该一起消失 ——
+ * 后端还会在内存里留最多 10 分钟（用于恢复/复用身份），但界面不拿"永远列"去对抗
+ * 发现结果；会话记录本身仍在会话列表里，不受影响。
  * **例外是"看得见但连不上"的**（`seen`，F-106）：它照样列出来 —— 用户的感受是"刚才还看到它、
  * 现在没了"，稳定地摆一行比闪一下就没好。这一行**不带任何特殊状态**：关系没建立就是「未绑定」，
  * 状态点照旧按 `offline` 画；"这张网把单播隔开了"只在**发起连接**时弹一句 tip（见 `unicastBlocked`）。
@@ -242,6 +255,8 @@ export type DeviceDotState = 'live' | 'online' | 'offline' | 'retrying' | 'repai
  * 右键菜单、状态点共用这一个判据。
  */
 export function needsRepair(d: PeerDevice): boolean {
+  // LocalSend 没有"配对/凭据"这一层：不存在要修复的关系。
+  if (d.transport === 'localsend') return false;
   const s = d.linkState;
   return !!s && s.kind === 'stopped' && (s.reason === 'tokenRejected' || s.reason === 'identityChanged');
 }
@@ -268,6 +283,8 @@ export function needsRepair(d: PeerDevice): boolean {
  * 就不适用。中转本身不上界面（用户要求），但这条判据照旧要看它。
  */
 export function unicastBlocked(d: PeerDevice | undefined): boolean {
+  // LocalSend 走 HTTPS 直连对端，没有"单播被 AP 隔开"这条 OrbDrop 专属的解释。
+  if (d?.transport === 'localsend') return false;
   // "此刻拨得动吗"：地址在手（或手里有一条借来的端点）。
   const hasRoute = !!d && ((d.ip !== '' && d.port !== 0) || !!d.relayVia);
   return !!d && d.seen && !d.relayVia && (!d.online || !hasRoute);
@@ -294,6 +311,8 @@ export function unicastBlockedTip(d: PeerDevice | undefined): string | null {
  */
 export function deviceDotState(d: PeerDevice | undefined): DeviceDotState {
   if (!localOnline || !d || !d.online) return 'offline';
+  // LocalSend 只有"能不能发现/探活到"这一档：没有长连接、不用配对、不会重试修复。
+  if (d.transport === 'localsend') return 'online';
   if (d.connected) return 'live';
   if (needsRepair(d)) return 'repair';
   if (d.linkState?.kind === 'retrying') return 'retrying';
@@ -333,7 +352,7 @@ export function threadTrusted(peerIds: string[]): boolean {
  *  与信任档（`trusted`：已配对且指纹已验证；状态点实心/空心就看它）。 */
 export type DeviceState = {
   dot: DeviceDotState;
-  chip: DeviceDotState | 'unbound' | 'offline';
+  chip: DeviceDotState | 'unbound' | 'offline' | 'localsend';
   label: string;
   trusted: boolean;
 };
@@ -352,6 +371,11 @@ export type DeviceState = {
  */
 export function deviceState(d: PeerDevice | undefined): DeviceState {
   const dot = deviceDotState(d);
+  // LocalSend 设备不在 OrbDrop 的关系里：胶囊只说它是另一种协议，信任档永远 false（空心点）。
+  // 胶囊里写协议缩写（全名太长，会把设备名挤淡）；全名由所在行的提示（`linkHint`）交代。
+  if (d?.transport === 'localsend') {
+    return { dot, chip: 'localsend', label: 'LS', trusted: false };
+  }
   if (!d || !d.paired) {
     // 关系还没建立：点照旧按链路画（蓝环/灰环），但永远是空心。
     return { dot, chip: 'unbound', label: t('未配对'), trusted: false };

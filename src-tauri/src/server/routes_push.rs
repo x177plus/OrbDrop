@@ -82,7 +82,8 @@ pub struct InviteResponse {
 ///   一句"送到了"（`pending`），用户点完的结果从回执通道过去。**没有超时**；
 /// - 老对端 → 这条请求一直挂着等用户决定，到点自动作废，响应就是回执。
 ///
-/// **已绑定**（已配对）设备不问同意：当场开收并立刻回 `accepted: true`（两条路一样）。
+/// **已绑定**（已配对）设备默认也要用户同意；只有设置里开了「已配对设备自动接收」才当场
+/// 开收并立刻回 `accepted: true`（两条路一样）。
 pub async fn push_invite_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -91,6 +92,9 @@ pub async fn push_invite_handler(
 ) -> Result<Json<InviteResponse>, (StatusCode, String)> {
     // 本机地址簿里这台是不是"已绑定"（已配对）。
     let paired = state.get_peer(&body.sender.id).is_some_and(|p| p.paired);
+    // 已配对只是"身份可信"，要不要免确认自动收由设置决定（默认关）。
+    let auto_accept_paired = state.config.lock().auto_accept_paired;
+    let auto = paired && auto_accept_paired;
     // 冒充已配对设备：拿不出 token 就拒 —— 走得过这一关的 paired = 身份确认过的老搭档。
     if paired {
         let claimed = bearer_token(&headers).and_then(|t| peer_id_from_token(&state, &t));
@@ -112,7 +116,7 @@ pub async fn push_invite_handler(
         .iter()
         .any(|c| c == crate::transfer::push_job::CAP_AWAIT);
     info!(
-        %invite_id, sender = %body.sender.name, name = %body.name, paired, await1 = await_capable,
+        %invite_id, sender = %body.sender.name, name = %body.name, paired, auto, await1 = await_capable,
         "inbound push invite (http)"
     );
 
@@ -126,7 +130,7 @@ pub async fn push_invite_handler(
             "size": body.size,
             "isDir": body.is_dir,
             "count": body.count,
-            "auto": paired,
+            "auto": auto,
             // 这条文件消息在会话时间线上的位置（发送方点的）。
             "at": body.at,
         }),
@@ -141,7 +145,7 @@ pub async fn push_invite_handler(
         count: body.count,
         files: body.files,
         caps: body.caps,
-        // 落盘根由用户在界面上定（「每次询问」时那颗目录选择框）—— 邀请到达时还不知道，
+        // 落盘根由用户在界面上定（「每次选择位置」时那颗目录选择框）—— 邀请到达时还不知道，
         // 所以这里恒为 `None`，真要挑就等 `accept_invite` 带的那个 root。
         root: None,
         // ip 取自 TCP 来源（不可伪造），端口用发送方自报的服务端口 —— 但**本机自己的监听
@@ -160,10 +164,10 @@ pub async fn push_invite_handler(
         return Err((StatusCode::PAYLOAD_TOO_LARGE, reason));
     }
 
-    // 已绑定的设备推送**不需要接收方同意**：直接开收，并用这次同步响应告诉发送方
-    // "收下了"。未绑定仍然走同意制（挂一张卡片等用户点）—— 那是"不配对也能推"的
-    // 唯一安全兜底，不能一起取消。
-    if paired {
+    // 开了「已配对设备自动接收」才免同意：直接开收，并用这次同步响应告诉发送方
+    // "收下了"。未绑定、以及已配对但关了自动接收的，仍然走同意制（挂一张卡片等用户点）
+    // —— 那是"不配对也能推"的安全兜底，也把"已配对 ≠ 一定自动落盘"还给了用户。
+    if auto {
         state.push.insert_invite(invite);
         if let Err(reason) = accept_invite(state.clone(), &invite_id, None) {
             warn!(%invite_id, %reason, "auto-accept failed");

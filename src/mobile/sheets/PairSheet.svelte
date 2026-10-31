@@ -18,7 +18,10 @@
    * 但命令要有一台目标设备，所以这里先选目标再生成码，而不是照抄原型那把假码。
    */
   const allCandidates = $derived(
-    devices.visibleDevices(devices.getDevices()).filter((d) => !d.paired || devices.needsRepair(d)),
+    devices
+      .visibleDevices(devices.getDevices())
+      // LocalSend 设备不走 OrbDrop 的配对：它们没有 token，也不该在这一栏出现。
+      .filter((d) => d.transport !== 'localsend' && (!d.paired || devices.needsRepair(d))),
   );
 
   /**

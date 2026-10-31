@@ -136,7 +136,7 @@
   "勾选一台设备时为单独会话；勾选两台以上才启用模式。": "Selecting one device gives a one-to-one conversation; the mode only applies with two or more.",
   "消息模式": "Message mode",
   "单向群发": "One-way broadcast",
-  "只显示你发出的消息；每台设备各自收到一条单独的一对一消息 —— 互相看不到，对方的回复也不会回到这里（各自回到它和你的会话里）。每台设备要分别点一次同意（已配对的直接收）。": "Only your own messages are shown; each device receives a separate one-to-one message — they can't see each other, and their replies don't come back here (each reply lands in its own conversation with you). Every device has to accept once (paired devices receive it directly).",
+  "只显示你发出的消息；每台设备各自收到一条单独的一对一消息 —— 互相看不到，对方的回复也不会回到这里（各自回到它和你的会话里）。每台设备要分别点一次同意（已配对且开着「自动接收」的除外）。": "Only your own messages are shown; each device receives a separate one-to-one message — they can't see each other, and their replies don't come back here (each reply lands in its own conversation with you). Every device has to accept once, except paired devices with \"Auto-receive from paired devices\" on.",
   "共享群聊": "Shared group",
   "群里任意一台设备发送的消息，所有参与者都能看到（同一条消息流）。收到邀请的人点「加入」才算这个群的一员；退群只影响自己（本机退出时这份记录也一并删掉，其他成员不受影响）。": "Messages sent by any device in the group are visible to every participant (one shared stream). An invitee only becomes a member after choosing “Join”; leaving affects only you (the local record is deleted too, and the other members are unaffected).",
   "模式不可更改（改了历史就成了两半），移除到只剩一台时会退回单独会话。": "The mode can't be changed (it would split the history); removing devices until one is left falls back to a one-to-one conversation.",
@@ -191,5 +191,13 @@
   "正在读这张图…": "Loading image…",
   "用系统程序打开": "Open with system app",
   "点一下看大图": "Click to view full size",
-  "看大图：{label}": "View full size: {label}"
+  "看大图：{label}": "View full size: {label}",
+  "LocalSend": "LocalSend",
+  "LocalSend 会话只支持文件，用右侧＋发送": "LocalSend conversations support files only — use the + on the right to send",
+  "LocalSend 会话只支持文件，用下方「＋」发送": "LocalSend conversations support files only — use the “+” below to send",
+  "发送文件到 LocalSend 设备": "Send files to the LocalSend device",
+  "选文件发给这台 LocalSend 设备（对方确认后接收）": "Pick files to send to this LocalSend device (the other side must accept them)",
+  "LocalSend 文字消息；图片和文件用右侧＋发送": "LocalSend text message; use the + on the right to send images and files",
+  "LocalSend 会话可以发文字；图片和文件用下方「＋」发送": "LocalSend conversations support text; use the “+” below for images and files",
+  "LocalSend 会话可以发文字/图片；普通文件用下方「＋」发送": "LocalSend conversations support text and images; use the “+” below for ordinary files"
 }

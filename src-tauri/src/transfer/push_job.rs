@@ -119,8 +119,9 @@ pub struct InboundInvite {
     pub caps: Vec<String>,
     /// 这次接收的落盘**根目录**：`None` = 用设置里的下载目录（S-01）。
     ///
-    /// 只有"需要用户同意"那条路（未绑定设备）才可能带它 —— 已配对设备免同意自动收，
-    /// "到了就收"没有让人先挑目录的时机（见 `transfer::accept_invite` 的 `root` 参数）。
+    /// 只有"需要用户同意"那条路（未绑定设备，或已配对但关了「自动接收」）才可能带它 ——
+    /// 开着自动接收时"到了就收"，没有让人先挑目录的时机（见 `transfer::accept_invite`
+    /// 的 `root` 参数）。
     ///
     /// 它只是**根**：`<根>/<发送方名>/…` 这一层由 `resume::landing_dir` 按设置（S-12）拼、
     /// 名字照样净化；关掉那层时根就是落点（`safe_join` 逐段校验仍是围栏）。
@@ -326,7 +327,7 @@ pub enum DownloadTarget {
 /// 「失败」；两者只在"这一批算不算全成"这件事上同类（卡片的收起规则见前端）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TargetState {
-    /// 邀请已发出、还没有任何回执（已配对的目标会很快转 `Sending`）。
+    /// 邀请已发出、还没有任何回执（已配对且对面开着自动接收的会很快转 `Sending`）。
     Invited,
     /// 对端正在拉数据。
     Sending,
@@ -384,9 +385,11 @@ impl TargetState {
 pub struct BatchTarget {
     pub peer_id: String,
     pub peer_name: String,
-    /// 这一台对应的邀请 id（= 它那条 `PushJob.id`）。
+    /// 这一台对应的邀请 id（= 它那条 `PushJob.id`；LocalSend 是本地任务 id）。
     pub invite_id: String,
-    /// 已配对 = 对方**不问同意**直接收：行文案别说「等待对方同意」（对面没点过任何东西）。
+    pub transport: crate::config::PeerTransport,
+    /// 已配对 = 身份可信；是否免同意还取决于**对方**的「已配对设备自动接收」设置，
+    /// 行文案不能只凭它断定"对方没点过任何东西"。
     pub paired: bool,
     pub state: TargetState,
     pub received: u64,
@@ -441,6 +444,7 @@ pub struct BatchTargetView {
     /// 设备名（界面那一行行首的字）。
     pub target: String,
     pub invite_id: String,
+    pub transport: &'static str,
     pub paired: bool,
     pub state: &'static str,
     pub received: u64,
@@ -483,6 +487,7 @@ fn snapshot(batch: &PushBatch) -> BatchView {
                 peer_id: t.peer_id.clone(),
                 target: t.peer_name.clone(),
                 invite_id: t.invite_id.clone(),
+                transport: t.transport.key(),
                 paired: t.paired,
                 state: t.state.key(),
                 received: t.received,
@@ -1041,8 +1046,12 @@ pub fn batch_set(
         (emit.then(|| snapshot(batch)), record)
     };
     // 状态跃迁那一刻盘上必须有（哪怕这几拍的事件被节流了：`apply_push_states` 的
-    // `Sending` 就是 `force = false`）。
-    state.push.out.save_batch(out_record);
+    // `Sending` 就是 `force = false`）。**LocalSend-only 的批次没有可恢复的 job**：
+    // `out_batch_of` 会过滤掉它们，落一个空 targets 的批次既没用、又会每 200ms 写一次盘 ——
+    // 所以只在真有 OrbDrop 目标时才写。
+    if !out_record.targets.is_empty() {
+        state.push.out.save_batch(out_record);
+    }
     let Some(shot) = shot else {
         return; // 节流住的只是**事件**：既不发快照，也不做收尾（与改动前一致）
     };
@@ -1100,6 +1109,9 @@ pub fn out_batch_of(batch: &PushBatch, roots: &[std::path::PathBuf]) -> super::p
         targets: batch
             .targets
             .iter()
+            // LocalSend 目标没有可恢复的 `PushJob`（协议没有续传），不写进 `push_out`；
+            // 混排批次里只持久化 OrbDrop 那几行。
+            .filter(|t| t.transport == crate::config::PeerTransport::OrbDrop)
             .map(|t| super::push_out::OutTarget {
                 peer_id: t.peer_id.clone(),
                 peer_name: t.peer_name.clone(),
@@ -1153,6 +1165,7 @@ pub fn restore_outbound(state: &Arc<AppState>) -> usize {
                 peer_id: t.peer_id.clone(),
                 peer_name: t.peer_name.clone(),
                 invite_id: t.invite_id.clone(),
+                transport: crate::config::PeerTransport::OrbDrop,
                 paired: t.paired,
                 // 对面已经点头、只是第一条进度还没到：别让恢复出来的卡片写「等待对方同意」。
                 state: if key == TargetState::Invited && is_accepted {
@@ -1499,8 +1512,9 @@ fn spawn_download_legacy(
         let config = state.config.lock().clone();
         // 落盘根 = `<落盘目录>/<发送方名>`（S-12 那颗开关关掉时就是落盘根本身；两条引擎共用
         // `resume::landing_dir`）。落盘目录默认是用户设的下载目录（S-01）；只有在
-        // 「每次询问」下由用户亲自挑过的那些邀请才带自己的根（`invite.root`）—— 已配对设备
-        // 免同意自动收，不会有这个根。推送接收不再单独有「收件目录」。
+        // 「每次选择位置」下由用户亲自挑过的那些邀请才带自己的根（`invite.root`）——
+        // 自动接收（已配对 + 开着「已配对设备自动接收」）不会有这个根。推送接收不再单独
+        // 有「收件目录」。
         //
         // 对端只往落盘根下面写 —— **没有"推送名子目录"**：清单里的相对路径就是落盘后
         // 的样子（单文件 `A.txt`、单目录 `D/…`、多选 `甲目录/…` + `散文件.txt`），
@@ -2025,6 +2039,7 @@ mod tests {
             peer_id: peer.into(),
             peer_name: peer.into(),
             invite_id: invite.into(),
+            transport: crate::config::PeerTransport::OrbDrop,
             paired: true,
             state,
             received,
@@ -2126,11 +2141,11 @@ mod tests {
                 "total": 20 * 1024 * 1024,
                 "targets": [
                     { "peerId": "PC-A", "target": "PC-A", "inviteId": "i1", "paired": true,
-                      "state": "done", "received": 10 * 1024 * 1024, "error": null },
+                      "transport": "orbdrop", "state": "done", "received": 10 * 1024 * 1024, "error": null },
                     { "peerId": "PC-B", "target": "PC-B", "inviteId": "i2", "paired": true,
-                      "state": "sending", "received": 3 * 1024 * 1024, "error": null },
+                      "transport": "orbdrop", "state": "sending", "received": 3 * 1024 * 1024, "error": null },
                     { "peerId": "PC-C", "target": "PC-C", "inviteId": "i3", "paired": true,
-                      "state": "failed", "received": 0, "error": null },
+                      "transport": "orbdrop", "state": "failed", "received": 0, "error": null },
                 ],
             })
         );
@@ -2442,6 +2457,7 @@ mod reconcile_tests {
             peer_id: peer.into(),
             peer_name: peer.into(),
             invite_id: invite.into(),
+            transport: crate::config::PeerTransport::OrbDrop,
             paired: true,
             state,
             received: 0,

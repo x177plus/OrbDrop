@@ -146,6 +146,9 @@ pub fn release(reg: Registration) {
 ///   5s 探活）。它是**能力**不是**关系**，谁看都一样。
 /// - `nets`：本机非回环 IPv4 网卡的网段（`192.168.1.0/24,10.0.0.0/8`）。跨网段时"这台设备
 ///   属于哪一段"只能由它自己说 —— 本机的掩码对远端网段不适用。
+/// - `fp`：本机 TLS 证书指纹（小写 SHA-256）。与 LocalSend 公告里的 `fingerprint` 是同一枚
+///   证书：同一台机器既播 `_orbdrop` 又播 `_localsend` 时，对端据此把两条发现结果认成一台
+///   设备。TXT 未经认证，这一项**只用于设备列表去重**，不参与任何信任判断。
 ///
 /// `nets` 是**提示**不是权威：网卡换了（插网线/开热点）不会重播 TXT（`enable_addr_auto`
 /// 只管地址记录），所以活回话（`/pair/info` 与 `/discover` 的 `nets`）才是真值。
@@ -189,6 +192,14 @@ pub fn register(
         "nets".to_string(),
         crate::subnet::format_list(&crate::subnet::host_nets()),
     );
+    // 与 LocalSend 公告里的 `fingerprint` 同一枚证书：对端用它把 `_orbdrop` 行与
+    // `_localsend` 行认成同一台设备（见 `AppState::mdns_fingerprints`）。拿不到身份
+    // 就不写这一项 —— 空值比一个错的指纹好。
+    if let Ok(fingerprint) = crate::net::local_fingerprint() {
+        if !fingerprint.is_empty() {
+            properties.insert("fp".to_string(), fingerprint.to_ascii_lowercase());
+        }
+    }
 
     let service = if scope == Scope::Local {
         // 只报回环地址：不调 `enable_addr_auto`，否则内网地址也会被塞进 A 记录。
@@ -262,6 +273,10 @@ pub enum PeerEvent {
         /// F-107：对端在 TXT 里自报的中转能力（`relay=1`）。缺字段按"不允许"读 ——
         /// 与 S-09 默认关一致，也是老版本的行为。
         relay: bool,
+        /// 对端在 TXT 里自报的 TLS 证书指纹（小写 hex；老版本不报 = 空）。
+        /// **只用于跨协议去重**（同一台机器的 `_orbdrop` 行 / `_localsend` 行），
+        /// 不参与信任判断。
+        fingerprint: String,
     },
     Offline(String), // id
 }
@@ -344,6 +359,9 @@ pub async fn scan(tx: mpsc::Sender<PeerEvent>, own_device_id: String, scope: Sco
                     .map(|c| c.to_cidr_string())
                     .collect::<Vec<String>>();
                 let relay = matches!(txt("relay").as_str(), "1" | "true");
+                // 老版本不报 `fp`：空串。归一化在 `AppState::note_mdns_fingerprint` 里做，
+                // 这里只搬运行上的形状。
+                let fingerprint = txt("fp");
 
                 if let (Some(ip), port) = (ip, port) {
                     let _ = tx
@@ -354,6 +372,7 @@ pub async fn scan(tx: mpsc::Sender<PeerEvent>, own_device_id: String, scope: Sco
                             port,
                             nets,
                             relay,
+                            fingerprint,
                         })
                         .await;
                 }
@@ -614,19 +633,32 @@ mod tests {
         let task = tokio::spawn(scan(tx, "own-id".to_string(), Scope::Local));
         let found = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = rx.recv().await {
-                if let PeerEvent::Online { id, .. } = event {
+                if let PeerEvent::Online {
+                    id, fingerprint, ..
+                } = event
+                {
                     if id == peer_id {
-                        return true;
+                        return Some(fingerprint);
                     }
                 }
             }
-            false
+            None
         })
         .await
-        .unwrap_or(false);
+        .unwrap_or(None);
 
         task.abort();
         release(reg);
-        assert!(found, "Local 扫描端应该能看见同机注册的实例");
+        let Some(fingerprint) = found else {
+            panic!("Local 扫描端应该能看见同机注册的实例");
+        };
+        // 跨协议去重靠这一项：TXT 里必须是本机 TLS 证书指纹（小写）。
+        assert_eq!(
+            fingerprint,
+            crate::net::local_fingerprint()
+                .expect("identity")
+                .to_ascii_lowercase(),
+            "mDNS TXT 要带上本机证书指纹"
+        );
     }
 }

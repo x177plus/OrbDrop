@@ -27,10 +27,12 @@ OrbDrop is a LAN file tool whose whole UI is an always-on-top floating orb. Two 
 
 LAN only: no NAT traversal, no relay servers, no cloud, no accounts.
 
+![Sharing is a reference: local shares and the peer's view of the same directory tree](./docs/images/ui-share-tree.en.png)
+
 ## Download
 
 Pick your platform, then take the file in the “Download this” column; `<version>` is the release
-version (for example `0.1.1`). Release pages:
+version (for example `0.2.0`). Release pages:
 [GitHub latest](https://github.com/x177plus/OrbDrop/releases/latest) ·
 [Gitee latest](https://gitee.com/x177plus/OrbDrop/releases).
 
@@ -83,6 +85,8 @@ additionally carry a Tauri update signature in `sig`), so a download can be chec
 
 Messaging is built in, and it is the host of the push feature rather than an add-on.
 
+![Conversations: 1:1, broadcast and group chat in one inbox, with per-peer progress and an offline queue](./docs/images/ui-convo.en.png)
+
 - **Three kinds of conversation**: 1:1, one-way broadcast lists (each recipient sees a normal private chat, members never see each other) and shared group chats.
 - **Push lives in the conversation.** The “+” beside the input opens an in-app picker where files *and* folders are selected in the same dialog and selections accumulate across directories, with a cart to review or drop items. One manifest is built once and sent to every recipient: each target gets its own invite, consent, progress and cancel, and a single summary card reports per-device status. One unreachable device does not affect the others.
 - **Offline peers queue messages** and flush them in order as soon as the device comes back. Read receipts, unread and pending badges on device rows, and a notification when a message arrives. **A conversation stays in the list for as long as it holds messages** — unpaired and offline included: the record is user data, not a property of the current link.
@@ -96,7 +100,11 @@ Messaging is built in, and it is the host of the push feature rather than an add
 - **Cross-subnet discovery**: mDNS cannot cross a router, so paired devices exchange their **entire** mDNS view over unicast every 5 seconds. Add and pair **one anchor** per subnet and everything the anchor can see appears — multi-NIC hosts report what each interface sees. Discovery itself stays single-hop; group messages have their own member-to-member relay.
 - **Manual add** (IP, or `IP:port`; a blank port scans 3890–3899), multi-NIC address reporting with subnet-aware dialing, and a read-only counter of how many bytes you have relayed for others.
 
+![Relay: blind bytes for peers and group messages for members, with the Allow relay switch and traffic counter](./docs/images/ui-relay.en.png)
+
 ## Everything else
+
+![Pairing is the trust boundary; the long-lived link is the access boundary](./docs/images/ui-pair.en.png)
 
 | Area | Behaviour |
 |---|---|
@@ -106,7 +114,8 @@ Messaging is built in, and it is the host of the push feature rather than an add
 | Transport security | A self-signed identity generated once, plus peer certificate fingerprint pinning (TOFU — the fingerprint is remembered, not the hostname). Plaintext exists only on loopback. Tokens and fingerprints share one credentials file in the app data directory; “wipe all credentials” also removes the Beyond Compare profiles. |
 | Transfer engine | Block-level resume keyed by file identity (a failed push resumes instead of restarting, and a receiver keeps receiving on its own even after it restarts), per-block SHA-256 verification, `<name>.orbdrop-part` followed by an atomic rename, configurable concurrency (1–8) and block size (1–32 MB). Measured on loopback TLS with a hot cache: 3,000 × 4 KB files in 1.72 s, a single 128 MB file at 101 MB/s. |
 | Devices | Per-device remarks stored **only locally** (never sent to the peer), search by name or IP, pending badges, unpair at any time — the peer does not need to be online. |
-| Settings | Download folder and mode, per-sender subdirectory for pushes, device name, port, autostart, relay switches, transfer concurrency and block size, and **interface language** (the system language is picked on first launch, falling back to English; switch between English and Simplified Chinese at any time). The choice takes effect immediately and also switches the tray menu and Android notifications. Logs rotate daily in the app data directory. |
+| Settings | Download folder and mode, per-sender subdirectory for pushes, device name, port, autostart, relay switches, transfer concurrency and block size, optional **LocalSend v2.2 compatibility** (text and image batches are accepted automatically, image writes are budgeted per hour), and **interface language** (the system language is picked on first launch, falling back to English; switch between English and Simplified Chinese at any time). The choice takes effect immediately and also switches the tray menu and Android notifications. Logs rotate daily in the app data directory. |
+| LocalSend compatibility | Off by default. When enabled and online, OrbDrop joins the LocalSend UDP multicast group (`224.0.0.167:53317`), answers `register`, and can exchange messages and files with LocalSend devices on the same LAN. Text messages and all-image batches are accepted automatically and shown in the conversation (automatic image writes are budgeted per hour; once the budget is used up that batch asks first); ordinary files still need confirmation. LocalSend devices appear with a `LocalSend` badge and open a one-to-one conversation; they never join pairing, long-lived links, groups, share browsing or relaying. Switching to offline stops both protocols. The switch applies immediately, without waiting for “Save settings”; if 53317 is in use it falls back to the main HTTP port, shows the degraded state in Settings, and reclaims 53317 automatically once it is free. WebRTC / `web.localsend.org` is not included. |
 | Android | A foreground service keeps the app online in the background, pushes arrive with a notification (on a channel separate from the keepalive notification, so you can mute one without losing the other), files can be sent from a conversation, received files open with a tap (`.apk` goes straight to the system installer), and the phone can act as a relay anchor too. |
 | Self-update | The manifest's artifacts carry both `sha256` and a minisign signature; the desktop single-file exe replaces itself using the freshly downloaded exe as a helper (and rolls back on failure); downloads try GitHub then Gitee with speed-based failover and a 24-hour preferred-mirror memory. |
 
@@ -142,7 +151,7 @@ npm run android:build:arm64  # Android release APK for arm64 only
 
 `npm run android:build` compiles the Rust crate for all four ABIs sequentially, so it is the slow one — use `android:build:arm64` while iterating (one ABI, roughly a quarter of the work) and save the full build for release day. Note that `--target aarch64` only limits which ABIs Rust builds: the Gradle flavor stays `universal`, so the arm64-only APK lands in (and overwrites) `apk/universal/release/`.
 
-Packaging: `npm run tauri build` (Windows desktop), `npm run mac:build` (macOS .app/.dmg), `npm run android:release` (arm64 APK, installed to the device), `npm run release` (bump version, build, publish to both release remotes; add `--macos-zip` to include a macOS artifact). `npm run mirror` runs the local mirror harness used to test the updater.
+Packaging: `npm run tauri build` (Windows desktop), `npm run mac:build` (macOS .app/.dmg), `npm run android:release` (arm64 APK, installed to the device), `npm run release` (build + publish to both release remotes; bump first with `npm run bump -- 0.2.0`, and add `--macos-zip` to include a macOS artifact). `npm run mirror` runs the local mirror harness used to test the updater.
 
 Running several instances on one machine (useful for testing against yourself) needs a distinct data directory and port per instance: set `ORBDROP_ALLOW_MULTI=1` and `ORBDROP_DATA_DIR` accordingly. In this mode mDNS is loopback-only by default, so the extra instances are invisible to other machines on the LAN (the release app on the same machine won't see them either). Set `ORBDROP_MDNS_SCOPE=lan` on an instance to expose it deliberately, or `off` to disable mDNS entirely (manual add still works).
 

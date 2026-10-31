@@ -23,11 +23,12 @@
    * 之外（多台时这个框本来就贴着面板高）。
    */
   const req = chat.getRecipientReq();
-  const devices = $derived(getDevices());
+  // LocalSend 设备不进会话收件人候选：它只有一对一的文件会话，不能进群发/群聊名册。
+  const devices = $derived(getDevices().filter((d) => d.transport !== 'localsend'));
 
   // 种子只在挂载那一刻读一次（组件由 App 在 `recipientReq` 非空时挂载）：设备已经不在
-  // 列表里的那些不算数（原型同款过滤）。
-  let selected = $state<string[]>((req?.seed ?? []).filter((id) => getDevices().some((d) => d.id === id)));
+  // 列表里的那些不算数（原型同款过滤）；LocalSend 同样排除在外。
+  let selected = $state<string[]>((req?.seed ?? []).filter((id) => devices.some((d) => d.id === id)));
   let picked = $state<ConvoMode>(req?.lock === 'group' ? 'group' : 'broadcast');
   let name = $state(req?.name ?? '');
 
@@ -107,7 +108,7 @@
         </span>
         <span class="mo-name">
           {t('单向群发')}<Hint>
-            {t('只显示你发出的消息；每台设备各自收到一条单独的一对一消息 —— 互相看不到，对方的回复也不会回到这里（各自回到它和你的会话里）。每台设备要分别点一次同意（已配对的直接收）。')}
+            {t('只显示你发出的消息；每台设备各自收到一条单独的一对一消息 —— 互相看不到，对方的回复也不会回到这里（各自回到它和你的会话里）。每台设备要分别点一次同意（已配对且开着「自动接收」的除外）。')}
           </Hint>
         </span>
       </label>

@@ -201,9 +201,25 @@ macOS 的更新单位是 `.app` 包（Info.plist、资源与签名都在里面�
 
 ## 9. 发布流程
 
-`node scripts/release.mjs --version 0.0.2 --notes "…"`（构建 → 签名 → 生成清单 → 写本仓根 →
-commit/tag → push → 建 Release 传附件 → 回读校验）；本机演练用 `--local --skip-build`（不联网、不 push），
-配套 `scripts/dev-mirror.mjs` 起镜像台，按打印出来的命令启动客户端即可。
+先升版本号并**提交**：`npm run bump -- 0.2.0`（同步 `package.json`、`tauri.conf.json`、
+`Cargo.toml` 与 `package-lock.json` 根条目），再 `cd src-tauri && cargo check` 让 `Cargo.lock`
+跟上；把功能改动、这次 bump 与文档一起提交完再发版。`release.mjs` 只提交 `update.json` +
+`CHANGELOG.md` 并给 **HEAD** 打 tag —— 代码还在工作树里没提交时，tag 会指向旧代码，而产物却是
+从工作树构建的。
+
+```bash
+node scripts/release.mjs --version 0.2.0 --notes "…" \
+  --macos-zip assets/v0.2.0/OrbDrop_0.2.0_macos_universal.app.zip \
+  --macos-dmg assets/v0.2.0/OrbDrop_0.2.0_macos_universal.dmg
+# 本机演练：--local --skip-build（不联网、不 push），配套 `scripts/dev-mirror.mjs` 起镜像台
+```
+
+更新说明只来自 `--notes`（或 `scripts/release.local.json` 的 `notes`），它会进 `update.json`、
+两个 Release 页面和 `CHANGELOG.md`。`CHANGELOG.md` 里的 `## 未发布` **不会自动改名**：把那段正文
+作为 `--notes` 传入并从文件里删掉，否则发布后会同时留下 `## 未发布` 和 `## vX` 两段。
+macOS 包用 `--macos-zip` / `--macos-dmg` 显式传入（不传 zip 会让 macOS 从清单里消失）；别用
+`--skip-build` 复用旧产物（APK 有内部版本校验，桌面 exe 没有）。
+
 远端模式要两个 token 调 API：**先读环境变量**（`GITHUB_TOKEN` / `GITEE_TOKEN`），**没有就读
 `scripts/release.local.env`**（已 gitignore，一行一个 `KEY=VALUE`，模板里写了去哪申请与要勾的权限；
 整体换路径用 `ORBDROP_RELEASE_SECRETS`）。脚本只会 `git add` 清单与 `CHANGELOG.md` 两处 ——

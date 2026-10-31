@@ -34,6 +34,12 @@ export type LinkState =
   | { kind: 'waiting' }
   | { kind: 'stopped'; reason: 'peerDisconnected' | 'tokenRejected' | 'identityChanged' | 'localDisconnected' | 'peerRejected' };
 
+/**
+ * 这台设备走哪套线上协议：OrbDrop 自己的（mdns + 配对 + 长连接）还是 LocalSend v2.2
+ * （UDP 发现 + HTTPS 上传，**不配对、不进聊天群**）。缺省 = `orbdrop`（老设备/老配置）。
+ */
+export type PeerTransport = 'orbdrop' | 'localsend';
+
 export interface PeerDevice {
   id: string;
   name: string;
@@ -41,6 +47,8 @@ export interface PeerDevice {
   port: number;
   online: boolean;
   paired: boolean;
+  /** 缺省 = `orbdrop`。`localsend` 的行不进配对候选；文本走 LocalSend 消息，图片/文件走文件传输。 */
+  transport?: PeerTransport;
   /** WS long connection is live (paired only) — this is what "长连接" means. */
   connected: boolean;
   /**
@@ -85,18 +93,27 @@ export interface PeerDevice {
 export interface AppSettings {
   port: number;
   /** 默认的落盘目录：手动下载（受 downloadMode 影响）与推送接收都默认写这里；
-   *  「每次询问」时接收未配对设备的推送会先挑一个目录，那次就用挑的那个作根。 */
+   *  「每次选择位置」时接收需要同意的推送会先挑一个目录，那次就用挑的那个作根。 */
   downloadDir: string;
   /**
    * 推送接收是否再放一层 `<发送方名>/`（设置里的「推送按发送方分目录」，**默认开**，S-12）。
    *
-   * 开着：对端推来的东西落在 `<下载目录>/<发送方名>/…`（「每次询问」挑的那个目录只是根，
+   * 开着：对端推来的东西落在 `<下载目录>/<发送方名>/…`（「每次选择位置」挑的那个目录只是根，
    * 这一层照旧）。关掉：推送与手动下载的文件落在同一层 —— 后端 `Config::device_subdir`，
    * 落盘根由 `transfer::resume::landing_dir` 按它算（围栏是 `safe_join` 逐段校验，与这层无关）。
    */
   deviceSubdir: boolean;
-  /** `AskEachTime` = 下载前弹保存框；接收未配对设备的推送前也弹一次目录框（取消即拒绝）。
-   *  已配对设备的推送免同意自动收，与它无关。 */
+  /**
+   * 已配对设备推送是否免确认自动收（设置里的「已配对设备自动接收」，**默认关**）。
+   *
+   * 开：已配对设备的推送不问用户，直接落下载目录；`downloadMode` 对这条不生效。
+   * 关：已配对设备与未绑定设备走同一条同意路 —— 点「接收」后按 `downloadMode` 决定位置。
+   * 认证口径不变：已配对设备仍必须带有效 token。
+   */
+  autoAcceptPaired: boolean;
+  /** `AskEachTime` = 下载前弹保存框；接收需要同意的推送（未配对，或已配对但关了自动接收）
+   *  前也弹一次目录框（取消即拒绝）。自动接收开启时，已配对设备的推送不问，与它无关。
+   *  桌面默认 `AskEachTime`；Android 默认 `Direct`（系统选择器返回 `content://`，落盘层只收路径）。 */
   downloadMode: 'Direct' | 'AskEachTime';
   deviceName: string;
   /**
@@ -169,6 +186,44 @@ export interface AppSettings {
    * 后端 `config::clamp_transfer_block_mb` 把取值域夹在 1..=32。
    */
   transferBlockMb: number;
+  /**
+   * 是否加入 LocalSend v2.2 兼容（设置里的「支持 LocalSend 协议」，**默认关**）。
+   *
+   * 开着且本机在线：监听 UDP 53317 组播、提供 `/api/localsend/v1|v2/*` 路由、设备列表里
+   * 多出 `transport: 'localsend'` 的行。离线时跟着一起停；关掉时零 socket、零行、路由 404。
+   * LocalSend 设备不配对、不进聊天群，只走 direct 会话：文字是 LocalSend 消息，
+   * 图片/文件是 LocalSend 文件传输（普通文件仍需确认）。
+   */
+  localsendEnabled: boolean;
+}
+
+/** TCP 53317 独立监听的状态（后端 `localsend::StandardPortState`）。 */
+export type LocalSendStandardPort =
+  | 'bound'
+  | 'busy'
+  | 'mainIsStandard'
+  | 'failed'
+  | 'stopped';
+
+/**
+ * LocalSend 兼容面的运行时状态（`localsend_status` 命令 + `localsend://status` 事件）。
+ *
+ * **与开关分开**：`enabled` 是用户意图，其余字段是运行结果。53317 被占用只是 `busy`，
+ * 不是失败 —— 官方 LocalSend 仍走公告里的主端口，写死 53317 的第三方发不进来。
+ */
+export interface LocalSendStatus {
+  enabled: boolean;
+  online: boolean;
+  /** UDP 53317 发现 supervisor 是否在跑。 */
+  discovery: boolean;
+  /** 最近一次发现启动失败的原因（`discovery` 为 false 时）。 */
+  discoveryError: string | null;
+  /** 53317 独立监听的结果。 */
+  standardPort: LocalSendStandardPort;
+  /** 53317 独立监听失败时的原始错误。 */
+  standardError: string | null;
+  /** 对端该拨的端口（0 = 服务没起；busy 时是主端口）。 */
+  advertisedPort: number;
 }
 
 /** 折叠态悬浮形态：圆球 / 圆角矩形悬浮框（后端 `config::OrbShape` 的同一套小写字面量）。 */
@@ -405,8 +460,8 @@ export interface PushInvite {
   /** 发送方这次选了几项（>1 = 多选合并成的一条推送）。 */
   count: number;
   /**
-   * 后端已经**自动收下**了这条推送（发送方是本机已绑定设备：token 就是那份信任，
-   * 不再问用户一次）。界面据此直接显示"正在接收"，不放「接收/拒绝」。
+   * 后端已经**自动收下**了这条推送（对端已配对，且本机开着「已配对设备自动接收」）。
+   * 界面据此直接显示"正在接收"，不放「接收/拒绝」；未配对或关了自动接收时为 false。
    */
   auto?: boolean;
   /**
@@ -417,6 +472,11 @@ export interface PushInvite {
    * 0 = 退回"收到的那一刻"。
    */
   at?: number;
+  /**
+   * 发送方走哪套协议：缺省 = `orbdrop`。`localsend` 时通知卡要带 LocalSend 徽标，
+   * 且对方是未配对设备 —— 必须问用户收不收。
+   */
+  transport?: PeerTransport;
 }
 
 /** 一台目标设备在一批推送里的状态（后端 `TargetState`）。 */
@@ -428,11 +488,13 @@ export interface PushTarget {
   /** 设备名。 */
   target: string;
   inviteId: string;
-  /** 已配对 = 对方不问同意直接收：行文案别说「等待对方同意」。 */
+  /** 已配对 = 身份可信；是否免同意取决于**对方**的「已配对设备自动接收」设置。 */
   paired: boolean;
   state: PushTargetState;
   received: number;
   error: string | null;
+  /** 缺省 = `orbdrop`。`localsend` 的目标没有"已读"语义，也不进 `PushJob`。 */
+  transport?: PeerTransport;
 }
 
 /**

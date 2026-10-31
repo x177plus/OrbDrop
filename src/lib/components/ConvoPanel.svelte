@@ -69,7 +69,7 @@
   } = $props();
 
   const open = $derived(chat.isChatOpen());
-  /** 「每次询问」：接收一张需要同意的卡片时会先弹目录选择框（App 那边执行），文案跟着说清。 */
+  /** 「每次选择位置」：接收一张需要同意的卡片时会先弹目录选择框（App 那边执行），文案跟着说清。 */
   const askEachTime = $derived(getSettings()?.downloadMode === 'AskEachTime');
   const thread = $derived(chat.activeThread());
   const rows = $derived(chat.convoRows());
@@ -94,6 +94,22 @@
    * （群发是每台各存一份），但"几台送到了"是群发那条视图的事（`deliveryText` / `fileStatusText`）。
    */
   const directPeer = $derived(thread?.mode === 'direct' ? thread.participants[0] : '');
+  /**
+   * 一对一那条会话对着哪套协议（群发/群聊恒为 OrbDrop）。
+   *
+   * LocalSend 设备只走 `dev:<id>` 的一对一会话：输入区与 OrbDrop 共用（文字/图片按顺序
+   * 发成多条 LocalSend 消息），普通文件仍走「＋」的 LocalSend 文件传输；群相关入口要按它藏掉。
+   * 设备表里找不到那台时按 OrbDrop 画（老会话、设备刚被移除）。
+   */
+  const threadTransport = $derived(
+    thread?.mode === 'direct'
+      ? deviceById(thread.participants[0])?.transport ??
+        // LocalSend 设备表是临时观察值：重启后那台不在线时行会消失，但会话还在。
+        // `ls-` 是 LocalSend 身份的唯一前缀（见后端 `id_for_fingerprint`），用它兜底。
+        (thread.participants[0]?.startsWith('ls-') ? 'localsend' : 'orbdrop')
+      : 'orbdrop',
+  );
+  const localSendThread = $derived(threadTransport === 'localsend');
   /** 标题旁那颗点：颜色=链路，实心/空心=这条会话里的设备是否都验证过。 */
   const headerDot = $derived(directPeer ? deviceState(openDev).dot : threadDotState(thread?.participants ?? []));
   const headerTrusted = $derived(directPeer ? deviceState(openDev).trusted : threadTrusted(thread?.participants ?? []));
@@ -242,7 +258,6 @@
     syncDraft();
   }
 
-  /** `Ctrl+V` 里带图：那几张图落盘后插到**光标处**（见 `composer.insertImages`）。 */
   function onPaste(e: ClipboardEvent) {
     const el = inputEl;
     if (!el) return;
@@ -346,13 +361,6 @@
     return receipt ? `${when} · ${receipt}` : when;
   }
 
-  /** 消息右键要复制的那串（文件消息 = `名字（大小）`，图片消息 = `[图片] 名字`，与原型同一套）。 */
-  function copyTextOf(item: ChatItem): string {
-    if (item.kind === 'file') return t('{name}（{size}）', { name: item.name, size: item.size });
-    if (item.image) return t('[图片] {name}', { name: item.name ?? '' }).trim();
-    return item.text;
-  }
-
   /**
    * 这条文件消息是不是一张**能在会话里摊开看的图**：按扩展名判（与后端 `paste::mime_of`
    * 同一份名单）。文件夹当然不是；认不出来的扩展名也不是（那样的气泡还是老样式）。
@@ -378,12 +386,13 @@
       if (picked && msgEl.contains(selection.getRangeAt(0).commonAncestorContainer)) sel = picked;
     }
     const item = items.find((i) => i.id === msgEl.dataset.id);
-    onMessageCtx(e.clientX, e.clientY, msgEl.dataset.id ?? '', item ? copyTextOf(item) : '', sel);
+    onMessageCtx(e.clientX, e.clientY, msgEl.dataset.id ?? '', item ? chat.copyTextOf(item) : '', sel);
   }
 
   /**
-   * 发出去这一整条。**顺序与分段都在 store 里**（`chat.sendComposer`）：输入区里可能是
-   * "一段文字 / 一张图 / 又一段文字"，它按框里的顺序一条条落成消息，两端都排得对。
+   * 发出去这一整条。**顺序与分段都在 store 里**（`chat.sendComposer` / LocalSend 的
+   * `chat.sendLocalSendComposer`）：输入区里可能是"一段文字 / 一张图 / 又一段文字"，
+   * 它按框里的顺序一条条落成消息，两端都排得对。
    *
    * 这里只管两件界面上的事：把输入区**重画**成 store 里剩下的那几段（发出去的不留、没发出去
    * 的原地留着），以及报结果 ——
@@ -394,7 +403,10 @@
   async function send() {
     const th = thread;
     if (!th) return;
-    const res = await chat.sendComposer(th.key).catch((e) => {
+    const res = await (localSendThread
+      ? chat.sendLocalSendComposer(th.key)
+      : chat.sendComposer(th.key)
+    ).catch((e) => {
       onToast(String(e));
       return null;
     });
@@ -593,6 +605,8 @@
                   <span class="convo-mode-chip bc">{@render icBc()}{t('群发')}</span>
                 {:else if row.mode === 'group'}
                   <span class="convo-mode-chip group">{@render icGrp()}{t('群聊')}</span>
+                {:else if deviceById(row.key.slice(4))?.transport === 'localsend'}
+                  <span class="convo-mode-chip ls" title="LocalSend">LS</span>
                 {/if}
                 <span class="convo-dot {row.dot} {row.trusted ? 'solid' : 'hollow'}"></span>
                 <span class="convo-time num">{row.time}</span>
@@ -635,6 +649,10 @@
                分组里那颗点与台数跟着名字走（原型那三样本来就是一组）。 -->
           <div class="conv-headline">
             <span class="conv-title" title={thread.title}>{thread.title}</span>
+            {#if localSendThread}
+              <!-- 这套会话走的是另一种协议：文件能收能发，但没有文本与已读回执那套语义。 -->
+              <span class="conv-ls-badge" title="LocalSend">LS</span>
+            {/if}
             <!-- 标题旁**只有一枚状态点**（`docs/orb-functional-design.md` §12.2「状态栏」：header
                  除设备名外就带该设备的状态点）。未绑定的设备照样能收发（消息走"长连接优先 +
                  HTTP 兜底"），但它不需要再挂一枚「未绑定」章 —— 那会在标题旁并排摆出两颗点
@@ -725,16 +743,18 @@
             </span>
           {/each}
         </div>
-        <button
-          class="recip-add"
-          type="button"
-          aria-label={thread.mode === 'direct' ? t('再加几台一起发') : t('编辑收件人')}
-          title={thread.mode === 'direct' ? t('再加几台：选到两台以上就成为一个多台会话（群发或群聊）') : ''}
-          onclick={() => chat.askParticipants(thread.key)}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
-          {t('添加')}
-        </button>
+        {#if !localSendThread}
+          <button
+            class="recip-add"
+            type="button"
+            aria-label={thread.mode === 'direct' ? t('再加几台一起发') : t('编辑收件人')}
+            title={thread.mode === 'direct' ? t('再加几台：选到两台以上就成为一个多台会话（群发或群聊）') : ''}
+            onclick={() => chat.askParticipants(thread.key)}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
+            {t('添加')}
+          </button>
+        {/if}
       </div>
 
       <!-- 消息流：右键复制走 `onLogContext`（菜单由 App 画在 `.orb-stage` 之外，跨层叠上下文永远在最上）。 -->
@@ -770,7 +790,9 @@
             {:else}
               {@render icChat()}
               <p>{t('还没有消息')}</p>
-              <p class="ce-sub">{t('发一条消息或传一个文件，开始和设备对话。')}</p>
+              <p class="ce-sub">{localSendThread
+                ? t('LocalSend 会话可以发文字/图片；普通文件用下方「＋」发送')
+                : t('发一条消息或传一个文件，开始和设备对话。')}</p>
             {/if}
           </div>
         {:else}
@@ -972,9 +994,8 @@
         }}
       >
         <!-- 富输入区（`contenteditable`）：文字与图片**在同一行流里**，图可以夹在前后两段文字
-             中间（需求要的就是这个顺序）。交给 Svelte 管的只有"哪个会话 / 哪个节点"，
-             里面的内容由 `lib/composer.ts` 直接读写 DOM —— 受控的话每敲一个字光标都会被拽回最前。
-             图片那一份（`.cx-img`）由那段代码用 `document.createElement` 造，样式在 `main.css`。 -->
+             中间（需求要的就是这个顺序）。LocalSend 也走这一份：图片会进框，点发送才按
+             图片消息发出去；图片/文件不走这里时仍用右侧「＋」。 -->
         <div
           class="chat-input cx"
           bind:this={inputEl}
@@ -1009,8 +1030,12 @@
           class="chat-plus"
           class:bc={thread.mode === 'broadcast'}
           type="button"
-          aria-label={thread.mode === 'broadcast' ? t('群发文件（即推送）') : thread.mode === 'group' ? t('发送文件到群里') : t('发送文件（即推送）')}
-          title={thread.mode === 'group' ? t('选文件发到群里：按成员逐台推送（未配对的成员各自点一次同意）') : t('选文件发过去就是推送')}
+          aria-label={localSendThread
+            ? t('发送文件到 LocalSend 设备')
+            : thread.mode === 'broadcast' ? t('群发文件（即推送）') : thread.mode === 'group' ? t('发送文件到群里') : t('发送文件（即推送）')}
+          title={localSendThread
+            ? t('选文件发给这台 LocalSend 设备（对方确认后接收）')
+            : thread.mode === 'group' ? t('选文件发到群里：按成员逐台推送（未配对的成员各自点一次同意）') : t('选文件发过去就是推送')}
           onclick={onSendFiles}
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
@@ -1056,6 +1081,15 @@
 </section>
 
 <style>
+  /* LocalSend 会话的协议徽标：与状态胶囊同一档的安静样子 —— 它说的是"这是另一种协议"，
+     不抢标题与状态点的注意力。 */
+  .conv-ls-badge {
+    flex: none; padding: 1px 6px; border: 1px solid var(--border); border-radius: 999px;
+    font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.04em; color: var(--muted);
+    line-height: 1.5;
+  }
+  /* 会话列表那一行：与群发/群聊的模式章同排，但用中性色（不是第三种模式，是另一种协议）。 */
+  .convo-mode-chip.ls { background: rgba(127, 127, 127, 0.12); color: var(--muted); }
   /* 群聊的补拉缺口：与群发那条单向台账（全局 `.chat-ledger`）同一副骨头 —— 两侧细线夹一行
      等宽小字 —— 但不借它的颜色：那套橙色是"群发"的语义色，这里只是"少了几条"的如实交代，
      用中性灰，读作提示而不是模式标记。 */

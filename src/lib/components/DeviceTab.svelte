@@ -15,7 +15,7 @@
     noticeCount,
   }: {
     onToast: (msg: string) => void;
-    /** 行上那颗「发消息」：打开与这台设备的会话。 */
+    /** 打开与这台设备的会话：整行点击与「发消息」按钮都走这里。 */
     onMessage?: (device: PeerDevice) => void;
     onOpenPair?: (device: PeerDevice | null) => void;
     onUnpair?: (device: PeerDevice) => void;
@@ -106,6 +106,11 @@
    * 的意思也只有这里说得下）。
    */
   function linkHint(d: PeerDevice): string {
+    if (d.transport === 'localsend') {
+      return d.online
+        ? t('LocalSend 设备在线：可以发消息或文件，文件由对方确认后接收。')
+        : t('LocalSend 设备当前离线：它重新出现后会恢复在线。');
+    }
     if (d.paired && !d.verified) {
       return t('没有钉住这台设备的证书指纹（老记录或凭据缺失）：需要重新配对才能验证身份。');
     }
@@ -170,7 +175,12 @@
     const device = devices.find(d => d.id === row.dataset.id);
     if (!device) return;
     const btn = (e.target as HTMLElement).closest('button');
-    if (!btn) return;
+    if (!btn) {
+      // 整行可点：打开与这台设备的 direct 会话（LocalSend 与 OrbDrop 同一套做法）。
+      // 行内动作仍由右边那几颗按钮各自处理 —— 点按钮不会顺带开会话（上面那个 `btn` 分支）。
+      onMessage?.(device);
+      return;
+    }
     if (btn.hasAttribute('data-unpair')) {
       onUnpair?.(device);
     } else if (btn.hasAttribute('data-connect')) {
@@ -197,6 +207,7 @@
         x: e.clientX, y: e.clientY,
         el, kind: 'device',
         deviceState: d.connected ? 'connected' : d.paired ? 'paired' : 'unbound',
+        transport: d.transport ?? 'orbdrop',
         online: d.online,
         needsPair: needsRepair(d) || !d.verified,
         name: deviceDisplayName(d),
@@ -236,7 +247,7 @@
     <p>
       {t('状态点：实心=已配对且指纹已核对（信任设备），空心=未配对/未验证；颜色：实心绿=长连接（会收到你拖入悬浮球的广播的就是这几台）、蓝=在线（能收到，但不会收到自动广播）、灰=离线、琥珀=本机在等、红=需重新配对（红永远空心：关系失效就不算信任设备）。')}
       {t('胶囊上那几个字说的是关系与链路，与点不重复 —— 行上不再另挂一枚「自动广播」标签，要一眼看出哪几台收得到广播，看状态点的颜色就够（绿只给长连接）。')}
-      {t('发消息按钮打开与这台设备的会话 —— 消息长连接优先、HTTP 兜底：已配对的不点「连接」也能收发，未配对设备也能收能发（对端名字是它自报的）；对端不在网上时那条消息排着队，它一上线就自动发出去（界面那一刻写「等待发送」）；已配对设备点「连接」建立长连接（配对本身不建链）；处于长连接的设备会自动收到你拖入悬浮球文件的广播，无需逐条操作；关机时连着长连接的设备，下次启动 OrbDrop 时会自动接回来（点过「断开」的不会）。')}
+      {t('点击设备行或「发消息」按钮都能打开与这台设备的会话 —— 消息长连接优先、HTTP 兜底：已配对的不点「连接」也能收发，未配对设备也能收能发（对端名字是它自报的）；对端不在网上时那条消息排着队，它一上线就自动发出去（界面那一刻写「等待发送」）；已配对设备点「连接」建立长连接（配对本身不建链）；处于长连接的设备会自动收到你拖入悬浮球文件的广播，无需逐条操作；关机时连着长连接的设备，下次启动 OrbDrop 时会自动接回来（点过「断开」的不会）。')}
       {t('已配对但离线的设备排在列表下方（在线的在上），可以「解除配对」—— 解除是本机动作，不需要对方在线。')}
       {t('推送在会话里（输入框左边那颗「＋」）：选文件发过去就是推送 —— 一对一发给这一台；「群发」那条会话里同样有那颗「＋」，一次发给名单上的所有设备（各自邀请、各自进度）。上面的新建会话一次选几台、选模式：单向群发是每台各自收到一条单独消息，共享群聊是所有人的同一条消息流（收到邀请的人点「加入」才算入群）；群那条会话里也有那颗「＋」，按名册逐台推过去。')}
       {t('搜索框只在这里筛显示（显示名或 IP），不影响长连接与消息。')}
@@ -290,11 +301,12 @@
       {@const unread = chat.unreadForPeer(d.id)}
       {@const notice = noticeCount?.(d.id) ?? 0}
       {@const pending = unread + notice}
+      {@const ls = d.transport === 'localsend'}
       <li
         class="device-row"
         class:online={d.online}
         data-id={d.id}
-        data-state={d.connected ? 'connected' : d.paired ? 'paired' : 'unbound'}
+        data-state={ls ? 'localsend' : d.connected ? 'connected' : d.paired ? 'paired' : 'unbound'}
         data-ip={`${d.ip}:${d.port}`}
         oncontextmenu={(e) => openCtx(e, d)}
       >
@@ -322,11 +334,17 @@
           <div class="d-ip">{addressLabel(d)}</div>
         </div>
         <div class="d-acts">
-          {#if !d.online && d.paired}
-            <!-- 已配对但离线：唯一能做的本机动作是「解除配对」（后端不依赖长连接，见 unpair_peer）。
+          {#if ls}
+            <!-- LocalSend 设备：不配对、没有长连接 —— 唯一动作就是打开 direct 会话发消息
+                 （文字在会话输入框，图片/文件走会话里的「＋」）。按钮与其它行的「发消息」
+                 同一颗（次要样式，不带边框）：一行里主按钮只该有一颗，这里没有别的动作。
+                 备注 / 从列表移除走右键菜单（`od:ctx`，带 `transport`）。 -->
+            {@render messageBtn()}
+          {:else if !d.online && d.paired}
+            <!-- 已配对但离线：行内唯一能做的本机动作是「解除配对」（后端不依赖长连接，见 unpair_peer）。
                  「连接」在这里不提供：对端不在网上，只会开一个空转的拨号循环；
-                 「发消息」也不给（同 F-14 的离线行规则）——设备页这一行不是消息的入口，
-                 会话列表里与它的那条会话一直在（那里的输入框照样能用，消息会排队等它上线）。
+                 「发消息」按钮也不给（同 F-14 的离线行规则），但**整行点击照样打开它的会话** ——
+                 与其它行一致，会话里的输入框能用，消息会排队等它上线。
                  **注意这里是"且已配对"**：未绑定的那一档（含"看得见却直连不通"的，F-106）
                  走下面的未绑定那一档 —— 它保留「配对」与「发消息」，但同样不给依赖链路的动作。 -->
             <button class="btn btn-ghost btn-sm" data-unpair>{t('解除配对')}</button>

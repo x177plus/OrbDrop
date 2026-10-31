@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::timeout::RequestBodyTimeoutLayer;
-use tracing::{error, info};
+use tracing::{info, warn};
 
 use crate::state::{AppState, LinkIntent};
 use crate::ws;
@@ -111,6 +111,55 @@ fn build_router(state: Arc<AppState>) -> Router {
     build_router_with_body_idle_timeout(state, PUBLIC_BODY_IDLE_TIMEOUT)
 }
 
+/// LocalSend 兼容面的路由本体（**只**含 `/api/localsend/*`，不含请求体空闲时限）。
+///
+/// 两处挂载：
+/// 1. 主 HTTP 监听（`public_routes` 里 merge，之后会被统一套上 `RequestBodyTimeoutLayer`）；
+/// 2. **独立的 TCP 53317 监听**（[`localsend_standalone_router`]）。协议的默认 HTTP 端口
+///    就是 53317，而第三方实现（真机：localsend-go 系）发送时把它**写死**、不读公告里的
+///    `port`；只监听主端口时，它们能被我方发现、我方也能发给它们，但它们永远发不过来。
+///
+/// 默认关闭时 handlers 统一 404，所以这条路由挂在哪个端口都受同一个开关约束。
+pub(crate) fn localsend_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/api/localsend/v1/info",
+            axum::routing::get(crate::localsend::server::info),
+        )
+        .route(
+            "/api/localsend/v2/info",
+            axum::routing::get(crate::localsend::server::info),
+        )
+        .route(
+            "/api/localsend/v1/register",
+            axum::routing::post(crate::localsend::server::register),
+        )
+        .route(
+            "/api/localsend/v2/register",
+            axum::routing::post(crate::localsend::server::register),
+        )
+        .route(
+            "/api/localsend/v2/prepare-upload",
+            axum::routing::post(crate::localsend::server::prepare_upload)
+                .layer(axum::extract::DefaultBodyLimit::max(MANIFEST_BODY_LIMIT)),
+        )
+        .route(
+            "/api/localsend/v2/upload",
+            axum::routing::post(crate::localsend::server::upload),
+        )
+        .route(
+            "/api/localsend/v2/cancel",
+            axum::routing::post(crate::localsend::server::cancel),
+        )
+}
+
+/// 独立监听（TCP 53317）用的路由：请求体空闲时限与公开面同一档。
+pub(crate) fn localsend_standalone_router(state: Arc<AppState>) -> Router {
+    localsend_routes()
+        .layer(RequestBodyTimeoutLayer::new(PUBLIC_BODY_IDLE_TIMEOUT))
+        .with_state(state)
+}
+
 /// 装配路由器。`body_idle_timeout` 单独做参数只为测试能换小值把它跑完；
 /// 生产值见 [`PUBLIC_BODY_IDLE_TIMEOUT`]。
 fn build_router_with_body_idle_timeout(
@@ -138,6 +187,13 @@ fn build_router_with_body_idle_timeout(
     // 各自的认人规则写在 handler 里（routes_push::authorize / push_invite_handler）。
     let public_routes = Router::new()
         .route("/pair/info", axum::routing::get(routes_pair::pair_info))
+        // LocalSend v2.2 兼容面（可选；默认关闭时 handler 统一 404）。
+        // 与 OrbDrop 的 `/pair/*` 完全独立：没有 token/配对，授权靠每文件 token + 用户确认。
+        //
+        // 单独抽成 [`localsend_routes`]，因为同一份路由还要挂在 **TCP 53317** 上：
+        // 第三方实现（真机：localsend-go 系）发送时把目标端口写死成 53317，不读公告里的
+        // `port` —— 只挂在主端口时，它们永远"发不过来"（见 `localsend::start_http`）。
+        .merge(localsend_routes())
         // 「手动添加」的另一半（F-11）：被添加的一方据此也建一行（低信任，与 mDNS 公告同档；
         // 自称已配对设备仍要出示 token）。添加方那边 best-effort。
         .route("/pair/hello", axum::routing::post(routes_pair::pair_hello))
@@ -560,7 +616,9 @@ async fn start_server_at(state: Arc<AppState>, base_port: u16, ip: IpAddr) -> Re
                 return Ok(port);
             }
             Err(e) if port < last => {
-                error!(port, "port busy, trying next: {e}");
+                // 端口顺延是正常回退（另一份实例/别的程序占着），最终绑定成功仍记 INFO；
+                // 只有全部端口都失败才会返回 Err。别把这种重试记成 ERROR。
+                warn!(port, "port busy, trying next: {e}");
                 continue;
             }
             Err(e) => {
@@ -927,5 +985,741 @@ mod tests {
         ] {
             assert!(!is_trusted_origin(bad), "{bad} 不该被信任");
         }
+    }
+
+    /// LocalSend 路由的最小冒烟：info 能回本机信息，register 能把对端登记进 LocalSend 表。
+    /// 走回环明文（`net::serve` 只对回环放行明文），与现有 HTTP 测试同一套。
+    #[tokio::test]
+    async fn localsend_info_and_register_are_mounted() {
+        let mut config = test_config();
+        config.localsend_enabled = true;
+        let name = config.device_name.clone();
+        let config_path =
+            std::env::temp_dir().join(format!("orbdrop_ls_cfg_{}.toml", uuid::Uuid::new_v4()));
+        let state = Arc::new(AppState::new(config, config_path));
+        let port = start_server_loopback(state.clone(), 4390)
+            .await
+            .expect("server start");
+
+        let info: serde_json::Value = reqwest::get(format!(
+            "http://127.0.0.1:{port}/api/localsend/v2/info"
+        ))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(info["alias"], name);
+        let own_fp = info["fingerprint"].as_str().unwrap_or_default();
+        assert!(!own_fp.is_empty());
+        // 对端自报的指纹必须**与本机不同**：和本机相同会命中 `register` 的
+        // 「来自本机自身，忽略登记」那道闸（同机第三方 LocalSend 拨回自己），
+        // 于是这一行永远不会出现 —— 测的就不是"登记"这条路径了。
+        let peer_fp = "0123456789abcdef".repeat(4);
+        assert_ne!(peer_fp, own_fp.to_ascii_lowercase());
+
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{port}/api/localsend/v2/register"
+            ))
+            .json(&serde_json::json!({
+                "alias": "LocalSend Peer",
+                "version": "2.2",
+                "deviceModel": "Test",
+                "deviceType": "desktop",
+                "fingerprint": peer_fp,
+                "port": 53317,
+                "protocol": "https",
+                "download": false,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let id = crate::localsend::id_for_fingerprint(&peer_fp);
+        let peer = state.localsend.get(&id).expect("注册后应出现 LocalSend 行");
+        assert_eq!(peer.alias, "LocalSend Peer");
+        assert_eq!(peer.port, 53317);
+
+        stop_server(&state).await;
+    }
+
+    /// 开关关闭时 LocalSend 路由必须是 404，而不是把参数错误/401 暴露出去。
+    #[tokio::test]
+    async fn localsend_routes_are_404_when_disabled() {
+        let root = temp_share_dir();
+        let state = make_state(root.clone());
+        let port = start_server_loopback(state.clone(), 4395)
+            .await
+            .expect("server start");
+        let resp = reqwest::get(format!(
+            "http://127.0.0.1:{port}/api/localsend/v2/info"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        stop_server(&state).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 一次完整的 LocalSend 上传：prepare-upload（等 UI 同意）→ upload → 落盘。
+    /// 用回环明文（同一套公开路由），证明会话、token、流式写盘这条链路是通的。
+    #[tokio::test]
+    async fn localsend_prepare_upload_round_trip() {
+        let download =
+            std::env::temp_dir().join(format!("orbdrop_ls_dl_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&download).unwrap();
+        let mut config = test_config();
+        config.localsend_enabled = true;
+        config.download_dir = download.clone();
+        config.device_subdir = false;
+        let config_path =
+            std::env::temp_dir().join(format!("orbdrop_ls_cfg_{}.toml", uuid::Uuid::new_v4()));
+        let state = Arc::new(AppState::new(config, config_path));
+        let port = start_server_loopback(state.clone(), 4391)
+            .await
+            .expect("server start");
+
+        // 没有 UI：轮询 pending，像用户点「接收」一样放行。
+        let accept_state = state.clone();
+        let accept = tokio::spawn(async move {
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let invite = accept_state
+                    .localsend
+                    .sessions
+                    .pending
+                    .lock()
+                    .keys()
+                    .next()
+                    .cloned();
+                if let Some(id) = invite {
+                    let _ = accept_state
+                        .localsend
+                        .sessions
+                        .accept_pending(&accept_state, &id, None);
+                    return;
+                }
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!(
+                "http://127.0.0.1:{port}/api/localsend/v2/prepare-upload"
+            ))
+            .json(&serde_json::json!({
+                "info": {
+                    "alias": "LocalSend Test",
+                    "version": "2.2",
+                    "deviceModel": "Test",
+                    "deviceType": "desktop",
+                    "fingerprint": "00112233445566778899aabbccddeeff",
+                    "port": 53317,
+                    "protocol": "https",
+                    "download": false,
+                },
+                "files": {
+                    "f1": {
+                        "id": "f1",
+                        "fileName": "hello.txt",
+                        "size": 5,
+                        "fileType": "text/plain",
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let session = body["sessionId"].as_str().unwrap();
+        let token = body["files"]["f1"].as_str().unwrap();
+
+        let up = client
+            .post(format!(
+                "http://127.0.0.1:{port}/api/localsend/v2/upload?sessionId={session}&fileId=f1&token={token}"
+            ))
+            .body("hello")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(up.status(), StatusCode::OK);
+        let saved = download.join("hello.txt");
+        assert_eq!(std::fs::read(&saved).unwrap(), b"hello");
+
+        let _ = accept.await;
+        stop_server(&state).await;
+        let _ = std::fs::remove_dir_all(download);
+    }
+
+    /// 文本消息**始终自动落进会话**：不建 pending、不需要用户点接收。
+    #[tokio::test]
+    async fn localsend_auto_accepts_text_into_the_conversation() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_ls_text_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = test_config();
+        config.localsend_enabled = true;
+        config.download_dir = dir.join("downloads");
+        config.device_subdir = false;
+        let state = Arc::new(AppState::new(config, dir.join("config.toml")));
+        let port = start_server_loopback(state.clone(), 4402)
+            .await
+            .expect("server start");
+
+        let fingerprint = "ab".repeat(32);
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!(
+                "http://127.0.0.1:{port}/api/localsend/v2/prepare-upload"
+            ))
+            .json(&serde_json::json!({
+                "info": {
+                    "alias": "LocalSend Text",
+                    "version": "2.2",
+                    "deviceModel": "Test",
+                    "deviceType": "desktop",
+                    "fingerprint": fingerprint,
+                    "port": 53317,
+                    "protocol": "https",
+                    "download": false,
+                },
+                "files": {
+                    "f1": {
+                        "id": "f1",
+                        "fileName": "message.txt",
+                        "size": 5,
+                        "fileType": "text/plain",
+                        "preview": "你好",
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state.localsend.sessions.pending.lock().is_empty(),
+            "自动接收的文本不应留下 pending 邀请"
+        );
+
+        let peer_id = crate::localsend::id_for_fingerprint(&fingerprint);
+        let convo = state
+            .chat
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == peer_id)
+            .expect("文本消息应落进会话");
+        assert_eq!(convo.messages.len(), 1);
+        assert_eq!(convo.messages[0].text, "你好");
+        assert!(!convo.messages[0].from_me);
+
+        stop_server(&state).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 整批图片自动接收：返回上传 token，收完后落成图片消息（不是文件卡）。
+    #[tokio::test]
+    async fn localsend_auto_accepts_images_as_messages() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_ls_img_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = test_config();
+        config.localsend_enabled = true;
+        config.download_dir = dir.join("downloads");
+        config.device_subdir = false;
+        let state = Arc::new(AppState::new(config, dir.join("config.toml")));
+        let port = start_server_loopback(state.clone(), 4403)
+            .await
+            .expect("server start");
+
+        let fingerprint = "cd".repeat(32);
+        let image = b"fake-png-bytes";
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!(
+                "http://127.0.0.1:{port}/api/localsend/v2/prepare-upload"
+            ))
+            .json(&serde_json::json!({
+                "info": {
+                    "alias": "LocalSend Image",
+                    "version": "2.2",
+                    "deviceModel": "Test",
+                    "deviceType": "desktop",
+                    "fingerprint": fingerprint,
+                    "port": 53317,
+                    "protocol": "https",
+                    "download": false,
+                },
+                "files": {
+                    "f1": {
+                        "id": "f1",
+                        "fileName": "photo.png",
+                        "size": image.len(),
+                        "fileType": "image/png",
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let session = body["sessionId"].as_str().unwrap();
+        let token = body["files"]["f1"].as_str().unwrap();
+
+        let up = client
+            .post(format!(
+                "http://127.0.0.1:{port}/api/localsend/v2/upload?sessionId={session}&fileId=f1&token={token}"
+            ))
+            .body(image.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(up.status(), StatusCode::OK);
+
+        let peer_id = crate::localsend::id_for_fingerprint(&fingerprint);
+        let convo = state
+            .chat
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == peer_id)
+            .expect("图片应落进会话");
+        assert_eq!(convo.messages.len(), 1);
+        assert!(convo.messages[0].image);
+        assert_eq!(convo.messages[0].name, "photo.png");
+        assert!(!convo.messages[0].path.is_empty(), "图片内容应已落到 blobs");
+        assert!(
+            !dir.join("downloads").join("photo.png").exists(),
+            "自动接收的图片不应落进下载目录"
+        );
+
+        stop_server(&state).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 第三方实现的入站请求：没有客户端证书，自报的又是设备 UUID。若这台设备已经通过
+    /// 公告登记过（同一 `ip:port`），会话必须归到那一行，而不是再造一个以来源 IP 为
+    /// id 的“第二台设备”。
+    #[tokio::test]
+    async fn localsend_inbound_identity_reuses_the_discovered_endpoint() {
+        let download =
+            std::env::temp_dir().join(format!("orbdrop_ls_id_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&download).unwrap();
+        let mut config = test_config();
+        config.localsend_enabled = true;
+        config.download_dir = download.clone();
+        config.device_subdir = false;
+        let state = Arc::new(AppState::new(
+            config,
+            std::env::temp_dir().join(format!("orbdrop_ls_id_{}.toml", uuid::Uuid::new_v4())),
+        ));
+        let port = start_server_loopback(state.clone(), 4397)
+            .await
+            .expect("server start");
+
+        // 公告登记出来的那一行（发现阶段已经学到证书指纹）。
+        let cert = "ab".repeat(32);
+        let id = crate::localsend::id_for_fingerprint(&cert);
+        state
+            .localsend
+            .upsert(crate::localsend::LocalSendPeer {
+                id: id.clone(),
+                fingerprint: cert.clone(),
+                alias: "D0622-localsend".to_string(),
+                device_model: Some("Windows".to_string()),
+                device_type: Some("desktop".to_string()),
+                ip: "127.0.0.1".to_string(),
+                port: 53317,
+                protocol: "https".to_string(),
+                download: false,
+                online: true,
+                seen_at: std::time::Instant::now(),
+                last_seen: std::time::Instant::now(),
+                certified: true,
+            });
+
+        let accept_state = state.clone();
+        let accept = tokio::spawn(async move {
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let invite = accept_state
+                    .localsend
+                    .sessions
+                    .pending
+                    .lock()
+                    .keys()
+                    .next()
+                    .cloned();
+                if let Some(invite_id) = invite {
+                    let _ = accept_state
+                        .localsend
+                        .sessions
+                        .accept_pending(&accept_state, &invite_id, None);
+                    return;
+                }
+            }
+        });
+
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{port}/api/localsend/v2/prepare-upload"
+            ))
+            .json(&serde_json::json!({
+                "info": {
+                    "alias": "D0622-localsend",
+                    "version": "2.1",
+                    "deviceModel": "Windows",
+                    "deviceType": "desktop",
+                    "fingerprint": "e44e30d3-4553-4d9e-bdc1-c14b6b384f75",
+                    "port": 53317,
+                    "protocol": "https",
+                    "download": false,
+                },
+                "files": {
+                    "f1": {
+                        "id": "f1",
+                        "fileName": "hello.txt",
+                        "size": 5,
+                        "fileType": ".txt",
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(
+            state.localsend.get(&id).is_some(),
+            "会话应归到公告登记的那一行"
+        );
+        assert!(
+            state
+                .localsend
+                .get(&crate::localsend::id_for_fingerprint("127.0.0.1"))
+                .is_none(),
+            "不应多出一条以来源 IP 为 id 的设备"
+        );
+
+        let _ = accept.await;
+        stop_server(&state).await;
+        let _ = std::fs::remove_dir_all(download);
+    }
+
+    /// 出站：`push_paths` 选中一个 LocalSend 目标 → 客户端 prepare/upload → 对端落盘。
+    /// 两个 `AppState` 在同一进程里，接收端仍走真实的 HTTPS 服务与同一套会话/token。
+    #[tokio::test]
+    async fn localsend_outbound_round_trip() {
+        let download =
+            std::env::temp_dir().join(format!("orbdrop_ls_out_{}", uuid::Uuid::new_v4()));
+        let src_dir =
+            std::env::temp_dir().join(format!("orbdrop_ls_src_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&download).unwrap();
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("hello.txt");
+        std::fs::write(&src, b"world").unwrap();
+
+        let mut rcfg = test_config();
+        rcfg.localsend_enabled = true;
+        rcfg.download_dir = download.clone();
+        rcfg.device_subdir = false;
+        let receiver = Arc::new(AppState::new(
+            rcfg,
+            std::env::temp_dir().join(format!("orbdrop_ls_rcv_{}.toml", uuid::Uuid::new_v4())),
+        ));
+        let rport = start_server_loopback(receiver.clone(), 4392)
+            .await
+            .expect("receiver server start");
+
+        let mut scfg = test_config();
+        scfg.localsend_enabled = true;
+        let sender = Arc::new(AppState::new(
+            scfg,
+            std::env::temp_dir().join(format!("orbdrop_ls_snd_{}.toml", uuid::Uuid::new_v4())),
+        ));
+
+        // 同一进程共用 identity.pem：指纹一致；这里只手动塞一条“对端”行，不经过发现。
+        let fp = crate::net::local_fingerprint().unwrap().to_ascii_lowercase();
+        let peer = crate::localsend::LocalSendPeer {
+            id: crate::localsend::id_for_fingerprint(&fp),
+            fingerprint: fp,
+            alias: "LocalSend Receiver".to_string(),
+            device_model: Some("Test".to_string()),
+            device_type: Some("desktop".to_string()),
+            ip: "127.0.0.1".to_string(),
+            port: rport,
+            protocol: "https".to_string(),
+            download: false,
+            online: true,
+            seen_at: std::time::Instant::now(),
+            last_seen: std::time::Instant::now(),
+            certified: true,
+        };
+        let peer_id = peer.id.clone();
+        sender.localsend.upsert(peer);
+
+        // 接收端没有 UI：像用户点「接收」一样轮询放行。
+        let accept_state = receiver.clone();
+        let accept = tokio::spawn(async move {
+            for _ in 0..200 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let invite = accept_state
+                    .localsend
+                    .sessions
+                    .pending
+                    .lock()
+                    .keys()
+                    .next()
+                    .cloned();
+                if let Some(id) = invite {
+                    let _ = accept_state
+                        .localsend
+                        .sessions
+                        .accept_pending(&accept_state, &id, None);
+                    return;
+                }
+            }
+        });
+
+        let batch = crate::transfer::push_paths(
+            sender.clone(),
+            vec![src.to_string_lossy().into_owned()],
+            vec![peer_id],
+            None,
+            None,
+        )
+        .await
+        .expect("push_paths");
+        let mut done = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(view) = sender.push.batch_snapshot(&batch.batch_id) {
+                if view.waiting == 0 {
+                    done = view.targets.iter().any(|t| t.state == "done");
+                    break;
+                }
+            }
+        }
+        assert!(done, "LocalSend 出站应走到 done");
+        assert_eq!(std::fs::read(download.join("hello.txt")).unwrap(), b"world");
+
+        let _ = accept.await;
+        stop_server(&receiver).await;
+        let _ = std::fs::remove_dir_all(download);
+        let _ = std::fs::remove_dir_all(src_dir);
+    }
+
+    /// 出站文本：官方形状（`preview`）→ 接收端自动接收并落进会话。
+    #[tokio::test]
+    async fn localsend_outbound_text_uses_preview_and_lands_in_the_conversation() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_ls_txt_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rcfg = test_config();
+        rcfg.localsend_enabled = true;
+        rcfg.download_dir = dir.join("downloads");
+        rcfg.device_subdir = false;
+        let receiver = Arc::new(AppState::new(rcfg, dir.join("receiver.toml")));
+        let rport = start_server_loopback(receiver.clone(), 4404)
+            .await
+            .expect("receiver server start");
+
+        let mut scfg = test_config();
+        scfg.localsend_enabled = true;
+        let sender = Arc::new(AppState::new(scfg, dir.join("sender.toml")));
+
+        let fp = crate::net::local_fingerprint().unwrap().to_ascii_lowercase();
+        let peer = crate::localsend::LocalSendPeer {
+            id: crate::localsend::id_for_fingerprint(&fp),
+            fingerprint: fp.clone(),
+            alias: "LocalSend Receiver".to_string(),
+            device_model: Some("Test".to_string()),
+            device_type: Some("desktop".to_string()),
+            ip: "127.0.0.1".to_string(),
+            port: rport,
+            protocol: "https".to_string(),
+            download: false,
+            online: true,
+            seen_at: std::time::Instant::now(),
+            last_seen: std::time::Instant::now(),
+            certified: true,
+        };
+
+        crate::localsend::client::send_text(&sender, &peer, "hello over preview")
+            .await
+            .expect("send_text");
+
+        let peer_id = crate::localsend::id_for_fingerprint(&fp);
+        let convo = receiver
+            .chat
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == peer_id)
+            .expect("接收端应落一条 LocalSend 文本");
+        assert_eq!(convo.messages.len(), 1);
+        assert_eq!(convo.messages[0].text, "hello over preview");
+
+        stop_server(&receiver).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 连续发多条文本：出站 lane 必须按用户顺序、一条一条跑。
+    ///
+    /// 文本现在始终自动接收（没有「先同意」那一档），不再靠接收端的单会话槽串行；
+    /// 这里直接盯 lane：同一台设备的 job 不重叠，接收端看到的顺序与发送顺序一致。
+    #[tokio::test]
+    async fn localsend_outbound_text_is_serialized_per_peer() {
+        let dir =
+            std::env::temp_dir().join(format!("orbdrop_ls_serial_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rcfg = test_config();
+        rcfg.localsend_enabled = true;
+        rcfg.download_dir = dir.join("downloads");
+        rcfg.device_subdir = false;
+        let receiver = Arc::new(AppState::new(rcfg, dir.join("receiver.toml")));
+        let rport = start_server_loopback(receiver.clone(), 4406)
+            .await
+            .expect("receiver server start");
+
+        let mut scfg = test_config();
+        scfg.localsend_enabled = true;
+        let sender = Arc::new(AppState::new(scfg, dir.join("sender.toml")));
+        let fp = crate::net::local_fingerprint().unwrap().to_ascii_lowercase();
+        let peer = crate::localsend::LocalSendPeer {
+            id: crate::localsend::id_for_fingerprint(&fp),
+            fingerprint: fp.clone(),
+            alias: "LocalSend Receiver".to_string(),
+            device_model: Some("Test".to_string()),
+            device_type: Some("desktop".to_string()),
+            ip: "127.0.0.1".to_string(),
+            port: rport,
+            protocol: "https".to_string(),
+            download: false,
+            online: true,
+            seen_at: std::time::Instant::now(),
+            last_seen: std::time::Instant::now(),
+            certified: true,
+        };
+
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outcomes = Arc::new(std::sync::Mutex::new(Vec::<Result<(), String>>::new()));
+        let texts = ["one", "two", "three"];
+        for text in texts {
+            let job_state = sender.clone();
+            let job_peer = peer.clone();
+            let outcomes = outcomes.clone();
+            let running = running.clone();
+            let peak = peak.clone();
+            sender.localsend.enqueue_outbound(
+                &peer.id,
+                Box::pin(async move {
+                    use std::sync::atomic::Ordering;
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    let outcome =
+                        crate::localsend::client::send_text(&job_state, &job_peer, text).await;
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    outcomes.lock().unwrap().push(outcome);
+                }),
+            );
+        }
+
+        let mut settled = false;
+        for _ in 0..250 {
+            if outcomes.lock().unwrap().len() == texts.len() {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(settled, "三条文本都应在 lane 上收尾");
+
+        let outcomes = outcomes.lock().unwrap();
+        assert_eq!(outcomes.len(), texts.len());
+        for outcome in outcomes.iter() {
+            assert!(outcome.is_ok(), "每条都应送达：{outcome:?}");
+        }
+        drop(outcomes);
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "同一台设备的出站必须一条一条跑"
+        );
+
+        let peer_id = crate::localsend::id_for_fingerprint(&fp);
+        let convo = receiver
+            .chat
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == peer_id)
+            .expect("接收端应有会话");
+        let got: Vec<&str> = convo
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(got, texts, "接收端应看到与发送顺序一致的文本");
+
+        stop_server(&receiver).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 出站图片：LocalSend 文件传输 → 接收端自动接收为图片消息（无文件卡）。
+    #[tokio::test]
+    async fn localsend_outbound_image_lands_as_an_image_message() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_ls_oimg_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rcfg = test_config();
+        rcfg.localsend_enabled = true;
+        rcfg.download_dir = dir.join("downloads");
+        rcfg.device_subdir = false;
+        let receiver = Arc::new(AppState::new(rcfg, dir.join("receiver.toml")));
+        let rport = start_server_loopback(receiver.clone(), 4405)
+            .await
+            .expect("receiver server start");
+
+        let mut scfg = test_config();
+        scfg.localsend_enabled = true;
+        let sender = Arc::new(AppState::new(scfg, dir.join("sender.toml")));
+        let fp = crate::net::local_fingerprint().unwrap().to_ascii_lowercase();
+        let peer = crate::localsend::LocalSendPeer {
+            id: crate::localsend::id_for_fingerprint(&fp),
+            fingerprint: fp.clone(),
+            alias: "LocalSend Receiver".to_string(),
+            device_model: Some("Test".to_string()),
+            device_type: Some("desktop".to_string()),
+            ip: "127.0.0.1".to_string(),
+            port: rport,
+            protocol: "https".to_string(),
+            download: false,
+            online: true,
+            seen_at: std::time::Instant::now(),
+            last_seen: std::time::Instant::now(),
+            certified: true,
+        };
+
+        crate::localsend::client::send_image(&sender, &peer, "photo.png", b"fake-png")
+            .await
+            .expect("send_image");
+
+        let peer_id = crate::localsend::id_for_fingerprint(&fp);
+        let convo = receiver
+            .chat
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == peer_id)
+            .expect("接收端应落一条 LocalSend 图片消息");
+        assert_eq!(convo.messages.len(), 1);
+        assert!(convo.messages[0].image);
+        assert_eq!(convo.messages[0].name, "photo.png");
+        assert!(!convo.messages[0].path.is_empty());
+
+        stop_server(&receiver).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

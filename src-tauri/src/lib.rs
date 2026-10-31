@@ -24,6 +24,7 @@ pub mod i18n;
 /// 对端自报标识符（设备 id / 共享项 id）的形态校验：它们会被当成本地路径段与 URL 路径段用。
 pub mod ids;
 pub mod link;
+pub mod localsend;
 pub mod log;
 pub mod mirror;
 // 移动端专属命令（收件目录列举/删除）：只在 Android 构建里登记。
@@ -58,6 +59,7 @@ pub mod unsendable;
 pub mod update;
 pub mod ws;
 
+use std::collections::HashSet;
 #[cfg(test)]
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -69,7 +71,7 @@ use tauri::WebviewWindow;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use config::{AppSettings, DownloadMode, OrbShape, PeerDevice, ShareItem};
 #[cfg(desktop)]
@@ -178,6 +180,10 @@ pub struct UpdateSettingsRequest {
     pub download_dir: String,
     /// 与前端 `AppSettings.downloadMode` 同一套字面量（`Direct` / `AskEachTime`）。
     pub download_mode: DownloadMode,
+    /// 已配对设备推送是否免确认自动收（设置里的「已配对设备自动接收」，**默认关**）。
+    /// `None` = 老界面没带这一项，保持原值 —— 不能在保存别的设置时把它悄悄关掉。
+    #[serde(default)]
+    pub auto_accept_paired: Option<bool>,
     pub device_name: String,
     /// 界面语言（具体语言：`en` / `zh-CN`）。`None` = 老界面没带这一项，保持原值；
     /// 旧值 `auto` 会解析成系统语言后落盘。
@@ -219,6 +225,10 @@ pub struct UpdateSettingsRequest {
     /// 大文件分块大小（MB，设置里的「分块大小」）。缺省 4。
     #[serde(default = "config::default_transfer_block_mb")]
     pub transfer_block_mb: u32,
+    /// 是否启用 LocalSend v2.2 兼容（设置里的「支持 LocalSend 协议」，默认关）。
+    /// `None` = 老界面没带这一项，保持原值（不能在保存别的设置时把它悄悄关掉）。
+    #[serde(default)]
+    pub localsend_enabled: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +414,59 @@ fn get_settings(state: State<'_, Arc<AppState>>) -> Result<AppSettings, String> 
     Ok(state.config.lock().settings())
 }
 
+fn localsend_status_json(state: &AppState) -> serde_json::Value {
+    let status = state
+        .localsend
+        .status(crate::localsend::enabled(state), state.is_online());
+    serde_json::to_value(status).unwrap_or(serde_json::Value::Null)
+}
+
+/// LocalSend 兼容面的运行时状态（设置页状态行；也由 `localsend://status` 事件推）。
+#[tauri::command]
+fn localsend_status(state: State<'_, Arc<AppState>>) -> serde_json::Value {
+    localsend_status_json(state.inner())
+}
+
+/// 立即开/关 LocalSend 兼容（设置页那颗开关，**不等「保存设置」**）。
+///
+/// 与其它设置项分开，是因为它带运行时状态：53317 被占用要回落、端口空出要自动接管、
+/// 发现可能起不来。开关只表达用户意图；状态由 `localsend://status` 单独推。
+///
+/// 返回最新状态。写盘失败时把内存里的值回滚并返回 Err（前端把开关弹回去）；
+/// 功能降级/离线**不是** Err —— 那只是状态行里的一档。
+#[tauri::command]
+fn set_localsend_enabled(
+    enabled: bool,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    {
+        let mut config = state.config.lock();
+        if config.localsend_enabled != enabled {
+            config.localsend_enabled = enabled;
+            if let Err(e) = config::save_config_at(&state.config_path, &config) {
+                config.localsend_enabled = !enabled;
+                return Err(e.to_string());
+            }
+        }
+    }
+    if enabled {
+        // 已经开着也 restart：这就是状态行「重试」按钮走的那一条。
+        crate::localsend::restart(state.inner());
+    } else {
+        crate::localsend::stop(state.inner());
+    }
+    Ok(localsend_status_json(state.inner()))
+}
+
+/// 设置页「重试」：只叫醒后台 guard 补一拍，**不**重启兼容层（在途传输不断）。
+///
+/// 不返回状态：guard 可能立刻改状态，命令回包里那份旧快照会把事件推来的新值覆盖掉。
+/// 界面等 `localsend://status` 就行。
+#[tauri::command]
+fn localsend_retry(state: State<'_, Arc<AppState>>) {
+    crate::localsend::retry_now(state.inner());
+}
+
 /// 切换界面语言：**立即落盘**并让托管文案（托盘）跟着换。
 ///
 /// 与其它设置项分开，是因为语言在设置页里是"选了就生效"的一档（不必等「保存」）：
@@ -438,6 +501,8 @@ async fn update_settings(
 ) -> Result<AppSettings, String> {
     let (old_port, old_name);
     let old_allow_relay;
+    let old_localsend;
+    let new_localsend;
     let language = req.language.as_deref().map(i18n::canonical_preference);
     #[cfg(desktop)]
     let old_autostart;
@@ -446,14 +511,19 @@ async fn update_settings(
         old_port = config.port;
         old_name = config.device_name.clone();
         old_allow_relay = config.allow_relay;
+        old_localsend = config.localsend_enabled;
+        new_localsend = req.localsend_enabled.unwrap_or(old_localsend);
         #[cfg(desktop)]
         {
             old_autostart = config.auto_start;
         }
         config.port = req.port;
         config.download_dir = PathBuf::from(&req.download_dir);
-        config.download_mode = req.download_mode;
+        config.download_mode = config::clamp_download_mode(req.download_mode);
         config.device_subdir = req.device_subdir;
+        if let Some(auto) = req.auto_accept_paired {
+            config.auto_accept_paired = auto;
+        }
         config.device_name = req.device_name.clone();
         if let Some(lang) = &language {
             config.language = lang.clone();
@@ -465,6 +535,7 @@ async fn update_settings(
         config.auto_broadcast_new = req.auto_broadcast_new;
         config.group_relay = req.group_relay;
         config.allow_relay = req.allow_relay;
+        config.localsend_enabled = new_localsend;
         config.relay_memory = req.relay_memory;
         config.transfer_workers = config::clamp_transfer_workers(req.transfer_workers);
         config.transfer_block_mb = config::clamp_transfer_block_mb(req.transfer_block_mb);
@@ -490,6 +561,17 @@ async fn update_settings(
 
     let name_changed = req.device_name != old_name;
     let port_changed = req.port != old_port;
+    let localsend_changed = new_localsend != old_localsend;
+
+    // LocalSend 是一个独立的可选面：开关变化、或设备名变化（公告里的 alias 变了）都要
+    // 重新起停。端口变化由下面那段 HTTP 重启流程负责（先停、换端口、再起）。
+    if !port_changed && (localsend_changed || name_changed) {
+        if new_localsend {
+            crate::localsend::restart(state.inner());
+        } else {
+            crate::localsend::stop(state.inner());
+        }
+    }
 
     // 关掉「允许为其它设备中转」→ **立刻收掉**本机正替别人转的每一条。
     // 开关是用户意图：已经开出去的端点不能继续占本机上行带宽（开着的那几条 TCP
@@ -520,15 +602,19 @@ async fn update_settings(
     if port_changed {
         let arc_state = state.inner().clone();
         let _ = tokio::spawn(async move {
+            // UDP 公告里播的是 HTTP 端口：先停，等新端口绑定后再起，别让对端拿旧端口拨。
+            crate::localsend::stop(&arc_state);
             server::stop_server(&arc_state).await;
             match server::ensure_server(arc_state.clone()).await {
                 Ok(port) => {
-                    info!(port, "HTTP server restarted");
+                    // `ensure_server` 自己已经记了 `HTTP server started`（带实际端口）；
+                    // 这里不再重复一条。
                     // 广播跟着重启后的端口走（配置端口还被占的话会再顺延一次）；
                     // 离线时照旧不播。
                     if arc_state.is_online() {
                         register_mdns(&arc_state, port);
                     }
+                    crate::localsend::start_if_enabled(&arc_state);
                     let _ = app.emit(ws::events::ui::SERVER_STARTED, port);
                 }
                 Err(e) => {
@@ -608,16 +694,78 @@ fn local_addresses() -> LocalAddresses {
     }
 }
 
+/// 一条 LocalSend 发现行是否应该藏掉：本机已经用 OrbDrop 身份认识这台设备。
+///
+/// 两条判据见调用点：`ls-<证书指纹>` 命中已知 OrbDrop 指纹（主），或同一个 `ip:port`
+/// （老版本对端没报 `fp` 时的兜底）。
+fn is_duplicate_localsend_row(
+    row: &serde_json::Value,
+    peers: &[PeerDevice],
+    duplicate_localsend_ids: &HashSet<String>,
+) -> bool {
+    let id = row.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    if duplicate_localsend_ids.contains(id) {
+        return true;
+    }
+    let ip = row.get("ip").and_then(|v| v.as_str()).unwrap_or_default();
+    let port = row.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    peers
+        .iter()
+        .any(|p| p.ip == ip && p.port == port && p.port != 0)
+}
+
 #[tauri::command]
 fn list_devices(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
+    merged_device_rows(state.inner())
+}
+
+/// `list_devices` 的实现：OrbDrop 设备表 + LocalSend 发现行（去重后）合并成界面看到的行。
+///
+/// 抽出来是为了能在单测里用真实 `AppState` 验跨协议去重，而不是只测判据函数。
+fn merged_device_rows(state: &AppState) -> Vec<serde_json::Value> {
     // 两份快照各自锁一次、不嵌套：设备表与配置表是两把独立的锁，嵌套着取是白送一个
     // 死锁面（两处顺序不同就够）。设备表本身很小（一屏设备数），拷一份不值一提。
     let peers = state.peers.lock().clone();
-    let remarks = state.config.lock().device_remarks.clone();
+    let (remarks, observed_fingerprints, localsend_on) = {
+        let config = state.config.lock();
+        (
+            config.device_remarks.clone(),
+            config.observed_fingerprints.clone(),
+            config.localsend_enabled,
+        )
+    };
     // 读一次凭据库就够：`verified` 是"已配对且指纹已钉住"，界面用它决定状态点实心/空心。
     // 读失败时不要把已配对设备全画成"未验证"——退回 `paired`，避免一次瞬时抖动让满屏变空心。
     let credentials = crate::credential::load_credentials();
-    peers
+
+    // 跨协议去重：同一台机器既跑 OrbDrop 又开着 LocalSend 时，两张发现表各有一行。
+    // LocalSend 行的 id 是**握手证书指纹**的派生（`ls-<hex>`），而本机从三条路知道
+    // 对端 OrbDrop 身份的证书指纹：mDNS TXT 的 `fp`（本次启动刚看见）、凭据库
+    // （已配对）、`observed_fingerprints`（未配对但核实过）。命中任一即同一台设备。
+    //
+    // 只取**当前设备表里有的 id**：观察指纹表按 knownPeers 存，可能留着已经没有行的旧
+    // id；用它去藏 LocalSend 行会把一台真实可见的设备直接藏没。
+    let mut orbdrop_fingerprints: HashSet<String> = HashSet::new();
+    for p in &peers {
+        if let Some(fp) = state.mdns_fingerprint_of(&p.id) {
+            orbdrop_fingerprints.insert(fp);
+        }
+        if let Some(fp) = observed_fingerprints.get(&p.id) {
+            orbdrop_fingerprints.insert(fp.trim().to_ascii_lowercase());
+        }
+        if let Ok(map) = &credentials {
+            if let Some(c) = map.get(&p.id) {
+                orbdrop_fingerprints.insert(c.fingerprint.trim().to_ascii_lowercase());
+            }
+        }
+    }
+    orbdrop_fingerprints.retain(|fp| !fp.is_empty());
+    let duplicate_localsend_ids: HashSet<String> = orbdrop_fingerprints
+        .iter()
+        .map(|fp| crate::localsend::id_for_fingerprint(fp))
+        .collect();
+
+    let mut rows: Vec<serde_json::Value> = peers
         .iter()
         .map(|p| {
             let connected = state.ws.has_connection(&p.id);
@@ -635,6 +783,9 @@ fn list_devices(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
                 "port": p.port,
                 "online": p.online,
                 "paired": p.paired,
+                // 协议面：LocalSend 行由下面的独立表合并进来；OrbDrop 行显式标出来，
+                // 旧前端不读这个字段时按默认 `orbdrop` 处理。
+                "transport": "orbdrop",
                 // 「看得见但连不上」（F-106）：记录还在（对端在喊），但探活没成 —— 界面据此把这一行
                 // 留在列表里，并在用户**发起连接**时补一句"这张网可能把单播隔开了"；**不是**一个状态档
                 // （那一行照常画「未绑定」/「离线」）。`online` 的定义不动（探活成功 = 真连得上）。
@@ -656,7 +807,27 @@ fn list_devices(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
                 "remark": remarks.get(&p.id),
             })
         })
-        .collect()
+        .collect();
+
+    // LocalSend 行是**临时观察值**，单独一张表；这里只做展示层合并。同一台设备
+    // 同时被 mDNS 和 LocalSend 看到时（一台 OrbDrop 实例既播 `_orbdrop` 又播
+    // `_localsend`），只保留 OrbDrop 行 —— 它有 id/配对/长连接，信息更全。
+    //
+    // 两条判据：
+    // 1. 同一个 `ip:port`（老版本对端没在 TXT 里报 `fp` 时的兜底）；
+    // 2. **证书指纹相同**：LocalSend 公告里的 `fingerprint` 就是 OrbDrop 的 TLS
+    //    身份，`ls-<fp>` 命中本机已知的任何一枚 OrbDrop 指纹 = 同一台机器。这是
+    //    主判据 —— 两条协议的监听端口本来就不一样（53317 vs 主端口），单看端点
+    //    永远合不上。
+    if localsend_on {
+        for row in state.localsend.rows(&remarks) {
+            if is_duplicate_localsend_row(&row, &peers, &duplicate_localsend_ids) {
+                continue;
+            }
+            rows.push(row);
+        }
+    }
+    rows
 }
 
 /// F-107：本机的中转记忆（网段级策略 + 各自的池 + 设备级链路）。
@@ -788,6 +959,9 @@ fn ensure_online(state: &AppState) -> Result<(), String> {
 /// 里是个裸 TCP 监听，不归 HTTP 那层管，只有这里收得掉；`relay::serve` 另有一道 `is_online`
 /// 兜底）；④ 把现有设备行标成离线（显示层，切回在线后 5s 探活会纠正回来）。
 pub fn apply_offline(arc: &Arc<AppState>) {
+    // 离线 = 两个协议一起隐身：先关 LocalSend 的 UDP 组播与在途会话，再注销 mDNS。
+    // 顺序不关键，但 LocalSend 必须**真的关 socket**，不能只是不再发公告。
+    crate::localsend::stop(arc);
     unregister_mdns(arc);
     arc.ws.drop_all();
     crate::relay::close_all(arc);
@@ -871,6 +1045,7 @@ pub(crate) fn apply_online(
 
     if online {
         register_mdns(arc, bound_port(arc));
+        crate::localsend::start_if_enabled(arc);
         ws::restore_links_on_startup(arc);
         // 离线期间对端收不到任何东西（本机整个路由回 503），够不着的那些消息在排队：
         // 切回在线就把它们发出去（"在途"的那些不退 —— 它们是真的在飞）。
@@ -1281,6 +1456,10 @@ async fn notify_unpair(
 
 #[tauri::command]
 async fn remove_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    if state.localsend.remove(&peer_id) {
+        state.emit_devices_changed();
+        return Ok(());
+    }
     unpair_peer(state.inner(), &peer_id).await
 }
 
@@ -1290,6 +1469,10 @@ async fn remove_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result
 /// 已经没有它（最糟的半清状态）。返回的错误文案直接展示给用户。
 #[tauri::command]
 fn forget_peer(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    if state.localsend.remove(&peer_id) {
+        state.emit_devices_changed();
+        return Ok(());
+    }
     if state.forget_peer(&peer_id) {
         Ok(())
     } else {
@@ -1550,8 +1733,9 @@ async fn cancel_push_batch(
 /// 没有 reactor，任务会被丢掉（用户侧："点了同意，两边都停在 0%"）。`task::spawn` 现在有
 /// 兜底（退到 Tauri 的全局运行时），但异步命令才是这里最自然的上下文。
 ///
-/// `root` = 这次接收的落盘根目录：界面在「每次询问」（`DownloadMode::AskEachTime`）下问过
-/// 用户就带上，否则 `None`（用设置里的下载目录）。已配对设备那条路不问、也就恒为 `None`。
+/// `root` = 这次接收的落盘根目录：界面在「每次选择位置」（`DownloadMode::AskEachTime`）下问过
+/// 用户就带上，否则 `None`（用设置里的下载目录）。已配对且开着「自动接收」那条路不问、
+/// 也就恒为 `None`。
 #[tauri::command]
 async fn accept_push(
     invite_id: String,
@@ -1559,11 +1743,20 @@ async fn accept_push(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     let root = root.map(PathBuf::from);
+    if state.localsend.sessions.has_pending(&invite_id) {
+        return state
+            .localsend
+            .sessions
+            .accept_pending(state.inner(), &invite_id, root);
+    }
     transfer::accept_invite(state.inner().clone(), &invite_id, root)
 }
 
 #[tauri::command]
 fn reject_push(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    if state.localsend.sessions.reject_pending(&invite_id) {
+        return Ok(());
+    }
     transfer::reject_invite(&state, &invite_id);
     Ok(())
 }
@@ -1577,6 +1770,21 @@ async fn cancel_push(invite_id: String, state: State<'_, Arc<AppState>>) -> Resu
 /// 接收方取消：要回执发送方（同样可能走 `POST /push/report`）—— 同样需要运行时。
 #[tauri::command]
 async fn cancel_receive(invite_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    if state.localsend.sessions.cancel_by_invite(&invite_id) {
+        crate::ws::emit_ui(
+            &state,
+            ws::events::ui::PUSH_DONE,
+            &serde_json::json!({
+                "inviteId": invite_id,
+                "status": "cancelled",
+                "transport": "localsend",
+            }),
+        );
+        return Ok(());
+    }
+    if state.localsend.sessions.reject_pending(&invite_id) {
+        return Ok(());
+    }
     transfer::cancel_receive(&state, &invite_id);
     Ok(())
 }
@@ -1719,10 +1927,181 @@ fn chat_send_image(
     })
 }
 
+/// 发一条 LocalSend 文本消息（**只走 LocalSend 协议**，不碰 OrbDrop 的 `chat_send`）。
+///
+/// 线上形状与官方客户端一致：单文件 + `text/plain` + 正文在 `preview`。命令先把这条
+/// 记进 `localsend_messages`（`Sending`）让会话立刻出现，再由后台任务发
+/// `prepare-upload`：`204` = 已送达，`200` = 第三方当文件收（降级上传 `.txt`），
+/// 其余失败落 `Failed`。LocalSend 没有离线队列，所以对端不在线时直接拒绝。
+#[tauri::command]
+fn localsend_send_text(
+    peer_id: String,
+    text: String,
+    at: Option<u64>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ChatSendView, String> {
+    ensure_online(&state)?;
+    if !crate::localsend::enabled(&state) {
+        return Err("LocalSend 兼容未开启".to_string());
+    }
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("消息为空".to_string());
+    }
+    if text.len() > crate::localsend::server::MAX_PREVIEW_BYTES {
+        return Err(format!(
+            "消息过长（LocalSend 文本上限 {} KB）",
+            crate::localsend::server::MAX_PREVIEW_BYTES / 1024
+        ));
+    }
+    let peer = state
+        .localsend
+        .get(&peer_id)
+        .ok_or_else(|| "LocalSend 设备不存在".to_string())?;
+    if !peer.alive() || peer.ip.is_empty() || peer.port == 0 {
+        return Err(format!("「{}」不在 LocalSend 网上，消息未发送", peer.alias));
+    }
+
+    let id = format!("ls:{}", uuid::Uuid::new_v4());
+    let at = at.unwrap_or_else(chat::now_ms);
+    state.chat.record_localsend_outbound(
+        &id,
+        &peer_id,
+        text.as_str(),
+        at,
+        chat::Delivery::Sending,
+    );
+    group::emit(&state);
+
+    let task_state = state.inner().clone();
+    let task_peer = peer.clone();
+    let task_peer_id = peer_id.clone();
+    let task_id = id.clone();
+    let task_text = text.clone();
+    // 同一台设备只有一个 LocalSend 会话槽：排队逐条发，否则第二条 `prepare-upload`
+    // 立刻吃 409（对端显示 "Blocked by another session"），这条就永久「未送达」。
+    state.localsend.enqueue_outbound(
+        &peer_id,
+        Box::pin(async move {
+            let delivery = match crate::localsend::client::send_text(
+                &task_state,
+                &task_peer,
+                &task_text,
+            )
+            .await
+            {
+                Ok(()) => chat::Delivery::Sent,
+                Err(e) => {
+                    tracing::warn!(peer = %task_peer.alias, %e, "LocalSend 文本消息发送失败");
+                    chat::Delivery::Failed
+                }
+            };
+            task_state
+                .chat
+                .set_localsend_delivery(&task_peer_id, &task_id, delivery);
+            group::emit(&task_state);
+        }),
+    );
+
+    Ok(ChatSendView {
+        id,
+        batch_id: None,
+        snapshot: group::snapshot(&state),
+    })
+}
+
+/// 发一张 LocalSend **图片消息**：本机会话里是图片气泡 + `发送中/已送达/未送达`，
+/// 线上仍是 LocalSend 文件传输（协议没有图片消息类型）。**不建 PushJob/批次卡**，所以
+/// 界面没有停止按钮，与 OrbDrop 的会话图片消息一致。
+#[tauri::command]
+fn localsend_send_image(
+    peer_id: String,
+    path: String,
+    name: String,
+    at: Option<u64>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ChatSendView, String> {
+    ensure_online(&state)?;
+    if !crate::localsend::enabled(&state) {
+        return Err("LocalSend 兼容未开启".to_string());
+    }
+    let name = name.trim().to_string();
+    if name.is_empty() || crate::paste::image_ext_of(&name).is_none() {
+        return Err("图片文件名不可用".to_string());
+    }
+    let peer = state
+        .localsend
+        .get(&peer_id)
+        .ok_or_else(|| "LocalSend 设备不存在".to_string())?;
+    if !peer.alive() || peer.ip.is_empty() || peer.port == 0 {
+        return Err(format!("「{}」不在 LocalSend 网上，图片未发送", peer.alias));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("读不到这张图（{path}）：{e}"))?;
+    if bytes.is_empty() {
+        return Err("图片内容为空".to_string());
+    }
+    if bytes.len() as u64 > crate::blobs::MAX_IMAGE_BYTES {
+        return Err(format!(
+            "这张图超过了会话图片上限（{} MB）",
+            crate::blobs::MAX_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+
+    // 消息 id 必须能当 blobs 文件名（`blobs::safe_id`）：只留字母/数字/`-`/`_`。
+    let id = format!("lsimg-{}", uuid::Uuid::new_v4());
+    crate::blobs::save_in(state.chat.blobs_root(), &id, &name, &bytes)?;
+    let at = at.unwrap_or_else(chat::now_ms);
+    state.chat.record_localsend_outbound(
+        &id,
+        &peer_id,
+        crate::blobs::Content::image(&name, bytes.len() as u64),
+        at,
+        chat::Delivery::Sending,
+    );
+    group::emit(&state);
+
+    let task_state = state.inner().clone();
+    let task_peer = peer.clone();
+    let task_peer_id = peer_id.clone();
+    let task_id = id.clone();
+    let task_name = name.clone();
+    // 与文本共用同一条 lane：混合草稿里的文字/图片按框里的顺序逐条发。
+    state.localsend.enqueue_outbound(
+        &peer_id,
+        Box::pin(async move {
+            let delivery = match crate::localsend::client::send_image(
+                &task_state,
+                &task_peer,
+                &task_name,
+                &bytes,
+            )
+            .await
+            {
+                Ok(()) => chat::Delivery::Sent,
+                Err(e) => {
+                    tracing::warn!(peer = %task_peer.alias, %e, "LocalSend 图片消息发送失败");
+                    chat::Delivery::Failed
+                }
+            };
+            task_state
+                .chat
+                .set_localsend_delivery(&task_peer_id, &task_id, delivery);
+            group::emit(&task_state);
+        }),
+    );
+
+    Ok(ChatSendView {
+        id,
+        batch_id: None,
+        snapshot: group::snapshot(&state),
+    })
+}
+
 /// 界面读过这些设备的会话：推进本地已读水位，并给对端回一条已读回执。
 #[tauri::command]
 fn chat_mark_read(peer_ids: Vec<String>, state: State<'_, Arc<AppState>>) -> group::Snapshot {
     chat::mark_read(&state, &peer_ids);
+    chat::mark_localsend_read(&state, &peer_ids);
     group::emit(&state);
     group::snapshot(&state)
 }
@@ -2174,7 +2553,7 @@ fn emit_browse_download(
 
 /// Download a file from a remote peer (P1 remote browsing download).
 ///
-/// 返回落盘路径；**用户在保存框里取消时返回 `None`**（「每次询问」那一档）——
+/// 返回落盘路径；**用户在保存框里取消时返回 `None`**（「每次选择位置」那一档）——
 /// 界面据此当"什么都没发生"，不弹提示、不当失败。
 #[tauri::command]
 async fn download_from_peer(
@@ -2188,7 +2567,7 @@ async fn download_from_peer(
 ) -> Result<Option<String>, String> {
     let (download_dir, mode) = {
         let cfg = state.config.lock();
-        (cfg.download_dir.clone(), cfg.download_mode)
+        (cfg.download_dir.clone(), config::clamp_download_mode(cfg.download_mode))
     };
     let peer = state
         .get_peer(&peer_id)
@@ -2461,7 +2840,7 @@ where
     Ok(offset)
 }
 
-/// 返回落盘路径；**用户在保存框里取消时返回 `None`**（「每次询问」那一档，见
+/// 返回落盘路径；**用户在保存框里取消时返回 `None`**（「每次选择位置」那一档，见
 /// `download_from_peer`）。与那条命令是同一套口径 —— 同一个设置、同一个行为。
 #[tauri::command]
 async fn download_file(
@@ -2478,7 +2857,7 @@ async fn download_file(
             .find(|s| s.id == share_id)
             .ok_or_else(|| format!("共享项不存在: {share_id}"))?
             .clone();
-        (share, config.download_dir.clone(), config.download_mode)
+        (share, config.download_dir.clone(), config::clamp_download_mode(config.download_mode))
     };
 
     // 空路径（或只有目录）时退成**共享项自己的名字**：那正是"共享项根就是一个文件"那一档，
@@ -2845,7 +3224,7 @@ fn place_orb_on_startup(app: &AppHandle) {
         },
     };
     match win.set_position(tauri::PhysicalPosition::new(x, y)) {
-        Ok(()) if saved.is_some() => info!(x, y, "已复原悬浮球位置"),
+        Ok(()) if saved.is_some() => debug!(x, y, "已复原悬浮球位置"),
         Ok(()) => info!(x, y, "首启：悬浮球放在默认落位（右上 1/3，靠边不吸附）"),
         Err(e) => warn!("悬浮球落位失败: {e}"),
     }
@@ -2984,7 +3363,8 @@ fn setup_server_task(app: &AppHandle) {
             let arc_state = state_arc.clone();
             match server::ensure_server(arc_state.clone()).await {
                 Ok(port) => {
-                    info!(port, "HTTP server started");
+                    // 服务启动的那一行由 `server::ensure_server` 记（带实际绑定端口）；
+                    // 这里重复一条只会让每次启动多一行一模一样的日志。
                     // 上次退出时是「离线」就照旧不广播（`Config::online` 跨重启有效）：
                     // 服务器照常起（切回在线要立刻可用），只是不进 mDNS。
                     if arc_state.is_online() {
@@ -2994,6 +3374,7 @@ fn setup_server_task(app: &AppHandle) {
                     // 必须赶在 mDNS 发现/探活/长连接恢复之前 —— 那几条路一拨号就要校验。
                     state::refresh_trust(&arc_state);
                     let _ = handle.emit(ws::events::ui::SERVER_STARTED, port);
+                    crate::localsend::start_if_enabled(&arc_state);
 
                     // Spawn mDNS scanner.
                     let (mdns_tx, mut mdns_rx) = mpsc::channel::<discover::PeerEvent>(64);
@@ -3032,12 +3413,16 @@ fn setup_server_task(app: &AppHandle) {
                                     port,
                                     nets,
                                     relay,
+                                    fingerprint,
                                 } => {
                                     // 「它在喊」这件事先记下（F-106）：探活成不成是另一回事 ——
                                     // 列表要靠这一档把"在同一网段、但被 AP 隔开"的设备显示出来。
                                     // 「第一次看见它」（下面那个接回/flush 的触发判据）。
                                     let was_seen = s2.is_seen(&id);
                                     s2.note_seen(&id);
+                                    // 跨协议去重：TXT 里的证书指纹只用来把同一台机器的
+                                    // `_localsend` 行藏掉，不进任何信任表（见字段说明）。
+                                    s2.note_mdns_fingerprint(&id, &fingerprint);
                                     // F-107：TXT 里自报的网段与中转能力。零请求就拿到了 ——
                                     // 之后 5s 探活那一拍会用活回话把这两项刷新（网卡换了 TXT
                                     // 不会重播，活回话才是权威）。
@@ -3423,6 +3808,9 @@ pub fn run() {
             rename_share,
             toggle_broadcast,
             get_settings,
+            localsend_status,
+            set_localsend_enabled,
+            localsend_retry,
             set_language,
             update_settings,
             #[cfg(desktop)]
@@ -3482,6 +3870,8 @@ pub fn run() {
             chat_snapshot,
             chat_send,
             chat_send_image,
+            localsend_send_text,
+            localsend_send_image,
             chat_mark_read,
             chat_batch_ensure,
             chat_batch_rename,
@@ -3604,7 +3994,7 @@ pub fn run() {
             {
                 match app.get_webview_window("main") {
                     Some(win) => match orb_window::strip_os_frame(&win) {
-                        Ok(()) => info!("已抹掉系统窗口边框与系统圆角"),
+                        Ok(()) => debug!("已抹掉系统窗口边框与系统圆角"),
                         Err(e) => warn!("抹掉系统窗口边框失败: {e}"),
                     },
                     None => warn!("未找到 main 窗口，跳过系统边框处理"),
@@ -3660,7 +4050,10 @@ pub fn run() {
             #[cfg(desktop)]
             {
                 let written = bc::provision_profiles(&state_arc);
-                info!(written, "启动预写 BeyondCompare profile 完成");
+                // 没有已配对设备时 `written == 0`：这一跑什么都没写，不是事件。
+                if written > 0 {
+                    info!(written, "启动预写 BeyondCompare profile 完成");
+                }
 
                 // `setup_server_task` 是异步起的：上面这一跑的时候 `server_port` 可能还是 0，
                 // 于是只写了骨架、没写 profile（真机 BC 5.2.6 踩到：文件里没有条目 ->
@@ -3683,7 +4076,9 @@ pub fn run() {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     let written = bc::provision_profiles(&state);
-                    info!(written, "服务起来后补写 BeyondCompare profile 完成");
+                    if written > 0 {
+                        info!(written, "服务起来后补写 BeyondCompare profile 完成");
+                    }
                 });
             }
             Ok(())
@@ -3727,6 +4122,117 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 同一台机器既跑 OrbDrop 又开着 LocalSend：两条发现结果只能剩 OrbDrop 一行。
+    ///
+    /// 两条协议的监听端口本来就不一样（LocalSend 53317 / OrbDrop 主端口），所以单靠
+    /// `ip:port` 合不上；主判据是 LocalSend 握手证书指纹 == OrbDrop 身份证书指纹。
+    #[test]
+    fn a_localsend_row_is_hidden_behind_the_same_orbdrop_device() {
+        let fingerprint = "ab".repeat(32);
+        let peer = PeerDevice {
+            id: "peer-a".into(),
+            name: "PC-A".into(),
+            ip: "192.168.1.9".into(),
+            port: 3890,
+            online: true,
+            paired: true,
+            ..Default::default()
+        };
+        let duplicate_ids = HashSet::from([crate::localsend::id_for_fingerprint(&fingerprint)]);
+        let same_device = serde_json::json!({
+            "id": crate::localsend::id_for_fingerprint(&fingerprint),
+            "ip": "192.168.1.9",
+            "port": 53317,
+        });
+        assert!(
+            is_duplicate_localsend_row(&same_device, &[peer.clone()], &duplicate_ids),
+            "同一枚证书指纹 = 同一台设备，端口不同也要合掉"
+        );
+
+        // 老版本对端没在 TXT 里报 `fp`：端点相同的兜底仍然成立。
+        let same_endpoint =
+            serde_json::json!({ "id": "ls-other", "ip": "192.168.1.9", "port": 3890 });
+        assert!(is_duplicate_localsend_row(
+            &same_endpoint,
+            &[peer.clone()],
+            &HashSet::new()
+        ));
+
+        // 另一台只开了 LocalSend 的机器：保留它。
+        let other = serde_json::json!({ "id": "ls-other", "ip": "192.168.1.10", "port": 53317 });
+        assert!(!is_duplicate_localsend_row(&other, &[peer], &duplicate_ids));
+    }
+
+    /// 真实设备表走一遍：同一台机器的 OrbDrop 行与 LocalSend 行只留 OrbDrop；
+    /// 只开了 LocalSend 的邻居照旧出现。
+    #[test]
+    fn device_list_keeps_one_row_per_machine_across_protocols() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_dedupe_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(AppState::new(
+            crate::config::Config {
+                device_id: "own-dedupe".into(),
+                device_name: "OWN".into(),
+                ..Default::default()
+            },
+            dir.join("config.toml"),
+        ));
+        state.config.lock().localsend_enabled = true;
+        state.upsert_peer(&PeerDevice {
+            id: "peer-a".into(),
+            name: "PC-A".into(),
+            ip: "192.168.1.9".into(),
+            port: 3890,
+            online: true,
+            ..Default::default()
+        });
+        let fingerprint = "cd".repeat(32);
+        state.note_mdns_fingerprint("peer-a", &fingerprint);
+
+        let now = std::time::Instant::now();
+        let add_localsend = |fp: &str, ip: &str| {
+            state.localsend.upsert(crate::localsend::LocalSendPeer {
+                id: crate::localsend::id_for_fingerprint(fp),
+                fingerprint: fp.to_string(),
+                alias: "PC".into(),
+                device_model: None,
+                device_type: None,
+                ip: ip.to_string(),
+                port: 53317,
+                protocol: "https".into(),
+                download: false,
+                online: true,
+                seen_at: now,
+                last_seen: now,
+                certified: true,
+            });
+        };
+        // 同一台机器：证书指纹与 mDNS TXT 相同，端口不同。
+        add_localsend(&fingerprint, "192.168.1.9");
+        // 另一台只开 LocalSend 的邻居。
+        let neighbor = "ef".repeat(32);
+        add_localsend(&neighbor, "192.168.1.10");
+
+        let rows = merged_device_rows(&state);
+        assert!(
+            rows.iter()
+                .any(|r| r["id"] == "peer-a" && r["transport"] == "orbdrop"),
+            "OrbDrop 行必须在"
+        );
+        let ls: Vec<_> = rows
+            .iter()
+            .filter(|r| r["transport"] == "localsend")
+            .collect();
+        assert_eq!(ls.len(), 1, "同一台机器只剩 OrbDrop 行：{rows:?}");
+        assert_eq!(
+            ls[0]["id"],
+            crate::localsend::id_for_fingerprint(&neighbor),
+            "留下的应是不在任何 OrbDrop 设备上的那一行"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 一个临时共享项根：`a.txt` + `sub/` + 一个 `.hidden`（后者 `/tree` 与计数都跳过）。
     ///

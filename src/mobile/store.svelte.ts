@@ -327,9 +327,9 @@ export function takePendingImages(key: string): PickedFile[] | null {
 /**
  * 那颗「＋」选了之后要走的路：图片进输入区当草稿，文件当场推送。
  *
- * **两条路的语义不同，所以是两项而不是一个框**：图片是**消息内容**（字节随会话消息过去，
- * 对端直接看得见），文件是**推送**（对端收到一张「接收 / 拒绝」卡）。混在一个框里让用户
- * 猜"我选的这张图会被当成哪一种"，不如让他自己挑。
+ * **两条路的语义不同，所以是两项而不是一个框**：图片先进输入区，发送时在 OrbDrop 里是
+ * 图片消息、在 LocalSend 里是一条图片消息（线上走文件传输）；文件是**推送**（对端收到一张
+ * 「接收 / 拒绝」卡）。混在一个框里让用户猜"我选的这张图会被当成哪一种"，不如让他自己挑。
  *
  * 目标会话就是**此刻开着的那条**（与桌面端 `chatSendFiles` 同一条判据）——「＋」只长在会话
  * 子屏上，没有会话时这个动作根本不会被调到。
@@ -347,6 +347,7 @@ export async function pickAttach(kind: "image" | "file"): Promise<void> {
   // 取消（空表）什么都不做：用户反悔是正常操作，不该看到任何提示。
   if (files.length === 0) return;
   if (kind === "image") {
+    // 两条协议都先把图放进输入区（和桌面端粘贴同一条路）；点发送才真正发出去。
     pendingImages = { key: thread.key, files };
     return;
   }
@@ -951,6 +952,8 @@ export type Sheet =
   | { kind: "remarkDevice"; peerId: string }
   | { kind: "fileActions"; entry: InboxEntry }
   | { kind: "chatActions"; key: string }
+  /** 长按一条消息：移动端的"消息右键菜单"（桌面端见 `ContextMenu.svelte` 的 `kind === 'chat'`）。 */
+  | { kind: "messageActions"; copyText: string; desc: string }
   | { kind: "attach" }
   | { kind: "appPicker" }
   | { kind: "convo" }

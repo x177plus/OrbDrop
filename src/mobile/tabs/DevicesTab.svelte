@@ -57,6 +57,8 @@
   let pressing = $state<string | null>(null);
   let pressTimer: ReturnType<typeof setTimeout> | null = null;
   let pressFrom = { x: 0, y: 0 };
+  /** 上一次长按触发操作表的时间：长按后的那次 click 不该再打开会话（两个动作叠在一起）。 */
+  let longPressAt = 0;
 
   function pressStart(e: PointerEvent, peerId: string): void {
     // 行动作那两颗按钮自己的按压不算长按（它们在 `.dacts` 里，各有各的动作）。
@@ -66,6 +68,7 @@
     pressTimer = setTimeout(() => {
       pressTimer = null;
       pressing = null;
+      longPressAt = Date.now();
       store.openSheet({ kind: "deviceActions", peerId });
     }, LONG_PRESS_MS);
   }
@@ -86,6 +89,26 @@
       pressTimer = null;
     }
     pressing = null;
+  }
+
+  /**
+   * 短按整行 = 打开与这台设备的会话（桌面端整行点击同一套行为）。
+   *
+   * 两处让路：长按已经开过设备操作表，紧接着那次松手不该再算一次点行；行内那两颗按钮
+   * （配对 / 连接 / 断开 / 发消息）各有各的动作，点它们不顺带开会话。
+   */
+  function openRow(e: Event, peerId: string): void {
+    if (Date.now() - longPressAt < 500) return;
+    if ((e.target as HTMLElement).closest(".dacts")) return;
+    store.openChat(peerId);
+  }
+
+  /** 行是 `role="button"`：键盘上的 Enter / 空格与短按同义。 */
+  function rowKey(e: KeyboardEvent, peerId: string): void {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    if ((e.target as HTMLElement).closest(".dacts")) return;
+    e.preventDefault();
+    store.openChat(peerId);
   }
 </script>
 
@@ -153,22 +176,26 @@
     {:else}
       <div class="card list">
         {#each rows as d (d.id)}
-          <!-- 长按整行 = 设备操作（桌面端是右键那一套）：短按不做任何事 —— 行只有信息，
-               动作是右边那两颗按钮。`is-pressing` 是按住 500ms 期间的浅底反馈。
+          <!-- 长按整行 = 设备操作（桌面端是右键那一套）；短按整行 = 打开与这台设备的会话
+               （与桌面端整行点击一致，行内那两颗按钮仍各管各的动作）。`is-pressing` 是按住
+               500ms 期间的浅底反馈。
 
-               这几个 pointer 处理器不是"这个 div 是颗按钮"：它只在**按住不放**时才做事，
-               给不了 `role="button"`（短按什么都不发生，加了就是骗读屏），键盘也没有等价操作 ——
-               设备操作的键盘/读屏入口因此**没有**（已知取舍，见 §21 那条记录）。 -->
+               行是 `role="button"`：短按有了动作，键盘上的 Enter / 空格也走同一条路。
+               设备操作那条长按手势没有键盘等价物（已知取舍，见 §21 那条记录）。 -->
           <!-- 行上的待处理角标（F-112）：这台设备还有几件等你处理 —— 未读消息（会话 store
                算好的）＋ 还没接收/拒绝的推送邀请。移动端的设备行**没有头像**（§21 把那一格
                还给了名字与地址），所以角标落在名字那一排、状态胶囊的右边：数字紧挨着
                "这台现在怎么样"，读作"它那边还有几件等你"。两行高度不变。 -->
           {@const unread = chat.unreadForPeer(d.id)}
           {@const pending = invitesOf(d.id)}
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
             class="drow"
+            role="button"
+            tabindex="0"
             class:is-pressing={pressing === d.id}
+            data-state={d.transport === "localsend" ? "localsend" : undefined}
+            onclick={(e) => openRow(e, d.id)}
+            onkeydown={(e) => rowKey(e, d.id)}
             onpointerdown={(e) => pressStart(e, d.id)}
             onpointermove={pressMove}
             onpointerup={pressEnd}
@@ -205,7 +232,11 @@
                    在线三档 = 一颗主按钮（断开 / 配对 / 连接）+「发消息」；
                    离线未绑定 = 「配对」+「发消息」（消息排着队等它上线，见 F-95）；
                    离线已配对 = 一颗不放（F-14 那颗「解除配对」走长按菜单，与其它设备操作同路）。 -->
-              {#if d.online}
+              {#if d.transport === "localsend"}
+                <!-- LocalSend 设备不配对、没有长连接：行内只留"打开会话发消息"（文字在会话输入框，
+                     图片/文件走会话里的「＋」）。按钮与其它行同一颗（次要样式、不带边框）。 -->
+                {@render messageBtn(d)}
+              {:else if d.online}
                 {#if d.connected}
                   <button class="btn btn-secondary btn-sm" type="button" onclick={() => void store.toggleConnection(d.id, true)}>{t("断开")}</button>
                 {:else if !d.paired || devices.needsRepair(d)}

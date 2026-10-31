@@ -31,6 +31,17 @@
   const mode = $derived(thread?.mode ?? "direct");
   const participants = $derived(thread?.participants ?? []);
   const title = $derived(thread?.title ?? "");
+  /** 这条 direct 会话的对端（LocalSend 只可能是 direct）。 */
+  const activePeer = $derived(mode === "direct" ? devices.deviceById(participants[0]) : undefined);
+  /**
+   * LocalSend 会话：复用 direct 外壳和富输入区；发送侧走
+   * `chat.sendLocalSendComposer`（文字/图片按框里的顺序各发一条 LocalSend 消息）。
+   * 没有已读/长连接。
+   */
+  const localSendThread = $derived(
+    mode === "direct" &&
+      (activePeer?.transport === "localsend" || participants[0]?.startsWith("ls-")),
+  );
   const items = $derived(chat.itemsOf(convoKey));
   /**
    * 最后一条的 id。吸底只认它：`items` 每次快照都是新数组，读 `.length` 看着像“只在条数变了
@@ -74,7 +85,11 @@
   const reachable = $derived(peers.filter((d) => devices.deviceDotState(d) !== "offline").length);
   /** 原型 `subText`：一对一按链路/可达性写，多台会话写"几台送得到"。 */
   const sub = $derived(
-    mode === "direct"
+    localSendThread
+      ? activePeer?.online
+        ? t("LocalSend · 在线")
+        : t("LocalSend · 离线")
+      : mode === "direct"
       ? linked > 0
         ? t("长连接 · 在线")
         : reachable > 0
@@ -180,7 +195,9 @@
    */
   async function send(): Promise<void> {
     try {
-      const res = await chat.sendComposer(convoKey);
+      const res = await (localSendThread
+        ? chat.sendLocalSendComposer(convoKey)
+        : chat.sendComposer(convoKey));
       const el = inputEl;
       if (el) {
         applyComposer(el, chat.draftSegsOf(convoKey));
@@ -319,6 +336,84 @@
     });
   }
 
+  // ── 长按一条消息 = 复制整条（移动端的"消息右键菜单"） ────────────────────────
+  //
+  // 与设备行同一套手势（`DevicesTab.pressStart`）：自己计时，不用 `contextmenu`。
+  // 消息里全是文字，WebView 的长按会先走去选文字 / 弹系统菜单，所以 `mobile.css` 把
+  // `.msg` 的 `user-select` / `-webkit-touch-callout` 关掉了 —— 这条手势让位给"复制整条"。
+  // 手指挪动超过 slop 就当成在滑记录，撤销这次按压；长按触发后紧跟的那次 click 不能
+  // 再打开图片/文件（见 `pressEnd` / `onPressClick`）。
+  const LONG_PRESS_MS = 500;
+  const LONG_PRESS_SLOP = 8;
+
+  let pressTimer: ReturnType<typeof setTimeout> | null = null;
+  let pressFrom = { x: 0, y: 0 };
+  let pressedItem: ChatItem | null = null;
+  let longPressFired = false;
+  /** 长按松手后那一下 click 的截止时间（浏览器会在 pointerup 之后补一个 click）。 */
+  let suppressClickUntil = 0;
+
+  function pressStart(e: PointerEvent): void {
+    if (!e.isPrimary || (e.pointerType === "mouse" && e.button !== 0)) return;
+    const target = e.target as Element | null;
+    // 收进来的推送邀请也是一条消息（桌面端那条 `.chat-msg` 同样能右键复制它的名字与大小）；
+    // 但卡片上「接收 / 拒绝」自己的按压不算长按 —— 那是两个动作按钮。
+    if (target?.closest?.(".inv-acts")) return;
+    const el = target?.closest?.(".msg, .invite") as HTMLElement | null;
+    const item = el?.dataset.id ? items.find((i) => i.id === el.dataset.id) : undefined;
+    if (!item) return;
+    pressFrom = { x: e.clientX, y: e.clientY };
+    pressedItem = item;
+    longPressFired = false;
+    pressTimer = setTimeout(() => {
+      pressTimer = null;
+      longPressFired = true;
+      const target = pressedItem;
+      pressedItem = null;
+      if (target) openMessageActions(target);
+    }, LONG_PRESS_MS);
+  }
+
+  function pressMove(e: PointerEvent): void {
+    if (!pressTimer) return;
+    if (
+      Math.abs(e.clientX - pressFrom.x) > LONG_PRESS_SLOP ||
+      Math.abs(e.clientY - pressFrom.y) > LONG_PRESS_SLOP
+    ) {
+      pressEnd();
+    }
+  }
+
+  function pressEnd(): void {
+    if (pressTimer) {
+      clearTimeout(pressTimer);
+      pressTimer = null;
+    }
+    pressedItem = null;
+    if (longPressFired) {
+      suppressClickUntil = Date.now() + 400;
+      longPressFired = false;
+    }
+  }
+
+  /** 捕获阶段吃掉长按之后的 click：文件气泡是按钮、图片气泡点开看大图，都不该顺手触发。 */
+  function onPressClick(e: MouseEvent): void {
+    if (Date.now() > suppressClickUntil) return;
+    suppressClickUntil = 0;
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  /** 长按一条消息时打开的底板（复制整条）。文案与桌面端右键菜单同一份（`chat.copyTextOf`）。 */
+  function openMessageActions(item: ChatItem): void {
+    const copyText = chat.copyTextOf(item);
+    if (!copyText) return;
+    // 表头只写"谁 · 什么时候"，正文预览留给气泡本身 —— 把整段消息再抄进表头并不更好读。
+    const who = item.fromMe ? "" : speakerName(item);
+    const desc = [who, chat.stamp(item.at)].filter(Boolean).join(" · ");
+    store.openSheet({ kind: "messageActions", copyText, desc });
+  }
+
   // 来了新消息就贴到底。依赖的是**最后一条的 id**，不是数组长度/数组身份：文件进度、
   // 图片路径这些同长度更新不该把正在翻历史的滚动位置拽走（见 `tail` 的说明）。
   // `convoKey` 也要读 —— 换一条会话时哪怕最后一条一样，也得先贴到底；`logEl` 从 null 变成
@@ -431,6 +526,9 @@
   </span>
   <div class="cb-main">
     <span class="cb-title">{title}</span>
+    {#if localSendThread}
+      <span class="state-chip localsend" style="flex:none; font-size:9px; padding:1px 5px" title="LocalSend">LS</span>
+    {/if}
     <span class="cb-sub"><i class="cv-dot {dot} {trusted ? 'solid' : 'hollow'}"></i>{sub}</span>
   </div>
   <!-- 左边那格槽的**镜像**：会话名是在「左右两格之间的剩余空间」里居中的，左边多出 34u 的话
@@ -459,12 +557,29 @@
   </div>
 {/if}
 
-<div class="chatlog" bind:this={logEl} role="log" aria-label={t("会话记录")} onscroll={onLogScroll}>
+<div
+  class="chatlog"
+  bind:this={logEl}
+  role="log"
+  aria-label={t("会话记录")}
+  onscroll={onLogScroll}
+  onpointerdown={pressStart}
+  onpointermove={pressMove}
+  onpointerup={pressEnd}
+  onpointercancel={pressEnd}
+  onpointerleave={pressEnd}
+  onclickcapture={onPressClick}
+  oncontextmenu={(e) => e.preventDefault()}
+>
   {#if !items.length}
     <div class="empty">
       <Icon name="chat" />
       <p>{t("还没有消息")}</p>
-      <p class="es">{t("发一条消息或传一个文件，开始和设备对话。")}</p>
+      <p class="es">
+        {localSendThread
+          ? t("发一条消息或粘贴图片；普通文件用「＋」发送。")
+          : t("发一条消息或传一个文件，开始和设备对话。")}
+      </p>
     </div>
   {/if}
   {#each items as item (item.id)}
@@ -472,7 +587,7 @@
     {#if item.kind === "file" && item.inviteState === "pending"}
       <!-- 收进来的推送邀请：接收 / 拒绝要落到后端（`answerInvite`），这张卡才会跟着事件变成
            "接收中 / 已接收"（这条消息的状态是推送事件写的，不是这里自己记的）。 -->
-      <div class="invite">
+      <div class="invite" data-id={item.id}>
         <div class="inv-head">
           <Icon name="file" />
           <span class="cv-main">
@@ -492,7 +607,13 @@
         </div>
       </div>
     {:else}
-      <div class="msg" class:me={item.fromMe} class:peer={!item.fromMe} class:bc={mode === "broadcast"}>
+      <div
+        class="msg"
+        class:me={item.fromMe}
+        class:peer={!item.fromMe}
+        class:bc={mode === "broadcast"}
+        data-id={item.id}
+      >
         {#if mode === "group" && !item.fromMe}
           <!-- 颜色档按**设备 id**（`speakerIndex` 本来就是按 id 哈希的）：跟着名字走的话，对方改
                一次名颜色就跳，同一个人的两句话会被认成两个人。 -->
@@ -649,13 +770,18 @@
   <button
     class="cbtn cplus"
     type="button"
-    aria-label={t("发送文件、图片或应用")}
-    title={t("选图片（落进输入区）、选文件（当场推送）或发送一个应用")}
+    aria-label={localSendThread ? t("发送文件到 LocalSend 设备") : t("发送文件、图片或应用")}
+    title={localSendThread ? t("发送文件到 LocalSend 设备") : t("选图片（落进输入区）、选文件（当场推送）或发送一个应用")}
     onclick={() => store.openSheet({ kind: "attach" })}
   >
     <Icon name="plus" />
   </button>
-  <button class="cbtn csend" type="submit" aria-label={t("发送消息")} disabled={!canSend}>
+  <button
+    class="cbtn csend"
+    type="submit"
+    aria-label={t("发送消息")}
+    disabled={!canSend}
+  >
     <Icon name="send" />
   </button>
 </form>

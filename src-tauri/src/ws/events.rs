@@ -397,6 +397,11 @@ pub mod ui {
     pub const SHARES_CHANGED: &str = "shares://changed";
     pub const SERVER_STARTED: &str = "server://started";
     pub const SERVER_ERROR: &str = "server://error";
+    /// LocalSend 兼容面的运行时状态（发现是否在跑、53317 是监听/被占/回落）。
+    ///
+    /// 载荷是**整份 `localsend::LocalSendStatus` 快照**：字段少、变化慢，前端直接画，
+    /// 不需要增量。开关本身还可能开/关失败，状态与开关是两件事（见设置页）。
+    pub const LOCALSEND_STATUS: &str = "localsend://status";
     /// 第二份进程被启动 → 本实例被调到前台，悬浮球面板展开。
     pub const ORB_SHOW: &str = "orb://show";
     /// 托盘左键**单击**、且此刻有事等处理 → 界面落到"该看的那一件事"上（未读会话 / 群邀请 /

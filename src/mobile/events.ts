@@ -4,8 +4,8 @@
  * **为什么需要这个文件**：`push://*` 这一族事件原先只在桌面端登记（`src/App.svelte` 的
  * `unPushInvite` / `unPushBatch` / `unPushResponse` / `unPushProgress` / `unPushDone`），
  * 移动端的模块图里一条都没有。缺席的是**界面这一半**：后端那半边一直是全的（邀请落账、
- * 进度、终局都在 `chat` / `push_job` 里跑，已配对设备还会 `auto` 直接开收，
- * 见 `server/routes_push.rs`），而把事件翻译进共享会话 store（`$lib/stores/chat.svelte` 的
+ * 进度、终局都在 `chat` / `push_job` 里跑，已配对且开了「自动接收」的设备还会 `auto`
+ * 直接开收，见 `server/routes_push.rs`），而把事件翻译进共享会话 store（`$lib/stores/chat.svelte` 的
  * `noteInboundInvite` 等）这一步没人做。表现就是**PC 在会话里发来的文件，安卓的会话里
  * 什么都不出现**，而且「文件」页的"待接收 / 传输中"永远空着 —— 那两处都是从会话里的
  * 文件消息筛出来的（`src/mobile/store.svelte.ts` 的 `pendingInvites` / `activeTransfers`）。
@@ -51,8 +51,8 @@ import { t } from "$lib/i18n.svelte";
 import * as store from "./store.svelte";
 
 export const ready: Promise<void> = (async () => {
-  // 别人推来的文件：会话里当场落一条文件消息。已配对设备后端已经 `auto` 收下了，
-  // 那张卡一出现就是"接收中"；未绑定的那条要等人在卡上点「接收」。
+  // 别人推来的文件：会话里当场落一条文件消息。`auto`（已配对 + 开着自动接收）后端
+  // 已经收下了，那张卡一出现就是"接收中"；其余情况要等人在卡上点「接收」。
   await listen<PushInvite>("push://invite", (ev) => {
     const inv = ev.payload;
     chat.noteInboundInvite(inv);

@@ -100,5 +100,8 @@
   "系统启动管理": "System startup management",
   "系统电池设置": "System battery settings",
   "系统权限设置": "System permission settings",
-  "系统后台耗电管理": "Background power management"
+  "系统后台耗电管理": "Background power management",
+  "从本机列表移除「{name}」？它还在网上时会重新出现。": "Remove “{name}” from this device’s list? It will reappear while still online.",
+  "打开与「{name}」的 LocalSend 会话：可以发文字；图片/文件按 LocalSend 文件传输，每批需要对方确认。": "Open the LocalSend conversation with “{name}”: you can send text; images/files use LocalSend file transfer and each batch must be confirmed on the other device.",
+  "消息操作": "Message actions"
 }

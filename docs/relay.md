@@ -479,6 +479,10 @@ B 落库后：`relayRoutes[AB 段] = { viaCidr: CD 段, viaDevices: [C, D] }` �
 | `discovery_reports_nets_and_per_peer_cidr` | `/pair/info` 带 `nets` 与 `relay`；`/discover` 带 `nets` + `ver: 2`，表里每条带 `relay` 与 `cidr`（算不出归属段时省略这一格） |
 | `remembered_pool_from_a_route_record_opens_a_relay` | 应用反向记录之后（接收方对那一段**没有任何 mDNS 视野**），按记录里的池借到中转、端点把字节搬到位 |
 
+> 日志级别：`开了中转端点` / `复用已开的中转端点` / `中转方报来它那一段的中转池` 现在是
+> `debug` 级（稳态下每 30s 会各出现一次，默认 `info` 里只剩状态变化）。复现下面的记录时带
+> `RUST_LOG=debug` 看这几行。
+
 真机 / 真进程（本机实测：同时起 3 个 `orbdrop.exe` 实例 —— 中转方 C（`allowRelay=true`）、
 目标 B、请求方 R；C 的地址簿里认识 B；请求方**未与 C 配对**）：
 

@@ -10,4 +10,4 @@
   let { state }: { state: DeviceState } = $props();
 </script>
 
-<span class="state-chip {state.chip}"><i class="dot {state.dot} {state.trusted ? 'solid' : 'hollow'}"></i>{state.label}</span>
+<span class="state-chip {state.chip}" title={state.chip === "localsend" ? "LocalSend" : undefined}><i class="dot {state.dot} {state.trusted ? 'solid' : 'hollow'}"></i>{state.label}</span>

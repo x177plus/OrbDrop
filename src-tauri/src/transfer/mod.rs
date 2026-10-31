@@ -53,6 +53,7 @@ const HTTP_INVITE_TIMEOUT: Duration = Duration::from_secs(75);
 /// 对端只把它接到 `<下载目录>/<发送方名>/` 后面；`sources` 是本机侧的翻译表。
 /// 多选推送之所以能落成"多文件就是多文件"，靠的就是这两件事：发送方在生成时就决定了
 /// 每条路径的顶层名字（各源自己的名字），对端不需要再猜、也不再套"推送名"那一层。
+#[derive(Clone)]
 pub struct PushSource {
     /// 只用于显示（通知/卡片里"推的是什么"）；**不参与落盘路径**。
     pub name: String,
@@ -423,65 +424,97 @@ pub async fn push_paths(
     // 先给每台定一行：不在网上的这台**就地失败、不排队**（F-53），能派的进 `pending` 去发邀请。
     let mut targets: Vec<push_job::BatchTarget> = Vec::new();
     let mut pending: Vec<(crate::config::PeerDevice, String)> = Vec::new();
+    let mut local_pending: Vec<(crate::localsend::LocalSendPeer, String)> = Vec::new();
     let mut first_reason: Option<String> = None;
     for peer_id in &ids {
-        let Some(peer) = state.get_peer(peer_id) else {
+        if let Some(peer) = state.get_peer(peer_id) {
+            if !peer.online || peer.ip.is_empty() || peer.port == 0 {
+                let reason = format!("「{}」不在网上，推送未发送", peer.name);
+                first_reason.get_or_insert(reason.clone());
+                targets.push(push_job::BatchTarget {
+                    peer_id: peer.id.clone(),
+                    peer_name: peer.name.clone(),
+                    invite_id: String::new(),
+                    transport: crate::config::PeerTransport::OrbDrop,
+                    paired: peer.paired,
+                    state: push_job::TargetState::Failed,
+                    received: 0,
+                    error: Some(reason),
+                });
+                continue;
+            }
+            let invite_id = uuid::Uuid::new_v4().to_string();
+            let job = PushJob::new(
+                invite_id.clone(),
+                batch_id.clone(),
+                peer.id.clone(),
+                peer.name.clone(),
+                source.name.clone(),
+                source.is_dir,
+                source.sources.clone(),
+                peer.paired,
+            );
+            // **这条从这一刻起就该被接手**：先落盘再进内存（`accepted = false` —— 等对面真的开始拉，
+            // 由 `update_status` 升级成 `true`，见 `push_out::OutJob::accepted`）。
+            // 一次发送只在"建"与"对面开始拉"这两个时刻动盘，进度不写。
+            state.push.out.save_job(push_job::out_job_of(&job, false));
+            state.push.insert_job(job);
+            targets.push(push_job::BatchTarget {
+                peer_id: peer.id.clone(),
+                peer_name: peer.name.clone(),
+                invite_id: invite_id.clone(),
+                transport: crate::config::PeerTransport::OrbDrop,
+                paired: peer.paired,
+                state: push_job::TargetState::Invited,
+                received: 0,
+                error: None,
+            });
+            pending.push((peer, invite_id));
+        } else if let Some(peer) = state.localsend.get(peer_id) {
+            if !peer.alive() || peer.ip.is_empty() || peer.port == 0 {
+                let reason = format!("「{}」不在 LocalSend 网上，推送未发送", peer.alias);
+                first_reason.get_or_insert(reason.clone());
+                targets.push(push_job::BatchTarget {
+                    peer_id: peer.id.clone(),
+                    peer_name: peer.alias.clone(),
+                    invite_id: String::new(),
+                    transport: crate::config::PeerTransport::LocalSend,
+                    paired: false,
+                    state: push_job::TargetState::Failed,
+                    received: 0,
+                    error: Some(reason),
+                });
+                continue;
+            }
+            let invite_id = uuid::Uuid::new_v4().to_string();
+            targets.push(push_job::BatchTarget {
+                peer_id: peer.id.clone(),
+                peer_name: peer.alias.clone(),
+                invite_id: invite_id.clone(),
+                transport: crate::config::PeerTransport::LocalSend,
+                paired: false,
+                state: push_job::TargetState::Invited,
+                received: 0,
+                error: None,
+            });
+            local_pending.push((peer, invite_id));
+        } else {
             let reason = format!("设备不存在: {peer_id}");
             first_reason.get_or_insert(reason.clone());
             targets.push(push_job::BatchTarget {
                 peer_id: peer_id.clone(),
                 peer_name: peer_id.clone(),
                 invite_id: String::new(),
+                transport: crate::config::PeerTransport::OrbDrop,
                 paired: false,
                 state: push_job::TargetState::Failed,
                 received: 0,
                 error: Some(reason),
             });
-            continue;
-        };
-        if !peer.online || peer.ip.is_empty() || peer.port == 0 {
-            let reason = format!("「{}」不在网上，推送未发送", peer.name);
-            first_reason.get_or_insert(reason.clone());
-            targets.push(push_job::BatchTarget {
-                peer_id: peer.id.clone(),
-                peer_name: peer.name.clone(),
-                invite_id: String::new(),
-                paired: peer.paired,
-                state: push_job::TargetState::Failed,
-                received: 0,
-                error: Some(reason),
-            });
-            continue;
         }
-        let invite_id = uuid::Uuid::new_v4().to_string();
-        let job = PushJob::new(
-            invite_id.clone(),
-            batch_id.clone(),
-            peer.id.clone(),
-            peer.name.clone(),
-            source.name.clone(),
-            source.is_dir,
-            source.sources.clone(),
-            peer.paired,
-        );
-        // **这条从这一刻起就该被接手**：先落盘再进内存（`accepted = false` —— 等对面真的开始拉，
-        // 由 `update_status` 升级成 `true`，见 `push_out::OutJob::accepted`）。
-        // 一次发送只在"建"与"对面开始拉"这两个时刻动盘，进度不写。
-        state.push.out.save_job(push_job::out_job_of(&job, false));
-        state.push.insert_job(job);
-        targets.push(push_job::BatchTarget {
-            peer_id: peer.id.clone(),
-            peer_name: peer.name.clone(),
-            invite_id: invite_id.clone(),
-            paired: peer.paired,
-            state: push_job::TargetState::Invited,
-            received: 0,
-            error: None,
-        });
-        pending.push((peer, invite_id));
     }
 
-    if pending.is_empty() {
+    if pending.is_empty() && local_pending.is_empty() {
         // 一台都派不出去 = 单台推送那条"就地失败"（F-53）：界面弹一条提示，不建卡片。
         // 单台时沿用原来那句原话，多台时给一句能概括的。
         return Err(if ids.len() == 1 {
@@ -493,6 +526,7 @@ pub async fn push_paths(
             )
         });
     }
+    let has_orbdrop_pending = !pending.is_empty();
 
     let batch = push_job::PushBatch {
         id: batch_id.clone(),
@@ -504,10 +538,11 @@ pub async fn push_paths(
         last_emit: Instant::now(),
     };
     // 卡片也落一份（含**用户这次点的那几项** `roots`：重启后要按它把源监视挂回去）。
-    state
-        .push
-        .out
-        .save_batch(push_job::out_batch_of(&batch, &roots));
+    // LocalSend-only 的批次没有可恢复的 job（`out_batch_of` 会过滤掉全部目标），不写空批次。
+    let out_batch = push_job::out_batch_of(&batch, &roots);
+    if !out_batch.targets.is_empty() {
+        state.push.out.save_batch(out_batch);
+    }
     let view = state.push.insert_batch(batch);
     if let Ok(value) = serde_json::to_value(&view) {
         ws::emit_ui(&state, ws::events::ui::PUSH_BATCH, &value);
@@ -534,9 +569,63 @@ pub async fn push_paths(
         spawn_invite_delivery(state.clone(), peer, invite_id, event, server_port);
     }
 
-    // 这批里有台在等对方点头（`Invited`）→ 盯住这次推的源：源一变，这批当场作废。
-    // 这是"我这边取消"的另一半（另一半是用户点「取消」）—— 见 `watch`。
-    if state.push.batch_has_invited(&batch_id) {
+    // LocalSend 目标：没有 `PushJob`（协议不支持续传），只建批次行；由客户端推字节并推进
+    // 同一张批次卡。失败只落自己那一行。
+    //
+    // **走 per-device lane**：接收端只有一个上传会话槽，直接 spawn 会和同一台设备的
+    // 文本/图片、以及另一次文件推送撞 409。取消令牌在**排队前**就登记，排队期间点取消
+    // 也能收掉（`cancel_push` 只认这张表）。
+    for (peer, invite_id) in local_pending {
+        let lane_id = peer.id.clone();
+        let job_state = state.clone();
+        let source = source.clone();
+        let batch_id = batch_id.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        state
+            .localsend
+            .register_outbound(invite_id.clone(), cancel.clone());
+        state.localsend.enqueue_outbound(
+            &lane_id,
+            Box::pin(async move {
+                let job_invite = invite_id;
+                if cancel.is_cancelled() {
+                    job_state.localsend.unregister_outbound(&job_invite);
+                    push_job::batch_set(
+                        &job_state,
+                        &job_invite,
+                        push_job::TargetState::Cancelled,
+                        None,
+                        Some("已取消".to_string()),
+                        true,
+                    );
+                    return;
+                }
+                if let Err(e) = crate::localsend::client::send_files(
+                    job_state.clone(),
+                    peer,
+                    batch_id,
+                    job_invite.clone(),
+                    source,
+                    cancel,
+                )
+                .await
+                {
+                    push_job::batch_set(
+                        &job_state,
+                        &job_invite,
+                        push_job::TargetState::Failed,
+                        None,
+                        Some(e),
+                        true,
+                    );
+                }
+            }),
+        );
+    }
+
+    // 这批里有**OrbDrop**台在等对方点头（`Invited`）→ 盯住这次推的源：源一变，这批当场作废。
+    // LocalSend 目标不走源监视（它没有可续的 job，客户端自己会失败）。
+    if has_orbdrop_pending && state.push.batch_has_invited(&batch_id) {
         watch::watch_sources(&state, &batch_id, &roots);
     }
 
@@ -737,6 +826,19 @@ async fn deliver_invite_http(
 ///   点「接收」才发现早就没了；
 /// - 已经在传 → 下载端点会当场断流、下一次请求拿到 410，收手更快。
 pub fn cancel_push(state: &AppState, invite_id: &str) -> Result<(), String> {
+    // LocalSend 目标没有 `PushJob`：它的取消令牌在 LocalSendState 里。
+    if state.localsend.outbound_cancel(invite_id).is_some() {
+        crate::localsend::client::cancel(state, invite_id);
+        push_job::batch_set(
+            state,
+            invite_id,
+            push_job::TargetState::Cancelled,
+            None,
+            Some("已取消".to_string()),
+            true,
+        );
+        return Ok(());
+    }
     cancel_push_with(state, invite_id, "已取消", "发送方已取消")
 }
 
@@ -801,7 +903,17 @@ pub fn cancel_push_batch_with(
         .batch_targets(batch_id)
         .ok_or_else(|| "推送不存在".to_string())?;
     for target in targets {
-        if target.state.is_waiting() {
+        if target.transport == crate::config::PeerTransport::LocalSend {
+            crate::localsend::client::cancel(state, &target.invite_id);
+            push_job::batch_set(
+                state,
+                &target.invite_id,
+                push_job::TargetState::Cancelled,
+                None,
+                Some(card.to_string()),
+                true,
+            );
+        } else if target.state.is_waiting() {
             let _ = cancel_push_with(state, &target.invite_id, card, wire);
         }
     }
@@ -843,10 +955,10 @@ pub fn schedule_invite_timeout(state: Arc<AppState>, invite_id: String) {
 
 /// 接收方：同意一条邀请 → 开始拉取（F-52）。
 ///
-/// `root` = 这次接收的落盘根目录：`None` 用设置里的下载目录。只有界面在「每次询问」
-/// （`DownloadMode::AskEachTime`）下替用户问过目录时才带它 —— 已配对设备免同意自动收，
-/// 走的是 `None`。传进来就**先验一次**（必须绝对路径、能建出来），不合格当场返回错误、
-/// 这条邀请**原样留着**（卡片还在，用户能换个目录再点一次），也不放行发送方。
+/// `root` = 这次接收的落盘根目录：`None` 用设置里的下载目录。只有界面在「每次选择位置」
+/// （`DownloadMode::AskEachTime`）下替用户问过目录时才带它 —— 自动接收（已配对 + 开着
+/// 「已配对设备自动接收」）走的是 `None`。传进来就**先验一次**（必须绝对路径、能建出来），
+/// 不合格当场返回错误、这条邀请**原样留着**（卡片还在，用户能换个目录再点一次），也不放行发送方。
 pub fn accept_invite(
     state: Arc<AppState>,
     invite_id: &str,
@@ -1551,6 +1663,7 @@ mod tests {
             peer_id: peer.into(),
             peer_name: peer.into(),
             invite_id: invite.into(),
+            transport: crate::config::PeerTransport::OrbDrop,
             paired: true,
             state,
             received: 0,
