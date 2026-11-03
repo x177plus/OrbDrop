@@ -53,6 +53,20 @@
     if (upd.updatePrompt() && !store.currentSheet()) store.openSheet({ kind: "update" });
   });
 
+  /**
+   * 底板一开，最上面状态栏露出的那一层窗口底色也跟着遮罩变暗。
+   *
+   * 页面里的 `.scrim` 是 WebView 内的绝对定位层，而 WebView 被 `MainActivity` 按系统栏
+   * inset 缩过边 —— `inset: 0` 也只能到 WebView 边界，状态栏那一条会保持白色。这里交给原生
+   * 换窗口底色（`sheet_scrim` / `SheetScrimPlugin`）；失败静默，底板本身不受影响。导航栏在
+   * 部分 ROM 上是系统自己画的，不跟这一层走。
+   *
+   * 依赖写成 `!!sheet`（而不是 `sheet` 对象）：换一张底板时状态栏不需要重算。
+   */
+  $effect(() => {
+    void api.setSheetScrim(!!sheet).catch(() => {});
+  });
+
   /** 顶部那一行：标题、副标题、右侧动作 —— 四个 tab 各一份，与原型一致。 */
   const bar = $derived.by((): { title: string; sub: string; act?: { icon: IconName; label: string; run: () => void } } => {
     if (tab === "convos") {
@@ -103,6 +117,8 @@
     // 顺序就是"从最上面一层开始收"：底板 → 会话子屏 → 非首层 tab；都没有才返回 false，
     // 让原生那边按平台惯例退出应用。桌面端永远不会调用它（没有那段 Kotlin）。
     (window as unknown as Record<string, unknown>).__orbdropBack = () => {
+      // 最上面一层先收：会话里那颗「复制」小气泡（它自己挂在 ChatScreen 上）。
+      if (store.runBackCloser()) return true;
       if (store.currentSheet()) {
         store.closeSheet();
         return true;

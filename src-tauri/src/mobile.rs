@@ -349,16 +349,31 @@ pub struct PickedFile {
     pub name: String,
     pub size: u64,
     pub mime: String,
+    /// 这一项是一整棵目录（原生已经把整棵树拷进缓存，`path` 是那棵树的根）。
+    ///
+    /// 界面据此把它标成"文件夹"（会话里那条气泡 / 推送卡），并让推送按目录建清单
+    /// （`transfer::manifest_for_named_paths` 看的是路径本身，不读这个标志）。
+    pub is_dir: bool,
+    /// 准备目录时**跳过的子项数**（读不到的项；单文件恒为 0）。
+    ///
+    /// 一棵几千项的树里有个别取不下来的项不该让整次发送失败（与桌面端走查同一条取舍），
+    /// 但界面必须说一声 —— 悄悄少几项比报错更坏。见 `PickFilePlugin.copyTreeToCache`。
+    pub skipped: u64,
 }
 
-/// 安卓：开一次系统选择器（`kind` = `"image"` 或 `"file"`），把选中的几项拷成应用缓存里的
-/// 暂存文件，返回它们的路径 / 名字 / 大小。
+/// 安卓：开一次系统选择器（`kind` = `"image"`、`"file"` 或 `"folder"`），把选中的几项拷成应用
+/// 缓存里的暂存文件/目录，返回它们的路径 / 名字 / 大小。
 ///
 /// **为什么必须有这一跳**：桌面端那颗「＋」开的是自绘的本机文件浏览器（`fs_browse` 那几条命令
 /// 全被 `#[cfg(desktop)]` 门控），安卓上没有对等物 —— 分区存储不给"按路径列共享存储"，非媒体
 /// 文件连读都读不到，只能走 SAF 的 URI 读授权。而发文件（推送）与发图片（会话消息）只认本机
 /// **真实路径**，所以 URI 必须在原生这一侧换成文件，界面拿到的才是一条能直接进
 /// `push_paths` / `chat_send_image` 的路径（与粘贴图片那条路同一个形状，见 `resolve_image_uri`）。
+///
+/// `"folder"` 走的是系统的目录选择器（`ACTION_OPEN_DOCUMENT_TREE`），回来的是**一整棵树的读
+/// 授权**；原生按那棵树递归拷贝，保留目录结构（空目录不落文件、空文件照收），根路径就是界面
+/// 拿到的那一条 `path`。`is_dir` = true，`skipped` = 读不到而跳过的子项数（界面会提示）。
+/// 一棵目录只回一项（系统不支持目录多选）；`size` 是树里所有文件的和。
 ///
 /// **取消不是错误**：用户在系统选择器里按返回键，Kotlin 回一份空表 —— 这里原样返回空 `Vec`，
 /// 界面据此什么都不做（写成一个错误的话，用户每次反悔都会看到一条"失败"提示）。
@@ -382,6 +397,8 @@ pub async fn pick_files(kind: String) -> Result<Vec<PickedFile>, String> {
                 name: it["name"].as_str().unwrap_or_default().to_string(),
                 size: it["size"].as_u64().unwrap_or(0),
                 mime: it["mime"].as_str().unwrap_or_default().to_string(),
+                is_dir: it["isDir"].as_bool().unwrap_or(false),
+                skipped: it["skipped"].as_u64().unwrap_or(0),
                 path,
             })
         })

@@ -73,7 +73,10 @@
     try {
       // 原型拼的是 `settings.inboxDir + '/' + name`（那份设置是 mock）；真实后端把完整路径
       // 随着收件项一起给全了，不自己拼，免得目录名一改就指到不存在的地方。
-      await navigator.clipboard.writeText(path);
+      // 走原生复制：WebView 的 `navigator.clipboard` 在安卓上永远拒绝写入
+      // （`Write permission denied`），而且这里还是**先关表、后写**——那条 Web 路要文档有焦点，
+      // 关表之后就更是必失败（以前这里一直坏着，用户只看到「复制路径失败」）。
+      await api.copyText(path);
       store.toast(t("已复制路径"), "copy");
     } catch (e) {
       store.toast(t("复制路径失败：{error}", { error: e instanceof Error ? e.message : String(e) }));

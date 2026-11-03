@@ -7,6 +7,8 @@ pub mod bc;
 /// 字节单独一份文件；文件本身是封装格式（见 `envelope`）。
 pub mod blobs;
 pub mod chat;
+/// 系统剪贴板（安卓上的写剪贴板；桌面端没有这条命令，见模块注释）。
+pub mod clipboard;
 pub mod config;
 pub mod credential;
 pub mod discover;
@@ -27,7 +29,7 @@ pub mod link;
 pub mod localsend;
 pub mod log;
 pub mod mirror;
-// 移动端专属命令（收件目录列举/删除）：只在 Android 构建里登记。
+/// 移动端专属命令（收件目录列举/删除）：只在 Android 构建里登记。
 #[cfg(mobile)]
 pub mod mobile;
 pub mod net;
@@ -51,6 +53,8 @@ pub mod state;
 /// IPv4 网段（CIDR）判定与自报（F-107 §5）。
 pub mod subnet;
 pub mod system_settings;
+#[cfg(mobile)]
+pub mod sheet_scrim;
 pub mod task;
 pub mod transfer;
 #[cfg(desktop)]
@@ -2981,7 +2985,7 @@ async fn resolve_image_uri(uri: String) -> Result<mobile::PickedImage, String> {
 /// 桌面端那颗「＋」开的是自绘的本机文件浏览器（`fs_browse` 那几条命令只在桌面端登记），安卓上
 /// 没有对等物：分区存储下非媒体文件拿不到可读路径，只能走 SAF 的 URI 读授权 —— 而推送与
 /// 会话图片都只认本机真实路径，所以 URI 必须在原生那一侧换成文件。取消回空表（**不是**错误）。
-/// 机制与取舍见 `mobile::pick_files`。
+/// `kind` 多一档 `"folder"`（整棵目录树，见下）；机制与取舍见 `mobile::pick_files`。
 #[cfg(mobile)]
 #[tauri::command]
 async fn pick_files(kind: String) -> Result<Vec<mobile::PickedFile>, String> {
@@ -3770,6 +3774,16 @@ pub fn run() {
     #[cfg(mobile)]
     let builder = builder.plugin(system_settings::plugin());
 
+    // 底板遮罩打开时，让状态栏露出的**窗口底色**跟着变暗：WebView 按系统栏 inset 缩过边，
+    // CSS 的 `.scrim` 只能盖到 WebView 边界，盖不到那一条。见 `sheet_scrim`。
+    #[cfg(mobile)]
+    let builder = builder.plugin(sheet_scrim::plugin());
+
+    // 写系统剪贴板：Android WebView 的 `navigator.clipboard.writeText` 永远拒绝写入
+    // （`NotAllowedError: Write permission denied.`），只能回原生 —— 见 `clipboard` 的模块注释。
+    #[cfg(mobile)]
+    let builder = builder.plugin(clipboard::plugin());
+
     // 界面（Activity / WebView）还在不在：安卓把 Activity 销毁之后，Rust 叫 Kotlin 那条路
     // （wry 的 `dispatch`）会 panic，而 release 档 `panic = "abort"` 是整个进程倒地 ——
     // 见 `notify::set_ui_alive`。这里只记账，判断在发通知那一步。
@@ -3918,6 +3932,12 @@ pub fn run() {
             system_settings::keepalive_guided,
             #[cfg(mobile)]
             system_settings::mark_keepalive_guided,
+            // 底板遮罩打开时窗口底色（状态栏露出的那一层）一起变暗 —— 见 `sheet_scrim`。
+            #[cfg(mobile)]
+            sheet_scrim::set_sheet_scrim,
+            // 写系统剪贴板（安卓 WebView 的 Web 剪贴板 API 不可用，见 `clipboard`）。
+            #[cfg(mobile)]
+            clipboard::copy_text,
             #[cfg(mobile)]
             notify::notification_state,
             #[cfg(mobile)]

@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
@@ -18,7 +19,9 @@ import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.io.File
 import java.text.SimpleDateFormat
+import java.util.ArrayDeque
 import java.util.Date
+import java.util.HashSet
 import java.util.Locale
 import java.util.UUID
 
@@ -45,7 +48,7 @@ import java.util.UUID
  */
 @InvokeArg
 class PickArgs {
-  /** `"image"` 或 `"file"`（后端只放这两个值过来；别的按文件处理）。 */
+  /** `"image"`、`"file"` 或 `"folder"`（后端只放这三个值过来；别的按文件处理）。 */
   var kind: String? = null
 }
 
@@ -55,9 +58,14 @@ class PickFilePlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun pick(invoke: Invoke) {
     val args = invoke.parseArgs(PickArgs::class.java)
-    val image = args.kind == "image"
-    val intent = if (image) imageIntent() else fileIntent()
-    intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+    val kind = args.kind
+    val intent = when (kind) {
+      "image" -> imageIntent()
+      // 目录只能一次选一棵（系统没有"多目录树"这回事），所以单独一支。
+      "folder" -> treeIntent()
+      else -> fileIntent()
+    }
+    if (kind != "folder") intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
     try {
       startActivityForResult(invoke, intent, "picked")
     } catch (e: Exception) {
@@ -75,15 +83,21 @@ class PickFilePlugin(private val activity: Activity) : Plugin(activity) {
       invoke.resolve(empty)
       return
     }
-    // `@ActivityCallback` 在主线程上执行；这里可能是一整个 500 MB–1 GB 的视频/安装包，
-    // `copyToCache` 的 `ins.copyTo` 不能占着 UI 线程（否则就是 ANR）。URI 列表先在主线程
-    // 取好，复制放到后台线程，结果再回主线程 resolve。
-    val uris = urisOf(result.data)
+    // `@ActivityCallback` 在主线程上执行；这里可能是一整个 500 MB–1 GB 的视频/安装包
+    // （或一整棵目录），`copyToCache` 的 `ins.copyTo` 不能占着 UI 线程（否则就是 ANR）。
+    // URI 先在主线程取好：目录树那一支拿的是 `data.data` 本身（它才是 tree URI），
+    // 普通文件那一支拿 `clipData` / `data`；两种解析都在后台线程里完成。
+    val tree = result.data?.data?.takeIf { DocumentsContract.isTreeUri(it) }
+    val data = result.data
     Thread {
       try {
         val files = JSArray()
-        for (uri in uris) {
-          files.put(copyToCache(uri))
+        if (tree != null) {
+          files.put(copyTreeToCache(tree))
+        } else {
+          for (uri in urisOf(data)) {
+            files.put(copyToCache(uri))
+          }
         }
         val out = JSObject()
         out.put("files", files)
@@ -112,6 +126,16 @@ class PickFilePlugin(private val activity: Activity) : Plugin(activity) {
   /** 选文件的那一支：任何类型都列出来（通配符见 `ANY_TYPE`；用户要发什么由他挑，不按扩展名收窄）。 */
   private fun fileIntent(): Intent = openable(ANY_TYPE)
 
+  /**
+   * 选目录的那一支：系统的目录选择器（SAF，`ACTION_OPEN_DOCUMENT_TREE`）。
+   *
+   * **为什么不是 `ACTION_GET_CONTENT`**：那条路给的是"一个文件"，目录根本不作为一个可选项
+   * 出现；`ACTION_OPEN_DOCUMENT_TREE` 是系统给"把一整棵目录的读权限交出去"的唯一入口。
+   * 同样不要任何存储权限 —— 返回的 tree URI 自带对整棵树的读授权（含之后新建的子项）。
+   * 它**只支持一次一棵**（没有多选）：手机上一次选两个目录只能分两次发。
+   */
+  private fun treeIntent(): Intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+
   private fun openable(type: String): Intent {
     val intent = Intent(Intent.ACTION_GET_CONTENT)
     intent.addCategory(Intent.CATEGORY_OPENABLE)
@@ -132,6 +156,177 @@ class PickFilePlugin(private val activity: Activity) : Plugin(activity) {
       data.data?.let { out.add(it) }
     }
     return out
+  }
+
+  /**
+   * 一棵目录树（`ACTION_OPEN_DOCUMENT_TREE` 交回的 tree URI）→ 缓存里的一整棵目录。
+   *
+   * **为什么必须整棵拷下来**：推送那条路只认本机真实路径（清单按路径列、下载端点按路径分块
+   * 取字节，见 `transfer`），而 SAF 给的是 `content://` —— Rust 侧没有 ContentResolver，
+   * WebView 里也读不出字节。所以和 [`copyToCache`] 是同一条取舍：先用系统授权把字节搬进
+   * `cacheDir/pick/`，再把**路径**交给推送。目录因此是"先整棵拷、再按目录推"，不是边传边读。
+   *
+   * **保留目录结构**：每一项按 provider 给的 `DISPLAY_NAME` 落成同名子目录/文件，相对路径
+   * 就是用户看到的那棵树（对端收到的清单也是它）。名字仍过 [`stagedName`]：provider 给的名字
+   * 是**别的应用的数据**，不能让它拼出 `../`。
+   *
+   * **读不到的子项跳过并计数**（`skipped`，界面会说一声）：一棵几千项的相册里有一张已经被删、
+   * 或某个云端占位符取不下来，不该让整次发送失败 —— 这与桌面端 `collect_dir_manifest` 对
+   * 读不到的项"跳过 + 计数"是同一条取舍。只有两种情况整条失败：根目录读不出来（用户点的就是
+   * 它），以及**空间不足**（继续"跳过"只会假装发成功，还留下半棵目录）。一个文件都没有的
+   * 目录也当场拒绝：清单里没有东西可推，`push_paths` 只会回一句更含糊的话。
+   *
+   * 空文件**不拒绝**（与 [`copyToCache`] 的单文件那条不同）：一个目录里放几个 0 字节的占位
+   * 文件是正常内容，跳过它们等于悄悄改了用户要发的东西。
+   */
+  private fun copyTreeToCache(tree: Uri): JSObject {
+    val resolver = activity.contentResolver
+    val staging = File(activity.cacheDir, "pick")
+    if (!staging.exists() && !staging.mkdirs()) {
+      throw IllegalStateException(activity.getString(R.string.pick_cache_dir_failed, staging.absolutePath))
+    }
+    val rootId = try {
+      DocumentsContract.getTreeDocumentId(tree)
+    } catch (e: Exception) {
+      throw IllegalStateException(activity.getString(R.string.pick_folder_read_failed, tree.toString()), e)
+    }
+    val rootUri = DocumentsContract.buildDocumentUriUsingTree(tree, rootId)
+    val root = File(staging, uniqueName(staging, stagedName(displayNameOf(rootUri), null, "文件夹")))
+    if (!root.mkdirs()) {
+      throw IllegalStateException(activity.getString(R.string.pick_cache_dir_failed, root.absolutePath))
+    }
+
+    var total = 0L
+    var files = 0
+    var skipped = 0
+    val pending = ArrayDeque<Pair<String, File>>()
+    // 有环 / 自引用的 provider（文档 id 指回祖先）：同一个 id 只展开一次，否则会无限深。
+    val seen = HashSet<String>()
+    pending.add(rootId to root)
+    while (pending.isNotEmpty()) {
+      val (docId, outDir) = pending.removeLast()
+      if (!seen.add(docId)) {
+        skipped++
+        continue
+      }
+      val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId)
+      val cursor = try {
+        resolver.query(children, CHILD_COLUMNS, null, null, null)
+      } catch (_: Exception) {
+        null
+      }
+      if (cursor == null) {
+        if (docId == rootId) {
+          root.deleteRecursively()
+          throw IllegalStateException(activity.getString(R.string.pick_folder_read_failed, tree.toString()))
+        }
+        skipped++
+        continue
+      }
+      try {
+        val idCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+        if (idCol < 0) {
+          if (docId == rootId) {
+            root.deleteRecursively()
+            throw IllegalStateException(activity.getString(R.string.pick_folder_read_failed, tree.toString()))
+          }
+          skipped++
+          continue
+        }
+        val nameCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+        val mimeCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+        while (cursor.moveToNext()) {
+          val childId = cursor.getString(idCol)
+          if (childId == null) {
+            skipped++
+            continue
+          }
+          val rawName = if (nameCol >= 0 && !cursor.isNull(nameCol)) cursor.getString(nameCol) ?: "" else ""
+          val mime = if (mimeCol >= 0 && !cursor.isNull(mimeCol)) cursor.getString(mimeCol) else null
+          if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+            val sub = File(outDir, uniqueName(outDir, stagedName(rawName, null, "文件夹")))
+            if (sub.mkdirs() || sub.isDirectory) {
+              pending.add(childId to sub)
+            } else {
+              skipped++
+            }
+            continue
+          }
+          val out = File(outDir, uniqueName(outDir, stagedName(rawName, null, "文件")))
+          try {
+            val docUri = DocumentsContract.buildDocumentUriUsingTree(tree, childId)
+            val input = resolver.openInputStream(docUri)
+              ?: throw IllegalArgumentException(activity.getString(R.string.pick_read_failed, tree.toString()))
+            input.use { ins ->
+              out.outputStream().use { outs -> ins.copyTo(outs, COPY_BUFFER) }
+            }
+            total += out.length()
+            files++
+          } catch (e: Exception) {
+            out.delete()
+            if (isNoSpace(e)) {
+              root.deleteRecursively()
+              throw IllegalStateException(
+                activity.getString(
+                  R.string.pick_folder_copy_failed,
+                  rawName.ifBlank { childId },
+                  e.message ?: e.toString(),
+                ),
+                e,
+              )
+            }
+            skipped++
+          }
+        }
+      } finally {
+        cursor.close()
+      }
+    }
+    if (files == 0) {
+      root.deleteRecursively()
+      throw IllegalStateException(activity.getString(R.string.pick_folder_empty))
+    }
+    val obj = JSObject()
+    obj.put("path", root.absolutePath)
+    obj.put("name", root.name)
+    obj.put("size", total)
+    obj.put("mime", "")
+    obj.put("isDir", true)
+    obj.put("skipped", skipped)
+    return obj
+  }
+
+  /** 一个 URI 的 `DISPLAY_NAME`（provider 不给就是空串）。目录根的名字就走这里。 */
+  private fun displayNameOf(uri: Uri): String {
+    val cols = arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+    return try {
+      activity.contentResolver.query(uri, cols, null, null, null)?.use { c ->
+        if (!c.moveToFirst()) {
+          ""
+        } else {
+          val i = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+          if (i >= 0 && !c.isNull(i)) c.getString(i) ?: "" else ""
+        }
+      } ?: ""
+    } catch (_: Exception) {
+      ""
+    }
+  }
+
+  /**
+   * 这次失败是不是"存储空间不够"。这种错误不能按"跳过这一项"处理：后面的每一项都会同样
+   * 失败，最后只会剩半棵目录。消息通常是 `ENOSPC` / `No space left on device`。
+   */
+  private fun isNoSpace(e: Throwable): Boolean {
+    var cur: Throwable? = e
+    while (cur != null) {
+      val msg = cur.message.orEmpty()
+      if (msg.contains("ENOSPC", ignoreCase = true) || msg.contains("No space left", ignoreCase = true)) {
+        return true
+      }
+      cur = cur.cause
+    }
+    return false
   }
 
   /**
@@ -197,8 +392,11 @@ class PickFilePlugin(private val activity: Activity) : Plugin(activity) {
    * png。这与 `PasteImagePlugin.extOf` 是同一条取舍：扩展名只是"让这条路先走通"，真解不出来
    * 的那一层会如实说读不出来。**文件那一档不动名字**：推送本来就是"用户要发什么就发什么"，
    * 对端落盘用的也是同一个名字。
+   *
+   * `fallback` 只决定空名兜底的前缀（文件是「文件-…」、目录是「文件夹-…」）：目录树里每一层
+   * 都可能遇到 provider 不给名字的项，两档兜底混用会让用户分不清那是什么。
    */
-  private fun stagedName(raw: String, mime: String?): String {
+  private fun stagedName(raw: String, mime: String?, fallback: String = "文件"): String {
     val clean = raw
       .replace('\u0000', ' ')
       .replace('/', '_')
@@ -206,7 +404,7 @@ class PickFilePlugin(private val activity: Activity) : Plugin(activity) {
       .trim()
       .trimStart('.')
       .trim()
-    if (clean.isEmpty()) return "文件-${stamp()}-${UUID.randomUUID().toString().take(4)}"
+    if (clean.isEmpty()) return "$fallback-${stamp()}-${UUID.randomUUID().toString().take(4)}"
     if (!mime.orEmpty().startsWith("image/")) return clean
     val dot = clean.lastIndexOf('.')
     val base = if (dot > 0) clean.substring(0, dot) else clean
@@ -261,5 +459,18 @@ class PickFilePlugin(private val activity: Activity) : Plugin(activity) {
 
     /** 任意类型（`Intent.type` 的那两个通配符；写成常量是因为它出现在注释里会提前结束块注释）。 */
     const val ANY_TYPE = "*/*"
+
+    /**
+     * 列一层目录时要的几列：文档 id（继续往下走 / 开流）、显示名（落盘名）、MIME（分辨目录）。
+     * `SIZE` 不要 —— 有些 provider 报 0 或干脆不给，大小一律以拷好的那份文件为准。
+     */
+    val CHILD_COLUMNS = arrayOf(
+      DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+      DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+      DocumentsContract.Document.COLUMN_MIME_TYPE,
+    )
+
+    /** 目录树拷贝的缓冲区：provider 的 `openInputStream` 一次读大块比逐 8 KB 少很多往返。 */
+    const val COPY_BUFFER = 64 * 1024
   }
 }
