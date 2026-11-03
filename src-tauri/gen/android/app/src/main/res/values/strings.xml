@@ -20,6 +20,9 @@
     <string name="pick_cache_dir_failed">"Cannot create the send staging directory: %1$s"</string>
     <string name="pick_read_failed">"Cannot read the selected item: %1$s"</string>
     <string name="pick_empty">"The selected item is empty: %1$s"</string>
+    <string name="pick_folder_read_failed">"Cannot read the selected folder: %1$s"</string>
+    <string name="pick_folder_copy_failed">"Cannot copy “%1$s” out of the selected folder: %2$s"</string>
+    <string name="pick_folder_empty">"The selected folder contains no files to send"</string>
 
     <string name="paste_cache_dir_failed">"Cannot create the paste staging directory: %1$s"</string>
     <string name="paste_read_failed">"Cannot read this image from the clipboard: %1$s"</string>
@@ -34,4 +37,6 @@
     <string name="notif_settings_failed">"Cannot open notification settings: please go to Settings → Notifications and status bar → OrbDrop manually"</string>
 
     <string name="apps_missing_package">"No package name given"</string>
+
+    <string name="clipboard_unavailable">"This device has no system clipboard service"</string>
 </resources>

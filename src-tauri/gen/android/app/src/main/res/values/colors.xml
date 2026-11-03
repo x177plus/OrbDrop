@@ -12,4 +12,10 @@
          #121212，而我们的 UI 只有浅色一套 —— 任何一像素没被页面覆盖（启动的第一帧、WebView
          尺寸变化的瞬间、平台层不整比缩放的缝）露出来的就是贴在屏幕两侧的近黑条。 -->
     <color name="orbdrop_bg">#FFFBFCFD</color>
+    <!-- 底板遮罩打开时窗口露出来的那一层（状态栏）：`mobile.css` 的
+         `rgba(14,18,23,.32)` 叠在 `orbdrop_bg` 上的等效不透明色 ≈ #AFB1B3。
+         导航栏在部分 ROM 上是系统自己画的，不跟这一层走（见 `sheet_scrim` 模块）。
+         见 `sheet_scrim` 模块与 `SheetScrimPlugin`：改窗口底色而不是 `statusBarColor`
+         （后者在 targetSdk 35+ 的 edge-to-edge 应用上已经无效）。 -->
+    <color name="orbdrop_scrim_bg">#FFAFB1B3</color>
 </resources>

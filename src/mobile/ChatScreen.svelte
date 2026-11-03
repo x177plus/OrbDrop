@@ -20,6 +20,7 @@
   import ImagePreview from "$lib/components/ImagePreview.svelte";
   import ImageViewer from "$lib/components/ImageViewer.svelte";
   import TransferRing from "$lib/components/TransferRing.svelte";
+  import MessageActionsPopover from "./components/MessageActionsPopover.svelte";
   import { t } from "$lib/i18n.svelte";
   import { untrack } from "svelte";
 
@@ -323,6 +324,9 @@
 
   /** 用户滚过：只有仍在底部附近才算“还贴着底”。 */
   function onLogScroll(): void {
+    // 小气泡是贴着某一条气泡摆的：记录一滚，它指的位置就不对了 —— 直接收起
+    // （也顺带避开"用户根本没在看它"的那一次：任何滚动都不该留下一个错位的浮层）。
+    closeMessageActions();
     const el = logEl;
     if (!el) return;
     pinned = el.scrollHeight - el.clientHeight - el.scrollTop <= 2;
@@ -345,13 +349,39 @@
   // 再打开图片/文件（见 `pressEnd` / `onPressClick`）。
   const LONG_PRESS_MS = 500;
   const LONG_PRESS_SLOP = 8;
+  /** 小气泡与消息气泡之间留的空隙（`--u` 的倍数：尾巴有 5u 长，空隙得比它大，否则会戳进气泡）。 */
+  const POP_GAP_U = 8;
+  /** 小气泡的高度估量（`--u` 的倍数）：只用来判"这一侧放不放得下"，见 `openMessageActions`。 */
+  const POP_H_U = 44;
 
   let pressTimer: ReturnType<typeof setTimeout> | null = null;
   let pressFrom = { x: 0, y: 0 };
   let pressedItem: ChatItem | null = null;
+  /** 被按住的那个节点：小气泡要贴着它摆（`getBoundingClientRect` 在计时结束时才量）。 */
+  let pressedEl: HTMLElement | null = null;
   let longPressFired = false;
   /** 长按松手后那一下 click 的截止时间（浏览器会在 pointerup 之后补一个 click）。 */
   let suppressClickUntil = 0;
+
+  /** 正开着的那颗「复制」小气泡（`null` = 没开，见 `MessageActionsPopover`）。 */
+  let msgActions = $state<{
+    copyText: string;
+    layout: { left?: number; right?: number; top?: number; bottom?: number };
+    above: boolean;
+    side: "l" | "r";
+  } | null>(null);
+
+  // 安卓返回键先收这颗小气泡（见 `store.setBackCloser`）：它不属于 store，回调由这一屏挂着 ——
+  // 这一屏卸载时（退列表 / 换会话）回调跟着摘掉，返回键照旧退回 tab。回调里读 `msgActions`
+  // 发生在 effect 之外，不会把"开关状态"变成这个 effect 的依赖。
+  $effect(() => {
+    store.setBackCloser(() => {
+      if (!msgActions) return false;
+      closeMessageActions();
+      return true;
+    });
+    return () => store.setBackCloser(null);
+  });
 
   function pressStart(e: PointerEvent): void {
     if (!e.isPrimary || (e.pointerType === "mouse" && e.button !== 0)) return;
@@ -364,13 +394,16 @@
     if (!item) return;
     pressFrom = { x: e.clientX, y: e.clientY };
     pressedItem = item;
+    pressedEl = el;
     longPressFired = false;
     pressTimer = setTimeout(() => {
       pressTimer = null;
       longPressFired = true;
       const target = pressedItem;
+      const node = pressedEl;
       pressedItem = null;
-      if (target) openMessageActions(target);
+      pressedEl = null;
+      if (target && node) openMessageActions(target, node);
     }, LONG_PRESS_MS);
   }
 
@@ -390,6 +423,7 @@
       pressTimer = null;
     }
     pressedItem = null;
+    pressedEl = null;
     if (longPressFired) {
       suppressClickUntil = Date.now() + 400;
       longPressFired = false;
@@ -404,14 +438,57 @@
     e.stopPropagation();
   }
 
-  /** 长按一条消息时打开的底板（复制整条）。文案与桌面端右键菜单同一份（`chat.copyTextOf`）。 */
-  function openMessageActions(item: ChatItem): void {
+  /**
+   * 长按一条消息：在那颗气泡旁边弹一个「复制」小气泡（`MessageActionsPopover`），
+   * 文案与桌面端右键菜单同一份（`chat.copyTextOf`）。
+   *
+   * 位置只写**两条边**，不用先量小气泡多大：横向跟着气泡自己的边（我发的靠右、对端靠左），
+   * 纵向优先塞在气泡上方 —— 手指正按在气泡上，浮层从上方探出来既不会被手指挡住，也不压住
+   * 正在读的那一条。**上方要留出的不是小气泡自己那点高度，而是记录区的顶边**：`.chatlog` 上面
+   * 还有标题栏，只按"气泡上面够不够高"判的话，贴顶的那几条会让小气泡压到会话名上。
+   * 高度用 `--u` 换算出来的估量（小气泡只有一行，差几像素也只是擦肩）。
+   */
+  function openMessageActions(item: ChatItem, el: HTMLElement): void {
     const copyText = chat.copyTextOf(item);
-    if (!copyText) return;
-    // 表头只写"谁 · 什么时候"，正文预览留给气泡本身 —— 把整段消息再抄进表头并不更好读。
-    const who = item.fromMe ? "" : speakerName(item);
-    const desc = [who, chat.stamp(item.at)].filter(Boolean).join(" · ");
-    store.openSheet({ kind: "messageActions", copyText, desc });
+    // 消息可能在按住这 500ms 里被重画掉（列表按 id 复用，理论上还在）：量一个已卸载的节点
+    // 只会得到全零矩形，小气泡就跑到左上角去了。
+    if (!copyText || !el.isConnected) return;
+    const r = el.getBoundingClientRect();
+    // CSS 里 `--u` = `max(1px, 100vw / 390)`（见 `mobile.css` 的设计单位），这里按同一式子取一份。
+    const u = Math.max(1, window.innerWidth / 390);
+    const log = logEl?.getBoundingClientRect();
+    const logTop = log?.top ?? 0;
+    const logBottom = log?.bottom ?? window.innerHeight;
+    /** 小气泡 + 空隙的高度估量：只用来判"这一侧放不放得下"。 */
+    const gap = Math.round(POP_GAP_U * u);
+    const need = POP_H_U * u + gap;
+    const roomAbove = r.top - logTop;
+    const roomBelow = logBottom - r.bottom;
+    // 比屏幕还高的长图 / 长文两边都放不下时，挑空得多的一侧（否则小气泡会掉到视口外）。
+    const above = roomAbove >= need || (roomBelow < need && roomAbove >= roomBelow);
+    // 我发的气泡贴着右边、对端贴着左边：小气泡同一条边对齐，尾巴就落在气泡靠近屏幕边的那一角上。
+    const side = item.fromMe ? "r" : "l";
+    msgActions = {
+      copyText,
+      side,
+      above,
+      layout: {
+        ...(side === "r"
+          ? { right: Math.max(8, window.innerWidth - r.right) }
+          : { left: Math.max(8, r.left) }),
+        // 上方放得下就是"气泡顶边往上让出空隙"。比屏幕还高的长消息可能只在上方留了几像素：
+        // 这时把落点往下推回记录区里（压住气泡顶边一角），而不是让它盖到会话名上。
+        // 下方同理夹在记录区底边之内 —— 长消息的底边可能在视口外，照抄 `r.bottom` 就跑到屏幕下面了。
+        ...(above
+          ? { bottom: window.innerHeight - Math.max(r.top, logTop + 4 + need) + gap }
+          : { top: Math.max(logTop + 4, Math.min(r.bottom + gap, logBottom - 8 - need)) }),
+      },
+    };
+  }
+
+  /** 收起那颗「复制」小气泡（点别处 / 滚记录 / 换尺寸都走这一条）。 */
+  function closeMessageActions(): void {
+    msgActions = null;
   }
 
   // 来了新消息就贴到底。依赖的是**最后一条的 id**，不是数组长度/数组身份：文件进度、
@@ -484,11 +561,20 @@
   });
 </script>
 
+<!-- 小气泡的落点是打开那一刻按气泡位置量出来的：屏幕一换尺寸（转屏 / 输入法顶起视口）就不准了，
+     直接收起；Esc 同理（外接键盘）。 -->
+<svelte:window
+  onkeydown={(e) => {
+    if (e.key === "Escape" && msgActions) closeMessageActions();
+  }}
+  onresize={closeMessageActions}
+/>
+
 <!-- 一条文件气泡的内容（图标 / 名字 / 大小 / 状态行）：外面套不套那颗按钮由调用处定
      （有落盘路径才点得开），右侧那颗暂停/停止圆环由调用处另摆 —— 它不能嵌在打开按钮里。
      状态那一行在点得开时补一句"点一下打开" —— 手机上这是唯一的提示，没有悬停可看。 -->
 {#snippet fileBub(item: ChatItem & { kind: "file" })}
-  <span class="fio"><Icon name="file" /></span>
+  <span class="fio"><Icon name={item.isDir ? "folder" : "file"} /></span>
   <span class="fmain">
     <span class="fname">{item.name}</span>
     <span class="fsize num">{item.size || t("文件")}</span>
@@ -496,7 +582,9 @@
       <span class="fstat">{t("传输中 {pct}%", { pct: Math.round(item.pct) })}</span>
     {:else if fileStatus(item)}
       <span class="fstat">
-        {item.path ? t("{status} · 点一下打开", { status: fileStatus(item) }) : fileStatus(item)}
+        <!-- 目录点不开：安卓上没有能浏览应用私有目录的应用（`FileOpenPlugin` 那一档），
+             所以别写"点一下打开"—— 那颗气泡对文件夹不是按钮。 -->
+        {item.path && !item.isDir ? t("{status} · 点一下打开", { status: fileStatus(item) }) : fileStatus(item)}
       </span>
     {/if}
   </span>
@@ -589,7 +677,7 @@
            "接收中 / 已接收"（这条消息的状态是推送事件写的，不是这里自己记的）。 -->
       <div class="invite" data-id={item.id}>
         <div class="inv-head">
-          <Icon name="file" />
+          <Icon name={item.isDir ? "folder" : "file"} />
           <span class="cv-main">
             <span class="fname">{item.name}</span>
             <span class="fmeta">{item.size || t("文件")}</span>
@@ -643,6 +731,23 @@
                     {@render fileBub(item)}
                   </button>
                 </ImagePreview>
+                {#if stoppable}
+                  <span class="fring">
+                    <TransferRing
+                      mode="send"
+                      pct={item.pct}
+                      name={item.name}
+                      onclick={() => void stopSend(item)}
+                    />
+                  </span>
+                {/if}
+              </span>
+            {:else if item.isDir && item.path}
+              <!-- 文件夹（已经选好/收完）：整块**不是按钮**（手机上打不开应用私有目录，点它只会
+                   报错），但仍要保留右侧那颗停止圆环 —— 发送中的目录同样得能中途收掉。还在
+                   接收、还没有落盘路径的目录走下面那一支，那里有暂停键。 -->
+              <span class="fbub-row">
+                <span class="fbub">{@render fileBub(item)}</span>
                 {#if stoppable}
                   <span class="fring">
                     <TransferRing
@@ -762,16 +867,17 @@
     onpaste={onPaste}
     onkeydown={onKey}
   ></div>
-  <!-- 那颗「＋」（F-118 / F-119）：桌面端它就在输入框与发送键之间（`ConvoPanel.svelte` 的 `chat-plus`），
-       安卓端同一个位置、同一个意思 —— 点开一张底板选「图片 / 文件 / 应用」。手机上没有桌面那种自绘的
-       本机文件浏览器可用（分区存储不给"按路径列共享存储"，非媒体文件连读都读不到），所以图片与文件借系统的
-       照片选择器与文件选择器，选中的东西由原生那一跳拷成暂存文件（见 `PickFilePlugin.kt`）；
-       「应用」不用借谁 —— 包管理器直接查得到，那张表由我们自己画（见 `AppPickerSheet.svelte`）。 -->
+  <!-- 那颗「＋」（F-118 / F-119 / F-120）：桌面端它就在输入框与发送键之间（`ConvoPanel.svelte` 的
+       `chat-plus`），安卓端同一个位置、同一个意思 —— 点开一张底板选「图片 / 文件 / 文件夹 / 应用」。
+       手机上没有桌面那种自绘的本机文件浏览器可用（分区存储不给"按路径列共享存储"，非媒体文件连读都
+       读不到），所以图片、文件与文件夹借系统的照片 / 文件 / 目录选择器，选中的东西由原生那一跳拷成
+       暂存文件或目录（见 `PickFilePlugin.kt`）；「应用」不用借谁 —— 包管理器直接查得到，那张表由我们
+       自己画（见 `AppPickerSheet.svelte`）。 -->
   <button
     class="cbtn cplus"
     type="button"
-    aria-label={localSendThread ? t("发送文件到 LocalSend 设备") : t("发送文件、图片或应用")}
-    title={localSendThread ? t("发送文件到 LocalSend 设备") : t("选图片（落进输入区）、选文件（当场推送）或发送一个应用")}
+    aria-label={localSendThread ? t("发送文件或文件夹到 LocalSend 设备") : t("发送文件、文件夹、图片或应用")}
+    title={localSendThread ? t("发送文件或文件夹到 LocalSend 设备") : t("选图片（落进输入区）、选文件或文件夹（当场推送）或发送一个应用")}
     onclick={() => store.openSheet({ kind: "attach" })}
   >
     <Icon name="plus" />
@@ -785,6 +891,18 @@
     <Icon name="send" />
   </button>
 </form>
+
+<!-- 长按一条消息后贴着气泡弹出的「复制」小气泡（见 `openMessageActions`）：
+     位置在打开那一刻就算好了，所以滚动 / 换尺寸都会收起它。 -->
+{#if msgActions}
+  <MessageActionsPopover
+    copyText={msgActions.copyText}
+    layout={msgActions.layout}
+    above={msgActions.above}
+    side={msgActions.side}
+    onClose={closeMessageActions}
+  />
+{/if}
 
 <!-- 「看大图」：会话里点一张图的缩略图就在这一层上摊开它（换会话时上面那个 effect 会清掉）。 -->
 {#if viewing && viewing.path !== undefined && viewing.path !== ""}

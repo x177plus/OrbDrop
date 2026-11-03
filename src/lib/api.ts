@@ -338,12 +338,30 @@ export function resolveImageUri(uri: string): Promise<{ path: string; size: numb
  *
  * `kind = 'image'` 走系统的照片选择器（Android 13 起；老系统退回「文件」应用），`'file'` 走
  * 通用的文件选择器，两条都**不要任何存储权限** —— 系统把选中那几个 URI 的读授权随结果一起给。
+ * `'folder'` 走系统的**目录选择器**（`ACTION_OPEN_DOCUMENT_TREE`），原生把整棵树递归拷进缓存、
+ * 保留目录结构，回来的是**一项** `isDir`（系统不支持目录多选）；`skipped` 是读不到而跳过的
+ * 子项数，界面必须提示一声。
+ *
  * 返回的 `path` 已经是本机真实路径（原生拷过一道），可以直接进 `pushPaths` / 图片消息。
  *
  * **用户取消回空数组**（不是异常）：界面据此什么都不做。
  */
-export function pickFiles(kind: 'image' | 'file'): Promise<PickedFile[]> {
+export function pickFiles(kind: 'image' | 'file' | 'folder'): Promise<PickedFile[]> {
   return invoke('pick_files', { kind });
+}
+
+/**
+ * 安卓：底板打开 / 关闭时切换**窗口底色**（最上面状态栏露出来的那一层）。
+ *
+ * WebView 按系统栏 inset 缩过边，页面里的 `.scrim` 只能盖到 WebView 边界，盖不到状态栏；
+ * 那一条露出来的是窗口底色。`open = true` 换成 `.scrim` 叠在页面底色上的等效不透明色，
+ * `false` 换回应用底色 —— 见 `sheet_scrim` 与 `SheetScrimPlugin`。
+ *
+ * 导航栏在部分 ROM 上是系统自己画的，不跟这一层走。只有移动端有这条命令；失败只是
+ * "状态栏没跟着暗"，调用方静默即可。
+ */
+export function setSheetScrim(open: boolean): Promise<void> {
+  return invoke('set_sheet_scrim', { open });
 }
 
 /**
@@ -645,6 +663,20 @@ export function downloadAndOpen(shareId: string, pathInShare: string): Promise<s
  *  路径不在了会 reject —— 调用方据此把通知留住。 */
 export function openPath(path: string): Promise<void> {
   return invoke('open_path', { path });
+}
+
+/**
+ * 把一段文字写进系统剪贴板（**移动端**：后端 `clipboard::copy_text`，只在安卓构建里注册）。
+ *
+ * 为什么不用 `navigator.clipboard`：Android WebView 里这条 Web API 永远拒绝写入 ——
+ * `NotAllowedError: Write permission denied.`（`clipboard-write` 权限在 WebView 里没有实现，
+ * `onPermissionRequest` 也不会被调用，Chromium issue 40205793）。掉到原生 `ClipboardManager`
+ * 上不需要任何安卓权限：Android 10 起限制的是**读**，写一直对前台应用开放。
+ *
+ * **桌面端不要调它**（那边没有这条命令）：桌面上的 `navigator.clipboard` 是通的。
+ */
+export function copyText(text: string): Promise<void> {
+  return invoke('copy_text', { text });
 }
 
 // 收件目录（移动端专属：手机上没有一个文件夹可翻，后端只在那边的构建里注册这两条）

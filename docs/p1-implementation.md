@@ -4409,3 +4409,77 @@ F2 把"记录里那个名字"播进了设备行的名字格，于是暴露出一
 | 有，`online=true` | 那一行按规矩该出现在设备列表里（未绑定、在线） | 列表里还是没有 → 界面这一层的问题，回来报 |
 | 有，`online=false` | 落在"未绑定 + 离线"：来源地址像本机自己 / 像"经中转来的"（`observed_dial_target` / `is_relayed_source` 两道），界面按规矩不列未绑定的离线行 | 看日志里那三个字段（`ip`/`port`/`online`）定位是"来源地址被当成中转方"还是"来源地址是本机自己" |
 | 一条都没有 | 报文没到 | 对方是旧包 / 被防火墙挡住 |
+
+## 44. 安卓：「＋」也能发文件夹（F-120，2026-11-03）
+
+需求一句话：**安卓会话里那颗「＋」的底板加第三项「文件夹」：选一整棵目录，按桌面端同一条推送发过去。**
+
+### 一、为什么必须是另一条选择器
+
+`ACTION_GET_CONTENT`（「文件」那一项用的）返回的永远是**一个可打开的文件**，目录根本不在候选里；系统里能给"一整棵目录的读授权"的只有一个入口：`ACTION_OPEN_DOCUMENT_TREE`（SAF 的目录选择器）。它同样**不要任何存储权限**：返回的 tree URI 自带对整棵子树的读授权，`DocumentsContract.buildChildDocumentsUriUsingTree` 就是按这棵树往下走的。
+
+三条平台边界（都来自系统，不是这里的取舍）：
+
+- **一次一棵**：没有"目录多选"这种 intent，手机上选两个目录只能分两次发。
+- **Android 11+ 不许选几个"根"**：内部存储根、Download 根等会被 DocumentsUI 直接拦下（按钮是灰的）。要发整棵 Download 的用户得先选它下面的子目录 —— 这是系统的隐私策略，应用改不了。
+- 目录里**空的子目录**进不了清单：`PushSource.files` 本身只装文件（桌面端推目录也是这个形状），所以对端拿到的是"有文件的那些相对路径"，不是一张空目录表。
+
+### 二、原生：整棵树先落进缓存
+
+`PickFilePlugin.kt` 的 `kind = "folder"` 走 `treeIntent()`；`picked()` 用 `DocumentsContract.isTreeUri(data.data)` 分辨"这是一棵树"还是"几个文件"，然后把整棵树递归拷进 `cacheDir/pick/<目录名>/`：
+
+- 逐层 `buildChildDocumentsUriUsingTree(tree, docId)` + 查询 `COLUMN_DOCUMENT_ID / COLUMN_DISPLAY_NAME / COLUMN_MIME_TYPE`（`SIZE` 不要 —— 有些 provider 不报或报 0，总大小以拷好的文件为准）；**迭代栈**而不是递归，几千项的树也不会把调用栈压爆；
+- 同一个 document id 只展开一次（`HashSet`）：有环/自引用的 provider 不会把拷贝带进无限深；
+- 相对路径 = provider 给的显示名，目录与文件都按原名落盘；名字仍过 `stagedName`（分隔符、控制字符、首尾点），**不能**让 provider 给的字符串拼出 `../`；
+- **空文件照收**（0 字节是正常内容，不能像单文件那条 `pick_empty` 一样拒掉）；空目录建出来但不进清单；
+- 个别子项读不到（已删除 / 云端占位符 / 该层 query 失败）→ `skipped++`，继续；`skipped` 随结果回界面，界面提示「准备文件夹时跳过了 n 项（读不到）」；
+- 只有四种情况整条失败并删掉半棵暂存树：根目录读不到、根层没有 document id、**空间不足**（`ENOSPC` / `No space left`：继续跳过只会假装成功）、以及一个文件都没有；
+- 结果一项：`{ path: 根目录绝对路径, name: 根目录名, size: 所有文件之和, mime: "", isDir: true, skipped }`。系统没有目录多选，所以一次只回这一项。
+
+**为什么必须整棵拷**：推送只认本机真实路径（清单按路径列、下载端点按路径分块取字节），而 `content://` 在 Rust 侧没有 ContentResolver、在 WebView 里也读不出字节。这条路与 F-118 的 `copyToCache`（以及剪贴板的 `PasteImagePlugin`）是同一条取舍；代价是**时间与双份磁盘**：一个 5 GB 的目录要在缓存里再放 5 GB，拷完才开推送。落点仍在 `cacheDir/pick/`（应用私有缓存、系统空间紧张时可回收），且不在自家数据目录那棵子树里（`unsendable::is_own_data_path` 不会把暂存的一棵树判成"本机凭据"）。
+
+### 三、Rust、类型与界面
+
+- `PickedFile` 多两格：`isDir`（这一项是一棵树）与 `skipped`（准备时跳过的子项数）；`mobile::pick_files` 原样解析 Kotlin 的 `isDir` / `skipped`，取消仍是空表。
+- **底板改成一行四列**：图片 / 文件 / 文件夹 / 应用只留**图标 + 名字**，长说明删掉（那是把底板撑到半屏以上的唯一原因）。图标沿用文件列表那套 `.ftile`（图片蓝、文件夹棕、应用紫、文件灰），整格可点、无外框；393×852 实测整张底板 **196 px 高**、四列各 82 px、无横向溢出；360 宽四列各 74 px，英文 `Images/Files/Folders/Apps` 也都不截断。
+- `pickAttach(kind)` 多一档 `"folder"`：选目录时挂一条**不自动消失**的「正在准备文件夹…」（`store.busyText`，`Toasts.svelte` 画；普通 toast 2.6 秒就没了，几千项等不起），`pick_files` 一回来就摘掉；`skipped > 0` 再补一条 toast。
+- `PushItem` / `LocalPick` 带上 `isDir`（原先写死 `false`）：会话里那条记录因此按**文件夹**画 —— 文件夹图标、`size` 显示「文件夹」、状态行**不写「点一下打开」**（安卓的 `FileOpenPlugin` 打不开应用私有目录，写了就是骗人），但发送中的停止圆环照旧；`ChatScreen` 为文件夹单独一支，不把整块包成按钮。接收侧那条邀请卡也用文件夹图标；还在接收、没有落盘路径的目录仍走原来那支，pause 环不丢。
+- **协议一个字没改**：`push_paths` 拿到的就是根路径，`manifest_for_named_paths` 早就按目录走查（`collect_dir_manifest`），对端收到的是同一条相对路径清单 —— 老版本 OrbDrop 与 LocalSend 设备照收。
+
+### 四、校验（做了什么、看到什么）
+
+- `npm run check`：170 文件 **0 errors / 1 warning**（`RemarkDeviceSheet.svelte` 的既有 `state_referenced_locally`，与本次无关）。
+- `npm run check:i18n`：980 个调用点 / 1041 条英文词条，通过（新增的 `文件夹`、`选择文件夹`、`正在准备文件夹…`、跳过计数都有译文与复数；底板那四条长说明已删掉，词条一并移除）。
+- `npm run check:compat`：Chrome 81 门禁通过。
+- 安卓目标的 Rust：`cargo check --target aarch64-linux-android`（带 NDK 的 `CC_/AR_/CARGO_TARGET_…_LINKER`）通过；4 条既有 warning，与本次无关。
+- Kotlin：`:app:compileUniversalDebugKotlin` `BUILD SUCCESSFUL`（`PickFilePlugin.kt` 由这一步编译）。
+- **真实产物 + 真实 Chromium + 假 IPC**（393×852）：`＋ → 文件夹` 发出 `pick_files({kind:"folder"})`；延迟 1.2 s 的桩里期间能看到「正在准备文件夹…」，回来后有「准备文件夹时跳过了 2 项（读不到）」；`push_paths` 收到的是 `{ paths: ["/data/user/0/com.x177plus.orbdrop/cache/pick/相册"], peerIds:["dev1"], names:null, at:null }`；会话里那条气泡 `clickable=false`、图标是文件夹、`传输中 0%`、右侧停止圆环在；控制台 0 错误。
+- **真机（安卓，USB；debug 包重签成发行密钥装上，验完已换回原 release 包）**：
+  - 选目录走的确实是 `ACTION_OPEN_DOCUMENT_TREE`：系统目录选择器先在内部存储根，底栏那句是「无法使用此文件夹 / 为保护您的隐私，请选择其他文件夹」；进 `Download/OrbDropDirTest` 后按钮才可用，点「使用此文件夹」→ 系统再确认一次「允许 OrbDrop 访问…」。
+  - 建了一棵测试树（`a.txt` 5 B、`empty.bin` 0 B、`sub/b.txt` 5 B、`sub/deeper/c.txt` 4 B）。回到应用后 `run-as … ls -lR cache/pick` 里是**同一棵树**（相对路径、空文件都在），`cat` 回来的字节是 `hello` / `world` / `deep` —— 递归拷贝、0 字节文件、嵌套目录三条都成立。
+  - 回到会话子屏：气泡写着 `OrbDropDirTest / 文件夹 / 传输中 0%`，整块**不是按钮**（`closest('button') == null`），右侧停止圆环在；`push_paths` 正常返回（否则这条记录不会出现）。对端那一刻没有点「接收」，所以**没有再验一次跨设备的目录落盘** —— 那一段走的是既有的目录推送链路（同一份 `collect_dir_manifest`，单测已覆盖）。
+  - 落点：`/data/user/0/com.x177plus.orbdrop/cache/pick/OrbDropDirTest/…`（应用私有缓存，`run-as` 才看得到）。
+
+## 45. 底板打开时，状态栏那一条也跟着遮罩变暗（2026-11-03）
+
+**现象**（真机）：打开任何底板，页面内容都被 `.scrim` 压暗了，但最上面的状态栏（时间 / 电量）还是一条白的 —— 像遮罩没盖到顶。
+
+**这不是 CSS 写错了，是两层绘制面**：应用是 edge-to-edge，但 `MainActivity.applyInsetsAsMargins` 把 WebView 按 `systemBars` 的 inset **缩了边**（不让时钟压在标题上、键盘盖住输入框，见 `MainActivity` 类注释）。状态栏那一条**不在 WebView 里**，露出来的是窗口底色（`windowBackground` = `orbdrop_bg`，白）。`.scrim` 是 WebView 里的 `position: absolute; inset: 0`，能盖到的最远处就是 WebView 的边界，盖不到状态栏。
+
+**做法**：新增 `sheet_scrim`（Rust）＋ `SheetScrimPlugin`（Kotlin），前端 `MobileApp.svelte` 用 `$effect` 跟着 `currentSheet()` 调 `set_sheet_scrim`：
+
+- 打开：把窗口底色换成 `orbdrop_scrim_bg` —— `.scrim` 的 `rgba(14,18,23,.32)` 叠在 `orbdrop_bg` 上的等效不透明色（`#AFB1B3`），与页面里被遮罩压暗的标题栏/底栏是同一个颜色；
+- 关闭：换回 `orbdrop_bg`；
+- **不碰 `statusBarColor`**：targetSdk 35+ 的 edge-to-edge 应用上它已经无效，真正露出来的是窗口底色；改窗口底色从 API 24 到 35 都成立；
+- **不切图标深浅**：32% 黑叠出来是中间灰，深色时间/电量图标对比度约 9:1；切换浅色图标会在变暗那一瞬闪一下，没有收益；
+- **导航栏不在这条里**：真机 Android 12 / EMUI 上它是系统自己的 `NAVIGATION_BAR_PANEL`（纯白），`navigationBarColor` 与 `isNavigationBarContrastEnforced` 都动不了它（两版都试过，像素一动不动）—— 那一条不归应用管，保持系统原样。
+
+**验证**（真机 Android 12 / CTR-AL20，light mode；`新建会话` 底板，1080×2388）：
+
+| 状态 | 状态栏中心像素 | 被遮罩压住的标题栏像素 |
+|---|---|---|
+| 底板关闭 | `(251, 252, 253)` = `#FBFCFD` | `(250, 252, 253)` |
+| 底板打开 | `(175, 177, 179)` = `#AFB1B3` | `(174, 177, 179)` |
+| 再关闭 | `(251, 252, 253)`，恢复原样 | `(250, 252, 253)` |
+
+状态栏与紧接着的标题栏只差 1/255（页面底色 `#FBFCFD` 与窗口底色不是同一个 token 的舍入），肉眼是一条连续的暗带。静态门禁：`npm run check`（170 文件 0 errors）、`check:i18n`、`check:compat`、`cargo check --target aarch64-linux-android`、`:app:compileUniversalDebugKotlin` 全过。

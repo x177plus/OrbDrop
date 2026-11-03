@@ -485,6 +485,44 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
    —— 原子性由 `contenteditable="false"` 给（见 `lib/composer.ts`），这里只管长相。
    与桌面端 `main.css` 里那条同名规则是同一份东西（两份产物各带一份，见那个文件的注释）。 */
 .cx-img { display: inline-block; vertical-align: middle; max-width: calc(120 * var(--u)); max-height: calc(96 * var(--u)); margin: 2px 3px; border-radius: calc(8 * var(--u)); border: 1px solid var(--border); object-fit: contain; background: var(--fg-soft); }
+
+/* 长按一条消息后贴在气泡旁边的「复制」小气泡（`components/MessageActionsPopover.svelte`）。
+   它是**上下文动作**，不是底板：长按只为一个动作，为它铺满一屏的遮罩、再从底部推一张表上来，
+   动作就落到离手指按着那个气泡最远的地方去了。落点由 `ChatScreen.openMessageActions` 按被按
+   那颗气泡的视口矩形算好（`left/right/top/bottom` 两两成对），这里只管摆。
+   `fixed` 是为了**越过 `.chatlog` 的 `overflow`**：被长按的那条往往在滚动区中间，放进记录区
+   就会被裁掉；`.sub` 开着时它就是整屏，换会话 / 退列表时随组件一起卸载。
+   这一层只接手指、不画底色 —— 会话不压暗，点别处即收。 */
+.msgpop-layer { position: fixed; inset: 0; z-index: 40; }
+.msgpop-scrim { position: absolute; inset: 0; }
+.msgpop { position: absolute; z-index: 1; display: flex; transform-origin: 50% 100%; animation: msgpop-in .16s cubic-bezier(.2,.8,.2,1); }
+/* 挂在气泡下方时尾巴朝上：张开的支点跟着翻到顶边（一直从贴着气泡的那条边长出来）。 */
+.msgpop.below { transform-origin: 50% 0; }
+/* 容器只是脚本聚焦的落点（`tabindex="-1"`，为读屏念出"消息操作"），不是可操作目标：
+   那圈描边只该出现在键盘 Tab 得到的东西上，也就是里面那颗按钮。 */
+.msgpop:focus { outline: none; }
+/* 尾巴：一颗转 45° 的小方块，露在胶囊外的那半截就是三角。只留朝外的两条边 ——
+   另外两条压在胶囊底下，由胶囊自己的描边接上去，接缝处不会多出一条线。 */
+.msgpop::after {
+  content: ""; position: absolute; width: calc(7 * var(--u)); height: calc(7 * var(--u));
+  border: 1px solid var(--border); background: var(--surface); transform: rotate(45deg);
+}
+.msgpop.above::after { bottom: calc(-3.5 * var(--u)); border-left: 0; border-top: 0; }
+.msgpop.below::after { top: calc(-3.5 * var(--u)); border-right: 0; border-bottom: 0; }
+.msgpop.tail-l::after { left: calc(12 * var(--u)); }
+.msgpop.tail-r::after { right: calc(12 * var(--u)); }
+.msgpop-btn {
+  display: flex; align-items: center; gap: calc(7 * var(--u));
+  padding: calc(9 * var(--u)) calc(15 * var(--u));
+  border: 1px solid var(--border); border-radius: 999px;
+  background: var(--surface); color: var(--fg);
+  font-size: var(--fs-sm); font-weight: 620; line-height: 1.4;
+  box-shadow: 0 calc(10 * var(--u)) calc(26 * var(--u)) calc(-14 * var(--u)) rgba(14, 18, 23, 0.36);
+  transition: background .15s ease, transform .08s ease;
+}
+.msgpop-btn .ic { width: calc(15 * var(--u)); height: calc(15 * var(--u)); color: var(--accent-deep); }
+.msgpop-btn:active { transform: scale(.96); background: var(--accent-soft); }
+@keyframes msgpop-in { from { opacity: 0; transform: scale(.86); } }
 /* ─────────────────────────── segmented control ─────────────────────────── */
 .seg { display: flex; gap: calc(4 * var(--u)); padding: 2px calc(18 * var(--u)) 0; background: var(--bg); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 3; }
 .seg-item { position: relative; padding: calc(11 * var(--u)) calc(4 * var(--u)) calc(12 * var(--u)); margin-right: calc(18 * var(--u)); color: var(--muted); font-size: var(--fs-md); font-weight: 560; display: inline-flex; align-items: center; gap: calc(6 * var(--u)); }

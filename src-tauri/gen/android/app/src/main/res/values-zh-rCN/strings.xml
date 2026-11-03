@@ -20,6 +20,9 @@
     <string name="pick_cache_dir_failed">建不了发送暂存目录：%1$s</string>
     <string name="pick_read_failed">读不到选中的这一项：%1$s</string>
     <string name="pick_empty">选中的这一项是空的：%1$s</string>
+    <string name="pick_folder_read_failed">读不到选中的文件夹：%1$s</string>
+    <string name="pick_folder_copy_failed">复制所选文件夹里的「%1$s」失败：%2$s</string>
+    <string name="pick_folder_empty">所选文件夹里没有可发送的文件</string>
 
     <string name="paste_cache_dir_failed">建不了粘贴暂存目录：%1$s</string>
     <string name="paste_read_failed">读不到剪贴板里这张图：%1$s</string>
@@ -34,4 +37,6 @@
     <string name="notif_settings_failed">打不开通知设置：请手动进入 设置 → 通知和状态栏 → OrbDrop</string>
 
     <string name="apps_missing_package">没有给包名</string>
+
+    <string name="clipboard_unavailable">这台设备没有系统剪贴板服务</string>
 </resources>

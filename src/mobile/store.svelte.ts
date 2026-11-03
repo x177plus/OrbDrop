@@ -119,6 +119,24 @@ export function failed(what: string, e: unknown): void {
   );
 }
 
+/**
+ * 「正在准备」那条**不会自己消失**的提示（`null` = 没有）。
+ *
+ * 选目录是唯一需要它的一档：系统选择器关掉之后，原生还要把整棵树拷进缓存才回话 —— 一个几千项
+ * 的相册可以走上好一会儿，而普通 toast 2.6 秒就没了。它由「＋」那条路发起与收尾（见
+ * `pickAttach`），`Toasts.svelte` 只负责画；不做成通用 busy 状态是因为其余动作都有进度条或
+ * 者回话很快，"转圈"反而会让人以为卡住。
+ */
+let busy = $state<string | null>(null);
+
+export function busyText(): string | null {
+  return busy;
+}
+
+function setBusy(text: string | null): void {
+  busy = text;
+}
+
 // ── 收件目录（移动端才有的视图）──────────────────────────────────────────────
 
 let inbox = $state<InboxEntry[]>([]);
@@ -325,27 +343,40 @@ export function takePendingImages(key: string): PickedFile[] | null {
 }
 
 /**
- * 那颗「＋」选了之后要走的路：图片进输入区当草稿，文件当场推送。
+ * 那颗「＋」选了之后要走的路：图片进输入区当草稿，文件 / 文件夹当场推送。
  *
- * **两条路的语义不同，所以是两项而不是一个框**：图片先进输入区，发送时在 OrbDrop 里是
- * 图片消息、在 LocalSend 里是一条图片消息（线上走文件传输）；文件是**推送**（对端收到一张
- * 「接收 / 拒绝」卡）。混在一个框里让用户猜"我选的这张图会被当成哪一种"，不如让他自己挑。
+ * **三条路的语义不同，所以是三项而不是一个框**：图片先进输入区，发送时在 OrbDrop 里是
+ * 图片消息、在 LocalSend 里是一条图片消息（线上走文件传输）；文件与文件夹是**推送**（对端收到
+ * 一张「接收 / 拒绝」卡）—— 文件夹只是清单里有一整棵相对路径，线上协议与单文件同一条。
+ * 混在一个框里让用户猜"我选的这张图会被当成哪一种"，不如让他自己挑。
  *
  * 目标会话就是**此刻开着的那条**（与桌面端 `chatSendFiles` 同一条判据）——「＋」只长在会话
  * 子屏上，没有会话时这个动作根本不会被调到。
+ *
+ * 选目录时 `busy` 一直挂到原生把整棵树拷完（见 `busyText`）：系统选择器关掉到 `pickFiles`
+ * 回话之间没有任何别的反馈，几千项能走很久。
  */
-export async function pickAttach(kind: "image" | "file"): Promise<void> {
+export async function pickAttach(kind: "image" | "file" | "folder"): Promise<void> {
   const thread = chat.activeThread();
   if (!thread) return;
   let files: PickedFile[];
+  const folder = kind === "folder";
+  if (folder) setBusy(t("正在准备文件夹…"));
   try {
     files = await api.pickFiles(kind);
   } catch (e) {
-    failed(t("选择文件"), e);
+    failed(folder ? t("选择文件夹") : t("选择文件"), e);
     return;
+  } finally {
+    setBusy(null);
   }
   // 取消（空表）什么都不做：用户反悔是正常操作，不该看到任何提示。
   if (files.length === 0) return;
+  // 目录里个别子项读不到时原生会跳过并计数：少了东西必须说出来，不能让他以为整棵都发了。
+  const skipped = files.reduce((n, f) => n + (f.skipped || 0), 0);
+  if (skipped > 0) {
+    toast(t("准备文件夹时跳过了 {n} 项（读不到）", { n: skipped }));
+  }
   if (kind === "image") {
     // 两条协议都先把图放进输入区（和桌面端粘贴同一条路）；点发送才真正发出去。
     pendingImages = { key: thread.key, files };
@@ -353,7 +384,7 @@ export async function pickAttach(kind: "image" | "file"): Promise<void> {
   }
   await sendFilesToConvo(
     thread,
-    files.map((f) => ({ path: f.path, name: f.name, size: f.size })),
+    files.map((f) => ({ path: f.path, name: f.name, size: f.size, isDir: f.isDir })),
   );
 }
 
@@ -368,6 +399,13 @@ interface PushItem {
   path: string;
   name: string;
   size: number;
+  /** 这一项是一整棵目录（选「文件夹」时唯一的那一项）。 */
+  isDir?: boolean;
+  /**
+   * 这个名字**只是给对端看的**（本机那份文件的真名不是它）：只有「应用」那一项会置它 ——
+   * 源是 `/data/app/…/base.apk`，落盘名该是
+   * `应用名_versionName(versionCode)_包名.apk`（见 `transfer::manifest_for_named_paths`）。
+   */
   rename?: boolean;
 }
 
@@ -392,7 +430,7 @@ async function sendFilesToConvo(thread: chat.ConvoThread, files: PushItem[]): Pr
     );
     return;
   }
-  const items: LocalPick[] = files.map((f) => ({ path: f.path, name: f.name, isDir: false, size: f.size }));
+  const items: LocalPick[] = files.map((f) => ({ path: f.path, name: f.name, isDir: f.isDir === true, size: f.size }));
   // 覆盖名逐位对齐：不改名的那些给空串（后端按空串 = 不覆盖处理）。整表全空时干脆不传
   // —— 老那条路（选择器选的文件）与以前一个字节都不差。
   const names = files.map((f) => (f.rename ? f.name : ""));
@@ -952,8 +990,6 @@ export type Sheet =
   | { kind: "remarkDevice"; peerId: string }
   | { kind: "fileActions"; entry: InboxEntry }
   | { kind: "chatActions"; key: string }
-  /** 长按一条消息：移动端的"消息右键菜单"（桌面端见 `ContextMenu.svelte` 的 `kind === 'chat'`）。 */
-  | { kind: "messageActions"; copyText: string; desc: string }
   | { kind: "attach" }
   | { kind: "appPicker" }
   | { kind: "convo" }
@@ -992,6 +1028,25 @@ export function closeSheet(): void {
 
 export function currentSheet(): Sheet | null {
   return sheet;
+}
+
+/**
+ * 会话子屏里那层"轻浮层"（消息复制小气泡，见 `MessageActionsPopover`）的收起回调：
+ * 安卓返回键**先收它**，再按原来的层级走（底板 → 会话子屏）。
+ *
+ * 为什么不像底板那样放进 store：它的落点是按被长按那颗气泡的视口矩形算的，属于那一屏自己的
+ * 状态（换会话 / 退列表就该跟着没）；只有"返回键该先收哪一层"这一件事需要让外壳知道，
+ * 所以这里只挂一个回调，不搬状态。**同一时刻只有一层**。
+ */
+let backCloser: (() => boolean) | null = null;
+
+export function setBackCloser(fn: (() => boolean) | null): void {
+  backCloser = fn;
+}
+
+/** 返回 true = 收掉了一层，返回键不用再往下退。 */
+export function runBackCloser(): boolean {
+  return backCloser?.() ?? false;
 }
 
 /**
