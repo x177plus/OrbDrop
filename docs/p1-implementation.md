@@ -4483,3 +4483,68 @@ F2 把"记录里那个名字"播进了设备行的名字格，于是暴露出一
 | 再关闭 | `(251, 252, 253)`，恢复原样 | `(250, 252, 253)` |
 
 状态栏与紧接着的标题栏只差 1/255（页面底色 `#FBFCFD` 与窗口底色不是同一个 token 的舍入），肉眼是一条连续的暗带。静态门禁：`npm run check`（170 文件 0 errors）、`check:i18n`、`check:compat`、`cargo check --target aarch64-linux-android`、`:app:compileUniversalDebugKotlin` 全过。
+
+## 46. 安卓：「保存到手机」——让私有目录里的文件被别的应用看见（F-121，2026-11-05）
+
+**现象**：电脑推过来的照片/视频在手机上的「文件 → 收件」里看得见、点得开，但**相册里搜不到**，想拿它发微信、当邮件附件时，那些应用自己的"挑一张图 / 挑一个文件"选择器里也**列不出它**。用户的原话是"这个文件只能在这个 app 中打开，没有办法通过其他 app 使用"。
+
+**根因不是打开那条路坏了**：收件、会话图片、粘贴/选择暂存全在应用私有数据目录里（`/data/user/0/<包名>/OrbDrop/…`）。F-109 的 `FileProvider` + `ACTION_VIEW` 只把**这一次**的临时读权限交给被唤起的应用，别的应用仍然"看不见"这份文件 —— 相册不索引私有目录，选择器也只列共享存储。要"通过别的应用使用"，文件本身必须出现在共享存储里。
+
+**做法**：新增 Kotlin `ExportFilePlugin`（命令 `saveToPublic`）＋ Rust `mobile::save_file_to_phone` ＋ 一条只在移动端注册的 `save_file_to_phone` 命令。两条路都不申请存储权限：
+
+- **Android 10（API 29）起直写 `MediaStore`**：图片进 `Pictures/OrbDrop`、视频进 `Movies/OrbDrop`、音频进 `Music/OrbDrop`、其余进 `Download/OrbDrop`（`RELATIVE_PATH`）。插入时 `IS_PENDING=1`、拷完清 0 —— 不清的话那条对相册/选择器永远不可见，用户只会看到一句"已保存"却哪儿都找不到。同一目录重名先按 `DISPLAY_NAME` + `RELATIVE_PATH` 查一遍，排成 `名字 (1).ext`（与桌面落盘的 S-01 口径一致）；拷贝失败就把占位行删掉，不留一条 0 字节、永远打不开的残骸。
+- **Android 9 及以下没有 `RELATIVE_PATH`**：按路径写公共目录要 `WRITE_EXTERNAL_STORAGE`（运行时权限），而本仓一直不申请存储权限（§44 那套取舍）。这一档改开系统的「保存到」对话框（`ACTION_CREATE_DOCUMENT`，SAF），用户自己挑落点，写授权随结果一起给。用户按返回 = **取消**，回 `{saved:false}` —— 正常操作，界面不提示、不算失败。
+
+**闸门**：保存会把字节写进别的应用看得见的地方，所以源路径的收口比"打开"那条更不能松。`AppFiles.requireOwned` 是**唯一实现**（canonical path，只认 `dataDir/OrbDrop` 与 `cacheDir`），`FileOpenPlugin` 与 `ExportFilePlugin` 共用；两条命令只是拒绝话术不同。会话图片在 `OrbDrop/chat-vault` 下、剪贴板/选择器暂存在 `cacheDir` 下，两条都能过；别的绝对路径（比如凭据库）一律拒绝。
+
+**会话图片要先解封装**：它们在盘上是 `chat-vault/blobs/<消息 id>.bin`（`envelope` 封装格式，真正的扩展名在文件头里，见 `blobs`/`envelope` 的模块注释）—— 原样交给系统共享存储就是一个打不开的 `.bin`（第一版真机反馈的正是这个）。所以 `mobile::save_file_to_phone` 分两档（`export.rs`）：
+
+- 头 4 字节是 `ODB1`：解出原始字节，按文件头里的扩展名 + 界面给的显示名写成 `<数据目录>/export/<uuid>/<名字>` 的一份临时文件再保存，保存完把临时目录删掉；
+- 普通文件（推送落盘的收件、暂存里选的图）：原样转发，只净化显示名。
+
+显示名**必须由界面传**（收件项的文件名 / 会话里那张图的名字），不能拿路径的文件名顶替 —— 会话图片的路径文件名是 `<消息 id>.bin`。`export_name` 还会只留最后一段（显示名可能来自对端）、过一遍 `sanitize_file_name`，并用文件头里的扩展名覆盖名字里写错的扩展名。
+
+**界面**（`store.saveToPhone` 统一出提示）：
+
+- 文件页收件项的操作表在「打开」下面多一项「保存到手机」，**文件夹不出这一项**（原生一次只处理一个文件；目录的递归保存不在这一版）。
+- 会话里点开大图，操作条多一颗「保存到相册」（`ImageViewer` 的可选 `onsave`，桌面端不传，所以桌面不画那颗按钮）。同一条命令，**显示名取会话里那条消息的名字**（`msgName(item)`）—— 后端据它解封装并命名。**先收起大图再保存**：toast 的层级（`.toasts` z-index 60）在大图层（`.iv-layer` 95）之下，不收起来那句「已保存到相册」用户看不见。
+- 提示按落点分档：「已保存到相册」/「已保存到音乐」/「已保存到下载」；老系统那条用户自己挑的位置只说「已保存」。
+- 复制出来的是**独立副本**：删收件里的原件不影响它，删它也不影响收件 —— 提示里不承诺"移动"，就是"保存"。
+
+### 校验（做了什么、看到什么）
+
+- `npm run check`：170 文件 **0 errors / 1 warning**（`RemarkDeviceSheet.svelte` 的既有 `state_referenced_locally`，与本次无关）。
+- `npm run check:i18n`：993 个调用点 / 1054 条英文词条，通过。
+- `npm run check:compat`：Chrome 81 门禁通过。
+- 安卓目标的 Rust：`cargo check --target aarch64-linux-android`（带 NDK 的 `CC_/AR_/CARGO_TARGET_…_LINKER`）通过；4 条既有 warning，与本次无关。宿主 `cargo check` 也通过（`#[cfg(mobile)]` 那段不会被宿主编译，所以只当回归看）。
+- `cargo test --lib export::tests`：**6 条全过** —— 封装文件解出的字节/名字、扩展名以文件头为准、显示名缺扩展名时补上、普通收件文件原样转发、`../` 显示名不能逃出临时目录、比魔数还短的文件不当封装文件。
+- Kotlin：`:app:compileUniversalDebugKotlin` `BUILD SUCCESSFUL`（`AppFiles.kt` / `ExportFilePlugin.kt` / 改动后的 `FileOpenPlugin.kt` 由这一步编译）。
+- **真实产物 + 真实 Chromium + 假 IPC**（`dist-mobile`，393×852）：收件两条（一个文件 + 一个文件夹）。点文件行，操作表是「打开 / 保存到手机 / 复制路径 / 删除本地副本」；点「保存到手机」发出
+  `save_file_to_phone({path:"/data/user/0/com.x177plus.orbdrop/OrbDrop/received/PC-A/IMG_20261105_101010.jpg", name:"IMG_20261105_101010.jpg"})`，随后出现「已保存到相册」toast；点文件夹行，操作表里**没有**「保存到手机」。会话里点开图片，操作条是「保存到相册 / 用系统程序打开 / 关闭」；点第一颗发出 `save_file_to_phone({path:"…/OrbDrop/chat-vault/blobs/m1.png", name:"图片-1.png"})`。
+- 真机验证见下面「真机」一段（未验的就是没验到，不写成"应该没问题"）。
+
+### 真机（Android 12 / CTR-AL20，USB；debug 包重签成发行密钥装上，验完已换回 v0.2.1 release）
+
+- 用 `run-as` 往收件里放了一张 320×240 的 JPEG（`OrbDrop/received/PC-A/照片测试.jpg`）。进「文件 → 收件」，行上是 `PC-A · 2 KB · 今天 11:29`；点行 → 操作表里「保存到手机」在「打开」下面；点它 → toast「已保存到相册」。
+- 落点：`/sdcard/Pictures/OrbDrop/照片测试.jpg`（1829 B，`media_rw`）；`content query --uri content://media/external/images/media` 里有 `_display_name=照片测试.jpg, relative_path=Pictures/OrbDrop/`。
+- 同一份**再点一次**：磁盘与媒体库里都是 `照片测试 (1).jpg` —— 不覆盖、也不出现两条同名。
+- 一份 `.txt`：落 `/sdcard/Download/OrbDrop/说明.txt`，媒体库行 `mime_type=text/plain`、`relative_path=Download/OrbDrop/`（`MediaStore.Downloads` 那条分支）。
+- 系统解析器把 `content://media/external/images/media/1580` + `image/jpeg` 解析到 `com.huawei.photos/.SinglePhotoActivity` —— 相册确实认这一条。显式 `am start -n` 被 ROM 拒了，没把相册拉起来截图（平台限制，不是本应用这条链的问题）。
+- 验完删掉了两处测试文件与对应媒体库行，并把应用恢复成 v0.2.1 release（`dumpsys package` 的 `flags` 里没有 `DEBUGGABLE`）。
+- **没验**：Android 9 及以下那条 SAF 对话框（手头只有 Android 12）；会话大图的「保存到相册」在真机上没点（那台机器上没有图片消息，按钮形态在 Chromium 桩上验过）。
+
+### 真机（第二轮：`.bin` 修复，Android 12 / CTR-AL20；debug 包重签成发行密钥装上，验完已换回 v0.2.1 release）
+
+第一版真机试出"保存下来是打不开的 `.bin`"（会话图片在盘上本来就是封装过的 `<id>.bin`）。这一轮直接照那条路复现：
+
+- 造了一份**封装格式的 PNG**（`ODB1` 头 + 564 B 的 PNG，文件共 577 B），以 `会话图片测试.bin` 放进收件。界面上它就是一条 `.bin`（577 B）。
+- 点「保存到手机」→ toast「已保存到相册」；落点是 **`/sdcard/Pictures/OrbDrop/会话图片测试.png`，564 B**，媒体库行 `mime_type=image/png`、`relative_path=Pictures/OrbDrop/`、`_size=564`。
+- `adb pull` 回来与原始 PNG **逐字节一致**（`cmp` 通过），Pillow 解出 `PNG (240, 180)` —— 不是"改了扩展名的封装文件"。
+- 保存后 `run-as … ls OrbDrop/export` 是**空的**：解封装用的临时子目录已经删掉。
+- 第一轮那几条（真实 JPEG、重名 `(1)`、txt → Download）在这一轮代码上没有重跑；这一轮改的是"交出去的是哪一份字节、叫什么名字"，复制/落盘那条 Kotlin 链两轮相同。
+
+### 边界（这一版不做）
+
+- **文件夹不保存**：递归导出要一棵树、还要处理同名目录合并，这一版只做单文件。
+- **不做"收到就自动进相册"**：那会多一份不受收件删除管理的副本（删了原件相册里还在），语义比"用户点一下保存"更含糊。
+- **不申请 `WRITE_EXTERNAL_STORAGE`**：Android 9 及以下改用系统「保存到」对话框，与本仓"零存储权限"的一贯取舍一致；代价是那些设备上多一次系统对话框。

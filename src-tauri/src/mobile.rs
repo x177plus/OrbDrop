@@ -254,6 +254,85 @@ pub async fn open_file(path: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+// ── 「把收件里的一份文件存进系统的相册 / 下载」（`save_file_to_phone`）────────────
+//
+// 私有目录里的文件只有本应用看得到：相册搜不到、微信/邮件这类"挑一张图"的选择器也挑不到。
+// `open_file` 解决"用别的应用打开这一份"，这一条解决"让别的应用看见并拿去用"—— 复制一份进
+// 系统媒体库（相册 / 音乐 / 下载）。机制与两条路的取舍见 `ExportFilePlugin.kt`。
+
+/// 「保存到手机」插件的句柄（与文件打开同款：`setup` 那一刻注册，用的时候取）。
+#[cfg(mobile)]
+static EXPORT_HANDLE: OnceLock<PluginHandle<tauri::Wry>> = OnceLock::new();
+
+/// 「保存到手机」插件（只在安卓构建里挂，见 `lib.rs`）。
+#[cfg(mobile)]
+pub fn export_plugin() -> TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("orbdrop-export-file")
+        .setup(|_app, api| {
+            // 类名与 Kotlin 那边的 `@TauriPlugin class ExportFilePlugin` 对应。
+            let handle = api.register_android_plugin("com.x177plus.orbdrop", "ExportFilePlugin")?;
+            if EXPORT_HANDLE.set(handle).is_err() {
+                warn!("保存到手机插件重复注册：沿用第一份句柄");
+            }
+            Ok(())
+        })
+        .build()
+}
+
+/// 「保存到手机」的结果。
+///
+/// `place` 是**给人看的那一档落点**：`gallery`（相册：图片与视频）、`music`（音乐）、
+/// `downloads`（下载：其余类型）—— 前三条是 Android 10+ 写媒体库时的固定子目录；
+/// `chosen` 是 Android 9 及以下那条系统「保存到」对话框（落点是用户自己挑的）。
+#[cfg(mobile)]
+#[derive(serde::Serialize)]
+pub struct SavedFile {
+    /// `false` = 用户在系统对话框里按了返回。**不是错误**：界面什么都不该提示。
+    pub saved: bool,
+    pub place: String,
+}
+
+/// 安卓：把一份应用私有目录里的文件复制进系统共享存储，让别的应用看得见它。
+///
+/// Android 10+ 直写 MediaStore（`Pictures|Movies|Music|Download` 下的 `OrbDrop/`，重名按
+/// `名字 (1).ext` 排开），不需要任何权限；9 及以下开系统的 `ACTION_CREATE_DOCUMENT`，
+/// 用户挑落点，同样不需要权限。源文件的路径闸门由原生侧 `AppFiles` 收口（与 `open_file`
+/// 同一份判据）。
+///
+/// `name` 是界面上那一份的**显示名**（收件项的文件名 / 会话里那张图的名字）。它决定共享存储
+/// 里叫什么、也决定 MIME 与落点（相册还是下载），所以不能拿路径的文件名顶替 —— 会话图片的
+/// 路径是 `chat-vault/blobs/<消息 id>.bin`（见下一段）。
+#[cfg(mobile)]
+pub async fn save_file_to_phone(path: String, name: Option<String>) -> Result<SavedFile, String> {
+    let Some(handle) = EXPORT_HANDLE.get() else {
+        return Err("保存到手机插件没注册上（内部错误）".into());
+    };
+    let temp_root = crate::config::data_dir().join("export");
+    let source = PathBuf::from(&path);
+    // 读盘/解封装挪到阻塞池：一份 8 MB 的图在慢存储上也会占住一个 runtime 线程。
+    let prepared = tauri::async_runtime::spawn_blocking(move || {
+        crate::export::prepare_export(&source, name.as_deref(), &temp_root)
+    })
+    .await
+    .map_err(|e| format!("准备保存失败：{e}"))??;
+    let value = handle
+        .run_mobile_plugin_async::<serde_json::Value>(
+            "saveToPublic",
+            serde_json::json!({
+                "path": prepared.path.to_string_lossy(),
+                "name": prepared.name.clone(),
+            }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    // `prepared` 在这里析构：解封装用的临时目录（如果真的解了）随之删掉。
+    drop(prepared);
+    Ok(SavedFile {
+        saved: value["saved"].as_bool().unwrap_or(false),
+        place: value["place"].as_str().unwrap_or_default().to_string(),
+    })
+}
+
 // ── 「把输入法剪贴板里的那张图拷成暂存文件」（`resolve_image_uri`）─────────────────
 
 /// 粘贴图片插件的句柄（与文件打开那条路同一个形状：`setup` 那一刻注册，用的时候取）。

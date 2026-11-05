@@ -32,6 +32,10 @@ pub mod mirror;
 /// 移动端专属命令（收件目录列举/删除）：只在 Android 构建里登记。
 #[cfg(mobile)]
 pub mod mobile;
+/// 「保存到手机」之前的准备（会话图片要先解封装、按显示名落成临时文件）：安卓命令用，
+/// 桌面端只在测试里编译（`cargo test` 要能直接跑那几个用例）。
+#[cfg(any(mobile, test))]
+mod export;
 pub mod net;
 // 收到消息时手机通知栏里那一条（F-108）：桌面端是空操作，模块本身两平台都有
 // （收消息那条路是共用的，调用点不该被 `cfg` 切成两半）。
@@ -696,6 +700,85 @@ fn local_addresses() -> LocalAddresses {
         primary: all.first().cloned(),
         all,
     }
+}
+
+/// 某条共享项的**免配对下载链接**（右键「复制下载链接」）。
+///
+/// 只有开着广播开关的共享项才给链接 —— 与公开路由 `/s/<id>` 的 gate 是同一个字段
+/// （`broadcast_enabled`），关掉开关链接立刻失效，不需要另存一份令牌。
+///
+/// 地址取首选内网 IPv4（与左下角「IP:端口」同一来源），协议用 **http**：主端口默认只服务
+/// 回环明文，但共享链接是唯一例外（`net::dispatch_conn` 只放行 `/s/*`），于是另一台设备的
+/// 浏览器打开就直接下载，不会先弹自签证书警告。
+///
+/// URL 最后一段带上下载文件名（目录是 `<名字>.zip`）：有些浏览器/下载器只按路径最后一段
+/// 取名，`Content-Disposition` 会被它们忽略；带一段名字后两边都能得到正确的文件名。
+#[tauri::command]
+fn share_download_url(
+    share_id: String,
+    path: Option<String>,
+    name: Option<String>,
+    is_dir: Option<bool>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
+    let share = state
+        .config
+        .lock()
+        .shares
+        .iter()
+        .find(|s| s.id == share_id && s.broadcast_enabled)
+        .cloned()
+        .ok_or_else(|| "共享项不存在或未开启广播".to_string())?;
+    // 前端树节点用 `/` 分隔，这里统一一下；空串 = 共享项根。
+    let rel = path.unwrap_or_default().replace('\\', "/");
+    if !crate::server::safe_relative_share_path(&rel) {
+        return Err("共享项内路径非法".to_string());
+    }
+    let display_name = name
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| share.name.clone());
+    let download_name =
+        crate::server::share_download_name(&display_name, is_dir.unwrap_or(false));
+    // URL 最后一段只是兜底文件名；分隔符/`..` 不能落进路径段（`path_segments_mut` 会编码
+    // 它们，但浏览器解码后可能又当成路径）。其余字符（中文、空格、`#`）交给 `url` 编码。
+    let mut url_name = download_name.replace(['/', '\\'], "_");
+    if url_name == "." || url_name == ".." {
+        url_name = "_".to_string();
+    }
+    let ip = crate::server::local_ipv4_addresses()
+        .into_iter()
+        .next()
+        .ok_or_else(|| "本机没有可用的内网地址（先连上局域网）".to_string())?;
+    let port = state.server_port.load(std::sync::atomic::Ordering::SeqCst);
+    if port == 0 {
+        return Err("HTTP 服务尚未启动".to_string());
+    }
+    share_download_url_at(&ip, port, &share.id, &rel, &url_name)
+}
+
+/// `share_download_url` 的纯函数部分：地址、端口、共享项 id、相对路径与兜底文件名 → URL。
+///
+/// `path` 走 `query_pairs_mut`，兜底文件名走 `path_segments_mut`（而不是手拼）：中文、空格、
+/// `#`/`&` 这些字符都由 `url` 按各自规则编码，服务端再原样解码/忽略。
+pub(crate) fn share_download_url_at(
+    ip: &str,
+    port: u16,
+    share_id: &str,
+    rel: &str,
+    tail: &str,
+) -> Result<String, String> {
+    let mut url = url::Url::parse(&format!("http://{ip}:{port}"))
+        .map_err(|e| format!("生成本机地址失败：{e}"))?;
+    url.set_path(&crate::server::share_link_path(share_id));
+    if !tail.is_empty() {
+        url.path_segments_mut()
+            .map_err(|_| "生成下载文件名失败".to_string())?
+            .push(tail);
+    }
+    if !rel.is_empty() {
+        url.query_pairs_mut().append_pair("path", rel);
+    }
+    Ok(url.into())
 }
 
 /// 一条 LocalSend 发现行是否应该藏掉：本机已经用 OrbDrop 身份认识这台设备。
@@ -2968,6 +3051,23 @@ async fn open_path(path: String) -> Result<(), String> {
     mobile::open_file(path).await
 }
 
+/// 安卓：把一份应用私有目录里的文件复制进系统共享存储（相册 / 音乐 / 下载），让别的应用
+/// 看得见它 —— 收件里的图片/视频「只能在本应用里看」的那一档就是它解决的。
+///
+/// Android 10+ 直接写 MediaStore（`Pictures|Movies|Music|Download` 下的 `OrbDrop/`，
+/// 重名排成 `名字 (1).ext`），不需要任何权限；9 及以下开系统的「保存到」对话框（SAF），
+/// 用户取消回 `{saved:false}`（**不是错误**）。`name` 是界面上的显示名（会话图片的路径是
+/// `chat-vault/blobs/<id>.bin`，不能用它当名字）。机制与取舍见 `mobile::save_file_to_phone`
+/// 与 `ExportFilePlugin.kt`。
+#[cfg(mobile)]
+#[tauri::command]
+async fn save_file_to_phone(
+    path: String,
+    name: Option<String>,
+) -> Result<mobile::SavedFile, String> {
+    mobile::save_file_to_phone(path, name).await
+}
+
 /// 安卓：把输入法剪贴板塞进输入框的那个图片 URI（`content://`）拷成一份暂存文件，
 /// 返回它的路径与字节数。
 ///
@@ -3747,6 +3847,11 @@ pub fn run() {
     #[cfg(mobile)]
     let builder = builder.plugin(mobile::open_plugin());
 
+    // 「保存到手机」：私有目录里的文件别的应用看不见（相册、微信的挑图器都碰不到它），
+    // 复制一份进系统媒体库 / 下载 —— 见 `mobile::save_file_to_phone`。
+    #[cfg(mobile)]
+    let builder = builder.plugin(mobile::export_plugin());
+
     // 「粘贴进来的那张图」：输入法剪贴板往输入框里插的是一个 `content://`，JS 读不出来，
     // 得请原生那一跳拷成暂存文件（会话里发图片走推送，只认本机路径）—— 见 `mobile::resolve_image_uri`。
     #[cfg(mobile)]
@@ -3835,6 +3940,7 @@ pub fn run() {
             bc_compare_with_left,
             get_actual_port,
             local_addresses,
+            share_download_url,
             list_devices,
             list_device_remarks,
             set_device_remark,
@@ -3911,6 +4017,8 @@ pub fn run() {
             mobile::delete_inbox_file,
             #[cfg(mobile)]
             resolve_image_uri,
+            #[cfg(mobile)]
+            save_file_to_phone,
             #[cfg(mobile)]
             pick_files,
             #[cfg(mobile)]

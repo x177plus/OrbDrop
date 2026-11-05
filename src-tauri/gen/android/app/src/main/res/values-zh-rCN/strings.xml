@@ -16,6 +16,13 @@
     <string name="file_open_missing">文件不在了：%1$s</string>
     <string name="file_open_is_directory">这是文件夹：安卓上没有能打开应用私有目录的应用</string>
 
+    <!-- 「保存到手机」（ExportFilePlugin）：把收件里的一份文件复制进系统相册 / 下载。 -->
+    <string name="export_not_owned">只能保存应用自己的文件：%1$s</string>
+    <string name="export_missing">文件不在了：%1$s</string>
+    <string name="export_is_directory">这是文件夹：保存到手机一次只处理一个文件</string>
+    <string name="export_no_output">系统没有给出可写的位置</string>
+    <string name="export_open_failed">打不开系统的「保存到」对话框</string>
+
     <string name="pick_open_failed">打不开系统选择器</string>
     <string name="pick_cache_dir_failed">建不了发送暂存目录：%1$s</string>
     <string name="pick_read_failed">读不到选中的这一项：%1$s</string>

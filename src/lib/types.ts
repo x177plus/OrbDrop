@@ -311,6 +311,18 @@ export interface TreeEntry {
   modified: string;
 }
 
+/**
+ * 「保存到手机」的结果（后端 `mobile::SavedFile`，只在移动端构建里注册）。
+ *
+ * `saved:false` = 用户在系统的「保存到」对话框里按了返回（Android 9 及以下那一档）——
+ * 正常操作，不是错误，界面不提示。`place` 是落点档位：`gallery`（相册，含视频）、
+ * `music`、`downloads`，以及老系统那条用户自己挑位置的 `chosen`。
+ */
+export interface SavedFile {
+  saved: boolean;
+  place: string;
+}
+
 // ── 移动端：系统那一层（F-87 / F-108 的横幅那半）──────────────────────────────
 
 /** 后台保活状态：**唯一能读到的系统状态**（电池优化白名单，Google 官方 API）。 */
@@ -810,6 +822,8 @@ export interface RectSlot {
   path: string;
   name: string;
   isDir: boolean;
+  /** 文件字节数（对端页下载进度要的总量）；目录与老版本对端没有这个数时是 0。 */
+  size?: number;
   /** 第二行的等宽小字（卡上只放得下很短的一段）。 */
   meta: string;
 }

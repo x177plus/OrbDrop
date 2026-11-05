@@ -171,6 +171,34 @@ export async function deleteInboxEntry(path: string): Promise<void> {
   await loadInbox();
 }
 
+/**
+ * 「保存到手机」：把收件 / 会话里的一份文件**复制**进系统的相册 / 音乐 / 下载。
+ *
+ * 为什么需要它：收件、会话图片、暂存全在应用私有目录（`/data/user/0/<包名>/…`）里 ——
+ * 相册搜不到、微信/邮件这类"挑一张图"的选择器也挑不到。`openPath` 只解决"用别的应用打开
+ * 这一份"，解决不了"让别的应用看见并用它"。复制出来的是一份**独立副本**：删收件里的原件
+ * 不影响它，反过来也一样。
+ *
+ * 两条路都在原生侧（见 `ExportFilePlugin.kt`）：Android 10+ 直接写 MediaStore，不用权限；
+ * 9 及以下开系统的「保存到」对话框（SAF，也不用权限），用户在对话框里取消 = 正常操作，
+ * 这里**不提示、不报错**（`saved:false`）。
+ *
+ * `name` 必须传界面上的显示名：会话图片在盘上是封装过的 `chat-vault/blobs/<id>.bin`，
+ * 后端会解封装并按这个名字落盘 —— 少了它，相册里就会是一个打不开的 `.bin`。
+ */
+export async function saveToPhone(path: string, name?: string): Promise<void> {
+  try {
+    const result = await api.saveFileToPhone(path, name);
+    if (!result.saved) return;
+    if (result.place === "gallery") toast(t("已保存到相册"), "download");
+    else if (result.place === "music") toast(t("已保存到音乐"), "download");
+    else if (result.place === "downloads") toast(t("已保存到下载"), "download");
+    else toast(t("已保存"), "download");
+  } catch (e) {
+    failed(t("保存"), e);
+  }
+}
+
 // ── 待接收 / 传输中（从会话的文件消息里筛）────────────────────────────────────
 
 /** 一条待接收的推送：会话里那条 `pending` 的文件消息 + 它在哪条会话里。 */

@@ -43,7 +43,7 @@
   const isApk = $derived(entry.name.toLowerCase().endsWith(".apk"));
 
   /**
-   * 三项动作都**先把要用的值取出来、再关表**。
+   * 每一项动作都**先把要用的值取出来、再关表**。
    *
    * 为什么不能先关表：`onClose()` 一下架这张表，这个组件的 props 当场就读不到了 —— 实测
    * `打开`/`复制路径`/`删除` 任何一项都只会得到一句
@@ -65,6 +65,19 @@
           : t("打开失败：{error}", { error: e instanceof Error ? e.message : String(e) }),
       );
     }
+  }
+
+  /**
+   * 保存到手机：把这一份**复制**进系统的相册 / 音乐 / 下载（其他应用从此看得到它）。
+   *
+   * 与「打开」互补：打开只是让别的应用**读这一次**，而相册、微信/邮件这类"挑一张图"的
+   * 选择器要的是**共享存储里的一份文件** —— 私有目录里的原件它们根本列不出来。
+   * 文件夹不出这一项：原生侧一次只处理一个文件（见 `ExportFilePlugin.kt`）。
+   */
+  async function save(): Promise<void> {
+    const { path, name } = entry;
+    onClose();
+    await store.saveToPhone(path, name);
   }
 
   async function copyPath(): Promise<void> {
@@ -115,6 +128,15 @@
       </span>
     </span>
   </button>
+  {#if !entry.isDir}
+    <button class="opt" type="button" onclick={save}>
+      <span class="oi"><Icon name="download" /></span>
+      <span class="om">
+        <span class="on">{t("保存到手机")}</span>
+        <span class="od">{t("复制一份到系统的相册 / 下载，其他应用也能看到并使用它。")}</span>
+      </span>
+    </button>
+  {/if}
   <button class="opt" type="button" onclick={copyPath}>
     <span class="oi"><Icon name="copy" /></span>
     <span class="om"><span class="on">{t("复制路径")}</span><span class="od">{t("复制收件目录中的完整路径。")}</span></span>

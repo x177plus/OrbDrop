@@ -28,9 +28,11 @@
 //!
 //! ## 同一个端口上接两种连接
 //!
-//! 明文 HTTP 只留给**回环**（本机 UI 的自验路径、Beyond Compare 的 WebDAV 入口，见
-//! `server::proxy`）。判据是 TLS 记录层的第一个字节：`0x16`（handshake）走 TLS，
-//! 其余且来源是回环才走明文 —— 局域网上的明文连接一律丢弃。
+//! 明文 HTTP 只留给两类请求：**回环**（本机 UI 的自验路径、Beyond Compare 的 WebDAV 入口，
+//! 见 `server::proxy`）与**公开共享链接** `GET/HEAD /s/<shareId>[/<下载文件名>]`（URL 本身就
+//! 是能力，内容本来就是给局域网里任意设备下载的，见 `server::routes_share_link`）。判据是
+//! TLS 记录层的第一个字节：`0x16`（handshake）走 TLS，其余先看来源；回环直接放行，非回环
+//! 还要再读一次请求行、只有共享链接那一条路径走明文，其余一律丢 —— 其余路径仍然只认 TLS。
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -65,6 +67,10 @@ const TLS_HANDSHAKE: u8 = 0x16;
 /// 等首字节的时限。明文 HTTP 客户端一定会先发请求行；超时说明对面连上就不说话
 /// （端口扫描、坏掉的客户端），别让它一直占着一个任务。
 const PEEK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 明文请求行的最大长度：只在这个范围内找 CRLF。共享链接带一个子路径查询也就几百字节；
+/// 8 KiB 是给畸形客户端的硬上限，peek 缓冲不会无界增长。
+const PLAINTEXT_REQUEST_LINE_MAX: usize = 8 * 1024;
 
 /// TLS 握手（`TlsAcceptor::accept`）的时限。**与首字节时限是两件事**：`PEEK_TIMEOUT`
 /// 只盖住"第一个字节到没到"，而这一个盖住"握手谈不谈得完"。
@@ -1249,6 +1255,75 @@ impl Drop for IpConnGuard {
     }
 }
 
+/// 从明文连接上**窥视**请求行（不消费字节；随后 hyper 还会从头读一遍）。
+///
+/// 只在非回环的明文连接上调用：用来判断它是不是公开共享链接。`peek` 不移动读指针，
+/// 判定通过后 `serve_http` 拿到的仍是完整请求。
+async fn peek_plaintext_request_line(stream: &TcpStream) -> Option<Vec<u8>> {
+    let deadline = std::time::Instant::now() + PEEK_TIMEOUT;
+    let mut buf = [0u8; PLAINTEXT_REQUEST_LINE_MAX];
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let n = tokio::time::timeout(remaining, stream.peek(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        if n == 0 {
+            return None; // 还没发请求行就关了
+        }
+        if let Some(end) = buf[..n].windows(2).position(|w| w == b"\r\n") {
+            return Some(buf[..end].to_vec());
+        }
+        if n >= buf.len() {
+            return None; // 请求行超长：不可能是共享链接
+        }
+        // 还没等到 CRLF：下一次 peek 会等新字节，deadline 兜底。
+    }
+}
+
+/// 局域网明文只放行**公开共享链接**：`GET/HEAD /s/<shareId>[/<下载文件名>][?query]`。
+///
+/// 路由本身只认 `/s/{*rest}`（第一段是 shareId，其余段是给浏览器兜底的文件名），所以这里
+/// 也要求 `/s/` 之后最多**两段**：`/s/../shares`、`/s/id/x/y` 这类形状一律不放行，避免明文
+/// 绕过其它路由的 TLS 要求。
+fn is_public_share_link_request(line: &[u8]) -> bool {
+    let mut parts = line.split(|b| *b == b' ').filter(|part| !part.is_empty());
+    let Some(method) = parts.next() else {
+        return false;
+    };
+    if method != b"GET" && method != b"HEAD" {
+        return false;
+    }
+    let Some(target) = parts.next() else {
+        return false;
+    };
+    let path = target.split(|b| *b == b'?').next().unwrap_or(target);
+    if !path.starts_with(b"/s/") {
+        return false;
+    }
+    let rest = &path[3..];
+    let mut segments = rest.split(|b| *b == b'/');
+    let Some(share_id) = segments.next() else {
+        return false;
+    };
+    if share_id.is_empty() || share_id == b"." || share_id == b".." {
+        return false;
+    }
+    match segments.next() {
+        None => true,
+        Some(file_name) => {
+            !file_name.is_empty()
+                && file_name != b"."
+                && file_name != b".."
+                && !file_name.contains(&b'\\')
+                && segments.next().is_none()
+        }
+    }
+}
+
 async fn dispatch_conn(
     stream: TcpStream,
     addr: SocketAddr,
@@ -1289,12 +1364,19 @@ async fn dispatch_conn(
         return serve_http(stream, addr, router, client_cert).await;
     }
 
-    // 明文只服务回环：本机 UI 的自验路径、以及 Beyond Compare 那条 WebDAV 入口
-    // （`server::proxy` 把它转成到对端的加密连接）。局域网上来的明文连接一律丢 ——
-    // 否则"加密"就是可选的，谁都能退回去用明文。
+    // 明文：回环直接服务（本机 UI / BC 入口）；**非回环只放行公开共享链接** `/s/<id>`，
+    // 其余路径仍然只认 TLS。共享链接的 URL 就是能力，内容本来就是给局域网任意设备下载的；
+    // 放行不等于把整张路由表都暴露到明文上 —— 认证/配置/文件接口仍然必须走 TLS。
     if !addr.ip().is_loopback() {
-        warn!(%addr, "非回环地址以明文 HTTP 连接，已拒绝");
-        return Ok(());
+        let allowed = match peek_plaintext_request_line(&stream).await {
+            Some(line) => is_public_share_link_request(&line),
+            None => false,
+        };
+        if !allowed {
+            warn!(%addr, "非回环地址的明文 HTTP 请求不是公开共享链接，已拒绝");
+            return Ok(());
+        }
+        debug!(%addr, "非回环地址以明文访问公开共享链接");
     }
     serve_http(stream, addr, router, ClientCertFingerprint(None)).await
 }
@@ -1440,6 +1522,27 @@ pub async fn connect_ws(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 局域网明文只认共享链接那一类请求行；其它路径/方法/多段路径一律不放行。
+    #[test]
+    fn plaintext_gate_only_allows_share_link_shape() {
+        assert!(is_public_share_link_request(b"GET /s/abc HTTP/1.1"));
+        assert!(is_public_share_link_request(
+            b"HEAD /s/abc?path=a%2Fb HTTP/1.1"
+        ));
+        assert!(is_public_share_link_request(
+            b"HEAD /s/abc/lan.txt?path=a%2Fb HTTP/1.1"
+        ));
+        assert!(!is_public_share_link_request(b"GET /shares HTTP/1.1"));
+        assert!(!is_public_share_link_request(b"POST /s/abc HTTP/1.1"));
+        assert!(!is_public_share_link_request(
+            b"GET /s/abc/lan.txt/extra HTTP/1.1"
+        ));
+        assert!(!is_public_share_link_request(b"GET /s/../shares HTTP/1.1"));
+        assert!(!is_public_share_link_request(b"GET /s/.. HTTP/1.1"));
+        assert!(!is_public_share_link_request(b"GET /s/abc/. HTTP/1.1"));
+        assert!(!is_public_share_link_request(b"GET /s/ HTTP/1.1"));
+    }
 
     #[test]
     fn fingerprint_is_stable_and_short_form_is_readable() {
