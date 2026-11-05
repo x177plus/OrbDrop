@@ -1,43 +1,43 @@
 {
-  "version": "0.2.1",
-  "versionCode": 2001,
-  "notes": "新增（安卓）：会话里的「＋」多一项**文件夹**（F-120）。走系统的目录选择器（`ACTION_OPEN_DOCUMENT_TREE`，不需要任何存储权限），一次选一棵目录；原生先把整棵树递归拷进应用缓存（保留相对路径与空文件，空目录不落文件），对端按同一棵相对路径接收 —— 协议没改，桌面端、老版本 OrbDrop 与 LocalSend 设备照旧收。个别子项读不到时跳过并计数，界面提示「准备文件夹时跳过了 n 项（读不到）」；根目录读不到、空间不足、一棵文件都没有时明确失败并清掉半棵暂存树，不会假装发成功。准备大目录期间会挂一条不会自动消失的「正在准备文件夹…」。附件底板同时改成一行四列（图片 / 文件 / 文件夹 / 应用），只留图标与名字。\n\n变更（安卓）：长按消息改为贴着气泡的**「复制」小浮层**，不再铺全屏底板、也不再压暗会话；滚动、转屏、Esc、安卓返回键都会收起。「复制整条消息」与文件操作里的「复制路径」改走原生 `ClipboardManager` —— Android WebView 的 `navigator.clipboard.writeText` 永远被拒绝（`NotAllowedError: Write permission denied.`），这两条路以前在真机上一直是坏的；原生写剪贴板不需要任何权限。\n\n修复（安卓）：打开底板时，最上面状态栏露出的那一层**窗口底色也跟着遮罩变暗**（此前 WebView 按系统栏 inset 缩过边，`.scrim` 只能盖到 WebView 边界，状态栏会留一条白）。导航栏在部分 ROM 上由系统自己绘制，仍不跟这一层走。\n\n文档：README / requirements / `p1-implementation.md` §44–45 补上文件夹选择、四列底板、消息小浮层与底板遮罩的机制、平台边界和真机验证记录。",
-  "pubDate": "2026-11-03T08:36:29Z",
+  "version": "0.2.2",
+  "versionCode": 2002,
+  "notes": "新增（安卓）：收件项操作表里多一项**「保存到手机」**（文件夹不出这一项）—— 把这一份**复制**进\n系统共享存储，别的应用从此看得见它：图片/视频进相册（`Pictures|Movies/OrbDrop`）、音频进音乐、\n其余进「下载」（`Download/OrbDrop`）。**解决的正是\"文件只能在这个应用里看\"**：收件与会话图片都在\n应用私有目录里，相册搜不到、微信/邮件这类\"挑一张图\"的选择器也列不出来（原来的「打开」只是把这一次\n的读权限交给目标应用）。Android 10+ 直写 `MediaStore`（不需要任何存储权限；同目录重名排成\n`名字 (1).ext`）；Android 9 及以下开系统的「保存到」对话框（SAF，同样免权限），取消不算错误。\n会话里点开大图也多了「保存到相册」一颗按钮（同一条命令）。**会话图片在盘上是封装过的\n`chat-vault/blobs/<消息 id>.bin`**：保存时先解封装，按会话里显示的名字落成真正的图片\n（`Pictures/OrbDrop/图片-1.png`），不会出现一个打不开的 `.bin`。复制出来的是独立副本，删收件里的原件\n不影响它。机制与验证见 `docs/p1-implementation.md` §46。\n\n新增：共享项右键**「复制下载链接」**——只对**开着广播开关**的共享项出现，复制出\n`http://<内网IP>:<实际端口>/s/<共享项 id>/<文件名>`。同一局域网里的其他设备用浏览器直接打开就能下，\n**不需要配对、不需要 token**，也不会先弹自签证书警告（主端口只对共享链接这一条路径放行\n局域网明文，其余路径仍然只认 TLS）；URL 最后一段就是真实文件名（目录是 `<名字>.zip`），\n不认 `Content-Disposition` 的下载器也能取对名字。开关关掉或共享项被移除后，这条 URL 立刻 404。文件按原字节流式\n返回；**目录边遍历边压成 ZIP 流**（不落临时文件、不先扫一遍算大小），ZIP 顶层保留目录名，\n解包是一棵有根的树。隐藏项与符号链接不打包（与设备页目录树的口径一致）。桌面端右键菜单；\n根共享项与树里任意子目录/文件都能生成（子项带 `path` 查询参数）。\n\n新增：圆角矩形悬浮框（卡片）里**设备页的共享项也能右键**了 —— 与面板里右键对端共享项同一份菜单\n（「下载到本地」+ BeyondCompare 区；对端项在 BC 里是 WebDAV 位置，`ctxBcTarget` 带上 `peerId`）。\n装了 BC 时，本机页卡片菜单也把同一片 BC 区摆进来（此前只在面板里有）；本机项按文件/文件夹读槽。\n两页都只对**最外那一层的共享项**开菜单，菜单照旧按实际尺寸临时撑大窗口、关掉缩回。\n\n修复：反向中转路由记录里**同一 `ip:port` 上的另一个 device id**（对端换过 id 后没清掉的旧行）\n不再被并进设备表。对端每 5 分钟把没变过的记录重推一次时仍会带着这些旧 id；此前\n`adopt_devices` 只按 id 判重，于是每轮都在同一地址上建出重复行，探活一拍后的\n`dedupe_known_addresses` 再删掉 —— `同一地址上的重复未配对设备行已合并 removed=N` 的 INFO 与\n`config.toml` 的双写会一直重复（真机 2026-11-05：本机 6 个旧 id 都指向 `10.198.71.106:3891`）。\n现在收养前按地址查重：设备表里已经占着的、以及同一批里在前的那一台之后的，都不再建行。",
+  "pubDate": "2026-11-05T14:26:36Z",
   "desktop": {
     "windows-x86_64": {
-      "size": 17831936,
-      "sha256": "be6c80f9a0b2a5fc04ccb4afde4ae49af71e73b46f89f215fd1c3b7f3a2796bd",
-      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NHJXNlljaVcySzJZM09xUVFwaldnZVZsc2E4S2Z6OHk4ekNNT0ZHZDNvQUhQdCthSW5FcUZieFdwKzJZaW8xVEZodjc3TFp1dXozNW5lSU1Cbk8xNHdVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNjk0OTg4CWZpbGU6b3JiZHJvcC5leGUKQjRaS2NMUlI4UTR1TU1NUERvcnBSdzRHanQvelZIcGlkd1g2R1R4VzcxK2hXcHkvLzRKU21oQUpRU1dMVllYMUtxcElTMTUrelZIWDFScEZSanpTQkE9PQo=",
+      "size": 17899008,
+      "sha256": "62ec3395a18ef7db8f463277c908bd701626e3ecfe3392bf787c39db19b455f2",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NHZlQUd5MkwzeUtlZ2UxWlJMdHJCSWg3di9MaWQ1Qis5OU1jR2tzOXUrOW5mbUxPMW9rUEIwcDk3bThrb25HeFQzSHNCVFB4ZWF4a3REUGFjUTM4UlF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzODg4Nzk1CWZpbGU6b3JiZHJvcC5leGUKVzJteXZ0R200QWZWdXh5ZTBkS1dSL0xOMlJMc05DQkhUTXVXMmhjSXIxczN1VGpvUG93QnI5b0hLNlpOUFlHUXZIcWF6em1USHdLQ2pjOXMzVlRpQWc9PQo=",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.2.1/OrbDrop_0.2.1_windows_x64.exe",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.2.1/OrbDrop_0.2.1_windows_x64.exe"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.2.2/OrbDrop_0.2.2_windows_x64.exe",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.2.2/OrbDrop_0.2.2_windows_x64.exe"
       ]
     },
     "macos-universal": {
-      "size": 14472718,
-      "sha256": "d76531463fdef244ca2e21d77726ab8243d7e7f89bff7e0a30de00bf0d2d00a3",
-      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NGl4YnEzWDFKK2Y5SkVWNTlEcENsTmlRM2RYQ3hCakJJS1g3WTNNN0hwc0lUTG1qMGFwZU5yK1k0ZEkxVGZsODJaaDU5TWViZHU2dHd2QVVvR25EMkE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNjk0OTg5CWZpbGU6T3JiRHJvcF8wLjIuMV9tYWNvc191bml2ZXJzYWwuYXBwLnppcApYVUZGb1N1d1VHYkJncTd6OGpXTjVkZ0hYUHgxQnVXRC9IL2k4OFA1SGhDQW5kSlp5bUs2WVZ6NjVpM3VLSzhZUVd2ZW02R2EvamhPUVNqb2N4U2dCZz09Cg==",
+      "size": 14638953,
+      "sha256": "dfa233833ee1bde4fb3e654743fdb01b63f5aa5ba3ddb67e15e26374cb7380a7",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NG53SWhSazExNUZLZkxWNlFGNU5XdWN3cnlQMWJZK1c2Z1RtYnNwNHMrKzY5Vk1vTnBVTHVtYThmRzZFNmUvSFdoVFkyM3c2QTNGeVBnNVhhSXlhR2c0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzODg4Nzk2CWZpbGU6T3JiRHJvcF8wLjIuMl9tYWNvc191bml2ZXJzYWwuYXBwLnppcApqeDM1c1h1MWlyRjJ5YjM5Q3EwYlA0Uld6dElhVUdxWTZ4ZkpseWNwRU5FRXlWREpyQk1wbGpDSjhMQlZCZnA3eDJJWGR5VTdrbVZzTStUdUs2NDBDUT09Cg==",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.2.1/OrbDrop_0.2.1_macos_universal.app.zip",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.2.1/OrbDrop_0.2.1_macos_universal.app.zip"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.2.2/OrbDrop_0.2.2_macos_universal.app.zip",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.2.2/OrbDrop_0.2.2_macos_universal.app.zip"
       ]
     }
   },
   "android": {
     "universal": {
-      "size": 30076207,
-      "sha256": "51e54d01f8e33eebf12b14abed3811673c3c3f386838ae36a6bdc5c8d25442e5",
+      "size": 30547195,
+      "sha256": "3977ed4778d8839c10eee6ecbed0bf84171d668a580c7bf8f7c8b0b94da402bf",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.2.1/OrbDrop_0.2.1_android_universal.apk",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.2.1/OrbDrop_0.2.1_android_universal.apk"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.2.2/OrbDrop_0.2.2_android_universal.apk",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.2.2/OrbDrop_0.2.2_android_universal.apk"
       ]
     },
     "arm64-v8a": {
-      "size": 9392135,
-      "sha256": "5c031d60807ca0c7b3a8666a4daf69854d6cbda84a2f2356dd1adf114a420428",
+      "size": 9506063,
+      "sha256": "9b368fe9bc88cffaa68576e3307e521d9c470a28c24b57e42e2075420c6086b8",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.2.1/OrbDrop_0.2.1_android_arm64.apk",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.2.1/OrbDrop_0.2.1_android_arm64.apk"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.2.2/OrbDrop_0.2.2_android_arm64.apk",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.2.2/OrbDrop_0.2.2_android_arm64.apk"
       ]
     }
   }
