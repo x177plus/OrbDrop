@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, PickedFile, InstalledApp, ChatFileMsg, ChatSnapshot, InboxEntry, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState, LocalSendStatus } from './types';
+import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, PickedFile, InstalledApp, ChatFileMsg, ChatSnapshot, InboxEntry, SavedFile, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState, LocalSendStatus } from './types';
 import type { ScreenMetrics, ScreenRect } from './orbLayout';
 
 // Share management
@@ -23,6 +23,23 @@ export function toggleBroadcast(shareId: string, enabled: boolean): Promise<void
   return invoke('toggle_broadcast', {
     req: { shareId, enabled },
   });
+}
+
+/**
+ * 共享项的免配对下载链接（右键「复制下载链接」）。
+ *
+ * 后端只给**开着广播开关**的共享项生成；`path` 是共享项内相对路径（空串 = 根）。
+ * 返回的 URL 用 `http://`：主端口默认只服务回环明文，但共享链接是唯一例外
+ * （`net::dispatch_conn` 只放行 `GET/HEAD /s/<id>`），另一台设备的浏览器打开就直接下载，
+ * 不会先弹自签证书警告。
+ */
+export function shareDownloadUrl(
+  shareId: string,
+  path = '',
+  name = '',
+  isDir = false,
+): Promise<string> {
+  return invoke('share_download_url', { shareId, path, name, isDir });
 }
 
 // Settings
@@ -688,6 +705,21 @@ export function listInbox(): Promise<InboxEntry[]> {
 /** 删掉收件目录里的一项**文件**（后端会挡住下载目录之外的路径与目录本身）。 */
 export function deleteInboxFile(path: string): Promise<void> {
   return invoke('delete_inbox_file', { path });
+}
+
+/**
+ * 把一份应用私有目录里的文件**复制**进系统共享存储 —— 图片/视频进相册
+ * （`Pictures|Movies/OrbDrop`），音频进音乐，其余进「下载」（`Download/OrbDrop`）。
+ *
+ * 为什么需要它：私有目录（`/data/user/0/<包名>/…`）只有本应用看得到，相册搜不到、别的应用
+ * "挑一张图 / 挑一个文件"时也挑不到。`openPath` 只解决"用别的应用打开这一份"。
+ * 复制出来的那一份是独立的：删收件里的原件不影响它。
+ *
+ * `name` 是**界面上的显示名**（收件项的文件名 / 会话里那张图的名字）。会话图片在盘上是
+ * 封装过的 `chat-vault/blobs/<消息 id>.bin`，后端会先解封装，再用这个名字落进相册。
+ */
+export function saveFileToPhone(path: string, name?: string): Promise<SavedFile> {
+  return invoke('save_file_to_phone', { path, name: name ?? null });
 }
 
 // 「让应用在后台活着」所需的系统那一层（F-87）：全是"读回状态 + 跳系统页"，只有安卓有实体

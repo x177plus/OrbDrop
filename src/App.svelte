@@ -19,7 +19,7 @@
   import * as chat from '$lib/stores/chat.svelte';
   import type { ConvoThread, ChatItem } from '$lib/stores/chat.svelte';
   import * as upd from '$lib/stores/update.svelte';
-  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, setPushReceivePaused, pushPaths, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, forgetPeer, downloadFromPeer, downloadFile, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
+  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, setPushReceivePaused, pushPaths, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, forgetPeer, downloadFromPeer, downloadFile, shareDownloadUrl, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
   import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem, PeerTransport } from '$lib/types';
   import { shareMeta, updateStatusText, updateTitleText } from '$lib/types';
   import { adoptLanguagePreference, t } from '$lib/i18n.svelte';
@@ -674,6 +674,7 @@
           path: loc.rel ? `${loc.rel}/${e.name}` : e.name,
           name: e.name,
           isDir: e.isDir,
+          size: e.size,
           meta: shareMeta(e.isDir, null, e.size),
         })),
       },
@@ -700,6 +701,7 @@
       path: '',
       name: s.name,
       isDir: s.isDir,
+      size: s.size ?? 0,
       meta: shareMeta(s.isDir, s.itemCount, s.size),
     }));
     const localDrill = rectView('local', localRoot);
@@ -725,6 +727,7 @@
           path: '',
           name: it.name,
           isDir: it.isDir,
+          size: it.size ?? 0,
           // 老版本对端不带 size/itemCount（`shareMeta` 认 `undefined`），那时只说类型名 ——
           // 不像上一版那样回退成登记日期（对端看到的是"别人哪天加的"，没有意义）。
           meta: shareMeta(it.isDir, it.itemCount, it.size),
@@ -935,12 +938,16 @@
   }
 
   /**
-   * 右键卡上的一格：与面板里右键一个共享项**同一个菜单、同一套处理**（`kind: 'share'`，
-   * 于是「打开所在文件夹 / 复制共享路径 / 移除共享项」全落到已有的那几个 `ctx*` 上）。
+   * 右键卡上的一格：与面板里右键一个共享项**同一个菜单、同一套处理**。
    *
-   * **只有本机页最外那一层**才长菜单：钻进去之后列的是共享项**里面**的东西（那是路径，
-   * 不是登记项 —— 没有"移除"这回事），设备页列的是别人的共享项（本机删不掉它）。两处右键
-   * 都不做事，与卡片上"单击不做事"同一套克制。
+   * - 本机页 → `kind: 'share'`：「打开所在文件夹 / 复制共享路径 / 移除共享项」全落到已有的
+   *   那几个 `ctx*` 上；装了 BC 时菜单尾部还有一整片 BC 区（与面板同一份）。
+   * - 设备页 → `kind: 'peer'`：「下载到本地」+ 同一片 BC 区（对端共享项在 BC 眼里是 WebDAV
+   *   位置，`ctxBcTarget` 会带上 peerId）。本机删不掉别人的共享项，所以这一档没有「移除」。
+   *
+   * **两页都只有最外那一层**才长菜单：钻进去之后列的是共享项**里面**的东西（那是路径，
+   * 不是登记项 —— 本机没有"移除"这回事；设备页则沿用面板里"共享项清单那一层"的口径）。
+   * 层级判定与「↰ 上一级」那格一致：它自己右键不做事，与卡片上"单击不做事"同一套克制。
    *
    * `orb: true` 是"这次开在折叠态卡片上"的标记，它带来三件事：`.reveal` 那一档要多算一路
    * （`orbCtxOpen`）、可点区域要把菜单盒并进来、以及**落点由 `placeOrbMenu` 现算**（先撑窗，
@@ -950,11 +957,19 @@
   function openRectCtx(pageIdx: number, slotIdx: number, x: number, y: number) {
     const page = rectPages[pageIdx];
     const slot = page?.items[slotIdx];
-    if (!page || page.kind !== 'local' || page.dir || !slot) return;
+    if (!page || page.dir || !slot) return;
     // 卡片这一份也要现读槽（与 `handleCtx` 同一理由：资源管理器那边可能刚改过）。
-    // 卡片上列的只有本机共享项入口（都是目录）→ 按文件夹那一档读。
-    void loadBcStatus('folder');
-    ctxState = { x, y, kind: 'share', shareId: slot.id, name: slot.name, orb: true, placed: false };
+    // 槽按右键项的类型取：对端共享项在 BC 眼里是 WebDAV 位置（文件夹那一档），本机项按 isDir。
+    void loadBcStatus(page.kind === 'peer' || slot.isDir ? 'folder' : 'file');
+    ctxState = page.kind === 'peer'
+      ? {
+          x, y, kind: 'peer', peerId: page.id, shareId: slot.id, path: slot.path,
+          isDir: slot.isDir, size: slot.size ?? 0, name: slot.name, orb: true, placed: false,
+        }
+      : {
+          x, y, kind: 'share', shareId: slot.id, path: slot.path,
+          isDir: slot.isDir, size: slot.size ?? 0, name: slot.name, orb: true, placed: false,
+        };
   }
 
   /** 菜单与屏幕边留的余量（CSS px）：与 `ctxPlacement` 的 `MARGIN` 同一个数。 */
@@ -2984,6 +2999,16 @@
     }
   }
 
+  /** 当前右键的共享项是不是开着广播（决定菜单里给不给「复制下载链接」）。
+   *  与后端 `/s/<id>` 的 gate 同一个字段；关掉开关后链接本身也立刻 404。 */
+  const ctxShareBroadcastOn = $derived.by(() => {
+    const c = ctxState;
+    if (!c || c.kind !== 'share' || !c.shareId) return false;
+    // 没有内网地址时复制出来也到不了别的设备（后端同样会拒绝）：菜单里先不给这一项。
+    if (!localAddrs.primary) return false;
+    return getShares().some((s) => s.id === c.shareId && s.broadcastEnabled);
+  });
+
   /** 「复制共享路径」：真的写剪贴板（从前只弹一句"已复制"，粘出来还是旧内容）。
    *  复制的是这项在磁盘上的**绝对路径** —— 拿它喂脚本/工具链才有用。 */
   async function ctxCopy() {
@@ -2996,6 +3021,30 @@
       toast(t('已复制共享路径'));
     } catch (e) {
       toast(t('复制失败：{error}', { error: String(e) }));
+    }
+  }
+
+  /** 「复制下载链接」：后端拼 `http://<内网IP>:<端口>/s/<shareId>?path=...`，另一台设备的
+   *  浏览器打开就能下；目录由后端边遍历边压成 ZIP。只有开播的共享项才有这一项（见
+   *  `ctxShareBroadcastOn`），后端也会再核一次 —— 开关刚被关掉时这里会收到明确错误。 */
+  async function ctxCopyUrl() {
+    const c = ctxState;
+    hideCtx();
+    if (!c?.shareId) return;
+    const item = localShareItem(c);
+    try {
+      const url = await shareDownloadUrl(
+        c.shareId,
+        (c.path ?? '').replace(/\\/g, '/'),
+        c.name ?? item?.share.name ?? '',
+        item?.isDir === true,
+      );
+      await navigator.clipboard.writeText(url);
+      toast(item?.isDir
+        ? t('已复制下载链接（目录将打包为 ZIP）')
+        : t('已复制下载链接'));
+    } catch (e) {
+      toast(t('复制下载链接失败：{error}', { error: String(e) }));
     }
   }
 
@@ -4227,6 +4276,7 @@
       onDownload={ctxDownload}
       onOpen={ctxOpen}
       onCopy={ctxCopy}
+      onCopyUrl={ctxShareBroadcastOn ? ctxCopyUrl : undefined}
       onRemove={ctxRemove}
       onConnect={ctxConnect}
       onDisconnect={ctxDisconnect}

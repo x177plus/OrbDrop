@@ -27,6 +27,7 @@ mod routes_pair;
 mod routes_pake;
 mod routes_push;
 mod routes_relay;
+mod routes_share_link;
 mod routes_shares;
 mod routes_stat;
 mod routes_tree;
@@ -224,6 +225,14 @@ fn build_router_with_body_idle_timeout(
         .route(
             "/link/request/withdraw",
             axum::routing::post(routes_link::link_withdraw_handler),
+        )
+        // 免配对下载链接（右键「复制下载链接」）：**公开面**，认人规则在 handler 里
+        // （共享项开着广播才服务）。浏览器没有 Bearer token，不能挂在 `auth_routes` 上。
+        // 路径尾部可以带一个**文件名**（URL 最后一段，给按路径取名的浏览器兜底）；
+        // handler 只取 `/s/` 之后的第一段当 shareId，后面的段忽略。
+        .route(
+            "/s/{*rest}",
+            axum::routing::get(routes_share_link::share_link_handler),
         )
         .route("/events", axum::routing::get(events_ws_handler))
         .route(
@@ -458,6 +467,32 @@ pub(crate) fn safe_relative_share_path(rel: &str) -> bool {
         }
     }
     true
+}
+
+/// 共享项免配对下载链接的路径段。命令层拼 URL 与公开路由用同一个拼法。
+pub fn share_link_path(share_id: &str) -> String {
+    format!("/s/{share_id}")
+}
+
+/// 下载时给浏览器的文件名：目录补 `.zip`（本身已叫 `.zip` 的不重复补）。
+///
+/// 头里的 `Content-Disposition` 与 URL 最后一段共用这一份拼法 —— URL 那一段是给
+/// **只按路径取文件名**的浏览器/下载器兜底的，见 `routes_share_link` 的模块注释。
+pub(crate) fn share_download_name(display_name: &str, is_dir: bool) -> String {
+    let name = if display_name.trim().is_empty() {
+        "download"
+    } else {
+        display_name
+    };
+    if is_dir {
+        if name.to_ascii_lowercase().ends_with(".zip") {
+            name.to_string()
+        } else {
+            format!("{name}.zip")
+        }
+    } else {
+        name.to_string()
+    }
 }
 
 /// 这个 `Origin` 是不是**本机自己的界面**发出来的。

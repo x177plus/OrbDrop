@@ -22,12 +22,18 @@
     name,
     onclose,
     onopenfile,
+    onsave,
   }: {
     path: string;
     name: string;
     onclose: () => void;
     /** 用系统默认程序打开这一份（与点普通文件消息同一件事）。 */
     onopenfile: () => void;
+    /**
+     * 把这张图复制到系统的相册（只在手机上给）。缺省不画那颗按钮 —— 桌面端本来就在
+     * 文件系统里，没有"相册"这一层可言。
+     */
+    onsave?: () => void;
   } = $props();
 
   let url = $state('');
@@ -134,6 +140,7 @@
     </button>
     <div class="iv-bar">
       <span class="iv-name" title={name}>{name}</span>
+      {#if onsave}<button class="iv-btn" type="button" onclick={onsave}>{t('保存到相册')}</button>{/if}
       <button class="iv-btn" type="button" onclick={onopenfile}>{t('用系统程序打开')}</button>
       <button class="iv-btn" type="button" onclick={onclose}>{t('关闭')}</button>
     </div>

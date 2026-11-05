@@ -44,6 +44,14 @@ export default defineConfig(({ mode }) => ({
     hmr: host
       ? { protocol: "ws", host, port: 1421 }
       : undefined,
-    watch: { ignored: ["**/src-tauri/**"] },
+    watch: {
+      // 开发服务器**不盯发布产物**：
+      // - `assets/` 里是发版时拷进来的安装包（`.gitignore` 第 32 行），构建/杀毒/复制那一刻会
+      //   把文件锁住，Windows 上 `fs.watch` 对它抛 `EBUSY`，而 Vite 不吞这个错误 —— 整个 dev
+      //   server 当场 exit 1（实测：`assets/v0.2.1/OrbDrop_0.2.1_windows_x64.exe` 正在写时）；
+      // - `dist/` / `dist-mobile/` 是 `vite build` 的落点，盯着它们只会在每次构建后白刷一次
+      //   整页重载（`page reload dist/index.html`），源码的 HMR 与它们无关。
+      ignored: ["**/src-tauri/**", "**/assets/**", "**/dist/**", "**/dist-mobile/**"],
+    },
   },
 }));

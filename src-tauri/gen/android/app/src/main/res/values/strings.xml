@@ -16,6 +16,13 @@
     <string name="file_open_missing">"The file is gone: %1$s"</string>
     <string name="file_open_is_directory">"This is a folder: no app on Android can open a directory inside private app storage"</string>
 
+    <!-- “Save to phone” (ExportFilePlugin): copies one inbox file into the system gallery / Downloads. -->
+    <string name="export_not_owned">"Only files owned by this app can be saved: %1$s"</string>
+    <string name="export_missing">"The file is gone: %1$s"</string>
+    <string name="export_is_directory">"This is a folder: Save to phone handles one file at a time"</string>
+    <string name="export_no_output">"The system didn't provide a place to write this file"</string>
+    <string name="export_open_failed">"Cannot open the system “Save to” dialog"</string>
+
     <string name="pick_open_failed">"Cannot open the system picker"</string>
     <string name="pick_cache_dir_failed">"Cannot create the send staging directory: %1$s"</string>
     <string name="pick_read_failed">"Cannot read the selected item: %1$s"</string>

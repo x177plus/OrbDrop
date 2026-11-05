@@ -30,6 +30,7 @@
     onDownload,
     onOpen,
     onCopy,
+    onCopyUrl,
     onRemove,
     onConnect,
     onDisconnect,
@@ -84,13 +85,10 @@
     /** 会话菜单：多台会话里这是**群发**（否则是群聊）—— 只影响文案。 */
     convoBc?: boolean;
     /**
-     * 共享项菜单的另一档：**折叠态卡片上开的那一份**（`ctxState.orb`）。只画装得进那扇
-     * 236×162 窗口的几项 —— 「下载到本地」与整片 BC 区留在面板里。
-     *
-     * 判据是**窗口**而不是"小不小气"：菜单是 `position: fixed`、夹取按窗口算（见 `bounds`），
-     * 超出窗口的部分会被窗口边硬裁掉。面板里那一份实测 205×278（装了 BC：7 项 + 2 条分隔；
-     * 没装 BC 那一档也是 172×162），折叠态窗口才 236×162 —— 全摆上去等于一个从中间被切掉的菜单；
-     * 这一份是 172×127。
+     * 卡片上开的那一份菜单（`ctxState.orb`）：本机页与设备页共用这一档 —— 行距、字号与文案
+     * 都收紧。它会**按菜单实际尺寸把折叠态窗口撑大**（`App.placeOrbMenu`），所以 BC 区
+     * （装了 BC 才画）照摆；本机共享项那一份仍不摆「下载到本地」（目录复制到下载目录是另一个
+     * 语义，见 `ctxDownload`），设备页那一份的「下载到本地」不受影响。
      */
     compact?: boolean;
     /**
@@ -114,6 +112,11 @@
     onDownload: () => void;
     onOpen: () => void;
     onCopy: () => void;
+    /**
+     * 共享项菜单：「复制下载链接」—— 只有共享项**开着广播开关**时调用方才传这个回调
+     * （后端 `/s/<shareId>` 的 gate 就是同一个字段）。不传 = 不画这一项。
+     */
+    onCopyUrl?: () => void;
     onRemove: () => void;
     onConnect: () => void;
     onDisconnect: () => void;
@@ -201,9 +204,9 @@
   {/if}
   <button class="ctx-item" disabled={!bcCompareEnabled} onclick={() => handleItem(onBcCompare)}>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><rect x="3" y="4" width="7" height="16" rx="1.5"/><rect x="14" y="4" width="7" height="16" rx="1.5"/></svg>
-    {bcCompareLabel
-      ? t('用 BeyondCompare 比较 · 与左侧：{label}', { label: bcCompareLabel })
-      : t('用 BeyondCompare 比较')}
+    {compact || !bcCompareLabel
+      ? t('用 BeyondCompare 比较')
+      : t('用 BeyondCompare 比较 · 与左侧：{label}', { label: bcCompareLabel })}
   </button>
   <button class="ctx-item" onclick={() => handleItem(onBcAddLeft)}>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H4M10 6l-6 6 6 6"/></svg>
@@ -280,9 +283,10 @@
       {convoThread ? (convoBc ? t('删除群发（消息留在各设备会话）') : t('退出群聊（本地删除并广播离开）')) : t('清空聊天记录')}
     </button>
   {:else if kind === 'peer'}
+    <!-- 卡片上的这一档已经由页头写着设备名（那一页就是它），文案不再重复一次。 -->
     <button class="ctx-item" onclick={() => handleItem(onPeerDownload)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
-      {peerName ? t('下载到本地 · 来自「{name}」', { name: peerName }) : t('下载到本地')}
+      {compact ? t('下载到本地') : peerName ? t('下载到本地 · 来自「{name}」', { name: peerName }) : t('下载到本地')}
     </button>
     {#if bcAvailable}{@render bcSection()}{/if}
   {:else if kind === 'share'}
@@ -300,12 +304,18 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11v13H4z"/><path d="M8 4h12v12"/></svg>
       {compact ? t('复制路径') : t('复制共享路径')}
     </button>
+    {#if onCopyUrl}
+      <button class="ctx-item" title={t('复制到其他设备的下载链接；用浏览器打开即开始下载')} onclick={() => onCopyUrl?.()}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3Z"/></svg>
+        {compact ? t('复制链接') : t('复制下载链接')}
+      </button>
+    {/if}
     <div class="ctx-sep"></div>
     <button class="ctx-item danger" onclick={() => handleItem(onRemove)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
       {compact ? t('移除共享') : t('移除共享项')}
     </button>
-    {#if !compact && bcAvailable}{@render bcSection()}{/if}
+    {#if bcAvailable}{@render bcSection()}{/if}
   {:else}
     <!-- 备注（F-101）**与在线状态无关**：它是纯本机数据（写进本机 `config.toml`，
          不发给对端），离线行、未绑定的行照样能改 —— 所以它排在下面那段状态分档之前，

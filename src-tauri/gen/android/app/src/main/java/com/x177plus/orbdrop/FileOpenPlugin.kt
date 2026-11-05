@@ -55,29 +55,9 @@ class FileOpenPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
-  /**
-   * 只允许把**应用自己的**文件交给 FileProvider。
-   *
-   * `file_paths.xml` 的 `root-path` 是 `/`（安卓的预定义根覆盖不到 `app_data_dir/OrbDrop`），
-   * 所以这一层必须自己收口：正常收件、聊天图片、粘贴暂存都在 `dataDir/OrbDrop` 或
-   * `cacheDir` 下；任何别的绝对路径（例如凭据库）都不该变成可对外授权的 `content://`。
-   * 用 canonical path 判，符号链接跳出去也会被拒。
-   */
-  private fun appOwnedFile(path: String): File {
-    val file = File(path).canonicalFile
-    val roots = listOf(
-      File(activity.applicationInfo.dataDir, "OrbDrop").canonicalFile,
-      activity.cacheDir.canonicalFile,
-    )
-    val allowed = roots.any { root ->
-      file == root || file.path.startsWith(root.path + File.separator)
-    }
-    if (!allowed) throw IllegalArgumentException(activity.getString(R.string.file_open_not_owned, path))
-    return file
-  }
-
   private fun intentFor(path: String): Intent {
-    val file = appOwnedFile(path)
+    // 「只能是应用自己的文件」这道闸与「保存到手机」共用一份实现，见 `AppFiles`。
+    val file = AppFiles.requireOwned(activity, path, R.string.file_open_not_owned)
     if (!file.exists()) throw IllegalArgumentException(activity.getString(R.string.file_open_missing, path))
     // 文件夹这一档没有出路：收件落在应用私有目录里，`content://` 也换不来一个"能浏览它"的应用
     // （FileProvider 给不出目录枚举）。与其丢一个系统解析不出的 Intent 让用户看到

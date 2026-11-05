@@ -298,6 +298,19 @@
   }
 
   /**
+   * 把大图那一份复制到系统相册（`ImageViewer` 的「保存到相册」）。
+   *
+   * **先收起大图再交给后端**：toast 的层级（`.toasts` z-index 60）在大图层（`.iv-layer`
+   * 95）之下，不收起来那句「已保存到相册」用户根本看不见。保存的是**一份副本** ——
+   * 会话里这条记录与它的文件都还在，删会话也不影响相册里的那一份。
+   */
+  function saveViewing(): void {
+    const item = viewing;
+    viewing = null;
+    if (item?.path) void store.saveToPhone(item.path, msgName(item));
+  }
+
+  /**
    * 点自己发出去那条文件气泡右侧的停止圆环：取消这条推送（`store.stopOutgoingFile`）。
    * 界面不用自己改这条消息：随后那条 `push://batch` 会把这一台落成「已取消」。
    */
@@ -910,6 +923,7 @@
     path={viewing.path}
     name={msgName(viewing)}
     onclose={() => (viewing = null)}
+    onsave={saveViewing}
     onopenfile={() => {
       if (viewing) void openFile(viewing);
     }}

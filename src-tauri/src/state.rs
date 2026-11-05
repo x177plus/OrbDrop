@@ -2185,19 +2185,41 @@ impl AppState {
     /// 这一档**唯一的出路**是已配对的对端在 `/discover` 里报来同一台（[`Self::learn_peers`]
     /// 会把它升格成"学来的"行：那一档不探活也不打 `seen`，界面的准入一条都不满足）。
     ///
+    /// **同一 `ip:port` 只认一台**：记录里带着"同一地址的另一个 id"（对端换过 device id
+    /// 之后没清掉的旧行）时，后来的一律不建行 —— 否则对端每轮重推都会把旧行塞回来，
+    /// 5s 一拍的去重再删掉，`removed=N` 的日志与 config 写盘永远停不下来
+    /// （见 [`Self::dedupe_known_addresses`]；真机 2026-11-05）。这一批内部报同一地址的
+    /// 多台也只并第一台。
+    ///
     /// 返回真正并进来的台数。
     pub fn adopt_devices(&self, devices: &[crate::relay::RouteDevice], exclude: &[&str]) -> usize {
-        let known: HashSet<String> = {
-            let peers: HashSet<String> = self.peers.lock().iter().map(|p| p.id.clone()).collect();
-            let booked: HashSet<String> = self
-                .config
-                .lock()
-                .peers
+        // 设备表的两份快照一次取完：id 用于"已经有这一台"，地址用于"这一格已经有人"。
+        // 加锁顺序与 `upsert_peer` 一致（peers → config），两把锁不嵌套。
+        let peer_rows: Vec<(String, String, u16)> = self
+            .peers
+            .lock()
+            .iter()
+            .map(|p| (p.id.clone(), p.ip.clone(), p.port))
+            .collect();
+        let (known, taken): (HashSet<String>, HashSet<(String, u16)>) = {
+            let config = self.config.lock();
+            let mut known: HashSet<String> = peer_rows.iter().map(|r| r.0.clone()).collect();
+            known.extend(config.peers.iter().map(|p| p.id.clone()));
+            let mut taken: HashSet<(String, u16)> = peer_rows
                 .iter()
-                .map(|p| p.id.clone())
+                .filter(|(_, ip, port)| !ip.is_empty() && *port != 0)
+                .map(|(_, ip, port)| (ip.clone(), *port))
                 .collect();
-            peers.union(&booked).cloned().collect()
+            taken.extend(
+                config
+                    .peers
+                    .iter()
+                    .filter(|p| !p.ip.is_empty() && p.port != 0)
+                    .map(|p| (p.ip.clone(), p.port)),
+            );
+            (known, taken)
         };
+        let mut addr_seen: HashSet<(String, u16)> = HashSet::new();
         let fresh: Vec<&crate::relay::RouteDevice> = devices
             .iter()
             .filter(|d| {
@@ -2207,6 +2229,10 @@ impl AppState {
                     && d.id != self.own_id
                     && !known.contains(&d.id)
                     && !exclude.contains(&d.id.as_str())
+            })
+            .filter(|d| {
+                let addr = (d.ip.clone(), d.port);
+                !taken.contains(&addr) && addr_seen.insert(addr)
             })
             .take(MAX_ADOPTED_DEVICES)
             .collect();
@@ -4682,6 +4708,75 @@ mod tests {
             !state.config.lock().known_peers.contains_key(&own),
             "观察记忆里也不该留下自己"
         );
+    }
+
+    /// 回归（真机 2026-11-05）：反向记录里**同一地址上的旧 id**不得被收养。
+    ///
+    /// 对端每 4~5 分钟重推一条 route 记录，里面始终带着本机 6 个旧 device id（同一个
+    /// `10.198.71.106:3891`）。`adopt_devices` 只按 id 判重，于是每轮都建行；下一拍探活末尾的
+    /// `dedupe_known_addresses` 再删 6 行 —— `removed=6` 的 INFO 与 config 的双写永远停不下来。
+    #[test]
+    fn a_route_cannot_adopt_a_second_id_at_an_occupied_address() {
+        let state = memory_state();
+        let Some(net) = first_own_net() else {
+            return;
+        };
+        // 这一格已经有一行（复现：本机旧 id 留在 knownPeers 里的那一行）。
+        state.upsert_peer(&PeerDevice {
+            id: "current-id".into(),
+            name: "D1159".into(),
+            ip: "10.44.0.7".into(),
+            port: 3890,
+            ..Default::default()
+        });
+        let stale = route_record(&net, "10.44.0.0/16", "old-id", "10.44.0.7");
+        state.apply_relay_route_hints("phone-a", std::slice::from_ref(&stale));
+        assert!(
+            state.get_peer("old-id").is_none(),
+            "同一 ip:port 的旧 id 不该再建一行"
+        );
+        assert!(
+            !state.config.lock().known_peers.contains_key("old-id"),
+            "观察记忆里也不该留下它"
+        );
+        assert_eq!(
+            state.dedupe_known_addresses(),
+            0,
+            "同一份记录重推之后也不该再有可合并的重复行（没有 removed 就不会刷日志）"
+        );
+
+        // 同一批里两台报同一格地址：也只并第一台。
+        let batch = crate::relay::RouteRecord {
+            target_cidr: net.clone(),
+            via_cidr: "10.44.0.0/16".into(),
+            via_devices: vec![
+                crate::relay::RouteDevice {
+                    id: "dup-a".into(),
+                    name: "A".into(),
+                    ip: "10.44.0.9".into(),
+                    port: 3890,
+                },
+                crate::relay::RouteDevice {
+                    id: "dup-b".into(),
+                    name: "B".into(),
+                    ip: "10.44.0.9".into(),
+                    port: 3890,
+                },
+            ],
+            via_paired: Vec::new(),
+            confirmed_at: None,
+        };
+        state.apply_relay_route_hints("phone-a", &[batch]);
+        assert!(state.get_peer("dup-a").is_some());
+        assert!(
+            state.get_peer("dup-b").is_none(),
+            "同一批同一地址只认第一台"
+        );
+
+        // 另一格地址照旧并进来（不是整条记录都扔掉）。
+        let other = route_record(&net, "10.44.0.0/16", "other-id", "10.44.0.8");
+        state.apply_relay_route_hints("phone-a", std::slice::from_ref(&other));
+        assert!(state.get_peer("other-id").is_some());
     }
 
     /// 所有"观察到一个地址/听到它"的入口都挡本机自己（`/relay/open`、`/relay/route`

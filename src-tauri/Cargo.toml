@@ -82,6 +82,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
 pathdiff = "0.2"
+# 共享项的免配对 HTTP 下载链接：目录要边遍历边压成 ZIP 直接往外吐（不落临时文件）。
+# 只用 `tokio`（tokio-util 的 compat）+ `deflate`，其余压缩格式一个都不编；`chrono`
+# 只为把文件的修改时间写进 ZIP 条目（chrono 本来就是本 crate 的依赖）。
+async_zip = { version = "0.0.19", default-features = false, features = ["tokio", "deflate", "chrono"] }
 # 自更新（见 `src/update/`）：版本比较用 `semver`，产物签名校验用 `minisign-verify`
 # （与 `tauri-plugin-updater` 自己那份实现同一个 crate，签名格式才是对得上的那一套）。
 semver = "1"
