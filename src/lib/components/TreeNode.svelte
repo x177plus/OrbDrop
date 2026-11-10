@@ -29,6 +29,8 @@
      * （展开子层、下载、BeyondCompare 比较全靠这个相对路径）。
      */
     parentPath = '',
+    /** 共享项的显示名（只给右键菜单/上传卡标题用；深层节点从父节点继承）。 */
+    shareName = '',
   }: {
     shareId: string;
     entry: TreeEntry;
@@ -36,6 +38,7 @@
     peerId?: string;
     refreshSignal?: number;
     parentPath?: string;
+    shareName?: string;
   } = $props();
 
   /** 本节点的共享项内相对路径（父目录路径 + 自己这一层名字）。 */
@@ -116,7 +119,7 @@
     e.stopPropagation();
     document.dispatchEvent(new CustomEvent('od:ctx', {
       detail: peerId
-        ? { x: e.clientX, y: e.clientY, kind: 'peer', peerId, shareId, path: ownPath, isDir: entry.isDir, size: entry.size, name: entry.name }
+        ? { x: e.clientX, y: e.clientY, kind: 'peer', peerId, shareId, shareName, path: ownPath, isDir: entry.isDir, size: entry.size, name: entry.name }
         : { x: e.clientX, y: e.clientY, kind: 'share', shareId, path: ownPath, isDir: entry.isDir, name: entry.name }
     }));
   }
@@ -128,7 +131,18 @@
 
 {#if entry.isDir}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="node" class:sub={level > 1} oncontextmenu={openCtx} use:dragOut={{ source: dragSource, onMessage: notify }}>
+  <div
+    class="node"
+    class:sub={level > 1}
+    data-od-peer-id={peerId}
+    data-od-share-id={shareId}
+    data-od-share-name={shareName}
+    data-od-path={ownPath}
+    data-od-name={entry.name}
+    data-od-isdir="true"
+    oncontextmenu={openCtx}
+    use:dragOut={{ source: dragSource, onMessage: notify }}
+  >
     <button class="chev" style="width:18px; height:18px; flex:none; margin-left:-22px" onclick={toggle} aria-label={t('展开')}>
       {@html ICON_CHEVRON}
     </button>
@@ -145,7 +159,7 @@
         <div class="node sub"><span class="n-name" style="color:var(--muted)">{t('空目录')}</span></div>
       {:else}
         {#each children as child (child.name)}
-          <TreeNode {shareId} entry={child} level={level + 1} parentPath={ownPath} {peerId} {refreshSignal} />
+          <TreeNode {shareId} entry={child} level={level + 1} parentPath={ownPath} {peerId} {refreshSignal} {shareName} />
         {/each}
       {/if}
     </div>
@@ -158,6 +172,12 @@
     class:dl-active={downloading}
     class:dl-paused={download?.status === 'paused'}
     style="--dl-pct: {downloadPct / 100}"
+    data-od-peer-id={peerId}
+    data-od-share-id={shareId}
+    data-od-share-name={shareName}
+    data-od-path={ownPath}
+    data-od-name={entry.name}
+    data-od-isdir="false"
     title={download?.status === 'paused'
       ? t('已暂停 · 双击继续「{name}」', { name: entry.name })
       : download?.status === 'running' ? t('双击暂停「{name}」', { name: entry.name }) : undefined}

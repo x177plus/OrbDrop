@@ -164,6 +164,23 @@ export const ICONS = {
       }
     ]
   },
+  "edit": {
+    "viewBox": "0 0 24 24",
+    "prims": [
+      {
+        "tag": "path",
+        "attrs": {
+          "d": "M4 20h4L18.5 9.5a2.8 2.8 0 0 0-4-4L4 16v4Z"
+        }
+      },
+      {
+        "tag": "path",
+        "attrs": {
+          "d": "m13 7 4 4"
+        }
+      }
+    ]
+  },
   "more": {
     "viewBox": "0 0 24 24",
     "prims": [

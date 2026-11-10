@@ -8,7 +8,7 @@
  *   这类"移动端才有的视图"，后者的数据来自后端命令。
  */
 import * as api from "$lib/api";
-import type { ChatFileMsg, InboxEntry, InstalledApp, LocalPick, PeerShareItem, PickedFile, TreeEntry } from "$lib/types";
+import type { AndroidShareState, ChatFileMsg, InboxEntry, InstalledApp, LocalPick, PeerShareItem, PickedFile, TreeEntry } from "$lib/types";
 import * as chat from "$lib/stores/chat.svelte";
 import * as devices from "$lib/stores/devices.svelte";
 import { t } from "$lib/i18n.svelte";
@@ -31,8 +31,8 @@ export function setTab(next: string): void {
   tab = (TABS as string[]).includes(next) ? (next as TabId) : "convos";
 }
 
-/** 文件页的三段：收件 / 传输 / 浏览。 */
-export type FilesSeg = "inbox" | "transfer" | "browse";
+/** 文件页的四段：收件 / 传输 / 本机共享 / 浏览对端。 */
+export type FilesSeg = "inbox" | "transfer" | "local" | "browse";
 
 let filesSeg = $state<FilesSeg>("inbox");
 
@@ -42,6 +42,32 @@ export function currentSeg(): FilesSeg {
 
 export function setSeg(next: FilesSeg): void {
   filesSeg = next;
+}
+
+/**
+ * 「所有文件访问」的状态（Android 11+ 才有）。
+ *
+ * 放在移动端 store 而不是某个组件里：文件页的「本机」段与路径选择器都要读它，授权页回来
+ * 之后两边得同时看到新状态。`null` = 还没读过；读失败也按 `null` 处理（界面只显示"正在读取"，
+ * 不会谎报"未授权"）。
+ */
+let shareAccess = $state<AndroidShareState | null>(null);
+
+export function getShareAccess(): AndroidShareState | null {
+  return shareAccess;
+}
+
+export async function refreshShareAccess(): Promise<void> {
+  try {
+    shareAccess = await api.androidShareState();
+  } catch {
+    shareAccess = null;
+  }
+}
+
+/** 打开系统的「所有文件访问」页；结果由调用方在 `visibilitychange` 里重读。 */
+export async function requestShareAccess(): Promise<void> {
+  await api.requestAndroidShareAccess();
 }
 
 /** 会话子屏开着时返回它的键（键的合法性由共享 store 判定，见 `chat.activeThread`）。 */
@@ -1024,6 +1050,10 @@ export type Sheet =
   | { kind: "editRecipients"; key: string }
   | { kind: "keepAlive" }
   | { kind: "update" }
+  /** 安卓作为共享方：选真实路径 / 管理本机共享项 / 改显示名。 */
+  | { kind: "sharePath" }
+  | { kind: "shareActions"; shareId: string }
+  | { kind: "renameShare"; shareId: string }
   /** 只由 `confirmAction` 创建：直接 `openSheet` 一个 confirm 不会有人结算 Promise。 */
   | { kind: "confirm"; prompt: ConfirmPrompt };
 

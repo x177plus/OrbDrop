@@ -745,19 +745,38 @@ async fn run(
         .map_err(|e| format!("清单超出上限: {e}"))?;
 
     let config = state.config.lock().clone();
-    // 落盘根 = `<落盘目录>/<对端名字>`（S-12 关掉这层时就是落盘根本身，见 `resume::landing_dir`）。
-    // 落盘目录默认是设置里的下载目录；只有在「每次询问」
-    // 下由用户亲自挑过的邀请才带自己的根（`invite.root`，见 `accept_invite`）。
-    // 名字先净化（对端自报的串不能直接当目录名用，
-    // 否则 `C:\Windows\Temp` / `..\..\Users\Public` 会把基址那一层整个顶掉）。
-    let base = invite
-        .root
-        .as_deref()
-        .unwrap_or(config.download_dir.as_path());
-    let dir = super::resume::landing_dir(base, &invite.sender.name, config.device_subdir);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| format!("建目录失败: {e}"))?;
+    // 落点：
+    // - 上传到共享项 → 共享项里的目标目录（自动收下，没有同意卡；同名文件恒覆盖）；
+    // - 普通推送 → `<落盘目录>/<对端名字>`（S-12 关掉这层时就是落盘根本身）。
+    //
+    // 上传的目录在 `accept_invite` 已经建过；重启续传时可能已经不在了（共享项被移除、
+    // 关播、盘拔了）—— `ensure_upload_dir` 会如实报错，这里按**终态**收尾，不要无限重试。
+    let dir = match invite.dest.clone() {
+        Some(dest) => match super::ensure_upload_dir(&state, &dest) {
+            Ok(dir) => dir,
+            Err(reason) => {
+                push_job::fail_download(
+                    &state,
+                    &peer_id,
+                    &invite.callback,
+                    &invite.invite_id,
+                    format!("上传目标不可用：{reason}"),
+                );
+                return Ok(());
+            }
+        },
+        None => {
+            let base = invite
+                .root
+                .as_deref()
+                .unwrap_or(config.download_dir.as_path());
+            let dir = super::resume::landing_dir(base, &invite.sender.name, config.device_subdir);
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .map_err(|e| format!("建目录失败: {e}"))?;
+            dir
+        }
+    };
 
     // 两个旋钮都从配置来（设置里的「传输并发数」「分块大小」），并在读的时候夹一次
     // 取值域 —— 配置文件是可以手改的，越界的值不能让传输行为失控。
@@ -779,28 +798,40 @@ async fn run(
     let mut pending_finalize: Vec<Arc<FileWork>> = Vec::new();
 
     for entry in invite.files.iter() {
+        // 清单路径是 `/push/stream` 的白名单键；本地落点可能被 `rename` 策略改过
+        // （`resolved`），两者必须分开。
+        let local_rel = invite
+            .resolved
+            .get(&entry.path)
+            .map(String::as_str)
+            .unwrap_or(entry.path.as_str());
         let target =
-            safe_join(&dir, &entry.path).ok_or_else(|| format!("非法路径: {}", entry.path))?;
+            safe_join(&dir, local_rel).ok_or_else(|| format!("非法路径: {}", entry.path))?;
         if let Some(parent) = target.parent() {
             if made_dirs.insert(parent.to_path_buf()) {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| format!("建目录失败: {e}"))?;
+                // 不跟随链接：共享项里的某一层若是链接，`create_dir_all` 会把文件写到
+                // 共享项外面；逐段判真目录后，越界在这里就停下。
+                super::create_dirs_within(&dir, parent)?;
             }
         }
-        // 身份 = 对端 id + **落盘目录** + 相对路径 + 大小 + 时间戳（见 `stream::resume_key`）：
-        // 同一个文件收在两个目录下是两份记录，互不踩。
+        // 身份 = 对端 id + **落盘目录** + 本地相对路径 + 大小 + 时间戳（见
+        // `stream::resume_key`）：同一个文件收在两个目录下是两份记录，互不踩；
+        // 同一个清单项被改名到另一个落点时，身份也跟着变（否则会接错半截文件）。
         let key = stream::resume_key(
             &peer_id,
             target.parent().unwrap_or(&dir),
-            &entry.path,
+            local_rel,
             entry.size,
             entry.mtime,
         );
-        let part = target
-            .parent()
-            .unwrap_or(&dir)
-            .join(stream::part_name(&key));
+        // 共享项目录里用点前缀的临时名：`/tree` 与目录 ZIP 会跳过 `.` 开头，
+        // 对端浏览时看不到一堆传输中的中间产物。下载目录保持原命名（向后兼容续传记录）。
+        let part_name = stream::part_name(&key);
+        let part = target.parent().unwrap_or(&dir).join(if invite.dest.is_some() {
+            format!(".{part_name}")
+        } else {
+            part_name
+        });
         let total_blocks = stream::block_count(entry.size, block_size);
 
         // 续传：只有"身份（含大小与时间戳）+ 块大小都一致"才认这条旧记录，
@@ -1053,9 +1084,25 @@ async fn run(
                 "inviteId": invite.invite_id,
                 "status": "completed",
                 "dest": dir.to_string_lossy(),
+                // 上传的 `skip` 策略：同名被跳过的项数与字节数（普通推送恒为 0）。
+                "skippedFiles": invite.skipped_files,
+                "skippedBytes": invite.skipped_bytes,
             }),
         );
-        info!(invite = %session.invite_id, files = session.files.len(), "并发接收完成");
+        // 审计：自动写入共享项没有人工确认，这一行是事后查"谁、往哪个共享项、写了多少"的
+        // 唯一结构化记录（界面那条通知只是顺带看一眼）。普通推送也记，`upload = false`。
+        info!(
+            invite = %session.invite_id,
+            upload = invite.dest.is_some(),
+            sender = %invite.sender.id,
+            sender_name = %invite.sender.name,
+            share = invite.dest.as_ref().map(|d| d.share_id.as_str()).unwrap_or(""),
+            path = invite.dest.as_ref().map(|d| d.path.as_str()).unwrap_or(""),
+            dest = %dir.display(),
+            files = session.files.len(),
+            total,
+            "并发接收完成"
+        );
     } else {
         let reason = session.summarize_failure();
         if session.source_changed.load(Ordering::Relaxed) {

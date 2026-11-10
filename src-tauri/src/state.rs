@@ -805,7 +805,13 @@ impl AppState {
                     p.port = peer.port;
                     address_changed = true;
                 }
-                p.paired = peer.paired;
+                // **只增不减**：这条路上来的 `peer` 常常是观察值（mDNS / 会话信封），
+                // `paired: false` 只表示"这次观察里没带关系"，**不是**"关系没了"。
+                // 以前这里是直接赋值 —— 一台已配对设备发一条未带凭据的报文（或一次发现
+                // 公告），地址簿里的 `paired` 就被写成 false 落了盘；内存里靠上面的
+                // `||` 还撑着 true，于是"内存已配对 / 磁盘未配对"两套真相，重启或任何
+                // 读配置的路径都会把设备显示成「未配对」。关系的唯一解除点是 `unpair`。
+                p.paired = p.paired || peer.paired;
             }
             let _ = crate::config::save_config_at(&self.config_path, &config);
         }
@@ -1116,6 +1122,72 @@ impl AppState {
         info!(%peer_id, %ip, port, "探活来源核实通过，已更新未配对设备地址");
     }
 
+    /// 一条**已鉴权**的入站长连接从哪儿来：把对端的直连地址校正成这条连接的来源。
+    ///
+    /// 为什么必须有这一步：链路活着时 `probe_peers_once` 不再探身份（`ws.has_connection`
+    /// 那一支），mDNS 在移动端/跨段也未必收得到 —— 对端换网（DHCP、换 Wi-Fi）之后地址簿里
+    /// 那条旧地址没有任何一条路能改掉。表现正是"消息发得到（走长连接），共享目录打不开
+    /// （HTTP 还拨旧 IP）"。
+    ///
+    /// 信任：`peer_id` 由 `/events` 的 token 反解（调用方 `events_ws_handler`），来源地址
+    /// 不可伪造；仍按 `/chat/*` / `/pair/hello` 的同一套判据排除"本机自己的监听端点"
+    /// （模拟器回连）与"经中转过来的"（来源是中转方，不是对端）。端口优先用对端自报的
+    /// （`?port=`：服务器可能顺延），老版本不带时沿用地址簿里的旧端口。
+    pub fn learn_link_endpoint(
+        self: &Arc<Self>,
+        peer_id: &str,
+        source: std::net::IpAddr,
+        reported_port: u16,
+    ) {
+        if peer_id.is_empty() || peer_id == self.own_id {
+            return;
+        }
+        // 没有这一行就没有"关系"可言（token 反解出的 id 正常一定有行，见
+        // `AppState::new` 的凭据合成）；不替一条陌生连接凭空建行。
+        let Some(known) = self.get_peer(peer_id) else {
+            return;
+        };
+        let port = if reported_port != 0 {
+            reported_port
+        } else {
+            known.port
+        };
+        if port == 0 {
+            return;
+        }
+        let Some((ip, port)) = crate::net::observed_dial_target(source, port, self.listening_port())
+        else {
+            return; // 来源就是本机自己的监听端点（模拟器/NAT 回连）
+        };
+        if known.ip == ip && known.port == port {
+            return; // 没变：不必落盘/广播
+        }
+        if self.is_relayed_source(source, peer_id) {
+            debug!(
+                %peer_id,
+                %source,
+                "长连接来源是本机认识的另一台设备（经它中转），不据此改地址"
+            );
+            return;
+        }
+        let name = if known.name.is_empty() {
+            peer_id.to_string()
+        } else {
+            known.name
+        };
+        let paired = self.is_paired(peer_id);
+        self.upsert_peer(&PeerDevice {
+            id: peer_id.to_string(),
+            name,
+            ip: ip.clone(),
+            port,
+            online: true,
+            paired,
+            ..Default::default()
+        });
+        info!(%peer_id, %ip, port, "对端的长连接从新地址拨入，已更新直连地址");
+    }
+
     /// 一台设备**经核实**的自报名字：直接更新（对端改名就跟着走）。
     ///
     /// "核实过"指这几条路：5s 探活的 `/pair/info` 回话、**有 token 的长连接会话**里的
@@ -1256,11 +1328,104 @@ impl AppState {
             config.forget_known_peer(&peer.id);
             let _ = crate::config::save_config_at(&self.config_path, &config);
         }
+        // **关系接管生命周期**：配对之前它可能是「学来的」或「反向记录带进来的」临时行
+        // （20s / 15min TTL，到期由清扫整行收走）。那两档的清扫都不会回头看配对状态
+        // —— 留着这条归属，配对后的设备会被它们按 TTL 从设备表里删掉：长连接还在，
+        // 但本机再也看不到它（真机：HUAWEI CTR-AL20，2026-11-09）。配对成功 = 这一行
+        // 从此由关系与探活维护，两档临时归属当场摘掉。
+        self.learned.lock().remove(&peer.id);
+        self.adopted.lock().remove(&peer.id);
         // 配对只确立关系、不建链（F-16）：把上一次留下的拨号状态清掉。最要紧的是
         // **重新配对**：token 失效时这台设备停在 `Stopped{TokenRejected}`，不清就会一直
         // 显示「需配对」—— 用户刚换到新 token，界面却还在叫他重新配对。
         self.ws.clear_link_state(&peer.id);
         self.emit_devices_changed();
+    }
+
+    /// 把「凭据库里有 token、内存/地址簿里却写着未配对」的行修回来，返回修了几行。
+    ///
+    /// 正常路径上 token 与 `paired` 同生同死：`commit_pairing` 写两者，`unpair` 清两者。
+    /// 但它们是**两份存储**，任何一处把 `paired` 写丢（清扫误删行、手改配置、旧版本
+    /// `upsert_peer` 的直接赋值），设备就会停在「本机有凭据、界面未配对、长连接还在」
+    /// 的鬼状态。凭据库是这段关系的**唯一权威**：token 在，这一行就该是已配对；行整个
+    /// 丢了（被临时 TTL 清扫误删）就按启动时同一套形状补回来 —— 地址与名字由探活/
+    /// mDNS 下一拍填。
+    ///
+    /// 每轮探活开头调一次；`peer_tokens()` 是版本化缓存，正常情况不读盘。
+    pub fn reconcile_pairing_flags(&self) -> usize {
+        let credentials = crate::credential::peer_tokens();
+        if credentials.is_empty() {
+            return 0;
+        }
+        let mut fixed = 0usize;
+        {
+            let mut peers = self.peers.lock();
+            for id in credentials.keys() {
+                if id == &self.own_id || !crate::ids::is_segment(id) {
+                    continue;
+                }
+                match peers.iter_mut().find(|p| &p.id == id) {
+                    Some(p) if !p.paired => {
+                        p.paired = true;
+                        fixed += 1;
+                    }
+                    Some(_) => {}
+                    None => {
+                        peers.push(PeerDevice {
+                            id: id.clone(),
+                            name: id.clone(),
+                            ip: String::new(),
+                            port: 0,
+                            online: false,
+                            paired: true,
+                            auto_connect: false,
+                            paused: false,
+                            relay: None,
+                        });
+                        fixed += 1;
+                    }
+                }
+            }
+        }
+        {
+            let mut config = self.config.lock();
+            let mut persisted = 0usize;
+            for id in credentials.keys() {
+                if id == &self.own_id || !crate::ids::is_segment(id) {
+                    continue;
+                }
+                match config.peers.iter_mut().find(|p| &p.id == id) {
+                    Some(p) if !p.paired => {
+                        p.paired = true;
+                        persisted += 1;
+                    }
+                    Some(_) => {}
+                    None => {
+                        config.peers.push(PeerDevice {
+                            id: id.clone(),
+                            name: id.clone(),
+                            ip: String::new(),
+                            port: 0,
+                            online: false,
+                            paired: true,
+                            auto_connect: false,
+                            paused: false,
+                            relay: None,
+                        });
+                        persisted += 1;
+                    }
+                }
+            }
+            if persisted > 0 {
+                fixed += persisted;
+                let _ = crate::config::save_config_at(&self.config_path, &config);
+            }
+        }
+        if fixed > 0 {
+            info!(fixed, "凭据库里有关系、设备行却丢了配对标记：已修回（行也补回来）");
+            self.emit_devices_changed();
+        }
+        fixed
     }
 
     /// 记下这台设备的长连接意图（F-16）。
@@ -2201,10 +2366,18 @@ impl AppState {
             .iter()
             .map(|p| (p.id.clone(), p.ip.clone(), p.port))
             .collect();
+        // 凭据库里的 id 也算"认识"：正常路径上它们都在地址簿里，但两者一旦不同步
+        // （行被 TTL 清扫误删、配置文件手改过），这条记录会在下一拍被重新 adopt，
+        // 15 分钟后再被同一把刀切掉 —— 关系还在，设备却周期性消失。关系的存在
+        // 由凭据库说了算，adopt 不许碰它。**先读、别在 config 锁里读盘**。
+        let credential_ids: HashSet<String> = crate::credential::load_peers()
+            .map(|m| m.into_keys().collect())
+            .unwrap_or_default();
         let (known, taken): (HashSet<String>, HashSet<(String, u16)>) = {
             let config = self.config.lock();
             let mut known: HashSet<String> = peer_rows.iter().map(|r| r.0.clone()).collect();
             known.extend(config.peers.iter().map(|p| p.id.clone()));
+            known.extend(credential_ids);
             let mut taken: HashSet<(String, u16)> = peer_rows
                 .iter()
                 .filter(|(_, ip, port)| !ip.is_empty() && *port != 0)
@@ -2456,12 +2629,43 @@ impl AppState {
             expired
         };
         if !expired.is_empty() {
-            {
-                let mut peers = self.peers.lock();
-                peers.retain(|p| !expired.contains(&p.id));
+            // **关系优先于临时归属**：这条 id 可能在 adopted 期间被配对（`mark_paired`
+            // 会摘掉归属，但老进程升级上来的内存表、以及竞态窗口里仍可能留着）。地址簿
+            // 里有、或凭据库里有 token 的行一律不删 —— 关系没解除，设备就不该消失。
+            // 以前这里无条件删行：一台已配对设备会在 adopted 到期那一刻从设备表里被
+            // 抠掉，而它的长连接还活着（真机：HUAWEI CTR-AL20，2026-11-09 13:44）——
+            // 本机看不到它、它却仍显示长连接；下一条报文再从"没有这一行"把它以
+            // 「未配对」重建。凭据读取失败时**保留**全部行：宁可这轮不清，也不拿一次
+            // 瞬时 IO 故障删用户的关系。
+            let booked: HashSet<String> = {
+                let config = self.config.lock();
+                config.peers.iter().map(|p| p.id.clone()).collect()
+            };
+            let credential_ids = crate::credential::load_peers();
+            let doomed: Vec<String> = match credential_ids {
+                Ok(paired) => expired
+                    .iter()
+                    .filter(|id| !booked.contains(*id) && !paired.contains_key(*id))
+                    .cloned()
+                    .collect(),
+                Err(e) => {
+                    debug!(%e, "凭据库读失败：本轮不按 adopted 到期删设备行");
+                    Vec::new()
+                }
+            };
+            if !doomed.is_empty() {
+                {
+                    let mut peers = self.peers.lock();
+                    peers.retain(|p| !doomed.contains(&p.id));
+                }
+                // 这两档本来就不该有长连接（未配对拨不动）。真有一条，说明状态已经分叉；
+                // 跟着行一起收掉，别留下"设备没了、链路还在"的半截状态。
+                for id in &doomed {
+                    self.ws.drop_peer(id);
+                }
+                debug!(n = doomed.len(), "反向记录带进来的设备行到期，收走");
+                self.emit_devices_changed();
             }
-            debug!(n = expired.len(), "反向记录带进来的设备行到期，收走");
-            self.emit_devices_changed();
         }
 
         // ② 策略与链路：先取快照（加锁顺序统一为 peers → direct_streak → config → pool）。
@@ -3181,6 +3385,27 @@ impl AppState {
         self.peers.lock().iter().find(|p| p.id == peer_id).cloned()
     }
 
+    /// 这台设备此刻是否处于**配对关系**。
+    ///
+    /// 判据是「设备行说已配对」**或**「凭据库里有它的 token」—— 任一成立即算。
+    /// 为什么不能只看设备行：两者是两份存储，行上的 `paired` 被写丢/行被临时清扫误删时，
+    /// 一台仍持有有效 token 的老搭档会被所有调用点当成未配对（不验 token、按未配对限流、
+    /// 地址变更走 TOFU、把 `paired: false` 写回配置）—— 用户看到的就是"长连接还在，
+    /// 界面却显示未配对"。关系的建立/解除都同时写两处（`commit_pairing` / `unpair`），
+    /// 所以"凭据在 = 关系在"是这条链路唯一稳定的不变量。
+    ///
+    /// `get_peer` 先取完、放掉 `peers` 锁再读凭据缓存：不与 `peer_tokens()` 的锁序交叉，
+    /// 缓存命中时也不读盘。
+    pub fn is_paired(&self, peer_id: &str) -> bool {
+        if peer_id.is_empty() || peer_id == self.own_id {
+            return false;
+        }
+        if self.get_peer(peer_id).is_some_and(|p| p.paired) {
+            return true;
+        }
+        crate::credential::peer_tokens().contains_key(peer_id)
+    }
+
     // ------------------------------------------------------------------
     // 跨网段发现：对端报来的设备（F-10 延伸）
     // ------------------------------------------------------------------
@@ -3342,15 +3567,24 @@ impl AppState {
             return;
         }
 
-        let adopted: HashSet<String> = {
-            let config = self.config.lock();
-            let paired = crate::credential::load_peers().unwrap_or_default();
-            expired
-                .iter()
-                .filter(|id| config.peers.iter().any(|p| &p.id == *id) || paired.contains_key(*id))
-                .cloned()
-                .collect()
+        // 凭据读取失败**不是"没配对"**：那会把这一拍的到期清理变成一次随机解除关系
+        // （行被删掉，凭据还在）。读不出来就整轮不动，下一拍再试。
+        let paired = match crate::credential::load_peers() {
+            Ok(map) => map,
+            Err(e) => {
+                debug!(%e, "凭据库读失败：本轮不按 learned 到期删设备行");
+                return;
+            }
         };
+        let booked: HashSet<String> = {
+            let config = self.config.lock();
+            config.peers.iter().map(|p| p.id.clone()).collect()
+        };
+        let adopted: HashSet<String> = expired
+            .iter()
+            .filter(|id| booked.contains(*id) || paired.contains_key(*id))
+            .cloned()
+            .collect();
 
         let mut removed = false;
         {
@@ -3398,11 +3632,14 @@ impl AppState {
             .iter()
             .map(|p| p.id.clone())
             .collect();
-        let paired: HashSet<String> = crate::credential::load_peers()
-            .unwrap_or_default()
-            .keys()
-            .cloned()
-            .collect();
+        // 读失败 → 这一轮不淘汰（把"读不到"当成"没配对"会拿瞬时 IO 故障删关系行）。
+        let paired: HashSet<String> = match crate::credential::load_peers() {
+            Ok(map) => map.into_keys().collect(),
+            Err(e) => {
+                debug!(%e, "凭据库读失败：本轮不按行预算淘汰设备行");
+                return 0;
+            }
+        };
         let learned: HashSet<String> = self.learned.lock().keys().cloned().collect();
         let adopted: HashSet<String> = self.adopted.lock().keys().cloned().collect();
         let seen: HashSet<String> = self.seen.lock().keys().cloned().collect();
@@ -3882,7 +4119,8 @@ async fn learn_from_peer(
     own_id: &str,
 ) {
     // 这一问带 token：按目标建表，别让同一地址上另一台已配对设备把 token 收走。
-    let paired = state.get_peer(peer_id).is_some_and(|p| p.paired);
+    // 「已配对」按凭据库也算：只有行标记时，标记一丢就会退回 TOFU，token 可能发错门。
+    let paired = state.is_paired(peer_id);
     let client = crate::net::dial_client_timeout(
         ip,
         &crate::credential::dial_pin(peer_id, paired),
@@ -4077,7 +4315,7 @@ async fn probe_addr(
     let scoped_client;
     let client = match token {
         Some(_) => {
-            let paired = state.get_peer(peer_id).is_some_and(|p| p.paired);
+            let paired = state.is_paired(peer_id);
             scoped_client = crate::net::dial_client_timeout(
                 host,
                 &crate::credential::dial_pin(peer_id, paired),
@@ -4135,6 +4373,10 @@ async fn probe_addr(
 /// 1.5s 超时，串行时它后面每一台都得跟着等 —— 而这正是"启动后某台明明在线却画成离线"
 /// 的放大器（列表里几台死行在前，真在网的那台排在最后）。
 pub async fn probe_peers_once(state: &Arc<AppState>) {
+    // 先修关系状态：凭据库里有 token、设备行却写着未配对（或整行被临时 TTL 清扫误删）
+    // 的，按凭据库修回来。这一步必须在本轮候选快照之前 —— 修回来的行这一拍就能被探活/
+    // 接回，而不是等到下一次设备表刷新。正常情况什么都不做（缓存读，不落盘）。
+    state.reconcile_pairing_flags();
     // 「学来的」行不在这里探：它们不是本机发现的，本机跟它们之间没有关系，拨过去既没有
     // 意义（本机到不了它时那一跳纯属空转），也正是这条路要避免的多余一跳。它们的存活由
     // 担保人的 `/discover` 表刷新 —— 见 `learn_peers` / `sweep_learned`。
@@ -6713,5 +6955,194 @@ mod tests {
         assert!(state.get_peer("dead").is_some(), "未到阈值前不能忘");
         state.note_probe_outcome("dead");
         assert!(state.get_peer("dead").is_none(), "到阈值后整行忘掉");
+    }
+
+    fn route_device(id: &str) -> crate::relay::RouteDevice {
+        crate::relay::RouteDevice {
+            id: id.into(),
+            name: id.into(),
+            ip: "10.0.0.9".into(),
+            port: 3890,
+        }
+    }
+
+    /// 配对成功 = 关系接管这一行：`learned` / `adopted` 这两档临时归属必须当场摘掉。
+    /// 不摘的后果：其中任意一把 TTL 到期，都会把一台**已配对**的设备整行删掉
+    /// （长连接还在、设备列表里却没有它）—— 真机事故 2026-11-09 13:44。
+    #[test]
+    fn pairing_takes_the_row_out_of_the_temporary_buckets() {
+        let state = memory_state();
+        assert_eq!(state.adopt_devices(&[route_device("dev-adopt")], &[]), 1);
+        state
+            .learned
+            .lock()
+            .insert("dev-adopt".into(), Instant::now());
+        assert!(state.is_adopted("dev-adopt") && state.is_learned("dev-adopt"));
+
+        state.mark_paired(&PeerDevice {
+            id: "dev-adopt".into(),
+            name: "AD".into(),
+            ip: "10.0.0.9".into(),
+            port: 3890,
+            online: true,
+            paired: true,
+            ..Default::default()
+        });
+
+        assert!(!state.is_adopted("dev-adopt"), "配对后不归 adopted 管");
+        assert!(!state.is_learned("dev-adopt"), "配对后不归 learned 管");
+    }
+
+    /// adopted 到期**不许**删掉地址簿里（或凭据库里）的记录 —— 只摘归属，行留着。
+    /// 这就是"过了一段时间本机看不到这台安卓设备了、它却仍显示长连接"的那条路径。
+    #[test]
+    fn adopted_expiry_spares_rows_that_have_a_relationship() {
+        let state = memory_state();
+        assert_eq!(state.adopt_devices(&[route_device("dev-keep")], &[]), 1);
+        state.mark_paired(&PeerDevice {
+            id: "dev-keep".into(),
+            name: "KEEP".into(),
+            ip: "10.0.0.9".into(),
+            port: 3890,
+            online: true,
+            paired: true,
+            ..Default::default()
+        });
+        // 模拟旧进程/竞态窗口里仍留在 adopted 表里的那条归属。
+        state.adopted.lock().insert(
+            "dev-keep".into(),
+            Instant::now() - ADOPTED_TTL - Duration::from_secs(1),
+        );
+
+        state.sweep_relay_memory();
+
+        assert!(
+            state.get_peer("dev-keep").is_some(),
+            "地址簿里的行不许被临时归属的 TTL 收走"
+        );
+        assert!(!state.is_adopted("dev-keep"), "归属本身仍然要摘掉");
+    }
+
+    /// 只有凭据、没有地址簿行的（配置手改/旧数据）同样受保护：凭据库才是关系的权威。
+    #[test]
+    fn adopted_expiry_spares_a_credentialed_row() {
+        let id = format!("dev-cred-{}", uuid::Uuid::new_v4());
+        let state = memory_state();
+        crate::credential::set_peer_credential(&id, &"ab".repeat(32), &"cd".repeat(32)).unwrap();
+        state.upsert_peer(&PeerDevice {
+            id: id.clone(),
+            name: "C".into(),
+            ip: "10.0.0.9".into(),
+            port: 3890,
+            paired: false,
+            ..Default::default()
+        });
+        state.adopted.lock().insert(
+            id.clone(),
+            Instant::now() - ADOPTED_TTL - Duration::from_secs(1),
+        );
+
+        state.sweep_relay_memory();
+
+        assert!(state.get_peer(&id).is_some(), "凭据在 = 关系在，行不许删");
+        assert!(!state.is_adopted(&id));
+        crate::credential::remove_peer(&id).ok();
+    }
+
+    /// 凭据库里有 token、设备行却整行丢了（被清扫误删）或标记被写丢：下一拍探活前
+    /// 按凭据库修回来（行也补回来）。修复前的表现是"界面未配对、消息 401"。
+    #[test]
+    fn reconcile_pairing_flags_restores_a_row_lost_from_the_table() {
+        let id = format!("dev-heal-{}", uuid::Uuid::new_v4());
+        let state = memory_state();
+        crate::credential::set_peer_credential(&id, &"ab".repeat(32), &"cd".repeat(32)).unwrap();
+        assert!(state.get_peer(&id).is_none(), "前提：行整行丢了");
+
+        assert!(
+            state.reconcile_pairing_flags() >= 1,
+            "内存与地址簿各修一处，计数至少 1"
+        );
+        let p = state.get_peer(&id).expect("按凭据库补回一行");
+        assert!(p.paired);
+        assert!(
+            state
+                .config
+                .lock()
+                .peers
+                .iter()
+                .any(|row| row.id == id && row.paired),
+            "地址簿里的标记也要一起修"
+        );
+
+        // 行在、只是标记丢了：同一入口修回来。
+        {
+            let mut peers = state.peers.lock();
+            peers.iter_mut().find(|p| p.id == id).unwrap().paired = false;
+        }
+        assert!(state.reconcile_pairing_flags() >= 1);
+        assert!(state.get_peer(&id).unwrap().paired);
+        crate::credential::remove_peer(&id).ok();
+    }
+
+    /// 观察值（mDNS / 未带凭据的报文）只能把 `paired` 往上抬，不能把地址簿里
+    /// 已配对的标记写成 false。
+    #[test]
+    fn an_unpaired_observation_never_clears_the_address_book_flag() {
+        let id = format!("dev-flag-{}", uuid::Uuid::new_v4());
+        let state = memory_state();
+        state.mark_paired(&PeerDevice {
+            id: id.clone(),
+            name: "F".into(),
+            ip: "10.0.0.7".into(),
+            port: 3890,
+            online: true,
+            paired: true,
+            ..Default::default()
+        });
+
+        state.upsert_peer(&PeerDevice {
+            id: id.clone(),
+            name: "F".into(),
+            ip: "10.0.0.7".into(),
+            port: 3890,
+            online: true,
+            paired: false,
+            ..Default::default()
+        });
+
+        assert!(state.get_peer(&id).unwrap().paired);
+        assert!(
+            state
+                .config
+                .lock()
+                .peers
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .paired,
+            "观察值不许把磁盘上的关系标记降级"
+        );
+    }
+
+    /// 「有没有关系」的判定以凭据库为准：行上的标记被写丢时，调用方仍要按已配对处理
+    /// （否则不验 token、按未配对限流，还会把 false 写回地址簿）。
+    #[test]
+    fn is_paired_follows_the_credential_store() {
+        let id = format!("dev-check-{}", uuid::Uuid::new_v4());
+        let state = memory_state();
+        state.upsert_peer(&PeerDevice {
+            id: id.clone(),
+            name: "P".into(),
+            ip: "10.0.0.6".into(),
+            port: 3890,
+            paired: false,
+            ..Default::default()
+        });
+        assert!(!state.is_paired(&id));
+
+        crate::credential::set_peer_credential(&id, &"ab".repeat(32), &"cd".repeat(32)).unwrap();
+        assert!(state.is_paired(&id), "token 在 = 关系在");
+        crate::credential::remove_peer(&id).ok();
+        assert!(!state.is_paired(&id));
     }
 }

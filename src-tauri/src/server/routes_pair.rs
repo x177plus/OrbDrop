@@ -136,7 +136,9 @@ pub async fn pair_hello(
         return Err((StatusCode::BAD_REQUEST, "不能把本机自己加进来".into()));
     }
     let existing = state.get_peer(&peer_id);
-    let paired = existing.as_ref().is_some_and(|p| p.paired);
+    // 「已配对」按凭据库与设备行任一为准（见 `AppState::is_paired`）：只信行会让一台
+    // 仍持有有效 token 的老搭档被当成未配对 —— 地址变更走 TOFU、`paired: false` 被写回。
+    let paired = state.is_paired(&peer_id);
     if paired {
         let claimed =
             bearer_token(&headers).and_then(|t| ws::session::peer_id_from_token(&state, &t));
@@ -513,7 +515,7 @@ pub async fn pair_invite_handler(
             "对方版本过旧，无法核对邀请身份；请改用配对码".into(),
         ));
     }
-    let paired = state.get_peer(&req.peer_id).is_some_and(|p| p.paired);
+    let paired = state.is_paired(&req.peer_id);
     let proven = !paired || {
         headers
             .get(axum::http::header::AUTHORIZATION)

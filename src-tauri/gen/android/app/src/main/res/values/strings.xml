@@ -46,4 +46,11 @@
     <string name="apps_missing_package">"No package name given"</string>
 
     <string name="clipboard_unavailable">"This device has no system clipboard service"</string>
+
+    <!-- Sharing this device's own files as OrbDrop share items (ShareStoragePlugin). -->
+    <string name="share_storage_unsupported">"Direct sharing needs Android 11 or newer"</string>
+    <string name="share_storage_not_granted">"“All files access” is not granted"</string>
+    <string name="share_storage_request_failed">"Cannot open the “All files access” settings page: please open Settings → Apps → Special app access → All files access → OrbDrop manually"</string>
+    <string name="share_storage_read_failed">"Cannot read this folder: %1$s"</string>
+    <string name="share_storage_out_of_root">"This path is outside shared storage"</string>
 </resources>

@@ -418,13 +418,19 @@ pub fn restore_links_on_startup(state: &Arc<AppState>) {
     if !state.is_online() {
         return;
     }
-    let targets: Vec<String> = state
+    // 先按配置收出"记得这条链"的目标（放锁），再按凭据库过滤关系 ——
+    // 顺序与锁不交叉；`paired` 标记被写丢不该让重启恢复漏掉这台设备。
+    let remembered: Vec<String> = state
         .config
         .lock()
         .peers
         .iter()
-        .filter(|p| p.paired && p.auto_connect)
+        .filter(|p| p.auto_connect)
         .map(|p| p.id.clone())
+        .collect();
+    let targets: Vec<String> = remembered
+        .into_iter()
+        .filter(|id| state.is_paired(id))
         .collect();
     for peer_id in targets {
         info!(%peer_id, "restoring long connection from the last session");
@@ -452,13 +458,16 @@ pub fn redial_if_remembered(state: &Arc<AppState>, peer_id: &str) {
     {
         return;
     }
+    // 先把配置快照取完、放锁，再问关系（`is_paired` 会锁 peers / 读凭据缓存，
+    // 与 config 锁不交叉）。「关系」以凭据库为准：行的配对标记被写丢时，
+    // 这条记忆照样能把链路接回来。
     let remembered = state
         .config
         .lock()
         .peers
         .iter()
-        .any(|p| p.id == peer_id && p.paired && p.auto_connect);
-    if !remembered {
+        .any(|p| p.id == peer_id && p.auto_connect);
+    if !remembered || !state.is_paired(peer_id) {
         return;
     }
     info!(%peer_id, "peer is back online, re-arming the long connection");
@@ -467,9 +476,10 @@ pub fn redial_if_remembered(state: &Arc<AppState>, peer_id: &str) {
 
 /// 一次拨号。`manual` / `auto` 见上面几个公开入口。
 fn dial_now(state: &Arc<AppState>, peer_id: &str, manual: bool, auto: bool) {
-    match state.get_peer(peer_id) {
-        Some(p) if p.paired => {}
-        _ => return,
+    // 行存在、且关系成立（行上的标记或凭据库任一）。只信行标记会让"标记被写丢"
+    // 的设备在用户点「连接」时毫无反应。
+    if state.get_peer(peer_id).is_none() || !state.is_paired(peer_id) {
+        return;
     }
     if state.ws.has_connection(peer_id) {
         return;
@@ -559,7 +569,7 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
             // DHCP, so a snapshot taken at spawn time would either dial nowhere
             // or dial a stale address forever.
             let peer = match state.get_peer(&peer_id) {
-                Some(p) if p.paired => p,
+                Some(p) if state.is_paired(&peer_id) => p,
                 _ => {
                     info!(%peer_id, "peer unpaired or gone, outbound link stopped");
                     state.ws.clear_link_state(&peer_id);
@@ -624,7 +634,13 @@ fn spawn_outbound_link(state: Arc<AppState>, peer_id: String, manual: bool, auto
             };
 
             // manual=1 只在第一次尝试时带上：这是一次"用户让连"的请求，不是持续声明。
-            let url = crate::net::peer_ws_url(peer.dial().0, peer.dial().1, &token, manual_pending);
+            let url = crate::net::peer_ws_url(
+                peer.dial().0,
+                peer.dial().1,
+                &token,
+                manual_pending,
+                state.listening_port(),
+            );
             manual_pending = false;
             state.ws.set_link_state(&peer_id, LinkState::Retrying);
             // 到对端要过 TLS，而"指纹对不上"发生在 WS 握手**之前** —— `stop_reason_for`

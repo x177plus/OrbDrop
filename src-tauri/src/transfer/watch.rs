@@ -138,6 +138,7 @@ mod tests {
             count: 1,
             skipped: 0,
             per_target_total: 3,
+            dest: None,
             targets: vec![BatchTarget {
                 peer_id: "p1".into(),
                 peer_name: "p1".into(),
@@ -159,6 +160,7 @@ mod tests {
             true,
             std::collections::HashMap::new(),
             false,
+            None,
         ));
 
         watch_sources(&state, "b1", &[src.clone()]);
@@ -199,6 +201,7 @@ mod tests {
             count: 1,
             skipped: 0,
             per_target_total: 3,
+            dest: None,
             targets: vec![BatchTarget {
                 peer_id: "p1".into(),
                 peer_name: "p1".into(),

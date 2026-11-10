@@ -4,18 +4,23 @@ import * as api from '$lib/api';
 // Svelte 5 rune-based store: reactive at module level.
 let items = $state<ShareItem[]>([]);
 let loading = $state(false);
+let error = $state<string | null>(null);
 let serverPort = $state(0);
 
 export function getShares() { return items; }
 export function isSharesLoading() { return loading; }
+/** 最近一次 `list_shares` 的失败原因；成功一次就清空。桌面端只是多一种可读的状态。 */
+export function getSharesError() { return error; }
 export function getServerPort() { return serverPort; }
 export function setServerPort(p: number) { serverPort = p; }
 
 export async function loadShares() {
   loading = true;
+  error = null;
   try {
     items = await api.listShares();
   } catch (e) {
+    error = e instanceof Error ? e.message : String(e);
     console.error('Failed to load shares:', e);
   } finally {
     loading = false;

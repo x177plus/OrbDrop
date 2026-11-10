@@ -3949,7 +3949,7 @@ pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -
     let direct = event.sender_id.is_empty() || event.sender_id == peer_id;
     // 已配对 = 这条入站请求的身份是 token 换来的（HTTP 在 `accept` 验过，WS 升级时验过）。
     // 只有它能证明"这个 id 就是这台设备"，也才有资格把公钥标成 attested。
-    let sender_paired = state.get_peer(peer_id).is_some_and(|p| p.paired);
+    let sender_paired = state.is_paired(peer_id);
     let member_key = state.groups.effective_member_key(&event.group_id, &author);
     // 公钥还没绑定（老群/新成员第一次说话）时按 TOFU 放行；一旦本机已经知道每个成员的
     // 钥（本地绑定或名册里都有提示），或者作者本人已绑定，就必须签名。名册里的提示只用
@@ -4225,7 +4225,7 @@ pub fn on_roster(
     };
     // 已配对 = 这条入站请求的身份是 token 换来的（HTTP 那一跳在 `accept` 里验过，
     // WS 升级时验过）。只有这一档才配把更新者的群公钥标成 attested。
-    let trusted = state.get_peer(peer_id).is_some_and(|p| p.paired);
+    let trusted = state.is_paired(peer_id);
     let outcome = state
         .groups
         .apply_roster_with_trust(&own_id, &roster, &from, trusted);
@@ -4271,7 +4271,7 @@ fn sync_with_inner(state: &Arc<AppState>, group_id: &str, peer_id: &str, chase: 
     debug!(group = %group_id, %peer_id, since_at, holes = holes.len(), "群补拉：问一台设备");
     let ask_id = uuid::Uuid::new_v4().to_string();
     debug!(%ask_id, "群补拉：这一问的凭据（对方的回答会原样带回来）");
-    let peer_paired = state.get_peer(peer_id).is_some_and(|p| p.paired);
+    let peer_paired = state.is_paired(peer_id);
     let own_pubkey = crate::group_identity::public_key_b64()
         .ok()
         .or_else(|| state.groups.effective_member_key(group_id, &own_id))
@@ -4388,7 +4388,7 @@ pub fn on_sync_ask(
     // 身份证明：已配对走 token（HTTP 的 `accept` / WS 升级已经验过），未配对必须拿出
     // 已认证成员公钥的签名。HTTP handler 已经做过一次；这里再做一次，保证任何调用点
     // （包括以后新增的路径）都绕不过去。
-    let paired = state.get_peer(peer_id).is_some_and(|p| p.paired);
+    let paired = state.is_paired(peer_id);
     if paired {
         attest_sync_ask(
             state, peer_id, group_id, ask_id, since_at, ts, &holes, pubkey, sig,
@@ -4465,7 +4465,7 @@ pub fn on_sync_post(
         warn!(group = %group_id, %peer_id, "补拉回答被丢弃：发送者不在本机名册里");
         return false;
     }
-    let paired = state.get_peer(peer_id).is_some_and(|p| p.paired);
+    let paired = state.is_paired(peer_id);
     if !paired {
         if let Err(e) = verify_sync_post(
             state, peer_id, group_id, ask_id, ts, has_more, &roster, &messages, sig,
@@ -4683,7 +4683,7 @@ fn ts_fresh(ts: u64) -> bool {
 /// 注意这里不要求公钥已 `attested`：TOFU 绑上的公钥仍可用于补拉（与群消息同一档信任），
 /// 但**永远不能从 ask 里绑钥**。`attested` 只用于"换钥时能不能覆盖"和"被冒名后恢复"。
 pub fn can_sync_with(state: &AppState, group_id: &str, peer_id: &str) -> bool {
-    state.get_peer(peer_id).is_some_and(|p| p.paired)
+    state.is_paired(peer_id)
         || state
             .groups
             .effective_member_key(group_id, peer_id)

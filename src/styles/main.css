@@ -122,6 +122,12 @@ input { font: inherit; }
    内容还是旧的窗口内坐标）。过渡一并关掉 —— 这是"立刻"，不是"动画"。 */
 .orb-stage.menu-busy .rq,
 .orb-stage.menu-busy .orb { opacity: 0; transition: none; }
+/* `menu-busy` 解除的那一帧卡片要**直接**出现：它那一藏是搬家（窗口原点被挪）的技术动作，
+   若走默认的 `opacity 0.15s`，卡片会慢慢淡回来 —— 菜单已经从左边长出来了，卡片还在原地渐显，
+   看起来就是"闪一下"。只在这一帧挂 `menu-snap`（见 `placeOrbMenu`），其余时间过渡照旧 ——
+   不能写成 `.orb-stage.menu .rq`：菜单收起时卡片要从展开位滑回竖条，那一趟必须保留过渡。 */
+.orb-stage.menu-snap .rq,
+.orb-stage.menu-snap .orb { transition: none; }
 
 /* 悬停热区：**只有屏上看得见的那一条**（由 App.svelte 按 `planDock` / `planRectDock` 的 `zone`
    算好 `--zone-*`）—— 贴边收起时是露出那截弧的方框 / 那条竖条，未贴边时就是球本身。
@@ -1164,6 +1170,8 @@ input { font: inherit; }
 /* 清单里少了的项（链接/读不到）：用警示色，别混进上面那行灰字里 ——
    它是"你推的东西不完整"，不是普通的元信息。 */
 .p-skip { margin-top: 6px; font-size: var(--fs-xs); color: var(--warn); }
+/* 上传卡的目标：共享项/子目录，压在主进度下面一行。 */
+.p-dest { margin-top: 6px; font-size: var(--fs-xs); color: var(--muted); overflow-wrap: anywhere; }
 /* 传完了把进度条转绿（和接收侧那条"已收到"一个意思）。 */
 .notif-bubble.done .p-bar i { background: var(--ok); }
 
@@ -1259,6 +1267,9 @@ input { font: inherit; }
 .nb-title { min-width: 0; overflow-wrap: anywhere; }
 .nb-size { flex: none; font-size: var(--fs-xs); color: var(--muted); }
 .nb-body { margin: 6px 0 0; font-size: var(--fs-xs); color: var(--muted); overflow-wrap: anywhere; }
+/* 上传卡：同名冲突策略。与正文同一档字号，选择框贴着右缘。 */
+.nb-conflict { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; font-size: var(--fs-xs); color: var(--muted); }
+.nb-conflict select { height: 26px; padding: 0 8px; border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface); color: var(--fg); font: inherit; }
 .notif-bubble.fail .nb-body { color: rgb(134, 71, 0); }
 /* 配对邀请的 SAS：两端应显示同一串；用户用眼睛比对，接收即确认。 */
 .sas-line { margin-top: 8px; padding: 8px 10px; border-radius: var(--radius); background: var(--fg-soft); text-align: center; }

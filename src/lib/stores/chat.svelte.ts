@@ -862,7 +862,7 @@ export function fileStatusText(f: ChatFileMsg, peerId = ''): string {
     if (failed) parts.push(t('{n} 台未送达', { n: failed }));
     return parts.join(' · ');
   }
-  if (f.inviteState === 'received') return t('已接收 · 已保存到下载目录');
+  if (f.inviteState === 'received') return f.upload ? t('已接收 · 已写入共享项') : t('已接收 · 已保存到下载目录');
   if (f.inviteState === 'rejected') return t('已拒绝接收');
   if (f.inviteState === 'cancelled') return t('已停止接收');
   if (f.inviteState === 'failed') return t('接收失败');
@@ -1624,6 +1624,7 @@ export function noteOutgoingFiles(peerIds: string[], items: LocalPick[], push: P
       groupId,
       perTargets,
       inviteId: '',
+      upload: false,
       inviteState: '',
       received: 0,
       bytes: 0,
@@ -1688,7 +1689,10 @@ export function noteInboundInvite(inv: PushInvite) {
     groupId: '',
     perTargets: [],
     inviteId: inv.inviteId,
-    // 后端自动收下了（`auto` = 已配对且开着「自动接收」）：卡片直接是"接收中"。
+    // 上传到共享项：收完的文案是"写入共享项"，不是"保存到下载目录"。
+    upload: !!inv.upload,
+    // 后端自动收下了（普通推送 = 已配对 + 长连接在线，或已配对 + 开着「自动接收」；
+    // 上传到共享项 = 已配对 + 长连接在线 + 开播）：卡片直接是"接收中"。
     inviteState: inv.auto ? 'accepted' : 'pending',
     received: 0,
     bytes: inv.size,
@@ -1761,8 +1765,9 @@ export function hasIncomingInvite(inviteId: string): boolean {
 /**
  * 那条邀请的终局：已接收 / 已拒绝 / 接收失败。
  *
- * `dest` = 后端随 `push://done` 给的那一层**落盘目录**（`<落盘目录>/<发送方名>`；S-12 关掉那层
- * 时就是落盘根本身），只有"已接收"才有。它是会话里那条气泡「打开」的**唯一路径来源**：
+ * `dest` = 后端随 `push://done` 给的那一层**落盘目录**（普通推送 = `<落盘目录>/<发送方名>`，
+ * S-12 关掉那层时就是落盘根本身；上传到共享项 = 共享项目录），只有"已接收"才有。它是会话里
+ * 那条气泡「打开」的**唯一路径来源**：
  * 东西落在哪只有后端知道，界面不自己拼目录名（同名/改写与净化都在后端）。
  */
 export function noteInviteDone(inviteId: string, outcome: 'received' | 'rejected' | 'failed' | 'cancelled', dest = '') {

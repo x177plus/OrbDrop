@@ -82,6 +82,24 @@ pub struct PendingInbound {
     /// 对端声明的能力位：重启后要按**同一套**协议续（`stream1` 走新数据面，否则老那一套）。
     #[serde(default)]
     pub caps: Vec<String>,
+    /// **上传到共享项**的目标（`Some` = 这条是上传，落点由共享项决定）。
+    ///
+    /// 老版本不认识这个键，serde 默认忽略；它在老版本上跑一圈会把本字段抹掉 —— 所以上传
+    /// 只在新/新之间成立，降级后这条待续传任务会退回"按普通推送落盘"。要彻底避免这一点，
+    /// 可以把上传的 pending 另存一份文件（同 `push_out.json` 的理由），当前先按最小改动处理。
+    #[serde(default)]
+    pub dest: Option<super::UploadDest>,
+    /// 接收方选定的冲突策略；重启后必须按同一档续（否则落点会漂移）。
+    #[serde(default)]
+    pub conflict: super::UploadConflict,
+    /// 清单路径 → 落点相对路径（`rename` 策略解析出来的映射）。
+    #[serde(default)]
+    pub resolved: HashMap<String, String>,
+    /// 同名被跳过的项数 / 字节数。
+    #[serde(default)]
+    pub skipped_files: usize,
+    #[serde(default)]
+    pub skipped_bytes: u64,
     /// 落盘根：只有"每次询问下用户亲自挑过目录"的那条邀请才带（否则用设置里的下载目录）。
     #[serde(default)]
     pub root: Option<String>,
@@ -1212,6 +1230,11 @@ mod pending_tests {
                 },
             ],
             caps: vec!["stream1".into()],
+            dest: None,
+            conflict: crate::transfer::UploadConflict::default(),
+            resolved: std::collections::HashMap::new(),
+            skipped_files: 0,
+            skipped_bytes: 0,
             root: Some("D:/下载".into()),
             callback: Some(("127.0.0.1".into(), 47800)),
             updated_at,

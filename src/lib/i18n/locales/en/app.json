@@ -74,7 +74,7 @@
   "「{name}」不在网上，推送未发送": "“{name}” is offline; nothing was pushed",
   "所选设备都不在网上，推送未发送": "None of the selected devices are online; nothing was pushed",
   "推送到{targets}": "Send to {targets}",
-  "文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。同一份内容会分别发给每台设备：已配对且开着「自动接收」的直接收，其余各自点同意，进度与成败都记在右下角那张卡片上。": "Pick files and folders together; double-click a folder to open it, and selections accumulate across folders. Review, remove items or clear all from the badge at the bottom. The same content goes to every device: paired devices with \"Auto-receive from paired devices\" on receive it directly, everyone else approves it, and progress and results are shown on the card in the bottom-right corner.",
+  "文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。同一份内容会分别发给每台设备：已配对且长连接在线的直接收，已配对但没连的看对方开关，其余各自点同意；进度与成败都记在右下角那张卡片上。": "Pick files and folders together; double-click a folder to open it, and selections accumulate across folders. Review, remove items or clear all from the badge at the bottom. The same content goes to every device: paired devices with a live link receive it directly, paired devices without one follow their auto-receive switch, everyone else approves it; progress and results are shown on the card in the bottom-right corner.",
   "推送到 {n} 台设备": {
     "one": "Send to {n} device",
     "other": "Send to {n} devices"
@@ -262,5 +262,27 @@
     "one": "This device has {n} LAN address (click to copy the first one):{list}",
     "other": "This device has {n} LAN addresses (click to copy the first one):{list}"
   },
-  "从列表移除": "Remove from list"
+  "从列表移除": "Remove from list",
+  "上传到「{device}」的「{where}」": "Upload to “{where}” on “{device}”",
+  "文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；确认后直接写进对方的共享项目录（不是它的下载目录）。对方的共享项开着广播、且与这台设备有长连接时，文件会直接写入（同名覆盖），不再弹接收确认。": "Files and folders can both be selected; double-click a folder to enter it and selections accumulate across folders. On confirm the items are written straight into the peer's shared folder (not its download folder). When that share is broadcasting and the two devices have a live link, the files are written immediately (same-name files overwritten) — no accept prompt.",
+  "上传": "Upload",
+  "上传未完成（{n} 项）": "Upload incomplete ({n} items)",
+  "已上传（{n} 项）": "Uploaded ({n} items)",
+  "正在上传（{n} 项）": "Uploading ({n} items)",
+  "等待对方接收（{n} 项）": "Waiting for the peer to accept ({n} items)",
+  "上传到共享项「{share}」{path}": "Uploading to share “{share}”{path}",
+  "「{name}」想上传到你的共享项（{n} 项）": "“{name}” wants to upload {n} items into your share",
+  "「{name}」想上传到你的共享项": "“{name}” wants to upload into your share",
+  "目标：共享项「{share}」{path}（同名文件覆盖）": "Target: share “{share}”{path} (same-name files overwritten)",
+  "「{name}」正在上传到你的共享项（{n} 项）": "“{name}” is uploading {n} items into your share",
+  "「{name}」正在上传到你的共享项": "“{name}” is uploading into your share",
+  "「{name}」已上传到你的共享项（{n} 项）": "“{name}” uploaded {n} items into your share",
+  "「{name}」已上传到你的共享项": "“{name}” uploaded into your share",
+  "上传到你的共享项失败（{n} 项）": "Upload into your share failed ({n} items)",
+  "上传到你的共享项失败": "Upload into your share failed",
+  "上传到此文件夹…": "Upload to this folder…",
+  "（同名文件已跳过 {n} 项）": " ({n} same-name items skipped)",
+  "已上传完成": "Upload complete",
+  "已取消上传": "Upload cancelled",
+  "只能上传到文件夹": "Can only upload into a folder"
 }

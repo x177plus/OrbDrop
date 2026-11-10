@@ -46,6 +46,7 @@
   },
   "已发送至 {sent} 台 · {failed} 台未送达": "Sent to {sent} devices · {failed} not delivered",
   "已接收 · 已保存到下载目录": "Received · saved to Downloads",
+  "已接收 · 已写入共享项": "Received · written to the share",
   "已拒绝接收": "Reception declined",
   "已停止接收": "Reception stopped",
   "已暂停 · {pct}%": "Paused · {pct}%",

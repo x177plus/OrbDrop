@@ -484,6 +484,163 @@ pub async fn pick_files(kind: String) -> Result<Vec<PickedFile>, String> {
         .collect())
 }
 
+// ── 安卓作为共享方：所有文件访问 + 真实路径选择器 ─────────────────────────────
+
+/// 「所有文件访问」/ 路径选择器插件的句柄（与文件选择、应用列表同款）。
+#[cfg(mobile)]
+static SHARE_STORAGE_HANDLE: OnceLock<PluginHandle<tauri::Wry>> = OnceLock::new();
+
+/// 「共享存储」插件（只在安卓构建里挂，见 `lib.rs`）。
+#[cfg(mobile)]
+pub fn share_storage_plugin() -> TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("orbdrop-share-storage")
+        .setup(|_app, api| {
+            // 类名与 Kotlin 那边的 `@TauriPlugin class ShareStoragePlugin` 对应。
+            let handle =
+                api.register_android_plugin("com.x177plus.orbdrop", "ShareStoragePlugin")?;
+            if SHARE_STORAGE_HANDLE.set(handle).is_err() {
+                warn!("共享存储插件重复注册：沿用第一份句柄");
+            }
+            Ok(())
+        })
+        .build()
+}
+
+/// 安卓「所有文件访问」的状态。`supported = false` 表示系统低于 Android 11，不能直接共享
+/// 真实目录（界面据此明确提示，不退到行为不一致的老权限分支）。
+#[cfg(mobile)]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidShareState {
+    pub supported: bool,
+    pub granted: bool,
+    pub sdk: u32,
+}
+
+/// 共享存储的一个根（内部存储 / SD 卡）。
+#[cfg(mobile)]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidShareRoot {
+    pub name: String,
+    pub path: String,
+}
+
+/// 路径选择器里的一行。`size` 只对文件有意义（目录恒为 0）；`modified` 是 epoch 毫秒。
+#[cfg(mobile)]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidShareEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: u64,
+}
+
+/// `list` 的一层结果；`parent` 为空表示已经在某个存储根上。
+#[cfg(mobile)]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidShareListing {
+    pub entries: Vec<AndroidShareEntry>,
+    pub parent: Option<String>,
+    /// 这一层超过原生侧的上限（500 项），界面要提示"还有更多"。
+    pub truncated: bool,
+}
+
+#[cfg(mobile)]
+fn share_storage_handle() -> Result<&'static PluginHandle<tauri::Wry>, String> {
+    SHARE_STORAGE_HANDLE
+        .get()
+        .ok_or_else(|| "共享存储插件没注册上（内部错误）".to_string())
+}
+
+/// 安卓：读「所有文件访问」是否已授予（只在 Android 11+ 有意义）。
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn android_share_state() -> Result<AndroidShareState, String> {
+    let value = share_storage_handle()?
+        .run_mobile_plugin_async::<serde_json::Value>("state", serde_json::json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(AndroidShareState {
+        supported: value["supported"].as_bool().unwrap_or(false),
+        granted: value["granted"].as_bool().unwrap_or(false),
+        sdk: value["sdk"].as_u64().unwrap_or(0) as u32,
+    })
+}
+
+/// 安卓：打开系统的「所有文件访问」页。用户在系统页里授权后回来，界面重读
+/// `android_share_state` —— 这里不假装知道结果。
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn android_share_request() -> Result<(), String> {
+    share_storage_handle()?
+        .run_mobile_plugin_async::<serde_json::Value>("request", serde_json::json!({}))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// 安卓：共享存储的根列表。权限没授时原生那一跳会拒绝，界面据此引导去授权。
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn android_share_roots() -> Result<Vec<AndroidShareRoot>, String> {
+    let value = share_storage_handle()?
+        .run_mobile_plugin_async::<serde_json::Value>("roots", serde_json::json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(items) = value["roots"].as_array() else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .iter()
+        .filter_map(|it| {
+            Some(AndroidShareRoot {
+                name: it["name"].as_str()?.to_string(),
+                path: it["path"].as_str()?.to_string(),
+            })
+        })
+        .collect())
+}
+
+/// 安卓：列一层共享存储目录。路径由原生侧再校验一次（必须落在某个存储根下），
+/// 前端传上来的字符串不可信。
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn android_share_list(path: String) -> Result<AndroidShareListing, String> {
+    let value = share_storage_handle()?
+        .run_mobile_plugin_async::<serde_json::Value>(
+            "list",
+            serde_json::json!({ "path": path }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let entries = value["entries"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| {
+                    Some(AndroidShareEntry {
+                        name: it["name"].as_str()?.to_string(),
+                        path: it["path"].as_str()?.to_string(),
+                        is_dir: it["isDir"].as_bool().unwrap_or(false),
+                        size: it["size"].as_u64().unwrap_or(0),
+                        modified: it["modified"].as_u64().unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(AndroidShareListing {
+        entries,
+        parent: value["parent"].as_str().map(str::to_string),
+        truncated: value["truncated"].as_bool().unwrap_or(false),
+    })
+}
+
 // ── 「发送应用」：列出设备上已安装的应用（`list_installed_apps`）──────────────────
 
 /// 应用列表插件的句柄（与文件打开、粘贴图片同款：插件 `setup` 那一刻注册，用的时候取）。

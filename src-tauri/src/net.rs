@@ -1042,11 +1042,18 @@ pub fn peer_base(ip: &str, port: u16) -> String {
 }
 
 /// 对端 WS 入口（`/events` 的完整 URL，带 token）。
-pub fn peer_ws_url(ip: &str, port: u16, token: &str, manual: bool) -> String {
-    format!(
-        "wss://{ip}:{port}/events?token={token}{}",
-        if manual { "&manual=1" } else { "" }
-    )
+///
+/// `listen_port` 是本机**实际在听**的服务端口（不是这条连接的来源端口）。对端拿它当
+/// "重新学会本机直连地址"的那一半：IP 只能取 TCP 来源（不可伪造），端口只能由本机自报
+/// （见 `server::events_ws_handler`）。老版本对端不认这个参数，忽略即可。
+pub fn peer_ws_url(ip: &str, port: u16, token: &str, manual: bool, listen_port: u16) -> String {
+    let extra = match (listen_port != 0, manual) {
+        (true, true) => format!("&port={listen_port}&manual=1"),
+        (true, false) => format!("&port={listen_port}"),
+        (false, true) => "&manual=1".to_string(),
+        (false, false) => String::new(),
+    };
+    format!("wss://{ip}:{port}/events?token={token}{extra}")
 }
 
 /// 地址字面量 → `IpAddr`，**容忍 URL 主机里的方括号写法**（`[::ffff:10.0.0.1]`）。

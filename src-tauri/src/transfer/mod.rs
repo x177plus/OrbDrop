@@ -44,6 +44,295 @@ pub const SENDER_GONE: &str = "发送方已不再提供这份推送（它可能�
 const HTTP_INVITE_TIMEOUT: Duration = Duration::from_secs(75);
 
 // ---------------------------------------------------------------------------
+// 上传到共享项（`/push/upload/invite`）
+// ---------------------------------------------------------------------------
+
+/// 一次上传的目标：共享项 id + 共享项内相对目录（`/` 分隔，`""` = 共享项根）。
+///
+/// **和普通推送的区别只在落点**：字节仍然由发送方提供、接收方按块拉取（`/push/stream`），
+/// 断点续传/每块 SHA-256/原子改名/取消全部复用。接收方在同意卡上看到的 dest 就是它。
+///
+/// `share_name` 只用于**上传方**那张卡片的标题（接收方以本机配置里的名字为准，不信任
+/// 报文里的字符串）；老对端不认识这个字段时 serde 默认忽略。
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadDest {
+    pub share_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub share_name: String,
+}
+
+/// 上传到共享项时的同名冲突策略（只对 `dest.is_some()` 的邀请有意义）。
+///
+/// `/push/upload/invite` 自动收下时**恒为 `Overwrite`**：写权限由「配对 + 长连接 + 开播」
+/// 授予，语义与 `/dav` 的 `PUT` 一致（资源管理器里的覆盖）。`Skip` / `Rename` 保留为传输
+/// 引擎能力（单测覆盖），但不再是上传入口的默认档。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UploadConflict {
+    /// 同名文件跳过（并入现有目录）。
+    #[default]
+    Skip,
+    /// 原子替换同名文件。
+    Overwrite,
+    /// 排成 `名字 (1).ext`，不覆盖任何东西。
+    Rename,
+}
+
+/// 找到共享项并返回它（上传面只认**开着广播**的共享项）。
+///
+/// 长连接由调用方保证：`/push/upload/invite` 在受理前已经验过 `ws.has_connection(caller)`
+/// （共享项只对长连接设备可见，与 `/dav` 同一口径）。这里不重复查，是因为**续传**也走它 ——
+/// 传到一半长连接抖一下不该把已经开始的落盘判死。共享项关掉广播 = 用户不想再暴露它，
+/// 邀请与续传都必须当场失败。
+fn upload_share(state: &AppState, dest: &UploadDest) -> Result<crate::config::ShareItem, String> {
+    if !crate::ids::is_segment(&dest.share_id) {
+        return Err("上传目标不合法".into());
+    }
+    let share = {
+        let config = state.config.lock();
+        config
+            .shares
+            .iter()
+            .find(|s| s.id == dest.share_id && s.broadcast_enabled)
+            .cloned()
+    };
+    share.ok_or_else(|| "共享项不存在或已关闭广播".to_string())
+}
+
+/// 把 `dest.path` 解析成共享项内的真实目录（**不创建**，写入方自己建）。
+///
+/// 逐段校验与 `/dav` 的 `resolve_within` 同一套口径：段里不许 `..`/`:`/结尾点或空格/
+/// 保留设备名；目标允许尚不存在，但对**最近已存在祖先**做 canonicalize，确认它仍在共享根内
+/// （防共享项里的符号链接把写入带出磁盘边界）。
+pub fn resolve_upload_dir(state: &AppState, dest: &UploadDest) -> Result<PathBuf, String> {
+    let share = upload_share(state, dest)?;
+    let root = share
+        .path
+        .canonicalize()
+        .map_err(|e| format!("共享项目录不可用: {e}"))?;
+    if !root.is_dir() {
+        return Err("共享项不是一个目录".into());
+    }
+    if !crate::server::safe_relative_share_path(&dest.path) {
+        return Err("上传目录不合法".into());
+    }
+    let mut dir = root.clone();
+    for part in dest.path.replace('\\', "/").split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        // `safe_relative_share_path` 已经挡了 `..` 与 Windows 的非法段；这里再逐段走一遍，
+        // 是为了拼出真实路径时不经过 `PathBuf::push` 的前缀语义。
+        dir.push(part);
+    }
+    let mut probe = dir.as_path();
+    let existing = loop {
+        if probe.exists() {
+            break probe;
+        }
+        probe = probe
+            .parent()
+            .ok_or_else(|| "上传目录不合法".to_string())?;
+    };
+    let existing_canon = existing
+        .canonicalize()
+        .map_err(|e| format!("上传目录不可用: {e}"))?;
+    if !existing_canon.starts_with(&root) {
+        return Err("上传目录越出共享项".into());
+    }
+    if dir.exists() && !dir.is_dir() {
+        return Err("上传目标不是目录".into());
+    }
+    Ok(dir)
+}
+
+/// 在 `base` 下面逐段建出 `target` 的父目录，**不跟随符号链接**。
+///
+/// 上传清单里的相对路径是发送方给的：如果共享项里某一层是链接，`create_dir_all` 会跟过去，
+/// 把文件写到共享项外面。这里每段都用 `symlink_metadata` 判"真目录"，链接一律拒绝。
+pub fn create_dirs_within(base: &Path, target: &Path) -> Result<(), String> {
+    let rel = target
+        .strip_prefix(base)
+        .map_err(|_| "落点越界".to_string())?;
+    let mut cur = base.to_path_buf();
+    for part in rel.components() {
+        cur.push(part);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(format!("落点不是目录: {}", cur.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&cur).map_err(|e| format!("建目录失败: {e}"))?;
+            }
+            Err(e) => return Err(format!("落点不可用: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// 邀请到达时的轻量校验：共享项存在、开着广播、目标路径合法。返回共享项显示名。
+pub fn validate_upload_dest(state: &AppState, dest: &UploadDest) -> Result<String, String> {
+    let share = upload_share(state, dest)?;
+    resolve_upload_dir(state, dest)?;
+    Ok(share.name)
+}
+
+/// 逐段建出上传目录，**不跟随符号链接**（共享项是用户的真实磁盘，别让一次上传沿着
+/// 已有链接写到共享项外面）。返回最终目录。
+///
+/// 与 `resolve_upload_dir` 的分工：那个只校验（邀请到达时用），这个在同意接收/重启续传时
+/// 真正建目录。每段都用 `symlink_metadata` 判"这是不是一个真目录"——链接（含 junction）
+/// 一律拒绝，而不是 `create_dir_all` 跟过去。
+pub fn ensure_upload_dir(state: &AppState, dest: &UploadDest) -> Result<PathBuf, String> {
+    let dir = resolve_upload_dir(state, dest)?;
+    let share = upload_share(state, dest)?;
+    let root = share
+        .path
+        .canonicalize()
+        .map_err(|e| format!("共享项目录不可用: {e}"))?;
+    let rel = dir
+        .strip_prefix(&root)
+        .map_err(|_| "上传目录越出共享项".to_string())?;
+    let mut cur = root.clone();
+    for part in rel.components() {
+        cur.push(part);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(format!("上传目标不是目录: {}", cur.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&cur).map_err(|e| format!("建目录失败: {e}"))?;
+            }
+            Err(e) => return Err(format!("上传目录不可用: {e}")),
+        }
+    }
+    // 建完再核一次最终落点仍在共享根内（防建目录过程中某一层被换成链接）。
+    let final_canon = dir
+        .canonicalize()
+        .map_err(|e| format!("上传目录不可用: {e}"))?;
+    if !final_canon.starts_with(&root) {
+        return Err("上传目录越出共享项".into());
+    }
+    Ok(dir)
+}
+
+/// 在同意卡那一刻把冲突策略落到清单上：
+///
+/// - `skip`：同名已存在的项**从清单里去掉**，计入 `skipped_*`（发送方收到 done 时会看到
+///   “跳过 N 项”）；
+/// - `overwrite`：落点保持清单路径，每个文件仍是 `.part` → 原子改名；
+/// - `rename`：同名项改成 `名字 (1).ext`，映射记在 `resolved`（清单路径保持不变 —— 它是
+///   `/push/stream` 的白名单键）。
+///
+/// **单文件上传也先归一成清单**：上传面永远按清单走，后面两条引擎都不必再分别处理
+/// “单文件只有名字”那一档。
+fn resolve_upload_conflicts(
+    invite: &mut InboundInvite,
+    dir: &Path,
+    policy: UploadConflict,
+) -> Result<(), String> {
+    if !invite.is_dir {
+        invite.files = invite.manifest();
+        invite.is_dir = true;
+    }
+    let mut kept: Vec<FileEntry> = Vec::with_capacity(invite.files.len());
+    let mut resolved: HashMap<String, String> = HashMap::new();
+    // 同一批里已经预定出去的名字（`a.txt` 要改名成 `a (1).txt`，而清单里本来就有
+    // `a (1).txt` —— 不先把它们记下来，两个文件会抢同一个落点）。
+    let mut reserved: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    invite.skipped_files = 0;
+    invite.skipped_bytes = 0;
+
+    let entries = std::mem::take(&mut invite.files);
+    for entry in entries {
+        let target = resume::safe_join(dir, &entry.path)
+            .ok_or_else(|| format!("非法路径: {}", entry.path))?;
+        // 父链里已有的段必须是真目录：某一层是同名文件或链接时，后面 `create_dir` 会失败，
+        // 而失败会被当成"这一轮没成"无限重试 —— 在同意这一刻就说清楚。
+        if let Some(parent) = target.parent() {
+            check_dir_chain(dir, parent)?;
+        }
+        let exists = target.exists() || reserved.contains(&target);
+        match policy {
+            UploadConflict::Skip if exists => {
+                invite.skipped_files += 1;
+                invite.skipped_bytes = invite.skipped_bytes.saturating_add(entry.size);
+                continue;
+            }
+            UploadConflict::Overwrite if target.is_dir() => {
+                return Err(format!(
+                    "同名落点是目录，不能覆盖（{}）；请改用「跳过」或「自动改名」",
+                    entry.path
+                ));
+            }
+            UploadConflict::Rename if exists => {
+                let parent = target
+                    .parent()
+                    .ok_or_else(|| format!("非法路径: {}", entry.path))?;
+                let name = target
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| format!("非法文件名: {}", entry.path))?;
+                let unique = unique_upload_path(parent, name, &reserved);
+                let rel = unique
+                    .strip_prefix(dir)
+                    .map_err(|_| "上传落点越界".to_string())?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                resolved.insert(entry.path.clone(), rel);
+                reserved.insert(unique);
+            }
+            _ => {
+                reserved.insert(target);
+            }
+        }
+        kept.push(entry);
+    }
+    invite.files = kept;
+    invite.resolved = resolved;
+    Ok(())
+}
+
+/// 校验 `target` 的父链：**已经存在的段必须是真目录**（链接/同名文件都拒绝）；不存在的段
+/// 留给 `create_dirs_within` 逐段创建。
+fn check_dir_chain(base: &Path, target: &Path) -> Result<(), String> {
+    let rel = target
+        .strip_prefix(base)
+        .map_err(|_| "落点越界".to_string())?;
+    let mut cur = base.to_path_buf();
+    for part in rel.components() {
+        cur.push(part);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(format!("落点路径不是目录: {}", cur.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("落点不可用: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// `名字 (1).ext` 的分配：与 `config::unique_path` 同一套命名，但把**同一批里已经预定的
+/// 落点**也算进去（`unique_path` 只看磁盘，两个并发/同批的重名会撞）。
+fn unique_upload_path(parent: &Path, name: &str, reserved: &std::collections::HashSet<PathBuf>) -> PathBuf {
+    let first = parent.join(name);
+    if !first.exists() && !reserved.contains(&first) {
+        return first;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => (stem.to_string(), format!(".{ext}")),
+        _ => (name.to_string(), String::new()),
+    };
+    for i in 1..9999 {
+        let candidate = parent.join(format!("{stem} ({i}){ext}"));
+        if !candidate.exists() && !reserved.contains(&candidate) {
+            return candidate;
+        }
+    }
+    parent.join(format!("{stem} (9999){ext}"))
+}
+
+// ---------------------------------------------------------------------------
 // Source manifest
 // ---------------------------------------------------------------------------
 
@@ -378,6 +667,47 @@ pub async fn push_paths(
     names: Option<Vec<String>>,
     at: Option<u64>,
 ) -> Result<push_job::BatchView, String> {
+    push_paths_with_dest(state, paths, peer_ids, names, at, None).await
+}
+
+/// 发送方：把本机一批文件/目录**上传到对端的一个共享项目录**。
+///
+/// 与普通推送共用同一份清单/批次/续传/取消，只多一个 `dest`：接收方把文件落到
+/// `<共享项>/<dest.path>/<清单路径>`，而不是下载目录。目标设备必须已配对（上传面只认
+/// 已配对设备）；数据面仍是接收方主动来拉（`/push/stream`），所以大文件/断点续传/每块
+/// SHA-256 全部照旧。
+pub async fn upload_to_share(
+    state: Arc<AppState>,
+    peer_id: String,
+    dest: UploadDest,
+    paths: Vec<String>,
+    names: Option<Vec<String>>,
+) -> Result<push_job::BatchView, String> {
+    if dest.share_id.is_empty() || !crate::ids::is_segment(&dest.share_id) {
+        return Err("共享项 id 不合法".into());
+    }
+    if !crate::server::safe_relative_share_path(&dest.path) {
+        return Err("上传目录不合法".into());
+    }
+    push_paths_with_dest(
+        state,
+        paths,
+        vec![peer_id],
+        names,
+        None,
+        Some(dest),
+    )
+    .await
+}
+
+async fn push_paths_with_dest(
+    state: Arc<AppState>,
+    paths: Vec<String>,
+    peer_ids: Vec<String>,
+    names: Option<Vec<String>>,
+    at: Option<u64>,
+    dest: Option<UploadDest>,
+) -> Result<push_job::BatchView, String> {
     // 逐位对齐是**调用方的契约**：长度对不上说明界面把两条表拼错了，与其按错位的名字发出去
     // （对端落盘的文件名全是别人的），不如当场拒绝。
     let names = names.unwrap_or_default();
@@ -406,6 +736,17 @@ pub async fn push_paths(
     }
     if ids.is_empty() {
         return Err("没有选择目标设备".into());
+    }
+    if dest.is_some() {
+        // 上传面只认已配对的 OrbDrop 设备：未配对设备没有可信身份，也不该拿到共享项 id。
+        for id in &ids {
+            let Some(peer) = state.get_peer(id) else {
+                return Err("上传目标必须是 OrbDrop 设备".into());
+            };
+            if !peer.paired {
+                return Err(format!("「{}」还没配对，不能上传到它的共享项", peer.name));
+            }
+        }
     }
 
     let roots: Vec<PathBuf> = items.iter().map(|(p, _)| p.clone()).collect();
@@ -453,6 +794,7 @@ pub async fn push_paths(
                 source.is_dir,
                 source.sources.clone(),
                 peer.paired,
+                dest.clone(),
             );
             // **这条从这一刻起就该被接手**：先落盘再进内存（`accepted = false` —— 等对面真的开始拉，
             // 由 `update_status` 升级成 `true`，见 `push_out::OutJob::accepted`）。
@@ -534,6 +876,7 @@ pub async fn push_paths(
         count: source.count,
         skipped: source.skipped,
         per_target_total: source.total,
+        dest: dest.clone(),
         targets,
         last_emit: Instant::now(),
     };
@@ -566,7 +909,7 @@ pub async fn push_paths(
             ],
             at,
         };
-        spawn_invite_delivery(state.clone(), peer, invite_id, event, server_port);
+        spawn_invite_delivery(state.clone(), peer, invite_id, event, server_port, dest.clone());
     }
 
     // LocalSend 目标：没有 `PushJob`（协议不支持续传），只建批次行；由客户端推字节并推进
@@ -642,12 +985,15 @@ fn spawn_invite_delivery(
     invite_id: String,
     event: WsEvent,
     server_port: u16,
+    upload: Option<UploadDest>,
 ) {
     let peer_id = peer.id.clone();
     let peer_name = peer.name.clone();
     let paired = peer.paired;
     crate::task::spawn("push invite", async move {
-        if state.ws.has_connection(&peer_id) {
+        // 上传**只走 HTTP 新路由**：老对端的 WS 事件解析不认识上传语义，而且新路由对
+        // 老版本自然是 404 —— 发送方据此报"对端版本不支持"，不会静默落到下载目录。
+        if upload.is_none() && state.ws.has_connection(&peer_id) {
             if state.ws.send(&peer_id, event) {
                 // 长连接那条路本来就是异步的（决定走 `push_response`）。**没有时钟**：
                 // 对端一直不点头就一直等着（它带 `await1` 时两边都没有时钟；老对端自己
@@ -658,7 +1004,12 @@ fn spawn_invite_delivery(
             }
             return;
         }
-        match deliver_invite_http(&peer, server_port, &event, paired).await {
+        let endpoint = if upload.is_some() {
+            "/push/upload/invite"
+        } else {
+            "/push/invite"
+        };
+        match deliver_invite_http(&peer, server_port, &event, paired, endpoint, upload.as_ref()).await {
             Ok(d) if d.pending => {
                 // `await1` 的对端：**投递即算送达**。它那边一条卡片挂着等用户点，
                 // 那道决定稍后从回执通道回来（`push_response`）。本机这张卡就一直写
@@ -780,12 +1131,17 @@ async fn deliver_invite_http(
     server_port: u16,
     event: &WsEvent,
     paired: bool,
+    endpoint: &str,
+    upload: Option<&UploadDest>,
 ) -> Result<InviteDecision, String> {
     let mut body = serde_json::to_value(event).map_err(|e| format!("邀请序列化失败: {e}"))?;
     body["port"] = serde_json::json!(server_port);
+    if let Some(dest) = upload {
+        body["dest"] = serde_json::to_value(dest).map_err(|e| format!("上传目标序列化失败: {e}"))?;
+    }
 
     let url = format!(
-        "{}/push/invite",
+        "{}{endpoint}",
         crate::net::peer_base(peer.dial().0, peer.dial().1)
     );
     let mut req = crate::net::dial_client(
@@ -806,6 +1162,28 @@ async fn deliver_invite_http(
         .await
         .map_err(|e| format!("联系不上「{}」：{e}", peer.name))?;
     if !resp.status().is_success() {
+        // 上传走的是新路由：404 只有一种解释 —— 对面还是老版本，别把这条说成"对方拒绝"。
+        // 共享项不可用那一档接收方回 409（见 handler），它的原话在 body 里。
+        if upload.is_some() {
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(format!(
+                    "「{}」不支持上传到共享项（对方版本过旧，请升级后重试）",
+                    peer.name
+                ));
+            }
+            let status = resp.status();
+            let reason = resp.text().await.unwrap_or_default();
+            let reason = reason.trim();
+            return Err(if reason.is_empty() {
+                format!(
+                    "「{}」拒绝了这次上传（HTTP {}）",
+                    peer.name,
+                    status.as_u16()
+                )
+            } else {
+                format!("「{}」拒绝了这次上传：{reason}", peer.name)
+            });
+        }
         return Err(format!(
             "「{}」没能接收这次推送（HTTP {}）",
             peer.name,
@@ -956,20 +1334,26 @@ pub fn schedule_invite_timeout(state: Arc<AppState>, invite_id: String) {
 /// 接收方：同意一条邀请 → 开始拉取（F-52）。
 ///
 /// `root` = 这次接收的落盘根目录：`None` 用设置里的下载目录。只有界面在「每次选择位置」
-/// （`DownloadMode::AskEachTime`）下替用户问过目录时才带它 —— 自动接收（已配对 + 开着
-/// 「已配对设备自动接收」）走的是 `None`。传进来就**先验一次**（必须绝对路径、能建出来），
+/// （`DownloadMode::AskEachTime`）下替用户问过目录时才带它 —— 自动接收（已配对 + 长连接
+/// 在线，或已配对且开着「已配对设备自动接收」）走的是 `None`。传进来就**先验一次**
+/// （必须绝对路径、能建出来），
 /// 不合格当场返回错误、这条邀请**原样留着**（卡片还在，用户能换个目录再点一次），也不放行发送方。
+///
+/// `conflict` = **上传到共享项**时的同名冲突策略（普通推送忽略它）。`/push/upload/invite`
+/// 自动收下时恒传 `Overwrite`（与资源管理器一致）；参数保留给传输引擎与单元测试。
+/// 上传的落点由共享项决定，`root` 不参与。
 pub fn accept_invite(
     state: Arc<AppState>,
     invite_id: &str,
     root: Option<std::path::PathBuf>,
+    conflict: Option<UploadConflict>,
 ) -> Result<(), String> {
     // 落盘那一层由设置决定（S-12）：在拿 inbound 锁**之前**读，锁序单一，不跟自己打结。
     let device_subdir = state.config.lock().device_subdir;
-    let (invite, sender_id) = {
-        let mut inbound = state.push.inbound.lock();
+    let (mut invite, sender_id) = {
+        let inbound = state.push.inbound.lock();
         let inv = inbound
-            .get_mut(invite_id)
+            .get(invite_id)
             .ok_or_else(|| "推送不存在或已超时".to_string())?;
         // 下载要连的地址：邀请带来的地址，或现从地址簿里补一个 —— 补不上就不能开始
         // （缺了它只会空转到天荒地老），也就还没到"放行"的时候。
@@ -982,21 +1366,6 @@ pub fn accept_invite(
                     .and_then(|p| (!p.ip.is_empty() && p.port != 0).then(|| (p.ip.clone(), p.port)))
             })
             .ok_or_else(|| "发送方地址未知，无法接收".to_string())?;
-        if let Some(base) = root.as_deref() {
-            // 目录选择框给的一定是绝对路径；不是就不接（相对路径会挂在进程当前目录上，
-            // 落哪儿全凭启动方式，谁也不想要这种"接收方"）。
-            if !base.is_absolute() {
-                return Err("落盘目录必须是绝对路径".into());
-            }
-            // 就地验一次可写（不存在的建出来、拔掉的盘/只读目录当场报错）：失败时**什么都别动**，
-            // 用户换一个目录重按「接收」即可 —— 比"收了一半才发现写不进去"强。
-            let dir = resume::landing_dir(base, &inv.sender.name, device_subdir);
-            std::fs::create_dir_all(&dir).map_err(|e| format!("落盘目录不可用：{e}"))?;
-        }
-        if let Some(tx) = inv.responder.take() {
-            // 放行发送方；但**保留**这条邀请：下载循环拿它当"没被取消"的标志。
-            let _ = tx.send(true);
-        }
         (
             InboundInvite {
                 invite_id: inv.invite_id.clone(),
@@ -1007,13 +1376,50 @@ pub fn accept_invite(
                 count: inv.count,
                 files: inv.files.clone(),
                 caps: inv.caps.clone(),
-                root: root.clone(),
+                dest: inv.dest.clone(),
+                conflict: inv.conflict,
+                resolved: inv.resolved.clone(),
+                skipped_files: inv.skipped_files,
+                skipped_bytes: inv.skipped_bytes,
+                // 上传的落点由共享项决定，绝不让 `root` 顶掉它。
+                root: if inv.dest.is_some() { None } else { root.clone() },
                 callback: Some(callback),
                 responder: None,
             },
             inv.sender.id.clone(),
         )
     };
+
+    if let Some(dest) = invite.dest.clone() {
+        // 共享项目录：逐段校验 + 建目录（不跟随链接），建完 `resolve_upload_conflicts` 才有东西可查。
+        let dir = ensure_upload_dir(&state, &dest)?;
+        let policy = conflict.unwrap_or_default();
+        resolve_upload_conflicts(&mut invite, &dir, policy)?;
+        invite.conflict = policy;
+        invite.root = None;
+    } else if let Some(base) = root.as_deref() {
+        // 目录选择框给的一定是绝对路径；不是就不接（相对路径会挂在进程当前目录上，
+        // 落哪儿全凭启动方式，谁也不想要这种"接收方"）。
+        if !base.is_absolute() {
+            return Err("落盘目录必须是绝对路径".into());
+        }
+        // 就地验一次可写（不存在的建出来、拔掉的盘/只读目录当场报错）：失败时**什么都别动**，
+        // 用户换一个目录重按「接收」即可 —— 比"收了一半才发现写不进去"强。
+        let dir = resume::landing_dir(base, &invite.sender.name, device_subdir);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("落盘目录不可用：{e}"))?;
+    }
+
+    // 放行发送方；但**保留**这条邀请：下载循环拿它当"没被取消"的标志。
+    // 这一拍才拿走 `responder` —— 上面的目录/共享项校验失败时发送方还在等，用户能重试。
+    {
+        let mut inbound = state.push.inbound.lock();
+        let Some(inv) = inbound.get_mut(invite_id) else {
+            return Err("推送已被取消".into());
+        };
+        if let Some(tx) = inv.responder.take() {
+            let _ = tx.send(true);
+        }
+    }
 
     // **从这一刻起这条接收该被接手**：落一份待续传任务 —— 进程之后被杀/关掉，下次启动
     // 自己接着收（见 `resume_pending`）。写在放行之后、起下载之前：没点头的邀请不该在重启
@@ -1126,13 +1532,16 @@ pub fn cancel_receive(state: &AppState, invite_id: &str) {
     // 老协议那条路的收尾清理（邀请此刻已经在手里，落盘根与清单都从它推）。
     let manifest = invite.manifest();
     let sizes: Vec<(&str, u64)> = manifest.iter().map(|f| (f.path.as_str(), f.size)).collect();
-    discard_legacy_receive(
-        state,
-        invite_id,
-        &invite.sender.name,
-        invite.root.as_deref(),
-        &sizes,
-    );
+    if invite.dest.is_none() {
+        // 上传走新协议，`.part` 由 `sweep_stale` / 位图管理；不要拿下载目录去套。
+        discard_legacy_receive(
+            state,
+            invite_id,
+            &invite.sender.name,
+            invite.root.as_deref(),
+            &sizes,
+        );
+    }
     // 下载循环发现邀请没了就会收手；这里替它把话带到发送方 ——
     // 否则对面永远停在"正在传输"，那条 job 没有超时兜底。
     push_job::report_to_sender(
@@ -1202,13 +1611,18 @@ pub fn resume_pending(state: &Arc<AppState>) {
                 .iter()
                 .map(|f| (f.path.as_str(), f.size))
                 .collect();
-            discard_legacy_receive(
-                state,
-                &rec.invite_id,
-                &rec.sender_name,
-                rec.root.as_deref().map(std::path::Path::new),
-                &files,
-            );
+            if rec.dest.is_none() {
+                discard_legacy_receive(
+                    state,
+                    &rec.invite_id,
+                    &rec.sender_name,
+                    rec.root.as_deref().map(std::path::Path::new),
+                    &files,
+                );
+            } else {
+                // 上传的残留是共享项里的 `.part`（按文件身份），与邀请 id 记录无关。
+                state.push.resume.clear(&rec.invite_id);
+            }
             push_job::fail_download(
                 state,
                 &rec.sender_id,
@@ -1392,6 +1806,173 @@ mod tests {
             std::env::temp_dir().join(format!("orbdrop_manifest_{tag}_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 一台有共享项（`share-1`，指向 `<temp>/share`）的 AppState。
+    fn upload_state(tag: &str) -> (Arc<AppState>, PathBuf) {
+        let dir = temp_dir(tag);
+        let share = dir.join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let state = Arc::new(AppState::new(
+            crate::config::test_config(),
+            dir.join("config.toml"),
+        ));
+        state.config.lock().shares.push(crate::config::ShareItem {
+            id: "share-1".into(),
+            name: "共享项".into(),
+            path: share,
+            created_at: chrono::Utc::now(),
+            broadcast_enabled: true,
+        });
+        (state, dir)
+    }
+
+    fn upload_dest(path: &str) -> UploadDest {
+        UploadDest {
+            share_id: "share-1".into(),
+            path: path.into(),
+            share_name: String::new(),
+        }
+    }
+
+    fn upload_invite(files: Vec<FileEntry>, dest_path: &str) -> InboundInvite {
+        InboundInvite {
+            invite_id: "inv-upload".into(),
+            sender: PeerInfo {
+                id: "peer-a".into(),
+                name: "PC-A".into(),
+            },
+            name: files.first().map(|f| f.path.clone()).unwrap_or_default(),
+            size: files.iter().map(|f| f.size).sum(),
+            is_dir: true,
+            count: files.len(),
+            files,
+            caps: vec![push_job::CAP_STREAM.to_string()],
+            dest: Some(upload_dest(dest_path)),
+            conflict: UploadConflict::default(),
+            resolved: HashMap::new(),
+            skipped_files: 0,
+            skipped_bytes: 0,
+            root: None,
+            callback: None,
+            responder: None,
+        }
+    }
+
+    /// 上传目录只许在共享项里面：`..` 直接拒，不存在的子目录逐段建出来。
+    #[test]
+    fn upload_dir_cannot_escape_the_share() {
+        let (state, dir) = upload_state("upload_escape");
+        assert!(resolve_upload_dir(&state, &upload_dest("../outside")).is_err());
+        assert!(resolve_upload_dir(&state, &upload_dest("ok/../outside")).is_err());
+
+        let made = ensure_upload_dir(&state, &upload_dest("sub/dir")).unwrap();
+        assert!(made.is_dir(), "不存在的目标目录要逐段建出来");
+        assert!(made.starts_with(dir.join("share").canonicalize().unwrap()));
+
+        // 同名文件挡在路径上：不能把它当成目录继续建。
+        std::fs::write(dir.join("share").join("blocked"), b"x").unwrap();
+        assert!(ensure_upload_dir(&state, &upload_dest("blocked")).is_err());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 三种冲突策略：跳过一个都不动、覆盖保留原清单、改名排到不撞的编号（同批已预订的也算）。
+    #[test]
+    fn upload_conflicts_never_touch_existing_files_unless_overwriting() {
+        let (_state, dir) = upload_state("upload_conflict");
+        let share = dir.join("share");
+        std::fs::write(share.join("a.txt"), b"old").unwrap();
+        std::fs::write(share.join("a (1).txt"), b"old1").unwrap();
+
+        let files = || {
+            vec![
+                FileEntry {
+                    path: "a.txt".into(),
+                    size: 3,
+                    mtime: 0,
+                },
+                FileEntry {
+                    path: "b.txt".into(),
+                    size: 1,
+                    mtime: 0,
+                },
+                FileEntry {
+                    path: "a (2).txt".into(),
+                    size: 1,
+                    mtime: 0,
+                },
+            ]
+        };
+
+        let mut skip = upload_invite(files(), "");
+        resolve_upload_conflicts(&mut skip, &share, UploadConflict::Skip).unwrap();
+        // `a.txt` 跳过；`b.txt` 与 `a (2).txt` 不存在 → 保留。
+        assert_eq!(skip.files.len(), 2);
+        assert_eq!(skip.skipped_files, 1);
+        assert_eq!(skip.skipped_bytes, 3);
+        assert_eq!(std::fs::read(share.join("a.txt")).unwrap(), b"old");
+
+        let mut over = upload_invite(files(), "");
+        resolve_upload_conflicts(&mut over, &share, UploadConflict::Overwrite).unwrap();
+        assert_eq!(over.files.len(), 3);
+        assert!(over.resolved.is_empty(), "覆盖档落点保持清单路径");
+
+        let mut rename = upload_invite(files(), "");
+        resolve_upload_conflicts(&mut rename, &share, UploadConflict::Rename).unwrap();
+        // `a.txt` 先抢到 `a (2).txt`（磁盘上没有、同批还没预订）；清单里本来那条
+        // `a (2).txt` 随后发现落点被预订，再挪开 —— 两条清单项绝不能落进同一个路径。
+        assert_eq!(
+            rename.resolved.get("a.txt").map(String::as_str),
+            Some("a (2).txt")
+        );
+        assert_eq!(
+            rename.resolved.get("a (2).txt").map(String::as_str),
+            Some("a (2) (1).txt")
+        );
+        assert_eq!(rename.resolved.get("b.txt"), None, "不冲突的项保持清单路径");
+        let mut targets: Vec<&String> = rename.resolved.values().collect();
+        targets.sort();
+        targets.dedup();
+        assert_eq!(targets.len(), rename.resolved.len(), "改名结果必须互不相同");
+        assert_eq!(std::fs::read(share.join("a.txt")).unwrap(), b"old");
+
+        // 父链里躺着一个同名文件：这条清单项永远建不出目录，同意时就该拒（别留到下载循环里
+        // 无限重试）。
+        std::fs::write(share.join("blocker"), b"x").unwrap();
+        let mut bad = upload_invite(
+            vec![FileEntry {
+                path: "blocker/x.txt".into(),
+                size: 1,
+                mtime: 0,
+            }],
+            "",
+        );
+        assert!(resolve_upload_conflicts(&mut bad, &share, UploadConflict::Skip).is_err());
+
+        // 同名落点是目录：Overwrite 不能把它替换成文件；Skip / Rename 才行。
+        std::fs::create_dir(share.join("adir")).unwrap();
+        let mut bad = upload_invite(
+            vec![FileEntry {
+                path: "adir".into(),
+                size: 1,
+                mtime: 0,
+            }],
+            "",
+        );
+        assert!(resolve_upload_conflicts(&mut bad, &share, UploadConflict::Overwrite).is_err());
+        let mut ok = upload_invite(
+            vec![FileEntry {
+                path: "adir".into(),
+                size: 1,
+                mtime: 0,
+            }],
+            "",
+        );
+        resolve_upload_conflicts(&mut ok, &share, UploadConflict::Skip).unwrap();
+        assert!(ok.files.is_empty(), "同名目录按跳过处理");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 链接不进去、也不数它里面有多少东西：junction 回环会让走查把同一棵树翻几百遍
@@ -1653,6 +2234,7 @@ mod tests {
             count: 1,
             skipped: 0,
             per_target_total: 10,
+            dest: None,
             targets,
             last_emit: Instant::now(),
         }
