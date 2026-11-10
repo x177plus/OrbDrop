@@ -1,14 +1,16 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import Icon from "../Icon.svelte";
   import FileTile from "../components/FileTile.svelte";
   import DownloadRing from "../components/DownloadRing.svelte";
   import * as store from "../store.svelte";
   import * as chat from "$lib/stores/chat.svelte";
   import * as devices from "$lib/stores/devices.svelte";
+  import * as sharesStore from "$lib/stores/shares.svelte";
   import { fileIcon } from "../util";
   import { t } from "$lib/i18n.svelte";
   import type { BrowseDownload, FilesSeg } from "../store.svelte";
-  import type { InboxEntry, PeerShareItem } from "$lib/types";
+  import type { InboxEntry, PeerShareItem, ShareItem } from "$lib/types";
 
   const seg = $derived(store.currentSeg());
   const inbox = $derived(store.getInbox());
@@ -19,17 +21,63 @@
   const transferCount = $derived(transfers.length + activeDownloads.length);
   const inboxState = $derived(store.inboxState());
 
+  /** 本机共享项：与桌面端 `LocalTab` 共用同一个 store / 同一批命令，只是换一套移动端布局。 */
+  const localShares = $derived(sharesStore.getShares());
+  const localLoading = $derived(sharesStore.isSharesLoading());
+  const localError = $derived(sharesStore.getSharesError());
+  const shareAccess = $derived(store.getShareAccess());
+
   const SEGS: { id: FilesSeg; label: string }[] = [
     { id: "inbox", label: "收件" },
     { id: "transfer", label: "传输" },
+    { id: "local", label: "本机" },
     { id: "browse", label: "浏览" },
   ];
 
-  /** 段角标：收件把「待接收」一起数（它们也是没处理完的文件）；浏览恒 0（原型就是 0）。 */
+  /** 段角标：收件把「待接收」一起数（它们也是没处理完的文件）；本机数共享项；浏览恒 0。 */
   function segCount(id: FilesSeg): number {
     if (id === "inbox") return inbox.length + invites.length;
     if (id === "transfer") return transferCount;
+    if (id === "local") return localShares.length;
     return 0;
+  }
+
+  /** 本机段进入时拉一次清单与权限状态；从系统授权页回来时重读权限。 */
+  $effect(() => {
+    if (seg !== "local") return;
+    void sharesStore.loadShares();
+    void store.refreshShareAccess();
+  });
+
+  onMount(() => {
+    void store.refreshShareAccess();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void store.refreshShareAccess();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  });
+
+  function addLocalShare(): void {
+    store.openSheet({ kind: "sharePath" });
+  }
+
+  async function grantShareAccess(): Promise<void> {
+    try {
+      await store.requestShareAccess();
+      store.toast(t("已打开系统设置：打开「所有文件访问」后返回"), "check");
+    } catch (e) {
+      store.failed(t("打开「所有文件访问」设置"), e);
+    }
+  }
+
+  async function setBroadcast(s: ShareItem, enabled: boolean): Promise<void> {
+    try {
+      await sharesStore.toggleBroadcast(s.id, enabled);
+      store.toast(enabled ? t("已开启广播") : t("已停止广播该共享项"), enabled ? "share" : "lock");
+    } catch (e) {
+      store.failed(t("切换广播"), e);
+    }
   }
 
   /** 字节 → 短文本（与桌面端 `fmtBytes` 同口径：收件行里只要够短）。 */
@@ -101,10 +149,10 @@
     if (first) void store.selectBrowsePeer(first.id);
   });
 
-  /** 共享项那一行的副行：目录给直接子项数（老版本对端不带这个字段时干脆不写），文件给大小。 */
+  /** 共享项那一行的副行：目录给直接子项数，文件给大小；拿不到时退回中性说法（不报 0 B）。 */
   function shareMeta(s: PeerShareItem): string {
-    if (!s.isDir) return fmtBytes(s.size ?? 0);
-    return s.itemCount == null ? "" : t("{n} 项", { n: s.itemCount });
+    if (!s.isDir) return typeof s.size === "number" ? fmtBytes(s.size) : t("单个文件");
+    return typeof s.itemCount === "number" ? t("{n} 项", { n: s.itemCount }) : t("文件夹");
   }
 
   /**
@@ -292,6 +340,98 @@
     </div>
     <!-- 原型的「最近完成」分组不画：`activeTransfers()` / `activeBrowseDownloads()` 都只给
          还在动的行，做完的那些这里列不出来。 -->
+  </div>
+{:else if seg === "local"}
+  <div class="body">
+    {#if shareAccess && !shareAccess.supported}
+      <div class="card gcard">
+        <div class="srow">
+          <div class="srow-top"><span class="slabel">{t("需要「所有文件访问」权限")}</span></div>
+          <p class="shelp">
+            {t("直接共享手机目录需要 Android 11 及以上；这台系统版本不支持。")}
+          </p>
+        </div>
+      </div>
+    {:else if shareAccess && !shareAccess.granted}
+      <div class="card gcard">
+        <div class="srow">
+          <div class="srow-top"><span class="slabel">{t("需要「所有文件访问」权限")}</span></div>
+          <p class="shelp">
+            {t("OrbDrop 只会共享你在这里明确选择的文件或文件夹；权限本身不会读取或上传任何内容。")}
+          </p>
+          {#if localShares.length}
+            <p class="shelp">{t("已有共享项在重新授权前暂时读不到。")}</p>
+          {/if}
+          <div class="perm-acts">
+            <button class="btn btn-primary btn-sm" type="button" onclick={() => void grantShareAccess()}>
+              {t("去授权")}
+            </button>
+            <button class="btn btn-secondary btn-sm" type="button" onclick={() => void store.refreshShareAccess()}>
+              {t("重新检查")}
+            </button>
+          </div>
+        </div>
+      </div>
+    {/if}
+
+    {#if !shareAccess || (shareAccess.supported && shareAccess.granted)}
+      <button class="btn btn-primary btn-block" type="button" onclick={addLocalShare}>
+        {t("添加共享项")}
+      </button>
+    {/if}
+
+    <div class="sec">
+      <div class="sec-label">
+        <span>{t("本机共享")}</span>
+        <span class="num">{t("{n} 项", { n: localShares.length })}</span>
+      </div>
+      <div class="card list">
+        {#if localError}
+          <div class="empty">
+            <Icon name="x" />
+            <p>{t("读取共享项失败")}</p>
+            <p class="es">{localError}</p>
+          </div>
+        {:else if localLoading && !localShares.length}
+          <div class="empty"><Icon name="folder" /><p>{t("正在读取共享项…")}</p></div>
+        {:else if !localShares.length}
+          <div class="empty">
+            <Icon name="folder" />
+            <p>{t("还没有共享项")}</p>
+            <p class="es">
+              {t("点「添加共享项」选择手机上的文件或文件夹；打开广播后，已连接设备就能看到。")}
+            </p>
+          </div>
+        {:else}
+          {#each localShares as s (s.id)}
+            <div class="lrow">
+              <button
+                class="lmain"
+                type="button"
+                onclick={() => store.openSheet({ kind: "shareActions", shareId: s.id })}
+              >
+                <FileTile name={s.name} isDir={s.isDir} />
+                <span class="fmain">
+                  <span class="fname2">{s.name}</span>
+                  <span class="fmeta">
+                    {shareAccess && !shareAccess.granted ? t("权限未授予") : shareMeta(s)}
+                  </span>
+                  <span class="lpath" title={s.path}>{s.path}</span>
+                </span>
+              </button>
+              <label class="switch" aria-label={t("广播")}>
+                <input
+                  type="checkbox"
+                  checked={s.broadcastEnabled}
+                  onchange={(e) => void setBroadcast(s, e.currentTarget.checked)}
+                />
+                <span class="track"></span>
+              </label>
+            </div>
+          {/each}
+        {/if}
+      </div>
+    </div>
   </div>
 {:else if !browseDevices.length}
   <div class="body">

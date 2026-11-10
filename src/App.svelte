@@ -19,8 +19,8 @@
   import * as chat from '$lib/stores/chat.svelte';
   import type { ConvoThread, ChatItem } from '$lib/stores/chat.svelte';
   import * as upd from '$lib/stores/update.svelte';
-  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, setPushReceivePaused, pushPaths, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, forgetPeer, downloadFromPeer, downloadFile, shareDownloadUrl, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
-  import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem, PeerTransport } from '$lib/types';
+  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, setPushReceivePaused, pushPaths, uploadToShare, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, forgetPeer, downloadFromPeer, downloadFile, shareDownloadUrl, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
+  import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem, PeerTransport, UploadDest } from '$lib/types';
   import { shareMeta, updateStatusText, updateTitleText } from '$lib/types';
   import { adoptLanguagePreference, t } from '$lib/i18n.svelte';
   import { isImageName } from '$lib/composer';
@@ -83,6 +83,23 @@
   }
 
   /**
+   * 等**这一帧真的画出来**（样式已经落到屏上），再做下一步 —— 与 `nextFrameOr` 的区别是
+   * 后者只保证"rAF 回调跑到了"，而 rAF 回调仍在绘制**之前**：隐藏/位移这类要与 OS 窗口动作
+   * 抢顺序的事，等一帧 rAF 不够（实测窗口先搬走、卡片晚一帧才藏，屏幕上就是卡片横跳一次）。
+   *
+   * 用**两帧 rAF**：第二个回调落在第一帧绘制之后，那时"藏起来"已经真的在屏上了。
+   * rAF 被节流（窗口被遮住/后台）时退回 `FRAME_FALLBACK_MS` —— 宁可少等，别卡住。
+   */
+  function afterPaint(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      requestAnimationFrame(() => requestAnimationFrame(finish));
+      setTimeout(finish, FRAME_FALLBACK_MS);
+    });
+  }
+
+  /**
    * 等 WebView2 的 CSS 视口跟上 OS 窗口尺寸。
    * SetWindowPos 之后视口尺寸会滞后 1~2 帧，此时布局仍按旧宽度算 ——
    * 面板若在这期间开始淡入，就会先以窄条出现再跳宽（右边缘闪一下）。
@@ -130,7 +147,7 @@
   // 右键菜单：开在哪（窗口 CSS px）、开的是什么（`kind` 决定菜单画哪一组），外加一个"这次是
   // 折叠态卡片上开的那一份"的标记（`orb`，见 `orbCtxOpen`）。开与关只有两条路：面板里的各行
   // 派 `od:ctx` 事件（见 `handleCtx`），卡片那一档直接调 `openRectCtx`。
-  type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer' | 'chat' | 'convo'; el?: HTMLElement; shareId?: string; path?: string; isDir?: boolean; size?: number; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; name?: string; chatId?: string; chatFull?: string; chatSel?: string; convoKey?: string; convoPeerId?: string; convoThread?: boolean; convoBc?: boolean; convoBrowse?: boolean; orb?: boolean; placed?: boolean; menuW?: number; menuH?: number };
+  type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer' | 'chat' | 'convo'; el?: HTMLElement; shareId?: string; shareName?: string; path?: string; isDir?: boolean; size?: number; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; name?: string; chatId?: string; chatFull?: string; chatSel?: string; convoKey?: string; convoPeerId?: string; convoThread?: boolean; convoBc?: boolean; convoBrowse?: boolean; orb?: boolean; placed?: boolean; menuW?: number; menuH?: number };
   let ctxState = $state<CtxState | null>(null);
   /**
    * 折叠态卡片上那个右键菜单是不是开着（`ctxState.orb`，见 `openRectCtx`）。
@@ -149,6 +166,9 @@
   let orbMenuGeo = $state<{ grown: boolean; shift: { x: number; y: number } }>({ grown: false, shift: { x: 0, y: 0 } });
   /** 撑窗那一两帧里卡片先不出镜：原点在挪，画面上会跳（见 main.css 的 `.menu-busy`）。 */
   let orbMenuBusy = $state(false);
+  /** 解除 `orbMenuBusy` 的那一帧：卡片要**直接**出现，不能按默认的 0.15s 淡回来
+   *  （否则菜单从左边长出来、卡片还在原地渐显，看起来就是闪一下）。只挂一帧，见 `placeOrbMenu`。 */
+  let orbMenuSnap = $state(false);
   /** 缩窗那一趟还在飞（窗口还没回到折叠态那一档）：新一次落点得先等它 —— 两次 `SetWindowPos`
    *  同时在飞，后到的说了算，窗口会停在错的那一档。 */
   let orbMenuRestoring: Promise<void> | null = null;
@@ -270,6 +290,10 @@
     sas?: string;
     /** 这条推送走哪套协议（缺省 = `orbdrop`）。LocalSend 的通知要带徽标。 */
     transport?: PeerTransport;
+    /** `true` = 对端请求**上传到本机共享项**（与普通推送不同：目标固定、长连接在线就自动收下）。 */
+    upload?: UploadDest;
+    /** 上传完成时因同名被跳过的项数（历史 `skip` 策略的记录；普通推送没有）。 */
+    skipped?: number;
   };
   let notices = $state<PushNotice[]>([]);
   // 铃铛：展开/收起右下角那组"等你确认"的气泡。收起 ≠ 已读 —— 角标照旧挂着。
@@ -993,13 +1017,16 @@
    * 见 main.css）；菜单挂在 stage 外面，坐标不受那次平移影响，所以它按**真窗口坐标**摆就是了。
    *
    * 原点要挪的那一两帧里卡片先不出镜（`orbMenuBusy`）：窗口已经到新位置、内容还是旧的窗口内
-   * 坐标，不藏就是"卡片横跳一次"。那几帧里菜单也还没显形，所以整扇窗口是空的 —— 换位置看不见。
+   * 坐标，不藏就是"卡片横跳一次"。**这一藏必须真画到屏上再搬窗口**（等两帧 rAF，见
+   * `afterPaint`）—— 只置状态的话 IPC 会抢在 DOM 之前落地，卡片照样横跳。那几帧里菜单也还没
+   * 显形，所以整扇窗口是空的 —— 换位置看不见。
    */
   async function placeOrbMenu(c: CtxState) {
     const el = document.querySelector<HTMLElement>('[data-od-id="ctx-menu"]');
     if (!el) return;                       // 菜单已经不在了（刚被关掉）：无事可做
     const mw = el.offsetWidth, mh = el.offsetHeight;   // 尺寸随字号/文本缩放变，量出来才算数
     if (orbMenuRestoring) await orbMenuRestoring;      // 上一趟缩窗还没落地：等它，否则两次 SetWindowPos 打架
+    let hidForMove = false;                            // 这一趟为搬家藏过卡片（解除时要直接显形，见 finally）
     try {
       const sf = await appWindow.scaleFactor();
       const pos = await appWindow.outerPosition();
@@ -1024,12 +1051,22 @@
         h: Math.max(my + ph + sl, pos.y + ch) - Math.min(my - sl, pos.y),
       };
       const dx = (rect.x - pos.x) / sf, dy = (rect.y - pos.y) / sf;   // 原点挪了多少（往左/上是负）
+      const moves = rect.x !== pos.x || rect.y !== pos.y;
       if (rect.x !== pos.x || rect.y !== pos.y || rect.w !== cw || rect.h !== ch) {
-        orbMenuBusy = dx !== 0 || dy !== 0;    // 只往右下长时画面上本来就看不出来，不必藏
+        orbMenuBusy = moves;    // 只往右下长时画面上本来就看不出来，不必藏
         // 兜底：`orbMenuBusy` 期间卡片与球都是 `opacity:0`（main.css 的 `.menu-busy`），
         // 撑窗那一步 invoke 不回就一直是"整窗空的"（见 `releaseStuckOrb`）。
         if (menuFailsafe) clearTimeout(menuFailsafe);
         menuFailsafe = setTimeout(() => { menuFailsafe = null; orbMenuBusy = false; }, STUCK_MS);
+        // 原点要挪时，**必须先让"藏起来"这一帧画到屏上**再搬窗口。SetWindowPos 一落地，
+        // WebView 的内容还按旧坐标画在新原点里：卡片会先横跳一段（实测 69px）再消失，
+        // 看起来就是"先向右弹了一下再向左展开"。只置 `orbMenuBusy` 不够 —— 它要到下一个
+        // 微任务才写进 DOM，而 IPC 可能抢先落地；等两帧 rAF 才算真的画完（见 `afterPaint`）。
+        if (moves) {
+          hidForMove = true;
+          await afterPaint();
+          if (ctxState !== c) return;   // 等这一帧时菜单被关掉/顶掉了：这趟作废
+        }
         await orbSetRect(rect);
         // **累加**：右键点另一格时窗口多半已经撑过一次（原点也挪过），这次挪的是相对**当前**原点的
         // 增量 —— 把它加到已有的那一段上，不然 stage 的平移会被清零，卡片当场横跳一段。
@@ -1051,6 +1088,12 @@
       if (ctxState?.orb) ctxState.placed = true;   // 撑不动就按现状显形（夹在窗口里，总比不显示强）
     } finally {
       orbMenuBusy = false;
+      if (hidForMove) {
+        // 卡片刚才是为了搬窗口才藏起来的：这一帧直接显形（`.menu-snap` 关掉过渡），
+        // 不能按默认的 0.15s 淡回来 —— 否则菜单已经在左边了、卡片还在原地渐显，看着像闪一下。
+        orbMenuSnap = true;
+        void afterPaint().then(() => { orbMenuSnap = false; });
+      }
       if (menuFailsafe) { clearTimeout(menuFailsafe); menuFailsafe = null; }
     }
   }
@@ -1721,6 +1764,17 @@
   function pushBatchTitle(b: PushBatch): string {
     const live = batchLive(b);
     const sending = b.targets.some((target) => target.state === 'sending');
+    // 上传到共享项：标题不再说"推送给谁"，说清"正在往对端的共享项里写"。
+    if (b.dest) {
+      if (!live) {
+        return b.failed > 0
+          ? t('上传未完成（{n} 项）', { n: b.count })
+          : t('已上传（{n} 项）', { n: b.count });
+      }
+      return sending
+        ? t('正在上传（{n} 项）', { n: b.count })
+        : t('等待对方接收（{n} 项）', { n: b.count });
+    }
     if (b.targets.length > 1) {
       const names = b.targets.map((target) => targetName(target));
       if (names.length === 1) return t('推送给「{name}」', { name: names[0] });
@@ -1767,8 +1821,8 @@
   /**
    * 一行目标设备的行内文案。
    *
-   * 已配对只说明身份可信，不再等于"对方一定自动收"（取决于对面的「已配对设备自动接收」
-   * 开关）。所以邀请阶段统一说「等待对方接收」，不替对面编"同意"或"自动接收"。
+   * 已配对只说明身份可信：对面有长连接在线就自动收；没有长连接才看对面的
+   * 「已配对设备自动接收」开关。所以邀请阶段统一说「等待对方接收」。
    */
   function targetLabel(target: PushTarget, total: number): string {
     switch (target.state) {
@@ -1842,10 +1896,10 @@
     if (b.targets.length === 1) {
       const target = b.targets[0];
       if (target.state === 'done') {
-        toast(t('已发送完成'));
+        toast(b.dest ? t('已上传完成') : t('已发送完成'));
         setTimeout(() => dropBatch(b.batchId), 3000);
       } else if (target.state === 'cancelled') {
-        toast(t('已取消推送'));
+        toast(b.dest ? t('已取消上传') : t('已取消推送'));
         dropBatch(b.batchId);
       } else {
         // 对端拒绝 / 对端没有这条邀请 / 传输失败：原因就在快照里（`push://done` 以前带的那句）。
@@ -1917,10 +1971,32 @@
     }
     picker = {
       title: t('推送到{targets}', { targets: pushTargetsLabel(live) }),
-      sub: t('文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。同一份内容会分别发给每台设备：已配对且开着「自动接收」的直接收，其余各自点同意，进度与成败都记在右下角那张卡片上。'),
+      sub: t('文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；已选项目在底部角标里可查看、逐项取消或全部取消。同一份内容会分别发给每台设备：已配对且长连接在线的直接收，已配对但没连的看对方开关，其余各自点同意；进度与成败都记在右下角那张卡片上。'),
       confirmLabel: live.length > 1 ? t('推送到 {n} 台设备', { n: live.length }) : t('推送'),
       onConfirm: (items) => void pushPicked(items, live, chatBatchId, groupId),
     };
+  }
+
+  /** 设备页的目录右键「上传到此文件夹…」：开与本机推送同一个选择框，目标换成对端共享项目录。 */
+  function requestUploadToShare(peerId: string, shareId: string, path: string, shareName: string) {
+    const device = peerShortName(peerId);
+    const where = path ? `${shareName ? `${shareName}/` : ''}${path}` : (shareName || '/');
+    picker = {
+      title: t('上传到「{device}」的「{where}」', { device, where }),
+      sub: t('文件与文件夹都可以选，双击文件夹进入，选中项跨目录累积；确认后直接写进对方的共享项目录（不是它的下载目录）。对方的共享项开着广播、且与这台设备有长连接时，文件会直接写入（同名覆盖），不再弹接收确认。'),
+      confirmLabel: t('上传'),
+      onConfirm: (items) => void uploadPicked(items, peerId, shareId, path, shareName),
+    };
+  }
+
+  async function uploadPicked(items: LocalPick[], peerId: string, shareId: string, path: string, shareName: string) {
+    closePicker();
+    if (items.length === 0) return;
+    try {
+      await uploadToShare(peerId, shareId, path, shareName, items.map((i) => i.path));
+    } catch (e) {
+      toast(String(e));
+    }
   }
 
   /** 「A」「B」等 3 台设备 —— 与卡片标题同一个规则（设备名一律用「」框住）。 */
@@ -2140,6 +2216,40 @@
     const x = pos.x / dpr;
     const y = pos.y / dpr;
     return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  }
+
+  /**
+   * OS 拖放的落点是不是某个**对端目录**（共享项根行 / 树节点）。
+   *
+   * Tauri 的拖放事件只给路径与物理像素坐标，没有 DOM 目标；这里除以 `devicePixelRatio`
+   * 后用 `elementFromPoint` 命中带 `data-od-*` 标记的节点（`TreeNode` 与 `PeerTab` 的根行）。
+   * 只认 `data-od-isdir="true"`：往文件上放没有语义（上传到文件所在的共享项目录也可以，
+   * 但那是另一个动作，不在这里偷偷改落点）。
+   */
+  function dropUploadTarget(pos: { x: number; y: number }): { peerId: string; shareId: string; path: string; shareName: string; isDir: boolean } | null {
+    const dpr = window.devicePixelRatio || 1;
+    const el = document.elementFromPoint(pos.x / dpr, pos.y / dpr);
+    const node = el?.closest<HTMLElement>('[data-od-peer-id][data-od-share-id]');
+    if (!node) return null;
+    const peerId = node.dataset.odPeerId;
+    const shareId = node.dataset.odShareId;
+    if (!peerId || !shareId) return null;
+    return {
+      peerId,
+      shareId,
+      path: node.dataset.odPath ?? '',
+      shareName: node.dataset.odShareName ?? '',
+      isDir: node.dataset.odIsdir === 'true',
+    };
+  }
+
+  /** 拖到对端目录上松手 = 直接上传到那一项（同一份清单/卡片，不走选择框）。 */
+  async function uploadDropped(paths: string[], target: { peerId: string; shareId: string; path: string; shareName: string }) {
+    try {
+      await uploadToShare(target.peerId, target.shareId, target.path, target.shareName, paths);
+    } catch (e) {
+      toast(String(e));
+    }
   }
 
   /**
@@ -2471,6 +2581,28 @@
     // 长连接请求（F-16 的同意制）：两边的卡片都说清"这个动作在等谁"。
     if (n.kind === 'link') return t('「{name}」请求建立长连接', { name: n.from });
     if (n.kind === 'linkWait') return t('等待「{name}」同意连接', { name: n.from });
+    // 上传到共享项：标题说清是"写进我的共享项"，不要和普通推送混在一起。
+    // 自动收下后没有「想不想」这一步：进行中说"正在上传"，终态说"已上传/失败"。
+    if (n.upload) {
+      if (n.kind === 'receiving') {
+        return n.count > 1
+          ? t('「{name}」正在上传到你的共享项（{n} 项）', { name: n.from, n: n.count })
+          : t('「{name}」正在上传到你的共享项', { name: n.from });
+      }
+      if (n.kind === 'done') {
+        return n.count > 1
+          ? t('「{name}」已上传到你的共享项（{n} 项）', { name: n.from, n: n.count })
+          : t('「{name}」已上传到你的共享项', { name: n.from });
+      }
+      if (n.kind === 'failed') {
+        return n.count > 1
+          ? t('上传到你的共享项失败（{n} 项）', { n: n.count })
+          : t('上传到你的共享项失败');
+      }
+      return n.count > 1
+        ? t('「{name}」想上传到你的共享项（{n} 项）', { name: n.from, n: n.count })
+        : t('「{name}」想上传到你的共享项', { name: n.from });
+    }
     if (n.count > 1) {
       const count = n.count;
       if (n.kind === 'invite') return t('收到「{name}」的推送（{n} 项）', { name: n.from, n: count });
@@ -2516,21 +2648,24 @@
       return t('已把连接请求发给「{name}」：它在自己的通知里点「接受」即建立长连接。60 秒内没人处理自动作废。', { name: n.from });
     }
     if (n.kind === 'done') {
+      const skipped = n.skipped ? t('（同名文件已跳过 {n} 项）', { n: n.skipped }) : '';
       if (n.count > 1) {
-        return n.dest
+        const body = n.dest
           ? t('{n} 项已保存到 {dest}', { n: n.count, dest: n.dest })
           : t('{n} 项已保存到下载目录', { n: n.count });
+        return body + skipped;
       }
-      return n.dest
+      const body = n.dest
         ? t('{name} 已保存到 {dest}', { name: n.name, dest: n.dest })
         : t('{name} 已保存到下载目录', { name: n.name });
+      return body + skipped;
     }
     return n.error ?? t('接收失败');
   }
 
   /**
-   * 接收一条**需要同意**的推送（未绑定设备，或已配对但关了「自动接收」）：设置了
-   * 「每次选择位置」就先问落盘目录。
+   * 接收一条**需要同意**的推送（未绑定设备，或已配对但没有长连接且关了「自动接收」）：
+   * 设置了「每次选择位置」就先问落盘目录。
    *
    * - 目录选择框打开即设置里的下载目录（`defaultPath`），省掉一层层点；
    * - 框里取消 = **拒绝**这次接收（返回 false）—— 发送方那边一直挂着等一个决定，不能让它
@@ -2538,8 +2673,8 @@
    *   `rejectNotice` / `chatRejectInvite` 把话带回去；
    * - 「直接保存到下载目录」那一档照旧不问，`root` 不带 → 后端落在设置里的下载目录。
    *
-   * **已配对且开着「自动接收」那条路不会走到这里**：它免同意直接收，界面上连「接收」
-   * 按钮都没有。
+   * **已配对且长连接在线（或开着「自动接收」）那条路不会走到这里**：它免同意直接收，
+   * 界面上连「接收」按钮都没有。
    */
   async function acceptInviteWithAsk(inviteId: string): Promise<boolean> {
     const s = getSettings();
@@ -2565,6 +2700,8 @@
       ok = await acceptInviteWithAsk(n.inviteId);
     } catch (e) {
       toast(String(e));
+      // 接收失败（目录不可写/邀请已被取消）：这张卡已经不可能变成接收中，收掉；
+      // 发送方那边会收到拒绝/失败，不会停在"等对方接收"。
       dropNotice(n.inviteId);
       return;
     }
@@ -2975,6 +3112,19 @@
     }
   }
 
+  /**
+   * 设备页目录右键「上传到此文件夹…」：目标写死在这一项上，用户只挑本机文件/目录。
+   *
+   * 共享项名字只在**最外层**那一行取得到（`c.path === ''` 时 `c.name` 就是它）；
+   * 钻进去之后的树节点只有相对路径，标题就用那一段路径 —— 上传目标本身不受影响。
+   */
+  function ctxPeerUpload() {
+    const c = ctxState;
+    hideCtx();
+    if (!c || c.kind !== 'peer' || !c.peerId || !c.shareId || !c.isDir) return;
+    requestUploadToShare(c.peerId, c.shareId, c.path ?? '', c.shareName || (c.path ? '' : (c.name ?? '')));
+  }
+
   /** 对端文件下载：走后端命令（token 取凭据库、落盘按下载目录设置都在 Rust 侧）。
    *
    *  下载前先把列表里已经知道的大小登记给进度 store（`browse://download` 只报已收字节）：
@@ -3256,8 +3406,12 @@
         const paths = event.payload.paths;
         if (paths.length === 0) return;
         // 落点在**开着的那条会话**上 = 往这条会话推（F-111，与「＋」同一条路）；
-        // 其余落点照旧登记成共享项（F-20）。现判坐标：这一次落点的位置只有 `drop` 自己知道。
+        // 落点在**对端目录**上 = 直接上传到那个共享项目录；其余落点照旧登记成共享项（F-20）。
+        // 现判坐标：这一次落点的位置只有 `drop` 自己知道。
+        const target = dropUploadTarget(event.payload.position);
         if (dropInConvo(event.payload.position)) void sendDroppedToConvo(paths);
+        else if (target?.isDir) void uploadDropped(paths, target);
+        else if (target) toast(t('只能上传到文件夹'));
         else void addShares(paths);
       }
     });
@@ -3278,8 +3432,8 @@
     // ── 推送事件：发送侧一张进度卡，接收侧一串通知（面板右下角的气泡组）──────
     // 邀请：接收方收到别人的推送 → 挂一条通知（悬浮球左上角的数字 +1）。
     // **不主动弹面板**：人来点，球上那个黄色数字就是"有事等你"的信号。
-    // 需要同意的邀请带「接收/拒绝」按钮；`auto`（已配对 + 开着自动接收）的已经直接开收、
-    // 只显示进度。
+    // 需要同意的邀请带「接收/拒绝」按钮；`auto`（已配对 + 长连接在线，或已配对 + 开着
+    // 自动接收）的已经直接开收、只显示进度。
     const unPushInvite = listen<PushInvite>('push://invite', (ev) => {
       const inv = ev.payload;
       notices = [...notices, {
@@ -3294,6 +3448,8 @@
         received: 0,
         // LocalSend 发来的文件必须问用户收不收（文本消息由后端直接落进会话，不会走到这里）。
         transport: inv.transport,
+        // 上传到共享项：目标固定（不能改）；长连接在线时后端已经自动收下（同名覆盖）。
+        upload: inv.dest,
       }];
       // 会话里也落一张卡（同一件事的另一处呈现：右下角是"顺带看一眼"，会话是"跟这台设备的往来"）。
       chat.noteInboundInvite(inv);
@@ -3327,8 +3483,8 @@
         if (notice) notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'receiving' } : n));
         const b = batchForInvite(inviteId);
         if (b && b.targets.length === 1) {
-          // 这条回执既可能来自用户点「接收」，也可能来自对面的自动接收（已配对 + 开着
-          // 自动接收）：不替对面编"同意"，只报"开始了"。
+          // 这条回执既可能来自用户点「接收」，也可能来自对面的自动接收（已配对 + 长连接
+          // 在线，或开着自动接收）：不替对面编"同意"，只报"开始了"。
           const target = b.targets[0];
           toast(t('开始向「{name}」传输', { name: targetName(target) }));
         }
@@ -3373,8 +3529,8 @@
       notePeerDownload(ev.payload);
     });
 
-    const unPushDone = listen<{ inviteId: string; status: string; reason?: string | null; dest?: string }>('push://done', (ev) => {
-      const { inviteId, status, reason, dest } = ev.payload;
+    const unPushDone = listen<{ inviteId: string; status: string; reason?: string | null; dest?: string; skippedFiles?: number }>('push://done', (ev) => {
+      const { inviteId, status, reason, dest, skippedFiles } = ev.payload;
       // `dest` 一并带给会话 store：收完那条气泡上的「打开」按它去开（见 `ChatFileMsg.path`）。
       // `cancelled` 单列一档：那是有人点了取消（本机通知卡上的「取消」，或发送方撤销），不是"接收失败"。
       chat.noteInviteDone(
@@ -3388,7 +3544,7 @@
           toast(t('已收到文件'));
           // 收完 ≠ 处理完：转成一条**待确认**的通知挂在右下角气泡里，直到用户点
           // 「知道了」才消失 —— 否则"东西落在哪"会跟着 toast 一起蒸发掉。
-          notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'done', received: n.size, dest } : n));
+          notices = notices.map((n) => (n.inviteId === inviteId ? { ...n, kind: 'done', received: n.size, dest, skipped: skippedFiles ?? 0 } : n));
         } else if (status === 'cancelled') {
           dropNotice(inviteId);
         } else {
@@ -3577,7 +3733,7 @@
           const slotFor = detail.kind === 'peer' || detail.isDir !== false ? 'folder' : 'file';
           void loadBcStatus(slotFor);
         }
-        ctxState = { x: detail.x, y: detail.y, el: detail.el, kind: detail.kind, shareId: detail.shareId, path: detail.path, isDir: detail.isDir, size: detail.size, deviceState: detail.deviceState, deviceOnline: detail.online, deviceNeedsPair: detail.needsPair, deviceId: detail.deviceId, peerId: detail.peerId, name: detail.name };
+        ctxState = { x: detail.x, y: detail.y, el: detail.el, kind: detail.kind, shareId: detail.shareId, shareName: detail.shareName, path: detail.path, isDir: detail.isDir, size: detail.size, deviceState: detail.deviceState, deviceOnline: detail.online, deviceNeedsPair: detail.needsPair, deviceId: detail.deviceId, peerId: detail.peerId, name: detail.name };
       }
     };
     document.addEventListener('od:ctx', handleCtx);
@@ -3644,6 +3800,7 @@
   class:docked-right={rectDock === 1}
   class:menu={orbMenuGeo.shift.x !== 0 || orbMenuGeo.shift.y !== 0}
   class:menu-busy={orbMenuBusy}
+  class:menu-snap={orbMenuSnap}
   style="--panel-slack: {PANEL_SLACK}px; --orb-inset: {layout.widget.x}px; --orb-inset-y: {layout.widget.y}px; --foot-h: {footH}px; --notif-max-h: {notifMaxH}px; --orb-x: {orbOffset.x}px; --orb-y: {orbOffset.y}px; --zone-x: {orbZone.x}px; --zone-y: {orbZone.y}px; --zone-w: {orbZone.w}px; --zone-h: {orbZone.h}px; --spin-l: {badgeSpin.left}deg; --spin-r: {badgeSpin.right}deg; --menu-dx: {orbMenuGeo.shift.x}px; --menu-dy: {orbMenuGeo.shift.y}px"
 >
   <!-- 悬停热区：**只有屏上看得见的那一条**（贴边收起后 = 露出那截弧的方框 / 那条竖条，
@@ -3890,6 +4047,9 @@
                   <span>{t('来自「{name}」', { name: n.from })}</span>
                   <span class="num">{fmtBytes(n.received)} / {fmtBytes(n.size)}</span>
                 </div>
+                {#if n.upload}
+                  <p class="nb-body">{t('目标：共享项「{share}」{path}（同名文件覆盖）', { share: n.upload.shareName || n.upload.shareId, path: n.upload.path ? `/${n.upload.path}` : '' })}</p>
+                {/if}
                 <div class="nb-acts">
                   <button class="btn btn-secondary btn-sm" onclick={() => void cancelNotice(n)}>{t('取消')}</button>
                 </div>
@@ -3997,6 +4157,14 @@
 
               <!-- 清单里少了的项（链接 / 读不到）：卡片上必须写出来 —— 清单少了东西却不说，
                    用户会以为"就这些"然后推漏（同 `fs_browse::list_dir` 那条注释的道理）。 -->
+              {#if b.dest}
+                <div class="p-dest">
+                  {t('上传到共享项「{share}」{path}', {
+                    share: b.dest.shareName || b.dest.shareId,
+                    path: b.dest.path ? `/${b.dest.path}` : '',
+                  })}
+                </div>
+              {/if}
               {#if b.skipped > 0}
                 <div class="p-skip">{t('已跳过 {n} 项（链接 / 读不到）', { n: b.skipped })}</div>
               {/if}
@@ -4292,6 +4460,7 @@
       onConvoClear={() => void ctxConvoClear()}
       onConvoExit={() => void ctxConvoExit()}
       onPeerDownload={ctxPeerDownload}
+      onPeerUpload={ctxPeerUpload}
       onBcCompare={ctxBcCompare}
       onBcAddLeft={() => void ctxBcPlaceLeft()}
     />

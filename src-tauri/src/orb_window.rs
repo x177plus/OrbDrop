@@ -129,7 +129,7 @@ pub fn mouse_down() -> bool {
     imp::mouse_down()
 }
 
-/// 这个位置（连同窗口当前尺寸）是否还落在某块显示器上。
+/// 这个位置（**窗口左上角**，物理像素；连同窗口当前尺寸）是否还落在某块显示器上。
 ///
 /// 复原悬浮球位置前必须问一句：显示器被拔掉 / 分辨率变了之后，上次的落点可能已经在
 /// 屏幕外 —— 透明无边框窗口没有标题栏可以拖回来，用户只能去删配置文件。
@@ -789,6 +789,57 @@ mod tests {
                 h: 90
             },
             &[ms[0]]
+        ));
+    }
+
+    /// 贴边收起的悬浮框：本体中心落在屏幕外（卡片大半滑出去），启动判活必须按窗口左上角判。
+    ///
+    /// 真机现场：1920×1080、`orbShape = "rect"`、落盘 `orbCenter.x = 1961`（= 1920 − 47 + 88），
+    /// 旧写法拿中心当窗口左上角 → 整块判成出界 → 每次重启都退回屏幕中央。
+    #[test]
+    fn a_docked_body_center_maps_back_to_a_window_on_screen() {
+        use crate::config::{orb_window_origin, OrbPos, OrbShape};
+
+        let monitor = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        let center = OrbPos { x: 1961, y: 408 };
+        let origin = orb_window_origin(center, OrbShape::Rect, 1.0);
+        let window = Rect {
+            x: origin.x,
+            y: origin.y,
+            w: 236,
+            h: 162,
+        };
+        assert!(
+            overlaps_any(window, &[monitor]),
+            "贴边窗口换算回来还有 61px 在屏内，不能判成出界"
+        );
+        // 同样的数按旧写法（本体中心当窗口左上角）就是反例，钉住"为什么必须换算"。
+        assert!(!overlaps_any(
+            Rect {
+                x: center.x,
+                y: center.y,
+                w: 236,
+                h: 162
+            },
+            &[monitor]
+        ));
+
+        // 换算不能把"显示器真没了"也放过：左侧副屏（-1920..0）被拔掉之后，
+        // 记在它上面贴左收起的位置换算成窗口仍然整块在主屏左侧之外。
+        let gone = orb_window_origin(OrbPos { x: -1961, y: 408 }, OrbShape::Rect, 1.0);
+        assert!(!overlaps_any(
+            Rect {
+                x: gone.x,
+                y: gone.y,
+                w: 236,
+                h: 162
+            },
+            &[monitor]
         ));
     }
 

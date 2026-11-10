@@ -39,6 +39,8 @@
     onForget,
     onRemark,
     onPeerDownload,
+    /** 设备页的目录：把本机文件/目录上传到这一项（只对目录给；`onPeerUpload` 不传就不画）。 */
+    onPeerUpload,
     onBcCompare,
     onBcAddLeft,
     onChatCopy,
@@ -127,6 +129,8 @@
     /** 设备 / 一对一会话菜单：改本机给这台设备起的备注（F-101）—— 纯本机动作，任何状态的行都给。 */
     onRemark: () => void;
     onPeerDownload: () => void;
+    /** 设备页的目录：上传到这一项。不传 = 不画这一项（文件行没有"上传到文件里"这回事）。 */
+    onPeerUpload?: () => void;
     onBcCompare: () => void;
     onBcAddLeft: () => void;
     /** 复制会话里的一条消息：`all` = 整条，`sel` = 只复制选中的那段。 */
@@ -197,20 +201,27 @@
 {#snippet bcSection()}
   <div class="ctx-sep"></div>
   {#if bcLeftLabel}
-    <button class="ctx-item" disabled>
+    {@const leftText = t('左：{label}', { label: bcLeftLabel }) + (bcLeftExists ? '' : t('（已被移动或删除）'))}
+    <button class="ctx-item" disabled title={compact ? leftText : undefined}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="3"/></svg>
-      {t('左：{label}', { label: bcLeftLabel })}{bcLeftExists ? '' : t('（已被移动或删除）')}
+      {#if compact}
+        <span class="ctx-elide">{leftText}</span>
+      {:else}
+        {leftText}
+      {/if}
     </button>
   {/if}
   <button class="ctx-item" disabled={!bcCompareEnabled} onclick={() => handleItem(onBcCompare)}>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><rect x="3" y="4" width="7" height="16" rx="1.5"/><rect x="14" y="4" width="7" height="16" rx="1.5"/></svg>
-    {compact || !bcCompareLabel
-      ? t('用 BeyondCompare 比较')
-      : t('用 BeyondCompare 比较 · 与左侧：{label}', { label: bcCompareLabel })}
+    {compact
+      ? t('BC 比较')
+      : bcCompareLabel
+        ? t('用 BeyondCompare 比较 · 与左侧：{label}', { label: bcCompareLabel })
+        : t('用 BeyondCompare 比较')}
   </button>
   <button class="ctx-item" onclick={() => handleItem(onBcAddLeft)}>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H4M10 6l-6 6 6 6"/></svg>
-    {t('添加到左侧比较位')}
+    {compact ? t('BC 加到左侧') : t('添加到左侧比较位')}
   </button>
 {/snippet}
 
@@ -288,6 +299,12 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
       {compact ? t('下载到本地') : peerName ? t('下载到本地 · 来自「{name}」', { name: peerName }) : t('下载到本地')}
     </button>
+    {#if onPeerUpload && isDir}
+      <button class="ctx-item" onclick={() => handleItem(onPeerUpload)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9M7 14l5-5 5 5M5 5h14"/></svg>
+        {t('上传到此文件夹…')}
+      </button>
+    {/if}
     {#if bcAvailable}{@render bcSection()}{/if}
   {:else if kind === 'share'}
     {#if !compact}
@@ -400,6 +417,16 @@
   .ctx.is-compact { min-width: 0; width: max-content; padding: 4px; }
   .ctx.is-compact .ctx-item { gap: 6px; padding: 4px 7px; font-size: var(--fs-xxs); }
   .ctx.is-compact .ctx-item svg { width: 12px; height: 12px; }
+  /* 左槽那行的文件名：卡片这一档只有 236px 窗口，菜单必须窄到能整条摆在指针左侧
+     （`placeOrbMenu` 才不会去搬窗口原点 —— 那一下正是闪烁的来源）。整行截断，全名在 title 里；
+     面板那一档不截断。 */
+  .ctx.is-compact .ctx-elide {
+    min-width: 0;
+    max-width: 40px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .ctx.is-compact .ctx-sep { margin: 4px 5px; }
 
   /* 比较位提示行 / 无可比对象的比较项：沿用 .ctx-item 排版，但不可点也不高亮。

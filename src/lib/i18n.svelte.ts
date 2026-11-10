@@ -39,6 +39,7 @@ import mobileCore from './i18n/locales/en/mobile-core.json';
 import mobileTabs from './i18n/locales/en/mobile-tabs.json';
 import mobileSheetsA from './i18n/locales/en/mobile-sheets-a.json';
 import mobileSheetsB from './i18n/locales/en/mobile-sheets-b.json';
+import mobileShares from './i18n/locales/en/mobile-shares.json';
 
 export type Locale = 'en' | 'zh-CN';
 
@@ -60,6 +61,7 @@ const CATALOGS: Record<Locale, Record<string, Translation> | null> = {
     mobileTabs,
     mobileSheetsA,
     mobileSheetsB,
+    mobileShares,
   ) as Record<string, Translation>,
   // 源语言：msgid 就是中文，不需要再抄一份。
   'zh-CN': null,

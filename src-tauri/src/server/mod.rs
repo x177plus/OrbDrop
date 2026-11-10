@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Query, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
@@ -243,6 +243,13 @@ fn build_router_with_body_idle_timeout(
             // 且看不出为什么。清单是发送方自己算出来的、有对端同意/取消两道闸，把它放开
             // 到 64MB（与长连接那条路的 tungstenite 帧上限同量级）是安全且必要的。
             axum::routing::post(routes_push::push_invite_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(MANIFEST_BODY_LIMIT)),
+        )
+        // 上传到共享项：新路由（老版本 404 → 发送方报"对端版本不支持"）。
+        // 认证比普通邀请更严：必须已配对 + token 身份与 sender.id 一致，见 handler。
+        .route(
+            "/push/upload/invite",
+            axum::routing::post(routes_push::push_upload_invite_handler)
                 .layer(axum::extract::DefaultBodyLimit::max(MANIFEST_BODY_LIMIT)),
         )
         .route(
@@ -554,11 +561,20 @@ async fn presence_middleware(
 /// ends our pause.
 async fn events_ws_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(params): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
     let token = params.get("token").cloned().unwrap_or_default();
     let manual = params.get("manual").map(|v| v == "1").unwrap_or(false);
+    // 拨号方的服务端口（`net::peer_ws_url` 带上来的）。IP 只能取这条连接的 TCP 来源，
+    // 端口只能由对端自报 —— 两者合起来才是"本机现在怎么拨它"。老版本不带，回落成
+    // 地址簿里记着的旧端口（`AppState::learn_link_endpoint`）。
+    let listen_port = params
+        .get("port")
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|p| *p != 0)
+        .unwrap_or(0);
 
     // 必须能反解出身份才放行。这里**没有**"本机一台设备都没配对就放行"的 P0 后门：
     // 那会让一个刚被解除配对的对端拿旧 token 连上、还被登记成本机的 "self" ——
@@ -585,7 +601,7 @@ async fn events_ws_handler(
     }
 
     ws.on_upgrade(move |socket| async move {
-        ws::session::run_inbound_session(state, peer_id, socket).await;
+        ws::session::run_inbound_session(state, peer_id, addr, listen_port, socket).await;
     })
     .into_response()
 }

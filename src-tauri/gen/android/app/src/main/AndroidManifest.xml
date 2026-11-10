@@ -1,6 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- 安卓端作为**共享方**（把手机上的文件/目录登记成共享项）时，需要读用户选中的
+         真实路径。分区存储下普通权限只能读媒体，非媒体文件（zip/pdf/apk…）必须走
+         「所有文件访问」这条特殊权限，或者 SAF 的 URI 授权。这里选前者：
+         权限**按需申请**，只在用户第一次点「添加共享项」时引导；共享范围始终是用户
+         自己选中的路径，不会因为授了权就自动共享任何内容。
+
+         仅 Android 11+（API 30）有这条特殊权限；更老的系统上功能入口会明确提示不支持
+         （见 `ShareStoragePlugin.kt` 与移动端文件页的「本机」段）。
+
+         `tools:ignore="ScopedStorage"`：这条权限本来就是给文件管理/共享类应用用的，
+         lint 的 ScopedStorage 提示在这里是预期行为，不是漏改。 -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
 
     <!-- mDNS 发现（F-10）在安卓上要额外两样东西（P1-13①）：
          ① `CHANGE_WIFI_MULTICAST_STATE` —— 拿 Wi-Fi 组播锁的权限。安卓的 Wi-Fi 驱动默认

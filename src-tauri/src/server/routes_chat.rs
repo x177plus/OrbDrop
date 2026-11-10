@@ -395,7 +395,7 @@ pub async fn group_sync_ask_handler(
 ) -> Result<StatusCode, (StatusCode, String)> {
     // 这一条要在验签/写日志之前挡：非法 id 本身可能是几 MB，不能进签名计算和日志。
     check_sender(&body.sender)?;
-    let paired = state.get_peer(&body.sender.id).is_some_and(|p| p.paired);
+    let paired = state.is_paired(&body.sender.id);
     if paired {
         // 已配对：token 就是身份证明（老客户端没有签名也照常放行）。
         let claimed = bearer_token(&headers).and_then(|t| peer_id_from_token(&state, &t));
@@ -472,7 +472,7 @@ pub async fn group_sync_post_handler(
     Json(body): Json<GroupSyncPostBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     check_sender(&body.sender)?;
-    let paired = state.get_peer(&body.sender.id).is_some_and(|p| p.paired);
+    let paired = state.is_paired(&body.sender.id);
     if !paired {
         crate::group::verify_sync_post(
             &state,
@@ -613,7 +613,10 @@ async fn accept_with(
     check_sender(sender)?;
     // 地址簿里这台是不是"已绑定"（已配对）。
     let existing = state.get_peer(&sender.id);
-    let paired = existing.as_ref().is_some_and(|p| p.paired);
+    // 行与凭据库任一说已配对就是已配对（见 `AppState::is_paired`）：只信行会在
+    // "行被清扫误删 / paired 标记被写丢"时把老搭档降级成未配对，并顺着 `upsert_peer`
+    // 把 `paired: false` 写回地址簿 —— "长连接还在、界面说未配对"的入口之一。
+    let paired = state.is_paired(&sender.id);
     // 冒充已配对设备：拿不出 token 就拒 —— 走得过这一关的才是身份确认过的老搭档。
     if paired {
         let claimed = bearer_token(headers).and_then(|t| peer_id_from_token(state, &t));
@@ -1289,6 +1292,67 @@ mod tests {
         let row = state.get_peer("new-peer").expect("设备行已建");
         assert_eq!((row.ip.as_str(), row.port), ("10.0.0.9", 5000));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 设备行上的 `paired` 被写丢、但凭据库里 token 还在：会话消息必须**仍按已配对认**。
+    ///
+    /// 修复前的行为是只看行标记 → 把老搭档当未配对放行（不验 token），再顺着
+    /// `upsert_peer` 把 `paired: false` 写回地址簿；界面上就是"长连接还在、显示未配对"，
+    /// 对端的已读回执反过来吃 401（真机 2026-11-09 13:47）。
+    #[tokio::test]
+    async fn a_valid_token_keeps_a_peer_paired_when_the_row_flag_was_lost() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_flag_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(AppState::new(
+            crate::config::test_config(),
+            dir.join("config.toml"),
+        ));
+        let id = format!("dev-flag-{}", uuid::Uuid::new_v4());
+        let token = "ab".repeat(32);
+        crate::credential::set_peer_credential(&id, &token, &"cd".repeat(32)).unwrap();
+        state.upsert_peer(&PeerDevice {
+            id: id.clone(),
+            name: "P".into(),
+            ip: "10.0.0.5".into(),
+            port: 4000,
+            paired: false, // 模拟"标记被写丢"
+            ..Default::default()
+        });
+
+        let addr: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let sender = PeerInfo {
+            id: id.clone(),
+            name: "P".into(),
+        };
+        let event = WsEvent::ChatRead { up_to: 1 };
+
+        // 不出示 token：既然关系还在，这一跳必须被拒（未配对才免认证）。
+        let denied = accept_with(
+            &state,
+            addr,
+            &HeaderMap::new(),
+            None,
+            &sender,
+            4000,
+            event.clone(),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.0, StatusCode::UNAUTHORIZED);
+
+        // 带正确 token：照常收下，并把行上的配对标记抬回 true。
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let ok = accept_with(&state, addr, &headers, None, &sender, 4000, event, true).await;
+        assert_eq!(ok.unwrap(), StatusCode::NO_CONTENT);
+        assert!(state.get_peer(&id).unwrap().paired, "关系被重新确认");
+
+        crate::credential::remove_peer(&id).ok();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

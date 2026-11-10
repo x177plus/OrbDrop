@@ -186,6 +186,10 @@ pub struct ChatFileMsg {
     /// 接收侧：那条推送邀请。
     #[serde(default)]
     pub invite_id: String,
+    /// 接收侧：这条是**上传到共享项**（不是普通推送）。状态文案据此说"写入共享项"，
+    /// 而不是"保存到下载目录"。
+    #[serde(default)]
+    pub upload: bool,
     /// 接收侧：`pending` / `accepted` / `received` / `rejected` / `failed` / 空。
     #[serde(default)]
     pub invite_state: String,
@@ -1289,11 +1293,12 @@ async fn deliver_http(
         .post(&url)
         .timeout(HTTP_TIMEOUT)
         .json(&body);
-    // 已配对的对端要出示那枚 token（对端据此确认"是本机那个老搭档"）；未配对的没有 token。
-    if peer.paired {
-        if let Ok(Some(token)) = crate::credential::get_peer_token(peer_id) {
-            req = req.bearer_auth(token);
-        }
+    // 有 token 就出示（对端据此确认"是本机那个老搭档"）：凭据库才是关系的权威。
+    // 这里以前还要求 `peer.paired` —— 设备行上的配对标记一旦被写丢（行被清扫误删、
+    // 旧版本 upsert 的覆盖写），明明手里有 token 也不发，对端回 401，界面就变成
+    // 「未配对 / 未送达」。token 不存在（真未配对）时行为不变。
+    if let Ok(Some(token)) = crate::credential::get_peer_token(peer_id) {
+        req = req.bearer_auth(token);
     }
     match req.send().await {
         Ok(r) if r.status().is_success() => Outcome::Delivered,
@@ -2100,6 +2105,7 @@ mod tests {
                 },
             ],
             invite_id: String::new(),
+            upload: false,
             invite_state: String::new(),
             received: 0,
             bytes: 0,

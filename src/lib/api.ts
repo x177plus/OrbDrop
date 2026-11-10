@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, PickedFile, InstalledApp, ChatFileMsg, ChatSnapshot, InboxEntry, SavedFile, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState, LocalSendStatus } from './types';
+import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, PickedFile, InstalledApp, ChatFileMsg, ChatSnapshot, InboxEntry, SavedFile, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState, LocalSendStatus, AndroidShareState, AndroidShareRoot, AndroidShareListing } from './types';
 import type { ScreenMetrics, ScreenRect } from './orbLayout';
 
 // Share management
@@ -314,6 +314,33 @@ export function pushPaths(paths: string[], peerIds: string[], at?: number, names
 }
 
 /**
+ * 把本机文件/目录**上传到对端的一个共享项目录**。
+ *
+ * 与 `pushPaths` 共用清单/进度/续传/取消；区别只有落点：接收方把它们写进
+ * `<共享项>/<path>/<清单路径>`，而不是下载目录。目标设备必须已配对；对方版本过旧时
+ * 会拿到一条明确错误（新路由 404），不会静默落到下载目录。
+ *
+ * `shareName` 只用于卡片标题，后端不拿它做任何判断。
+ */
+export function uploadToShare(
+  peerId: string,
+  shareId: string,
+  path: string,
+  shareName: string,
+  paths: string[],
+  names?: string[],
+): Promise<PushBatch> {
+  return invoke('upload_to_share', {
+    peerId,
+    shareId,
+    path,
+    shareName: shareName || null,
+    paths,
+    names: names ?? null,
+  });
+}
+
+/**
  * 发送侧那张卡的**初值**：界面挂载时拉一次。
  *
  * `push://batch` 只是"变化"，而重启之后那些**恢复出来的批次**只躺在后端（后端一启动就把
@@ -414,10 +441,16 @@ export function cancelPushBatch(batchId: string): Promise<void> {
  * 接收方点「同意接收」：起下载任务。
  *
  * `root` = 这次的落盘根目录（设置里「每次选择位置」时，界面先弹目录选择框再带上来）；
- * 不带就用设置里的下载目录。**已配对且开着「自动接收」那条免同意的路不问**，也就恒不带它。
+ * 不带就用设置里的下载目录。**已配对且长连接在线（或开着「自动接收」）那条免同意的路
+ * 不问**，也就恒不带它。
+ *
+ * 上传到共享项不走这条命令：`/push/upload/invite` 在接收侧自动收下（同名覆盖）。
  */
 export function acceptPush(inviteId: string, root?: string): Promise<void> {
-  return invoke('accept_push', { inviteId, root: root ?? null });
+  return invoke('accept_push', {
+    inviteId,
+    root: root ?? null,
+  });
 }
 
 export function rejectPush(inviteId: string): Promise<void> {
@@ -705,6 +738,29 @@ export function listInbox(): Promise<InboxEntry[]> {
 /** 删掉收件目录里的一项**文件**（后端会挡住下载目录之外的路径与目录本身）。 */
 export function deleteInboxFile(path: string): Promise<void> {
   return invoke('delete_inbox_file', { path });
+}
+
+// 安卓作为共享方（移动端专属）：按需申请「所有文件访问」，从共享存储里选真实路径。
+// 选完的路径仍交给跨端共享命令（`addShare` 等），桌面端看到的是同一套 `/shares`。
+
+/** 「所有文件访问」是否可用 / 已授予（Android 11 以下 `supported=false`）。 */
+export function androidShareState(): Promise<AndroidShareState> {
+  return invoke('android_share_state');
+}
+
+/** 打开系统的「所有文件访问」页；授权结果由界面在回前台时重读 `androidShareState`。 */
+export function requestAndroidShareAccess(): Promise<void> {
+  return invoke('android_share_request');
+}
+
+/** 共享存储的根（内部存储 / SD 卡…）。 */
+export function androidShareRoots(): Promise<AndroidShareRoot[]> {
+  return invoke('android_share_roots');
+}
+
+/** 列一层共享存储目录（原生侧会再校验路径必须落在某个存储根下）。 */
+export function androidShareList(path: string): Promise<AndroidShareListing> {
+  return invoke('android_share_list', { path });
 }
 
 /**

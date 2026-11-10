@@ -54,6 +54,9 @@ pub struct OutJob {
     pub peer_paired: bool,
     /// 相对路径 → 本机绝对路径（`/push/stream` 的白名单 + 解析表）。
     pub sources: Vec<(String, String)>,
+    /// **上传到共享项**的目标（`Some` = 这条不是普通推送）。重启后卡片要照样写对目标。
+    #[serde(default)]
+    pub dest: Option<crate::transfer::UploadDest>,
     /// **对面真的开始拉了**（收到"同意"或第一条进度）。它决定重启后这条要不要恢复成一张卡：
     /// - `true`：对面手上有 `pending`，会自己来要 → 恢复 job **+ 卡片**；
     /// - `false`：只恢复 job、**不显示卡片**（补那个"在拉但状态没上报成功"的窄窗口；
@@ -72,6 +75,9 @@ pub struct OutBatch {
     pub count: usize,
     pub skipped: usize,
     pub per_target_total: u64,
+    /// 上传到共享项的目标（`None` = 普通推送）。
+    #[serde(default)]
+    pub dest: Option<crate::transfer::UploadDest>,
     pub targets: Vec<OutTarget>,
     /// 用户这次**点的**那几项源（`push_paths` 的 `roots`，不是清单里那份解析过的绝对路径）。
     ///
@@ -283,6 +289,7 @@ mod tests {
                 ("报告/a.bin".into(), "D:/src/a.bin".into()),
                 ("报告/空.txt".into(), "D:/src/空.txt".into()),
             ],
+            dest: None,
             accepted,
             updated_at,
         }
@@ -295,6 +302,7 @@ mod tests {
             count: 2,
             skipped: 0,
             per_target_total: 4096,
+            dest: None,
             targets: vec![OutTarget {
                 peer_id: "peer-a".into(),
                 peer_name: "PC-A".into(),

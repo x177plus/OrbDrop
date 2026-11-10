@@ -14,6 +14,8 @@ use crate::state::AppState;
 use crate::ws;
 use crate::ws::events::{FileEntry, PeerInfo, WsEvent};
 
+use super::{UploadConflict, UploadDest};
+
 /// 回报发送方的间隔（进度）。
 ///
 /// 下载循环按数据块推进（每块 50ms），逐块回报等于 20 次/秒 —— 走 HTTP 那条路时是
@@ -69,6 +71,10 @@ pub struct PushJob {
     pub created_at: Instant,
     /// 对端是否已配对：它决定了下载端点怎么认人（见 `routes_push`）。
     pub peer_paired: bool,
+    /// **上传到共享项**的目标（`Some` = 这条 job 的字节要落到对端的共享项里）。
+    ///
+    /// 发送端只用它画卡片与重启恢复；数据面（`/push/stream`）不读它。
+    pub dest: Option<UploadDest>,
     /// 这条 job 是不是已经作废（取消 / 已完成 / 失败被清掉）。
     ///
     /// 下载端点**每读一帧**都要问一次"还能不能继续发"，那是整份流的每一帧；拿
@@ -88,6 +94,7 @@ impl PushJob {
         is_dir: bool,
         sources: HashMap<String, PathBuf>,
         peer_paired: bool,
+        dest: Option<UploadDest>,
     ) -> Self {
         Self {
             id,
@@ -100,6 +107,7 @@ impl PushJob {
             status: PushStatus::Invited,
             created_at: Instant::now(),
             peer_paired,
+            dest,
             cancel: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -117,11 +125,26 @@ pub struct InboundInvite {
     pub files: Vec<FileEntry>,
     /// 发送方声明支持的能力位（见 `WsEvent::PushInvite::caps`）。
     pub caps: Vec<String>,
+    /// **上传到共享项**的目标（`Some` = 这条邀请不是普通推送，而是往共享项里写）。
+    ///
+    /// 落点由接收方在 `accept_invite` 里按本机配置复核；发送方报文里的共享项名字只做显示，
+    /// 一律不信。`None` = 普通推送（下载目录 / 用户挑的 root）。
+    pub dest: Option<UploadDest>,
+    /// 上传时的同名冲突策略（只有 `dest.is_some()` 有意义）。`/push/upload/invite`
+    /// 自动收下时恒为 `Overwrite`；`Skip`/`Rename` 保留给传输引擎与单测。
+    pub conflict: UploadConflict,
+    /// 清单路径 → 落点相对路径（`rename` 策略下会改；空表 = 原样）。
+    ///
+    /// 键必须保持**清单路径**：它是 `/push/stream` 的白名单键（发送方按它查表）。
+    pub resolved: HashMap<String, String>,
+    /// 因同名被跳过的项数 / 字节数（上传的 `skip` 策略；完成回执用）。
+    pub skipped_files: usize,
+    pub skipped_bytes: u64,
     /// 这次接收的落盘**根目录**：`None` = 用设置里的下载目录（S-01）。
     ///
-    /// 只有"需要用户同意"那条路（未绑定设备，或已配对但关了「自动接收」）才可能带它 ——
-    /// 开着自动接收时"到了就收"，没有让人先挑目录的时机（见 `transfer::accept_invite`
-    /// 的 `root` 参数）。
+    /// 只有"需要用户同意"那条路（未绑定设备，或已配对但没有长连接且关了「自动接收」）才可能
+    /// 带它 —— 已配对且长连接在线（或开着自动接收）时"到了就收"，没有让人先挑目录的时机
+    /// （见 `transfer::accept_invite` 的 `root` 参数）。
     ///
     /// 它只是**根**：`<根>/<发送方名>/…` 这一层由 `resume::landing_dir` 按设置（S-12）拼、
     /// 名字照样净化；关掉那层时根就是落点（`safe_join` 逐段校验仍是围栏）。
@@ -258,6 +281,11 @@ impl InboundInvite {
                 })
                 .collect(),
             caps: self.caps.clone(),
+            dest: self.dest.clone(),
+            conflict: self.conflict,
+            resolved: self.resolved.clone(),
+            skipped_files: self.skipped_files,
+            skipped_bytes: self.skipped_bytes,
             root: self.root.as_ref().map(|p| p.to_string_lossy().into_owned()),
             callback: self.callback.clone(),
             updated_at: super::resume::now_secs(),
@@ -291,6 +319,11 @@ impl super::resume::PendingInbound {
                 })
                 .collect(),
             caps: self.caps.clone(),
+            dest: self.dest.clone(),
+            conflict: self.conflict,
+            resolved: self.resolved.clone(),
+            skipped_files: self.skipped_files,
+            skipped_bytes: self.skipped_bytes,
             root: self.root.as_ref().map(PathBuf::from),
             callback: self.callback.clone(),
             responder: None,
@@ -327,7 +360,8 @@ pub enum DownloadTarget {
 /// 「失败」；两者只在"这一批算不算全成"这件事上同类（卡片的收起规则见前端）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TargetState {
-    /// 邀请已发出、还没有任何回执（已配对且对面开着自动接收的会很快转 `Sending`）。
+    /// 邀请已发出、还没有任何回执（已配对且长连接在线，或已配对且开着「自动接收」的
+    /// 会很快转 `Sending`）。
     Invited,
     /// 对端正在拉数据。
     Sending,
@@ -388,8 +422,8 @@ pub struct BatchTarget {
     /// 这一台对应的邀请 id（= 它那条 `PushJob.id`；LocalSend 是本地任务 id）。
     pub invite_id: String,
     pub transport: crate::config::PeerTransport,
-    /// 已配对 = 身份可信；是否免同意还取决于**对方**的「已配对设备自动接收」设置，
-    /// 行文案不能只凭它断定"对方没点过任何东西"。
+    /// 已配对 = 身份可信；是否免同意取决于**对方**有没有长连接在线（在线即自动），没有长连接
+    /// 才看对方的「已配对设备自动接收」设置；行文案不能只凭它断定"对方没点过任何东西"。
     pub paired: bool,
     pub state: TargetState,
     pub received: u64,
@@ -411,6 +445,8 @@ pub struct PushBatch {
     pub skipped: usize,
     /// 每台的字节总量（各台都是同一份清单）。
     pub per_target_total: u64,
+    /// 上传到共享项的目标（`Some` = 这一批是上传，不是普通推送）。
+    pub dest: Option<UploadDest>,
     pub targets: Vec<BatchTarget>,
     /// 上次发快照的时刻：纯进度更新按 `REPORT_INTERVAL` 合并，
     /// 状态跃迁（成功/失败/取消）不受它约束（见 `batch_set`）。
@@ -434,6 +470,9 @@ pub struct BatchView {
     /// 所以有台失败时进度条照样能走到 100%（每行自己还有百分比与状态，信息不会丢）。
     pub received: u64,
     pub total: u64,
+    /// 上传目标（`None` = 普通推送）。界面据此把卡片标题写成"上传到 …"。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dest: Option<UploadDest>,
     pub targets: Vec<BatchTargetView>,
 }
 
@@ -480,6 +519,7 @@ fn snapshot(batch: &PushBatch) -> BatchView {
         failed,
         received,
         total,
+        dest: batch.dest.clone(),
         targets: batch
             .targets
             .iter()
@@ -563,7 +603,12 @@ fn invite_footprint(inv: &InboundInvite) -> usize {
         .saturating_add(inv.sender.name.len())
         .saturating_add(inv.name.len())
         .saturating_add(inv.root.as_ref().map(|p| p.to_string_lossy().len()).unwrap_or(0))
-        .saturating_add(inv.callback.as_ref().map(|(ip, _)| ip.len()).unwrap_or(0))
+        .saturating_add(
+            inv.dest
+                .as_ref()
+                .map(|d| d.share_id.len() + d.path.len() + d.share_name.len())
+                .unwrap_or(0),
+        )
         .saturating_add(inv.caps.iter().map(String::len).sum::<usize>());
     for f in &inv.files {
         bytes = bytes
@@ -1092,6 +1137,7 @@ pub fn out_job_of(job: &PushJob, accepted: bool) -> super::push_out::OutJob {
             .iter()
             .map(|(rel, abs)| (rel.clone(), abs.to_string_lossy().into_owned()))
             .collect(),
+        dest: job.dest.clone(),
         accepted,
         updated_at: super::push_out::now_secs(),
     }
@@ -1106,6 +1152,7 @@ pub fn out_batch_of(batch: &PushBatch, roots: &[std::path::PathBuf]) -> super::p
         count: batch.count,
         skipped: batch.skipped,
         per_target_total: batch.per_target_total,
+        dest: batch.dest.clone(),
         targets: batch
             .targets
             .iter()
@@ -1187,6 +1234,7 @@ pub fn restore_outbound(state: &Arc<AppState>) -> usize {
             count: rec.count,
             skipped: rec.skipped,
             per_target_total: rec.per_target_total,
+            dest: rec.dest,
             targets,
             last_emit: Instant::now(),
         };
@@ -1236,6 +1284,7 @@ pub fn restore_outbound(state: &Arc<AppState>) -> usize {
             // `Instant` 落不了盘（也没人读它）→ 重启这一刻重新起算。
             created_at: Instant::now(),
             peer_paired: rec.peer_paired,
+            dest: rec.dest.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
         };
         // 走 `insert_job`（**不碰盘**）：恢复不是"新建一次推送"，别把盘上那份的 `accepted`
@@ -1443,7 +1492,10 @@ pub fn spawn_download(state: Arc<AppState>, invite: InboundInvite, peer_id: Stri
         .insert(invite_id.clone(), control.clone());
     let gate = ReceiveGate::new(state.clone(), invite_id.clone());
 
-    if invite.supports_stream() {
+    // 上传到共享项**只走分帧数据面**：老循环把半截文件直接写在最终路径上，而共享项是
+    // 用户的真实目录，不能承受"写到一半的文件顶着真名"。上传邀请只有新版本才会发，
+    // 所以这里不按 `caps` 分叉 —— 对面声称没有 `stream1` 也不改变这个事实。
+    if invite.supports_stream() || invite.dest.is_some() {
         super::download::spawn(state, invite, peer_id, token, control, gate);
         return;
     }
@@ -1513,7 +1565,7 @@ fn spawn_download_legacy(
         // 落盘根 = `<落盘目录>/<发送方名>`（S-12 那颗开关关掉时就是落盘根本身；两条引擎共用
         // `resume::landing_dir`）。落盘目录默认是用户设的下载目录（S-01）；只有在
         // 「每次选择位置」下由用户亲自挑过的那些邀请才带自己的根（`invite.root`）——
-        // 自动接收（已配对 + 开着「已配对设备自动接收」）不会有这个根。推送接收不再单独
+        // 自动接收（已配对 + 长连接在线，或开着「已配对设备自动接收」）不会有这个根。推送接收不再单独
         // 有「收件目录」。
         //
         // 对端只往落盘根下面写 —— **没有"推送名子目录"**：清单里的相对路径就是落盘后
@@ -1941,13 +1993,26 @@ pub(super) fn discard_legacy(
 ///
 /// 邀请已经不在了的那条路（`resume_pending` 判过期）由调用方自己清 —— 见 `resume_pending`。
 fn discard_legacy_of_invite(state: &AppState, invite_id: &str) {
-    let (sender_name, root, files) = {
+    let snapshot = {
         let inbound = state.push.inbound.lock();
-        let Some(inv) = inbound.get(invite_id) else {
-            return;
-        };
-        (inv.sender.name.clone(), inv.root.clone(), inv.manifest())
+        inbound.get(invite_id).map(|inv| {
+            (
+                inv.dest.is_some(),
+                inv.sender.name.clone(),
+                inv.root.clone(),
+                inv.manifest(),
+            )
+        })
     };
+    let Some((is_upload, sender_name, root, files)) = snapshot else {
+        return;
+    };
+    // 上传走新协议（`.part` + 按文件身份的位图），不存在"按邀请 id 记的 offset +
+    // 最终路径上的半截文件"这套残留；拿下载目录去套反而可能误删同名文件。
+    if is_upload {
+        state.push.resume.clear(invite_id);
+        return;
+    }
     let sizes: Vec<(&str, u64)> = files.iter().map(|f| (f.path.as_str(), f.size)).collect();
     super::discard_legacy_receive(state, invite_id, &sender_name, root.as_deref(), &sizes);
 }
@@ -2054,6 +2119,7 @@ mod tests {
             count: 2,
             skipped: 0,
             per_target_total: 10 * 1024 * 1024,
+            dest: None,
             targets,
             last_emit: Instant::now(),
         }
@@ -2206,6 +2272,11 @@ mod reconcile_tests {
             count: 1,
             files: vec![],
             caps: Vec::new(),
+            dest: None,
+            conflict: super::UploadConflict::default(),
+            resolved: std::collections::HashMap::new(),
+            skipped_files: 0,
+            skipped_bytes: 0,
             root: None,
             callback: None,
             responder: None,
@@ -2469,6 +2540,7 @@ mod reconcile_tests {
             count: 1,
             skipped: 0,
             per_target_total: 10,
+            dest: None,
             targets: vec![
                 t("pc", "w1", TargetState::Invited),
                 t("pc", "w2", TargetState::Sending),

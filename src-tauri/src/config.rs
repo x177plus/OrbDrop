@@ -447,8 +447,9 @@ pub struct AppSettings {
     pub download_dir: PathBuf,
     /// 推送接收是否再放一层 `<发送方名>/`（设置里的「推送按发送方分目录」，默认开）。见 `Config::device_subdir`。
     pub device_subdir: bool,
-    /// 已配对设备推送是否**免确认自动收**（设置里的「已配对设备自动接收」，**默认关**）。
-    /// 见 `Config::auto_accept_paired`。
+    /// 已配对但**当前没有长连接**的设备推送是否也免确认自动收（设置里的「已配对设备自动接收」，
+    /// **默认关**）。已配对且长连接在线的设备不受它影响：长连接本身就是更高一级的信任，
+    /// 推送与共享项写入都直接放行。见 `Config::auto_accept_paired`。
     pub auto_accept_paired: bool,
     pub download_mode: DownloadMode,
     pub device_name: String,
@@ -551,6 +552,19 @@ pub fn orb_center_from_legacy(pos: OrbPos, shape: OrbShape, scale_factor: f64) -
     }
 }
 
+/// 本体中心 → 折叠态窗口左上角（[`orb_center_from_legacy`] 的逆运算）。
+///
+/// 启动判活必须走这一步：贴边收起时本体中心本来就在屏幕外（卡片大半滑出去了，
+/// 1920 屏幕上贴右的卡片中心在 1961），拿中心当窗口左上角去判"还在不在某块屏上"
+/// 会把合法贴边误判成显示器没了，于是每次重启都退回屏幕中央。
+pub fn orb_window_origin(center: OrbPos, shape: OrbShape, scale_factor: f64) -> OrbPos {
+    let (ix, iy) = collapsed_center_inset(shape);
+    OrbPos {
+        x: center.x - (ix * scale_factor).round() as i32,
+        y: center.y - (iy * scale_factor).round() as i32,
+    }
+}
+
 /// 上一次**成功**用过的更新镜像（主机名 + 时刻，epoch 毫秒）。
 ///
 /// 只服务一件事：下次检查/下载先试这一条。国内直连 github.com 实测 connect 21 秒才失败，
@@ -576,9 +590,9 @@ pub struct Config {
     /// —— 没有"推送名子目录"那一层。不再单设「收件目录」——两个预设位置对用户是同一种操作。
     ///
     /// **例外**：`download_mode = AskEachTime` 时，接收**需要用户同意**的推送（未绑定设备，
-    /// 或已配对但关了「自动接收」）会先让用户挑一个目录，挑的那个只是这次接收的**根**
-    /// （`InboundInvite::root`；S-12 开着时 `<根>/<发送方名>/…` 那层照旧）—— 已配对且开着
-    /// 自动接收的推送免同意直接收，永远用这里。
+    /// 或已配对但没有长连接且关了「自动接收」）会先让用户挑一个目录，挑的那个只是这次接收的
+    /// **根**（`InboundInvite::root`；S-12 开着时 `<根>/<发送方名>/…` 那层照旧）—— 已配对且
+    /// 长连接在线（或开着自动接收）的推送免同意直接收，永远用这里。
     #[serde(default = "default_download_dir")]
     pub download_dir: PathBuf,
     /// 推送接收时是否**再放一层 `<发送方名>/`**（S-12，默认**开**）。
@@ -594,18 +608,21 @@ pub struct Config {
     /// 「每次选择位置」下挑的根就等于直接授权对方往那一层写文件名。
     #[serde(default = "default_device_subdir")]
     pub device_subdir: bool,
-    /// 已配对设备推送是否**免确认自动收**（设置里的「已配对设备自动接收」，**默认关**）。
+    /// 已配对但**当前没有长连接**的设备推送是否也免确认自动收（设置里的「已配对设备自动接收」，
+    /// **默认关**）。
     ///
-    /// 开：已配对设备的推送不问用户，直接落到下载目录；`download_mode` 对这条不生效
+    /// 信任等级：已配对 + 长连接在线 → 直接落盘（与共享项写入同一级）；已配对但没连 → 看这颗
+    /// 开关；未配对 → 永远同意。
+    /// 开：这类推送不问用户，直接落到下载目录；`download_mode` 对这条不生效
     /// （自动收的时候没有人可以回答"存哪儿"）。
-    /// 关：已配对设备与未绑定设备走同一条同意路 —— 通知卡上点「接收」；`download_mode =
+    /// 关：它们与未绑定设备走同一条同意路 —— 通知卡上点「接收」；`download_mode =
     /// AskEachTime` 时再选这次的落盘根。认证口径不变：已配对设备仍必须带有效 token，
     /// 凭据失效照样 401。
     #[serde(default)]
     pub auto_accept_paired: bool,
     /// 下载模式（S-02）：手动下载弹出保存框；`AskEachTime` 时，接收**需要同意的**推送
-    /// （未绑定设备，或已配对但关了「自动接收」）也会先弹一次目录选择框，取消即拒绝这次
-    /// 接收。已配对且开着自动接收的推送不问，与它无关。
+    /// （未绑定设备，或已配对但没有长连接且关了「自动接收」）也会先弹一次目录选择框，
+    /// 取消即拒绝这次接收。已配对且长连接在线的推送不问，与它无关。
     #[serde(default)]
     pub download_mode: DownloadMode,
     /// `config.toml` 的格式版本；见 [`CONFIG_SCHEMA_VERSION`]。
@@ -2319,7 +2336,7 @@ mod tests {
         assert_eq!(missing.download_mode, expected);
         assert!(
             !missing.auto_accept_paired,
-            "已配对设备默认不自动接收：仍要用户点一次"
+            "没有长连接时默认不自动接收：仍要用户点一次"
         );
     }
 
@@ -2529,6 +2546,23 @@ mod tests {
         let text = toml::to_string_pretty(&migrated).unwrap();
         assert!(text.contains("orbCenter"), "{text}");
         assert!(!text.contains("orbPos"), "{text}");
+    }
+
+    /// `orb_window_origin` 必须正好是 `orb_center_from_legacy` 的逆运算：启动判活拿它
+    /// 把落盘的中心换算成窗口左上角，换算错了就会把合法贴边判成"显示器没了"。
+    #[test]
+    fn orb_window_origin_inverts_the_body_center() {
+        let origin = OrbPos { x: 1859, y: 331 };
+        for shape in [OrbShape::Rect, OrbShape::Circle] {
+            for sf in [1.0, 1.25, 1.5] {
+                let center = orb_center_from_legacy(origin, shape, sf);
+                assert_eq!(
+                    orb_window_origin(center, shape, sf),
+                    origin,
+                    "{shape:?} @ {sf}×"
+                );
+            }
+        }
     }
 
     /// 选择框「常用」默认是空的：老配置（没有这一节）解析出来就是空表，界面不会凭空冒出

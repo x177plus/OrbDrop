@@ -146,7 +146,7 @@ pub async fn relay_open(
             // - **已配对设备**：不能拿它改地址/名字/在线状态 —— 否则攻击者只要先占住
             //   一个空地址，下一次探活就会把该设备的 token 发到它那里；
             // - 未配对设备：没有 token 可泄露，仍按原来的"只补空行"处理。
-            let paired = state.get_peer(claim.id.trim()).is_some_and(|p| p.paired);
+            let paired = state.is_paired(claim.id.trim());
             if !paired {
                 state.observe_verified_addr(claim.id.trim(), &addr.ip().to_string(), claim.port);
                 // 同一问还证明了两件事，一并收下：
@@ -321,7 +321,7 @@ pub async fn relay_route(
                 // 这一问只能证明"这个地址上有个会回这个 id 的东西"，而 `/pair/info` 本身
                 // 是公开的自报端点。**已配对设备**的地址/名字/在线状态不能由它改写 ——
                 // 否则任何 LAN 主机都能把一台已配对设备改名并写进地址簿，或把它标成在线。
-                let paired = state.get_peer(claim.id.trim()).is_some_and(|p| p.paired);
+                let paired = state.is_paired(claim.id.trim());
                 if !paired {
                     state.observe_verified_addr(
                         claim.id.trim(),

@@ -14,6 +14,9 @@
   import EditRecipientsSheet from "./sheets/EditRecipientsSheet.svelte";
   import KeepAliveSheet from "./sheets/KeepAliveSheet.svelte";
   import UpdateSheet from "./sheets/UpdateSheet.svelte";
+  import SharePathSheet from "./sheets/SharePathSheet.svelte";
+  import ShareActionsSheet from "./sheets/ShareActionsSheet.svelte";
+  import RenameShareSheet from "./sheets/RenameShareSheet.svelte";
   import ConfirmSheet from "./sheets/ConfirmSheet.svelte";
 
   // 底板宿主：把 store 里那个槽位翻成具体的 sheet。
@@ -49,6 +52,12 @@
   <KeepAliveSheet {onClose} />
 {:else if sheet.kind === "update"}
   <UpdateSheet {onClose} />
+{:else if sheet.kind === "sharePath"}
+  <SharePathSheet {onClose} />
+{:else if sheet.kind === "shareActions"}
+  <ShareActionsSheet shareId={sheet.shareId} {onClose} />
+{:else if sheet.kind === "renameShare"}
+  <RenameShareSheet shareId={sheet.shareId} {onClose} />
 {:else if sheet.kind === "confirm"}
   <ConfirmSheet prompt={sheet.prompt} {onClose} />
 {/if}

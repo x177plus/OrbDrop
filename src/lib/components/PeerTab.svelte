@@ -203,6 +203,12 @@
           class:dl-active={dlActive}
           class:dl-paused={dlPaused}
           style="--dl-pct: {dlPct / 100}"
+          data-od-peer-id={device.id}
+          data-od-share-id={share.id}
+          data-od-share-name={share.name}
+          data-od-path=""
+          data-od-name={share.name}
+          data-od-isdir={share.isDir ? 'true' : 'false'}
           title={dlPaused
             ? t('已暂停 · 双击继续「{name}」', { name: share.name })
             : dl?.status === 'running' ? t('双击暂停「{name}」', { name: share.name }) : undefined}
@@ -232,7 +238,7 @@
                 <div class="node"><span class="n-name" style="color:var(--muted)">{t('空目录')}</span></div>
               {:else if ts.expanded}
                 {#each ts.entries as entry (entry.name)}
-                  <TreeNode shareId={share.id} {entry} level={1} peerId={device.id} {refreshSignal} />
+                  <TreeNode shareId={share.id} {entry} level={1} peerId={device.id} {refreshSignal} shareName={share.name} />
                 {/each}
               {/if}
             </div>

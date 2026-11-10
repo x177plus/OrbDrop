@@ -335,7 +335,7 @@ struct PeerDevice {
 struct Settings {
     port: u16,                           // S-06 默认 3890
     download_dir: PathBuf,               // S-01 默认桌面（默认落盘位置：下载 + 推送接收；「每次选择位置」时需要同意的推送可逐次挑根）
-    auto_accept_paired: bool,            // S-02a 默认 false：已配对设备也要同意；开 = 免同意直接落下载目录
+    auto_accept_paired: bool,            // S-02a 默认 false：只管已配对但没有长连接的设备；已配对且长连接在线 = 始终免同意，开 = 没有长连接的也免同意
     download_mode: DownloadMode,         // S-02 桌面默认 AskEachTime（Android 默认 Direct：content:// 不是文件系统路径）；Direct = 手动下载/同意后的推送直接落下载目录；AskEachTime = 弹保存框/目录框（取消即不落盘/拒绝）
     auto_start: bool,                    // S-04 默认 true
     device_name: String,                 // S-05 默认主机名；安卓没有主机名 → 取设备型号/厂商名

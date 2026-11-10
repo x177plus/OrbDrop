@@ -188,8 +188,8 @@ pub struct UpdateSettingsRequest {
     pub download_dir: String,
     /// 与前端 `AppSettings.downloadMode` 同一套字面量（`Direct` / `AskEachTime`）。
     pub download_mode: DownloadMode,
-    /// 已配对设备推送是否免确认自动收（设置里的「已配对设备自动接收」，**默认关**）。
-    /// `None` = 老界面没带这一项，保持原值 —— 不能在保存别的设置时把它悄悄关掉。
+    /// 已配对但**当前没有长连接**的设备推送是否也免确认自动收（设置里的「已配对设备自动接收」，
+    /// **默认关**）。`None` = 老界面没带这一项，保持原值 —— 不能在保存别的设置时把它悄悄关掉。
     #[serde(default)]
     pub auto_accept_paired: Option<bool>,
     pub device_name: String,
@@ -856,12 +856,19 @@ fn merged_device_rows(state: &AppState) -> Vec<serde_json::Value> {
         .iter()
         .map(|p| {
             let connected = state.ws.has_connection(&p.id);
+            // 关系以**凭据库**为准（与 `AppState::is_paired` 同一条规则）：行上的 `paired`
+            // 可能被清扫/旧版本覆盖写弄丢，但 token 还在 —— 那时界面仍应显示「已配对」，
+            // 而不是把一台长连接还活着的设备画成「未配对」。凭据读失败时退回行上的标记。
+            let paired = match &credentials {
+                Ok(map) => p.paired || map.contains_key(&p.id),
+                Err(_) => p.paired,
+            };
             let verified = connected
                 || match &credentials {
                     Ok(map) => {
-                        p.paired && map.get(&p.id).is_some_and(|c| !c.fingerprint.is_empty())
+                        paired && map.get(&p.id).is_some_and(|c| !c.fingerprint.is_empty())
                     }
-                    Err(_) => p.paired,
+                    Err(_) => paired,
                 };
             serde_json::json!({
                 "id": p.id,
@@ -869,7 +876,7 @@ fn merged_device_rows(state: &AppState) -> Vec<serde_json::Value> {
                 "ip": p.ip,
                 "port": p.port,
                 "online": p.online,
-                "paired": p.paired,
+                "paired": paired,
                 // 协议面：LocalSend 行由下面的独立表合并进来；OrbDrop 行显式标出来，
                 // 旧前端不读这个字段时按默认 `orbdrop` 处理。
                 "transport": "orbdrop",
@@ -1787,6 +1794,34 @@ async fn push_paths(
     transfer::push_paths(state.inner().clone(), paths, peer_ids, names, at).await
 }
 
+/// 把本机文件/目录**上传到对端的一个共享项目录**。
+///
+/// 与 `push_paths` 共用清单/批次/续传/取消，区别只有一个：接收方把文件落到
+/// `<共享项>/<path>/<清单路径>`，而不是下载目录。目标设备必须已配对（上传面只认已配对设备），
+/// 共享项必须仍开着广播；两端都必须是支持 `/push/upload/invite` 的版本，否则发送方会拿到
+/// 一条"对端版本过旧"的原话。
+///
+/// `path` 是共享项内相对目录（`""` = 根），由后端先做一次词法校验（逐段、不许 `..`），
+/// 真正的落地边界在接收方那一侧再核（它只认自己配置里的共享项）。
+#[tauri::command]
+async fn upload_to_share(
+    peer_id: String,
+    share_id: String,
+    path: String,
+    share_name: Option<String>,
+    paths: Vec<String>,
+    names: Option<Vec<String>>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<transfer::push_job::BatchView, String> {
+    ensure_online(&state)?;
+    let dest = transfer::UploadDest {
+        share_id,
+        path,
+        share_name: share_name.unwrap_or_default(),
+    };
+    transfer::upload_to_share(state.inner().clone(), peer_id, dest, paths, names).await
+}
+
 /// 把剪贴板里的图片字节落成一个**暂存文件**，返回它的绝对路径（见 `paste`）。
 ///
 /// 字节走 **base64 字符串**而不是 `Vec<u8>`：`invoke` 的载荷是 JSON，`Vec<u8>` 得摊成一串
@@ -1821,8 +1856,8 @@ async fn cancel_push_batch(
 /// 兜底（退到 Tauri 的全局运行时），但异步命令才是这里最自然的上下文。
 ///
 /// `root` = 这次接收的落盘根目录：界面在「每次选择位置」（`DownloadMode::AskEachTime`）下问过
-/// 用户就带上，否则 `None`（用设置里的下载目录）。已配对且开着「自动接收」那条路不问、
-/// 也就恒为 `None`。
+/// 用户就带上，否则 `None`（用设置里的下载目录）。已配对且长连接在线（或开着「自动接收」）
+/// 那条路不问、也就恒为 `None`。
 #[tauri::command]
 async fn accept_push(
     invite_id: String,
@@ -1836,7 +1871,8 @@ async fn accept_push(
             .sessions
             .accept_pending(state.inner(), &invite_id, root);
     }
-    transfer::accept_invite(state.inner().clone(), &invite_id, root)
+    // 上传到共享项不再走这条命令：`/push/upload/invite` 在接收侧自动收下（同名覆盖）。
+    transfer::accept_invite(state.inner().clone(), &invite_id, root, None)
 }
 
 #[tauri::command]
@@ -3301,23 +3337,27 @@ fn place_orb_on_startup(app: &AppHandle) {
         warn!("按形态设置折叠态窗口尺寸失败: {e}");
     }
     let (x, y) = match saved {
-        // 上次那块显示器没了 / 分辨率变小：留在居中，否则球落到屏幕外、用户拖不回来
-        // （透明无边框窗口没有标题栏）
-        Some(pos) if !orb_window::visible_on_some_monitor(&win, pos.x, pos.y) => {
-            warn!(
-                x = pos.x,
-                y = pos.y,
-                "上次的悬浮球位置已不在任何显示器上，保持居中"
-            );
-            return;
-        }
         Some(center) => {
             let sf = win.scale_factor().unwrap_or(1.0);
-            let (ix, iy) = config::collapsed_center_inset(shape);
-            (
-                center.x - (ix * sf).round() as i32,
-                center.y - (iy * sf).round() as i32,
-            )
+            let origin = config::orb_window_origin(center, shape, sf);
+            // 判活按**窗口左上角**，不能按记下的本体中心：贴边收起时本体大半在屏幕外
+            // （1920 屏、贴右的卡片中心在 1961），拿中心当窗口左上角会把合法贴边误判成
+            // "上次那块显示器没了"，于是每次重启都退回屏幕中央。
+            //
+            // 贴边记录的窗口左上角换算出来会比真实窗口更靠屏外（本体偏移与未贴边不同），
+            // 但**看得见的那一条**分毫不差：卡片右贴时它正好露出左端 `RECT_DOCK_W` 那一条，
+            // 界面起来后的那次吸附会把窗口搬到贴边位、位置不变。
+            if !orb_window::visible_on_some_monitor(&win, origin.x, origin.y) {
+                // 上次那块显示器没了 / 分辨率变小：留在居中，否则球落到屏幕外、用户拖不回来
+                // （透明无边框窗口没有标题栏）
+                warn!(
+                    x = center.x,
+                    y = center.y,
+                    "上次的悬浮球位置已不在任何显示器上，保持居中"
+                );
+                return;
+            }
+            (origin.x, origin.y)
         }
         None => match orb_window::default_pos(&win, width) {
             Ok(p) => p,
@@ -3863,6 +3903,11 @@ pub fn run() {
     #[cfg(mobile)]
     let builder = builder.plugin(mobile::pick_plugin());
 
+    // 安卓作为共享方：按需申请「所有文件访问」，并从真实路径里选共享项（见 `mobile::share_storage_plugin`）。
+    // 权限只是能力；真正共享哪些路径由用户在移动端「本机」段里自己选，后端共享链路一个字不改。
+    #[cfg(mobile)]
+    let builder = builder.plugin(mobile::share_storage_plugin());
+
     // 「发送应用」（F-119）：会话里那颗「＋」的第三项要列设备上已安装的应用（各自的 base.apk）。
     // 列表由原生查（包可见性靠清单里的 `<queries>`），名字（`应用名_版本号(版本名)_包名.apk`）
     // 与净化在 Rust 这一侧拼 —— 与接收侧落盘那道闸门同一份判据。见 `mobile::list_installed_apps`。
@@ -3978,6 +4023,7 @@ pub fn run() {
             #[cfg(desktop)]
             set_picker_favorites,
             push_paths,
+            upload_to_share,
             push_batches,
             save_pasted_image,
             read_image_data_url,
@@ -4025,6 +4071,17 @@ pub fn run() {
             list_installed_apps,
             #[cfg(mobile)]
             app_icon,
+            // 安卓作为共享方：所有文件访问的状态 / 授权页 / 共享存储根 / 目录列表。
+            // 选完的路径直接交给上面那组跨端共享命令（`add_share` / `list_shares` / `toggle_broadcast`），
+            // 桌面端看到的仍是同一套 `/shares`、`/tree`、`/file`、`/dav`。
+            #[cfg(mobile)]
+            mobile::android_share_state,
+            #[cfg(mobile)]
+            mobile::android_share_request,
+            #[cfg(mobile)]
+            mobile::android_share_roots,
+            #[cfg(mobile)]
+            mobile::android_share_list,
             // 「让应用在后台活着」所需的系统那一层（F-87）：读回电池优化白名单在不在、把用户送到
             // ROM 的自启动页与「后台耗电管理」页；外加通知这一层的自查与跳转（F-108 的横幅那一半）。
             // 全是"读状态 + 跳系统页"，没有业务逻辑 —— 只有安卓有实体，见 `system_settings`。

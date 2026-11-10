@@ -104,15 +104,18 @@ export interface AppSettings {
    */
   deviceSubdir: boolean;
   /**
-   * 已配对设备推送是否免确认自动收（设置里的「已配对设备自动接收」，**默认关**）。
+   * 已配对但**当前没有长连接**的设备推送是否也免确认自动收（设置里的
+   * 「已配对设备自动接收」，**默认关**）。
    *
-   * 开：已配对设备的推送不问用户，直接落下载目录；`downloadMode` 对这条不生效。
-   * 关：已配对设备与未绑定设备走同一条同意路 —— 点「接收」后按 `downloadMode` 决定位置。
+   * 信任等级：已配对 + 长连接在线 → 直接落盘（与共享项写入同一级）；已配对但没连 → 看这颗
+   * 开关；未配对 → 永远同意。
+   * 开：这类推送不问用户，直接落下载目录；`downloadMode` 对这条不生效。
+   * 关：它们与未绑定设备走同一条同意路 —— 点「接收」后按 `downloadMode` 决定位置。
    * 认证口径不变：已配对设备仍必须带有效 token。
    */
   autoAcceptPaired: boolean;
-  /** `AskEachTime` = 下载前弹保存框；接收需要同意的推送（未配对，或已配对但关了自动接收）
-   *  前也弹一次目录框（取消即拒绝）。自动接收开启时，已配对设备的推送不问，与它无关。
+  /** `AskEachTime` = 下载前弹保存框；接收需要同意的推送（未配对，或已配对但没有长连接且关了
+   *  自动接收）前也弹一次目录框（取消即拒绝）。已配对且长连接在线的推送不问，与它无关。
    *  桌面默认 `AskEachTime`；Android 默认 `Direct`（系统选择器返回 `content://`，落盘层只收路径）。 */
   downloadMode: 'Direct' | 'AskEachTime';
   deviceName: string;
@@ -323,6 +326,38 @@ export interface SavedFile {
   place: string;
 }
 
+// ── 移动端：把自己手机上的文件登记成共享项（所有文件访问 + 真实路径选择器）──────
+
+/** Android 11+ 的「所有文件访问」状态；`supported=false` 时界面明确提示不支持。 */
+export interface AndroidShareState {
+  supported: boolean;
+  granted: boolean;
+  sdk: number;
+}
+
+/** 共享存储的一个根（内部存储 / SD 卡）。 */
+export interface AndroidShareRoot {
+  name: string;
+  path: string;
+}
+
+/** 路径选择器里的一行。目录的 `size` 恒为 0；`modified` 是 epoch 毫秒。 */
+export interface AndroidShareEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number;
+  modified: number;
+}
+
+/** 一层目录；`parent` 为空表示已经在某个存储根上。 */
+export interface AndroidShareListing {
+  entries: AndroidShareEntry[];
+  parent: string | null;
+  /** 这一层超过原生侧上限（500 项），界面要提示还有更多。 */
+  truncated: boolean;
+}
+
 // ── 移动端：系统那一层（F-87 / F-108 的横幅那半）──────────────────────────────
 
 /** 后台保活状态：**唯一能读到的系统状态**（电池优化白名单，Google 官方 API）。 */
@@ -470,6 +505,18 @@ export interface DragTicket {
   ready: boolean;
 }
 
+/**
+ * 一次上传的目标（后端 `UploadDest`）：共享项 id + 共享项内相对目录。
+ *
+ * `shareName` 只给上传方那张卡片用；接收方一律以本机配置里的名字为准。
+ */
+export interface UploadDest {
+  shareId: string;
+  /** `/` 分隔，`''` = 共享项根。 */
+  path: string;
+  shareName?: string;
+}
+
 export interface PushInvite {
   inviteId: string;
   sender: { id: string; name: string };
@@ -478,9 +525,15 @@ export interface PushInvite {
   isDir: boolean;
   /** 发送方这次选了几项（>1 = 多选合并成的一条推送）。 */
   count: number;
+  /** `true` = 这不是普通推送，而是**上传到本机共享项**（见 `dest`）。 */
+  upload?: boolean;
+  /** 上传目标（只有 `upload` 时有）。`shareName` 由接收方后端按本机配置填。 */
+  dest?: UploadDest;
   /**
-   * 后端已经**自动收下**了这条推送（对端已配对，且本机开着「已配对设备自动接收」）。
-   * 界面据此直接显示"正在接收"，不放「接收/拒绝」；未配对或关了自动接收时为 false。
+   * 后端已经**自动收下**了这条推送。三种来源：普通推送 = 对端已配对且长连接在线
+   * （在线即最高信任级），或对端已配对但没有长连接、本机开着「已配对设备自动接收」；
+   * 上传到共享项 = 对端已配对 + 长连接在线 + 共享项开播（写权限与 `/dav` 同一口径，
+   * 同名覆盖）。界面据此直接显示"正在接收"，不放「接收/拒绝」。
    */
   auto?: boolean;
   /**
@@ -507,7 +560,8 @@ export interface PushTarget {
   /** 设备名。 */
   target: string;
   inviteId: string;
-  /** 已配对 = 身份可信；是否免同意取决于**对方**的「已配对设备自动接收」设置。 */
+  /** 已配对 = 身份可信；自动收取决于**对方**有没有长连接在线（在线即自动），
+   *  没有长连接才看对面的「已配对设备自动接收」设置。 */
   paired: boolean;
   state: PushTargetState;
   received: number;
@@ -535,6 +589,8 @@ export interface PushBatch {
   /** 聚合进度：分母只算还活着的台（失败/取消的整条不计），所以有台失败也能走到 100%。 */
   received: number;
   total: number;
+  /** 上传到共享项的目标（`undefined` = 普通推送）。 */
+  dest?: UploadDest;
   targets: PushTarget[];
 }
 
@@ -656,6 +712,11 @@ export interface ChatFileMsg {
   perTargets: { peerId: string; inviteId: string; state: PushTargetState }[];
   /** 接收侧：那条推送邀请。 */
   inviteId: string;
+  /**
+   * 接收侧：这条是**上传到共享项**（不是普通推送）。状态文案据此说"写入共享项"，
+   * 而不是"保存到下载目录"。
+   */
+  upload: boolean;
   /**
    * 接收侧走到哪一步了：`pending` = 等用户点头；`accepted` = 接收中（含"断了、正在自己重试"）；
    * `received` / `rejected` / `failed` / `cancelled` = 终态（`cancelled` = 有人点了取消：本机

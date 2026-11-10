@@ -51,13 +51,16 @@ pub struct InviteBody {
     /// 老对端不带 → 0 → 接收侧退回"收到的那一刻"。
     #[serde(default)]
     at: u64,
+    /// **上传到共享项**的目标（只有 `/push/upload/invite` 带；普通推送没有）。
+    #[serde(default)]
+    dest: Option<crate::transfer::UploadDest>,
 }
 
 fn one_item() -> usize {
     1
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct InviteResponse {
     accepted: bool,
     /// **邀请已送达、本机等用户点头**（对端带 `await1` 时才有这一档，见
@@ -82,8 +85,9 @@ pub struct InviteResponse {
 ///   一句"送到了"（`pending`），用户点完的结果从回执通道过去。**没有超时**；
 /// - 老对端 → 这条请求一直挂着等用户决定，到点自动作废，响应就是回执。
 ///
-/// **已绑定**（已配对）设备默认也要用户同意；只有设置里开了「已配对设备自动接收」才当场
-/// 开收并立刻回 `accepted: true`（两条路一样）。
+/// 信任等级：**已绑定 + 长连接在线** → 当场开收并立刻回 `accepted: true`（与共享项写入
+/// 同一级）；**已绑定但没有长连接** → 看「已配对设备自动接收」开关；**未绑定** → 永远挂卡
+/// 等用户同意。
 pub async fn push_invite_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -91,10 +95,11 @@ pub async fn push_invite_handler(
     Json(body): Json<InviteBody>,
 ) -> Result<Json<InviteResponse>, (StatusCode, String)> {
     // 本机地址簿里这台是不是"已绑定"（已配对）。
-    let paired = state.get_peer(&body.sender.id).is_some_and(|p| p.paired);
-    // 已配对只是"身份可信"，要不要免确认自动收由设置决定（默认关）。
+    let paired = state.is_paired(&body.sender.id);
+    // 信任等级：已配对 + 长连接在线 = 直接收（与共享项写入同一级）；已配对但当前没连 =
+    // 看「已配对设备自动接收」开关；未配对 = 永远同意。
     let auto_accept_paired = state.config.lock().auto_accept_paired;
-    let auto = paired && auto_accept_paired;
+    let auto = paired && (state.ws.has_connection(&body.sender.id) || auto_accept_paired);
     // 冒充已配对设备：拿不出 token 就拒 —— 走得过这一关的 paired = 身份确认过的老搭档。
     if paired {
         let claimed = bearer_token(&headers).and_then(|t| peer_id_from_token(&state, &t));
@@ -145,6 +150,12 @@ pub async fn push_invite_handler(
         count: body.count,
         files: body.files,
         caps: body.caps,
+        // 上传目标只在 `/push/upload/invite` 那条路出现；普通推送恒为 None。
+        dest: None,
+        conflict: crate::transfer::UploadConflict::default(),
+        resolved: std::collections::HashMap::new(),
+        skipped_files: 0,
+        skipped_bytes: 0,
         // 落盘根由用户在界面上定（「每次选择位置」时那颗目录选择框）—— 邀请到达时还不知道，
         // 所以这里恒为 `None`，真要挑就等 `accept_invite` 带的那个 root。
         root: None,
@@ -164,12 +175,12 @@ pub async fn push_invite_handler(
         return Err((StatusCode::PAYLOAD_TOO_LARGE, reason));
     }
 
-    // 开了「已配对设备自动接收」才免同意：直接开收，并用这次同步响应告诉发送方
-    // "收下了"。未绑定、以及已配对但关了自动接收的，仍然走同意制（挂一张卡片等用户点）
-    // —— 那是"不配对也能推"的安全兜底，也把"已配对 ≠ 一定自动落盘"还给了用户。
+    // `auto` = 已配对 + 长连接在线（最高信任级），或已配对 + 开关开：直接开收，并用这次
+    // 同步响应告诉发送方"收下了"。其余（未绑定，或已配对但没连且开关关）仍然走同意制
+    // （挂一张卡片等用户点）—— 那是"不配对也能推"的安全兜底。
     if auto {
         state.push.insert_invite(invite);
-        if let Err(reason) = accept_invite(state.clone(), &invite_id, None) {
+        if let Err(reason) = accept_invite(state.clone(), &invite_id, None, None) {
             warn!(%invite_id, %reason, "auto-accept failed");
             // 本机那条"正在接收"的通知得收尾（`reject_invite_with` 会把它变成一条
             // 失败通知），再把原因作为这次同步响应回给发送方。
@@ -212,6 +223,148 @@ pub async fn push_invite_handler(
         };
     Ok(Json(InviteResponse {
         accepted,
+        pending: false,
+        reason: None,
+    }))
+}
+
+/// POST /push/upload/invite —— 对端请求把文件/目录写进本机某个共享项。
+///
+/// 与 `/push/invite` 的区别：
+/// - **必须已配对且长连接在线**：token 反解出的设备 id 必须等于报文里自称的 `sender.id`；
+///   共享项本来就只对长连接设备可见（与 `Caller::sees_share` 同一口径），所以上传也只在
+///   `ws.has_connection(caller)` 时受理 —— 断链后一律 409，不靠“先挂卡再等用户”绕过去；
+/// - **目标共享项必须存在且开着广播**（否则 409）；
+/// - **不需要接收方同意**：写权限由「配对 + 长连接 + 共享项开播」这组既有条件授予，与
+///   `/dav` 的 `PUT`/`DELETE` 同一口径。同名文件一律**原子替换**（资源管理器里的覆盖），
+///   不再挂同意卡、也不再有跳过/改名那一档；
+/// - 落点由共享项决定（`dest { shareId, path }`），不是下载目录。
+pub async fn push_upload_invite_handler(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<InviteBody>,
+) -> Result<Json<InviteResponse>, (StatusCode, String)> {
+    let invite_id = body.invite_id.clone();
+    let Some(dest) = body.dest.clone() else {
+        return Err((StatusCode::BAD_REQUEST, "缺少上传目标".into()));
+    };
+    // 身份只认 token：报文里的 `sender.id` 只是字符串，不能拿它当"这台设备是谁"。
+    let caller = bearer_token(&headers)
+        .and_then(|t| peer_id_from_token(&state, &t))
+        .ok_or((StatusCode::UNAUTHORIZED, "需要已配对设备的 token".to_string()))?;
+    if caller != body.sender.id || !state.is_paired(&caller) {
+        info!(sender = %body.sender.id, caller = %caller, "上传邀请被拒：身份不符");
+        return Err((StatusCode::UNAUTHORIZED, "身份校验失败".into()));
+    }
+    // 共享项只对长连接设备可见（`auth::Caller::sees_share` 同一口径）：没有长连接就等于
+    // 看不到这个共享项，上传也不该被受理。消息不分“共享项不存在”与“没连上”，避免把
+    // 本机有哪些共享项泄露给一个只是拿着 token 的 HTTP 请求。
+    if !state.ws.has_connection(&caller) {
+        info!(sender = %caller, "上传邀请被拒：对端当前没有长连接（共享项不可见）");
+        return Err((
+            StatusCode::CONFLICT,
+            "共享项不可用（对端当前未建立长连接）".to_string(),
+        ));
+    }
+    // 邀请到达时先确认共享项还在、广播还开着、目标路径合法；真正建目录在下面自动接收时。
+    // **不用 404**：404 留给"对面根本没有这条路由"（老版本），否则发送方分不清
+    // "共享项没了"与"对方版本太旧"。错误详情只记本机日志 —— 它可能带着共享方的真实
+    // 磁盘路径，不该回给对端。
+    let share_name = crate::transfer::validate_upload_dest(&state, &dest).map_err(|reason| {
+        warn!(%invite_id, %reason, "上传邀请被拒：目标共享项不可用");
+        (
+            StatusCode::CONFLICT,
+            "共享项不可用（可能已移除、关闭广播或目录不可写）".to_string(),
+        )
+    })?;
+    state.note_heard_online(&caller);
+
+    let display_name = body.sender.name.clone();
+    let at = body.at;
+    let invite = InboundInvite {
+        invite_id: invite_id.clone(),
+        sender: PeerInfo {
+            id: caller.clone(),
+            name: display_name.clone(),
+        },
+        name: body.name.clone(),
+        size: body.size,
+        // 上传永远按清单走（单文件也合成一条），后面两条引擎都不必再分叉。
+        is_dir: true,
+        count: body.count,
+        files: if body.files.is_empty() {
+            vec![FileEntry {
+                path: body.name.clone(),
+                size: body.size,
+                mtime: 0,
+            }]
+        } else {
+            body.files
+        },
+        caps: body.caps,
+        dest: Some(dest.clone()),
+        // 与资源管理器一致：同名文件覆盖。写权限已经没有“点接收”这一道人工闸门，
+        // 冲突策略也就不该再由接收方在卡片上临时选 —— 落点只有一条确定的规则。
+        conflict: crate::transfer::UploadConflict::Overwrite,
+        resolved: std::collections::HashMap::new(),
+        skipped_files: 0,
+        skipped_bytes: 0,
+        root: None,
+        // 与普通邀请同一套：ip 取 TCP 来源，端口用发送方自报的服务端口。
+        callback: net::observed_dial_target(addr.ip(), body.port, state.listening_port()),
+        responder: None,
+    };
+    if let Err(reason) = crate::transfer::push_job::validate_invite(&invite) {
+        warn!(%invite_id, %reason, "上传邀请被拒：清单超出上限");
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, reason));
+    }
+    if invite.files.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "上传清单为空".into()));
+    }
+    info!(
+        %invite_id, sender = %display_name, share = %share_name,
+        path = %dest.path, "inbound upload invite (auto-accept, http)"
+    );
+
+    // 界面照旧收到一条“正在接收”的通知：上传不再需要用户点任何东西，但写进了哪个
+    // 共享项、收了多少字节仍然要看得见（审计的第一层）。
+    crate::ws::emit_ui(
+        &state,
+        crate::ws::events::ui::PUSH_INVITE,
+        &serde_json::json!({
+            "inviteId": invite_id,
+            "sender": { "id": caller, "name": display_name },
+            "name": invite.name,
+            "size": invite.size,
+            "isDir": invite.is_dir,
+            "count": invite.count,
+            "auto": true,
+            "at": at,
+            "upload": true,
+            // 接收方以本机配置里的名字为准；报文里的 dest 只提供 id 与相对目录。
+            "dest": {
+                "shareId": dest.share_id,
+                "path": dest.path,
+                "shareName": share_name,
+            },
+        }),
+    );
+
+    state.push.insert_invite(invite);
+    if let Err(reason) = accept_invite(
+        state.clone(),
+        &invite_id,
+        None,
+        Some(crate::transfer::UploadConflict::Overwrite),
+    ) {
+        warn!(%invite_id, %reason, "auto-accept upload failed");
+        // 已经开始的通知要收尾：这条邀请已经不可能变成完成了。
+        reject_invite_with(&state, &invite_id, &reason);
+        return Err((StatusCode::BAD_REQUEST, reason));
+    }
+    Ok(Json(InviteResponse {
+        accepted: true,
         pending: false,
         reason: None,
     }))
@@ -267,7 +420,7 @@ pub async fn push_report_handler(
     // 必须出示它的 token。否则只要知道 invite_id（v4 UUID，可能从日志/界面/别处漏出去），
     // 任何人都能伪造一条 `push_done` 把在途传输判完成或判失败。
     // 未绑定的对端手里没有 token（这正是"未绑定也能推"的前提），只能靠 invite_id。
-    let peer_paired = state.get_peer(&sender_id).is_some_and(|p| p.paired);
+    let peer_paired = state.is_paired(&sender_id);
     authorize(&state, &headers, peer_paired, &sender_id)?;
     info!(%invite_id, kind, "push report (http)");
     let _ = crate::ws::session::handle_inbound(&state, &sender_id, event).await;
@@ -517,6 +670,11 @@ mod tests {
             count: 1,
             files: Vec::new(),
             caps: Vec::new(),
+            dest: None,
+            conflict: crate::transfer::UploadConflict::default(),
+            resolved: std::collections::HashMap::new(),
+            skipped_files: 0,
+            skipped_bytes: 0,
             root: None,
             callback: None,
             responder: None,
@@ -596,5 +754,110 @@ mod tests {
 
         crate::server::stop_server(&st).await;
         crate::credential::remove_peer("peer-paired").ok();
+    }
+
+    /// 上传邀请的认人比普通邀请更严：**必须已配对 + token 身份与 sender.id 一致 + 长连接在线**；
+    /// 目标共享项不存在 / 没开播 → 409；条件齐了 → **当场自动收下**（`accepted`，不再挂卡）。
+    #[tokio::test]
+    async fn upload_invite_needs_a_paired_token_a_live_link_and_a_visible_share() {
+        let st = state();
+        let root =
+            std::env::temp_dir().join(format!("orbdrop_upload_route_{}", uuid::Uuid::new_v4()));
+        let share_root = root.join("share");
+        std::fs::create_dir_all(&share_root).unwrap();
+        st.config.lock().shares.push(crate::config::ShareItem {
+            id: "share-up".into(),
+            name: "共享项".into(),
+            path: share_root.clone(),
+            created_at: chrono::Utc::now(),
+            broadcast_enabled: true,
+        });
+        crate::credential::set_peer_credential("peer-up", "tok-upload", &"d".repeat(64)).unwrap();
+
+        let body = |sender: &str, share: &str| InviteBody {
+            invite_id: format!("inv-{sender}-{share}"),
+            sender: PeerInfo {
+                id: sender.into(),
+                name: "PC-U".into(),
+            },
+            port: 40000,
+            name: "a.txt".into(),
+            size: 3,
+            is_dir: false,
+            count: 1,
+            files: vec![FileEntry {
+                path: "a.txt".into(),
+                size: 3,
+                mtime: 0,
+            }],
+            caps: vec![crate::transfer::push_job::CAP_AWAIT.into()],
+            at: 0,
+            dest: Some(crate::transfer::UploadDest {
+                share_id: share.into(),
+                path: "sub".into(),
+                share_name: String::new(),
+            }),
+        };
+        let call = |headers: HeaderMap, body: InviteBody| {
+            let st = st.clone();
+            async move {
+                push_upload_invite_handler(
+                    State(st),
+                    ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 40123))),
+                    headers,
+                    Json(body),
+                )
+                .await
+            }
+        };
+
+        let err = call(HeaderMap::new(), body("peer-up", "share-up"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED, "未配对设备不能上传");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer tok-upload".parse().unwrap());
+        let err = call(headers.clone(), body("peer-other", "share-up"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED, "token 与 sender.id 不符");
+
+        // 共享项只对长连接设备可见：没有长连接，上传也不受理（哪怕 token 是对的）。
+        let err = call(headers.clone(), body("peer-up", "share-up"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.0,
+            StatusCode::CONFLICT,
+            "没有长连接 = 共享项不可见"
+        );
+
+        // 模拟这台设备的长连接（`register` 之后 `has_connection` 为真）。
+        let (tx, _rx) = tokio::sync::mpsc::channel::<crate::ws::events::WsEvent>(8);
+        st.ws.register("peer-up", tx);
+
+        let err = call(headers.clone(), body("peer-up", "share-nope"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.0,
+            StatusCode::CONFLICT,
+            "共享项必须存在且开着广播（404 留给老版本没有这条路由）"
+        );
+
+        let ok = call(headers, body("peer-up", "share-up")).await.unwrap();
+        assert!(ok.0.accepted, "条件齐了就当场收下，不再等用户点头");
+        assert!(!ok.0.pending, "上传不挂同意卡");
+        // 邀请在自动接收期间仍挂在 inbound 里（下载循环拿它当"没被取消"的标志）；
+        // 真正的落盘与覆盖由 `p1_integration` 的整链路用例钉住。
+        if let Some(inv) = st.push.inbound.lock().get("inv-peer-up-share-up") {
+            assert!(inv.dest.is_some());
+            assert!(inv.is_dir, "上传永远按清单走");
+            assert_eq!(inv.conflict, crate::transfer::UploadConflict::Overwrite);
+        }
+
+        crate::credential::remove_peer("peer-up").ok();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

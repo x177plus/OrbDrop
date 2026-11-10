@@ -147,7 +147,8 @@ async fn pairing_then_push_transfers_file_to_receiver() {
     // Two instances (same process): A and B.
     let state_a = make_state(3990, "device-a", "PC-A", save_dir.clone());
     let state_b = make_state(3991, "device-b", "PC-B", save_dir.clone());
-    // 这条用例测配对 + WS 推送的整条链路，前提是"已配对设备自动接收"开着。
+    // 这条用例测配对 + WS 推送的整条链路；长连接在线本身就是自动接收的信任级，
+    // 开关开着只是额外覆盖（没有长连接那一档才由开关决定）。
     state_b.config.lock().auto_accept_paired = true;
 
     // Give A a share.
@@ -266,7 +267,7 @@ async fn pairing_then_push_transfers_file_to_receiver() {
     std::fs::write(&big, vec![0x5Au8; 32 * 1024 * 1024]).unwrap();
 
     // A pushes a local directory to B (推送的是用户选的本机路径，与共享项无关）。
-    // B 是**已绑定**（已配对）设备且开着「自动接收」→ 这条推送不需要它点同意：整条链路里
+    // B 是**已绑定**（已配对）设备且**长连接在线**（开关也开着）→ 这条推送不需要它点同意：整条链路里
     // 没有一处调用 `accept_invite`，下面"文件真的落了盘"就是"自动收下"的证明（下载循环
     // 唯一的入口就是它 —— 界面点「接收」，或已配对设备在收到邀请时自动放行）。
     let invite_id = push_invite(
@@ -484,7 +485,7 @@ async fn push_to_unpaired_peer_rides_http() {
     })
     .await;
 
-    transfer::accept_invite(state_b.clone(), &invite_id, None).expect("B 同意");
+    transfer::accept_invite(state_b.clone(), &invite_id, None, None).expect("B 同意");
 
     let name = src.file_name().unwrap().to_string_lossy().to_string();
     let expected = save_dir.join("PC-UA").join(&name).join("hello.txt");
@@ -609,7 +610,7 @@ async fn a_waiting_invite_never_expires_on_its_own() {
     );
 
     // 等了 70 秒这条邀请还是好好的：这会儿点同意照样能收完（等待没有把它等坏）。
-    transfer::accept_invite(state_b.clone(), &invite_id, None).expect("70 秒之后点同意也要能收");
+    transfer::accept_invite(state_b.clone(), &invite_id, None, None).expect("70 秒之后点同意也要能收");
     let landed = save_dir.join("PC-NXA").join("wait.txt");
     wait_until("等过 70 秒之后仍然收得下来", || {
         std::fs::read(&landed)
@@ -717,10 +718,13 @@ async fn paired_push_without_a_long_connection_skips_consent_http() {
     let _ = std::fs::remove_dir_all(&save_dir);
 }
 
-/// 已配对但**没开**「已配对设备自动接收」（新默认）：邀请和未绑定设备一样挂着等用户点头，
-/// 不会因为"配过对"就自动落盘；用户同意后按这次挑的根落。
+/// 已配对但**没有长连接**、也没开「已配对设备自动接收」（新默认）：邀请和未绑定设备一样
+/// 挂着等用户点头，不会因为"配过对"就自动落盘；用户同意后按这次挑的根落。
+///
+/// 随后把长连接建起来、开关仍然关着：同一条推送路径必须**直接收下** —— 长连接是更高一级的
+/// 信任，和共享项写入同一口径；开关只对"已配对但没有长连接"那一档有意义。
 #[tokio::test]
-async fn paired_push_needs_consent_when_auto_receive_is_off() {
+async fn paired_push_needs_consent_without_a_link_and_auto_receives_with_one() {
     let src = temp_share_dir("PCA");
     let save_dir =
         std::env::temp_dir().join(format!("orbdrop_it_pcasave_{}", uuid::Uuid::new_v4()));
@@ -731,7 +735,11 @@ async fn paired_push_needs_consent_when_auto_receive_is_off() {
     let state_b = make_state(port_b, "device-pcb", "PC-PCB", save_dir.clone());
     assert!(
         !state_b.config.lock().auto_accept_paired,
-        "新默认：已配对设备不自动接收"
+        "新默认：没有长连接时仍要用户点接收"
+    );
+    assert!(
+        !state_b.ws.has_connection("device-pca"),
+        "前提：这条用例先走没有长连接的那一档"
     );
     let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
         .await
@@ -787,7 +795,7 @@ async fn paired_push_needs_consent_when_auto_receive_is_off() {
         "没点接收之前不该有任何文件落盘"
     );
 
-    transfer::accept_invite(state_b.clone(), &invite_id, Some(chosen.clone())).expect("B 同意");
+    transfer::accept_invite(state_b.clone(), &invite_id, Some(chosen.clone()), None).expect("B 同意");
     let name = src.file_name().unwrap().to_string_lossy().to_string();
     let expected = chosen.join("PC-PCA").join(&name).join("hello.txt");
     wait_until("同意后收进挑的那个根", || {
@@ -796,6 +804,38 @@ async fn paired_push_needs_consent_when_auto_receive_is_off() {
             .unwrap_or(false)
     })
     .await;
+    // 第一条收尾（邀请从受控表里摘掉）再发第二条：接收侧同一时刻只放一条普通推送。
+    wait_until("第一条推送收尾", || {
+        !state_b.push.inbound.lock().contains_key(&invite_id)
+    })
+    .await;
+
+    // ---- 同一对设备建起长连接：开关仍然关着，这次必须自动收 ----
+    orbdrop_lib::ws::ensure_link_now(&state_a, "device-pcb");
+    wait_until("WS 长连接建立", || {
+        state_a.ws.has_connection("device-pcb") && state_b.ws.has_connection("device-pca")
+    })
+    .await;
+
+    // 没有 `accept_invite`：文件出现在默认下载目录，只能来自“已配对 + 长连接”的自动收。
+    let _ = push_invite(
+        state_a.clone(),
+        vec![src.to_string_lossy().to_string()],
+        "device-pcb",
+    )
+    .await
+    .expect("长连接下邀请要发得出去");
+    let auto_landed = save_dir.join("PC-PCA").join(&name).join("hello.txt");
+    wait_until("长连接下自动收进下载目录", || {
+        std::fs::read(&auto_landed)
+            .map(|c| c == b"hello world from A")
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        !state_b.config.lock().auto_accept_paired,
+        "开关还是关着，自动收只能来自长连接"
+    );
 
     orbdrop_lib::server::stop_server(&state_a).await;
     orbdrop_lib::server::stop_server(&state_b).await;
@@ -857,7 +897,7 @@ async fn consent_push_lands_in_the_chosen_root() {
 
     // 不合格的根：当场拒绝，且**邀请原样留着**。
     assert!(
-        transfer::accept_invite(state_b.clone(), &invite_id, Some("relative/dir".into())).is_err(),
+        transfer::accept_invite(state_b.clone(), &invite_id, Some("relative/dir".into()), None).is_err(),
         "相对路径不该被当成落盘根"
     );
     assert!(
@@ -865,7 +905,7 @@ async fn consent_push_lands_in_the_chosen_root() {
         "校验不过不该把邀请吃掉（用户还能换个目录重来）"
     );
 
-    transfer::accept_invite(state_b.clone(), &invite_id, Some(chosen.clone())).expect("B 同意");
+    transfer::accept_invite(state_b.clone(), &invite_id, Some(chosen.clone()), None).expect("B 同意");
 
     let name = src.file_name().unwrap().to_string_lossy().to_string();
     let expected = chosen.join("PC-RA").join(&name).join("hello.txt");
@@ -1092,7 +1132,7 @@ async fn multi_device_push_isolates_targets_and_shares_one_manifest() {
     .await;
 
     // ── C 点头（未绑定设备的同意制在批次里照旧）→ 也传完 ──
-    transfer::accept_invite(state_c.clone(), &invite_c, None).expect("C 同意");
+    transfer::accept_invite(state_c.clone(), &invite_c, None, None).expect("C 同意");
     let expected_c = save_c.join("PC-MDA").join(&name).join("hello.txt");
     // 等**整份目录**都落齐再断言：下载是逐文件的顺序循环，`hello.txt` 写完不代表
     // `sub/nested.txt` 也写完了 —— 只等其中一个、再断言另一个，是一条会偶发的竞态
@@ -1300,7 +1340,7 @@ async fn run_one_push(
     invite_id: &str,
     expect: &[(std::path::PathBuf, &[u8])],
 ) {
-    transfer::accept_invite(state_b.clone(), invite_id, None).expect("同意");
+    transfer::accept_invite(state_b.clone(), invite_id, None, None).expect("同意");
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         if expect
@@ -1410,7 +1450,7 @@ async fn a_hostile_sender_name_still_lands_inside_the_download_dir() {
             state_b.push.inbound.lock().contains_key(&invite_id)
         })
         .await;
-        transfer::accept_invite(state_b.clone(), &invite_id, None).expect("B 同意");
+        transfer::accept_invite(state_b.clone(), &invite_id, None, None).expect("B 同意");
         wait_until("文件落到下载目录里", || {
             find_file_under(&save_dir, "A.txt")
                 .map(|p| {
@@ -1518,7 +1558,7 @@ async fn a_single_pushed_file_lands_as_a_file() {
         state_b.push.inbound.lock().contains_key(&invite_id)
     })
     .await;
-    transfer::accept_invite(state_b.clone(), &invite_id, None).expect("B 同意");
+    transfer::accept_invite(state_b.clone(), &invite_id, None, None).expect("B 同意");
 
     let landed = save_dir.join("PC-UO").join("A.txt");
     wait_until("单个文件直接落盘（不套同名目录）", || {
@@ -1585,7 +1625,7 @@ async fn accepting_a_push_from_a_sync_context_still_downloads() {
     let accept_state = state_b.clone();
     let accept_id = invite_id.clone();
     std::thread::spawn(move || {
-        transfer::accept_invite(accept_state, &accept_id, None).expect("accept");
+        transfer::accept_invite(accept_state, &accept_id, None, None).expect("accept");
     })
     .join()
     .expect("accept 线程");
@@ -1956,7 +1996,7 @@ async fn nat_peer_keeps_no_address_and_its_liveness_follows_the_link() {
     );
 
     // ---- ② 对端拨进来（长连接）：这是它可达的唯一证据 ----
-    let url = orbdrop_lib::net::peer_ws_url("127.0.0.1", serving, &token, false);
+    let url = orbdrop_lib::net::peer_ws_url("127.0.0.1", serving, &token, false, serving);
     let ws =
         orbdrop_lib::net::connect_ws(&url, "127.0.0.1", serving, &orbdrop_lib::net::DialPin::Tofu)
             .await
@@ -1980,6 +2020,68 @@ async fn nat_peer_keeps_no_address_and_its_liveness_follows_the_link() {
 
     orbdrop_lib::server::stop_server(&state).await;
     credential::remove_peer("device-nat").ok();
+    let _ = std::fs::remove_dir_all(&save_dir);
+}
+
+/// 对端换过网段之后经长连接拨进来：地址簿里的旧 IP 必须被这条连接纠正。
+///
+/// 真机现场：安卓从 `10.198.x` 换到 `192.168.x`，重启后长连接照旧（它拨本机），消息走
+/// 链路发得到；共享目录/推送回执这些 HTTP 数据面还在拨旧 IP —— 链路活着时 5s 探活会
+/// 跳过这一台（`probe_peers_once` 的 `has_connection` 分支），mDNS 也未必重新解析得到，
+/// 旧地址于是没人改。这里把"旧地址 + 对端从新地址拨入并自报端口"摆出来，盯两件事：
+/// ① 内存行与地址簿都改成"TCP 来源 + 自报端口"；② 没变的那次连接不重复落盘。
+#[tokio::test]
+async fn an_inbound_link_corrects_the_peers_stale_address() {
+    credential::remove_peer("device-roam").ok();
+    let save_dir = temp_share_dir("roam_save");
+    let port = free_port();
+    let state = make_state(port, "device-roam-pc", "PC-ROAM", save_dir.clone());
+    // 地址簿里仍是上一段网络的地址；对端这一趟在新网段上，服务端口没变。
+    state.add_peer_book(PeerDevice {
+        id: "device-roam".into(),
+        name: "Phone".into(),
+        ip: "10.198.71.106".into(),
+        port: 3890,
+        online: false,
+        paired: true,
+        auto_connect: false,
+        paused: false,
+        relay: None,
+    });
+    credential::set_peer_credential("device-roam", "tok-roam", &"a".repeat(64)).unwrap();
+
+    let serving = orbdrop_lib::server::start_server_loopback(state.clone(), port)
+        .await
+        .expect("server");
+
+    // 对端拨进来：来源是 127.0.0.1（测试里代替新网段），自报端口 3890。
+    let url = orbdrop_lib::net::peer_ws_url("127.0.0.1", serving, "tok-roam", false, 3890);
+    let ws =
+        orbdrop_lib::net::connect_ws(&url, "127.0.0.1", serving, &orbdrop_lib::net::DialPin::Tofu)
+            .await
+            .expect("inbound ws from the roaming peer");
+    wait_until("链路建立后旧地址被纠正", || {
+        state
+            .get_peer("device-roam")
+            .is_some_and(|p| p.ip == "127.0.0.1" && p.port == 3890)
+    })
+    .await;
+    assert!(
+        state.get_peer("device-roam").unwrap().online,
+        "链路活着 = 在线"
+    );
+    // 地址簿落盘那一份也要跟着改：重启后 `AppState::new` 读的是它。
+    let book = read_config(&state.config_path);
+    let row = book
+        .peers
+        .iter()
+        .find(|p| p.id == "device-roam")
+        .expect("地址簿里应该有这一行");
+    assert_eq!((row.ip.as_str(), row.port), ("127.0.0.1", 3890));
+
+    drop(ws);
+    orbdrop_lib::server::stop_server(&state).await;
+    credential::remove_peer("device-roam").ok();
     let _ = std::fs::remove_dir_all(&save_dir);
 }
 
@@ -2045,11 +2147,16 @@ fn button_tasks_without_a_tokio_runtime_do_not_panic() {
             files: vec![],
             // 老对端那条路（不带能力位）：这个用例测的是"没有 reactor 也不能 panic"。
             caps: Vec::new(),
+            dest: None,
+            conflict: orbdrop_lib::transfer::UploadConflict::default(),
+            resolved: std::collections::HashMap::new(),
+            skipped_files: 0,
+            skipped_bytes: 0,
             root: None,
             callback: Some(("127.0.0.1".into(), 1)),
             responder: None,
         });
-    orbdrop_lib::transfer::accept_invite(state.clone(), "nort-invite", None).expect("accept");
+    orbdrop_lib::transfer::accept_invite(state.clone(), "nort-invite", None, None).expect("accept");
 
     credential::remove_peer("device-zb").ok();
     let _ = std::fs::remove_dir_all(&save_dir);
@@ -5552,7 +5659,7 @@ async fn a_token_dial_pinned_to_another_certificate_is_rejected() {
 
     // ③ WS 那条路同样按目标钉住（token 在 URL 里，漏出去就等于交出凭据）。
     let ws = orbdrop_lib::net::connect_ws(
-        &orbdrop_lib::net::peer_ws_url(&ip, port, "token-that-must-not-leak", false),
+        &orbdrop_lib::net::peer_ws_url(&ip, port, "token-that-must-not-leak", false, 0),
         &ip,
         port,
         &orbdrop_lib::net::DialPin::Fingerprint(wrong),
@@ -5565,4 +5672,138 @@ async fn a_token_dial_pinned_to_another_certificate_is_rejected() {
 
     orbdrop_lib::server::stop_server(&state).await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 一轮完整上传：发邀请 → 接收方**自动收下**（同名覆盖）→ 等发送方收到完成回执。
+///
+/// 这条用例里没有一次 `accept_invite`：文件能落到共享项，只能是因为对端的长连接让
+/// `/push/upload/invite` 直接开了闸。
+async fn run_upload_round(
+    state_a: &Arc<AppState>,
+    peer_id: &str,
+    share_id: &str,
+    dest_path: &str,
+    src: &std::path::Path,
+) {
+    let view = transfer::upload_to_share(
+        state_a.clone(),
+        peer_id.into(),
+        orbdrop_lib::transfer::UploadDest {
+            share_id: share_id.into(),
+            path: dest_path.into(),
+            share_name: String::new(),
+        },
+        vec![src.to_string_lossy().to_string()],
+        None,
+    )
+    .await
+    .expect("上传邀请要发得出去");
+    let invite_id = view.targets[0].invite_id.clone();
+    wait_until("发送方收到上传完成回执", || {
+        state_a.push.jobs.lock().get(&invite_id).is_none()
+    })
+    .await;
+}
+
+/// 上传到共享项：邀请走新路由 `/push/upload/invite`，落点是**共享项目录**（不是下载目录），
+/// 数据面仍是接收方主动来拉（`/push/stream`）。
+///
+/// 这条用例把整条链走一遍：A、B 建立长连接 → A 选 B 的共享项 + 子目录 → 邀请 →
+/// B **不问人直接收下**（同名文件覆盖）→ 文件落到 `<共享项>/<子目录>/<源名>/…` →
+/// 发送方收到完成回执 → 下载目录里**没有**副本。
+#[tokio::test]
+async fn upload_lands_in_the_peer_share_not_the_download_dir() {
+    const TOKEN: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+    let src = temp_share_dir("UP");
+    let share_root =
+        std::env::temp_dir().join(format!("orbdrop_it_upshare_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(share_root.join("dest")).unwrap();
+    let save_dir =
+        std::env::temp_dir().join(format!("orbdrop_it_upsave_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&save_dir).unwrap();
+
+    let (port_a, port_b) = two_free_ports();
+    let state_a = make_state(port_a, "device-upa", "PC-UPA", save_dir.clone());
+    let state_b = make_state(port_b, "device-upb", "PC-UPB", save_dir.clone());
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
+        .await
+        .expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b)
+        .await
+        .expect("B server");
+
+    // 两侧互相已配对（地址簿 + 同一枚 token）。共享项只对长连接设备可见，所以先建链。
+    credential::set_peer("device-upb", TOKEN).unwrap();
+    credential::set_peer("device-upa", TOKEN).unwrap();
+    state_a.add_peer_book(PeerDevice {
+        id: "device-upb".into(),
+        name: "PC-UPB".into(),
+        ip: "127.0.0.1".into(),
+        port: port_b,
+        online: true,
+        paired: true,
+        auto_connect: false,
+        paused: false,
+        relay: None,
+    });
+    state_b.add_peer_book(PeerDevice {
+        id: "device-upa".into(),
+        name: "PC-UPA".into(),
+        ip: "127.0.0.1".into(),
+        port: port_a,
+        online: true,
+        paired: true,
+        auto_connect: false,
+        paused: false,
+        relay: None,
+    });
+
+    // B 的共享项：必须开着广播，上传面才认。
+    let mut share = ShareItem::new(share_root.clone());
+    share.broadcast_enabled = true;
+    let share_id = share.id.clone();
+    state_b.config.lock().shares.push(share);
+
+    // 共享项只对长连接设备可见（`Caller::Peer::sees_share` 同一口径）：没有长连接，
+    // `/push/upload/invite` 直接 409。这里把链建起来 —— 建链即“对面能看到这个共享项”。
+    orbdrop_lib::ws::ensure_link_now(&state_a, "device-upb");
+    wait_until("WS 长连接建立", || {
+        state_a.ws.has_connection("device-upb") && state_b.ws.has_connection("device-upa")
+    })
+    .await;
+
+    // 第一轮：共享项里还没有同名文件，自动收下并落盘。
+    run_upload_round(&state_a, "device-upb", &share_id, "dest", &src).await;
+
+    let name = src.file_name().unwrap().to_string_lossy().to_string();
+    let landed = share_root.join("dest").join(&name).join("hello.txt");
+    wait_until("文件落到共享项目录", || {
+        std::fs::read(&landed)
+            .map(|c| c == b"hello world from A")
+            .unwrap_or(false)
+    })
+    .await;
+
+    // 落点是共享项，不是下载目录（下载目录这一趟一个字节都不该多）。
+    assert!(
+        !save_dir.join("PC-UPA").exists(),
+        "上传不得落进下载目录"
+    );
+
+    // 第二轮：源改了、同名文件已存在 —— 没有一次 `accept_invite`，直接覆盖。
+    std::fs::write(src.join("hello.txt"), b"second version").unwrap();
+    run_upload_round(&state_a, "device-upb", &share_id, "dest", &src).await;
+    assert_eq!(
+        std::fs::read(&landed).unwrap(),
+        b"second version",
+        "自动收下时同名文件必须原子覆盖（与资源管理器一致）"
+    );
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    credential::remove_peer("device-upa").ok();
+    credential::remove_peer("device-upb").ok();
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&share_root);
+    let _ = std::fs::remove_dir_all(&save_dir);
 }

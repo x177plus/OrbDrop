@@ -561,6 +561,18 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .fgo { flex: none; width: calc(36 * var(--u)); height: calc(36 * var(--u)); border-radius: calc(10 * var(--u)); display: grid; place-items: center; color: var(--muted); }
 .fgo:hover { background: var(--fg-soft); color: var(--fg); }
 .fgo .ic { width: calc(18 * var(--u)); height: calc(18 * var(--u)); }
+/* 本机共享行：左边整块是操作入口（与 `.frow` 同一套内边距/分割线），右边单独一颗广播开关。
+   开关不能塞进按钮里（嵌套交互元素），所以行本身是 div，主区域另起一颗 button。 */
+.lrow { display: flex; align-items: center; gap: calc(8 * var(--u)); padding: calc(11 * var(--u)) calc(12 * var(--u)); }
+.lrow + .lrow { border-top: 1px solid var(--border); }
+.lmain { flex: 1; min-width: 0; display: flex; align-items: center; gap: calc(11 * var(--u)); text-align: left; }
+.lmain:hover { background: var(--fg-soft); border-radius: calc(10 * var(--u)); }
+.lpath { font-family: var(--font-mono); font-size: calc(10 * var(--u)); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.perm-acts { display: flex; gap: calc(8 * var(--u)); flex-wrap: wrap; }
+/* 路径选择器当前目录：长路径允许从任意位置断行，不要把底下的列表顶宽。 */
+.path-hint { font-family: var(--font-mono); word-break: break-all; }
+/* 「上一级」那一格沿用文件夹底色，图标默认朝右，这里转成向上。 */
+.ftile .ic.up { transform: rotate(-90deg); }
 /* 应用表（F-119，会话里「＋」→「应用」）那一行的字母头像。
    行骨架沿用 `.frow`（与文件列表同一套内边距与分割线），这里只补一颗"看着像图标"的方块 ——
    应用图标要在原生那一侧 Bitmap→PNG 落一份缓存才拿得到，为了一张表不值得；首字母与

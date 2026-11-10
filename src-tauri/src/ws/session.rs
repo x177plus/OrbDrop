@@ -21,8 +21,19 @@ use crate::ws::events::{ui, PeerInfo, WsEvent};
 /// `rx_events.recv()` yield `None` — that only closes the socket if the same task
 /// also owns the read half. Split into two tasks, the read loop parks on `next()`
 /// forever and the peer keeps believing the long connection is alive.
-pub async fn run_inbound_session(state: Arc<AppState>, peer_id: String, ws: WebSocket) {
-    info!(%peer_id, "inbound WS session starting");
+pub async fn run_inbound_session(
+    state: Arc<AppState>,
+    peer_id: String,
+    addr: std::net::SocketAddr,
+    listen_port: u16,
+    ws: WebSocket,
+) {
+    info!(%peer_id, %addr, "inbound WS session starting");
+    // **先纠正地址，再补发/对账**：`flush_queued`、`transfer::reconcile` 与后面的共享目录
+    // 都按 `peer.dial()` 取址。对端换网后这条连接是它此刻唯一的地址证据 —— 链路活着时
+    // 5s 探活会跳过它（`probe_peers_once`），mDNS 也未必重新解析得到（移动端/跨段），
+    // 不在这里学，旧 IP 就一直挂着（消息走链路发得到，共享目录却拨旧地址）。
+    state.learn_link_endpoint(&peer_id, addr.ip(), listen_port);
     state.set_peer_online(&peer_id, true);
     // 被拨号的一端同样是"处于长连接"（F-16）：重启后这一侧也要能自动接回来。
     // 同一次写入清掉「断开」的暂停 —— 能走到这里，就说明本机不是暂停态（闸门放行了）。
@@ -202,11 +213,11 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             // 下面那句"设备表优先"取到的是占位名（= 设备 id），一张推送卡上就会顶着一串 deviceid。
             state.note_peer_name(peer_id, &sender.name);
             let known = state.get_peer(peer_id);
-            // 已绑定（已配对）只说明身份是这条会话用 token 换来的；要不要免确认自动收，
-            // 由设置决定（默认关）。
-            let paired = known.as_ref().is_some_and(|p| p.paired);
+            // 这条邀请就是长连接送来的：已配对 = 最高信任级，直接收（与共享项写入同一级）；
+            // 「已配对设备自动接收」开关只对"已配对但没有长连接"的推送有意义。
+            let paired = state.is_paired(peer_id);
             let auto_accept_paired = state.config.lock().auto_accept_paired;
-            let auto = paired && auto_accept_paired;
+            let auto = paired && (state.ws.has_connection(peer_id) || auto_accept_paired);
             let display_name = known
                 .as_ref()
                 .map(|p| p.name.clone())
@@ -234,6 +245,12 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 count,
                 files,
                 caps,
+                // 上传只走 HTTP 的新路由（`/push/upload/invite`），WS 邀请永远是普通推送。
+                dest: None,
+                conflict: transfer::UploadConflict::default(),
+                resolved: std::collections::HashMap::new(),
+                skipped_files: 0,
+                skipped_bytes: 0,
                 // 自动收的时候没有"先挑目录"的时机 → 落盘根恒为下载目录；
                 // 关了自动接收就等用户点「接收」，那时 `accept_invite` 才带上选的根。
                 root: None,
@@ -268,10 +285,10 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                     "at": at,
                 }),
             );
-            // 开了「已配对设备自动接收」才免同意：直接开收 —— 界面那条通知是"正在接收"
-            // 而不是"要不要收"。其余情况（未绑定、或已配对但关了自动接收）挂卡片等用户点。
+            // `auto`（已配对；这条邀请就是长连接送来的）直接开收 —— 界面那条通知是"正在接收"
+            // 而不是"要不要收"。其余（未绑定，或链路收尾竞态里没被放行的）挂卡片等用户点。
             if auto {
-                if let Err(reason) = transfer::accept_invite(state.clone(), &invite_id, None) {
+                if let Err(reason) = transfer::accept_invite(state.clone(), &invite_id, None, None) {
                     warn!(%invite_id, %reason, "auto-accept failed");
                     // 本机那条"正在接收"的通知得收尾：这条邀请已经不可能变成完成了。
                     transfer::reject_invite_with(state, &invite_id, &reason);
@@ -439,7 +456,13 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 return InboundResult::Accepted;
             }
             info!(%peer_id, "received unpair over WS");
-            let _ = credential::remove_peer(peer_id);
+            // **凭据先清成功再改状态**：反过来的话，一次瞬时写盘失败会留下"设备行已解除、
+            // token 还在"的半截关系 —— 下一拍 `reconcile_pairing_flags` 又会按 token 把
+            // 它修回已配对（用户点了「解除配对」却自己长回来）。
+            if let Err(e) = credential::remove_peer(peer_id) {
+                warn!(%peer_id, %e, "解除配对的凭据清理失败：本次不改状态，等对端重试/本机操作");
+                return InboundResult::Accepted;
+            }
             state.ws.drop_peer(peer_id);
             state.unpair(peer_id);
             emit_ui(state, ui::DEVICES_CHANGED, &serde_json::json!({}));

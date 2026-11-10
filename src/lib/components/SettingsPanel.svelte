@@ -82,8 +82,9 @@
    */
   let deviceSubdir = $state(true);
   /**
-   * 已配对设备推送是否免确认自动收（后端 `AppSettings.autoAcceptPaired`，**默认关**）。
-   * 开着时直接落下载目录；关着时和未配对设备一样先点「接收」，再按「保存位置」决定落点。
+   * 已配对但**当前没有长连接**的设备推送是否也免确认自动收（后端
+   * `AppSettings.autoAcceptPaired`，**默认关**）。已配对且长连接在线的设备始终自动收，
+   * 不受这颗开关影响；这颗开关是"没有长连接"那一档的额外放行。
    */
   let autoAcceptPaired = $state(false);
   let downloadMode = $state<'Direct' | 'AskEachTime'>('AskEachTime');
@@ -440,10 +441,10 @@
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
       <label>{t('已配对设备自动接收')}<Hint>
-        {t('开启：已配对设备推来的文件不再询问，直接保存到下载目录（此时下面的「保存位置」对这条不生效）。关闭（默认）：和未配对设备一样，先点「接收」，再按「保存位置」决定放到哪里。已配对设备仍必须带有效 token，凭据失效照样拒收；未配对设备始终需要你确认。')}
+        {t('已配对且当前有长连接的设备推来的文件始终直接接收，不弹「接收」。这颗开关只管已配对但当前没有长连接的设备：开启后它们也免确认、直接保存到下载目录（此时下面的「保存位置」对这条不生效）；关闭（默认）时它们仍要你点「接收」，再按「保存位置」决定放到哪里。未配对设备始终需要你确认。')}
       </Hint></label>
       <div style="display:flex; align-items:center; justify-content:space-between;">
-        <span style="font-size:var(--fs-sm); color:var(--muted);">{t('已配对设备推送免确认，直接落下载目录')}</span>
+        <span style="font-size:var(--fs-sm); color:var(--muted);">{t('无长连接的已配对设备也免确认，直接落下载目录')}</span>
         <label class="switch">
           <input type="checkbox" bind:checked={autoAcceptPaired} data-auto-accept-paired />
           <span class="track"></span>
