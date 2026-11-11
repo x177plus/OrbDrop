@@ -186,8 +186,8 @@ fn overlaps(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
 /// 回调表必须以 `CF_CALLBACK_REGISTRATION_END`（= `{ CF_CALLBACK_TYPE_NONE, NULL }`）收尾；
 /// 这个哨兵在 `windows` crate 里没有常量，得自己写出来。
 ///
-/// 只注册我们确实实现的：**不注册 `NOTIFY_DELETE` / `NOTIFY_RENAME`** —— 镜像只读单向，
-/// 用户/别的程序在镜像里删改东西我们不需要回写对端（见模块头）。
+/// 只注册我们确实实现的：**不注册 `NOTIFY_DELETE` / `NOTIFY_RENAME` / `NOTIFY_UPDATE`** ——
+/// 镜像不做自动同步；写回是用户显式动作（`mirror::writeback`），不靠平台变更通知。
 static CALLBACKS: [CF_CALLBACK_REGISTRATION; 6] = [
     CF_CALLBACK_REGISTRATION {
         Type: CF_CALLBACK_TYPE_FETCH_DATA,
@@ -266,13 +266,7 @@ pub fn ensure_ready(state: Arc<AppState>) -> Result<(), String> {
 /// 顺序要紧：先断开（不再有回调进来），再删（删占位符时不该还有目标在读），最后注销
 /// （先删再注销：注销之后残留的项会变成谁也水合不了的重解析点）。
 pub fn shutdown() {
-    let key = CONNECTION.get().copied();
-    if let Some(key) = key {
-        if !key.is_invalid() {
-            // `Free` 是这条 API 家族里"释放连接"的正规入口（它会调 `CfDisconnectSyncRoot`）。
-            unsafe { windows_core::Free::free(&mut { key }) };
-        }
-    }
+    disconnect();
     let root = super::root();
     if root.exists() {
         match std::fs::remove_dir_all(&root) {
@@ -285,6 +279,20 @@ pub fn shutdown() {
         match unsafe { CfUnregisterSyncRoot(PCWSTR(wide_root.as_ptr())) } {
             Ok(()) => info!("同步根已注销"),
             Err(e) => warn!(error = ?e, "注销同步根失败"),
+        }
+    }
+}
+
+/// 只断开 provider，**不删镜像树、不注销注册**。
+///
+/// 用在“还有未写回副本没导出成功”的退出路径：此时删树会丢编辑，注销会让占位符
+/// 永远读不回来；保留注册至少下次启动还能连上同一棵树把内容读出来。
+pub fn disconnect() {
+    let key = CONNECTION.get().copied();
+    if let Some(key) = key {
+        if !key.is_invalid() {
+            // `Free` 是这条 API 家族里"释放连接"的正规入口（它会调 `CfDisconnectSyncRoot`）。
+            unsafe { windows_core::Free::free(&mut { key }) };
         }
     }
 }
@@ -398,8 +406,13 @@ fn connect(provider: &'static Provider, wide_root: &[u16]) -> Result<CF_CONNECTI
 // 发起一侧：建占位符
 // ---------------------------------------------------------------------------
 
-/// 把一项放进镜像并返回本地路径。
-pub async fn place_item(state: &Arc<AppState>, item: &MirroredItem) -> Result<PathBuf, String> {
+/// 把一项放进镜像并返回本地路径（连同问到的对端元数据）。
+pub async fn place_item(
+    state: &Arc<AppState>,
+    item: &MirroredItem,
+    refresh: bool,
+    force_rebuild: bool,
+) -> Result<super::PlacedItem, String> {
     // 落点先校验（两个 id 都是对端自报的，见 `identity::share_dir`），**再**问本机有没有这枚
     // token：标识不合法、或不是已配对设备的项，一个目录都不该建出来。
     let dir = identity::share_dir(&super::root(), &item.peer_id, &item.share_id)?;
@@ -413,13 +426,28 @@ pub async fn place_item(state: &Arc<AppState>, item: &MirroredItem) -> Result<Pa
     // 来自对端 `/shares` 的旧值，可能过时 —— 与旧路径同一条判据（元数据说了算）。
     let client = peer_fs::client_for(state, &item.peer_id)?;
     let meta = peer_fs::probe_entry(&client, &base, &token, &item.share_id, &item.path).await?;
-    let is_dir = meta.map(|m| m.is_dir).unwrap_or(item.is_dir);
-    let (size, mtime) = if is_dir {
+    let is_dir = meta
+        .as_ref()
+        .map(|m| m.is_dir)
+        .unwrap_or(item.is_dir);
+    let (size, mtime, mtime_ms, remote_rev) = if is_dir {
         // 目录也保留对端 mtime：资源管理器里显示的是真实修改时间，日志/一致性判断也能用。
-        (0, meta.and_then(|m| m.mtime))
+        (
+            0,
+            meta.as_ref().and_then(|m| m.mtime),
+            meta.as_ref().and_then(|m| m.mtime_ms),
+            meta.as_ref().and_then(|m| m.rev.clone()),
+        )
     } else {
-        let meta = meta.ok_or_else(|| format!("问不到「{}」的大小，这一项不走镜像", item.name))?;
-        (meta.size, meta.mtime)
+        let meta = meta
+            .as_ref()
+            .ok_or_else(|| format!("问不到「{}」的大小，这一项不走镜像", item.name))?;
+        (
+            meta.size,
+            meta.mtime,
+            meta.mtime_ms,
+            meta.rev.clone(),
+        )
     };
 
     let id = identity::Identity {
@@ -429,6 +457,7 @@ pub async fn place_item(state: &Arc<AppState>, item: &MirroredItem) -> Result<Pa
         // 用**校正过**的那个判断，不能用 `item.is_dir`：界面的旧值把文件说成目录时，
         // 身份里也会跟着错，水合时就按目录去伺候了。
         is_dir,
+        rev: remote_rev.clone().unwrap_or_default(),
     };
     let blob = id.encode()?;
     let name = local
@@ -440,7 +469,88 @@ pub async fn place_item(state: &Arc<AppState>, item: &MirroredItem) -> Result<Pa
         .ok_or_else(|| "镜像落点没有父目录".to_string())?
         .to_path_buf();
 
-    create_placeholder(&parent, &name, &blob, size, mtime, is_dir).await
+    let path = create_placeholder(&parent, &name, &blob, size, mtime, is_dir, refresh, force_rebuild).await?;
+    // 基线用**本地占位符自己的**大小/mtime，而不是刚探测到的远端值：目标还开着时
+    // `create_placeholder` 可能沿用了旧占位符（远端已经更新）。登记旧版本，后面的
+    // 冲突检测才能发现对端变化，而不会把旧内容当成最新。
+    let local_meta = std::fs::metadata(&path).ok();
+    let local_size = local_meta.as_ref().map(|meta| meta.len());
+    let local_mtime_ms = local_meta
+        .as_ref()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|age| age.as_millis() as i64);
+    // 占位符里存的身份是**建它时**的版本。目标还开着时可能沿用了旧占位符（对端已经更新），
+    // 这时必须把旧版本登记成写回基线，不能拿刚探测到的新值 —— 否则写回会以为本地内容
+    // 基于最新版本，把对端的改动当成"没变"覆盖掉。
+    let known = super::known_identity(&path).and_then(|blob| identity::Identity::decode(&blob).ok());
+    let placed_rev = match known {
+        // 占位符里存的是**建它时**的版本。空串 = 这一层不知道（目录枚举建的子占位符），
+        // 不能拿刚探测到的新 rev 冒充“本地内容基于最新版本”。
+        Some(identity) => (!identity.rev.is_empty()).then_some(identity.rev),
+        // 没有身份记录 = 这次新建的；用刚探测到的远端版本。
+        None => remote_rev,
+    };
+    Ok(super::PlacedItem {
+        path,
+        // 目录不参与写回；大小/时间戳保留占位符自己的值。
+        size: if is_dir {
+            None
+        } else {
+            local_size.or(Some(size))
+        },
+        mtime: local_mtime_ms
+            .map(|ms| ms / 1000)
+            .or(mtime),
+        mtime_ms: local_mtime_ms.or(mtime_ms),
+        rev: placed_rev,
+        is_dir,
+    })
+}
+
+/// 从磁盘上的占位符里读回我们写进去的身份 blob。
+///
+/// `known_identity` 只是进程内的账；应用重启后它是空的，但占位符里的 blob 还在。没有这一步，
+/// 重启后第一次打开/刷新会把一个**同一项**误判成“另一项”，走删除重建 —— 编辑器就会提示
+/// 文件已删除。`CfGetPlaceholderInfo` 不触发水合。
+fn placeholder_identity(path: &Path) -> Option<Vec<u8>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+
+    let file = std::fs::File::open(path).ok()?;
+    let handle = HANDLE(file.as_raw_handle() as _);
+    let base = std::mem::size_of::<CF_PLACEHOLDER_STANDARD_INFO>();
+    let capacity = base + CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH as usize;
+    // 结构体有 8 字节对齐要求；用 u64 的 Vec 保证缓冲区对齐。
+    let mut words = vec![0u64; capacity.div_ceil(8)];
+    let byte_len = words.len() * 8;
+    let mut returned = 0u32;
+    if let Err(e) = unsafe {
+        CfGetPlaceholderInfo(
+            handle,
+            CF_PLACEHOLDER_INFO_BASIC,
+            words.as_mut_ptr() as *mut _,
+            byte_len as u32,
+            Some(&mut returned),
+        )
+    } {
+        debug!(path = %path.display(), error = ?e, "读占位符身份失败");
+        return None;
+    }
+    let info = unsafe { &*(words.as_ptr() as *const CF_PLACEHOLDER_STANDARD_INFO) };
+    let identity_len = (info.FileIdentityLength as usize)
+        .min(CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH as usize);
+    if identity_len == 0 {
+        return None;
+    }
+    let identity_ptr = std::ptr::addr_of!((*info).FileIdentity) as *const u8;
+    let start = identity_ptr as usize - words.as_ptr() as usize;
+    let end = start.checked_add(identity_len)?;
+    if end > byte_len || (returned as usize) < end {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, byte_len) };
+    Some(bytes[start..end].to_vec())
 }
 
 /// 在 `dir` 下放一个占位符，返回实际落点。
@@ -468,37 +578,85 @@ async fn create_placeholder(
     size: u64,
     mtime: Option<i64>,
     is_dir: bool,
+    refresh: bool,
+    force_rebuild: bool,
 ) -> Result<PathBuf, String> {
     // 父目录是 `place_item` 建的，但后台 sweep 可能刚好把空目录收掉（并发拖拽时）。
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("建镜像目录失败（{}）: {e}", dir.display()))?;
 
     let desired = dir.join(name);
-    let known = super::known_identity(&desired);
+    // 先读平台里的 blob（跨进程可靠），再退回本进程记账。
+    let known = placeholder_identity(&desired).or_else(|| super::known_identity(&desired));
+    let desired_id = identity::Identity::decode(blob).ok();
+    let known_id = known
+        .as_deref()
+        .and_then(|blob| identity::Identity::decode(blob).ok());
+    // “同一项”只看坐标（peer/share/path/is_dir），不看 rev：远端内容变了仍然是同一项，
+    // 应该按同名刷新，而不是当成另一个文件改成 `(2)`。
+    let same_item = match (known_id.as_ref(), desired_id.as_ref()) {
+        (Some(before), Some(now)) => {
+            before.peer_id == now.peer_id
+                && before.share_id == now.share_id
+                && before.path == now.path
+                && before.is_dir == now.is_dir
+        }
+        _ => false,
+    };
     let same = known.as_deref() == Some(blob);
 
     if desired.exists() {
         let placeholder = is_placeholder(&desired);
         let busy = super::is_busy(&desired);
 
-        if same {
+        if same_item {
             if placeholder && busy {
-                // 目标还在读：**不能**为了"对齐最新内容"去删/重建，否则正在进行的复制
-                // 当场失败（这正是当初"源文件损坏/不可用"的来源）。这里只做一次便宜的
-                // 元数据比对并记录；占用中的项一律沿用旧占位符，等句柄释放后下次拖拽再刷新。
-                if !is_dir && !metadata_matches(&desired, size, mtime) {
-                    warn!(
-                        path = %desired.display(),
-                        "目标仍在读取，但占位符与对端的大小/时间戳不一致；本次沿用旧占位符以保护进行中的复制"
-                    );
+                // 打开路径的显式重新打开：刚关掉的 60s 宽限期不算"还有人在读"；没有
+                // 活动句柄时继续往下走（元数据不一致就同名重建，取对端的最新内容）。
+                // 容量/目录/拖出仍旧沿用宽限策略，保护可能紧接着重开的读者。
+                let can_refresh = refresh && !is_dir && !super::is_open(&desired);
+                if !can_refresh {
+                    // 目标还在读：**不能**为了"对齐最新内容"去删/重建，否则正在进行的复制
+                    // 当场失败（这正是当初"源文件损坏/不可用"的来源）。这里只做一次便宜的
+                    // 元数据比对并记录；占用中的项一律沿用旧占位符，等句柄释放后下次拖拽再刷新。
+                    if !is_dir && !metadata_matches(&desired, size, mtime) {
+                        warn!(
+                            path = %desired.display(),
+                            "目标仍在读取，但占位符与对端的大小/时间戳不一致；本次沿用旧占位符以保护进行中的复制"
+                        );
+                    }
+                    info!(path = %desired.display(), "镜像项正在被目标读取，复用而不重建（同名）");
+                    // **保留旧身份**：占位符里的内容还是旧版本，不能把新 rev 写进记账，
+                    // 否则写回会误以为本地内容基于最新版本。
+                    note_placed(&desired, known.as_deref().unwrap_or(blob));
+                    return Ok(desired);
                 }
-                info!(path = %desired.display(), "镜像项正在被目标读取，复用而不重建（同名）");
-                note_placed(&desired, blob);
-                return Ok(desired);
+            }
+            // 文件内容变了（或用户明确要求用远端覆盖）：**原地更新同一个占位符**。
+            // 不再删掉重建——编辑器/资源管理器会看到“文件已删除”。新内容由下一次读取
+            // 按需水合；有活动句柄时 `is_open` 已经在上面拦住了。
+            if placeholder
+                && !is_dir
+                && (force_rebuild || !same || !metadata_matches(&desired, size, mtime))
+            {
+                match update_placeholder_in_place(&desired, blob, size, mtime) {
+                    Ok(()) => {
+                        note_placed(&desired, blob);
+                        info!(path = %desired.display(), "占位符已原地更新（数据待重新水合）");
+                        return Ok(desired);
+                    }
+                    Err(e) => {
+                        warn!(
+                            path = %desired.display(), error = %e,
+                            "占位符原地更新失败；不删除旧文件，等下一次重试"
+                        );
+                        return Err(e);
+                    }
+                }
             }
             // 文件没变就复用：保留已经水合好的字节，重试只补缺的区间。
             // 目录一律按同名重建（刷新按需填充出来的子树）。
-            if placeholder && !is_dir && metadata_matches(&desired, size, mtime) {
+            if placeholder && !is_dir && same && metadata_matches(&desired, size, mtime) && !force_rebuild {
                 info!(path = %desired.display(), "镜像项与对端一致，复用（保留已水合字节）");
                 note_placed(&desired, blob);
                 return Ok(desired);
@@ -525,6 +683,45 @@ async fn create_placeholder(
 
     // 名字现在不存在：同名新建；碰到 delete-pending / 临时占用就等它释放，**绝不换名**。
     place_same_name(dir, name, blob, size, mtime, is_dir).await
+}
+
+/// 原地更新一个已存在的占位符：换身份、大小、mtime，并把数据标记为需要重新水合。
+///
+/// **不删文件**：编辑器/资源管理器看到的是同一路径上的元数据更新，而不是 delete + create。
+/// 远端新内容由下一次读取按需拉回。要求没有其他活动句柄（`CF_UPDATE_FLAG_DEHYDRATE`
+/// 在文件仍被占用时会失败）——调用方已经用 `is_open` 挡过；失败时返回错误让自动同步退避重试，
+/// 绝不回退到“删掉重建”，否则又会触发编辑器提示文件已删除。
+fn update_placeholder_in_place(
+    path: &Path,
+    blob: &[u8],
+    size: u64,
+    mtime: Option<i64>,
+) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("打开占位符失败: {e}"))?;
+    let handle = HANDLE(file.as_raw_handle() as _);
+    let metadata = fs_metadata(size, mtime, false);
+    unsafe {
+        CfUpdatePlaceholder(
+            handle,
+            Some(&metadata),
+            Some(blob.as_ptr() as *const _),
+            blob.len() as u32,
+            None,
+            CF_UPDATE_FLAG_DEHYDRATE | CF_UPDATE_FLAG_MARK_IN_SYNC,
+            None,
+            None,
+        )
+    }
+    .map_err(|e| format!("原地更新占位符失败: {e:?}"))?;
+    drop(file);
+    Ok(())
 }
 
 /// 用**同一个本地名**放下这一项；同名暂时不可用就等它释放，绝不换名。
@@ -1012,6 +1209,9 @@ fn prepare_children(
             share_id: parent.share_id.clone(),
             path: peer_fs::join_slash(&parent.path, &entry.name),
             is_dir: entry.is_dir,
+            // 目录枚举拿不到 `/stat` 的 rev；真正“打开”这一项时 `place_item` 会
+            // 用新探测到的值重建身份。空串只表示“这一层不知道”，不参与冲突判断。
+            rev: String::new(),
         };
         match child.encode() {
             Ok(blob) => prepared.push((
@@ -1415,6 +1615,7 @@ mod tests {
             share_id: "share-1".into(),
             path: "sub".into(),
             is_dir: true,
+            rev: String::new(),
         };
         let entry = |name: &str, is_dir: bool, size: u64| peer_fs::TreeEntry {
             name: name.into(),

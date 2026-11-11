@@ -4635,5 +4635,106 @@ F2 把"记录里那个名字"播进了设备行的名字格，于是暴露出一
 
 - DAV 的 64 MiB 单次上限不变：`/dav` 继续服务 BC 与第三方 WebDAV；应用内上传走分块数据面。
 - 空目录不传（清单只有文件项），与现有推送一致。
-- 不做写回：上传是"写一次"，没有打开远端文件的编辑回写；那是另一个决策。
+- 编辑回写不在这一节：上传是"写一次"；「打开」后的自动写回见 §49。
 - 安卓作为**接收方**：后端同样自动收下（长连接在线 + 开播），移动端通知卡显示「正在接收 / 已上传」并带目标共享项；不再有冲突选择（恒覆盖）。
+
+## 49. 直接打开远端文件：稳定工作副本 + 双向同步（2026-11-10）
+
+### 入口
+
+设备页的对端文件**双击打开**（右键也有「打开」；「下载到本地」仍在右键菜单里）；目录双击展开，右键「打开」进资源管理器 / Finder。**正在下载的那一行双击仍是暂停/继续**（行标题会写）：下载和打开是两条独立链路，同时跑会抢同一份数据。返回本地真实路径后由前端 `open_path` 交给系统默认程序；成功提示写「已打开（本地副本）。保存后会自动写回；右键可立即重试或强制覆盖。」
+
+### 一个远端项 = 一个稳定本地路径
+
+- **Windows**：CFAPI 占位符，路径仍是 `<镜像根>/<peer>/<share>/<清洗后的名字>`。占位符的 CFAPI 身份 blob 里新增远端 `rev`（见下）；进程重启后先用 `CfGetPlaceholderInfo` 从占位符里读回身份，再决定复用/原地更新——不会因为内存记账为空把同一项误判成另一项。远端内容变了用 `CfUpdatePlaceholder`（`DEHYDRATE | MARK_IN_SYNC`）**原地更新**身份/大小/mtime，下一次读取再按需水合新内容——不删文件、不换 file index，编辑器不会收到“文件已删除”。
+- **macOS**：`mac::open_item` 落到 `<镜像根>/<peer>/<share>/work/<共享项内相对路径>`；没有 CFAPI 的公开等价物。同一版本复用，版本变了**原地写入**同一个文件（先备份旧内容，失败恢复），不 `rename` 替换目录项。
+- **Android / 其它**：`stage_peer_file_for_open` 落到同一个 `work/` 路径，复用 `stream_peer_file_with_progress` 与 `browse://download` 进度；刷新同样原地写入。目录在这些平台没有“占位符”概念，明确要求先下载。
+- 拖出仍走**独立的一次性槽**（Windows 仍用同一占位符 provider；macOS 用 UUID 槽），避免目标程序还捏着上一次那份复制时被覆盖。`work/` 只服务“打开/写回”。
+
+### 同步状态（由事实派生，不落盘）
+
+```text
+dirty_local  = 本地 size/mtime_ms != 登记里的本地基线（或 dirty 标记）
+dirty_remote = 最近探测到的远端 rev != 本地副本基于的 rev
+```
+
+| dirty_local | dirty_remote | 行为 |
+| --- | --- | --- |
+| false | false | `Synced`：等本地保存 / 远端失效 |
+| true | false | `LocalDirty`：本地元数据安静 2s 后条件写回 |
+| false | true | `RemoteDirty`：本地无修改，原地刷新同一路径 |
+| true | true | `Diverged`：冲突，不自动覆盖任何一侧 |
+
+- 本地变化：`mirror::auto` 每 1s 只 stat 登记表里的少量文件；CFAPI 水合不会改 size/mtime，所以不会自己触发自己。
+- 远端变化：长连接 `ShareChanged` → `auto::note_share_changed(share_id)`；下一拍只对该共享项下的工作副本做一次 `/stat`。另保留 60s 兜底探测（老对端/长连接抖动）。
+- 冲突：发一次 `writeback://auto` 的 `conflict` 提示并停下；右键「强制写回」= 用户明确用本地覆盖（`force`，接收端跳过条件提交）；右键「用远端覆盖（本地另存）」= 先把本地修改另存成 `名字 (本地冲突 时间).扩展名`，再强制刷新同一路径。赢回本地干净后自动恢复跟踪。
+- 失败：网络/对端暂时不可用 → `failed` 提示（同一条错误不反复弹）+ 5s→10s→…→5min 退避；副本/路径/文件名不可用 → `blocked`。刷新失败单独用 `refresh-failed`，同样退避。
+
+### 登记与持久化
+
+`mirror::writeback` 的登记**移出镜像根**：`<数据目录>/writeback/journal.json`。每条记录保存
+`(peer, share, path) → 稳定本地路径 + 本地副本基于的远端 rev + 对端大小/毫秒时间戳 + 本地基线`。
+
+- 查找时 canonicalize 后要求仍在**镜像根或 pending 根**下、落在该项自己的 `<peer>/<share>` 目录里、且是普通文件；同坐标或同本地路径的旧登记在重新登记时让位。
+- 运行期不因为某一拍看不到文件就删登记（编辑器原子保存会短暂让路径消失）；启动时 `prune_missing` 清理真正缺失的。
+- `mirror::sweep` 跳过登记过的工作副本（连同它们所在的 `work/` 顶层目录），不会按 6h/24h TTL 把正在编辑的文件删掉。
+- **退出**：Windows `mirror::shutdown()` 在删镜像树前调用 `writeback::export_dirty_pending()`，把未写回的工作副本复制到 `<数据目录>/writeback/pending/<peer>/<share>/…` 并置 `dirty`。重启后自动任务从 pending 续传；写回成功后删 pending 文件与登记。macOS/Android 的工作副本本来就是普通文件，登记与文件都跨重启保留。
+
+### 写回：条件提交
+
+- 打开时记下远端 `rev`（`/stat` 的 `size + mtime 纳秒`，`server::rev_for_metadata`）。
+- 写回前先 `/stat` 一次做**提前提示**；真正的闸门在接收端：上传邀请的 `dest` 带 `baseRev` 与 `expectPath`，接收端在 `finalize()` 原子改名之前重新算目标 `rev`，不一致/目标已删除/变成目录或链接 → 以 `写回冲突` 开头失败，**绝不改名**。旧发送端/旧接收端不再考虑兼容（这些改动未对外）。
+- 上传前把本地副本复制成 `<数据目录>/writeback/staging/<uuid>/<name>` 的稳定快照，真正传的是快照；成功后本地基线取**发起上传时原文件**的 size/mtime_ms，传输期间又改过的副本仍算未写回。
+- 接收端仍走 §48 的分块并发 + 断点续传 + 每块 SHA-256 + `.orbdrop-part` 原子改名；写回只是多一个前置条件。
+- 单文件共享项（`path == ""`）不写回：上传面只能写进共享项目录，写不到共享根那个文件。远端文件名含冒号、Windows 保留设备名、结尾点/空格等接收侧落不了盘的名字也明确拒绝；前导点（`.env` / `.gitignore`）按原名保留。
+
+### 对端更新
+
+打开的是**本地工作副本**，不是网络句柄；对端更新不会直接改编辑器已经打开的缓冲区。
+
+- 本地无修改：自动刷新同一路径（Windows 在没有活动句柄时按同名重建；macOS/Android 原子替换）。编辑器若还开着旧 fd，需要它自己重载；界面发 `refreshed` 提示。
+- 本地有修改：不自动替换，进入 `Diverged`，提示「本地也有修改；写回会冲突」。
+- **不自动替换正在编辑的副本**：编辑器缓冲、外部替换语义不可靠；在用户还开着文件时硬换内容，可能让未保存内容与对端更新互相覆盖。检测到变化只刷新磁盘文件并提示。
+
+### 边界
+
+- 自动同步只在本进程运行期间轮询；保存后至少给 2s 稳定窗口。Windows 正常退出会把未写回副本导出到 pending 后删镜像树；异常被杀时镜像树与登记会留下，下次启动先接上 provider 再 sweep/prune，登记仍能续传。占位符本身已损坏的那部分只能依赖编辑器缓冲。
+- 写回传的是**整份稳定快照**，不是块级 diff：Windows 占位符里还没水合的区间会先从对端拉回来再传回去。改一个小地方也要付一次完整文件的上传时间。
+- 自动检测看本地副本的 size/mtime_ms；编辑器若保存了同样大小且刻意保留时间戳的内容，可能识别不到，右键「写回对端」可立即补上。
+- 写回要求对端已配对、共享项开着广播、且有长连接；对端版本过旧/不在线/磁盘写失败都会在通知卡上报原话，自动任务按退避重试。
+- 移动端目前没有「打开 / 写回」的界面入口：Android 后端路径已就绪（`open_peer_file` + `work/` + 进度 + 写回核心/自动任务），移动端浏览页还没接按钮。
+- 校验：`cargo check --lib` 通过；`cargo test --lib` 618 通过 + 1 既有 ignored（写回登记/稳定路径/冲突后缀/条件提交/自动门控/WS 失效/更新记录单测均通过）；`cargo test --test mirror_hydrate` 通过（含“远端更新后同一 file index 原地刷新、内容更新”断言）、`--test peer_metadata`、`--test p1_integration upload_lands_in_the_peer_share_not_the_download_dir` 通过（含上传归属与本机修改归属断言）；`npm run check` 0 errors / 1 既有 warning，`npm run check:i18n` 通过。真机 UI 的右键与系统默认程序打开未在手边设备上复核；macOS 分支本机没有 Apple SDK，未交叉编译。
+
+## 50. 共享项更新记录（2026-11-11）
+
+### 归属
+
+记录只存在**共享项设备**上。只有它知道谁在写：`/dav` 有调用方 token、`/push/upload` 有 sender、本机 watcher 能看到本地修改。其他设备右键「更新记录」时向共享项设备查询（`GET /history`），不在本地另记一份。
+
+### 记录与归属
+
+- 一条记录：`path, at, actor_id, actor_name, kind(created/modified/deleted), source(local/upload/dav), size?`。
+- watcher 看到变化时先查**短时归属表**：写路径在落盘前登记 `(share, path/前缀) → 设备`，命中就记成该设备，未命中记成本机；同一路径同一批只记最后状态。
+- `/push/upload` 的 `finalize` 在原子改名之前按 `dest.path + 实际落点` 登记 sender；`/dav` 的 `PUT/DELETE/MKCOL` 在 `dispatch` 登记，`MOVE/COPY` 在 `move_response` 同时登记源与目标（目录用前缀匹配子事件）。
+- watcher 的 `debounce_loop` 在广播开关判断**之前**写历史：共享项关播也能回答“谁改过我的文件”。
+- 每共享项 2 万条上限；同一 `path + actor` 2 秒内合并；跳过 `.orbdrop-part` / `.orbdrop-old-*`。落盘 `<数据目录>/share-history.json`，后台 2s 合并写，退出时 flush。
+
+### 查询
+
+- `GET /history?share=&path=&dir=&limit=`：可见性与 `/tree` 相同（存在 + 开播 + 长连接）；文件返回该路径时间线，目录返回前缀下每个文件的**最新一条**（按时间倒序，最多 500 条）。
+- `mine` 由共享项设备按本次调用方算：`actor_id == 调用方 id` 即“本机”。
+- 本机共享项由 Tauri 命令 `share_update_history` 直接读本地；对端共享项由 `peer_fs::fetch_history` 查询共享项设备。
+- 移除共享项时调用 `history.remove_share` 清掉记录。
+
+### 界面
+
+- 本机/对端共享项的文件、目录右键「更新记录…」。
+- 文件：顶部「本机最近更新 / 对端最近更新」，下面时间线（本机/对端徽标 + 设备名 + 创建/修改/删除 + 时间）。
+- 目录：列出有变化的文件（最新一条），点一行查该文件完整时间线；可返回目录。
+- 共享项设备离线/版本不支持时显示错误，不伪造。
+
+### 校验
+
+- `share::history` 单测：本机/归属、精确归属消费、目录只取最新、落盘回读、临时文件过滤、`mine`。
+- `server::routes_history` 单测：长连接对端可见、`mine` 相对调用方。
+- `tests/p1_integration::upload_lands_in_the_peer_share_not_the_download_dir`：上传后记录 actor 为发送方；本机直接改共享文件后记录 actor 为本机。

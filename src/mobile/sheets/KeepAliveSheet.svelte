@@ -120,15 +120,14 @@
     <div class="sec-label"><span>{t("后台保活")}</span></div>
     <div class="card gcard">
       <div class="srow">
-        <div class="srow-top" style="justify-content:space-between;">
+        <div class="srow-top">
           <span class="slabel">{t("电池优化白名单")}</span>
           <span
-            class="slabel"
-            style="flex:none; color:{keepAlive === null
-              ? "var(--muted)"
+            class="slabel side tone-{keepAlive === null
+              ? "muted"
               : keepAlive.batteryOptimizationIgnored
-                ? "var(--accent)"
-                : "var(--warn)"};"
+                ? "accent"
+                : "warn"}"
           >
             {keepAlive === null ? t("读取中…") : keepAlive.batteryOptimizationIgnored ? t("已允许") : t("未允许")}
           </span>
@@ -144,7 +143,7 @@
       </div>
 
       <div class="srow">
-        <div class="srow-top" style="justify-content:space-between;">
+        <div class="srow-top">
           <span class="slabel">{t("自启动 / 关联启动 / 后台活动")}</span>
         </div>
         <p class="shelp">
@@ -156,7 +155,7 @@
       </div>
 
       <div class="srow">
-        <div class="srow-top" style="justify-content:space-between;">
+        <div class="srow-top">
           <span class="slabel">{t("后台耗电管理")}</span>
         </div>
         <p class="shelp">
@@ -173,15 +172,14 @@
     <div class="sec-label"><span>{t("通知")}</span></div>
     <div class="card gcard">
       <div class="srow">
-        <div class="srow-top" style="justify-content:space-between;">
+        <div class="srow-top">
           <span class="slabel">{t("允许通知")}</span>
           <span
-            class="slabel"
-            style="flex:none; color:{notify === null
-              ? "var(--muted)"
+            class="slabel side tone-{notify === null
+              ? "muted"
               : notify.enabled
-                ? "var(--accent)"
-                : "var(--warn)"};"
+                ? "accent"
+                : "warn"}"
           >
             {notify === null ? t("读取中…") : notify.enabled ? t("已允许") : t("未允许")}
           </span>
@@ -193,9 +191,9 @@
       </div>
 
       <div class="srow">
-        <div class="srow-top" style="justify-content:space-between;">
+        <div class="srow-top">
           <span class="slabel">{t("「消息通知」渠道")}</span>
-          <span class="slabel" style="flex:none; color:var(--muted);">
+          <span class="slabel side tone-muted">
             {importanceText(notify?.messageChannelImportance)}
           </span>
         </div>
@@ -210,6 +208,6 @@
   </div>
 
   {#snippet foot()}
-    <button class="btn btn-primary btn-block" type="button" onclick={onClose}>{t("知道了")}</button>
+    <button class="btn btn-primary" type="button" onclick={onClose}>{t("知道了")}</button>
   {/snippet}
 </Sheet>

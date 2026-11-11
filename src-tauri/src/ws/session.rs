@@ -417,6 +417,9 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             path,
             kind,
         } => {
+            // 工作副本的远端失效先于 UI 节流：即使这一条被合并掉，下一次轮询也要
+            // 去问“我打开的这几个文件是不是变了”。
+            crate::mirror::auto::note_share_changed(&share_id);
             // **这条是流量，不是新闻**：对端一次构建能在 300ms 的窗口里发来几百条逐文件事件
             // （实测 1300 条/秒），每一条都记一条日志、发一次 Tauri 事件，前端就每一条重拉一次
             // 整层树。按共享项**前缘节流**（见 `AppState::share_changed_due`）：窗口内第一条

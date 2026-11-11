@@ -149,7 +149,7 @@
     <!-- 从设备行点进来时目标已经定了（`peerId`）：只画这一台，不出整份候选表。
          没给 `peerId`（「配对设备」那颗全局按钮）才列所有候选。 -->
     {#if fixed}
-      <div class="sec-label" style="padding-bottom:0">
+      <div class="sec-label flush">
         <span>{t("目标设备")}</span><span class="num">{t("{n} 台", { n: 1 })}</span>
       </div>
       <div class="stack">
@@ -165,7 +165,7 @@
     {:else}
       <!-- 目标设备这一份就是**设备列表**（候选取自 `visibleDevices`）：名字与头像字都走
            **显示名**（F-101：有备注就是「备注(设备名)」），与设备页那一行同规。 -->
-      <div class="sec-label" style="padding-bottom:0">
+      <div class="sec-label flush">
         <span>{t("目标设备")}</span><span class="num">{t("{n} 台", { n: candidates.length })}</span>
       </div>
       <div class="stack">
@@ -221,9 +221,6 @@
           <span class="code-hint">{t("对方屏幕应显示同一串；不一致就取消这次邀请。")}</span>
         </div>
       {/if}
-      <button class="btn btn-secondary btn-block" type="button" onclick={() => void cancelInvite()}>
-        <Icon name="x" />{t("取消邀请")}
-      </button>
     {:else}
       <button class="btn btn-secondary btn-block" type="button" onclick={() => void invite()}>
         <Icon name="bell" />{t("发起配对邀请")}
@@ -232,9 +229,17 @@
   {/if}
 
   {#snippet foot()}
-    <button class="btn btn-secondary" type="button" onclick={onClose}>{t("关闭")}</button>
-    {#if target}
-      <button class="btn btn-primary" type="button" onclick={() => void confirm()}>{t("确认配对")}</button>
+    <!-- 等待对端确认时就只剩"取消邀请"这一个动作（关闭仍走标题栏的 × / 遮罩）：
+         邀请已经发出，再摆一颗「确认配对」等于把两条路并排摆给用户，底部会堆出两条按钮。 -->
+    {#if waiting}
+      <button class="btn btn-secondary" type="button" onclick={() => void cancelInvite()}>
+        <Icon name="x" />{t("取消邀请")}
+      </button>
+    {:else}
+      <button class="btn btn-secondary" type="button" onclick={onClose}>{t("关闭")}</button>
+      {#if target}
+        <button class="btn btn-primary" type="button" onclick={() => void confirm()}>{t("确认配对")}</button>
+      {/if}
     {/if}
   {/snippet}
 </Sheet>

@@ -39,8 +39,17 @@
     onForget,
     onRemark,
     onPeerDownload,
+    /** 设备页的对端项：用系统默认程序打开（Windows 是 CFAPI 占位符，按需水合）。 */
+    onPeerOpen,
+    /** 设备页的文件：把「打开」后的本地修改写回对端（显式覆盖）。不传/目录/单文件共享根不画。 */
+    onPeerWriteback,
+    /** 设备页的文件：跳过冲突核对，直接用本地副本覆盖对端（用户明确点的强制档）。 */
+    onPeerForceWriteback,
+    onPeerUseRemote,
     /** 设备页的目录：把本机文件/目录上传到这一项（只对目录给；`onPeerUpload` 不传就不画）。 */
     onPeerUpload,
+    /** 共享项（本机或对端）文件/目录：查看更新记录。 */
+    onShareHistory,
     onBcCompare,
     onBcAddLeft,
     onChatCopy,
@@ -91,6 +100,8 @@
      * 都收紧。它会**按菜单实际尺寸把折叠态窗口撑大**（`App.placeOrbMenu`），所以 BC 区
      * （装了 BC 才画）照摆；本机共享项那一份仍不摆「下载到本地」（目录复制到下载目录是另一个
      * 语义，见 `ctxDownload`），设备页那一份的「下载到本地」不受影响。
+     * 也**不摆「更新记录…」与「上传到此文件夹…」**：历史浮层（`UpdateHistory`）与本机文件
+     * 选择框（`FilePicker`）都只长在展开的面板里，折起来时窗口装不下 —— 要用先展开主界面。
      */
     compact?: boolean;
     /**
@@ -129,6 +140,25 @@
     /** 设备 / 一对一会话菜单：改本机给这台设备起的备注（F-101）—— 纯本机动作，任何状态的行都给。 */
     onRemark: () => void;
     onPeerDownload: () => void;
+    /** 设备页的对端项：打开（返回本地路径后由调用方交给系统）。不传 = 不画这一项。 */
+    onPeerOpen?: () => void;
+    /**
+     * 设备页的文件：写回对端。只对**打开过且编辑过**的本地副本有意义；后端会核对打开时的
+     * 对端元数据，变过就拒绝。不传 = 不画这一项。
+     */
+    onPeerWriteback?: () => void;
+    /**
+     * 设备页的文件：强制写回。跳过"对端在打开后变过"的核对，直接用本地副本覆盖；
+     * 仍拒绝目录。不传 = 不画这一项。
+     */
+    onPeerForceWriteback?: () => void;
+    /**
+     * 设备页的文件：冲突时用远端覆盖本地。先把本地修改另存成冲突副本，再刷新同一路径；
+     * 不传 = 不画这一项。
+     */
+    onPeerUseRemote?: () => void;
+    /** 共享项（本机或对端）文件/目录：查看更新记录。不传 = 不画。 */
+    onShareHistory?: () => void;
     /** 设备页的目录：上传到这一项。不传 = 不画这一项（文件行没有"上传到文件里"这回事）。 */
     onPeerUpload?: () => void;
     onBcCompare: () => void;
@@ -294,15 +324,49 @@
       {convoThread ? (convoBc ? t('删除群发（消息留在各设备会话）') : t('退出群聊（本地删除并广播离开）')) : t('清空聊天记录')}
     </button>
   {:else if kind === 'peer'}
+    {#if onPeerOpen}
+      <button class="ctx-item" onclick={() => handleItem(onPeerOpen)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3h7v7"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>
+        {t('打开')}
+      </button>
+    {/if}
+    <!-- 单文件共享项（path 为空）不走写回：上传面只能写进共享项目录，写不到共享根那个文件。 -->
+    {#if onPeerWriteback && !isDir && path}
+      <button class="ctx-item" title={t('立即用本地副本覆盖对端文件；对端在打开后变过就拒绝')} onclick={() => handleItem(onPeerWriteback)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9M7 14l5-5 5 5M5 3h14"/></svg>
+        {t('写回对端')}
+      </button>
+    {/if}
+    {#if onPeerForceWriteback && !isDir && path}
+      <button class="ctx-item danger" title={t('不核对对端是否在打开后变过；用本地副本直接覆盖（可能丢掉对方的修改）')} onclick={() => handleItem(onPeerForceWriteback)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 2 21h20L12 3Z"/><path d="M12 9v6M12 18h.01"/></svg>
+        {compact ? t('强制写回') : t('强制写回（覆盖远端更新）')}
+      </button>
+    {/if}
+    {#if onPeerUseRemote && !isDir && path}
+      <button class="ctx-item" title={t('把本地修改另存为冲突副本，再用对端版本刷新同一个本地路径')} onclick={() => handleItem(onPeerUseRemote)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
+        {compact ? t('用远端覆盖') : t('用远端覆盖（本地另存）')}
+      </button>
+    {/if}
     <!-- 卡片上的这一档已经由页头写着设备名（那一页就是它），文案不再重复一次。 -->
     <button class="ctx-item" onclick={() => handleItem(onPeerDownload)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
       {compact ? t('下载到本地') : peerName ? t('下载到本地 · 来自「{name}」', { name: peerName }) : t('下载到本地')}
     </button>
-    {#if onPeerUpload && isDir}
+    <!-- 卡片这一档不摆「上传到此文件夹…」与「更新记录…」：挑本机文件/目录的选择框、历史浮层
+         都长在**展开的面板**里，折起来时 236×162 的窗口装不下（点了界面也出不来）—— 要用就
+         先展开主界面。面板里那两处入口照旧。 -->
+    {#if onPeerUpload && isDir && !compact}
       <button class="ctx-item" onclick={() => handleItem(onPeerUpload)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9M7 14l5-5 5 5M5 5h14"/></svg>
         {t('上传到此文件夹…')}
+      </button>
+    {/if}
+    {#if onShareHistory && !compact}
+      <button class="ctx-item" onclick={() => handleItem(onShareHistory)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+        {t('更新记录…')}
       </button>
     {/if}
     {#if bcAvailable}{@render bcSection()}{/if}
@@ -325,6 +389,12 @@
       <button class="ctx-item" title={t('复制到其他设备的下载链接；用浏览器打开即开始下载')} onclick={() => onCopyUrl?.()}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3Z"/></svg>
         {compact ? t('复制链接') : t('复制下载链接')}
+      </button>
+    {/if}
+    {#if onShareHistory && !compact}
+      <button class="ctx-item" onclick={() => handleItem(onShareHistory)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+        {t('更新记录…')}
       </button>
     {/if}
     <div class="ctx-sep"></div>

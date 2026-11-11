@@ -202,6 +202,11 @@ async fn probe_entry_reports_what_the_peer_actually_has() {
     assert!(!file.is_dir, "对端说它是文件");
     assert_eq!(file.size, b"file-content".len() as u64, "大小要是真的");
     assert!(file.mtime.is_some(), "修改时间也要带上");
+    assert!(file.rev.is_some(), "/stat 要带条件写回用的 rev");
+    assert!(
+        file.mtime_ms.is_some(),
+        "/stat 要带毫秒时间戳，秒级精度挡不住同一秒内的保存"
+    );
 
     // 越界路径必须报错，不能"看着成功了"到最后复制才失败
     assert!(peer_fs::probe_entry(&client, &base, "t", &share_id, "../x")
@@ -238,6 +243,10 @@ async fn old_peer_without_stat_falls_back_to_parent_listing() {
     assert!(!meta.is_dir, "从父目录列表里读到的是文件");
     assert_eq!(meta.size, 4, "父目录列表里的 size 就是它的大小");
     assert!(meta.mtime.is_some(), "父目录列表里也有修改时间");
+    assert!(
+        meta.rev.is_none(),
+        "没有 /stat 时不能凭空编一个条件写回版本"
+    );
 
     credential::remove_peer(&peer).ok();
     let _ = std::fs::remove_dir_all(&root);

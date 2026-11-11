@@ -22,10 +22,13 @@
 //!   实测：**平台不会为 provider 自己进程**的枚举请求按需填充（本进程 `read_dir` 只看到空的
 //!   本地视图）；枚举者是资源管理器/目标应用时那条路才通 —— 也就是真实场景里的那一个。
 //! - **退出清干净、启动从头建**：注册只在进程活着的时候有意义（我们不在时占位符读不了，
-//!   实测 os error 362），所以退出是"断开连接 → 删镜像树 → 注销同步根"，启动是"注册 + 连接"。
-//!   镜像里的一切都能从对端重建，留着只会留下"有注册、没 provider"的残骸。
+//!   实测 os error 362），所以退出是"把未写回的工作副本导出到 pending → 断开连接 → 删镜像树
+//!   → 注销同步根"，启动是"注册 + 连接"。镜像里能重建的干净项不留；**未写回的编辑**在删除
+//!   之前已经变成 `<数据目录>/writeback/pending` 里的普通文件，下次启动自动续传。
 //!   （注册本身很便宜：实测 1.53 ms；注销是 O(N)，靠"先删树"把它压回常量级。）
-//! - **不注册 `NOTIFY_DELETE` / `NOTIFY_RENAME`**：镜像只读单向，没有要回写对端的状态。
+//! - **不注册 `NOTIFY_DELETE` / `NOTIFY_RENAME` / `NOTIFY_UPDATE`**：写回与远端刷新由
+//!   [`auto`] 的本地元数据轮询 + 长连接 `ShareChanged` 失效驱动；平台变更通知会把
+//!   "目标程序读取/水合"误当成"用户保存"，自己触发自己。
 //!   代价是"用户在镜像里删东西"我们不知道 —— 所以**创建侧一律幂等**：同名同身份直接复用、
 //!   未变化就保留已水合字节；需要刷新时按**同名**重建，名字被占就等它释放（绝不换名）。
 //!   只有同名落点确认是**另一项**（清洗后撞名）才改用不冲突的本地名，绝不删正在读的项。
@@ -50,7 +53,9 @@ use tracing::{info, warn};
 
 use crate::state::AppState;
 
+pub mod auto;
 pub mod identity;
+pub mod writeback;
 
 #[cfg(windows)]
 mod win;
@@ -78,7 +83,8 @@ const CLOSE_GRACE: Duration = Duration::from_secs(60);
 
 /// 后台回收的节拍。回收**不在拖拽路径上**：拖拽路径里做扫描既慢，又会和"刚放好的项"抢同一
 /// 路径（并发拖两个项时，后一个的扫描可能把前一个正在复制的占位符删掉）。
-#[cfg(any(windows, target_os = "macos"))]
+///
+/// 移动端没有拖放，但「打开远端文件」的缓存槽也在镜像根里，同样需要这条回收。
 const SWEEP_INTERVAL: Duration = Duration::from_secs(120);
 
 /// 镜像根：`<数据目录>/mirror`。
@@ -101,23 +107,95 @@ pub struct MirroredItem {
     pub is_dir: bool,
 }
 
+/// 一项放进镜像后的结果：本地路径 + 建它时对端的元数据。
+///
+/// **为什么把元数据带回来**：写回要拿"打开那一刻的对端大小/时间戳"做冲突判据。平台侧
+/// `place` 本来就要问一次对端（占位符必须报真实大小），顺手带回来，写回时不必再猜
+/// "本地这份是不是已经过期"。`size = None` = 当时问不到（老对端/根目录），按未知处理。
+#[derive(Debug, Clone)]
+pub struct PlacedItem {
+    pub path: PathBuf,
+    /// 对端文件大小；目录或问不到时为 `None`。
+    pub size: Option<u64>,
+    /// 对端修改时间（epoch 秒）；问不到时为 `None`。
+    pub mtime: Option<i64>,
+    /// 对端毫秒级修改时间（新对端才有）。
+    pub mtime_ms: Option<i64>,
+    /// 建这份副本时对端的版本标识；`None` = 问不到，写回只能退回大小/时间戳。
+    pub rev: Option<String>,
+    pub is_dir: bool,
+}
+
 /// 把一项镜像到本地：建占位符，返回**交给 `CF_HDROP` 的真实路径**。
 ///
 /// 不下载任何字节；文件的大小与时间戳要问一次对端（占位符必须报真实大小，否则目标会拷出
 /// 0 字节）。大小问不到就报错 —— 由调用方退回旧路径，而不是拿一个 0 字节的镜像糊弄过去。
 pub async fn place(state: &Arc<AppState>, item: &MirroredItem) -> Result<PathBuf, String> {
+    place_with_meta(state, item, false)
+        .await
+        .map(|placed| placed.path)
+}
+
+/// 同 [`place`]，但把建项时拿到的对端元数据一并带回来（写回登记用）。
+///
+/// `refresh` = 用户显式重新打开：若本地副本与对端元数据不一致、且**没有活动句柄**，
+/// 即使刚关掉还在 60s 宽限期里，也按同名重建以取得对端的新内容（拖出保持旧的宽限策略）。
+pub async fn place_with_meta(
+    state: &Arc<AppState>,
+    item: &MirroredItem,
+    refresh: bool,
+) -> Result<PlacedItem, String> {
+    place_with_meta_inner(state, item, refresh, false, false).await
+}
+
+/// 同 [`place_with_meta`]，但**跳过“本地有未写回修改”的拦截**。
+///
+/// 只给“用户明确选择用远端覆盖本地”的冲突处理用：调用方已经先把本地内容另存成冲突副本，
+/// 随后刷新/重建同一个路径。自动同步与普通打开绝不能走这一条。
+pub async fn place_with_meta_force(
+    state: &Arc<AppState>,
+    item: &MirroredItem,
+    refresh: bool,
+) -> Result<PlacedItem, String> {
+    place_with_meta_inner(state, item, refresh, true, true).await
+}
+
+async fn place_with_meta_inner(
+    state: &Arc<AppState>,
+    item: &MirroredItem,
+    refresh: bool,
+    ignore_dirty: bool,
+    force_rebuild: bool,
+) -> Result<PlacedItem, String> {
+    if !item.is_dir && !ignore_dirty {
+        if let Some(opened) =
+            writeback::find_opened(&item.peer_id, &item.share_id, &item.path)
+        {
+            if writeback::local_changed(&opened) {
+                return Err(
+                    "本地副本还有未写回的修改；自动写回完成前不能打开/拖出；如需立即写回请右键「写回对端」"
+                        .to_string(),
+                );
+            }
+        }
+    }
     #[cfg(windows)]
     {
         ensure_ready(state.clone());
-        win::place_item(state, item).await
+        win::place_item(state, item, refresh, force_rebuild).await
     }
     #[cfg(target_os = "macos")]
     {
-        mac::place_item(state, item).await
+        if refresh {
+            mac::open_item(state, item).await
+        } else {
+            let _ = refresh;
+            mac::place_item(state, item).await
+        }
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = (state, item);
+        let _ = (state, item, refresh);
         Err("当前平台没有对端项的拖出实现".into())
     }
 }
@@ -137,12 +215,87 @@ pub fn ensure_ready(state: Arc<AppState>) {
     }
 }
 
+/// 用 `temp` 的内容**原地更新** `target`，保留同一个 inode/目录项。
+///
+/// macOS/Android 的“打开/刷新”走这里：原子 `rename` 会让编辑器看到 inode 被替换（很多
+/// 编辑器会提示“文件已被删除/移动”）。原地写入看到的是同一个文件被修改。
+///
+/// 写之前先把旧内容备份到同目录的隐藏文件；写入/落盘失败时恢复旧内容，避免把半截文件
+/// 留在最终路径上（那会被自动写回当成用户编辑传回对端）。成功后才删备份与临时文件。
+#[cfg(not(windows))]
+pub(crate) async fn replace_file_in_place(temp: &Path, target: &Path) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    if !target.exists() {
+        return tokio::fs::rename(temp, target)
+            .await
+            .map_err(|e| format!("工作副本落位失败: {e}"));
+    }
+    let meta = tokio::fs::symlink_metadata(target)
+        .await
+        .map_err(|e| format!("工作副本不可用: {e}"))?;
+    if !meta.is_file() || crate::unsendable::is_link(&meta.file_type()) {
+        return Err("工作副本不是普通文件，拒绝原地覆盖".into());
+    }
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "work".into());
+    let backup = target
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{name}.orbdrop-old-{}", uuid::Uuid::new_v4()));
+    tokio::fs::copy(target, &backup)
+        .await
+        .map_err(|e| format!("备份旧工作副本失败: {e}"))?;
+    let write = async {
+        let mut src = tokio::fs::File::open(temp).await?;
+        let mut dst = tokio::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(target)
+            .await?;
+        tokio::io::copy(&mut src, &mut dst).await?;
+        dst.flush().await?;
+        dst.sync_all().await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+    match write {
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(&backup).await;
+            let _ = tokio::fs::remove_file(temp).await;
+            Ok(())
+        }
+        Err(e) => {
+            // 恢复旧内容；恢复失败也只能如实报错（此时文件可能已经不完整）。
+            let _ = tokio::fs::copy(&backup, target).await;
+            let _ = tokio::fs::remove_file(&backup).await;
+            let _ = tokio::fs::remove_file(temp).await;
+            Err(format!("写入工作副本失败（已尝试恢复原内容）: {e}"))
+        }
+    }
+}
+
 /// 退出时注销同步根。
 ///
 /// 不做这一步会留下"有同步根、没有 provider"的目录：里面的占位符在别的程序看来是坏文件。
 pub fn shutdown() {
     #[cfg(windows)]
-    win::shutdown();
+    {
+        // 镜像树马上要被删掉：先把未写回的编辑复制成普通文件，放进数据目录的 pending。
+        // 这一步必须在 `win::shutdown` 断开 provider 之前做——断开之后占位符就读不出内容了。
+        let failed = writeback::export_dirty_pending();
+        if failed > 0 {
+            warn!(
+                failed,
+                "有未写回的副本无法导出；保留镜像树与同步根注册，等下次启动恢复"
+            );
+            // 删树会丢编辑，注销会让占位符读不回来；只断开 provider。
+            win::disconnect();
+        } else {
+            win::shutdown();
+        }
+    }
 }
 
 /// 一项在进程内的生命周期记账。四张表由同一把锁保护，判据才不会读到互相矛盾的状态。
@@ -225,6 +378,13 @@ pub fn known_identity(path: &Path) -> Option<Vec<u8>> {
     LIFE.lock().unwrap().identities.get(&key).cloned()
 }
 
+/// 这一项（精确路径）此刻是否有**活动句柄**。与 [`is_busy`] 不同：不把"刚关掉 60s 内"
+/// 算作占用。显式重新打开时用它决定能不能为刷新而重建占位符。
+pub fn is_open(path: &Path) -> bool {
+    let key = normalize(&path.to_string_lossy());
+    LIFE.lock().unwrap().open.contains_key(&key)
+}
+
 /// 这一项（或它目录下任意子项）此刻还有目标在读写，或刚刚才关掉句柄。
 ///
 /// `create_placeholder` 用它决定"能不能删掉重建"：正在读的项一律复用/换名，
@@ -258,6 +418,9 @@ pub fn sweep() {
     let Ok(peers) = std::fs::read_dir(&root) else {
         return; // 还没放过东西
     };
+    // 「打开」的工作副本不是一次性暂存：远端版本变化时它还要原地刷新。整库扫一遍
+    // 登记表（条目很少），命中就跳过；否则 6h/24h 的 TTL 会把用户正在编辑的那份删掉。
+    let protected = writeback::registered_paths();
     for peer in peers.flatten() {
         let Ok(shares) = std::fs::read_dir(peer.path()) else {
             continue;
@@ -268,6 +431,14 @@ pub fn sweep() {
             };
             for item in items.flatten() {
                 let path = item.path();
+                // 登记过的工作副本（含它所在的 `work/` 顶层目录）一律不回收。
+                let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if protected.iter().any(|entry| {
+                    crate::unsendable::is_equal_or_under(&canon, entry)
+                        || crate::unsendable::is_equal_or_under(entry, &canon)
+                }) {
+                    continue;
+                }
                 if !reclaimable(&path) {
                     continue;
                 }
@@ -333,8 +504,9 @@ fn should_reclaim(path: &Path, life: &Lifecycle, now: Instant) -> bool {
 }
 
 /// 启动后台周期回收。启动时由调用方先同步 [`sweep`] 一次，之后按 [`SWEEP_INTERVAL`] 收。
+///
+/// 全平台都跑：桌面拖放与移动端「打开」的缓存槽共用镜像根。
 pub fn start_sweeper() {
-    #[cfg(any(windows, target_os = "macos"))]
     crate::task::spawn("mirror sweep", async {
         loop {
             tokio::time::sleep(SWEEP_INTERVAL).await;

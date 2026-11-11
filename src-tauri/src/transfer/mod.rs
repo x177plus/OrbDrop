@@ -61,6 +61,21 @@ pub struct UploadDest {
     pub path: String,
     #[serde(default)]
     pub share_name: String,
+    /// 自动写回等后台同步：发送/接收两侧都不弹通知卡，只留失败/冲突提示。
+    #[serde(default)]
+    pub silent: bool,
+    /// 写回的条件提交：只有当前远端 `rev` 与它一致才允许原子改名。
+    ///
+    /// 普通上传为 `None`（无条件覆盖，语义不变）；写回把它设为打开副本时记下的版本。
+    /// 接收端在 `finalize` 里以它为准，发送端上传前那次 `/stat` 只用于提前提示。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_rev: Option<String>,
+    /// 这份前置条件属于共享项里的哪一项（清单路径，`/` 分隔）。
+    ///
+    /// 接收端用它把 `base_rev` 绑到唯一一个落点；对不上就拒绝整条邀请，避免把前置条件
+    /// 当成探测共享项里其他路径的工具。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_path: Option<String>,
 }
 
 /// 上传到共享项时的同名冲突策略（只对 `dest.is_some()` 的邀请有意义）。
@@ -386,6 +401,52 @@ pub struct PushSource {
 pub async fn manifest_for_named_paths(
     items: &[(PathBuf, Option<String>)],
 ) -> Result<PushSource, String> {
+    manifest_for_named_paths_trusting(items, None).await
+}
+
+/// 写回源与登记路径的比较：Windows 大小写不敏感，其它平台逐字节。
+///
+/// 两侧都来自本机（登记表 + 调用方传入的同一个 canonical 路径），不做 canonicalize，
+/// 避免在清单走查里多一次逐段解析。
+fn same_path(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
+/// 写回源放行的两道闸门：镜像目录与数据目录。
+///
+/// `trusted` 只对**登记表交回来的那一份镜像副本**为 true（调用方已确认路径完全相等且
+/// canonical 落在镜像根下）。其余路径一律按原规则拒绝。
+fn data_dir_source_allowed(
+    path: &Path,
+    trusted: bool,
+    own_data_dir: &Path,
+    mirror_root: &Path,
+) -> Result<(), String> {
+    if crate::unsendable::is_mirror_path(path, mirror_root) && !trusted {
+        return Err("镜像目录（拖放用的本地占位符）不能推送".into());
+    }
+    // 数据目录**整棵子树**都不行：只挡"数据目录本身"会漏掉 `credentials.dat` 这类
+    // （见 `unsendable::is_own_data_path`），那等于直接把本机凭据推给对端。
+    // 写回是唯一例外，而且只放行登记表交回来的那一份副本（`trusted`）。
+    if crate::unsendable::is_own_data_path(path, own_data_dir) && !trusted {
+        return Err("OrbDrop 自己的数据目录不能推送（里面是本机的设置与凭据）".into());
+    }
+    Ok(())
+}
+
+/// 同 [`manifest_for_named_paths`]，但允许 `trusted_source` 这一个**完全相等**的路径
+/// 来自镜像/数据目录（写回专用）。其余路径的闸门一个不少。
+async fn manifest_for_named_paths_trusting(
+    items: &[(PathBuf, Option<String>)],
+    trusted_source: Option<&Path>,
+) -> Result<PushSource, String> {
     if items.is_empty() {
         return Err("没有可推送的文件".into());
     }
@@ -394,7 +455,17 @@ pub async fn manifest_for_named_paths(
         // 单源：清单名**就是**那条路径（见 `is_dir` 那段），所以覆盖名要在这里就给出去 ——
         // 对端"只认名字与大小"那条单文件路拿的正是它。
         let (path, rename) = &items[0];
-        shown_name_of(path, rename.as_deref())
+        let trusted = trusted_source.is_some_and(|trusted| same_path(trusted, path));
+        if trusted {
+            // 写回：名字是**对端已存在的原名**，只过了 `safe_join` 口径的校验；
+            // 不能再过一遍会吃掉前导点的跨平台净化（`.gitignore` → `gitignore`）。
+            rename
+                .clone()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| file_name_of(path))
+        } else {
+            shown_name_of(path, rename.as_deref())
+        }
     } else {
         common_parent_name(&items.iter().map(|(p, _)| p).collect::<Vec<_>>())
             .unwrap_or_else(|| format!("{} 项", items.len()))
@@ -426,18 +497,20 @@ pub async fn manifest_for_named_paths(
         if crate::unsendable::is_system_name(&base, crate::unsendable::sits_in_volume_root(path)) {
             return Err(format!("「{base}」是系统自己的目录/文件，不能推送"));
         }
-        if crate::unsendable::is_mirror_path(path, &crate::mirror::root()) {
-            return Err("镜像目录（拖放用的本地占位符）不能推送".into());
-        }
-        // 数据目录**整棵子树**都不行：只挡"数据目录本身"会漏掉 `credentials.dat` 这类
-        // （见 `unsendable::is_own_data_path`），那等于直接把本机凭据推给对端。
-        if crate::unsendable::is_own_data_path(path, &own_data_dir) {
-            return Err("OrbDrop 自己的数据目录不能推送（里面是本机的设置与凭据）".into());
-        }
+        let trusted = trusted_source.is_some_and(|trusted| same_path(trusted, path));
+        data_dir_source_allowed(path, trusted, &own_data_dir, &crate::mirror::root())?;
         // 同名去重：`C:\a\报告.txt` 与 `D:\b\报告.txt` 不能在清单里撞成同一条路径
         // （Windows 的文件名比较本来就大小写不敏感，比对时照此办理）。
         // 去重比的是**对端看到的名字**：覆盖名（下面 `shown`）才是写进清单的那一个。
-        let shown = shown_name_of(path, rename.as_deref());
+        let shown = if trusted {
+            // 见上面单源那段的解释：写回名是远端原名，保留前导点/合法字符。
+            rename
+                .clone()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| file_name_of(path))
+        } else {
+            shown_name_of(path, rename.as_deref())
+        };
         let mut prefix = shown.clone();
         let mut n = 2;
         while used.iter().any(|u| u.eq_ignore_ascii_case(&prefix)) {
@@ -667,7 +740,7 @@ pub async fn push_paths(
     names: Option<Vec<String>>,
     at: Option<u64>,
 ) -> Result<push_job::BatchView, String> {
-    push_paths_with_dest(state, paths, peer_ids, names, at, None).await
+    push_paths_with_dest(state, paths, peer_ids, names, at, None, None).await
 }
 
 /// 发送方：把本机一批文件/目录**上传到对端的一个共享项目录**。
@@ -696,6 +769,68 @@ pub async fn upload_to_share(
         names,
         None,
         Some(dest),
+        None,
+    )
+    .await
+}
+
+/// 写回专用：只允许**一个**已经登记过的本地副本作为源，上传到对端共享项里的父目录，
+/// 用对端原名覆盖。
+///
+/// `local` 必须来自 `mirror::writeback::find_opened`（写回命令已经校验），调用方不要把
+/// 任意路径传进来；这个 `trusted_source` 会让清单那两道"镜像/数据目录不能推送"的闸门
+/// 对这一份放行。名字仍要过同一套跨平台净化 —— 写回命令已经先拒绝会被改名的项。
+pub async fn upload_to_share_from_mirror(
+    state: Arc<AppState>,
+    peer_id: String,
+    dest: UploadDest,
+    local: PathBuf,
+    name: String,
+) -> Result<push_job::BatchView, String> {
+    if dest.share_id.is_empty() || !crate::ids::is_segment(&dest.share_id) {
+        return Err("共享项 id 不合法".into());
+    }
+    if !crate::server::safe_relative_share_path(&dest.path) {
+        return Err("上传目录不合法".into());
+    }
+    // 不止信调用方：真正读字节之前再确认一次这是镜像根下的普通文件。登记表本身已做过
+    // 同样的检查，这里是第二道（`upload_to_share_from_mirror` 是 pub，不能被误用成
+    // "任意数据目录文件都能上传"）。
+    let local = tokio::fs::canonicalize(&local)
+        .await
+        .map_err(|e| format!("写回源不可用: {e}"))?;
+    // 可接受的源：镜像里的工作副本、退出前抢救出来的 pending、以及本轮上传的 staging 快照。
+    // 不把整个 `<数据目录>/writeback` 放进来：登记文件本身不该出现在上传源里。
+    let mut trusted = false;
+    for root in [
+        crate::mirror::root(),
+        crate::mirror::writeback::pending_root(),
+        crate::mirror::writeback::staging_root(),
+    ] {
+        if let Ok(root) = tokio::fs::canonicalize(&root).await {
+            if crate::unsendable::is_equal_or_under(&local, &root) {
+                trusted = true;
+                break;
+            }
+        }
+    }
+    if !trusted {
+        return Err("写回源必须是本机镜像/待写回目录里的副本".into());
+    }
+    let meta = tokio::fs::symlink_metadata(&local)
+        .await
+        .map_err(|e| format!("写回源不可用: {e}"))?;
+    if !meta.is_file() || crate::unsendable::is_link(&meta.file_type()) {
+        return Err("写回源不是普通文件".into());
+    }
+    push_paths_with_dest(
+        state,
+        vec![local.to_string_lossy().into_owned()],
+        vec![peer_id],
+        Some(vec![name]),
+        None,
+        Some(dest),
+        Some(local),
     )
     .await
 }
@@ -707,6 +842,8 @@ async fn push_paths_with_dest(
     names: Option<Vec<String>>,
     at: Option<u64>,
     dest: Option<UploadDest>,
+    // 仅写回用：这一份本地副本已经过登记表校验，允许从镜像/数据目录读字节。
+    trusted_source: Option<PathBuf>,
 ) -> Result<push_job::BatchView, String> {
     // 逐位对齐是**调用方的契约**：长度对不上说明界面把两条表拼错了，与其按错位的名字发出去
     // （对端落盘的文件名全是别人的），不如当场拒绝。
@@ -750,7 +887,8 @@ async fn push_paths_with_dest(
     }
 
     let roots: Vec<PathBuf> = items.iter().map(|(p, _)| p.clone()).collect();
-    let source = manifest_for_named_paths(&items).await?;
+    let source =
+        manifest_for_named_paths_trusting(&items, trusted_source.as_deref()).await?;
     if source.files.is_empty() {
         return Err("没有可推送的文件".into());
     }
@@ -968,7 +1106,12 @@ async fn push_paths_with_dest(
 
     // 这批里有**OrbDrop**台在等对方点头（`Invited`）→ 盯住这次推的源：源一变，这批当场作废。
     // LocalSend 目标不走源监视（它没有可续的 job，客户端自己会失败）。
-    if has_orbdrop_pending && state.push.batch_has_invited(&batch_id) {
+    // 写回（`trusted_source`）不挂：源是镜像里的副本，接收端来拉时会触发占位符水合，
+    // 那种读/元数据刷新在 `notify` 眼里可能像"源变了"，把一趟正常写回误取消。
+    if has_orbdrop_pending
+        && trusted_source.is_none()
+        && state.push.batch_has_invited(&batch_id)
+    {
         watch::watch_sources(&state, &batch_id, &roots);
     }
 
@@ -1397,6 +1540,24 @@ pub fn accept_invite(
         resolve_upload_conflicts(&mut invite, &dir, policy)?;
         invite.conflict = policy;
         invite.root = None;
+        // 写回的条件提交必须绑定到清单里**唯一**一项；否则一份邀请可以拿别人的
+        // `baseRev` 去探测共享项里的其他路径。
+        if let Some(expected) = dest.expect_path.as_deref() {
+            if dest.base_rev.is_none() {
+                return Err("写回前置条件缺少版本".into());
+            }
+            if !crate::server::safe_relative_share_path(expected) {
+                return Err("写回前置路径不合法".into());
+            }
+            let hits = invite
+                .files
+                .iter()
+                .filter(|file| file.path == expected)
+                .count();
+            if hits != 1 {
+                return Err("写回前置条件没有唯一匹配的清单项".into());
+            }
+        }
     } else if let Some(base) = root.as_deref() {
         // 目录选择框给的一定是绝对路径；不是就不接（相对路径会挂在进程当前目录上，
         // 落哪儿全凭启动方式，谁也不想要这种"接收方"）。
@@ -1808,6 +1969,26 @@ mod tests {
         dir
     }
 
+    /// 镜像/数据目录这两个闸门只有**登记过的那一份写回源**能过；普通文件照旧放行，
+    /// 未登记的镜像路径照旧拒绝。
+    #[test]
+    fn only_a_trusted_mirror_copy_bypasses_the_data_dir_guards() {
+        let root = temp_dir("guard");
+        let mirror = root.join("mirror");
+        let copy = mirror.join("peer").join("share").join("a.txt");
+        assert!(data_dir_source_allowed(&copy, false, &root, &mirror).is_err());
+        assert!(
+            data_dir_source_allowed(&copy, true, &root, &mirror).is_ok(),
+            "登记过的镜像副本是写回的唯一例外"
+        );
+
+        let normal = temp_dir("guard_normal").join("a.txt");
+        assert!(data_dir_source_allowed(&normal, false, &root, &mirror).is_ok());
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(normal.parent().unwrap()).unwrap();
+    }
+
     /// 一台有共享项（`share-1`，指向 `<temp>/share`）的 AppState。
     fn upload_state(tag: &str) -> (Arc<AppState>, PathBuf) {
         let dir = temp_dir(tag);
@@ -1832,6 +2013,9 @@ mod tests {
             share_id: "share-1".into(),
             path: path.into(),
             share_name: String::new(),
+            silent: false,
+            base_rev: None,
+            expect_path: None,
         }
     }
 

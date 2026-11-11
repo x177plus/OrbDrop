@@ -79,8 +79,8 @@
   label={t("编辑收件人")}
   onClose={onClose}
 >
-  <!-- 原型在底板里给这行去掉了底边距（`.sheet-body` 自己用 gap 排），照抄它那份 inline。 -->
-  <div class="sec-label" style="padding-bottom:0">
+  <!-- 底板里这行不留自己的下边距（`.sheet-body` 的 gap 已经排了），走 `.flush` 这一档。 -->
+  <div class="sec-label flush">
     <span>{t("参与设备")}</span><span class="num">{t("已选 {n} 台", { n: picked.length })}</span>
   </div>
   {#if candidates.length === 0}

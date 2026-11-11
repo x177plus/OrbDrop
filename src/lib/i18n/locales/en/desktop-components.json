@@ -144,5 +144,7 @@
   "进入「{name}」": "Open “{name}”",
   "发送文件": "Send files",
   "LocalSend 设备在线：可以发消息或文件，文件由对方确认后接收。": "LocalSend device is online: you can send messages or files; files are received after confirmation.",
-  "LocalSend 设备当前离线：它重新出现后会恢复在线。": "The LocalSend device is offline right now; it will come back online when it reappears."
+  "LocalSend 设备当前离线：它重新出现后会恢复在线。": "The LocalSend device is offline right now; it will come back online when it reappears.",
+  "双击打开「{name}」": "Double-click to open “{name}”",
+  "双击展开「{name}」": "Double-click to expand “{name}”"
 }

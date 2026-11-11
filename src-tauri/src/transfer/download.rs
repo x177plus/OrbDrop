@@ -79,6 +79,10 @@ struct FileWork {
     rel: String,
     size: u64,
     mtime: i64,
+    /// 写回条件提交：改名之前目标必须仍是这个 `rev`。
+    expected_rev: Option<String>,
+    /// 上传到共享项时的历史相对路径（`dest.path` + 实际落点）；普通推送为 `None`。
+    history_path: Option<String>,
     /// 最终落盘路径 / 临时文件路径（都在 `<下载目录>/<发送方名>/…` 下）。
     target: PathBuf,
     part: PathBuf,
@@ -133,6 +137,10 @@ struct Session {
     state: Arc<AppState>,
     peer_id: String,
     invite_id: String,
+    /// 上传到共享项时的目标共享项 id；普通推送为 `None`。
+    dest_share_id: Option<String>,
+    /// 发送方自报的设备名（历史记录展示用；优先用地址簿里的当前名字）。
+    peer_name: String,
     callback: Option<(String, u16)>,
     base_url: String,
     /// 实际拨号的主机字面量（`base_url` 里的那个）：按它建目标信任表。
@@ -344,6 +352,34 @@ impl Session {
                 .map_err(|e| format!("打开临时文件失败: {e}"))?;
             f.sync_all().await.map_err(|e| format!("落盘失败: {e}"))?;
         }
+        // **写回的条件提交**：直到改名前的最后一刻才核对目标版本。发送端上传前那次
+        // `/stat` 只能提前提示；如果对端在这之后、本轮传输期间又改过或删了文件，
+        // 这里必须把它拦下——目标路径上永远不能出现“基于旧版本写上去”的内容。
+        if let Some(expected) = fw.expected_rev.as_deref() {
+            if let Err(reason) = check_target_rev(&fw.target, expected).await {
+                fw.failed.store(true, Ordering::SeqCst);
+                return Err(reason);
+            }
+        }
+
+        // 先把“这次落盘是谁写的”登记给 watcher；它在 rename 之后的 300ms 批次里会看到这条路径。
+        if let (Some(share_id), Some(rel)) = (&self.dest_share_id, &fw.history_path) {
+            let name = self
+                .state
+                .get_peer(&self.peer_id)
+                .map(|peer| peer.name)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| self.peer_name.clone());
+            self.state.history.attribute(
+                share_id,
+                rel,
+                &self.peer_id,
+                &name,
+                "upload",
+                crate::share::history::UPLOAD_ATTRIBUTION_TTL,
+            );
+        }
+
         // 同卷 rename = 原子替换（Windows 上 std 用的是 `MOVEFILE_REPLACE_EXISTING`）：
         // 目标路径上永远是"旧的完整文件"或"新的完整文件"，没有中间态。
         tokio::fs::rename(&fw.part, &fw.target)
@@ -888,10 +924,24 @@ async fn run(
         received += rec.done_bytes();
         state.push.resume.save_file(&key, rec.clone());
 
+        let expected_rev = invite.dest.as_ref().and_then(|dest| {
+            // 条件只绑在唯一一个清单项上；`accept_invite` 已经校验 `expect_path` 必须
+            // 正好命中一项，这里再按清单路径取值。
+            (dest.expect_path.as_deref() == Some(entry.path.as_str()))
+                .then(|| dest.base_rev.clone())
+                .flatten()
+        });
+        let history_path = invite
+            .dest
+            .as_ref()
+            .map(|dest| crate::peer_fs::join_slash(&dest.path, local_rel));
+
         let fw = Arc::new(FileWork {
             rel: entry.path.clone(),
             size: entry.size,
             mtime: entry.mtime,
+            expected_rev,
+            history_path,
             target,
             part,
             key,
@@ -949,6 +999,8 @@ async fn run(
         state: state.clone(),
         peer_id: peer_id.clone(),
         invite_id: invite.invite_id.clone(),
+        dest_share_id: invite.dest.as_ref().map(|dest| dest.share_id.clone()),
+        peer_name: invite.sender.name.clone(),
         callback: callback.clone(),
         base_url,
         dial_host,
@@ -1268,6 +1320,38 @@ fn clear_bit(bits: &str, index: u32) -> String {
     out
 }
 
+/// 写回条件提交的最终核对：目标必须仍是 `expected` 版本。
+///
+/// 抽成独立函数是为了让单测能在不启动整条下载会话的情况下钉住“版本不符/目标被删/变成
+/// 目录或链接”这三档；`finalize` 只负责在原子改名之前调用它。
+async fn check_target_rev(target: &std::path::Path, expected: &str) -> Result<(), String> {
+    match tokio::fs::symlink_metadata(target).await {
+        Ok(meta) if meta.is_file() && !crate::unsendable::is_link(&meta.file_type()) => {
+            let current = crate::server::rev_for_metadata(&meta);
+            if current == expected {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{}：对端文件在写回期间已变化（当前 {current}，期望 {expected}）",
+                    crate::mirror::writeback::CONFLICT_MARKER
+                ))
+            }
+        }
+        Ok(_) => Err(format!(
+            "{}：对端目标已变成目录或链接",
+            crate::mirror::writeback::CONFLICT_MARKER
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "{}：对端文件已被删除或改名",
+            crate::mirror::writeback::CONFLICT_MARKER
+        )),
+        Err(e) => Err(format!(
+            "{}：无法读取对端目标（{e}）",
+            crate::mirror::writeback::CONFLICT_MARKER
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1280,6 +1364,8 @@ mod tests {
             rel: rel.into(),
             size,
             mtime: 0,
+            expected_rev: None,
+            history_path: None,
             target: dir.join(format!("orbdrop_dl_test_{rel}")),
             part: dir.join(format!("orbdrop_dl_test_{rel}.part")),
             key: format!("key-{rel}"),
@@ -1305,6 +1391,8 @@ mod tests {
             state,
             peer_id: "device-test".into(),
             invite_id: "inv-test".into(),
+            dest_share_id: None,
+            peer_name: String::new(),
             callback: None,
             base_url: String::new(),
             dial_host: String::new(),
@@ -1464,5 +1552,43 @@ mod tests {
             .await
             .expect("放开闸门后 worker 应当退出")
             .expect("worker 不应 panic");
+    }
+
+    /// 条件提交：目标没变才放行；内容/版本/存在形态任何一项变了都必须拒绝。
+    #[tokio::test]
+    async fn conditional_commit_rejects_a_changed_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "orbdrop_cond_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("a.txt");
+        std::fs::write(&target, b"old").unwrap();
+        let rev = crate::server::rev_for_metadata(&std::fs::metadata(&target).unwrap());
+        check_target_rev(&target, &rev)
+            .await
+            .expect("版本没变应放行");
+
+        // 同大小、不同 mtime 也必须是一个新版本。
+        std::fs::write(&target, b"new").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&target).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() + Duration::from_secs(2)),
+        )
+        .unwrap();
+        let err = check_target_rev(&target, &rev).await.unwrap_err();
+        assert!(err.contains(crate::mirror::writeback::CONFLICT_MARKER), "{err}");
+
+        // 目标被删/变成目录：同样是冲突，不是“创建新文件”。
+        std::fs::remove_file(&target).unwrap();
+        let err = check_target_rev(&target, &rev).await.unwrap_err();
+        assert!(err.contains(crate::mirror::writeback::CONFLICT_MARKER), "{err}");
+
+        std::fs::create_dir_all(&target).unwrap();
+        let err = check_target_rev(&target, &rev).await.unwrap_err();
+        assert!(err.contains(crate::mirror::writeback::CONFLICT_MARKER), "{err}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

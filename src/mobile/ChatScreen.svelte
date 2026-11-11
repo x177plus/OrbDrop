@@ -626,10 +626,14 @@
     {/if}
   </span>
   <div class="cb-main">
-    <span class="cb-title">{title}</span>
-    {#if localSendThread}
-      <span class="state-chip localsend" style="flex:none; font-size:9px; padding:1px 5px" title="LocalSend">LS</span>
-    {/if}
+    <span class="cb-line">
+      <span class="cb-title">{title}</span>
+      {#if localSendThread}
+        <!-- 协议徽标跟着名字走（与桌面端 `.conv-headline` 同一个排法）；`.cb-main` 是 grid，
+             不套这一层的话它会单独占一行、把标题与状态行挤开。 -->
+        <span class="state-chip localsend" title="LocalSend">LS</span>
+      {/if}
+    </span>
     <span class="cb-sub"><i class="cv-dot {dot} {trusted ? 'solid' : 'hollow'}"></i>{sub}</span>
   </div>
   <!-- 左边那格槽的**镜像**：会话名是在「左右两格之间的剩余空间」里居中的，左边多出 34u 的话

@@ -196,6 +196,9 @@ a { color: inherit; text-decoration: none; }
   padding: 0 2px calc(8 * var(--u)); font-size: var(--fs-xs); font-weight: 620; color: var(--muted); letter-spacing: .01em;
 }
 .sec-label .num { font-family: var(--font-mono); font-weight: 400; }
+/* 底板里的分组标题：`.sheet-body` 已经用 12u 的 grid gap 排版，标题自己的 8u 下边距
+   会把首行推远。`.flush` 就是"这层空白由容器给"。 */
+.sec-label.flush { padding-bottom: 0; }
 .stack { display: grid; gap: 2px; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); }
 .card.list { overflow: hidden; }
@@ -265,6 +268,8 @@ a { color: inherit; text-decoration: none; }
 .cv-mode .ic { width: calc(11 * var(--u)); height: calc(11 * var(--u)); }
 .cv-mode.bc { background: var(--bc-soft); color: var(--bc-deep); }
 .cv-mode.grp { background: var(--accent-soft); color: var(--accent-deep); }
+/* LocalSend 是另一种协议，不是第三种会话模式：用中性色（与桌面端 `.convo-mode-chip.ls` 同义）。 */
+.cv-mode.ls { background: var(--fg-soft); color: var(--muted); }
 .cv-dot { flex: none; width: calc(7 * var(--u)); height: calc(7 * var(--u)); border-radius: 50%; background: rgba(14, 18, 23, 0.24); }
 .cv-dot.ok { background: var(--ok); }
 .cv-dot.warn { background: var(--warn); }
@@ -309,7 +314,9 @@ a { color: inherit; text-decoration: none; }
    的空白"，而不是"名字前面多出来的一截"）。居中必须靠 `text-align` 而不是 `justify-items: center`：
    后者会让名字按内容宽度摆（`max-content`），长名字就不再省略、直接盖到右边那颗 ⋮ 上。 */
 .cb-main { flex: 1; min-width: 0; display: grid; gap: 2px; text-align: center; }
-.cb-title { font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 620; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 名字与协议徽标同排（徽标跟着名字，不另占一行）：整组在 `.cb-main` 里居中。 */
+.cb-line { display: flex; align-items: center; justify-content: center; gap: calc(6 * var(--u)); min-width: 0; }
+.cb-title { min-width: 0; font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 620; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cb-sub { display: flex; align-items: center; justify-content: center; gap: calc(6 * var(--u)); font-size: calc(11 * var(--u)); color: var(--muted); }
 /* 会话子屏头顶那颗「别处还等着几条」（返回箭头右边，见 ChatScreen 里那段说明）：
    配色与 `.cv-unread`、底栏「会话」角标同一档（蓝 = 有人在跟你说话 / 有东西等你）——
@@ -364,13 +371,13 @@ a { color: inherit; text-decoration: none; }
 .bubble.media > .fbub-row > .fbub { padding: calc(9 * var(--u)) calc(12 * var(--u)); }
 .ctext { display: block; white-space: pre-wrap; }
 .meta { margin-top: calc(4 * var(--u)); font-family: var(--font-mono); font-size: calc(10 * var(--u)); color: var(--muted); }
-.who { display: flex; align-items: center; gap: calc(5 * var(--u)); margin: 0 2px calc(4 * var(--u)); }
+.who { display: flex; align-items: center; gap: calc(5 * var(--u)); max-width: 100%; min-width: 0; margin: 0 2px calc(4 * var(--u)); }
 .who .who-av {
   flex: none; width: calc(18 * var(--u)); height: calc(18 * var(--u)); border-radius: calc(6 * var(--u));
   display: grid; place-items: center; color: #fff;
   font-family: var(--font-display); font-size: calc(10 * var(--u)); font-weight: 700;
 }
-.who .who-nm { font-family: var(--font-display); font-size: calc(11 * var(--u)); font-weight: 620; }
+.who .who-nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-display); font-size: calc(11 * var(--u)); font-weight: 620; }
 .who.sp-1 .who-av { background: var(--sp-1-deep); }
 .who.sp-1 .who-nm { color: var(--sp-1-deep); }
 .who.sp-2 .who-av { background: var(--sp-2-deep); }
@@ -423,7 +430,9 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 }
 .rc-head { font-size: calc(11 * var(--u)); color: var(--muted); }
 .rc-list { display: flex; flex-wrap: wrap; gap: calc(6 * var(--u)); }
-.rc-dev { display: inline-flex; align-items: center; gap: calc(5 * var(--u)); height: calc(24 * var(--u)); padding: 0 calc(8 * var(--u)) 0 calc(4 * var(--u)); border-radius: 99px; background: var(--fg-soft); font-size: calc(11 * var(--u)); }
+/* 收件回执是一排胶囊：设备名可能很长，超出卡片时要省略，不能把整张回执顶宽。 */
+.rc-dev { display: inline-flex; align-items: center; gap: calc(5 * var(--u)); max-width: 100%; min-width: 0; height: calc(24 * var(--u)); padding: 0 calc(8 * var(--u)) 0 calc(4 * var(--u)); border-radius: 99px; background: var(--fg-soft); font-size: calc(11 * var(--u)); }
+.rc-nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rc-dev .rc-av { flex: none; width: calc(16 * var(--u)); height: calc(16 * var(--u)); border-radius: calc(5 * var(--u)); display: grid; place-items: center; font-size: calc(9 * var(--u)); font-weight: 700; background: var(--accent-soft); color: var(--accent-deep); }
 .rc-dev .ic { width: calc(12 * var(--u)); height: calc(12 * var(--u)); }
 .rc-dev.ok .rc-ic { color: var(--ok); }
@@ -604,6 +613,8 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 /* ─────────────────────────── files · browse ─────────────────────────── */
 .chips { display: flex; gap: calc(8 * var(--u)); overflow-x: auto; padding: 2px 0 calc(6 * var(--u)); scrollbar-width: none; }
 .chips::-webkit-scrollbar { display: none; }
+/* 设备筛选条与它下面的列表/目录卡之间要留出原型那 8u（`.chips` 自己只到 6u）。 */
+.chips + .card { margin-top: calc(8 * var(--u)); }
 .node { width: 100%; display: flex; align-items: center; gap: calc(11 * var(--u)); padding: calc(11 * var(--u)) calc(12 * var(--u)); text-align: left; }
 /* 每个节点外面套一层 `.noderow`：分割线跟着这一层走；文件行右侧留出圆环那一格
    （`DownloadRing` 绝对定位盖在行上面，行高与目录行完全一致）。 */
@@ -653,15 +664,37 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .drow.is-pressing { background: var(--fg-soft); }
 .state-chip { flex: none; display: inline-flex; align-items: center; gap: calc(5 * var(--u)); height: calc(22 * var(--u)); padding: 0 calc(8 * var(--u)); border-radius: 99px; background: var(--fg-soft); color: var(--muted); font-size: calc(10 * var(--u)); font-weight: 600; }
 .state-chip.unbound { background: var(--fg-soft); color: var(--muted); }
+/* 会话标题里的 LocalSend 协议缩写：比设备行上的状态胶囊再小一档，别把名字挤掉。 */
+.state-chip.localsend { font-size: calc(9 * var(--u)); padding: 0 calc(5 * var(--u)); }
 .dacts { flex: none; display: flex; align-items: center; gap: calc(4 * var(--u)); }
 
 /* ─────────────────────────── settings ─────────────────────────── */
 .gcard { overflow: hidden; }
 .srow { display: grid; gap: calc(5 * var(--u)); padding: calc(13 * var(--u)) calc(14 * var(--u)); }
 .srow + .srow { border-top: 1px solid var(--border); }
-.srow-top { display: flex; align-items: center; gap: calc(12 * var(--u)); }
+/* 设置行：左边标题、右边控件（开关 / 小按钮）各在一头 —— 全项目的 srow-top 都是这个结构，
+   不再逐行写 inline `justify-content`。只有一个孩子时与 flex-start 等价。 */
+.srow-top { display: flex; align-items: center; justify-content: space-between; gap: calc(12 * var(--u)); }
 .slabel { flex: 1; min-width: 0; font-size: var(--fs-md); }
-.shelp { margin: 0; font-size: var(--fs-xs); color: var(--muted); line-height: 1.55; }
+/* 行尾的状态字（已允许 / 未允许 / 通知级别）：不参与"占满剩余宽度"，只按内容宽。 */
+.slabel.side { flex: none; }
+.shelp { margin: 0; overflow-wrap: anywhere; font-size: var(--fs-xs); color: var(--muted); line-height: 1.55; }
+/* 等待卡 + 取消动作（设备页的长连接请求）：这一档不在底板里，`.sec` 没有 grid gap，
+   卡片与按钮要自己隔开 —— 与底板里 `.opt` 和按钮的 12u 同一档。 */
+.waitbox { display: grid; gap: calc(12 * var(--u)); }
+/* 状态说明 + 行内重试按钮：说明占满剩余宽度，按钮不被文字挤掉。 */
+.shelp-row { display: flex; align-items: flex-start; gap: calc(8 * var(--u)); }
+.shelp-row .shelp { min-width: 0; }
+.shelp-row .btn { flex: none; }
+/* 文案语义色（原来散在各组件的 inline `color:var(--…)` 里）：只给文字，不参与布局。 */
+.tone-ok { color: var(--ok); }
+.tone-accent { color: var(--accent); }
+.tone-warn { color: var(--warn); }
+.tone-danger { color: var(--danger); }
+.tone-muted { color: var(--muted); }
+/* 进度条（设置页与更新底板共用；`i` 的宽度由组件按百分比给）。 */
+.pbar { height: calc(6 * var(--u)); border-radius: calc(3 * var(--u)); background: var(--fg-soft); overflow: hidden; }
+.pbar > i { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .15s linear; }
 .input {
   width: 100%; height: calc(42 * var(--u)); padding: 0 calc(12 * var(--u));
   border: 1px solid var(--border); border-radius: calc(11 * var(--u));
@@ -739,10 +772,14 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .sheet-grip { flex: none; width: calc(38 * var(--u)); height: calc(4 * var(--u)); border-radius: 99px; background: rgba(14, 18, 23, 0.18); margin: calc(10 * var(--u)) auto calc(4 * var(--u)); }
 .sheet-head { flex: none; padding: calc(6 * var(--u)) calc(20 * var(--u)) calc(4 * var(--u)); display: flex; align-items: flex-start; gap: calc(12 * var(--u)); }
 .sheet-head .sht { flex: 1; min-width: 0; display: grid; gap: calc(3 * var(--u)); }
-.sheet-title { margin: 0; font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.015em; }
-.sheet-desc { margin: 0; font-size: var(--fs-xs); color: var(--muted); line-height: 1.55; }
+/* 标题可能是文件名 / 设备名（`FileActionsSheet`、`DeviceActionsSheet`）：长串没有空格时
+   允许在任意位置断开，别把标题顶出底板右边缘。 */
+.sheet-title { margin: 0; overflow-wrap: anywhere; font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.015em; }
+.sheet-desc { margin: 0; overflow-wrap: anywhere; font-size: var(--fs-xs); color: var(--muted); line-height: 1.55; }
 .sheet-body { flex: 1; min-height: 0; overflow-y: auto; padding: calc(12 * var(--u)) calc(20 * var(--u)) calc(22 * var(--u)); display: grid; gap: calc(12 * var(--u)); align-content: start; scrollbar-width: none; }
 .sheet-body::-webkit-scrollbar { display: none; }
+/* 有底部动作栏时，滚动区自己的下边距交给 `.sheet-foot` 的顶部内边距，别叠成一大段空白。 */
+.sheet.has-foot .sheet-body { padding-bottom: calc(12 * var(--u)); }
 /* 卡片（`overflow: hidden` —— 行底色要贴着圆角裁）在 `.sheet-body` 这个 grid 里**不贡献内容高度**：
    实测（Chromium，与安卓 WebView 同一套布局）`.card.list` 里 150 行一共 19501px，卡片自己塌成
    26.9px，于是 `.sheet-body` 的 `scrollHeight == clientHeight` —— **整段列表既看不见也滚不动**。
@@ -752,16 +789,27 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
    为什么"别的底板没碰上"：它们的长列表直接摆在 `.sheet-body` 里（`.stack` / `.pick`），
    用 `.card.list` 包的都只有空状态那两三行。 */
 .sheet-body > .card { height: max-content; }
-.sheet-foot { display: flex; gap: calc(10 * var(--u)); }
-.sheet-foot .btn { flex: 1; }
+/* 底部动作栏：钉在底板下沿，和滚动内容用一条分隔线断开。只有一个按钮时它占满整行
+   （`.sheet-foot .btn` 的 flex:1），不再需要组件另挂 `.btn-block`。 */
+.sheet-foot {
+  flex: none; display: flex; gap: calc(10 * var(--u));
+  padding: calc(12 * var(--u)) calc(20 * var(--u)) calc(14 * var(--u));
+  border-top: 1px solid var(--border); background: var(--surface);
+}
+/* 没有 body 的底板（确认框）：分隔线上方就是标题，别再压一条线。 */
+.sheet-head + .sheet-foot { border-top: 0; }
+.sheet-foot .btn { flex: 1; min-width: 0; }
 
 .opt { display: flex; gap: calc(11 * var(--u)); padding: calc(12 * var(--u)); border: 1px solid var(--border); border-radius: calc(13 * var(--u)); text-align: left; }
-.opt:hover { background: var(--fg-soft); }
+/* 只有真的能点的 `.opt` 才吃悬停底：等待/说明那一档是 `<div>`，别画成可按的。 */
+button.opt:hover { background: var(--fg-soft); }
 .opt .oi { flex: none; width: calc(34 * var(--u)); height: calc(34 * var(--u)); border-radius: calc(10 * var(--u)); display: grid; place-items: center; }
 .opt .oi .ic { width: calc(19 * var(--u)); height: calc(19 * var(--u)); }
 .opt .om { flex: 1; min-width: 0; display: grid; gap: 2px; }
-.opt .on { font-size: var(--fs-md); font-weight: 620; }
-.opt .od { font-size: var(--fs-xs); color: var(--muted); line-height: 1.5; }
+/* 选项标题/说明里可能夹着设备名或备注（没有空格的英文串）：允许任意位置断行，
+   否则一条长名字会把 `.opt` 卡片顶宽。 */
+.opt .on { overflow-wrap: anywhere; font-size: var(--fs-md); font-weight: 620; }
+.opt .od { overflow-wrap: anywhere; font-size: var(--fs-xs); color: var(--muted); line-height: 1.5; }
 .opt.danger { border-color: rgb(229, 183, 180); }
 .opt.danger .oi { background: var(--danger-soft); color: var(--danger-deep); }
 .opt.danger .on { color: var(--danger-deep); }

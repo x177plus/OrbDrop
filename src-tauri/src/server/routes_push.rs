@@ -327,29 +327,30 @@ pub async fn push_upload_invite_handler(
         path = %dest.path, "inbound upload invite (auto-accept, http)"
     );
 
-    // 界面照旧收到一条“正在接收”的通知：上传不再需要用户点任何东西，但写进了哪个
-    // 共享项、收了多少字节仍然要看得见（审计的第一层）。
-    crate::ws::emit_ui(
-        &state,
-        crate::ws::events::ui::PUSH_INVITE,
-        &serde_json::json!({
-            "inviteId": invite_id,
-            "sender": { "id": caller, "name": display_name },
-            "name": invite.name,
-            "size": invite.size,
-            "isDir": invite.is_dir,
-            "count": invite.count,
-            "auto": true,
-            "at": at,
-            "upload": true,
-            // 接收方以本机配置里的名字为准；报文里的 dest 只提供 id 与相对目录。
-            "dest": {
-                "shareId": dest.share_id,
-                "path": dest.path,
-                "shareName": share_name,
-            },
-        }),
-    );
+    // 界面通知：自动写回（`dest.silent`）两端都不弹卡；普通上传仍显示写入位置。
+    if !dest.silent {
+        crate::ws::emit_ui(
+            &state,
+            crate::ws::events::ui::PUSH_INVITE,
+            &serde_json::json!({
+                "inviteId": invite_id,
+                "sender": { "id": caller, "name": display_name },
+                "name": invite.name,
+                "size": invite.size,
+                "isDir": invite.is_dir,
+                "count": invite.count,
+                "auto": true,
+                "at": at,
+                "upload": true,
+                // 接收方以本机配置里的名字为准；报文里的 dest 只提供 id 与相对目录。
+                "dest": {
+                    "shareId": dest.share_id,
+                    "path": dest.path,
+                    "shareName": share_name,
+                },
+            }),
+        );
+    }
 
     state.push.insert_invite(invite);
     if let Err(reason) = accept_invite(
@@ -796,6 +797,9 @@ mod tests {
                 share_id: share.into(),
                 path: "sub".into(),
                 share_name: String::new(),
+                silent: false,
+                base_rev: None,
+                expect_path: None,
             }),
         };
         let call = |headers: HeaderMap, body: InviteBody| {
@@ -836,6 +840,19 @@ mod tests {
         // 模拟这台设备的长连接（`register` 之后 `has_connection` 为真）。
         let (tx, _rx) = tokio::sync::mpsc::channel::<crate::ws::events::WsEvent>(8);
         st.ws.register("peer-up", tx);
+
+        // 条件提交必须绑定到清单里唯一一项；随便指一个别的路径要当场拒绝。
+        let mut mismatch = body("peer-up", "share-up");
+        if let Some(dest) = mismatch.dest.as_mut() {
+            dest.base_rev = Some("7-18f".into());
+            dest.expect_path = Some("other.txt".into());
+        }
+        let err = call(headers.clone(), mismatch).await.unwrap_err();
+        assert_eq!(
+            err.0,
+            StatusCode::BAD_REQUEST,
+            "expect_path 没有唯一匹配的清单项"
+        );
 
         let err = call(headers.clone(), body("peer-up", "share-nope"))
             .await

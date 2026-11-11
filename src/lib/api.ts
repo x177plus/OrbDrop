@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, PickedFile, InstalledApp, ChatFileMsg, ChatSnapshot, InboxEntry, SavedFile, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState, LocalSendStatus, AndroidShareState, AndroidShareRoot, AndroidShareListing } from './types';
+import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, PickedFile, InstalledApp, ChatFileMsg, ChatSnapshot, InboxEntry, SavedFile, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState, LocalSendStatus, AndroidShareState, AndroidShareRoot, AndroidShareListing, ShareUpdateEntry } from './types';
 import type { ScreenMetrics, ScreenRect } from './orbLayout';
 
 // Share management
@@ -693,6 +693,88 @@ export function downloadFile(shareId: string, pathInShare: string): Promise<stri
 
 export function downloadFromPeer(peerId: string, shareId: string, pathInShare: string, fileName?: string): Promise<string | null> {
   return invoke('download_from_peer', { peerId, shareId, pathInShare, fileName: fileName ?? null });
+}
+
+/**
+ * 打开对端的一项：返回本机可交给系统默认程序的真实路径。
+ *
+ * Windows 是 CFAPI 占位符（起开零字节、按需水合），macOS 先整份暂存，Android 暂存到镜像根的
+ * 缓存槽（同一项复用）。打开的是本地副本；保存后由后台自动写回（`mirror::auto`），
+ * `writebackPeerFile` 是右键立即重试/强制的入口。
+ */
+export function openPeerFile(
+  peerId: string,
+  shareId: string,
+  pathInShare: string,
+  name?: string,
+  isDir?: boolean,
+): Promise<string> {
+  return invoke('open_peer_file', {
+    peerId,
+    shareId,
+    pathInShare,
+    name: name ?? null,
+    isDir: isDir ?? null,
+  });
+}
+
+/**
+ * 手动立即写回（右键「写回对端」/「强制写回」）。保存后的自动写回由后台轮询负责，
+ * 不需要调用这个命令。
+ *
+ * 后端用打开时登记的副本与对端元数据做冲突判断：对端在打开后变过、副本已被回收、或
+ * 是单文件共享项/接收侧落不了盘的文件名都会拒绝。`force = true` 跳过冲突核对（仍拒绝目录），
+ * 对应用户明确点的「强制写回」。只支持文件，不支持目录。
+ */
+export function writebackPeerFile(
+  peerId: string,
+  shareId: string,
+  pathInShare: string,
+  shareName?: string,
+  force = false,
+): Promise<void> {
+  return invoke('writeback_peer_file', {
+    peerId,
+    shareId,
+    pathInShare,
+    shareName: shareName ?? null,
+    force,
+  });
+}
+
+/**
+ * 冲突处理：`useLocal = true` 用本地副本强制覆盖对端；`false` 先把本地修改另存成
+ * `名字 (本地冲突 时间).扩展名`，再刷新成远端版本，返回另存路径（本来就没修改时为空串）。
+ */
+export function resolveWritebackConflict(
+  peerId: string,
+  shareId: string,
+  pathInShare: string,
+  useLocal: boolean,
+): Promise<string> {
+  return invoke('resolve_writeback_conflict', {
+    peerId,
+    shareId,
+    pathInShare,
+    useLocal,
+  });
+}
+
+/** 读取共享项更新记录。`peerId = null` 读本机共享项；否则向共享项设备查询。 */
+export function shareUpdateHistory(
+  peerId: string | null,
+  shareId: string,
+  pathInShare: string,
+  isDir: boolean,
+  limit = 200,
+): Promise<ShareUpdateEntry[]> {
+  return invoke('share_update_history', {
+    peerId,
+    shareId,
+    pathInShare,
+    isDir,
+    limit,
+  });
 }
 
 /** 暂停 / 继续一次对端浏览下载；`false` = 那条下载已经结束。 */

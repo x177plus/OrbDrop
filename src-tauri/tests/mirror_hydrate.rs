@@ -43,6 +43,7 @@ fn remote_share_dir() -> PathBuf {
     std::fs::write(dir.join("big.bin"), big_payload()).unwrap();
     std::fs::write(dir.join("cancel.bin"), cancel_payload()).unwrap();
     std::fs::write(dir.join("small.txt"), SMALL).unwrap();
+    std::fs::write(dir.join("refresh.bin"), SMALL).unwrap();
     std::fs::write(dir.join("empty.bin"), b"").unwrap();
     std::fs::write(dir.join("sub").join("a.txt"), SUB_A).unwrap();
     std::fs::write(dir.join("sub").join("b.bin"), SUB_B).unwrap();
@@ -79,6 +80,20 @@ fn on_disk_bytes(path: &std::path::Path) -> u64 {
         .collect();
     let low = unsafe { GetCompressedFileSizeW(PCWSTR(wide.as_ptr()), None) };
     low as u64
+}
+
+/// 文件身份（卷内 file index）：原地更新必须保持不变；删了重建会变。
+fn file_index(path: &std::path::Path) -> (u32, u32) {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    let file = std::fs::File::open(path).expect("打开文件取身份");
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(HANDLE(file.as_raw_handle() as _), &mut info)
+            .expect("GetFileInformationByHandle");
+    }
+    (info.nFileIndexHigh, info.nFileIndexLow)
 }
 
 use std::os::windows::ffi::OsStrExt;
@@ -245,9 +260,60 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
         .unwrap()
         .expect("再读一次");
     assert_eq!(second, big_payload(), "第二次读的字节同样要一致");
+    // 重新打开保护拿"本地副本的大小/mtime 与打开时是否不同"判断有没有未写回的编辑；
+    // 平台水合**不能**改这两个值，否则读过一次的文件会被误判成"改过"。
+    let after_hydration = std::fs::metadata(&local).expect("水合后占位符应当存在");
+    assert_eq!(
+        after_hydration.len(),
+        meta.len(),
+        "水合不应改变占位符的逻辑大小"
+    );
+    assert_eq!(
+        after_hydration.modified().ok(),
+        meta.modified().ok(),
+        "水合不应改变占位符 mtime（重新打开保护依赖它）"
+    );
     // 水合之后平台会不会把本地副本留在盘上，是策略/平台的账（我们开了 AUTO_DEHYDRATION_ALLOWED，
     // 它可以在读完之后自己脱水）——所以这里只记录、不断言。
     println!("水合后 磁盘上的大小 = {} 字节", on_disk_bytes(&local));
+
+    // ---- 1.5 远端更新：同一路径原地刷新，不删除重建 ----
+    //
+    // 用户的编辑器会因为“删掉再拉”提示文件已删除。这里钉住：刷新走 `CfUpdatePlaceholder`
+    // （同一 file index、同一目录项），内容由下一次读取重新水合。
+    let refresh_item = MirroredItem {
+        peer_id: peer.clone(),
+        share_id: share_id.clone(),
+        path: "refresh.bin".into(),
+        name: "refresh.bin".into(),
+        is_dir: false,
+    };
+    let refresh_local = mirror::place(&state, &refresh_item)
+        .await
+        .expect("放 refresh.bin");
+    let _ = std::fs::read(&refresh_local).expect("先水合一次");
+    let index_before = file_index(&refresh_local);
+    let updated = b"updated from peer (same file, new bytes)";
+    std::fs::write(share_root.join("refresh.bin"), updated).expect("改远端文件");
+    // 让 CFAPI 的 close 回调把“刚才那次读”记成已关闭；否则刷新可能误以为还有活动句柄。
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let refreshed = mirror::place_with_meta(&state, &refresh_item, true)
+        .await
+        .expect("原地刷新占位符");
+    assert_eq!(
+        refreshed.path, refresh_local,
+        "刷新必须还是同一个本地路径"
+    );
+    assert_eq!(
+        file_index(&refresh_local),
+        index_before,
+        "刷新不能删掉重建：file index 必须保持不变"
+    );
+    assert_eq!(
+        std::fs::read(&refresh_local).expect("读刷新后的占位符"),
+        updated,
+        "刷新后的读取必须拿到远端的新内容"
+    );
 
     // ---- 2.5 平台撤销过的那一段，随后还得能拉回来 ----
     //
@@ -461,10 +527,14 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
         .unwrap()
         .expect("先读一遍原内容");
     assert_eq!(first, b"first version");
+    // 等 CFAPI 的 CLOSE 回调落账：模拟"用户关掉编辑器后马上重新打开"。这时 `is_busy`
+    // 还处在 60s 宽限期里，显式打开必须绕过它、按同名重建拿到新内容。
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     std::fs::write(&change_remote, b"second version, longer").unwrap();
-    let rebuilt = mirror::place(&state, &change_item)
+    let rebuilt = mirror::place_with_meta(&state, &change_item, true)
         .await
-        .expect("对端内容变化后仍要能放（同名重建）");
+        .expect("对端内容变化后显式重新打开要刷新")
+        .path;
     assert_eq!(rebuilt, change_local, "同一项内容变化也只能沿用原名");
     let rebuilt_path = rebuilt.clone();
     let second = tokio::task::spawn_blocking(move || std::fs::read(&rebuilt_path))

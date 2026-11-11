@@ -75,6 +75,12 @@ async fn dispatch(
     // `.`/`./`/空串都指向共享项根；`resolve_within` 会把 `.` 直接跳过。只按字符串是否为空
     // 判断会漏掉 `.`，而 `DELETE /dav/<id>/.` 会在 `remove_dir_all` 里删掉整个共享根。
     let root_request = is_share_root_path(&rel_path);
+    // 写/删/建目录前登记归属：watcher 300ms 内就会看到这些路径。
+    if !root_request
+        && matches!(method.as_str(), "PUT" | "DELETE" | "MKCOL")
+    {
+        attribute_peer(&state, &caller, &share_id, &rel_path);
+    }
     let result = match method.as_str() {
         "OPTIONS" => Ok(options_response()),
         "PROPFIND" => propfind_response(&share_id, &rel_path, &target, &headers).await,
@@ -92,8 +98,32 @@ async fn dispatch(
         )),
         "DELETE" => delete_response(&target).await,
         "MKCOL" => mkcol_response(&target).await,
-        "MOVE" => move_response(&share_id, &share.path, &target, &headers, false).await,
-        "COPY" => move_response(&share_id, &share.path, &target, &headers, true).await,
+        "MOVE" => {
+            move_response(
+                &state,
+                &caller,
+                &share_id,
+                &rel_path,
+                &share.path,
+                &target,
+                &headers,
+                false,
+            )
+            .await
+        }
+        "COPY" => {
+            move_response(
+                &state,
+                &caller,
+                &share_id,
+                &rel_path,
+                &share.path,
+                &target,
+                &headers,
+                true,
+            )
+            .await
+        }
         "PROPPATCH" => Ok(propstat_response(
             &share_id,
             &rel_path,
@@ -122,6 +152,26 @@ async fn dispatch(
 
 const ALLOW_METHODS: &str =
     "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, COPY";
+
+/// 对端通过 WebDAV 写/删/移动时，在 watcher 看到之前登记归属。
+fn attribute_peer(state: &AppState, caller: &Caller, share_id: &str, path: &str) {
+    let Caller::Peer(peer_id) = caller else {
+        return; // 本机回环 DAV 由 watcher 默认记成本机
+    };
+    let name = state
+        .get_peer(peer_id)
+        .map(|peer| peer.name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| peer_id.clone());
+    state.history.attribute(
+        share_id,
+        path,
+        peer_id,
+        &name,
+        "dav",
+        crate::share::history::ATTRIBUTION_TTL,
+    );
+}
 
 /// `PUT` 的请求体上限（`Content-Length` 预检 + 流上硬截断都用它）。
 ///
@@ -661,7 +711,10 @@ async fn delete_response(target: &Path) -> Result<Response, (StatusCode, String)
 
 /// MOVE / COPY：Destination 头可以是绝对 URI 或绝对路径，都解析回同一命名空间。
 async fn move_response(
+    state: &Arc<AppState>,
+    caller: &Caller,
     share_id: &str,
+    source_rel: &str,
     root: &Path,
     target: &Path,
     headers: &HeaderMap,
@@ -686,6 +739,9 @@ async fn move_response(
     }
     let dest =
         resolve_within(root, &dest_rel).map_err(|status| (status, "目标路径不可用".to_string()))?;
+    // 目录移动/复制会触发子路径的 watcher 事件：登记的是前缀，`HistoryStore` 会按前缀匹配。
+    attribute_peer(state, caller, share_id, source_rel);
+    attribute_peer(state, caller, share_id, &dest_rel);
     let overwrite = !matches!(
         headers.get("overwrite").and_then(|v| v.to_str().ok()),
         Some("F")
@@ -1059,10 +1115,25 @@ mod tests {
     async fn move_and_copy_refuse_overlapping_paths_without_deleting_data() {
         let root = fixture_root();
         let hello = root.join("hello.txt");
+        let state = Arc::new(AppState::new(
+            crate::config::test_config(),
+            std::env::temp_dir().join(format!("orbdrop_dav_cfg_{}.toml", uuid::Uuid::new_v4())),
+        ));
+        let caller = Caller::Local;
 
         // 自身 MOVE：无操作，文件必须还在。
         let status = Box::pin(async {
-            move_response("s", &root, &hello, &destination("/hello.txt"), false).await
+            move_response(
+                &state,
+                &caller,
+                "s",
+                "hello.txt",
+                &root,
+                &hello,
+                &destination("/hello.txt"),
+                false,
+            )
+            .await
         })
         .await
         .unwrap()
@@ -1073,7 +1144,17 @@ mod tests {
         // 文件移到它的祖先目录：拒绝，源与子目录都还在。
         let nested = root.join("sub").join("nested.txt");
         let status = Box::pin(async {
-            move_response("s", &root, &nested, &destination("/sub"), false).await
+            move_response(
+                &state,
+                &caller,
+                "s",
+                "sub/nested.txt",
+                &root,
+                &nested,
+                &destination("/sub"),
+                false,
+            )
+            .await
         })
         .await
         .unwrap_err()
@@ -1084,7 +1165,10 @@ mod tests {
         // COPY 到自己的子目录：拒绝，且不产生递归副本。
         let status = Box::pin(async {
             move_response(
+                &state,
+                &caller,
                 "s",
+                "sub",
                 &root,
                 &root.join("sub"),
                 &destination("/sub/copy"),

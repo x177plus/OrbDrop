@@ -49,7 +49,7 @@
       </span>
     </div>
     {#if invite.unproven}
-      <p class="field-hint" style="color:var(--warn)">
+      <p class="field-hint tone-warn">
         {t("这台设备自称是本机已配对的设备，但没能出示凭据（它可能只是换了地址，也可能不是）。接受前请确认对方身份。")}
       </p>
     {/if}
@@ -59,7 +59,7 @@
         <span class="code-hint">{t("和对方屏幕上的这串一致再点「接收」；不一致请拒绝。")}</span>
       </div>
     {:else}
-      <p class="field-hint" style="color:var(--warn)">
+      <p class="field-hint tone-warn">
         {t("对方版本过旧，无法核对身份；建议拒绝并改用配对码。")}
       </p>
     {/if}

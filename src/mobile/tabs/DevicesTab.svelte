@@ -149,7 +149,7 @@
        写法与配对表里的「取消邀请」同款（`.opt` + 一颗次级整宽按钮），不另造一套视觉。
        `link://request_result` / `link://request_closed` 回来时这一档自己会收掉。 -->
   {#if linkWait}
-    <div class="sec">
+    <div class="sec waitbox">
       <div class="opt">
         <span class="oi"><Icon name="link" /></span>
         <span class="om">
