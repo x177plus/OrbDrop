@@ -19,8 +19,8 @@
   import * as chat from '$lib/stores/chat.svelte';
   import type { ConvoThread, ChatItem } from '$lib/stores/chat.svelte';
   import * as upd from '$lib/stores/update.svelte';
-  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, setPushReceivePaused, pushPaths, uploadToShare, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, forgetPeer, downloadFromPeer, downloadFile, shareDownloadUrl, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
-  import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem, PeerTransport, UploadDest } from '$lib/types';
+  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, setPushReceivePaused, pushPaths, uploadToShare, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, forgetPeer, downloadFromPeer, openPeerFile, writebackPeerFile, resolveWritebackConflict, shareUpdateHistory, downloadFile, shareDownloadUrl, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
+  import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem, PeerTransport, UploadDest, ShareUpdateEntry } from '$lib/types';
   import { shareMeta, updateStatusText, updateTitleText } from '$lib/types';
   import { adoptLanguagePreference, t } from '$lib/i18n.svelte';
   import { isImageName } from '$lib/composer';
@@ -36,6 +36,7 @@
   import ContextMenu from '$lib/components/ContextMenu.svelte';
   import ConvoPanel from '$lib/components/ConvoPanel.svelte';
   import RecipientDialog from '$lib/components/RecipientDialog.svelte';
+  import UpdateHistory from '$lib/components/UpdateHistory.svelte';
   import Hint from '$lib/components/Hint.svelte';
   import UpdateNotes from '$lib/components/UpdateNotes.svelte';
   import HintLayer from '$lib/components/HintLayer.svelte';
@@ -149,6 +150,21 @@
   // 派 `od:ctx` 事件（见 `handleCtx`），卡片那一档直接调 `openRectCtx`。
   type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer' | 'chat' | 'convo'; el?: HTMLElement; shareId?: string; shareName?: string; path?: string; isDir?: boolean; size?: number; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; name?: string; chatId?: string; chatFull?: string; chatSel?: string; convoKey?: string; convoPeerId?: string; convoThread?: boolean; convoBc?: boolean; convoBrowse?: boolean; orb?: boolean; placed?: boolean; menuW?: number; menuH?: number };
   let ctxState = $state<CtxState | null>(null);
+
+  type HistoryPanel = {
+    open: boolean;
+    loading: boolean;
+    error: string | null;
+    title: string;
+    path: string;
+    isDir: boolean;
+    entries: ShareUpdateEntry[];
+    peerId: string | null;
+    shareId: string;
+    parent: { path: string; title: string } | null;
+  };
+  let historyPanel = $state<HistoryPanel | null>(null);
+  let historySeq = 0;
   /**
    * 折叠态卡片上那个右键菜单是不是开着（`ctxState.orb`，见 `openRectCtx`）。
    *
@@ -3113,6 +3129,169 @@
   }
 
   /**
+   * 打开一项对端文件/目录（右键「打开」与双击共用同一条路）。
+   *
+   * Windows 是 CFAPI 占位符（起开几乎零成本，目标读哪段才拉哪段）；macOS/Android 会先
+   * 暂存整份（Android 有 `browse://download` 进度，macOS 暂存期间只有"正在准备"提示）。
+   * 打开的是本地副本；保存后由 `mirror::auto` 在元数据稳定 2s 后自动写回，右键「写回对端」
+   * 可立即重试，对端在打开后变过则拒绝（「强制写回」才覆盖）。
+   */
+  async function openPeerEntry(entry: { peerId: string; shareId: string; path: string; name?: string; isDir?: boolean }) {
+    try {
+      toast(t('正在准备「{name}」…', { name: entry.name ?? '' }));
+      const local = await openPeerFile(entry.peerId, entry.shareId, entry.path, entry.name, entry.isDir);
+      await openPath(local);
+      toast(
+        !entry.isDir && entry.path
+          ? t('已打开（本地副本）。保存后会自动写回；右键可立即重试或强制覆盖。')
+          : t('已打开（本地副本）。'),
+      );
+    } catch (e) {
+      toast(t('打开失败：{error}', { error: String(e) }));
+    }
+  }
+
+  /** 设备页右键「打开」。 */
+  function ctxPeerOpen() {
+    const c = ctxState;
+    hideCtx();
+    if (!c || c.kind !== 'peer' || !c.peerId || !c.shareId) return;
+    void openPeerEntry({ peerId: c.peerId, shareId: c.shareId, path: c.path ?? '', name: c.name, isDir: c.isDir });
+  }
+
+  /**
+   * 设备页右键「写回对端」/「强制写回」：把打开后编辑过的本地副本覆盖回对端原文件。
+   *
+   * 安全默认（`force=false`）：后端先核对对端的大小/时间戳是否仍与打开时一致，不一致就拒绝。
+   * 强制档只跳过这项核对，仍走同一条上传链路；两档都要等这一批传完才报「已写回」。
+   * 上传进度/成败在会话通知区那张批次卡里。
+   */
+  async function runPeerWriteback(force: boolean) {
+    const c = ctxState;
+    hideCtx();
+    if (!c || c.kind !== 'peer' || !c.peerId || !c.shareId || c.isDir) return;
+    const path = c.path ?? '';
+    if (!path) return; // 单文件共享项：上传面写不到共享根那个文件本身
+    const name = c.name ?? t('文件');
+    try {
+      toast(t('正在写回「{name}」…（进度见通知卡）', { name }));
+      await writebackPeerFile(c.peerId, c.shareId, path, c.shareName, force);
+      toast(t('已写回「{name}」', { name }));
+    } catch (e) {
+      toast(t('写回失败：{error}', { error: String(e) }));
+    }
+  }
+
+  function ctxPeerWriteback() {
+    void runPeerWriteback(false);
+  }
+
+  function ctxPeerForceWriteback() {
+    void runPeerWriteback(true);
+  }
+
+  /** 冲突时用远端覆盖：本地修改先另存成冲突副本，再刷新同一个本地路径。 */
+  async function ctxPeerUseRemote() {
+    const c = ctxState;
+    hideCtx();
+    if (!c || c.kind !== 'peer' || !c.peerId || !c.shareId || c.isDir) return;
+    const path = c.path ?? '';
+    if (!path) return; // 单文件共享项没有工作副本
+    const name = c.name ?? t('文件');
+    try {
+      const saved = await resolveWritebackConflict(c.peerId, c.shareId, path, false);
+      toast(
+        saved
+          ? t('已用远端覆盖「{name}」，本地修改另存为「{saved}」', { name, saved })
+          : t('已用远端覆盖「{name}」', { name }),
+      );
+    } catch (e) {
+      toast(t('操作失败：{error}', { error: String(e) }));
+    }
+  }
+
+  /** 共享项（本机/对端）文件或目录：打开更新记录。 */
+  async function ctxShareHistory() {
+    const c = ctxState;
+    hideCtx();
+    if (!c || !c.shareId) return;
+    const path = c.path ?? '';
+    const isDir = c.isDir ?? path === '';
+    const peerId = c.kind === 'peer' ? (c.peerId ?? null) : null;
+    const title = c.name ?? c.shareName ?? t('共享项');
+    const panel: HistoryPanel = {
+      open: true,
+      loading: true,
+      error: null,
+      title,
+      path,
+      isDir,
+      entries: [],
+      peerId,
+      shareId: c.shareId,
+      parent: null,
+    };
+    historyPanel = panel;
+    await refreshHistory(panel);
+  }
+
+  async function refreshHistory(panel: HistoryPanel) {
+    const seq = ++historySeq;
+    try {
+      const entries = await shareUpdateHistory(
+        panel.peerId,
+        panel.shareId,
+        panel.path,
+        panel.isDir,
+      );
+      if (seq === historySeq && historyPanel) {
+        historyPanel = { ...historyPanel, loading: false, error: null, entries };
+      }
+    } catch (e) {
+      if (seq === historySeq && historyPanel) {
+        historyPanel = { ...historyPanel, loading: false, error: String(e) };
+      }
+    }
+  }
+
+  async function openHistoryFile(path: string, name: string) {
+    const current = historyPanel;
+    if (!current) return;
+    const parent = current.isDir
+      ? { path: current.path, title: current.title }
+      : current.parent;
+    const next: HistoryPanel = {
+      ...current,
+      loading: true,
+      error: null,
+      title: name,
+      path,
+      isDir: false,
+      entries: [],
+      parent,
+    };
+    historyPanel = next;
+    await refreshHistory(next);
+  }
+
+  async function backHistoryDir() {
+    const current = historyPanel;
+    if (!current?.parent) return;
+    const next: HistoryPanel = {
+      ...current,
+      loading: true,
+      error: null,
+      title: current.parent.title,
+      path: current.parent.path,
+      isDir: true,
+      entries: [],
+      parent: null,
+    };
+    historyPanel = next;
+    await refreshHistory(next);
+  }
+
+  /**
    * 设备页目录右键「上传到此文件夹…」：目标写死在这一项上，用户只挑本机文件/目录。
    *
    * 共享项名字只在**最外层**那一行取得到（`c.path === ''` 时 `c.name` 就是它）；
@@ -3369,7 +3548,11 @@
           pushBatches = [
             ...pushBatches,
             ...fetched.filter(
-              (b) => b.waiting > 0 && !known.has(b.batchId) && !closedBatches.has(b.batchId),
+              (b) =>
+                b.waiting > 0 &&
+                !b.dest?.silent &&
+                !known.has(b.batchId) &&
+                !closedBatches.has(b.batchId),
             ),
           ];
         } catch (e) {
@@ -3460,6 +3643,8 @@
     // 自动/立刻收掉，与以前一模一样）和"多台的收尾方式"（全成自动收；有失败就粘住等确认）。
     const unPushBatch = listen<PushBatch>('push://batch', (ev) => {
       const b = ev.payload;
+      // 自动写回是后台同步：发送侧不建卡、不进通知组。失败/冲突由 `writeback://auto` 报。
+      if (b.dest?.silent) return;
       // 已经收掉的卡不许复活：迟到的快照（对账补账 / late_success 纠正 / 初值拉取晚到）
       // 只说明后端那一份，界面这张已经按用户的动作（或自动收尾）走掉了。
       if (closedBatches.has(b.batchId)) return;
@@ -3473,6 +3658,34 @@
       // 落到 0（对端回执 / 对账补账 / 超时兜底）都能收掉。以前单台交给 `push://done`，
       // 而后两条路根本不发它 —— 那张卡就成了没有按钮的僵尸（见 `settleBatch`）。
       if (b.waiting === 0) settleBatch(b);
+    });
+
+    // 自动写回成功是**静默的**（发送/接收两侧都不弹卡）；这里只处理需要用户注意的冲突/失败。
+    const unAutoWriteback = listen<{
+      peerId: string;
+      shareId: string;
+      path: string;
+      name: string;
+      state: string;
+      error?: string | null;
+      localDirty?: boolean;
+    }>('writeback://auto', (ev) => {
+      const { name, state, error, localDirty } = ev.payload;
+      if (state === 'conflict') {
+        toast(t('自动写回「{name}」未执行：{error}', { name, error: error ?? t('对端文件已变化') }));
+      } else if (state === 'blocked') {
+        toast(t('自动写回「{name}」已暂停：{error}', { name, error: error ?? '' }));
+      } else if (state === 'failed') {
+        toast(t('自动写回「{name}」失败，稍后自动重试：{error}', { name, error: error ?? '' }));
+      } else if (state === 'remote-changed') {
+        toast(
+          localDirty
+            ? t('对端已更新「{name}」，本地也有修改；写回会冲突')
+            : t('对端已更新「{name}」；关闭后重新打开可获取最新内容'),
+        );
+      } else if (state === 'refresh-failed') {
+        toast(t('刷新本地副本「{name}」失败：{error}', { name, error: error ?? '' }));
+      }
     });
 
     const unPushResponse = listen<{ inviteId: string; accepted: boolean; reason?: string | null }>('push://response', (ev) => {
@@ -3738,6 +3951,22 @@
     };
     document.addEventListener('od:ctx', handleCtx);
 
+    // 双击对端文件（树节点 / 共享项根行）= 打开本地副本；右键菜单里的「打开」共用同一条。
+    const handleOpenPeer = (e: Event) => {
+      const d = (e as CustomEvent).detail as
+        | { peerId?: string; shareId?: string; path?: string; name?: string; isDir?: boolean }
+        | undefined;
+      if (!d?.peerId || !d.shareId) return;
+      void openPeerEntry({
+        peerId: d.peerId,
+        shareId: d.shareId,
+        path: d.path ?? '',
+        name: d.name,
+        isDir: d.isDir,
+      });
+    };
+    document.addEventListener('od:open-peer', handleOpenPeer);
+
     // 右键全局兜底：webview 自带一份**默认右键菜单**（wry 打开 WebView2 的
     // AreDefaultContextMenusEnabled；dev 构建里还带「检查」），任何没被拦下的 contextmenu
     // 都会把它叫出来。这里一律 preventDefault 把它关掉 —— 需要右键的地方（设备行/共享项/
@@ -3760,6 +3989,7 @@
       unRecover.then(fn => fn());
       unPushInvite.then(fn => fn());
       unPushBatch.then(fn => fn());
+      unAutoWriteback.then(fn => fn());
       unPushResponse.then(fn => fn());
       unPushProgress.then(fn => fn());
       unBrowseDownload.then(fn => fn());
@@ -3781,6 +4011,7 @@
       unLinkClosed.then(fn => fn());
       unLinkResult.then(fn => fn());
       document.removeEventListener('od:ctx', handleCtx);
+      document.removeEventListener('od:open-peer', handleOpenPeer);
       document.removeEventListener('contextmenu', killDefaultCtx, true);
       document.removeEventListener('od:toast', handleToast);
     };
@@ -4340,6 +4571,20 @@
     {#if chat.getRecipientReq()}
       <RecipientDialog />
     {/if}
+    {#if historyPanel}
+      <UpdateHistory
+        open={historyPanel.open}
+        title={historyPanel.title}
+        subtitle={historyPanel.path}
+        isDir={historyPanel.isDir}
+        loading={historyPanel.loading}
+        error={historyPanel.error}
+        entries={historyPanel.entries}
+        onClose={() => (historyPanel = null)}
+        onSelect={(path, name) => void openHistoryFile(path, name)}
+        onBack={historyPanel.parent ? () => void backHistoryDir() : undefined}
+      />
+    {/if}
 
     <!-- 文件选择框：文件与文件夹在同一个框里混选、选中项跨目录累积。推送与「添加共享项」
          都用它 —— 开成什么样由 `picker` 这个请求对象决定（`closePicker` 关掉它）。 -->
@@ -4460,6 +4705,11 @@
       onConvoClear={() => void ctxConvoClear()}
       onConvoExit={() => void ctxConvoExit()}
       onPeerDownload={ctxPeerDownload}
+      onPeerOpen={ctxPeerOpen}
+      onPeerWriteback={ctxPeerWriteback}
+      onPeerForceWriteback={ctxPeerForceWriteback}
+      onPeerUseRemote={ctxPeerUseRemote}
+      onShareHistory={ctxShareHistory}
       onPeerUpload={ctxPeerUpload}
       onBcCompare={ctxBcCompare}
       onBcAddLeft={() => void ctxBcPlaceLeft()}

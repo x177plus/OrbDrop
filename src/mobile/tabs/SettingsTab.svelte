@@ -78,18 +78,9 @@
   $effect(() => {
     if (isAndroid && downloadMode !== "Direct") downloadMode = "Direct";
   });
-  /** 状态行的颜色：绿=正常，琥珀=降级，红=发现没起来，灰=离线暂停。 */
+  /** 状态行的颜色档：绿=正常，琥珀=降级，红=发现没起来，灰=离线暂停（对应 `.tone-*`）。 */
   function localSendTone(tone: "ok" | "warn" | "error" | "muted"): string {
-    switch (tone) {
-      case "ok":
-        return "var(--ok)";
-      case "warn":
-        return "var(--warn)";
-      case "error":
-        return "var(--danger)";
-      default:
-        return "var(--muted)";
-    }
+    return tone === "error" ? "danger" : tone;
   }
 
   /**
@@ -542,15 +533,14 @@
             {t("开启后立即生效，不等「保存设置」。53317 被占用时先回落主端口，端口空出后自动接管；不会因此自动关闭。")}
           </p>
           {#if localSendView}
-            <div style="display:flex; align-items:flex-start; gap:8px;">
-              <p class="shelp" style="margin:0; color:{localSendTone(localSendView.tone)};">
+            <div class="shelp-row">
+              <p class="shelp tone-{localSendTone(localSendView.tone)}">
                 {localSendView.text}
               </p>
               {#if localSendView.retry}
                 <button
                   class="btn btn-secondary btn-sm"
                   type="button"
-                  style="flex:none;"
                   disabled={localSendBusy}
                   onclick={() => void retryLocalSend()}
                 >{t("重试")}</button>
@@ -615,7 +605,7 @@
       <div class="sec-label"><span>{t("后台与通知")}</span></div>
       <div class="card gcard">
         <div class="srow">
-          <div class="srow-top" style="justify-content:space-between;">
+          <div class="srow-top">
             <span class="slabel">{t("保活与通知")}</span>
             <button
               class="btn btn-secondary btn-sm"
@@ -649,7 +639,7 @@
            就有，卡片只是把同一件事说第二遍，小字则在出错时和真正的报错抢视线。 -->
       <div class="card gcard">
         <div class="srow">
-          <div class="srow-top" style="justify-content:space-between;">
+          <div class="srow-top">
             <span class="slabel">{t("当前版本 v{version}", { version: update?.current ?? "…" })}</span>
             <button
               class="btn btn-secondary btn-sm"
@@ -663,7 +653,7 @@
         </div>
         {#if update?.phase === "available"}
           <div class="srow">
-            <div class="srow-top" style="justify-content:space-between;">
+            <div class="srow-top">
               <span class="slabel">v{update.version}{update.size ? ` · ${formatFileSize(update.size)}` : ""}</span>
               <button
                 class="btn btn-primary btn-sm"
@@ -682,16 +672,12 @@
         {/if}
         {#if update?.phase === "downloading" || update?.phase === "verifying"}
           <div class="srow">
-            <div style="height:calc(6 * var(--u)); border-radius:calc(3 * var(--u)); background:var(--fg-soft); overflow:hidden;">
-              <div
-                style="height:100%; width:{updatePct}%; background:var(--accent); transition:width .15s linear;"
-              ></div>
-            </div>
+            <div class="pbar"><i style="width:{updatePct}%"></i></div>
           </div>
         {/if}
         {#if update && updateStatusText(update)}
           <div class="srow">
-            <p class="shelp" style="color:{update.phase === "error" ? "var(--danger)" : "var(--muted)"};">
+            <p class="shelp" class:tone-danger={update.phase === "error"}>
               {updateStatusText(update)}
             </p>
           </div>

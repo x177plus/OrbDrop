@@ -131,7 +131,27 @@
     }));
   }
 
-  /** 双击共享项根那一行（只对文件）：下载中 → 暂停，已暂停 → 继续。 */
+  /** 双击共享项根那一行：目录 = 展开/收起；文件 = 下载中暂停/继续，否则打开。 */
+  function shareDblClick(e: MouseEvent, share: PeerShareItem) {
+    if (share.isDir) {
+      e.preventDefault();
+      e.stopPropagation();
+      void toggleShare(share);
+      return;
+    }
+    const dl = peerDownloadOf(device.id, share.id, '');
+    if (dl && (dl.status === 'running' || dl.status === 'paused')) {
+      void toggleShareDownload(e, share);
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    document.dispatchEvent(new CustomEvent('od:open-peer', {
+      detail: { peerId: device.id, shareId: share.id, path: '', name: share.name, isDir: false },
+    }));
+  }
+
+  /** 双击共享项根那一行（文件）：下载中 → 暂停，已暂停 → 继续。 */
   async function toggleShareDownload(e: MouseEvent, share: PeerShareItem) {
     if (share.isDir) return;
     const dl = peerDownloadOf(device.id, share.id, '');
@@ -211,8 +231,12 @@
           data-od-isdir={share.isDir ? 'true' : 'false'}
           title={dlPaused
             ? t('已暂停 · 双击继续「{name}」', { name: share.name })
-            : dl?.status === 'running' ? t('双击暂停「{name}」', { name: share.name }) : undefined}
-          ondblclick={(e) => void toggleShareDownload(e, share)}
+            : dl?.status === 'running'
+              ? t('双击暂停「{name}」', { name: share.name })
+              : share.isDir
+                ? t('双击展开「{name}」', { name: share.name })
+                : t('双击打开「{name}」', { name: share.name })}
+          ondblclick={(e) => shareDblClick(e, share)}
           use:dragOut={{ source: { peerId: device.id, shareId: share.id, path: '', name: share.name, isDir: share.isDir }, onMessage: onToast }}
         >
           {#if share.isDir}

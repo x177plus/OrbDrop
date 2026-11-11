@@ -45,12 +45,24 @@ const REUSE_WINDOW: Duration = Duration::from_secs(10 * 60);
 const MAX_ENTRIES: usize = 200_000;
 const MAX_DEPTH: usize = 64;
 
-/// 最近暂存的 `(坐标 → 本地路径)`。只在本进程内，进程退出即失效（文件本身按 TTL 回收）。
-static RECENT: LazyLock<Mutex<HashMap<String, (PathBuf, Instant)>>> =
+/// 最近暂存的 `(坐标 → 本地路径 + 对端元数据)`。只在本进程内，进程退出即失效（文件本身按 TTL 回收）。
+#[derive(Clone)]
+struct Recent {
+    path: PathBuf,
+    at: Instant,
+    /// 首次暂存时问到的对端元数据；写回拿它做冲突判据。
+    meta: Option<peer_fs::EntryMeta>,
+    is_dir: bool,
+}
+
+static RECENT: LazyLock<Mutex<HashMap<String, Recent>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 把一项从对端落到镜像目录，返回可以交给 Finder 的真实路径。
-pub async fn place_item(state: &Arc<AppState>, item: &MirroredItem) -> Result<PathBuf, String> {
+/// 把一项从对端落到镜像目录，返回可以交给 Finder 的真实路径（连同对端元数据）。
+pub async fn place_item(
+    state: &Arc<AppState>,
+    item: &MirroredItem,
+) -> Result<super::PlacedItem, String> {
     let dir = identity::share_dir(&super::root(), &item.peer_id, &item.share_id)?;
     let (base, token) = peer_fs::coords(state, &item.peer_id)?;
     tokio::fs::create_dir_all(&dir)
@@ -58,17 +70,44 @@ pub async fn place_item(state: &Arc<AppState>, item: &MirroredItem) -> Result<Pa
         .map_err(|e| format!("建镜像目录失败（{}）: {e}", dir.display()))?;
 
     let key = format!("{}\0{}\0{}", item.peer_id, item.share_id, item.path);
+    // 先问对端元数据再决定能否复用缓存：缓存只保证"同一个远端版本"的暂存副本，
+    // 对端改了就必须换新槽重新下载（否则重新打开拿到的还是旧内容）。问不到时若缓存还在，
+    // 退回缓存（离线也能看最近那份）；在线后自动任务会发现对端版本变化并提示。
+    let client = peer_fs::client_for(state, &item.peer_id)?;
+    let meta = match peer_fs::probe_entry(&client, &base, &token, &item.share_id, &item.path).await
+    {
+        Ok(meta) => meta,
+        Err(e) => {
+            if let Some(cached) = cached(&key) {
+                warn!(error = %e, path = %cached.path.display(), "问不到对端元数据，复用最近的暂存副本");
+                return Ok(cached);
+            }
+            return Err(e);
+        }
+    };
     if let Some(cached) = cached(&key) {
-        info!(path = %cached.display(), "复用刚暂存过的对端项");
-        return Ok(cached);
+        let remote_size = meta
+            .as_ref()
+            .and_then(|m| (!m.is_dir).then_some(m.size));
+        let remote_mtime = meta.as_ref().and_then(|m| m.mtime);
+        let remote_rev = meta.as_ref().and_then(|m| m.rev.as_deref());
+        if (cached.size, cached.mtime) == (remote_size, remote_mtime)
+            && remote_rev.map_or(true, |rev| cached.rev.as_deref() == Some(rev))
+        {
+            info!(path = %cached.path.display(), "复用刚暂存过的对端项（远端版本未变）");
+            return Ok(cached);
+        }
+        forget_cached(&key);
+        info!("对端已更新，丢弃旧暂存并重新下载");
     }
 
-    // 元数据：`isDir` 以对端为准（界面的旧值可能过期）；文件大小问不到也允许，
-    // 下载循环会一直读到短读为止，只是少一道"大小对得上"的校验。
-    let client = peer_fs::client_for(state, &item.peer_id)?;
-    let meta = peer_fs::probe_entry(&client, &base, &token, &item.share_id, &item.path).await?;
-    let is_dir = meta.map(|m| m.is_dir).unwrap_or(item.is_dir);
-    let expected = meta.and_then(|m| (!m.is_dir).then_some(m.size));
+    let is_dir = meta
+        .as_ref()
+        .map(|m| m.is_dir)
+        .unwrap_or(item.is_dir);
+    let expected = meta
+        .as_ref()
+        .and_then(|m| (!m.is_dir).then_some(m.size));
 
     let desired = identity::child_path(&dir, &item.name)?;
     let name = desired
@@ -111,12 +150,151 @@ pub async fn place_item(state: &Arc<AppState>, item: &MirroredItem) -> Result<Pa
     // 记账点在**槽目录**上：`mirror::sweep` 扫的是 `<peer>/<share>/<top>` 这一层，
     // 而且整槽一起回收，不会只删掉文件留下空目录。
     note_placed(&slot, b"macos-staging");
-    remember(key, local.clone());
+    let mtime = meta.as_ref().and_then(|m| m.mtime);
+    let mtime_ms = meta.as_ref().and_then(|m| m.mtime_ms);
+    let rev = meta.as_ref().and_then(|m| m.rev.clone());
+    remember(key, local.clone(), meta, is_dir);
     info!(
         path = %local.display(),
         is_dir, "对端项已完整暂存，按真实路径拖出"
     );
-    Ok(local)
+    Ok(super::PlacedItem {
+        path: local,
+        size: expected,
+        mtime,
+        mtime_ms,
+        rev,
+        is_dir,
+    })
+}
+
+/// 「打开」用的稳定工作副本：同一个远端路径永远落在
+/// `<镜像根>/<peer>/<share>/work/<相对路径>`，远端版本变化时原地替换，不换槽。
+///
+/// 与 [`place_item`] 的分工：拖出要“每次一个新槽”，因为 Finder/目标程序可能还捏着上一次
+/// 那份在复制；打开要的是“同一个文件”，否则编辑器、最近文件列表、写回登记全会跟着漂。
+pub async fn open_item(
+    state: &Arc<AppState>,
+    item: &MirroredItem,
+) -> Result<super::PlacedItem, String> {
+    let dir = identity::share_dir(&super::root(), &item.peer_id, &item.share_id)?;
+    let work_root = dir.join("work");
+    tokio::fs::create_dir_all(&work_root)
+        .await
+        .map_err(|e| format!("建工作副本目录失败（{}）: {e}", work_root.display()))?;
+    let local = super::writeback::stable_local_path(
+        &item.peer_id,
+        &item.share_id,
+        &item.path,
+        &item.name,
+    )?;
+    if let Some(parent) = local.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("建工作副本目录失败（{}）: {e}", parent.display()))?;
+    }
+
+    let (base, token) = peer_fs::coords(state, &item.peer_id)?;
+    let client = peer_fs::client_for(state, &item.peer_id)?;
+    let meta = match peer_fs::probe_entry(&client, &base, &token, &item.share_id, &item.path).await {
+        Ok(meta) => meta,
+        Err(e) => {
+            // 对端暂时问不到：本地已有副本就先用着（自动任务会在链路回来后重新探测）；
+            // 没有就只能如实失败。
+            if local.exists() {
+                warn!(error = %e, path = %local.display(), "问不到对端元数据，复用本地工作副本");
+                let (size, mtime_ms) = super::writeback::local_snapshot(&local);
+                return Ok(super::PlacedItem {
+                    path: local,
+                    size,
+                    mtime: mtime_ms.map(|ms| ms / 1000),
+                    mtime_ms,
+                    rev: None,
+                    is_dir: false,
+                });
+            }
+            return Err(e);
+        }
+    };
+    if meta.as_ref().is_some_and(|m| m.is_dir) {
+        return Err("当前平台只能直接打开文件；目录请先下载".to_string());
+    }
+    let expected = meta.as_ref().map(|m| m.size);
+    let rev = meta.as_ref().and_then(|m| m.rev.clone());
+    let mtime = meta.as_ref().and_then(|m| m.mtime);
+    let mtime_ms = meta.as_ref().and_then(|m| m.mtime_ms);
+
+    // 同一个远端版本已经落过盘：直接复用，不重新下载。自动刷新只在 rev 变化时才调
+    // 这里，所以“版本相同”只会出现在用户重复打开同一条目时。
+    if local.exists() {
+        if let Some(opened) =
+            super::writeback::find_opened(&item.peer_id, &item.share_id, &item.path)
+        {
+            if !super::writeback::local_changed(&opened)
+                && match (rev.as_deref(), opened.rev.as_deref()) {
+                    (Some(remote), Some(base)) => remote == base,
+                    // 任一侧不知道版本：宁可重新下载，也不把旧内容当成最新。
+                    _ => false,
+                }
+            {
+                let (size, local_mtime_ms) = super::writeback::local_snapshot(&local);
+                return Ok(super::PlacedItem {
+                    path: local,
+                    size: size.or(expected),
+                    mtime: local_mtime_ms.map(|ms| ms / 1000).or(mtime),
+                    mtime_ms: local_mtime_ms.or(mtime_ms),
+                    rev,
+                    is_dir: false,
+                });
+            }
+        }
+    }
+
+    let name = local
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| item.name.clone());
+    let temp = local
+        .parent()
+        .unwrap_or(&work_root)
+        .join(format!(".{name}.orbdrop-part"));
+    let existed_before = local.exists();
+    let before = super::writeback::local_snapshot(&local);
+    download_file(
+        &client,
+        &base,
+        &token,
+        &item.share_id,
+        &item.path,
+        &temp,
+        expected,
+    )
+    .await?;
+    // 下载期间用户又保存了：**不能**把新内容 rename 到目标路径上。先把临时文件丢掉，
+    // 让调用方按冲突处理；本地内容原样保留。
+    if existed_before {
+        let after = super::writeback::local_snapshot(&local);
+        if after != before {
+            let _ = std::fs::remove_file(&temp);
+            return Err("本地工作副本在刷新期间被修改；已保留本地内容，未覆盖".into());
+        }
+    }
+    super::replace_file_in_place(&temp, &local).await?;
+    // 记账点放在 work 根：回收扫描按 `<share>/work` 这一层看；真正保护它的是写回登记。
+    note_placed(&work_root, b"work-copy");
+    info!(
+        path = %local.display(),
+        refresh = true,
+        "对端文件已落成稳定工作副本"
+    );
+    Ok(super::PlacedItem {
+        path: local,
+        size: expected,
+        mtime,
+        mtime_ms,
+        rev,
+        is_dir: false,
+    })
 }
 
 /// 递归下载一个目录。用显式栈而不是递归 async fn：深度由对端决定，递归会直接吃爆调用栈。
@@ -245,13 +423,27 @@ async fn cleanup(path: &Path) {
     }
 }
 
-fn cached(key: &str) -> Option<PathBuf> {
+fn forget_cached(key: &str) {
+    RECENT.lock().remove(key);
+}
+
+fn cached(key: &str) -> Option<super::PlacedItem> {
     let mut map = RECENT.lock();
     let hit = map
         .get(key)
-        .map(|(path, at)| (path.clone(), at.elapsed() < REUSE_WINDOW));
+        .map(|recent| (recent.clone(), recent.at.elapsed() < REUSE_WINDOW));
     match hit {
-        Some((path, true)) if path.exists() => Some(path),
+        Some((recent, true)) if recent.path.exists() => Some(super::PlacedItem {
+            path: recent.path,
+            size: recent
+                .meta
+                .as_ref()
+                .and_then(|m| (!m.is_dir).then_some(m.size)),
+            mtime: recent.meta.as_ref().and_then(|m| m.mtime),
+            mtime_ms: recent.meta.as_ref().and_then(|m| m.mtime_ms),
+            rev: recent.meta.as_ref().and_then(|m| m.rev.clone()),
+            is_dir: recent.is_dir,
+        }),
         Some(_) => {
             map.remove(key);
             None
@@ -260,9 +452,17 @@ fn cached(key: &str) -> Option<PathBuf> {
     }
 }
 
-fn remember(key: String, path: PathBuf) {
+fn remember(key: String, path: PathBuf, meta: Option<peer_fs::EntryMeta>, is_dir: bool) {
     let mut map = RECENT.lock();
     // 顺手清掉过期项；正常一次会话不会堆太多。
-    map.retain(|_, value| value.1.elapsed() < REUSE_WINDOW);
-    map.insert(key, (path, Instant::now()));
+    map.retain(|_, recent| recent.at.elapsed() < REUSE_WINDOW);
+    map.insert(
+        key,
+        Recent {
+            path,
+            at: Instant::now(),
+            meta,
+            is_dir,
+        },
+    );
 }

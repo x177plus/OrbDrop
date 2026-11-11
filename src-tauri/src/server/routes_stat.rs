@@ -16,6 +16,10 @@ pub struct StatResponse {
     pub is_dir: bool,
     pub size: u64,
     pub modified: String,
+    /// 条件写回的版本标识；与 `/dav` 的 ETag 同源（见 `server::rev_for_metadata`）。
+    pub rev: String,
+    /// 毫秒级修改时间：秒级 `modified` 里同一秒内的两次保存会看起来完全一样。
+    pub modified_ms: i64,
 }
 
 /// GET /stat?share=<id>&path=<relative_path>
@@ -88,6 +92,13 @@ pub async fn stat_handler(
             Some(chrono::DateTime::from_timestamp(secs, 0)?.to_rfc3339())
         })
         .unwrap_or_default();
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|age| age.as_millis() as i64)
+        .unwrap_or(0);
+    let rev = crate::server::rev_for_metadata(&metadata);
 
     Ok(Json(StatResponse {
         name: canonical
@@ -97,5 +108,7 @@ pub async fn stat_handler(
         is_dir: metadata.is_dir(),
         size: if metadata.is_dir() { 0 } else { metadata.len() },
         modified,
+        rev,
+        modified_ms,
     }))
 }

@@ -14,6 +14,8 @@ pub struct ChangeEvent {
     pub share_id: String,
     pub path: String,
     pub kind: String,
+    /// 这一项此刻是不是目录（删除事件可能已经看不到，按 false 处理）。
+    pub is_dir: bool,
 }
 
 /// Start watching a directory for changes (called when a share is added).
@@ -52,7 +54,16 @@ pub fn watch_share(state: &Arc<AppState>, share_id: &str, path: std::path::PathB
     tokio::spawn(async move {
         let sid_for_log = sid.clone();
         let sid_for_broadcast = sid.clone();
+        let sid_for_history = sid.clone();
         debounce_loop(rx, sid, base, QUIET_WINDOW, move |batch| {
+            // 历史记录放在广播开关之前：共享项关播也要能回答“谁改过我的文件”。
+            let (local_id, local_name) = {
+                let config = broadcaster.config.lock();
+                (config.device_id.clone(), config.device_name.clone())
+            };
+            broadcaster
+                .history
+                .record_batch(&sid_for_history, &batch, &local_id, &local_name);
             broadcast(&broadcaster, &sid_for_broadcast, batch)
         })
         .await;
@@ -138,6 +149,9 @@ fn collect_events(
             share_id: sid.to_string(),
             path: rel.to_string_lossy().replace('\\', "/"),
             kind: kind.to_string(),
+            is_dir: std::fs::symlink_metadata(&path)
+                .map(|meta| meta.is_dir())
+                .unwrap_or(false),
         };
         if pending
             .iter()
@@ -275,6 +289,7 @@ mod tests {
                 share_id: sid.clone(),
                 path: format!("build/out-{i}.class"),
                 kind: "modified".into(),
+                is_dir: false,
             })
             .collect();
         broadcast(&state, &sid, batch);

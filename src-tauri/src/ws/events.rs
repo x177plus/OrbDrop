@@ -387,6 +387,10 @@ pub mod ui {
     /// 下载命令本身仍是阻塞到落盘的（界面 `await` 它拿落盘路径），这条事件只负责中途的字节数
     /// 与终局 —— 与 `PUSH_PROGRESS` / `UPDATE_STATE` 同一个取舍。
     pub const BROWSE_DOWNLOAD: &str = "browse://download";
+    /// 自动写回/对端更新需要用户注意的结果（`state` = `conflict` / `failed` / `blocked` /
+    /// `remote-changed`）：界面用它弹 toast。成功是常态，只记日志、由上传批次卡展示进度与终态。
+    /// 载荷 `{ peerId, shareId, path, name, state, localDirty?, error }`；手动写回不经过这条事件。
+    pub const WRITEBACK_AUTO: &str = "writeback://auto";
     /// 一条消息**暂时送不出去**（直连不通、也没有可用的中转方，F-106）：界面挂一句提示。
     ///
     /// 排队本身是既有语义（F-95：等它上线再发），这条事件补的是**为什么现在送不出去** ——

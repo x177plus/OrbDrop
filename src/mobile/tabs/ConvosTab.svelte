@@ -1,5 +1,6 @@
 <script lang="ts">
   import * as chat from "$lib/stores/chat.svelte";
+  import * as devices from "$lib/stores/devices.svelte";
   import Icon from "../Icon.svelte";
   import { t } from "$lib/i18n.svelte";
   import * as store from "../store.svelte";
@@ -89,6 +90,10 @@
                   <span class="cv-mode bc"><Icon name="bc" />{t("群发")}</span>
                 {:else if row.mode === "group"}
                   <span class="cv-mode grp"><Icon name="group" />{t("群聊")}</span>
+                {:else if devices.deviceById(row.key.slice(4))?.transport === "localsend"}
+                  <!-- 与设备页/会话头同一枚协议徽标：LocalSend 会话也是一对一，但没有
+                       token/已读那套语义，列表里不能长得和 OrbDrop 会话一模一样。 -->
+                  <span class="cv-mode ls" title="LocalSend">LS</span>
                 {/if}
                 <span class="cv-dot {row.dot} {row.trusted ? 'solid' : 'hollow'}"></span>
                 <span class="cv-time num">{row.time}</span>

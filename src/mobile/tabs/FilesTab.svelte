@@ -184,9 +184,10 @@
     store.toast(t("这是一个空目录"));
   }
 
-  /** 嵌套行的缩进：原型 `flattenNodes` 是按深度算的（12 + depth * 20）。 */
+  /** 嵌套行的缩进：原型 `flattenNodes` 是按深度算的（12 + depth * 20），长度同样走 `--u`
+      缩放 —— 别写死 px，宽视口上整列都放大了，只有缩进不跟，层级看着会挤平。 */
   function indent(depth: number): string {
-    return `padding-left:${12 + depth * 20}px`;
+    return `padding-left:calc(${12 + depth * 20} * var(--u))`;
   }
 </script>
 
@@ -343,41 +344,49 @@
   </div>
 {:else if seg === "local"}
   <div class="body">
+    <!-- 每一块都包一层 `.sec`：`.sec + .sec` 才是页面那 20u 的分组间距。权限卡与
+         「添加共享项」原来直接摆在 `.body` 里、后面再接 `.sec`，两组之间一点留白都没有。 -->
     {#if shareAccess && !shareAccess.supported}
-      <div class="card gcard">
-        <div class="srow">
-          <div class="srow-top"><span class="slabel">{t("需要「所有文件访问」权限")}</span></div>
-          <p class="shelp">
-            {t("直接共享手机目录需要 Android 11 及以上；这台系统版本不支持。")}
-          </p>
+      <div class="sec">
+        <div class="card gcard">
+          <div class="srow">
+            <div class="srow-top"><span class="slabel">{t("需要「所有文件访问」权限")}</span></div>
+            <p class="shelp">
+              {t("直接共享手机目录需要 Android 11 及以上；这台系统版本不支持。")}
+            </p>
+          </div>
         </div>
       </div>
     {:else if shareAccess && !shareAccess.granted}
-      <div class="card gcard">
-        <div class="srow">
-          <div class="srow-top"><span class="slabel">{t("需要「所有文件访问」权限")}</span></div>
-          <p class="shelp">
-            {t("OrbDrop 只会共享你在这里明确选择的文件或文件夹；权限本身不会读取或上传任何内容。")}
-          </p>
-          {#if localShares.length}
-            <p class="shelp">{t("已有共享项在重新授权前暂时读不到。")}</p>
-          {/if}
-          <div class="perm-acts">
-            <button class="btn btn-primary btn-sm" type="button" onclick={() => void grantShareAccess()}>
-              {t("去授权")}
-            </button>
-            <button class="btn btn-secondary btn-sm" type="button" onclick={() => void store.refreshShareAccess()}>
-              {t("重新检查")}
-            </button>
+      <div class="sec">
+        <div class="card gcard">
+          <div class="srow">
+            <div class="srow-top"><span class="slabel">{t("需要「所有文件访问」权限")}</span></div>
+            <p class="shelp">
+              {t("OrbDrop 只会共享你在这里明确选择的文件或文件夹；权限本身不会读取或上传任何内容。")}
+            </p>
+            {#if localShares.length}
+              <p class="shelp">{t("已有共享项在重新授权前暂时读不到。")}</p>
+            {/if}
+            <div class="perm-acts">
+              <button class="btn btn-primary btn-sm" type="button" onclick={() => void grantShareAccess()}>
+                {t("去授权")}
+              </button>
+              <button class="btn btn-secondary btn-sm" type="button" onclick={() => void store.refreshShareAccess()}>
+                {t("重新检查")}
+              </button>
+            </div>
           </div>
         </div>
       </div>
     {/if}
 
     {#if !shareAccess || (shareAccess.supported && shareAccess.granted)}
-      <button class="btn btn-primary btn-block" type="button" onclick={addLocalShare}>
-        {t("添加共享项")}
-      </button>
+      <div class="sec">
+        <button class="btn btn-primary btn-block" type="button" onclick={addLocalShare}>
+          {t("添加共享项")}
+        </button>
+      </div>
     {/if}
 
     <div class="sec">
@@ -455,8 +464,7 @@
         </button>
       {/each}
     </div>
-    <!-- 原型这里的内联 margin 原样搬：`.chips` 下方没有留白，去掉就贴在一起了。 -->
-    <div class="card list" style="margin-top:calc(8 * var(--u))">
+    <div class="card list">
       {#if browseState.error}
         <div class="empty">
           <Icon name="x" />

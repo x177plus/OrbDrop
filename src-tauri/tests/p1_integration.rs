@@ -5692,6 +5692,9 @@ async fn run_upload_round(
             share_id: share_id.into(),
             path: dest_path.into(),
             share_name: String::new(),
+            silent: false,
+            base_rev: None,
+            expect_path: None,
         },
         vec![src.to_string_lossy().to_string()],
         None,
@@ -5763,6 +5766,8 @@ async fn upload_lands_in_the_peer_share_not_the_download_dir() {
     share.broadcast_enabled = true;
     let share_id = share.id.clone();
     state_b.config.lock().shares.push(share);
+    // 更新记录靠共享项设备自己的 watcher；测试直接 push 配置，需要手动挂上。
+    orbdrop_lib::share::watcher::watch_share(&state_b, &share_id, share_root.clone());
 
     // 共享项只对长连接设备可见（`Caller::Peer::sees_share` 同一口径）：没有长连接，
     // `/push/upload/invite` 直接 409。这里把链建起来 —— 建链即“对面能看到这个共享项”。
@@ -5790,14 +5795,53 @@ async fn upload_lands_in_the_peer_share_not_the_download_dir() {
         "上传不得落进下载目录"
     );
 
+    // 更新记录：共享项设备把这次上传记成发送方，而不是本机。
+    let history_path = format!("dest/{name}/hello.txt");
+    wait_until("上传写入更新记录", || {
+        state_b
+            .history
+            .query_file(&share_id, &history_path, 10)
+            .iter()
+            .any(|entry| entry.actor_id == "device-upa" && entry.source == "upload")
+    })
+    .await;
+
     // 第二轮：源改了、同名文件已存在 —— 没有一次 `accept_invite`，直接覆盖。
     std::fs::write(src.join("hello.txt"), b"second version").unwrap();
+    let first_upload_at = state_b
+        .history
+        .query_file(&share_id, &history_path, 20)
+        .first()
+        .map(|entry| entry.at)
+        .unwrap_or(0);
     run_upload_round(&state_a, "device-upb", &share_id, "dest", &src).await;
     assert_eq!(
         std::fs::read(&landed).unwrap(),
         b"second version",
         "自动收下时同名文件必须原子覆盖（与资源管理器一致）"
     );
+    // 等第二趟上传的 watcher 批次真正落进历史，避免紧接着的本机写入被那一条归属吞掉。
+    wait_until("第二次上传写入更新记录", || {
+        state_b
+            .history
+            .query_file(&share_id, &history_path, 20)
+            .iter()
+            .any(|entry| entry.actor_id == "device-upa" && entry.at > first_upload_at)
+    })
+    .await;
+
+    // 本机直接改共享文件：watcher 记成本机，而不是沿用上一条上传归属。
+    std::fs::write(&landed, b"local edit on B").unwrap();
+    wait_until("本机修改写入更新记录", || {
+        state_b
+            .history
+            .query_file(&share_id, &history_path, 20)
+            .iter()
+            .any(|entry| {
+                entry.actor_id == state_b.own_id() && entry.source == "local"
+            })
+    })
+    .await;
 
     orbdrop_lib::server::stop_server(&state_a).await;
     orbdrop_lib::server::stop_server(&state_b).await;

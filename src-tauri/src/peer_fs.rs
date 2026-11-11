@@ -137,6 +137,9 @@ pub struct Stat {
     pub is_dir: bool,
     pub size: u64,
     pub modified: String,
+    /// 对端报的版本标识；老对端没有 `/stat` 时为 `None`。
+    pub rev: Option<String>,
+    pub mtime_ms: Option<i64>,
 }
 
 pub async fn fetch_tree(
@@ -226,15 +229,25 @@ pub async fn fetch_stat(
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
+        rev: value
+            .get("rev")
+            .and_then(|v| v.as_str())
+            .filter(|rev| !rev.is_empty())
+            .map(str::to_string),
+        mtime_ms: value.get("modifiedMs").and_then(|v| v.as_i64()),
     })
 }
 
 /// 一项的元数据（`/stat` 或列父目录得来的都归到这里）。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct EntryMeta {
     pub is_dir: bool,
     pub size: u64,
     pub mtime: Option<i64>,
+    /// 毫秒级时间戳（新对端的 `/stat` 有；老对端退回秒级 `mtime`）。
+    pub mtime_ms: Option<i64>,
+    /// 条件写回用的版本标识（新对端才有）。
+    pub rev: Option<String>,
 }
 
 /// 问对端"这一项是什么、多大、什么时候改的"。
@@ -255,6 +268,8 @@ pub async fn probe_entry(
                 is_dir: stat.is_dir,
                 size: stat.size,
                 mtime: parse_rfc3339_secs(&stat.modified),
+                mtime_ms: stat.mtime_ms,
+                rev: stat.rev,
             }))
         }
         Err(e) => e,
@@ -275,11 +290,16 @@ pub async fn probe_entry(
         .await
         .map_err(|e| format!("{stat_err}；退回列父目录也失败：{e}"))?;
     match entries.iter().find(|e| e.name == leaf) {
-        Some(entry) => Ok(Some(EntryMeta {
-            is_dir: entry.is_dir,
-            size: entry.size,
-            mtime: parse_rfc3339_secs(&entry.modified),
-        })),
+        Some(entry) => {
+            let mtime = parse_rfc3339_secs(&entry.modified);
+            Ok(Some(EntryMeta {
+                is_dir: entry.is_dir,
+                size: entry.size,
+                mtime,
+                mtime_ms: mtime.map(|secs| secs.saturating_mul(1000)),
+                rev: None,
+            }))
+        }
         None => Err(format!("对端没有这一项：{path}")),
     }
 }
@@ -290,6 +310,55 @@ pub fn join_slash(base: &str, name: &str) -> String {
     } else {
         format!("{base}/{name}")
     }
+}
+
+/// 问共享项设备要一项/一个目录的更新记录。
+///
+/// `mine` 由共享项设备按**这次请求的调用方**算好：对端看到的“本机”就是它自己写的那些。
+pub async fn fetch_history(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    share_id: &str,
+    path: &str,
+    is_dir: bool,
+    limit: usize,
+) -> Result<Vec<crate::share::history::HistoryView>, String> {
+    let url = format!("{base}/history");
+    let resp = client
+        .get(&url)
+        .query(&[
+            ("share", share_id),
+            ("path", path),
+            ("dir", if is_dir { "1" } else { "0" }),
+            ("limit", &limit.to_string()),
+        ])
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("读取对端更新记录失败: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = crate::net::read_text_capped(resp, crate::net::CONTROL_BODY_MAX)
+            .await
+            .unwrap_or_default();
+        return Err(format!(
+            "读取对端更新记录失败: HTTP {status}{}",
+            if body.trim().is_empty() {
+                String::new()
+            } else {
+                format!("（{}）", body.trim())
+            }
+        ));
+    }
+    let value: serde_json::Value = crate::net::read_json_capped(resp, PEER_JSON_BODY_MAX)
+        .await
+        .map_err(|e| format!("解析更新记录失败: {e}"))?;
+    let entries = value
+        .get("entries")
+        .cloned()
+        .ok_or_else(|| "对端更新记录响应异常".to_string())?;
+    serde_json::from_value(entries).map_err(|e| format!("更新记录格式异常: {e}"))
 }
 
 pub fn parse_rfc3339_secs(text: &str) -> Option<i64> {

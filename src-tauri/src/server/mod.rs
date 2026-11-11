@@ -22,6 +22,7 @@ mod routes_chat;
 mod routes_dav;
 mod routes_discover;
 mod routes_file;
+mod routes_history;
 mod routes_link;
 mod routes_pair;
 mod routes_pake;
@@ -364,6 +365,10 @@ fn build_router_with_body_idle_timeout(
     // Authenticated routes (auth middleware).
     let auth_routes = Router::new()
         .route("/tree", axum::routing::get(routes_tree::tree_handler))
+        .route(
+            "/history",
+            axum::routing::get(routes_history::history_handler),
+        )
         .route("/stat", axum::routing::get(routes_stat::stat_handler))
         .route("/unpair", axum::routing::post(routes_pair::unpair))
         .route("/file", axum::routing::get(routes_file::file_handler))
@@ -423,6 +428,22 @@ fn build_router_with_body_idle_timeout(
             presence_middleware,
         ))
         .with_state(state)
+}
+
+/// 一项文件内容的版本标识：`<大小>-<mtime 纳秒>`。
+///
+/// 写回的条件提交两端都用它：`/stat` 报给发送方，接收端在原子改名之前再算一次。
+/// 它必须对**同一次写入**稳定，对任何内容/时间变化敏感；纳秒精度能挡住"同一秒内
+/// 同大小保存"这一类秒级时间戳看不出来的改动。它不是密码学哈希，恶意伪造不在
+/// 威胁模型里（共享项本来就只有已配对 + 长连接设备可见）。
+pub(crate) fn rev_for_metadata(meta: &std::fs::Metadata) -> String {
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|age| age.as_nanos())
+        .unwrap_or(0);
+    format!("{:x}-{:x}", meta.len(), mtime_ns)
 }
 
 /// `/file`、`/tree`、`/stat` 的 `path` 查询参数必须是**共享项内的相对路径**。

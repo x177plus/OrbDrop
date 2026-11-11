@@ -515,6 +515,25 @@ export interface UploadDest {
   /** `/` 分隔，`''` = 共享项根。 */
   path: string;
   shareName?: string;
+  /** 自动写回：两端都不显示通知卡；失败/冲突仍由写回提示报出。 */
+  silent?: boolean;
+}
+
+export interface ShareUpdateEntry {
+  path: string;
+  /** epoch 毫秒。 */
+  at: number;
+  actorId: string;
+  actorName: string;
+  /** `created` / `modified` / `deleted`。 */
+  kind: string;
+  /** 这一项是不是目录（目录视图只列文件）。 */
+  isDir: boolean;
+  /** `local` / `upload` / `dav`。 */
+  source: string;
+  size?: number | null;
+  /** 相对查询方：这一条是不是本机写的。 */
+  mine: boolean;
 }
 
 export interface PushInvite {

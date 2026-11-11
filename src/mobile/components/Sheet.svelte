@@ -21,7 +21,7 @@
 <div class="scrim open" role="presentation" onclick={onClose}></div>
 
 <div class="sheet-layer open">
-  <div class="sheet" role="dialog" aria-modal="true" aria-label={label ?? title}>
+  <div class="sheet" class:has-foot={!!foot} role="dialog" aria-modal="true" aria-label={label ?? title}>
     <div class="sheet-grip"></div>
     <div class="sheet-head">
       <div class="sht">
@@ -30,11 +30,15 @@
       </div>
       <button class="icon-btn" type="button" aria-label={t("关闭")} onclick={onClose}><Icon name="x" /></button>
     </div>
-    {#if children || foot}
+    <!-- 底部动作栏**不在滚动区里**：长内容（配对等待那一屏、设备列表）滚到底时
+         按钮仍钉在底板下沿，不会跟着内容跑；分隔线由 `.sheet-foot` 自己画。 -->
+    {#if children}
       <div class="sheet-body">
-        {#if children}{@render children()}{/if}
-        {#if foot}<div class="sheet-foot">{@render foot()}</div>{/if}
+        {@render children()}
       </div>
+    {/if}
+    {#if foot}
+      <div class="sheet-foot">{@render foot()}</div>
     {/if}
   </div>
 </div>

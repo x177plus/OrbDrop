@@ -137,6 +137,14 @@ export const ready: Promise<void> = (async () => {
   await listen<{ peerId: string; peerName?: string | null; inviteId?: string | null }>(
     "pair://completed",
     (ev) => {
+      // 配对已经成了：这张表就该收起来（桌面端在同一个事件里也是 `closePair()`）。
+      // 那台设备随即从候选里消失（已配对、不再需要配），表再留着就只剩一句
+      // 「没有待配对的设备」，看起来像卡住了。从设备行点开的那张表只认报上来的这个
+      // id —— 别把正在给另一台配对的那张也顶掉；全局按钮开的那张（没有 peerId）收掉。
+      const open = store.currentSheet();
+      if (open?.kind === "pair" && (!open.peerId || open.peerId === ev.payload.peerId)) {
+        store.closeSheet();
+      }
       // 等对方确认的那一档到此结束（表里那颗「取消邀请」跟着收掉）。
       store.clearPendingPairInvite(ev.payload.inviteId ?? undefined);
       if (!ev.payload.inviteId) return;

@@ -141,6 +141,7 @@ windows = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
+    "Win32_System_IO",
     "Win32_System_Memory",
     "Win32_System_Ole",
     # 盘符类型常量（DRIVE_FIXED / DRIVE_REMOVABLE / …）：本机选择框要按类型说

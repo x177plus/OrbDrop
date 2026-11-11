@@ -103,6 +103,8 @@ pub struct AppState {
     /// File watchers keyed by share id（推送批次的源变化监视用 `push:<batch_id>`，见
     /// `transfer::watch` —— 两类键不会撞：共享项那个是 UUID）。
     pub watchers: Mutex<std::collections::HashMap<String, notify::RecommendedWatcher>>,
+    /// 共享项的更新记录（共享项设备是唯一真相源；对端通过 `/history` 查询）。
+    pub history: crate::share::history::HistoryStore,
     /// 「浏览」里正在跑的手动下载的暂停闸（键见 `transfer::browse_dl::key`）。
     ///
     /// 只有**还在跑**的命令在表里：命令一开始登记、结束（成功/失败）自己摘掉。
@@ -717,6 +719,7 @@ impl AppState {
             chat_rev: AtomicU64::new(0),
             app_handle: Mutex::new(None),
             watchers: Mutex::new(std::collections::HashMap::new()),
+            history: crate::share::history::HistoryStore::new(),
             browse_downloads: Mutex::new(HashMap::new()),
             receive_downloads: Mutex::new(HashMap::new()),
             learned: Mutex::new(HashMap::new()),

@@ -51,12 +51,10 @@
       <UpdateNotes notes={update.notes} />
       <p class="shelp">{t("下载完会打开系统安装器，需要你确认一次安装（非系统应用不能静默安装）。")}</p>
     {:else if busy}
-      <div style="height:calc(6 * var(--u)); border-radius:calc(3 * var(--u)); background:var(--fg-soft); overflow:hidden;">
-        <div style="height:100%; width:{pct}%; background:var(--accent); transition:width .15s linear;"></div>
-      </div>
+      <div class="pbar"><i style="width:{pct}%"></i></div>
       <p class="shelp">{updateStatusText(update)}</p>
     {:else}
-      <p class="shelp" style="color:var(--danger);">{updateStatusText(update)}</p>
+      <p class="shelp tone-danger">{updateStatusText(update)}</p>
     {/if}
   {/if}
 
@@ -71,6 +69,9 @@
       <button class="btn btn-primary" type="button" disabled={upd.isApplying()} onclick={() => void install()}>
         {t("重试")}
       </button>
+    {:else}
+      <!-- 下载 / 校验中也要有出口：关掉这张表不影响后台继续下载，进度可在设置页再看。 -->
+      <button class="btn btn-secondary" type="button" onclick={later}>{t("关闭")}</button>
     {/if}
   {/snippet}
 </Sheet>

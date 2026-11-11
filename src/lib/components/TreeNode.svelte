@@ -58,10 +58,11 @@
   }
 
   /**
-   * 双击正在下载的那一行 = 暂停 / 继续。
+   * 双击正在下载的那一行 = 暂停 / 继续；**没有在下载的对端文件 = 打开**。
    *
-   * 只有对端项、且这条下载真在动（或已暂停）时才接：别的行双击不做事（文件夹展开仍走
-   * 那颗箭头，本机项没有下载）。后端那道闸只停流，不丢 `.orbdrop-part` 与已收字节。
+   * 下载中不打开：那会另起一条打开链路（镜像/暂存），和正在写的下载抢同一份数据；
+   * 这一行此刻唯一有意义的动作是暂停/继续（行标题也这么写）。其它情况按文件管理器习惯
+   * 直接打开本地副本（见 App 的 `od:open-peer`）。
    */
   async function toggleDownload(e: MouseEvent) {
     if (!peerId || !download || (download.status !== 'running' && download.status !== 'paused')) return;
@@ -70,6 +71,19 @@
     const result = await togglePeerDownloadPause(peerId, shareId, ownPath);
     if (result === 'missing') notify(t('这项已不在下载中'));
     else if (result === 'error') notify(t('暂停 / 继续下载失败'));
+  }
+
+  function fileDblClick(e: MouseEvent) {
+    if (!peerId) return; // 本机项没有"打开远端"这回事
+    if (download && (download.status === 'running' || download.status === 'paused')) {
+      void toggleDownload(e);
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    document.dispatchEvent(new CustomEvent('od:open-peer', {
+      detail: { peerId, shareId, path: ownPath, name: entry.name, isDir: false },
+    }));
   }
 
   let expanded = $state(false);
@@ -140,6 +154,12 @@
     data-od-path={ownPath}
     data-od-name={entry.name}
     data-od-isdir="true"
+    title={t('双击展开「{name}」', { name: entry.name })}
+    ondblclick={(e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      void toggle();
+    }}
     oncontextmenu={openCtx}
     use:dragOut={{ source: dragSource, onMessage: notify }}
   >
@@ -180,8 +200,10 @@
     data-od-isdir="false"
     title={download?.status === 'paused'
       ? t('已暂停 · 双击继续「{name}」', { name: entry.name })
-      : download?.status === 'running' ? t('双击暂停「{name}」', { name: entry.name }) : undefined}
-    ondblclick={toggleDownload}
+      : download?.status === 'running'
+        ? t('双击暂停「{name}」', { name: entry.name })
+        : peerId ? t('双击打开「{name}」', { name: entry.name }) : undefined}
+    ondblclick={fileDblClick}
     oncontextmenu={openCtx}
     use:dragOut={{ source: dragSource, onMessage: notify }}
   >

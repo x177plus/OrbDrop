@@ -24,6 +24,11 @@ pub struct Identity {
     /// 共享项内相对路径（`/` 分隔；`""` = 共享项根）
     pub path: String,
     pub is_dir: bool,
+    /// 建这个占位符时对端的版本标识（见 `server::rev_for_metadata`）。
+    ///
+    /// 它参与身份比较：远端内容一变，blob 就不同，`place` 才会知道"同一个名字下的
+    /// 内容已经过期"。空串 = 当时没问到（老数据/离线），按未知处理。
+    pub rev: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -34,6 +39,8 @@ struct Wire {
     path: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     dir: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    rev: String,
 }
 
 impl Identity {
@@ -45,6 +52,7 @@ impl Identity {
             share: self.share_id.clone(),
             path: self.path.clone(),
             dir: self.is_dir,
+            rev: self.rev.clone(),
         };
         let bytes = serde_json::to_vec(&wire).map_err(|e| format!("身份编码失败: {e}"))?;
         if bytes.len() > IDENTITY_MAX {
@@ -70,6 +78,7 @@ impl Identity {
             share_id: wire.share,
             path: wire.path,
             is_dir: wire.dir,
+            rev: wire.rev,
         })
     }
 }
@@ -124,6 +133,7 @@ mod tests {
             share_id: "share-1".into(),
             path: "子目录/a.txt".into(),
             is_dir: false,
+            rev: "7-18f".into(),
         }
     }
 

@@ -23,6 +23,7 @@ html.lgap .convo > * + * { margin-left: calc(12 * var(--u)); }
 html.lgap .cv-top > * + * { margin-left: calc(6 * var(--u)); }
 html.lgap .cv-mode > * + * { margin-left: calc(3 * var(--u)); }
 html.lgap .chatbar > * + * { margin-left: calc(8 * var(--u)); }
+html.lgap .cb-line > * + * { margin-left: calc(6 * var(--u)); }
 html.lgap .cb-sub > * + * { margin-left: calc(6 * var(--u)); }
 html.lgap .chat-banner > * + * { margin-left: calc(8 * var(--u)); }
 html.lgap .chatlog > * + * { margin-top: calc(10 * var(--u)); }
@@ -54,7 +55,7 @@ html.lgap .dnrow > * + * { margin-left: calc(6 * var(--u)); }
 html.lgap .drow > * + * { margin-left: calc(12 * var(--u)); }
 html.lgap .state-chip > * + * { margin-left: calc(5 * var(--u)); }
 html.lgap .dacts > * + * { margin-left: calc(4 * var(--u)); }
-html.lgap .srow-top > * + * { margin-left: calc(12 * var(--u)); }
+html.lgap .shelp-row > * + * { margin-left: calc(8 * var(--u)); }
 html.lgap .lang-menu > * + * { margin-top: calc(2 * var(--u)); }
 html.lgap .radio > * + * { margin-left: calc(11 * var(--u)); }
 html.lgap .sheet-head > * + * { margin-left: calc(12 * var(--u)); }
@@ -77,12 +78,13 @@ html.lgap .mode input { margin: calc(3 * var(--u)) 0 0; }
 /*
  * 下面这些要人工核对（生成器只能照搬，判断得人来做）：
  *   · 第 193 行 `.sec-label`：`justify-content: space-between` 已自带分离，**跳过**（不补 margin）
- *   · 第 227 行 `.empty` 下的 `.empty p` 自带 `margin: 0`（重置，兜底表的间距照常生效）
- *   · 第 335 行 `.chatlog` 下的 `.chatlog > .empty` 自带 `margin: auto`（设计值，下面会原样再声明一遍保住它）
- *   · 第 424 行 `.rc-list`：换行容器，走"容器负外边距 + 子项外边距"（行/列间距都有）
- *   · 第 570 行 `.perm-acts`：换行容器，走"容器负外边距 + 子项外边距"（行/列间距都有）
- *   · 第 599 行 `.t-meta`：`justify-content: space-between` 已自带分离，**跳过**（不补 margin）
- *   · 第 700 行 `.radio` 下的 `.radio input` 自带 `margin: 0`（重置，兜底表的间距照常生效）
- *   · 第 767 行 `.mode` 下的 `.mode input` 自带 `margin: calc(3 * var(--u)) 0 0`（设计值，下面会原样再声明一遍保住它）
- *   · 第 780 行 `.pick` 下的 `.pick input` 自带 `margin: 0`（重置，兜底表的间距照常生效）
+ *   · 第 230 行 `.empty` 下的 `.empty p` 自带 `margin: 0`（重置，兜底表的间距照常生效）
+ *   · 第 342 行 `.chatlog` 下的 `.chatlog > .empty` 自带 `margin: auto`（设计值，下面会原样再声明一遍保住它）
+ *   · 第 431 行 `.rc-list`：换行容器，走"容器负外边距 + 子项外边距"（行/列间距都有）
+ *   · 第 579 行 `.perm-acts`：换行容器，走"容器负外边距 + 子项外边距"（行/列间距都有）
+ *   · 第 608 行 `.t-meta`：`justify-content: space-between` 已自带分离，**跳过**（不补 margin）
+ *   · 第 674 行 `.srow-top`：`justify-content: space-between` 已自带分离，**跳过**（不补 margin）
+ *   · 第 733 行 `.radio` 下的 `.radio input` 自带 `margin: 0`（重置，兜底表的间距照常生效）
+ *   · 第 815 行 `.mode` 下的 `.mode input` 自带 `margin: calc(3 * var(--u)) 0 0`（设计值，下面会原样再声明一遍保住它）
+ *   · 第 828 行 `.pick` 下的 `.pick input` 自带 `margin: 0`（重置，兜底表的间距照常生效）
  */

@@ -92,7 +92,7 @@
         </div>
       </div>
     {:else}
-      <div class="sec-label" style="padding-bottom:0">
+      <div class="sec-label flush">
         <span>{t("应用")}</span>
         <!-- 重读期间（旧表还在屏幕上）说"读取中"，不留一个看不出在动的数字。 -->
         <span class="num">{loadState.loading ? t("读取中…") : `${shown.length} / ${apps?.length ?? 0}`}</span>
