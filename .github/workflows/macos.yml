@@ -13,7 +13,10 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # GitHub 已不再为 `macos-14` 标签提供 runner：任务会在 1 秒内被 cancelled（0 step，
+    # 不排队、不报错）。`macos-latest` 当前是 macOS 15，`tauri.conf.json` 的
+    # `minimumSystemVersion = 11.0` 仍决定产物最低系统；标签后续换代也不用再改这里。
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
