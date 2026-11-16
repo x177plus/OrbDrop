@@ -1,16 +1,25 @@
 {
   "version": "0.3.1",
   "versionCode": 3001,
-  "notes": "修复：把对端共享项拖到资源管理器时可能永久卡住——日志里 开始水合/水合完成 不停循环、文件一直不出现、资源管理器未响应。根因是取数据回调把对端的短读当成“已经到文件末尾”，只交一部分字节就返回成功；平台不会补发余下区间，那个读会一直挂着（60 秒超时，期间任何别的有效操作还会重置计时器）。现在只要没盖住平台要的那一段就明确判失败（日志写明 offset、需要到哪、占位符大小），目标当场报错而不是卡死；占位符大小与对端不一致时，重新拖一次会按对端当前大小原地刷新（沿用原名，不会多出 (2)）。macOS 这一版未出包（在 Windows 上构建；该修复只影响 Windows），macOS 停在 0.3.0 不受影响。",
-  "pubDate": "2026-11-16T11:29:37Z",
+  "notes": "修复：把对端共享项拖到资源管理器时可能永久卡住——日志里 开始水合/水合完成 不停循环、文件一直不出现、资源管理器未响应。根因是取数据回调把对端的短读当成“已经到文件末尾”，只交一部分字节就返回成功；平台不会补发余下区间，那个读会一直挂着（60 秒超时，期间任何别的有效操作还会重置计时器）。现在只要没盖住平台要的那一段就明确判失败（日志写明 offset、需要到哪、占位符大小），目标当场报错而不是卡死；占位符大小与对端不一致时，重新拖一次会按对端当前大小原地刷新（沿用原名，不会多出 (2)）。macOS 通用包随本版一起发布（zip 供应用内自动更新、dmg 供首次安装；未签名，首次打开需右键“打开”）。",
+  "pubDate": "2026-11-16T11:52:30Z",
   "desktop": {
     "windows-x86_64": {
       "size": 18710016,
       "sha256": "178cb90b6de6c619e61823d8823ca5088fcd3c20f4d9497646199b57ce556a54",
-      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NHBLMDFXSlh4M3BzdmsrZTFrN1psQlpDQzk1Yi9YdnNMNGZHQjJHNUgxcWtteXhuK1A5TmxzWVQxdnBMak00QU9xeklvTXRka2QyeGF1bUFYY1NMM2dRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0ODI4NTc3CWZpbGU6b3JiZHJvcC5leGUKb0lEamo3Qlo5c2lQMmlvUEFFT1dyU0FCMjA3bU4wOUlYZGpwWmhHcEdzaE5OeGNxWEJxTTFWNHhpNGdCL3FHWVl3REgyMHVSRmZidzhvM0k1eE8vREE9PQo=",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NGtzQUZhYXRzZFE4ZHR3eENkQkdhc3lJZW1JWENJVWk5dGMrMlhLSk54cWlYT21nWlRUR1Nrd01KVEVWWjdVNTJseXN1SEhJdnAxb0R5L2tSMDUySGdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0ODI5OTQ5CWZpbGU6b3JiZHJvcC5leGUKbjRXblU0UlQrWTN6R1ZjYTI1ajJrZXNka1ZwSVlrOElvbWhub01SUkFKZlp1bDNLczQrdHhoWmtPTmJQbnFtd3g4R0t1c2JteG1UbHN0SnlCZXE4RFE9PQo=",
       "mirrors": [
         "https://github.com/x177plus/OrbDrop/releases/download/v0.3.1/OrbDrop_0.3.1_windows_x64.exe",
         "https://gitee.com/x177plus/OrbDrop/releases/download/v0.3.1/OrbDrop_0.3.1_windows_x64.exe"
+      ]
+    },
+    "macos-universal": {
+      "size": 15258790,
+      "sha256": "13830852e7b0a917f9a35c057e269fc73cde1090a9225d9b43f3392602b3ae2e",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NHRsQ3V1WnB3UDFvcHV5QjVna1MycEJ4VjdKNDQzeVNSUlE0US9OU00zZHEyS3YrQ0pwMExxWFJuWHdsak1SYVpNVDFvUUMrbE5Ybzg3enJsaWpsUEFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0ODI5OTQ5CWZpbGU6T3JiRHJvcF8wLjMuMV9tYWNvc191bml2ZXJzYWwuYXBwLnppcApkclJPZ0hBdDFsczR3SVNFNFptSlFFUEV5UnBYZElwSDltNi9jMTNBZ0ltektrL1lKeEtQZmhURVRMMWhMWU9ObmYxNldIcDBiZGdCRHVwekJyNmxCUT09Cg==",
+      "mirrors": [
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.3.1/OrbDrop_0.3.1_macos_universal.app.zip",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.3.1/OrbDrop_0.3.1_macos_universal.app.zip"
       ]
     }
   },
