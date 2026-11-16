@@ -22,6 +22,8 @@
 
   interface TreeState { expanded: boolean; entries: TreeEntry[]; loaded: boolean; loading: boolean; error: string | null; }
   let shareTreeStates = $state<Record<string, TreeState>>({});
+  /** 本机树里的文件被删除后就地刷新：值变化时已加载的 TreeNode 各自重拉那一层。 */
+  let refreshSignal = $state(0);
   // 尚未展开过的共享项用这个只读占位：模板里只能读状态，建条目必须发生在事件处理里，
   // 否则等于在渲染期写 $state（Svelte 5 抛 state_unsafe_mutation，整块列表渲染中断）。
   const EMPTY_TREE_STATE: TreeState = Object.freeze({ expanded: false, entries: [], loaded: false, loading: false, error: null });
@@ -29,6 +31,16 @@
   onMount(() => {
     loadShares();
     getActualPort().then(setServerPort).catch(console.error);
+    // 删除成功的那一下由 App 派事件（本机没有 WS 回传）：已展开的根层重拉，
+    // 深层由 `refreshSignal` 驱动 TreeNode 各自重拉。
+    const onDeleted = (e: Event) => {
+      const d = (e as CustomEvent).detail as { kind?: string; shareId?: string } | undefined;
+      if (d?.kind !== 'share' || !d.shareId) return;
+      refreshSignal += 1;
+      void reloadShareRoot(d.shareId);
+    };
+    document.addEventListener('od:entry-deleted', onDeleted);
+    return () => document.removeEventListener('od:entry-deleted', onDeleted);
   });
 
   let shares = $derived(getShares());
@@ -59,6 +71,39 @@
     st.expanded = !st.expanded;
   }
 
+  /** 删除文件后重拉共享项根那一层（展开状态与已加载标记保持不变）。 */
+  async function reloadShareRoot(shareId: string) {
+    if (!treeState(shareId).loaded) return;
+    try {
+      const entries = await fetchTree(getServerPort(), shareId, '');
+      shareTreeStates = {
+        ...shareTreeStates,
+        [shareId]: { ...treeState(shareId), entries, error: null },
+      };
+    } catch (e: any) {
+      shareTreeStates = {
+        ...shareTreeStates,
+        [shareId]: { ...treeState(shareId), error: e?.message ?? t('加载失败') },
+      };
+    }
+  }
+
+  /** 双击共享项根这一行：目录 = 展开/收起；文件 = 直接用系统默认程序打开（与设备页一致）。 */
+  function shareDblClick(e: MouseEvent, share: ShareItem) {
+    // 行里的按钮/开关自己双击有含义（切广播、展开），别把它们当成"打开这一行"。
+    const target = e.target as HTMLElement | null;
+    if (target?.closest('button, label, input')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (share.isDir) {
+      void toggleTree(share.id);
+      return;
+    }
+    document.dispatchEvent(new CustomEvent('od:open-local', {
+      detail: { shareId: share.id, path: '', name: share.name, isDir: false },
+    }));
+  }
+
   function handleBroadcastToggle(shareId: string, checked: boolean) {
     toggleBroadcast(shareId, checked).catch(console.error);
     onToast(checked
@@ -73,7 +118,7 @@
     e.stopPropagation();
     const item = el.closest('.share-item') as HTMLElement | null;
     document.dispatchEvent(new CustomEvent('od:ctx', {
-      detail: { x: e.clientX, y: e.clientY, el: item, kind: 'share', shareId: share.id, name: share.name }
+      detail: { x: e.clientX, y: e.clientY, el: item, kind: 'share', shareId: share.id, name: share.name, isDir: share.isDir, size: share.size ?? 0 }
     }));
   }
 
@@ -123,7 +168,13 @@
         data-id={share.id}
         oncontextmenu={(e) => openCtx(e, e.currentTarget, share)}
       >
-        <div class="share-row" use:dragOut={{ source: { shareId: share.id, path: '', name: share.name, isDir: dir }, onMessage: onToast }}>
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
+          class="share-row"
+          title={dir ? t('双击展开「{name}」', { name: share.name }) : t('双击打开「{name}」', { name: share.name })}
+          ondblclick={(e) => shareDblClick(e, share)}
+          use:dragOut={{ source: { shareId: share.id, path: '', name: share.name, isDir: dir }, onMessage: onToast }}
+        >
           {#if dir}
             <button class="chev" onclick={() => toggleTree(share.id)} aria-label={t('展开')}>{@html ICON_CHEVRON}</button>
           {:else}
@@ -168,6 +219,7 @@
                     shareId={share.id}
                     {entry}
                     level={1}
+                    {refreshSignal}
                   />
                 {/each}
               {/if}

@@ -12,9 +12,8 @@
     <string name="notif_channel_messages_desc">收到设备发来的消息时提醒你；关掉不影响 OrbDrop 在后台保持在线。</string>
 
     <!-- 安卓插件端端到界面的报错（invoke.reject / 抛出的异常），与默认资源同名。 -->
-    <string name="file_open_not_owned">只能打开应用自己的文件：%1$s</string>
-    <string name="file_open_missing">文件不在了：%1$s</string>
-    <string name="file_open_is_directory">这是文件夹：安卓上没有能打开应用私有目录的应用</string>
+    <string name="file_open_missing">文件已经不在了：%1$s</string>
+    <string name="file_open_is_directory">这是文件夹：安卓上没有能通用打开目录的应用</string>
 
     <!-- 「保存到手机」（ExportFilePlugin）：把收件里的一份文件复制进系统相册 / 下载。 -->
     <string name="export_not_owned">只能保存应用自己的文件：%1$s</string>

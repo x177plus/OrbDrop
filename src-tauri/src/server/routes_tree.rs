@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Query, State};
@@ -24,45 +25,21 @@ pub struct TreeResponse {
     pub entries: Vec<TreeEntry>,
 }
 
-/// GET /tree?share=<id>&path=<relative_path>
+/// 列共享项内一层目录（`rel_path` 是共享项内相对路径，空串 = 根）。
 ///
-/// Returns a one-level directory listing for the given share and path.
-pub async fn tree_handler(
-    State(state): State<Arc<AppState>>,
-    Extension(caller): Extension<Caller>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<TreeResponse>, (StatusCode, String)> {
-    let share_id = params.get("share").ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "Missing 'share' query parameter".into(),
-        )
-    })?;
-    let rel_path = params.get("path").map(|s| s.as_str()).unwrap_or("");
-
-    // 不可见与不存在都回 404：不向对端泄露「本机有这么个共享项」。
-    let share = {
-        let config = state.config.lock();
-        config
-            .shares
-            .iter()
-            .find(|s| s.id == *share_id && caller.sees_share(&state, s))
-            .cloned()
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    format!("Share '{}' not found", share_id),
-                )
-            })?
-    };
-    let share_root = share.path;
-
+/// `/tree` 路由与安卓的 `local_tree` 命令共用这一份实现：手机 release WebView 禁止
+/// 明文 `http://127.0.0.1`（`usesCleartextTraffic=false`），页面里的 `fetch` 会直接报
+/// `Failed to fetch`，所以移动端走 IPC，本机 HTTP 只留给桌面端与对端。
+pub async fn list_entries(
+    share_root: &Path,
+    rel_path: &str,
+) -> Result<Vec<TreeEntry>, (StatusCode, String)> {
     if !crate::server::safe_relative_share_path(rel_path) {
         return Err((StatusCode::FORBIDDEN, "Path access denied".into()));
     }
 
     let target = if rel_path.is_empty() {
-        share_root.clone()
+        share_root.to_path_buf()
     } else {
         share_root.join(rel_path)
     };
@@ -135,5 +112,41 @@ pub async fn tree_handler(
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
 
+    Ok(entries)
+}
+
+/// GET /tree?share=<id>&path=<relative_path>
+///
+/// Returns a one-level directory listing for the given share and path.
+pub async fn tree_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<TreeResponse>, (StatusCode, String)> {
+    let share_id = params.get("share").ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Missing 'share' query parameter".into(),
+        )
+    })?;
+    let rel_path = params.get("path").map(|s| s.as_str()).unwrap_or("");
+
+    // 不可见与不存在都回 404：不向对端泄露「本机有这么个共享项」。
+    let share = {
+        let config = state.config.lock();
+        config
+            .shares
+            .iter()
+            .find(|s| s.id == *share_id && caller.sees_share(&state, s))
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Share '{}' not found", share_id),
+                )
+            })?
+    };
+
+    let entries = list_entries(&share.path, rel_path).await?;
     Ok(Json(TreeResponse { entries }))
 }

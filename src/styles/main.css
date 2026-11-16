@@ -20,6 +20,9 @@
   --notif: rgb(186, 87, 2);
   /* 「关系出问题」才用的红：对端点过「断开」（重拨被拒）/ 对端不认本机 token。 */
   --danger: rgb(215, 51, 55);
+  /* 危险按钮（删除共享项）的浅底与深字；现代值在文件末尾的 @supports 里派生。 */
+  --danger-soft: rgba(215, 51, 55, 0.12);
+  --danger-deep: rgb(154, 34, 37);
 
   --accent-soft: rgba(23, 121, 225, 0.13);
   --fg-soft: rgba(14, 18, 23, 0.06);
@@ -1139,6 +1142,9 @@ input { font: inherit; }
 .btn-primary:hover { background: var(--accent-deeper); }
 .btn-secondary { background: var(--surface); color: var(--fg); border-color: var(--border); }
 .btn-secondary:hover { border-color: rgba(14, 18, 23, 0.4); }
+/* 危险动作（删除共享项）：与移动端 `.btn-danger` 同一套浅红底/深红字。 */
+.btn-danger { background: var(--danger-soft); color: var(--danger-deep); }
+.btn-danger:hover { background: rgba(215, 51, 55, 0.2); }
 .btn-ghost { background: transparent; color: var(--muted); }
 .btn-ghost:hover { color: var(--fg); background: var(--fg-soft); }
 .btn-block { width: 100%; }
@@ -1318,6 +1324,9 @@ input { font: inherit; }
 .sheet-head { display: flex; align-items: center; gap: var(--gap-md); padding: 13px 16px; border-bottom: 1px solid var(--border); }
 .sheet-head h3 { margin: 0; font-family: var(--font-display); font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
 .sheet-body { flex: 1; overflow-y: auto; padding: 18px 16px; display: flex; flex-direction: column; gap: 16px; }
+/* 滚动区还有下文时压在窗口底边的一道渐隐：不是 footer、不占布局、不挡点击。
+   只在 `moreBelow` 为真时挂上（SettingsPanel），滚到底立刻撤掉。 */
+.sheet-fade { position: absolute; left: 0; right: 0; bottom: 0; z-index: 1; height: 32px; pointer-events: none; background: linear-gradient(to bottom, transparent, var(--surface)); }
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field > label { font-size: var(--fs-xs); color: var(--muted); }
 .input { width: 100%; height: 36px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--fg); font-size: var(--fs-sm); }
@@ -1439,6 +1448,10 @@ input { font: inherit; }
    静态缩略图把这一列直接显出来：它本身也是"这张卡片长这样"的一部分。 */
 .shape-picker .so-scale .rq-dots { opacity: 1; }
 .sheet-foot { display: flex; justify-content: flex-end; gap: var(--gap-sm); padding: 12px 16px; border-top: 1px solid var(--border); }
+.autosave-status { align-self: center; font-size: var(--fs-sm); color: var(--muted); white-space: nowrap; }
+.autosave-status.is-error { color: var(--danger); }
+.autosave-retry { padding: 0; border: 0; background: none; color: inherit; font: inherit; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.autosave-retry:hover { color: var(--accent); }
 
 /* ─── hint（圆圈 ? + 悬停说明）──────────────────────────────── */
 /* 说明都收进这颗 14px 的圈里，指针悬停 / 键盘聚焦才出气泡。圈里的「?」用正文字体并
@@ -2164,6 +2177,8 @@ input { font: inherit; }
   --warn: oklch(62% 0.15 60);
   --notif: oklch(57% 0.15 50);
   --danger: oklch(58% 0.2 25);
+  --danger-soft: color-mix(in oklab, var(--danger) 12%, transparent);
+  --danger-deep: color-mix(in oklab, var(--danger) 78%, black);
   --accent-soft: color-mix(in oklab, var(--accent) 13%, transparent);
   --fg-soft: color-mix(in oklab, var(--fg) 6%, transparent);
   --ok-soft: color-mix(in oklab, var(--ok) 13%, transparent);

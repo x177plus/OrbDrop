@@ -29,6 +29,10 @@
     onToast,
     onDownload,
     onOpen,
+    /** 共享项（本机）文件：用系统默认程序打开这一项自己。不传 = 不画「打开」。 */
+    onOpenLocal,
+    /** 共享项（本机/对端）文件：删除磁盘上的这一份。不传 = 不画「删除文件」。 */
+    onDeleteEntry,
     onCopy,
     onCopyUrl,
     onRemove,
@@ -41,11 +45,10 @@
     onPeerDownload,
     /** 设备页的对端项：用系统默认程序打开（Windows 是 CFAPI 占位符，按需水合）。 */
     onPeerOpen,
-    /** 设备页的文件：把「打开」后的本地修改写回对端（显式覆盖）。不传/目录/单文件共享根不画。 */
-    onPeerWriteback,
-    /** 设备页的文件：跳过冲突核对，直接用本地副本覆盖对端（用户明确点的强制档）。 */
+    /** 设备页的文件：打开本机工作副本所在的文件夹（与「打开」同一份本地副本）。不传 = 不画。 */
+    onPeerOpenFolder,
+    /** 设备页的文件：强制写回。只在冲突/自动写回停住时给；跳过冲突核对直接覆盖对端。 */
     onPeerForceWriteback,
-    onPeerUseRemote,
     /** 设备页的目录：把本机文件/目录上传到这一项（只对目录给；`onPeerUpload` 不传就不画）。 */
     onPeerUpload,
     /** 共享项（本机或对端）文件/目录：查看更新记录。 */
@@ -124,6 +127,10 @@
     onToast: (msg: string) => void;
     onDownload: () => void;
     onOpen: () => void;
+    /** 共享项（本机）文件：打开文件自己（不是所在文件夹）。 */
+    onOpenLocal?: () => void;
+    /** 共享项（本机/对端）文件：删除这一份（目录与共享项根不画）。 */
+    onDeleteEntry?: () => void;
     onCopy: () => void;
     /**
      * 共享项菜单：「复制下载链接」—— 只有共享项**开着广播开关**时调用方才传这个回调
@@ -142,21 +149,13 @@
     onPeerDownload: () => void;
     /** 设备页的对端项：打开（返回本地路径后由调用方交给系统）。不传 = 不画这一项。 */
     onPeerOpen?: () => void;
-    /**
-     * 设备页的文件：写回对端。只对**打开过且编辑过**的本地副本有意义；后端会核对打开时的
-     * 对端元数据，变过就拒绝。不传 = 不画这一项。
-     */
-    onPeerWriteback?: () => void;
+    /** 设备页的文件：打开本机工作副本所在的文件夹。不传 = 不画这一项。 */
+    onPeerOpenFolder?: () => void;
     /**
      * 设备页的文件：强制写回。跳过"对端在打开后变过"的核对，直接用本地副本覆盖；
      * 仍拒绝目录。不传 = 不画这一项。
      */
     onPeerForceWriteback?: () => void;
-    /**
-     * 设备页的文件：冲突时用远端覆盖本地。先把本地修改另存成冲突副本，再刷新同一路径；
-     * 不传 = 不画这一项。
-     */
-    onPeerUseRemote?: () => void;
     /** 共享项（本机或对端）文件/目录：查看更新记录。不传 = 不画。 */
     onShareHistory?: () => void;
     /** 设备页的目录：上传到这一项。不传 = 不画这一项（文件行没有"上传到文件里"这回事）。 */
@@ -324,29 +323,19 @@
       {convoThread ? (convoBc ? t('删除群发（消息留在各设备会话）') : t('退出群聊（本地删除并广播离开）')) : t('清空聊天记录')}
     </button>
   {:else if kind === 'peer'}
+    <!-- 第一项永远是「打开」（树根文件与目录都适用）；随后是"拿到本地"的操作。 -->
     {#if onPeerOpen}
       <button class="ctx-item" onclick={() => handleItem(onPeerOpen)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3h7v7"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>
         {t('打开')}
       </button>
     {/if}
-    <!-- 单文件共享项（path 为空）不走写回：上传面只能写进共享项目录，写不到共享根那个文件。 -->
-    {#if onPeerWriteback && !isDir && path}
-      <button class="ctx-item" title={t('立即用本地副本覆盖对端文件；对端在打开后变过就拒绝')} onclick={() => handleItem(onPeerWriteback)}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9M7 14l5-5 5 5M5 3h14"/></svg>
-        {t('写回对端')}
-      </button>
-    {/if}
-    {#if onPeerForceWriteback && !isDir && path}
-      <button class="ctx-item danger" title={t('不核对对端是否在打开后变过；用本地副本直接覆盖（可能丢掉对方的修改）')} onclick={() => handleItem(onPeerForceWriteback)}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 2 21h20L12 3Z"/><path d="M12 9v6M12 18h.01"/></svg>
-        {compact ? t('强制写回') : t('强制写回（覆盖远端更新）')}
-      </button>
-    {/if}
-    {#if onPeerUseRemote && !isDir && path}
-      <button class="ctx-item" title={t('把本地修改另存为冲突副本，再用对端版本刷新同一个本地路径')} onclick={() => handleItem(onPeerUseRemote)}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
-        {compact ? t('用远端覆盖') : t('用远端覆盖（本地另存）')}
+    <!-- 文件：打开本机工作副本所在的文件夹（与「打开」同一份本地副本）；目录的「打开」
+         就是进它自己，不再重复一项。 -->
+    {#if onPeerOpenFolder && !isDir}
+      <button class="ctx-item" onclick={() => handleItem(onPeerOpenFolder)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>
+        {compact ? t('打开文件夹') : t('打开所在文件夹')}
       </button>
     {/if}
     <!-- 卡片上的这一档已经由页头写着设备名（那一页就是它），文案不再重复一次。 -->
@@ -363,24 +352,57 @@
         {t('上传到此文件夹…')}
       </button>
     {/if}
+    <!-- 自动写回负责正常保存；手动只留冲突时的「强制写回」。普通写回和"用远端覆盖"
+         不再占菜单：前者由 `mirror::auto` 自动做，后者直接用「下载到本地」取一份即可。 -->
+    {#if onPeerForceWriteback && !isDir && !compact}
+      <button class="ctx-item danger" title={t('不核对对端是否在打开后变过；用本地副本直接覆盖（可能丢掉对方的修改）')} onclick={() => handleItem(onPeerForceWriteback)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 2 21h20L12 3Z"/><path d="M12 9v6M12 18h.01"/></svg>
+        {compact ? t('强制写回') : t('强制写回（覆盖远端更新）')}
+      </button>
+    {/if}
     {#if onShareHistory && !compact}
       <button class="ctx-item" onclick={() => handleItem(onShareHistory)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
         {t('更新记录…')}
       </button>
     {/if}
+    <!-- 删除放第一组的最后（本机 / 对端同一位置），红色。共享项根（单文件共享 / 树根，
+         path 为空）不给 —— 那等于删掉用户磁盘上的源文件，和「移除共享项」是两回事。
+         目录递归删除由后端执行，确认框会明确写出"及其全部内容"。 -->
+    {#if onDeleteEntry && path}
+      <button
+        class="ctx-item delete"
+        title={isDir ? t('从对方设备的共享目录中删除这个文件夹及其全部内容，无法恢复') : t('从对方设备的共享目录中删除这个文件，无法恢复')}
+        onclick={() => handleItem(onDeleteEntry)}
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
+        {isDir
+          ? (compact ? t('删除文件夹') : t('删除文件夹…'))
+          : (compact ? t('删除文件') : t('删除文件…'))}
+      </button>
+    {/if}
     {#if bcAvailable}{@render bcSection()}{/if}
   {:else if kind === 'share'}
-    {#if !compact}
+    <!-- 第一项永远是「打开」：文件用系统默认程序打开自己，目录进文件管理器。
+         「打开所在文件夹」只对文件给（目录的「打开」就是进它自己，不再重复一项）。 -->
+    {#if onOpenLocal}
+      <button class="ctx-item" onclick={() => handleItem(onOpenLocal)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3h7v7"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>
+        {t('打开')}
+      </button>
+    {/if}
+    {#if !isDir}
+      <button class="ctx-item" onclick={() => handleItem(onOpen)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>
+        {compact ? t('打开文件夹') : t('打开所在文件夹')}
+      </button>
+    {/if}
+    {#if !compact && !isDir}
       <button class="ctx-item" onclick={() => handleItem(onDownload)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 19h14"/></svg>
         {t('下载到本地')}
       </button>
     {/if}
-    <button class="ctx-item" onclick={() => handleItem(onOpen)}>
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 7h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>
-      {compact ? t('打开文件夹') : t('打开所在文件夹')}
-    </button>
     <button class="ctx-item" onclick={() => handleItem(onCopy)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11v13H4z"/><path d="M8 4h12v12"/></svg>
       {compact ? t('复制路径') : t('复制共享路径')}
@@ -395,6 +417,19 @@
       <button class="ctx-item" onclick={() => handleItem(onShareHistory)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
         {t('更新记录…')}
+      </button>
+    {/if}
+    <!-- 删除放第一组的最后，红色；共享项根（path 为空）不给。 -->
+    {#if onDeleteEntry && path}
+      <button
+        class="ctx-item delete"
+        title={isDir ? t('从本机磁盘上删除这个文件夹及其全部内容，无法恢复') : t('从本机磁盘上删除这个文件，无法恢复')}
+        onclick={() => handleItem(onDeleteEntry)}
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
+        {isDir
+          ? (compact ? t('删除文件夹') : t('删除文件夹…'))
+          : (compact ? t('删除文件') : t('删除文件…'))}
       </button>
     {/if}
     <div class="ctx-sep"></div>
@@ -498,6 +533,14 @@
     white-space: nowrap;
   }
   .ctx.is-compact .ctx-sep { margin: 4px 5px; }
+
+  /* 删除：红色（`.danger` 是这套配色里"关系出问题"的琥珀色；删除这一条用户要求用红）。
+     图标也要跟着红：`.ctx-item svg` 默认是 muted。 */
+  .ctx-item.delete { color: var(--danger); }
+  .ctx-item.delete svg { color: var(--danger); }
+  /* 走令牌而不是组件内写 `color-mix()`：令牌自带 sRGB/现代两档回退，老 WebView 不会整条失效
+     （兼容性门禁也会把组件 CSS 里的裸 `color-mix()` 算作问题）。 */
+  .ctx-item.delete:hover { background: var(--danger-soft); }
 
   /* 比较位提示行 / 无可比对象的比较项：沿用 .ctx-item 排版，但不可点也不高亮。
      pointer-events:none 让点击落到菜单根节点上，等于「点空白关闭菜单」。 */

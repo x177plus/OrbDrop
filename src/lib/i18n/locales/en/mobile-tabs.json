@@ -54,8 +54,6 @@
   "接收自 {name}": "From {name}",
   "下载自 {name}": "Downloading from {name}",
   "已暂停": "Paused",
-  "当前没有进行中的传输": "No transfers in progress",
-  "推送或下载文件时会在这里显示进度。": "Progress shows up here while pushing or downloading files.",
   "没有处于长连接的设备": "No devices with a live connection",
   "在「设备」页选一台已配对的 PC 点「连接」，建立长连接后就能浏览它共享的目录。": "On the Devices page, pick a paired PC and tap “Connect”; once a live connection is up you can browse the folders it shares.",
   "读取共享项失败": "Couldn't load shared items",

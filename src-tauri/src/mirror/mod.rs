@@ -150,8 +150,8 @@ pub async fn place_with_meta(
 
 /// 同 [`place_with_meta`]，但**跳过“本地有未写回修改”的拦截**。
 ///
-/// 只给“用户明确选择用远端覆盖本地”的冲突处理用：调用方已经先把本地内容另存成冲突副本，
-/// 随后刷新/重建同一个路径。自动同步与普通打开绝不能走这一条。
+/// 只给“用户明确要求忽略本地修改、强制刷新同一路径”的冲突处理路径用：调用方已经先
+/// 把本地内容另存成冲突副本，随后刷新/重建同一个路径。自动同步与普通打开绝不能走这一条。
 pub async fn place_with_meta_force(
     state: &Arc<AppState>,
     item: &MirroredItem,
@@ -173,7 +173,7 @@ async fn place_with_meta_inner(
         {
             if writeback::local_changed(&opened) {
                 return Err(
-                    "本地副本还有未写回的修改；自动写回完成前不能打开/拖出；如需立即写回请右键「写回对端」"
+                    "本地副本还有未写回的修改；自动写回完成前不能打开/拖出；如需立即写回请右键「强制写回」"
                         .to_string(),
                 );
             }

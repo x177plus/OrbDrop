@@ -50,9 +50,22 @@
       queueShareRefresh(shareId);
     });
 
+    // 本机刚删掉这一页里的一个文件：不等对端 watcher 的 300ms 防抖 + WS 回传，
+    // 直接重拉已加载的根层（展开中的子层由 `refreshSignal` 驱动）。
+    const onDeleted = (e: Event) => {
+      const d = (e as CustomEvent).detail as
+        | { kind?: string; peerId?: string; shareId?: string }
+        | undefined;
+      if (d?.kind !== 'peer' || d.peerId !== device.id || !d.shareId) return;
+      refreshSignal += 1;
+      if (treeState(d.shareId).loaded) void loadShareRoot(d.shareId, true);
+    };
+    document.addEventListener('od:entry-deleted', onDeleted);
+
     return () => {
       if (changedTimer !== null) { clearTimeout(changedTimer); changedTimer = null; }
       pendingChanged.clear();
+      document.removeEventListener('od:entry-deleted', onDeleted);
       void changed.then((fn) => fn());
     };
   });

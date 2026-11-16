@@ -122,6 +122,78 @@ pub async fn file_handler(
     Ok(Body::from_stream(stream))
 }
 
+/// `DELETE /entry?share=<id>&path=<relative_path>` —— 删除共享项里的一个**文件或目录**。
+///
+/// 文件直接删，目录递归删；共享项根一律拒绝。根是用户整项共享的落点，误点一次会丢掉
+/// 整棵树，根级操作仍只由共享项设备的界面负责。
+///
+/// 删除前与 `/dav` 一样先登记短时归属：watcher 在 300ms 内看到 `deleted`，命中归属表
+/// 才会把这条更新记录写成**调用方设备**，否则会误记成共享项设备自己。
+pub async fn delete_entry_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let share_id = params.get("share").ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Missing 'share' query parameter".into(),
+        )
+    })?;
+    let rel_path = params.get("path").map(|s| s.as_str()).unwrap_or("");
+    let rel_path = crate::server::normalized_share_path(rel_path);
+    if rel_path.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "不能删除共享项根".into()));
+    }
+    if !crate::server::safe_relative_share_path(&rel_path) {
+        return Err((StatusCode::FORBIDDEN, "Path access denied".into()));
+    }
+
+    // 不可见与不存在都回 404：不向对端泄露「本机有这么个共享项」。
+    let share_root = {
+        let config = state.config.lock();
+        config
+            .shares
+            .iter()
+            .find(|s| s.id == *share_id && caller.sees_share(&state, s))
+            .map(|s| s.path.clone())
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Share '{share_id}' not found"),
+                )
+            })?
+    };
+
+    let root = tokio::fs::canonicalize(&share_root).await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "无法解析共享项根目录".to_string(),
+        )
+    })?;
+    let target = root.join(&rel_path);
+    let canonical = tokio::fs::canonicalize(&target)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "路径不存在".to_string()))?;
+    if !canonical.starts_with(&root) {
+        return Err((StatusCode::FORBIDDEN, "Path traversal denied".into()));
+    }
+    // 检查/删除的是**这一条路径本身**（符号链接删链接，不删目标）；canonicalize 只做越界检查。
+    let meta = tokio::fs::symlink_metadata(&target)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("读取元数据失败: {e}")))?;
+    let is_dir = meta.is_dir();
+
+    crate::server::routes_dav::attribute_peer(&state, &caller, share_id, &rel_path);
+    let removed = if is_dir {
+        tokio::fs::remove_dir_all(&target).await
+    } else {
+        tokio::fs::remove_file(&target).await
+    };
+    removed.map_err(|e| (StatusCode::FORBIDDEN, format!("删除失败: {e}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +238,75 @@ mod tests {
             resp.bytes().await.unwrap().as_ref(),
             b"hello from a file share"
         );
+
+        crate::server::stop_server(&state).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「删除」支持文件与目录（目录递归），但共享项根（含 `./` 归一后的根）与越界路径
+    /// 一律拒绝，且被拒时磁盘上的东西一个都不动。
+    #[tokio::test]
+    async fn delete_entry_removes_files_and_directories_inside_the_share() {
+        let dir = std::env::temp_dir().join(format!("orbdrop_delete_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("hello.txt"), b"hello").unwrap();
+        std::fs::write(dir.join("sub").join("inner.txt"), b"inner").unwrap();
+
+        let mut config = crate::config::test_config();
+        let share = ShareItem::new(dir.clone());
+        let share_id = share.id.clone();
+        config.shares.push(share);
+        let config_path =
+            std::env::temp_dir().join(format!("orbdrop_delete_cfg_{}.toml", uuid::Uuid::new_v4()));
+        let state = Arc::new(AppState::new(config, config_path));
+        let port = crate::server::start_server_loopback(state.clone(), 4095)
+            .await
+            .expect("起服务");
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/entry");
+
+        let resp = client
+            .delete(url.as_str())
+            .query(&[("share", share_id.as_str()), ("path", "hello.txt")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+        assert!(!dir.join("hello.txt").exists(), "文件应该真的被删掉");
+
+        // 目录：整棵子树递归删除。
+        let resp = client
+            .delete(url.as_str())
+            .query(&[("share", share_id.as_str()), ("path", "sub")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+        assert!(!dir.join("sub").exists(), "目录应该真的被删掉");
+
+        // 共享项根：空 path 与 `./` 都不能落到根自身。
+        for path in ["", "./"] {
+            let resp = client
+                .delete(url.as_str())
+                .query(&[("share", share_id.as_str()), ("path", path)])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "path={path:?} 不该删共享项根"
+            );
+        }
+        assert!(dir.exists(), "共享项根目录必须还在");
+
+        let resp = client
+            .delete(url.as_str())
+            .query(&[("share", share_id.as_str()), ("path", "../outside.txt")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
 
         crate::server::stop_server(&state).await;
         let _ = std::fs::remove_dir_all(&dir);

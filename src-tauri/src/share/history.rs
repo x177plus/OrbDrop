@@ -160,7 +160,8 @@ impl HistoryStore {
         }
     }
 
-    /// 登记一次写入归属。`prefix` = 精确文件路径，或目录前缀（不带尾斜杠）。
+    /// 登记一次写入归属。`prefix` = 精确文件路径，或目录前缀（不带尾斜杠）；
+    /// **空串 = 单文件共享项的根文件**（只对 watcher 报上来的空路径精确命中）。
     pub fn attribute(
         &self,
         share_id: &str,
@@ -171,13 +172,16 @@ impl HistoryStore {
         ttl: Duration,
     ) {
         let prefix = norm(prefix);
-        if prefix.is_empty() || !crate::ids::is_segment(share_id) {
+        if !crate::ids::is_segment(share_id) {
             return;
         }
         let mut inner = self.inner.lock().unwrap();
         let log = inner.shares.entry(share_id.to_string()).or_default();
         let now = Instant::now();
         log.attribution.retain(|a| a.until > now);
+        // 同一路径的最新一次登记说了算：旧登记（上一次写、上一个设备）不能因为先到而
+        // 继续消费下一批 watcher 事件。目录前缀不受影响（前缀不同，各自保留到 TTL）。
+        log.attribution.retain(|a| a.prefix != prefix);
         log.attribution.push(Attribution {
             prefix,
             actor_id: actor_id.to_string(),
@@ -224,6 +228,37 @@ impl HistoryStore {
         local_name: &str,
     ) {
         self.record_with_dir(share_id, path, kind, size, false, local_id, local_name);
+    }
+
+    /// 摘掉某条路径的短时归属（本机即将主动删/写它时用）。
+    ///
+    /// 必须在**落盘动作之前**调用：watcher 的防抖窗口是 300ms，但它与写路径并发，
+    /// 先摘掉这条归属，watcher 才不会被上一次对端写入的归属抢走。
+    pub fn forget_attribution(&self, share_id: &str, path: &str) {
+        let path = norm(path);
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(log) = inner.shares.get_mut(share_id) {
+            log.attribution.retain(|a| a.prefix != path);
+        }
+    }
+
+    /// 记录一条**本机界面明确发起**的动作（右键删除等）：不查短时归属表。
+    ///
+    /// `record_with_dir` 会先看归属表：如果对端 15 秒内刚写过这个路径，本机紧接着的删除
+    /// 会被误记成"对端删的"。这里先把这一条路径的归属摘掉，再按本机记录；watcher 稍后
+    /// 看到同一次删除时会命中同一条（同一 actor、2s 合并窗口）而不会多记一条。
+    pub fn record_local(
+        &self,
+        share_id: &str,
+        path: &str,
+        kind: &str,
+        size: Option<u64>,
+        is_dir: bool,
+        local_id: &str,
+        local_name: &str,
+    ) {
+        self.forget_attribution(share_id, path);
+        self.record_with_dir(share_id, path, kind, size, is_dir, local_id, local_name);
     }
 
     /// 记录一条变更（含文件/目录标记）。watcher 用这个版本，目录视图据此只列文件。
@@ -320,8 +355,13 @@ impl HistoryStore {
         };
         let mut latest: HashMap<&str, &UpdateEntry> = HashMap::new();
         for entry in &log.entries {
-            if entry.path.is_empty() || entry.is_dir {
+            if entry.path.is_empty() {
                 // 单文件共享项根的记录只给 `query_file("")` 用；目录视图只列文件。
+                continue;
+            }
+            // 目录自身只在**被删除**时进目录视图：创建/修改一个目录只是"里面可能有文件"的
+            // 附带事件；但删除是一条用户要看的记录（尤其是本机/对端右键删掉一整棵目录时）。
+            if entry.is_dir && entry.kind != "deleted" {
                 continue;
             }
             if !under(&entry.path, &prefix) {
@@ -491,6 +531,47 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// 单文件共享项根的历史路径是空串：归属也必须能落在这条上，否则写回会被记成本机。
+    #[test]
+    fn single_file_share_root_can_be_attributed() {
+        let (store, path) = store();
+        store.attribute("share-1", "", "peer-1", "对端", "upload", ATTRIBUTION_TTL);
+        store.record_batch("share-1", &[ev("", "modified")], "me", "本机");
+        let entries = store.query_file("share-1", "", 10);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "");
+        assert_eq!(entries[0].actor_id, "peer-1");
+        assert_eq!(entries[0].source, "upload");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 本机右键删除不能被"对端 15 秒内刚写过这个路径"的归属抢走：删除记录必须是本机，
+    /// 而且 watcher 稍后补的那条 `deleted` 应该并进同一条（不是第二条、也不是对端）。
+    #[test]
+    fn local_delete_wins_over_a_recent_peer_write() {
+        let (store, path) = store();
+        store.attribute("share-1", "a.txt", "peer-1", "对端", "dav", ATTRIBUTION_TTL);
+        store.record_local("share-1", "a.txt", "deleted", None, false, "me", "本机");
+        store.record_batch("share-1", &[ev("a.txt", "deleted")], "me", "本机");
+        let entries = store.query_file("share-1", "a.txt", 10);
+        assert_eq!(entries.len(), 1, "同一次删除只该有一条记录");
+        assert_eq!(entries[0].actor_id, "me");
+        assert_eq!(entries[0].kind, "deleted");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 同一路径的归属以**最后一次登记**为准：上一个设备的旧登记不能继续消费下一批事件。
+    #[test]
+    fn newer_attribution_for_the_same_path_wins() {
+        let (store, path) = store();
+        store.attribute("share-1", "a.txt", "peer-1", "甲", "dav", ATTRIBUTION_TTL);
+        store.attribute("share-1", "a.txt", "peer-2", "乙", "upload", ATTRIBUTION_TTL);
+        store.record_batch("share-1", &[ev("a.txt", "modified")], "me", "本机");
+        let entries = store.query_file("share-1", "a.txt", 10);
+        assert_eq!(entries[0].actor_id, "peer-2");
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn directory_query_returns_only_the_latest_entry_per_file() {
         let (store, path) = store();
@@ -542,6 +623,26 @@ mod tests {
         let entries = store.query_dir("share-1", "", 10);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "dir/a.txt");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 删除目录是一条用户要看的记录：目录视图里要出现它（创建/修改目录仍然不出现）。
+    #[test]
+    fn deleted_directories_are_listed_in_the_directory_view() {
+        let (store, path) = store();
+        store.record_with_dir(
+            "share-1",
+            "gone",
+            "deleted",
+            None,
+            true,
+            "me",
+            "本机",
+        );
+        let entries = store.query_dir("share-1", "", 10);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "gone");
+        assert_eq!(entries[0].kind, "deleted");
         let _ = std::fs::remove_file(path);
     }
 

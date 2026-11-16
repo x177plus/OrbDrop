@@ -19,7 +19,7 @@
   import * as chat from '$lib/stores/chat.svelte';
   import type { ConvoThread, ChatItem } from '$lib/stores/chat.svelte';
   import * as upd from '$lib/stores/update.svelte';
-  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, setPushReceivePaused, pushPaths, uploadToShare, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, forgetPeer, downloadFromPeer, openPeerFile, writebackPeerFile, resolveWritebackConflict, shareUpdateHistory, downloadFile, shareDownloadUrl, openPath, fetchTree, peerTree, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
+  import { getActualPort, startHttpServer, setOnline, acceptPush, rejectPush, cancelPush, cancelPushBatch, cancelReceive, setPushReceivePaused, pushPaths, uploadToShare, pushBatches as pushBatchesApi, pathPicks, localAddresses, orbScreenMetrics, orbSetRect, orbSetHitRegion, orbDragStart, orbMouseDown, orbSaveCenter, traySetAlert, addPeer, pairStart, pairConfirm, pairInvite, cancelPairInvite, acceptPairInvite, rejectPairInvite, connectPeer, disconnectPeer, removePeer, forgetPeer, downloadFromPeer, openPeerFile, openPeerFolder, writebackPeerFile, shareUpdateHistory, downloadFile, shareDownloadUrl, openPath, fetchTree, peerTree, deleteShareEntry, deletePeerEntry, acceptLinkRequest, rejectLinkRequest, cancelLinkRequest } from '$lib/api';
   import type { PushInvite, PushBatch, PushTarget, PeerDevice, TabKey, BcTarget, OrbDragInfo, LocalPick, RectPage, RectSlot, TreeEntry, OrbShape, ShareItem, PeerTransport, UploadDest, ShareUpdateEntry } from '$lib/types';
   import { shareMeta, updateStatusText, updateTitleText } from '$lib/types';
   import { adoptLanguagePreference, t } from '$lib/i18n.svelte';
@@ -37,6 +37,7 @@
   import ConvoPanel from '$lib/components/ConvoPanel.svelte';
   import RecipientDialog from '$lib/components/RecipientDialog.svelte';
   import UpdateHistory from '$lib/components/UpdateHistory.svelte';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import Hint from '$lib/components/Hint.svelte';
   import UpdateNotes from '$lib/components/UpdateNotes.svelte';
   import HintLayer from '$lib/components/HintLayer.svelte';
@@ -165,6 +166,36 @@
   };
   let historyPanel = $state<HistoryPanel | null>(null);
   let historySeq = 0;
+  /**
+   * 应用内确认框的状态。所有需要"用户点一下才继续"的桌面动作都走 `askInApp`，
+   * 不再调 `@tauri-apps/plugin-dialog` 的 `ask`：系统弹窗的图标、字体和按钮风格
+   * 与本应用的对话框不是一套。`resolve` 让调用方可以 `await`，形状与 `window.confirm` 同义。
+   */
+  type InAppConfirm = {
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    cancelLabel?: string;
+    /** 危险动作：确认键走红色，初始焦点落在「取消」上。 */
+    danger?: boolean;
+    resolve: (ok: boolean) => void;
+  };
+  let confirmState = $state<InAppConfirm | null>(null);
+
+  function askInApp(options: Omit<InAppConfirm, 'resolve'>): Promise<boolean> {
+    // 同一时刻只留一个：后来的把前一个按"取消"结算，别让调用方的 await 永久悬着。
+    confirmState?.resolve(false);
+    return new Promise((resolve) => {
+      confirmState = { ...options, resolve };
+    });
+  }
+
+  function settleConfirm(ok: boolean): void {
+    const current = confirmState;
+    if (!current) return;
+    confirmState = null;
+    current.resolve(ok);
+  }
   /**
    * 折叠态卡片上那个右键菜单是不是开着（`ctxState.orb`，见 `openRectCtx`）。
    *
@@ -1151,23 +1182,24 @@
    * 双击一个文件 = 用系统默认程序打开它。
    *
    * 本机项**直接开原文件**（零拷贝：文件本来就在这台机器上，开一份副本只会让人对着两份文件
-   * 发愣）；对端项的文件不在本机，先按 S-02 的下载模式取一份到下载目录再打开 —— 之后想再开
-   * 一次、或想留着这份，都能从落盘那份走（所以提示里要说清"是下载来的副本"）。
+   * 发愣）；对端项与面板里双击同一条路（`openPeerEntry`）：打开本地工作副本（Windows CFAPI /
+   * 其它平台的稳定副本），不再先复制进下载目录 —— 要"另存一份"走右键「下载到本地」。
    */
   async function openRectFile(page: RectPage, slot: RectSlot) {
     try {
       if (page.kind === 'local') {
-        const share = getShares().find((s) => s.id === slot.id);
-        if (!share) throw new Error(t('共享项已不存在'));
-        await openPath(slot.path ? `${share.path}/${slot.path}` : share.path);
+        await openLocalEntry({ shareId: slot.id, path: slot.path, isDir: slot.isDir });
         return;
       }
-      const copy = await downloadFromPeer(page.id, slot.id, slot.path, slot.name);
-      // 「每次询问」下用户在保存框里取消：什么都没发生，别去打开一个不存在的路径。
-      if (!copy) return;
-      await openPath(copy);
-      // 提示只报状态：文件名/路径可能很长，卡片和列表里已经能看全。
-      toast(t('已下载副本并打开'));
+      // 与面板里双击对端文件同一语义：打开本地工作副本（Windows CFAPI / 其它平台的稳定副本），
+      // 而不是先复制一份进下载目录。右键「下载到本地」仍保留那条"另存一份"的路。
+      await openPeerEntry({
+        peerId: page.id,
+        shareId: slot.id,
+        path: slot.path,
+        name: slot.name,
+        isDir: false,
+      });
     } catch (e) {
       toast(t('打开失败：{error}', { error: e instanceof Error ? e.message : String(e) }));
     }
@@ -3129,12 +3161,43 @@
   }
 
   /**
+   * 本机共享项里的一个文件/目录：直接交给系统默认程序打开。
+   *
+   * 双击文件（本机页 / 树节点）与右键「打开」共用这一条；目录走同一调用，落在文件
+   * 管理器里。路径由共享项根 + 树节点传下来的共享项内相对路径拼成 —— 与后端
+   * `/file` 的 `share_root.join(rel)` 同一个拼法。
+   */
+  async function openLocalEntry(entry: { shareId: string; path?: string; isDir?: boolean }) {
+    const share = getShares().find((s) => s.id === entry.shareId);
+    if (!share) {
+      toast(t('共享项已不存在'));
+      return;
+    }
+    const rel = (entry.path ?? '').replace(/\\/g, '/');
+    const root = share.path.replace(/[\\/]+$/, '');
+    const abs = rel ? `${root}/${rel}` : share.path;
+    try {
+      await openPath(abs);
+    } catch (e) {
+      toast(t('打开失败：{error}', { error: String(e) }));
+    }
+  }
+
+  /** 本机共享项右键「打开」：打开文件自己（不是所在文件夹）。 */
+  function ctxOpenLocalEntry() {
+    const c = ctxState;
+    hideCtx();
+    if (!c || c.kind !== 'share' || !c.shareId) return;
+    void openLocalEntry({ shareId: c.shareId, path: c.path, isDir: c.isDir });
+  }
+
+  /**
    * 打开一项对端文件/目录（右键「打开」与双击共用同一条路）。
    *
    * Windows 是 CFAPI 占位符（起开几乎零成本，目标读哪段才拉哪段）；macOS/Android 会先
    * 暂存整份（Android 有 `browse://download` 进度，macOS 暂存期间只有"正在准备"提示）。
-   * 打开的是本地副本；保存后由 `mirror::auto` 在元数据稳定 2s 后自动写回，右键「写回对端」
-   * 可立即重试，对端在打开后变过则拒绝（「强制写回」才覆盖）。
+   * 打开的是本地副本；保存后由 `mirror::auto` 在元数据稳定 2s 后自动写回；只有自动写回
+   * 因冲突停住时，才需要右键「强制写回」。
    */
   async function openPeerEntry(entry: { peerId: string; shareId: string; path: string; name?: string; isDir?: boolean }) {
     try {
@@ -3142,8 +3205,8 @@
       const local = await openPeerFile(entry.peerId, entry.shareId, entry.path, entry.name, entry.isDir);
       await openPath(local);
       toast(
-        !entry.isDir && entry.path
-          ? t('已打开（本地副本）。保存后会自动写回；右键可立即重试或强制覆盖。')
+        !entry.isDir
+          ? t('已打开（本地副本）。保存后会自动写回；冲突时可右键强制覆盖。')
           : t('已打开（本地副本）。'),
       );
     } catch (e) {
@@ -3160,53 +3223,43 @@
   }
 
   /**
-   * 设备页右键「写回对端」/「强制写回」：把打开后编辑过的本地副本覆盖回对端原文件。
+   * 设备页右键「打开所在文件夹」：打开**本机工作副本**所在的目录。
    *
-   * 安全默认（`force=false`）：后端先核对对端的大小/时间戳是否仍与打开时一致，不一致就拒绝。
-   * 强制档只跳过这项核对，仍走同一条上传链路；两档都要等这一批传完才报「已写回」。
-   * 上传进度/成败在会话通知区那张批次卡里。
+   * 已经打开/登记过的文件直接用它所在的目录；没有登记时才触发一次 place（Windows 是
+   * CFAPI 占位符，几乎零成本；macOS/Android 暂存整份，与「打开」同一代价）。本机目录
+   * 项不走这条 —— 它们的「打开」就是进目录本身。
    */
-  async function runPeerWriteback(force: boolean) {
+  async function ctxPeerOpenFolder() {
     const c = ctxState;
     hideCtx();
     if (!c || c.kind !== 'peer' || !c.peerId || !c.shareId || c.isDir) return;
-    const path = c.path ?? '';
-    if (!path) return; // 单文件共享项：上传面写不到共享根那个文件本身
-    const name = c.name ?? t('文件');
     try {
-      toast(t('正在写回「{name}」…（进度见通知卡）', { name }));
-      await writebackPeerFile(c.peerId, c.shareId, path, c.shareName, force);
-      toast(t('已写回「{name}」', { name }));
+      toast(t('正在准备「{name}」…', { name: c.name ?? '' }));
+      const dir = await openPeerFolder(c.peerId, c.shareId, c.path ?? '', c.name);
+      await openPath(dir);
     } catch (e) {
-      toast(t('写回失败：{error}', { error: String(e) }));
+      toast(t('打开失败：{error}', { error: String(e) }));
     }
   }
 
-  function ctxPeerWriteback() {
-    void runPeerWriteback(false);
-  }
-
-  function ctxPeerForceWriteback() {
-    void runPeerWriteback(true);
-  }
-
-  /** 冲突时用远端覆盖：本地修改先另存成冲突副本，再刷新同一个本地路径。 */
-  async function ctxPeerUseRemote() {
+  /**
+   * 设备页右键「强制写回」：自动写回在冲突时停住，用户明确用本地副本覆盖对端。
+   *
+   * 跳过"对端在打开后变过"的核对，仍走同一条上传链路并等待这一批传完才报「已写回」；
+   * 上传进度/成败在会话通知区那张批次卡里。
+   */
+  async function ctxPeerForceWriteback() {
     const c = ctxState;
     hideCtx();
     if (!c || c.kind !== 'peer' || !c.peerId || !c.shareId || c.isDir) return;
     const path = c.path ?? '';
-    if (!path) return; // 单文件共享项没有工作副本
     const name = c.name ?? t('文件');
     try {
-      const saved = await resolveWritebackConflict(c.peerId, c.shareId, path, false);
-      toast(
-        saved
-          ? t('已用远端覆盖「{name}」，本地修改另存为「{saved}」', { name, saved })
-          : t('已用远端覆盖「{name}」', { name }),
-      );
+      toast(t('正在写回「{name}」…（进度见通知卡）', { name }));
+      await writebackPeerFile(c.peerId, c.shareId, path, c.shareName, true);
+      toast(t('已写回「{name}」', { name }));
     } catch (e) {
-      toast(t('操作失败：{error}', { error: String(e) }));
+      toast(t('写回失败：{error}', { error: String(e) }));
     }
   }
 
@@ -3384,6 +3437,63 @@
       toast(t('已移除共享项'));
     }
     hideCtx();
+  }
+
+  /**
+   * 共享项（本机/对端）文件或目录右键「删除文件 / 删除文件夹」：确认后真的删掉这一份。
+   *
+   * 本机走 `delete_share_entry`（直接删磁盘 + 记更新记录）；对端走 `delete_peer_entry`
+   * （对端带 token 的 `DELETE /entry`，由共享项设备删除并记入它的更新记录）。
+   * 目录递归删除（确认框写明"及其全部内容"）；共享项根（path 为空）不给 —— 那是
+   * 「移除共享项」与用户源文件之间的事。
+   *
+   * 删除成功后派 `od:entry-deleted`：本机页/设备页各自就地刷新那一棵树，不等 watcher
+   * 的 300ms 防抖与 WS 回传。
+   */
+  async function ctxDeleteEntry() {
+    const c = ctxState;
+    if (!c || (c.kind !== 'share' && c.kind !== 'peer') || !c.shareId || !c.path) return;
+    if (c.orb === true) {
+      // 折叠卡片（236×162）上也能删：确认框是应用内的，得先把面板展开才有地方画。
+      // `expand()` 自己会清掉这份菜单；展开失败时它已经 toast 过，直接放弃这次删除，
+      // 别把对话框硬塞进折叠窗口。
+      await expand();
+      if (!expanded) return;
+    } else {
+      hideCtx();
+    }
+    const peerId = c.kind === 'peer' ? c.peerId : null;
+    if (c.kind === 'peer' && !peerId) return;
+    const isDir = c.isDir === true;
+    const name = c.name ?? c.path.split('/').pop() ?? c.path;
+    const title = peerId
+      ? (isDir ? t('删除对端文件夹') : t('删除对端文件'))
+      : (isDir ? t('删除本机文件夹') : t('删除本机文件'));
+    const message = peerId
+      ? (isDir
+          ? t('将从对方设备的共享目录中删除文件夹「{name}」及其全部内容，无法恢复。', { name })
+          : t('将从对方设备的共享目录中删除「{name}」，无法恢复。', { name }))
+      : (isDir
+          ? t('将从本机磁盘上删除文件夹「{name}」及其全部内容，无法恢复。', { name })
+          : t('将从本机磁盘上删除「{name}」，无法恢复。', { name }));
+    const ok = await askInApp({
+      title,
+      message,
+      confirmLabel: t('删除'),
+      cancelLabel: t('取消'),
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      if (peerId) await deletePeerEntry(peerId, c.shareId, c.path);
+      else await deleteShareEntry(c.shareId, c.path);
+      toast(t('已删除「{name}」', { name }));
+      document.dispatchEvent(new CustomEvent('od:entry-deleted', {
+        detail: { kind: c.kind, peerId, shareId: c.shareId, path: c.path, name },
+      }));
+    } catch (e) {
+      toast(t('删除失败：{error}', { error: String(e) }));
+    }
   }
 
   async function ctxConnect() {
@@ -3967,6 +4077,16 @@
     };
     document.addEventListener('od:open-peer', handleOpenPeer);
 
+    // 双击本机文件（共享项根行 / 树节点）= 用系统默认程序打开它自己；右键「打开」共用同一条。
+    const handleOpenLocal = (e: Event) => {
+      const d = (e as CustomEvent).detail as
+        | { shareId?: string; path?: string; isDir?: boolean }
+        | undefined;
+      if (!d?.shareId) return;
+      void openLocalEntry({ shareId: d.shareId, path: d.path ?? '', isDir: d.isDir });
+    };
+    document.addEventListener('od:open-local', handleOpenLocal);
+
     // 右键全局兜底：webview 自带一份**默认右键菜单**（wry 打开 WebView2 的
     // AreDefaultContextMenusEnabled；dev 构建里还带「检查」），任何没被拦下的 contextmenu
     // 都会把它叫出来。这里一律 preventDefault 把它关掉 —— 需要右键的地方（设备行/共享项/
@@ -4012,6 +4132,7 @@
       unLinkResult.then(fn => fn());
       document.removeEventListener('od:ctx', handleCtx);
       document.removeEventListener('od:open-peer', handleOpenPeer);
+      document.removeEventListener('od:open-local', handleOpenLocal);
       document.removeEventListener('contextmenu', killDefaultCtx, true);
       document.removeEventListener('od:toast', handleToast);
     };
@@ -4583,10 +4704,22 @@
         onClose={() => (historyPanel = null)}
         onSelect={(path, name) => void openHistoryFile(path, name)}
         onBack={historyPanel.parent ? () => void backHistoryDir() : undefined}
-      />
+/>
     {/if}
 
-    <!-- 文件选择框：文件与文件夹在同一个框里混选、选中项跨目录累积。推送与「添加共享项」
+    <!-- 应用内确认框：删除共享项文件/文件夹等动作走这里（系统 `ask` 已移除）。 -->
+    <ConfirmDialog
+      open={!!confirmState}
+      title={confirmState?.title ?? ''}
+      message={confirmState?.message ?? ''}
+      confirmLabel={confirmState?.confirmLabel}
+      cancelLabel={confirmState?.cancelLabel}
+      danger={confirmState?.danger ?? false}
+      onConfirm={() => settleConfirm(true)}
+      onCancel={() => settleConfirm(false)}
+    />
+
+    <!-- 文件选择框：文件与文件夹在同一个框里混选，选中项跨目录累积。推送与「添加共享项」
          都用它 —— 开成什么样由 `picker` 这个请求对象决定（`closePicker` 关掉它）。 -->
     {#if picker}
       <FilePicker
@@ -4688,6 +4821,8 @@
       onToast={toast}
       onDownload={ctxDownload}
       onOpen={ctxOpen}
+      onOpenLocal={ctxOpenLocalEntry}
+      onDeleteEntry={() => void ctxDeleteEntry()}
       onCopy={ctxCopy}
       onCopyUrl={ctxShareBroadcastOn ? ctxCopyUrl : undefined}
       onRemove={ctxRemove}
@@ -4706,9 +4841,8 @@
       onConvoExit={() => void ctxConvoExit()}
       onPeerDownload={ctxPeerDownload}
       onPeerOpen={ctxPeerOpen}
-      onPeerWriteback={ctxPeerWriteback}
+      onPeerOpenFolder={ctxPeerOpenFolder}
       onPeerForceWriteback={ctxPeerForceWriteback}
-      onPeerUseRemote={ctxPeerUseRemote}
       onShareHistory={ctxShareHistory}
       onPeerUpload={ctxPeerUpload}
       onBcCompare={ctxBcCompare}

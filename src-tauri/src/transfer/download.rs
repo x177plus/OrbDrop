@@ -363,18 +363,18 @@ impl Session {
         }
 
         // 先把“这次落盘是谁写的”登记给 watcher；它在 rename 之后的 300ms 批次里会看到这条路径。
+        let actor_name = self
+            .state
+            .get_peer(&self.peer_id)
+            .map(|peer| peer.name)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.peer_name.clone());
         if let (Some(share_id), Some(rel)) = (&self.dest_share_id, &fw.history_path) {
-            let name = self
-                .state
-                .get_peer(&self.peer_id)
-                .map(|peer| peer.name)
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| self.peer_name.clone());
             self.state.history.attribute(
                 share_id,
                 rel,
                 &self.peer_id,
-                &name,
+                &actor_name,
                 "upload",
                 crate::share::history::UPLOAD_ATTRIBUTION_TTL,
             );
@@ -385,6 +385,22 @@ impl Session {
         tokio::fs::rename(&fw.part, &fw.target)
             .await
             .map_err(|e| format!("改名失败: {e}"))?;
+        // 单文件共享项根的回执不能只指望 watcher：notify 对“直接 watch 一个文件”在
+        // 各平台行为不一致，而这条上传本身已经成功。显式记一条（同路径同 actor 会被
+        // 2s 合并窗口并掉，不会凭空多一条）。
+        if let (Some(share_id), Some(rel)) = (&self.dest_share_id, &fw.history_path) {
+            if rel.is_empty() {
+                self.state.history.record_with_dir(
+                    share_id,
+                    "",
+                    "modified",
+                    Some(fw.size),
+                    false,
+                    &self.peer_id,
+                    &actor_name,
+                );
+            }
+        }
         self.state.push.resume.drop_file(&fw.key);
         // 一个文件真的落定了 = 这条接收**有进展**：把待续传任务的 TTL 锚点往前挪
         // （够不着对端那种"没有进展"的等待就不该刷新它，见 `PendingInbound::updated_at`）。
@@ -787,9 +803,12 @@ async fn run(
     //
     // 上传的目录在 `accept_invite` 已经建过；重启续传时可能已经不在了（共享项被移除、
     // 关播、盘拔了）—— `ensure_upload_dir` 会如实报错，这里按**终态**收尾，不要无限重试。
-    let dir = match invite.dest.clone() {
-        Some(dest) => match super::ensure_upload_dir(&state, &dest) {
-            Ok(dir) => dir,
+    //
+    // 单文件共享项根（`RootFile`）没有目录：`dir` 是文件的父目录，真正落点由下面的
+    // `root_file` 直接钉在 `share.path` 上。
+    let upload_target = match invite.dest.clone() {
+        Some(dest) => match super::resolve_upload_target(&state, &dest) {
+            Ok(target) => Some(target),
             Err(reason) => {
                 push_job::fail_download(
                     &state,
@@ -801,6 +820,35 @@ async fn run(
                 return Ok(());
             }
         },
+        None => None,
+    };
+    let (dir, root_file) = match upload_target {
+        Some(super::UploadTarget::RootFile(file)) => {
+            let parent = file
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .ok_or_else(|| "上传目标没有父目录".to_string())?;
+            (parent, Some(file))
+        }
+        Some(super::UploadTarget::Dir(_)) => {
+            let dest = invite
+                .dest
+                .as_ref()
+                .ok_or_else(|| "上传目标丢失".to_string())?;
+            match super::ensure_upload_dir(&state, dest) {
+                Ok(dir) => (dir, None),
+                Err(reason) => {
+                    push_job::fail_download(
+                        &state,
+                        &peer_id,
+                        &invite.callback,
+                        &invite.invite_id,
+                        format!("上传目标不可用：{reason}"),
+                    );
+                    return Ok(());
+                }
+            }
+        }
         None => {
             let base = invite
                 .root
@@ -810,7 +858,7 @@ async fn run(
             tokio::fs::create_dir_all(&dir)
                 .await
                 .map_err(|e| format!("建目录失败: {e}"))?;
-            dir
+            (dir, None)
         }
     };
 
@@ -833,21 +881,37 @@ async fn run(
     let mut made_dirs: HashSet<PathBuf> = HashSet::new();
     let mut pending_finalize: Vec<Arc<FileWork>> = Vec::new();
 
+    // 单文件共享项根只有一个落点：清单多于一项时，接收端无法判断该保留哪一份，
+    // 直接按终态失败（`accept_invite` 已经拦过一次，这里是重启续传的兜底）。
+    if root_file.is_some() && invite.files.len() != 1 {
+        return Err("单文件共享项只能写回一个文件".into());
+    }
+
     for entry in invite.files.iter() {
         // 清单路径是 `/push/stream` 的白名单键；本地落点可能被 `rename` 策略改过
         // （`resolved`），两者必须分开。
-        let local_rel = invite
-            .resolved
-            .get(&entry.path)
-            .map(String::as_str)
-            .unwrap_or(entry.path.as_str());
-        let target =
-            safe_join(&dir, local_rel).ok_or_else(|| format!("非法路径: {}", entry.path))?;
-        if let Some(parent) = target.parent() {
-            if made_dirs.insert(parent.to_path_buf()) {
-                // 不跟随链接：共享项里的某一层若是链接，`create_dir_all` 会把文件写到
-                // 共享项外面；逐段判真目录后，越界在这里就停下。
-                super::create_dirs_within(&dir, parent)?;
+        let local_rel = if root_file.is_some() {
+            entry.path.clone()
+        } else {
+            invite
+                .resolved
+                .get(&entry.path)
+                .cloned()
+                .unwrap_or_else(|| entry.path.clone())
+        };
+        let target = if let Some(root) = &root_file {
+            // 单文件共享项：目标就是共享根文件本身，`local_rel` 只用于清单键/续传身份。
+            root.clone()
+        } else {
+            safe_join(&dir, &local_rel).ok_or_else(|| format!("非法路径: {}", entry.path))?
+        };
+        if root_file.is_none() {
+            if let Some(parent) = target.parent() {
+                if made_dirs.insert(parent.to_path_buf()) {
+                    // 不跟随链接：共享项里的某一层若是链接，`create_dir_all` 会把文件写到
+                    // 共享项外面；逐段判真目录后，越界在这里就停下。
+                    super::create_dirs_within(&dir, parent)?;
+                }
             }
         }
         // 身份 = 对端 id + **落盘目录** + 本地相对路径 + 大小 + 时间戳（见
@@ -856,7 +920,7 @@ async fn run(
         let key = stream::resume_key(
             &peer_id,
             target.parent().unwrap_or(&dir),
-            local_rel,
+            &local_rel,
             entry.size,
             entry.mtime,
         );
@@ -931,10 +995,15 @@ async fn run(
                 .then(|| dest.base_rev.clone())
                 .flatten()
         });
-        let history_path = invite
-            .dest
-            .as_ref()
-            .map(|dest| crate::peer_fs::join_slash(&dest.path, local_rel));
+        let history_path = if root_file.is_some() {
+            // 共享根就是文件本身：历史路径是空串（watcher 对文件根报的也是空串）。
+            Some(String::new())
+        } else {
+            invite
+                .dest
+                .as_ref()
+                .map(|dest| crate::peer_fs::join_slash(&dest.path, &local_rel))
+        };
 
         let fw = Arc::new(FileWork {
             rel: entry.path.clone(),
@@ -1157,8 +1226,12 @@ async fn run(
         );
     } else {
         let reason = session.summarize_failure();
-        if session.source_changed.load(Ordering::Relaxed) {
+        if session.source_changed.load(Ordering::Relaxed)
+            || reason.contains(crate::mirror::writeback::CONFLICT_MARKER)
+        {
             // 对端的源文件与清单对不上：再试还是同一份清单，落终态。
+            // 写回条件提交被拒（对端版本变了/被删/变成目录）：同一条 `baseRev` 再试
+            // 一百次也一样，必须落终态，否则发送方的写回会一直等到超时。
             push_job::fail_download(&state, &peer_id, &callback, &invite.invite_id, reason);
         } else {
             // 其余（网络断了、写不进去、有几块重试到底仍失败）→ **这次不成、推送还在**：

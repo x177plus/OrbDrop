@@ -37,7 +37,7 @@ pub use auth::Caller;
 pub use routes_file::file_handler;
 pub use routes_shares::shares_handler;
 pub use routes_stat::stat_handler;
-pub use routes_tree::tree_handler;
+pub use routes_tree::{list_entries, tree_handler};
 
 /// 本机网卡上的全部地址（含回环、含 IPv6）。
 ///
@@ -372,6 +372,11 @@ fn build_router_with_body_idle_timeout(
         .route("/stat", axum::routing::get(routes_stat::stat_handler))
         .route("/unpair", axum::routing::post(routes_pair::unpair))
         .route("/file", axum::routing::get(routes_file::file_handler))
+        // 对端右侧（设备页）的「删除文件」：只删文件，不删目录/共享项根。
+        .route(
+            "/entry",
+            axum::routing::delete(routes_file::delete_entry_handler),
+        )
         .route("/shares", axum::routing::get(routes_shares::shares_handler))
         // 跨网段发现（F-10 延伸）：已配对对端来取「本机此刻看得见的设备」（整份视野）。
         .route("/discover", axum::routing::get(routes_discover::discover))
@@ -444,6 +449,16 @@ pub(crate) fn rev_for_metadata(meta: &std::fs::Metadata) -> String {
         .map(|age| age.as_nanos())
         .unwrap_or(0);
     format!("{:x}-{:x}", meta.len(), mtime_ns)
+}
+
+/// 把相对路径里的空段与 `.` 归一掉（结果为空 = 共享项根）；`..` 原样保留，交给
+/// [`safe_relative_share_path`] 拒绝。删除这些**落盘动作**要在拼接前先归一，
+/// 否则 `DELETE /entry?path=./` 会绕过"不能删共享项根"的分支指到根自身。
+pub(crate) fn normalized_share_path(rel: &str) -> String {
+    rel.split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// `/file`、`/tree`、`/stat` 的 `path` 查询参数必须是**共享项内的相对路径**。

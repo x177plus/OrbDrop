@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import * as api from "$lib/api";
   import { formatFileSize, updateStatusText } from "$lib/types";
   import { t, setLanguagePreference, adoptLanguagePreference, normalizePreference, type Locale } from "$lib/i18n.svelte";
@@ -24,7 +24,19 @@
   let saved = $state<AppSettings | null>(null);
   let loading = $state(true);
   let loadError = $state<string | null>(null);
+  /**
+   * 自动保存（与桌面端同一口径）：**没有「保存设置」这颗按钮**。开关 / 单选改完立刻落盘；
+   * 文本输入在失焦或回车时落盘；离开设置页时把仍在编辑的那一格一起提交。
+   *
+   * `saving` = 有一趟 `update_settings` 在飞；这期间的改动由 `saveAgain` 排队，等这一趟回来
+   * 立刻再发一趟（带的是最新值），保证最后一次改动一定落盘。
+   */
   let saving = $state(false);
+  let saveAgain = false;
+  /** 文本输入正在编辑（还没失焦）：离开页面时用它决定要不要补一次提交。 */
+  let textDirty = false;
+  /** 状态条：空闲 / 正在保存 / 已自动保存 / 保存失败。 */
+  let saveState = $state<"idle" | "saving" | "saved" | "error">("idle");
   /** 界面语言（具体语言，没有「跟随系统」）：改它 = 立刻生效并落后端。 */
   let languagePref = $state<Locale>(normalizePreference(null));
 
@@ -146,24 +158,33 @@
 
   const form = $derived(store.form());
 
+  /** 把后端返回的设置写回页面（打开页面时、自动保存回来后）。 */
+  function applyServer(next: AppSettings) {
+    saved = next;
+    downloadMode = next.downloadMode;
+    autoAcceptPaired = next.autoAcceptPaired;
+    deviceSubdir = next.deviceSubdir;
+    autoBroadcast = next.autoBroadcastNew;
+    // 一颗开关两条后端位：任一条开着就显示成开（与桌面端读法一致）。
+    relay = next.allowRelay || next.groupRelay;
+    transferWorkers = String(next.transferWorkers);
+    transferBlockMb = String(next.transferBlockMb);
+    store.resetForm({ deviceName: next.deviceName, port: next.port });
+  }
+
   async function load(): Promise<void> {
     loading = true;
     loadError = null;
     try {
       const s = await api.getSettings();
-      saved = s;
       languagePref = normalizePreference(s.language);
       adoptLanguagePreference(s.language);
-      downloadMode = s.downloadMode;
-      autoAcceptPaired = s.autoAcceptPaired;
-      deviceSubdir = s.deviceSubdir;
-      autoBroadcast = s.autoBroadcastNew;
-      transferWorkers = String(s.transferWorkers);
-      transferBlockMb = String(s.transferBlockMb);
-      // 一颗开关两条后端位：任一条开着就显示成开（与桌面端读法一致）。
-      relay = s.allowRelay || s.groupRelay;
+      applyServer(s);
+      // LocalSend 开关独立走 `set_localsend_enabled`，不参与这套表单：这里只读一次显示值，
+      // 之后由开关自己更新（保存别的设置时不回写它）。
       localsendEnabled = s.localsendEnabled;
-      store.resetForm({ deviceName: s.deviceName, port: s.port });
+      textDirty = false;
+      saveState = "idle";
     } catch (e) {
       loadError = e instanceof Error ? e.message : String(e);
     } finally {
@@ -190,7 +211,24 @@
     // 它没有可订阅的事件，所以这一页开着时按 5s 轮询（与桌面端同一个节拍），离开即停。
     void refreshTraffic();
     const trafficTimer = setInterval(() => void refreshTraffic(), 5000);
-    return () => clearInterval(trafficTimer);
+    // 切到后台 / 锁屏时把文本输入里还没失焦的值提交掉：那条路不一定会触发 `change`，
+    // 而输入框里的内容已经算"用户改过了"。
+    const flushHidden = () => {
+      if (document.visibilityState === "hidden") commitTextEdits();
+    };
+    document.addEventListener("visibilitychange", flushHidden);
+    return () => {
+      clearInterval(trafficTimer);
+      document.removeEventListener("visibilitychange", flushHidden);
+    };
+  });
+
+  // 离开设置页（切 tab）时把还在输入框里、尚未失焦的那一格提交掉：`change` 只保证在
+  // 用户自己移开焦点时触发，程序化卸载不一定有。保存请求本身不依赖这个组件继续活着。
+  // 上次自动保存失败也再试一趟，别让用户刚改的值停在未保存状态；再失败会由全局 toast 报出来。
+  onDestroy(() => {
+    commitTextEdits();
+    if (saveState === "error") scheduleSave();
   });
 
   /** 读一次"本机替别人中转了多少"（只读的用量记录：不是设置项、不参与保存，失败只进控制台）。 */
@@ -290,47 +328,88 @@
     }
   }
 
-  async function save(): Promise<void> {
+  /**
+   * 自动保存的请求体。**每次都带整份设置**（后端 `update_settings` 收的就是完整
+   * `AppSettings`），没在页面里出现的字段从 `saved` 原样带回。
+   */
+  function buildRequest() {
     const f = form;
-    if (!saved || !f || saving) return;
+    if (!saved || !f) return null;
+    const digits = String(f.port).replace(/\D/g, "");
+    const port = digits ? Math.min(65535, Math.max(1, Number(digits))) : saved.port;
+    // LocalSend 开关是**立即生效**的（`toggleLocalSend` 自己落盘）：这里显式不带它，
+    // 否则一次晚到的保存会把刚切过的开关覆盖回旧值（后端 `None` = 保持原值）。
+    const { localsendEnabled: _ignored, ...rest } = saved;
+    return {
+      ...rest,
+      deviceName: f.deviceName.trim() || saved.deviceName,
+      language: languagePref,
+      port,
+      downloadMode: isAndroid ? "Direct" : downloadMode,
+      autoAcceptPaired,
+      deviceSubdir,
+      autoBroadcastNew: autoBroadcast,
+      online,
+      // 一颗开关管两条路（与桌面端同一个口径）：替其它设备盲转字节 + 替群聊转消息。
+      groupRelay: relay,
+      allowRelay: relay,
+      transferWorkers: clampNum(transferWorkers, 1, 8, saved.transferWorkers),
+      transferBlockMb: clampNum(transferBlockMb, 1, 32, saved.transferBlockMb),
+    };
+  }
+
+  /** 把一次改动排进保存队列：没有在飞的请求就立刻发，否则等它回来带上最新值再发。 */
+  function scheduleSave(): void {
+    if (!saved) return;
+    saveAgain = true;
+    if (!saving) void runSave();
+  }
+
+  /**
+   * 自动保存循环：一趟只发一个 `update_settings`；这一趟期间又有改动（`saveAgain`）就再发
+   * 一趟。后端返回的是**落盘后的真值**（取值被夹住、语言被规范化），没有新改动、也没有正在
+   * 编辑的文本时才写回页面；有改动时保留用户刚输入的那份，下一趟一起带上。
+   *
+   * 失败不自动重试（写盘失败 / 后端忙时重试只会刷屏）：状态条变成「保存失败」，点它重试；
+   * 用户继续改设置也会照常触发下一趟。
+   */
+  async function runSave(): Promise<void> {
+    if (!saved || saving) {
+      saveAgain = true;
+      return;
+    }
     saving = true;
+    saveState = "saving";
+    let failed = false;
     try {
-      const digits = String(f.port).replace(/\D/g, "");
-      const next = await api.updateSettings({
-        ...saved,
-        deviceName: f.deviceName.trim() || saved.deviceName,
-        language: languagePref,
-        port: digits ? Number(digits) : saved.port,
-        downloadMode: isAndroid ? "Direct" : downloadMode,
-        autoAcceptPaired,
-        deviceSubdir,
-        autoBroadcastNew: autoBroadcast,
-        online,
-        // 一颗开关管两条路（与桌面端同一个口径）：替其它设备盲转字节 + 替群聊转消息。
-        groupRelay: relay,
-        allowRelay: relay,
-        // LocalSend 开关是**立即生效**的（`toggleLocalSend` 自己落盘）：保存表单时
-        // 不再带它，否则表单里那份旧值会把用户刚点的开关覆盖回去（桌面端同一口径）。
-        transferWorkers: clampNum(transferWorkers, 1, 8, saved.transferWorkers),
-        transferBlockMb: clampNum(transferBlockMb, 1, 32, saved.transferBlockMb),
-      });
-      // 后端会规范化（端口被占时顺延、名字裁剪），保存后再读一次让表单跟着真值走。
-      saved = next;
-      downloadMode = next.downloadMode;
-      autoAcceptPaired = next.autoAcceptPaired;
-      deviceSubdir = next.deviceSubdir;
-      autoBroadcast = next.autoBroadcastNew;
-      relay = next.allowRelay || next.groupRelay;
-      localsendEnabled = next.localsendEnabled;
-      transferWorkers = String(next.transferWorkers);
-      transferBlockMb = String(next.transferBlockMb);
-      store.resetForm({ deviceName: next.deviceName, port: next.port });
-      store.toast(t("设置已保存"), "check");
+      while (saveAgain) {
+        saveAgain = false;
+        const req = buildRequest();
+        if (!req) break;
+        const next = await api.updateSettings(req);
+        if (!saveAgain && !textDirty) {
+          applyServer(next);
+        } else {
+          saved = next;
+        }
+      }
+      saveState = "saved";
     } catch (e) {
+      failed = true;
+      saveState = "error";
       store.failed(t("保存设置"), e);
     } finally {
       saving = false;
+      // 失败时保留 `saveAgain`：状态条上的「重试」会再发一趟。
+      if (!failed && saveAgain) void runSave();
     }
+  }
+
+  /** 文本输入提交：失焦 / 回车 / 离开设置页都走这里。 */
+  function commitTextEdits(): void {
+    if (!textDirty) return;
+    textDirty = false;
+    scheduleSave();
   }
 </script>
 
@@ -357,6 +436,18 @@
   </div>
 {:else}
   <div class="body">
+    <div class="autosave-bar" class:is-error={saveState === "error"} role="status">
+      {#if saveState === "error"}
+        <span>{t("保存失败")}</span>
+        <button class="btn btn-secondary btn-sm" type="button" onclick={scheduleSave}>{t("重试")}</button>
+      {:else if saveState === "saving"}
+        <span>{t("正在自动保存…")}</span>
+      {:else if saveState === "saved"}
+        <span class="tone-ok">{t("已自动保存")}</span>
+      {:else}
+        <span>{t("改动会自动保存")}</span>
+      {/if}
+    </div>
     <div class="sec">
       <div class="sec-label"><span>{t("语言")}</span></div>
       <div class="card gcard lang-card">
@@ -380,7 +471,14 @@
             maxlength="20"
             aria-label={t("本机名称")}
             value={form?.deviceName ?? ""}
-            oninput={(e: Event) => store.editForm({ deviceName: (e.currentTarget as HTMLInputElement).value })}
+            oninput={(e: Event) => {
+              store.editForm({ deviceName: (e.currentTarget as HTMLInputElement).value });
+              textDirty = true;
+            }}
+            onchange={commitTextEdits}
+            onkeydown={(e: KeyboardEvent) => {
+              if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
+            }}
           />
         </div>
         <div class="srow">
@@ -390,7 +488,14 @@
             inputmode="numeric"
             aria-label={t("监听端口")}
             value={form?.port ?? ""}
-            oninput={(e: Event) => store.editForm({ port: (e.currentTarget as HTMLInputElement).value })}
+            oninput={(e: Event) => {
+              store.editForm({ port: (e.currentTarget as HTMLInputElement).value });
+              textDirty = true;
+            }}
+            onchange={commitTextEdits}
+            onkeydown={(e: KeyboardEvent) => {
+              if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
+            }}
           />
           <p class="shelp">{t("默认 3890；被占用时自动探测 3891–3899。")}</p>
         </div>
@@ -410,7 +515,15 @@
           <div class="srow-top">
             <span class="slabel">{t("推送按发送方分目录")}</span>
             <label class="switch">
-              <input type="checkbox" bind:checked={deviceSubdir} aria-label={t("推送按发送方分目录")} />
+              <input
+                type="checkbox"
+                checked={deviceSubdir}
+                aria-label={t("推送按发送方分目录")}
+                onchange={(e: Event) => {
+                  deviceSubdir = (e.currentTarget as HTMLInputElement).checked;
+                  scheduleSave();
+                }}
+              />
               <span class="track"></span>
             </label>
           </div>
@@ -424,7 +537,15 @@
           <div class="srow-top">
             <span class="slabel">{t("已配对设备自动接收")}</span>
             <label class="switch">
-              <input type="checkbox" bind:checked={autoAcceptPaired} aria-label={t("已配对设备自动接收")} />
+              <input
+                type="checkbox"
+                checked={autoAcceptPaired}
+                aria-label={t("已配对设备自动接收")}
+                onchange={(e: Event) => {
+                  autoAcceptPaired = (e.currentTarget as HTMLInputElement).checked;
+                  scheduleSave();
+                }}
+              />
               <span class="track"></span>
             </label>
           </div>
@@ -438,7 +559,15 @@
           <span class="slabel">{t("保存位置")}</span>
           <!-- 取值是后端的 `DownloadMode`（`Direct` / `AskEachTime`），原型里那两个小写字面量是 mock。 -->
           <label class="radio" class:is-checked={downloadMode === "Direct"}>
-            <input type="radio" name="dlMode" value="Direct" bind:group={downloadMode} />
+            <input
+              type="radio"
+              name="dlMode"
+              checked={downloadMode === "Direct"}
+              onchange={() => {
+                downloadMode = "Direct";
+                scheduleSave();
+              }}
+            />
             <span class="rmain">
               <span class="rname">{t("直接保存到下载目录")}</span>
               <span class="rdesc">{t("手动下载直接存；接收推送也直接存到下载目录。")}</span>
@@ -446,7 +575,15 @@
           </label>
           {#if !isAndroid}
           <label class="radio" class:is-checked={downloadMode === "AskEachTime"}>
-            <input type="radio" name="dlMode" value="AskEachTime" bind:group={downloadMode} />
+            <input
+              type="radio"
+              name="dlMode"
+              checked={downloadMode === "AskEachTime"}
+              onchange={() => {
+                downloadMode = "AskEachTime";
+                scheduleSave();
+              }}
+            />
             <span class="rmain">
               <span class="rname">{t("每次选择位置")}</span>
               <span class="rdesc">{t("手动下载前选择保存位置；接收推送仍保存到下载目录（手机没有可写的目录选择器）。")}</span>
@@ -473,7 +610,14 @@
             inputmode="numeric"
             aria-label={t("传输并发数")}
             value={transferWorkers}
-            oninput={(e: Event) => (transferWorkers = (e.currentTarget as HTMLInputElement).value)}
+            oninput={(e: Event) => {
+              transferWorkers = (e.currentTarget as HTMLInputElement).value;
+              textDirty = true;
+            }}
+            onchange={commitTextEdits}
+            onkeydown={(e: KeyboardEvent) => {
+              if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
+            }}
           />
           <p class="shelp">{t("一次接收同时跑几路传输；取值 1–8，默认 4，超出范围保存时自动夹住。")}</p>
         </div>
@@ -484,7 +628,14 @@
             inputmode="numeric"
             aria-label={t("分块大小（MB）")}
             value={transferBlockMb}
-            oninput={(e: Event) => (transferBlockMb = (e.currentTarget as HTMLInputElement).value)}
+            oninput={(e: Event) => {
+              transferBlockMb = (e.currentTarget as HTMLInputElement).value;
+              textDirty = true;
+            }}
+            onchange={commitTextEdits}
+            onkeydown={(e: KeyboardEvent) => {
+              if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
+            }}
           />
           <p class="shelp">{t("大文件按它切片、片与片之间并行；取值 1–32，默认 4，超出范围保存时自动夹住。")}</p>
         </div>
@@ -498,7 +649,15 @@
           <div class="srow-top">
             <span class="slabel">{t("允许中转")}</span>
             <label class="switch">
-              <input type="checkbox" bind:checked={relay} aria-label={t("允许中转")} />
+              <input
+                type="checkbox"
+                checked={relay}
+                aria-label={t("允许中转")}
+                onchange={(e: Event) => {
+                  relay = (e.currentTarget as HTMLInputElement).checked;
+                  scheduleSave();
+                }}
+              />
               <span class="track"></span>
             </label>
           </div>
@@ -530,7 +689,7 @@
             )}
           </p>
           <p class="shelp">
-            {t("开启后立即生效，不等「保存设置」。53317 被占用时先回落主端口，端口空出后自动接管；不会因此自动关闭。")}
+            {t("开启后立即生效。53317 被占用时先回落主端口，端口空出后自动接管；不会因此自动关闭。")}
           </p>
           {#if localSendView}
             <div class="shelp-row">
@@ -592,7 +751,15 @@
           <div class="srow-top">
             <span class="slabel">{t("添加后自动共享")}</span>
             <label class="switch">
-              <input type="checkbox" bind:checked={autoBroadcast} aria-label={t("添加后自动共享")} />
+              <input
+                type="checkbox"
+                checked={autoBroadcast}
+                aria-label={t("添加后自动共享")}
+                onchange={(e: Event) => {
+                  autoBroadcast = (e.currentTarget as HTMLInputElement).checked;
+                  scheduleSave();
+                }}
+              />
               <span class="track"></span>
             </label>
           </div>
@@ -683,13 +850,6 @@
           </div>
         {/if}
       </div>
-    </div>
-
-    <div class="sec">
-      <!-- 原型末尾还有一颗「清空全部凭据」（`wipe_credentials`）：危险操作，移动端本阶段不做。 -->
-      <button class="btn btn-primary btn-block" type="button" disabled={saving || localSendBusy} onclick={() => void save()}>
-        {t("保存设置")}
-      </button>
     </div>
   </div>
 {/if}

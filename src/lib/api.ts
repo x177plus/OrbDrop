@@ -15,6 +15,16 @@ export function removeShare(shareId: string): Promise<void> {
   return invoke('remove_share', { shareId });
 }
 
+/**
+ * 删除本机共享项里的一个**文件或目录**（右键「删除文件 / 删除文件夹」）。
+ *
+ * 文件直接删、目录递归删；共享项根由后端拒绝。删除会真的从磁盘移除，后端同时记一条
+ * `deleted` 更新记录，并作为本机 watcher 的变更广播给开播设备。
+ */
+export function deleteShareEntry(shareId: string, pathInShare: string): Promise<void> {
+  return invoke('delete_share_entry', { shareId, pathInShare });
+}
+
 export function renameShare(shareId: string, name: string): Promise<void> {
   return invoke('rename_share', { shareId, name });
 }
@@ -700,7 +710,7 @@ export function downloadFromPeer(peerId: string, shareId: string, pathInShare: s
  *
  * Windows 是 CFAPI 占位符（起开零字节、按需水合），macOS 先整份暂存，Android 暂存到镜像根的
  * 缓存槽（同一项复用）。打开的是本地副本；保存后由后台自动写回（`mirror::auto`），
- * `writebackPeerFile` 是右键立即重试/强制的入口。
+ * 只有自动写回因冲突停住时才需要右键「强制写回」（`writebackPeerFile(..., true)`）。
  */
 export function openPeerFile(
   peerId: string,
@@ -719,8 +729,27 @@ export function openPeerFile(
 }
 
 /**
- * 手动立即写回（右键「写回对端」/「强制写回」）。保存后的自动写回由后台轮询负责，
- * 不需要调用这个命令。
+ * 对端一项在**本机**的工作副本所在文件夹（右键「打开所在文件夹」）。
+ *
+ * 已经登记过的工作副本直接返回它所在目录；没有登记时才触发一次 place（Windows CFAPI
+ * 占位符几乎零成本，macOS/Android 暂存整份）。调用方拿到路径后再交给系统打开。
+ */
+export function openPeerFolder(
+  peerId: string,
+  shareId: string,
+  pathInShare: string,
+  name?: string,
+): Promise<string> {
+  return invoke('open_peer_folder', {
+    peerId,
+    shareId,
+    pathInShare,
+    name: name ?? null,
+  });
+}
+
+/**
+ * 手动写回（右键只剩「强制写回」这一档）。正常保存由后台自动写回负责，不需要调用。
  *
  * 后端用打开时登记的副本与对端元数据做冲突判断：对端在打开后变过、副本已被回收、或
  * 是单文件共享项/接收侧落不了盘的文件名都会拒绝。`force = true` 跳过冲突核对（仍拒绝目录），
@@ -742,24 +771,6 @@ export function writebackPeerFile(
   });
 }
 
-/**
- * 冲突处理：`useLocal = true` 用本地副本强制覆盖对端；`false` 先把本地修改另存成
- * `名字 (本地冲突 时间).扩展名`，再刷新成远端版本，返回另存路径（本来就没修改时为空串）。
- */
-export function resolveWritebackConflict(
-  peerId: string,
-  shareId: string,
-  pathInShare: string,
-  useLocal: boolean,
-): Promise<string> {
-  return invoke('resolve_writeback_conflict', {
-    peerId,
-    shareId,
-    pathInShare,
-    useLocal,
-  });
-}
-
 /** 读取共享项更新记录。`peerId = null` 读本机共享项；否则向共享项设备查询。 */
 export function shareUpdateHistory(
   peerId: string | null,
@@ -775,6 +786,21 @@ export function shareUpdateHistory(
     isDir,
     limit,
   });
+}
+
+/**
+ * 删除对端共享项里的一个**文件或目录**（设备页右键「删除文件 / 删除文件夹」）。
+ *
+ * 走对端带 token 的 `DELETE /entry`，由共享项设备执行并记入它的更新记录；对端接受文件与
+ * 目录（目录递归删除），共享项根会被拒绝。成功后本机摘掉这一项及其目录下的工作副本登记，
+ * 避免自动写回把已删除的文件又传回去。
+ */
+export function deletePeerEntry(
+  peerId: string,
+  shareId: string,
+  pathInShare: string,
+): Promise<void> {
+  return invoke('delete_peer_entry', { peerId, shareId, pathInShare });
 }
 
 /** 暂停 / 继续一次对端浏览下载；`false` = 那条下载已经结束。 */
@@ -1008,5 +1034,17 @@ export async function fetchTree(port: number, shareId: string, path: string): Pr
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
   const data = await resp.json();
+  return data.entries;
+}
+
+/**
+ * 本机共享项的一层目录，走 Tauri IPC。
+ *
+ * **安卓上不要用 `fetchTree`**：release WebView 禁止明文 HTTP（`usesCleartextTraffic=false`），
+ * 页面从 `https://tauri.localhost` fetch `http://127.0.0.1:<端口>` 会直接得到
+ * `TypeError: Failed to fetch`。命令内部与 `/tree` 共用同一份列举实现。
+ */
+export async function localTree(shareId: string, path: string): Promise<TreeEntry[]> {
+  const data = await invoke<{ entries: TreeEntry[] }>('local_tree', { shareId, path });
   return data.entries;
 }

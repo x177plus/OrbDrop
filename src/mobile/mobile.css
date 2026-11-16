@@ -190,6 +190,9 @@ a { color: inherit; text-decoration: none; }
 
 /* ─────────────────────────── generic pieces ─────────────────────────── */
 .body { padding: calc(14 * var(--u)) calc(18 * var(--u)) calc(26 * var(--u)); }
+.autosave-bar { display: flex; align-items: center; gap: calc(10 * var(--u)); margin-bottom: calc(16 * var(--u)); padding: calc(9 * var(--u)) calc(12 * var(--u)); border-radius: var(--radius); background: var(--fg-soft); color: var(--muted); font-size: var(--fs-sm); }
+.autosave-bar .btn { margin-left: auto; flex: none; }
+.autosave-bar.is-error { color: var(--danger); }
 .sec + .sec { margin-top: calc(20 * var(--u)); }
 .sec-label {
   display: flex; align-items: center; justify-content: space-between; gap: calc(10 * var(--u));
@@ -571,11 +574,22 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .fgo:hover { background: var(--fg-soft); color: var(--fg); }
 .fgo .ic { width: calc(18 * var(--u)); height: calc(18 * var(--u)); }
 /* 本机共享行：左边整块是操作入口（与 `.frow` 同一套内边距/分割线），右边单独一颗广播开关。
-   开关不能塞进按钮里（嵌套交互元素），所以行本身是 div，主区域另起一颗 button。 */
-.lrow { display: flex; align-items: center; gap: calc(8 * var(--u)); padding: calc(11 * var(--u)) calc(12 * var(--u)); }
-.lrow + .lrow { border-top: 1px solid var(--border); }
+   开关不能塞进按钮里（嵌套交互元素），所以行本身是 div，主区域另起一颗 button。
+   整块 `.litem` = 一行 + 它展开的子树：分割线跟着 `.litem` 走，子树收起来时行与行之间
+   仍然只有一条线（`.lrow + .lrow` 那种写法在中间夹了子树之后就接不上了）。
+   行与树节点都要挡住 WebView 自己的长按：`user-select` 挡选字、`-webkit-touch-callout`
+   挡长按弹窗（不挡的话长按只会弹出系统菜单，我们那条手势永远轮不上）。 */
+.litem + .litem { border-top: 1px solid var(--border); }
+.lrow { display: flex; align-items: center; gap: calc(8 * var(--u)); padding: calc(11 * var(--u)) calc(12 * var(--u)); user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.lrow.is-pressing { background: var(--fg-soft); }
 .lmain { flex: 1; min-width: 0; display: flex; align-items: center; gap: calc(11 * var(--u)); text-align: left; }
 .lmain:hover { background: var(--fg-soft); border-radius: calc(10 * var(--u)); }
+/* 目录的展开箭头：收起朝右、展开朝下（与浏览页 `.node .chev` 同一个角度）。 */
+.lmain .chev { flex: none; width: calc(16 * var(--u)); height: calc(16 * var(--u)); display: grid; place-items: center; color: var(--muted); }
+.lmain .chev .ic { width: calc(16 * var(--u)); height: calc(16 * var(--u)); transform: rotate(0deg); transition: transform .18s ease; }
+.lmain .chev.open .ic { transform: rotate(90deg); }
+.ltree .node { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ltree .node.is-pressing { background: var(--fg-soft); }
 .lpath { font-family: var(--font-mono); font-size: calc(10 * var(--u)); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .perm-acts { display: flex; gap: calc(8 * var(--u)); flex-wrap: wrap; }
 /* 路径选择器当前目录：长路径允许从任意位置断行，不要把底下的列表顶宽。 */

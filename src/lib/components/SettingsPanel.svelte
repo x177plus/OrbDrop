@@ -18,7 +18,7 @@
   import { fileManagerLabel, isMac } from '$lib/stores/platform.svelte';
   import * as upd from '$lib/stores/update.svelte';
   import { formatFileSize, updateStatusText } from '$lib/types';
-  import type { OrbShape, RectPage, RelayTraffic } from '$lib/types';
+  import type { AppSettings, OrbShape, RectPage, RelayTraffic } from '$lib/types';
   import Orb from '$lib/components/Orb.svelte';
   import RectOrb from '$lib/components/RectOrb.svelte';
 
@@ -145,7 +145,34 @@
   let bcExePath = $state('');
   /** 折叠态悬浮形态：圆球（现有的 62px 球）/ 圆角矩形悬浮框（设备分页卡片）。 */
   let orbShape = $state<OrbShape>('circle');
+  /**
+   * 自动保存：**没有「保存设置」这颗按钮**。离散控件（开关 / 单选 / 悬浮形态）改完立刻落盘；
+   * 文本输入在失焦或回车时落盘（端口会重启 HTTP 服务，不能每敲一个字就提交）；关闭面板时
+   * 把仍在编辑的那一格一起提交。
+   *
+   * `saving` = 有一趟 `update_settings` 在飞；这期间的改动由 `saveAgain` 排队，等这一趟回来
+   * 立刻再发一趟（带的是最新值），保证最后一次改动一定落盘。
+   */
   let saving = $state(false);
+  let saveAgain = false;
+  /** 文本输入正在编辑（还没失焦）：关闭面板时用它决定要不要补一次提交。 */
+  let textDirty = false;
+  /** 标题栏的状态字：空闲 / 正在保存 / 已自动保存 / 保存失败。 */
+  let saveState = $state<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  /** 滚动区还在下面有内容时画一道底部渐隐；滚到底就撤掉（不留永久阴影）。 */
+  let bodyEl = $state<HTMLDivElement | null>(null);
+  let moreBelow = $state(false);
+
+  /**
+   * 判断滚动区还能不能继续往下滚。阈值 2px 是给缩放 / 圆整误差留的余量：
+   * `scrollTop + clientHeight === scrollHeight` 在 125% DPI 下偶尔会差 0.x px，
+   * 严格相等会让渐隐在真正的底部一闪一闪。
+   */
+  function updateMoreBelow(): void {
+    const el = bodyEl;
+    if (!el) return;
+    moreBelow = el.scrollHeight - el.scrollTop - el.clientHeight > 2;
+  }
   /** 「清空全部凭据」的二次确认：点一下变成确认条，再点才真删。 */
   let wipeArmed = $state(false);
   let wiping = $state(false);
@@ -219,7 +246,10 @@
         defaultPath: downloadDir || undefined,
       });
       const dir = Array.isArray(picked) ? picked[0] : picked;
-      if (dir) downloadDir = dir;
+      if (dir) {
+        downloadDir = dir;
+        scheduleSave();
+      }
     } catch (e: any) {
       console.error('Pick directory failed:', e);
       onToast(t('打开目录选择框失败：{error}', { error: String(e) }));
@@ -238,31 +268,84 @@
     }
   }
 
+  /** 把后端那整份设置灌进表单（打开面板、或自动保存回来后）。 */
+  function applySettings(s: AppSettings) {
+    port = s.port;
+    downloadDir = s.downloadDir;
+    deviceSubdir = s.deviceSubdir;
+    autoAcceptPaired = s.autoAcceptPaired;
+    downloadMode = s.downloadMode;
+    deviceName = s.deviceName;
+    languagePref = normalizePreference(s.language);
+    adoptLanguagePreference(s.language);
+    autoStart = s.autoStart;
+    autoBroadcastNew = s.autoBroadcastNew;
+    relay = s.allowRelay || s.groupRelay;
+    transferWorkers = s.transferWorkers;
+    transferBlockMb = s.transferBlockMb;
+    bcExePath = s.bcExePath ?? '';
+    orbShape = s.orbShape;
+  }
+
+  /**
+   * 打开面板时重读一次：面板常驻 DOM，不能只在 `onMount` 读 —— 那样第二次打开看到的
+   * 还是上一次的值（含"上次改了、后端又被别处改了"这种分叉）。这里不碰 LocalSend 开关：
+   * 它是立即生效的，不参与这套表单。
+   */
+  async function reloadForm() {
+    await loadSettings();
+    const s = getSettings();
+    if (s) {
+      applySettings(s);
+      textDirty = false;
+      saveState = 'idle';
+    }
+  }
+
   onMount(() => {
     // 订阅一次自更新状态（重复调用没有副作用）：设置面板是唯一能看到"有新版 / 下载进度"的地方。
     void upd.watchUpdate();
     void refreshLocalSendStatus();
-    loadSettings().then(() => {
-      const s = getSettings();
-      if (s) {
-        port = s.port;
-        downloadDir = s.downloadDir;
-        deviceSubdir = s.deviceSubdir;
-        autoAcceptPaired = s.autoAcceptPaired;
-        downloadMode = s.downloadMode;
-        deviceName = s.deviceName;
-        languagePref = normalizePreference(s.language);
-        adoptLanguagePreference(s.language);
-        autoStart = s.autoStart;
-        autoBroadcastNew = s.autoBroadcastNew;
-        relay = s.allowRelay || s.groupRelay;
-        localsendEnabled = s.localsendEnabled;
-        transferWorkers = s.transferWorkers;
-        transferBlockMb = s.transferBlockMb;
-        bcExePath = s.bcExePath ?? '';
-        orbShape = s.orbShape;
-      }
-    });
+  });
+
+  // 每次打开都重新灌一次（`open` 由面板外壳控制）。
+  $effect(() => {
+    if (!open) return;
+    void reloadForm();
+  });
+
+  /**
+   * 底部渐隐的开关：滚动位置 + 内容高度变化都要重算。
+   *
+   * - `scroll` 由模板上的 `onscroll` 触发；
+   * - `ResizeObserver` 管窗口/面板尺寸变化；
+   * - `MutationObserver` 管"打开后异步长出来的行"（LocalSend 状态、更新说明、二次确认条），
+   *   它们不改变外层尺寸，但会改 `scrollHeight`。
+   *
+   * 渐隐只在**下面确实还有内容**时出现；滚到底立刻撤掉，不留一条永久阴影。
+   */
+  $effect(() => {
+    if (!open) {
+      moreBelow = false;
+      return;
+    }
+    const el = bodyEl;
+    if (!el) return;
+    let frame = 0;
+    const recalc = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(updateMoreBelow);
+    };
+    const ro = new ResizeObserver(recalc);
+    ro.observe(el);
+    const mo = new MutationObserver(recalc);
+    mo.observe(el, { childList: true, subtree: true, characterData: true });
+    recalc();
+    return () => {
+      cancelAnimationFrame(frame);
+      ro.disconnect();
+      mo.disconnect();
+    };
   });
 
   // 「中转流量」是**实时视图**：本机替别人搬的字节随时在涨（长连接中途也会涨）。而本组件从
@@ -332,63 +415,86 @@
     }
   }
 
-  async function save() {
+  /**
+   * 自动保存的请求体。**每次都带整份设置**（后端 `update_settings` 收的就是完整
+   * `AppSettings`），没在表单里出现的字段按各自口径处理：LocalSend 由它自己的开关立即
+   * 落盘，这里不带；`relayMemory` 一律写开。
+   */
+  function buildRequest() {
+    return {
+      port: clampNum(port, 1, 65535, getSettings()?.port ?? 3890),
+      downloadDir,
+      deviceSubdir,
+      autoAcceptPaired,
+      downloadMode,
+      // 清空名字不是有效设置：退回后端当前名字，不要把设备改成空字符串。
+      deviceName: deviceName.trim() || getSettings()?.deviceName || deviceName,
+      language: languagePref,
+      autoStart,
+      autoBroadcastNew,
+      // 一颗开关管两条路：替其它设备盲转字节 + 替群聊转消息（`allowRelay` / `groupRelay`）。
+      groupRelay: relay,
+      allowRelay: relay,
+      relayMemory: true,
+      transferWorkers: clampNum(transferWorkers, 1, 8, getSettings()?.transferWorkers ?? 4),
+      transferBlockMb: clampNum(transferBlockMb, 1, 32, getSettings()?.transferBlockMb ?? 4),
+      bcExePath,
+      orbShape,
+    };
+  }
+
+  /** 把一次改动排进保存队列：没有在飞的请求就立刻发，否则等它回来带上最新值再发。 */
+  function scheduleSave(): void {
+    saveAgain = true;
+    if (!saving) void runSave();
+  }
+
+  /**
+   * 自动保存循环：一趟只发一个 `update_settings`；这一趟期间又有改动（`saveAgain`）就再发
+   * 一趟。后端返回的是**落盘后的真值**（取值被夹住、语言被规范化），没有新改动、也没有正在
+   * 编辑的文本时才写回表单；有改动时保留用户刚输入的那份，下一趟一起带上。
+   *
+   * 失败不自动重试（写盘失败 / 后端忙时重试只会刷屏）：状态条变成「保存失败」，点它重试；
+   * 用户继续改设置也会照常触发下一趟。
+   */
+  async function runSave(): Promise<void> {
     saving = true;
+    saveState = 'saving';
+    let failed = false;
     try {
-      await updateSettings({
-        port,
-        downloadDir,
-        deviceSubdir,
-        autoAcceptPaired,
-        downloadMode,
-        deviceName,
-        language: languagePref,
-        autoStart,
-        autoBroadcastNew,
-        // 一颗开关管两条路：替其它设备盲转字节 + 替群聊转消息（`allowRelay` / `groupRelay`）。
-        groupRelay: relay,
-        allowRelay: relay,
-        // LocalSend 开关是**立即生效**的（`set_localsend_enabled`），不走这里：
-        // 这里不带它 = 后端保持原值，避免保存时把刚切过的开关又写回表单里的旧状态。
-        // 「记住并自动复用跨网段中转」不给控制、默认开：一律写开。
-        relayMemory: true,
-        transferWorkers: clampNum(transferWorkers, 1, 8, 4),
-        transferBlockMb: clampNum(transferBlockMb, 1, 32, 4),
-        bcExePath,
-        orbShape,
-      });
-      onClose();
-      onToast(t('设置已保存'));
+      while (saveAgain) {
+        saveAgain = false;
+        const next = await updateSettings(buildRequest());
+        if (!saveAgain && !textDirty) {
+          applySettings(next);
+        }
+      }
+      saveState = 'saved';
     } catch (e: any) {
+      failed = true;
+      saveState = 'error';
       console.error('Settings save failed:', e);
       onToast(t('保存失败：{error}', { error: String(e) }));
     } finally {
       saving = false;
+      // 失败时保留 `saveAgain`：状态条上的「重试」会再发一趟。
+      if (!failed && saveAgain) void runSave();
     }
   }
 
-  function cancel() {
-    // Reload values from store (discard edits)
-    const s = getSettings();
-    if (s) {
-      port = s.port;
-      downloadDir = s.downloadDir;
-      deviceSubdir = s.deviceSubdir;
-      autoAcceptPaired = s.autoAcceptPaired;
-      downloadMode = s.downloadMode;
-      deviceName = s.deviceName;
-      languagePref = normalizePreference(s.language);
-      adoptLanguagePreference(s.language);
-      autoStart = s.autoStart;
-      autoBroadcastNew = s.autoBroadcastNew;
-      relay = s.allowRelay || s.groupRelay;
-      // LocalSend 开关是立即生效的，**不参与取消**（`cancel` 不能把它拨回旧值；
-      // 否则面板关掉前会闪一下与后端不一致的状态）。
-      transferWorkers = s.transferWorkers;
-      transferBlockMb = s.transferBlockMb;
-      bcExePath = s.bcExePath ?? '';
-      orbShape = s.orbShape;
-    }
+  /** 文本输入提交：失焦 / 回车 / 关闭面板都走这里。 */
+  function commitTextEdits(): void {
+    if (!textDirty) return;
+    textDirty = false;
+    scheduleSave();
+  }
+
+  function close() {
+    // 焦点还在输入框里就点右上角关闭时，change 不一定会先跑：这里补一次。
+    commitTextEdits();
+    // 上次自动保存失败就再试一趟：关掉面板不该把用户刚改的东西悄悄留在未保存状态。
+    // 仍然失败会弹 toast；下次打开面板会按后端落盘值重灌。
+    if (saveState === 'error') scheduleSave();
     onClose();
   }
 </script>
@@ -398,13 +504,26 @@
     <span class="panel-brand" style="margin-right:auto">
       <Logo size={20} />{t('设置')}
     </span>
-    <button class="icon-btn" onclick={cancel} aria-label={t('关闭设置')}>
+    <span class="autosave-status" class:is-error={saveState === 'error'} role="status">
+      {#if saveState === 'error'}
+        <button class="autosave-retry" type="button" onclick={scheduleSave}>
+          {t('保存失败 · 点此重试')}
+        </button>
+      {:else if saveState === 'saving'}
+        {t('正在自动保存…')}
+      {:else if saveState === 'saved'}
+        {t('已自动保存')}
+      {:else}
+        {t('改动会自动保存')}
+      {/if}
+    </span>
+    <button class="icon-btn" onclick={close} aria-label={t('关闭设置')}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
         <path d="M6 6l12 12M18 6 6 18"/>
       </svg>
     </button>
   </header>
-  <div class="sheet-body">
+  <div class="sheet-body" bind:this={bodyEl} onscroll={updateMoreBelow}>
     <div class="field">
       <label for="language">{t('界面语言')}<Hint>
         {t('界面正文、托盘菜单与通知栏会立刻切换。首次启动使用系统语言，系统语言不在支持列表里时使用英语。')}
@@ -413,7 +532,16 @@
     </div>
     <div class="field">
       <label for="deviceName">{t('设备名称')}</label>
-      <input class="input" id="deviceName" bind:value={deviceName} />
+      <input
+        class="input"
+        id="deviceName"
+        bind:value={deviceName}
+        oninput={() => (textDirty = true)}
+        onchange={commitTextEdits}
+        onkeydown={(e: KeyboardEvent) => {
+          if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+        }}
+      />
     </div>
     <div class="field">
       <label for="downloadDir">{t('下载目录')}<Hint>
@@ -433,7 +561,15 @@
       <div style="display:flex; align-items:center; justify-content:space-between;">
         <span style="font-size:var(--fs-sm); color:var(--muted);">{t('接收推送时放进以发送方命名的子目录')}</span>
         <label class="switch">
-          <input type="checkbox" bind:checked={deviceSubdir} data-device-subdir />
+          <input
+            type="checkbox"
+            checked={deviceSubdir}
+            data-device-subdir
+            onchange={(e: Event) => {
+              deviceSubdir = (e.currentTarget as HTMLInputElement).checked;
+              scheduleSave();
+            }}
+          />
           <span class="track"></span>
         </label>
       </div>
@@ -446,7 +582,15 @@
       <div style="display:flex; align-items:center; justify-content:space-between;">
         <span style="font-size:var(--fs-sm); color:var(--muted);">{t('无长连接的已配对设备也免确认，直接落下载目录')}</span>
         <label class="switch">
-          <input type="checkbox" bind:checked={autoAcceptPaired} data-auto-accept-paired />
+          <input
+            type="checkbox"
+            checked={autoAcceptPaired}
+            data-auto-accept-paired
+            onchange={(e: Event) => {
+              autoAcceptPaired = (e.currentTarget as HTMLInputElement).checked;
+              scheduleSave();
+            }}
+          />
           <span class="track"></span>
         </label>
       </div>
@@ -456,30 +600,80 @@
       <label id="dlModeLabel">{t('保存位置')}</label>
       <div class="radio-group">
         <label class="radio">
-          <input type="radio" name="dlMode" bind:group={downloadMode} value="Direct" />
+          <input
+            type="radio"
+            name="dlMode"
+            checked={downloadMode === 'Direct'}
+            onchange={() => {
+              downloadMode = 'Direct';
+              scheduleSave();
+            }}
+          />
           <span class="r-label">{t('直接保存到下载目录')}<span class="r-sub">{t('手动下载直接存；推送在你点接收后也直接存，不再问位置。')}</span></span>
         </label>
         <label class="radio">
-          <input type="radio" name="dlMode" bind:group={downloadMode} value="AskEachTime" />
+          <input
+            type="radio"
+            name="dlMode"
+            checked={downloadMode === 'AskEachTime'}
+            onchange={() => {
+              downloadMode = 'AskEachTime';
+              scheduleSave();
+            }}
+          />
           <span class="r-label">{t('每次选择位置')}<span class="r-sub">{t('手动下载、以及你点接收后的推送，都先选保存位置。')}</span></span>
         </label>
       </div>
     </div>
     <div class="field">
       <label for="port">{t('服务端口')}<Hint>{t('被占用时自动 +1 探测，实际端口显示在底部状态栏。')}</Hint></label>
-      <input class="input num" id="port" type="number" bind:value={port} />
+      <input
+        class="input num"
+        id="port"
+        type="number"
+        bind:value={port}
+        oninput={() => (textDirty = true)}
+        onchange={commitTextEdits}
+        onkeydown={(e: KeyboardEvent) => {
+          if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+        }}
+      />
     </div>
     <div class="field">
       <label for="transferWorkers">{t('传输并发数')}<Hint>
         {t('一次接收同时跑几路传输（一块 / 一个文件算一路）。局域网上 4 就够把千兆喂饱，调到 8 以上只会把连接、句柄与磁盘队列都堆起来，反而互相拖。取值 1–8，超出范围会在保存时夹住。')}
       </Hint></label>
-      <input class="input num" id="transferWorkers" type="number" min="1" max="8" bind:value={transferWorkers} />
+      <input
+        class="input num"
+        id="transferWorkers"
+        type="number"
+        min="1"
+        max="8"
+        bind:value={transferWorkers}
+        oninput={() => (textDirty = true)}
+        onchange={commitTextEdits}
+        onkeydown={(e: KeyboardEvent) => {
+          if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+        }}
+      />
     </div>
     <div class="field">
       <label for="transferBlockMb">{t('分块大小（MB）')}<Hint>
         {t('大文件按它切片、片与片之间并行。4MB 在千兆下约 33ms 一块 —— 取消 / 失败的可感知延迟就在这个尺度，同时「一块要重传」的代价也不大。取值 1–32，超出范围会在保存时夹住；再大就不是并行，而是「一次传半个文件」。')}
       </Hint></label>
-      <input class="input num" id="transferBlockMb" type="number" min="1" max="32" bind:value={transferBlockMb} />
+      <input
+        class="input num"
+        id="transferBlockMb"
+        type="number"
+        min="1"
+        max="32"
+        bind:value={transferBlockMb}
+        oninput={() => (textDirty = true)}
+        onchange={commitTextEdits}
+        onkeydown={(e: KeyboardEvent) => {
+          if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+        }}
+      />
     </div>
     <!-- svelte-ignore a11y_label_has_associated_control -->
     <div class="field">
@@ -490,7 +684,16 @@
       </Hint></label>
       <div class="shape-picker" role="radiogroup" aria-labelledby="orbShapeLabel">
         <label class="shape-opt" title={t('圆球：贴边收起半颗，悬停滑回来')}>
-          <input type="radio" name="orbShape" bind:group={orbShape} value="circle" aria-label={t('圆球')} />
+          <input
+            type="radio"
+            name="orbShape"
+            checked={orbShape === 'circle'}
+            aria-label={t('圆球')}
+            onchange={() => {
+              orbShape = 'circle';
+              scheduleSave();
+            }}
+          />
           <!-- 缩略图 = **真组件 + 示例数据**（同一套 CSS/DOM，件件与实物一致），外面套一层
                缩放框（`--s` = 缩放比，`--w`/`--h` = 不含缩放的视觉外框，`--ox`/`--oy` = 组件
                原点在外框里的落点）。
@@ -509,7 +712,16 @@
           </span>
         </label>
         <label class="shape-opt" title={t('圆角矩形悬浮框：设备分页卡片，贴边收起成竖条，可直接拖出共享项')}>
-          <input type="radio" name="orbShape" bind:group={orbShape} value="rect" aria-label={t('圆角矩形悬浮框')} />
+          <input
+            type="radio"
+            name="orbShape"
+            checked={orbShape === 'rect'}
+            aria-label={t('圆角矩形悬浮框')}
+            onchange={() => {
+              orbShape = 'rect';
+              scheduleSave();
+            }}
+          />
           <span class="so-frame" style="--s:0.78; --w:236px; --h:144px; --ox:30px; --oy:5px" inert>
             <span class="so-scale">
               <RectOrb
@@ -539,6 +751,11 @@
         class="input"
         id="bcExePath"
         bind:value={bcExePath}
+        oninput={() => (textDirty = true)}
+        onchange={commitTextEdits}
+        onkeydown={(e: KeyboardEvent) => {
+          if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+        }}
         placeholder={isMac() ? t('留空 = 自动探测（.app 也可）') : t('留空 = 自动探测')}
       />
     </div>
@@ -548,7 +765,15 @@
       <div style="display:flex; align-items:center; justify-content:space-between;">
         <span style="font-size:var(--fs-sm); color:var(--muted);">{t('登录后自动启动 OrbDrop')}</span>
         <label class="switch">
-          <input type="checkbox" bind:checked={autoStart} data-autostart />
+          <input
+            type="checkbox"
+            checked={autoStart}
+            data-autostart
+            onchange={(e: Event) => {
+              autoStart = (e.currentTarget as HTMLInputElement).checked;
+              scheduleSave();
+            }}
+          />
           <span class="track"></span>
         </label>
       </div>
@@ -562,7 +787,15 @@
       <div style="display:flex; align-items:center; justify-content:space-between;">
         <span style="font-size:var(--fs-sm); color:var(--muted);">{t('新添加的目录/文件自动开启共享')}</span>
         <label class="switch">
-          <input type="checkbox" bind:checked={autoBroadcastNew} data-autobroadcast />
+          <input
+            type="checkbox"
+            checked={autoBroadcastNew}
+            data-autobroadcast
+            onchange={(e: Event) => {
+              autoBroadcastNew = (e.currentTarget as HTMLInputElement).checked;
+              scheduleSave();
+            }}
+          />
           <span class="track"></span>
         </label>
       </div>
@@ -578,7 +811,15 @@
       <div style="display:flex; align-items:center; justify-content:space-between;">
         <span style="font-size:var(--fs-sm); color:var(--muted);">{t('本机替够不着彼此的其它设备搬字节、替够不着的同群成员转消息；会占用本机上行带宽')}</span>
         <label class="switch">
-          <input type="checkbox" bind:checked={relay} data-relay />
+          <input
+            type="checkbox"
+            checked={relay}
+            data-relay
+            onchange={(e: Event) => {
+              relay = (e.currentTarget as HTMLInputElement).checked;
+              scheduleSave();
+            }}
+          />
           <span class="track"></span>
         </label>
       </div>
@@ -604,7 +845,7 @@
         </label>
       </div>
       <p style="margin:4px 0 0; font-size:var(--fs-sm); color:var(--muted);">
-        {t('开启后立即生效，不等「保存设置」。53317 被占用时先回落主端口，端口空出后自动接管；不会因此自动关闭。')}
+        {t('开启后立即生效。53317 被占用时先回落主端口，端口空出后自动接管；不会因此自动关闭。')}
       </p>
       {#if localSendView}
         <div style="display:flex; align-items:flex-start; gap:8px; margin-top:4px;">
@@ -709,10 +950,7 @@
       {/if}
     </div>
   </div>
-  <footer class="sheet-foot">
-    <button class="btn btn-ghost" onclick={cancel}>{t('取消')}</button>
-    <button class="btn btn-primary" onclick={save} disabled={saving || localSendBusy}>
-      {saving ? t('保存中…') : t('保存设置')}
-    </button>
-  </footer>
+  {#if moreBelow}
+    <div class="sheet-fade" aria-hidden="true"></div>
+  {/if}
 </section>

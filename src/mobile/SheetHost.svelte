@@ -16,6 +16,7 @@
   import UpdateSheet from "./sheets/UpdateSheet.svelte";
   import SharePathSheet from "./sheets/SharePathSheet.svelte";
   import ShareActionsSheet from "./sheets/ShareActionsSheet.svelte";
+  import ShareEntryActionsSheet from "./sheets/ShareEntryActionsSheet.svelte";
   import RenameShareSheet from "./sheets/RenameShareSheet.svelte";
   import ConfirmSheet from "./sheets/ConfirmSheet.svelte";
 
@@ -56,6 +57,15 @@
   <SharePathSheet {onClose} />
 {:else if sheet.kind === "shareActions"}
   <ShareActionsSheet shareId={sheet.shareId} {onClose} />
+{:else if sheet.kind === "shareEntryActions"}
+  <ShareEntryActionsSheet
+    shareId={sheet.shareId}
+    path={sheet.path}
+    name={sheet.name}
+    isDir={sheet.isDir}
+    size={sheet.size}
+    {onClose}
+  />
 {:else if sheet.kind === "renameShare"}
   <RenameShareSheet shareId={sheet.shareId} {onClose} />
 {:else if sheet.kind === "confirm"}

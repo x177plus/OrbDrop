@@ -182,7 +182,7 @@ pub fn start(state: Arc<AppState>, app: AppHandle) {
                                 "本地与对端都改过，自动同步停下等用户处理"
                             );
                             emit(&app, entry, "conflict", Some(
-                                "对端文件在打开后已变化；本地也有修改。请选择用本地覆盖、用远端覆盖或保留两份",
+                                "对端文件在打开后已变化；本地也有修改。请右键「强制写回」用本地覆盖，或先「下载到本地」保留对端版本",
                             ));
                         }
                     } else if !track.blocked && !track.in_flight && !track.refreshing {
@@ -550,12 +550,7 @@ fn emit_remote_changed(
     local_dirty: bool,
     error: Option<&str>,
 ) {
-    let name = entry
-        .path
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or(entry.path.as_str());
+    let name = crate::mirror::writeback::display_name(entry);
     let _ = app.emit(
         crate::ws::events::ui::WRITEBACK_AUTO,
         serde_json::json!({
@@ -571,12 +566,7 @@ fn emit_remote_changed(
 }
 
 fn emit(app: &AppHandle, entry: &OpenedCopy, state: &str, error: Option<&str>) {
-    let name = entry
-        .path
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or(entry.path.as_str());
+    let name = crate::mirror::writeback::display_name(entry);
     let _ = app.emit(
         crate::ws::events::ui::WRITEBACK_AUTO,
         serde_json::json!({

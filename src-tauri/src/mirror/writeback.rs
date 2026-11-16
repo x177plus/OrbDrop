@@ -69,6 +69,25 @@ pub struct OpenedCopy {
     pub dirty: bool,
 }
 
+/// 命名的唯一口径：普通项取远端相对路径最后一段；共享项根文件（`path == ""`）
+/// 取本地工作副本的文件名。自动写回的通知、刷新日志与手动写回共用这一份。
+pub fn display_name(opened: &OpenedCopy) -> String {
+    opened
+        .path
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            opened
+                .local
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or_else(|| "文件".to_string())
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Journal {
     #[serde(default)]
@@ -135,8 +154,9 @@ fn save(root: &Path, entries: &[Entry]) {
 
 /// 记录一次「打开」：同坐标或同本地路径的旧记录先清掉，再写新的。
 ///
-/// 目录不登记（写回面只做文件）；空路径是**单文件共享项**的根，整份覆盖不走上传链路，
-/// 也不登记。登记失败只记日志，不能让“打开”因此失败。
+/// 目录不登记（写回面只做文件）；空路径是**单文件共享项**的根，也照常登记 ——
+/// 写回目标由 `UploadDest.path == ""` 表达（接收端把共享根当文件本身覆盖）。
+/// 登记失败只记日志，不能让“打开”因此失败。
 pub fn record_opened(peer_id: &str, share_id: &str, path: &str, placed: &PlacedItem) {
     record_at(
         &root(),
@@ -178,6 +198,15 @@ pub fn forget_opened(peer_id: &str, share_id: &str, path: &str) {
         share_id,
         path,
     );
+}
+
+/// 删除目录（或文件）后清掉它和它**下面**所有工作副本的登记。
+///
+/// 远端目录被递归删除时，只按目录路径摘登记不够：目录里那些打开过/改过的文件仍在登记表里，
+/// 自动写回会把它们重新上传，等于让删除"复活"。这里按 `path` 前缀一起摘掉；本地工作副本
+/// 本身不删（用户可能还开着，想留也能留）。
+pub fn forget_opened_under(peer_id: &str, share_id: &str, path: &str) {
+    forget_under_at(&root(), &pending_root(), peer_id, share_id, path);
 }
 
 /// 本地副本在打开后是否被改过（大小或 mtime_ms 与登记基线不同，或已被标记待写回）。
@@ -289,10 +318,13 @@ pub fn begin_writeback(peer_id: &str, share_id: &str, path: &str) -> Option<InFl
 /// 普通上传会对名字做跨平台净化；写回用的是对端已存在的原名，调用方（清单构造）也会对
 /// 登记过的源跳过净化。这里只按接收侧 [`crate::transfer::resume::safe_join`] 的口径拒绝
 /// 真正落不了盘的名字（冒号、保留设备名、结尾点/空格、斜杠），合法的前导点原样保留。
+///
+/// 空路径是**单文件共享项根**，没有可拆的父目录；调用方（`perform_writeback`）会用
+/// `dest.path == ""` 直接表达“覆盖共享根文件”，不经过这里。
 pub fn remote_target(path: &str) -> Result<(String, String), String> {
     let path = norm_remote(path);
     if path.is_empty() {
-        return Err("单文件共享项暂不支持写回".into());
+        return Err("空路径不是可拆分的写回目标".into());
     }
     let (parent, name) = match path.rsplit_once('/') {
         Some((parent, name)) => (parent.to_string(), name.to_string()),
@@ -612,9 +644,6 @@ fn record_at(
         return;
     }
     let path = norm_remote(path);
-    if path.is_empty() {
-        return; // 单文件共享项：上传面写不到共享根本身
-    }
     let local = placed.path.to_string_lossy().into_owned();
     let (local_size, local_mtime_ms) = local_stat(&placed.path);
     let _guard = LOCK.lock().unwrap();
@@ -716,6 +745,39 @@ fn forget_at(journal_root: &Path, pending: &Path, peer_id: &str, share_id: &str,
         save(journal_root, &entries);
         // pending 副本是我们自己导出的临时物，登记没了就不用留；镜像里的工作副本
         // 不删（用户可能还想从本地拿回内容）。
+        for local in removed {
+            if is_under(&local, pending) {
+                let _ = std::fs::remove_file(&local);
+            }
+        }
+    }
+}
+
+/// [`forget_opened_under`] 的实现：命中「同一路径」或「以 `path/` 开头」的全部登记。
+fn forget_under_at(
+    journal_root: &Path,
+    pending: &Path,
+    peer_id: &str,
+    share_id: &str,
+    path: &str,
+) {
+    let base = norm_remote(path);
+    let prefix = format!("{base}/");
+    let _guard = LOCK.lock().unwrap();
+    let mut entries = load(journal_root);
+    let mut removed: Vec<PathBuf> = Vec::new();
+    let before = entries.len();
+    entries.retain(|e| {
+        let hit = e.peer_id == peer_id
+            && e.share_id == share_id
+            && (e.path == base || e.path.starts_with(&prefix));
+        if hit && e.dirty {
+            removed.push(PathBuf::from(&e.local));
+        }
+        !hit
+    });
+    if entries.len() != before {
+        save(journal_root, &entries);
         for local in removed {
             if is_under(&local, pending) {
                 let _ = std::fs::remove_file(&local);
@@ -925,7 +987,7 @@ mod tests {
             remote_target("dir/.env").unwrap(),
             ("dir".to_string(), ".env".to_string())
         );
-        assert!(remote_target("").is_err(), "单文件共享项没有可写回的父目录");
+        assert!(remote_target("").is_err(), "空路径由调用方按共享根处理，不能在这里拆");
         assert!(remote_target("a:b.txt").is_err(), "接收侧 safe_join 会拒冒号");
         assert!(remote_target("dir/CON").is_err(), "Windows 保留名");
         assert!(remote_target("dir/trailing.").is_err(), "结尾点落不了盘");
@@ -948,6 +1010,58 @@ mod tests {
 
         forget_at(&journal, &pending, "peer", "share", "dir/a.txt");
         assert!(find_at(&journal, &mirror, &pending, "peer", "share", "dir/a.txt").is_none());
+
+        std::fs::remove_dir_all(journal.parent().unwrap()).unwrap();
+    }
+
+    /// 单文件共享项的根（`path == ""`）也登记；显示名与待写回副本的名字都取工作副本文件名。
+    #[test]
+    fn single_file_share_root_is_registered_and_named_after_the_copy() {
+        let (journal, mirror, pending) = roots();
+        let local = file_in(&mirror, "peer", "share", "report.pdf");
+
+        record_at(&journal, &mirror, &pending, "peer", "share", "", &placed(&local));
+        let opened = find_at(&journal, &mirror, &pending, "peer", "share", "").unwrap();
+        assert_eq!(opened.path, "");
+        assert_eq!(display_name(&opened), "report.pdf");
+
+        let entries = load(&journal);
+        assert_eq!(
+            pending_path(&pending, &entries[0]).unwrap(),
+            pending.join("peer").join("share").join("report.pdf"),
+            "待写回副本用文件名，不能拼出空路径"
+        );
+
+        forget_at(&journal, &pending, "peer", "share", "");
+        assert!(find_at(&journal, &mirror, &pending, "peer", "share", "").is_none());
+        std::fs::remove_dir_all(journal.parent().unwrap()).unwrap();
+    }
+
+    /// 删除一个目录时，目录里打开过/改过的文件登记也要一起摘掉，否则自动写回会把它们
+    /// 重新上传，等于让删除"复活"。
+    #[test]
+    fn forgetting_a_directory_drops_descendant_registrations() {
+        let (journal, mirror, pending) = roots();
+        let dir = mirror.join("peer").join("share").join("dir").join("sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = mirror.join("peer").join("share").join("dir").join("a.txt");
+        let b = dir.join("b.txt");
+        let other = mirror.join("peer").join("share").join("other.txt");
+        for file in [&a, &b, &other] {
+            std::fs::write(file, b"hello").unwrap();
+        }
+        record_at(&journal, &mirror, &pending, "peer", "share", "dir/a.txt", &placed(&a));
+        record_at(&journal, &mirror, &pending, "peer", "share", "dir/sub/b.txt", &placed(&b));
+        record_at(&journal, &mirror, &pending, "peer", "share", "other.txt", &placed(&other));
+
+        forget_under_at(&journal, &pending, "peer", "share", "dir");
+
+        assert!(find_at(&journal, &mirror, &pending, "peer", "share", "dir/a.txt").is_none());
+        assert!(find_at(&journal, &mirror, &pending, "peer", "share", "dir/sub/b.txt").is_none());
+        assert!(
+            find_at(&journal, &mirror, &pending, "peer", "share", "other.txt").is_some(),
+            "目录之外的登记不能被误删"
+        );
 
         std::fs::remove_dir_all(journal.parent().unwrap()).unwrap();
     }
