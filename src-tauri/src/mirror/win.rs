@@ -1075,14 +1075,27 @@ fn fetch_data(info: &CF_CALLBACK_INFO, params: &CF_CALLBACK_PARAMETERS) {
         if size == 0 && matches!(execute_transfer(info, &[], start, 0), Ok(())) {
             return;
         }
-        fail_range(info, start, 0, "请求区间为空");
+        // **判失败也必须给出一段非空的区间**：`CfExecute(TRANSFER_DATA)` 只作废与
+        // `[Offset, Offset+Length)` 重叠的挂起 IO。长度 0 = 什么也没作废 = 那个读一直挂着
+        // （60 秒后才超时；期间任何有效操作还会重置计时器）。目标侧就是"文件一直不出现、
+        // 资源管理器不响应"。一页 4 KiB 就够：它一定落在 `start` 这一页里。
+        warn!(
+            path = %id.path, start, end, required_start, required_end, size,
+            "取数据回调的区间为空（或越过末尾），按一页判失败收尾"
+        );
+        fail_range(info, start, ALIGN, "请求区间为空");
         return;
     }
 
     // 登记这次请求：平台随后的撤销只认领**它**（见 [`note_cancel`]），落地时（含提前返回）摘掉。
     let fetch_guard = FetchGuard::begin(info.FileId, start, end);
-    info!(path = %id.path, start, end, size, resume = fetch.Flags.contains(CF_CALLBACK_FETCH_DATA_FLAG_RECOVERY), "开始水合");
-    match transfer_range(provider, info, &id, start, end, &fetch_guard) {
+    info!(
+        path = %id.path, start, end, required_start, required_end, size,
+        flags = fetch.Flags.0,
+        resume = fetch.Flags.contains(CF_CALLBACK_FETCH_DATA_FLAG_RECOVERY),
+        "开始水合"
+    );
+    match transfer_range(provider, info, &id, start, end, required_end, &fetch_guard) {
         Ok(()) => {}
         Err(Stop::Cancelled) => {
             // 我们看到了这次请求的撤销。**必须给平台一个回音**：静默返回会让这个读一直挂着
@@ -1104,12 +1117,19 @@ fn fetch_data(info: &CF_CALLBACK_INFO, params: &CF_CALLBACK_PARAMETERS) {
 
 /// 把 `[start, end)` 从对端搬过来交给平台。分块交付：`PROGRESSIVE` 下平台一拿到"够用的数据"
 /// 就放行用户 IO，所以**不要**攒一整块再交。
+///
+/// **契约**（违反它就是实机上的"卡死"）：平台要的那一段 `[required_start, required_end)`
+/// 必须要么交付齐、要么在返回前明确判失败。部分交付**不会**让平台"以后再要剩下那半" ——
+/// 挂起的 IO 就地等着，直到 60 秒超时，而任何别的有效操作还会重置那个计时器。目标侧看到
+/// 的就是：复制进度不动、文件一直不出现、资源管理器不响应，而日志里只有一对对的
+/// `开始水合` / `水合完成`（那些是别的读在正常跑）。
 fn transfer_range(
     provider: &Provider,
     info: &CF_CALLBACK_INFO,
     id: &identity::Identity,
     start: u64,
     end: u64,
+    required_end: u64,
     fetch: &FetchGuard,
 ) -> Result<(), Stop> {
     let began = std::time::Instant::now();
@@ -1158,15 +1178,33 @@ fn transfer_range(
         delivered += length;
         report_progress(info, total, delivered as i64);
         if length < want {
-            // 服务端按 len 截断：拿回来的比要的少 = 已经到末尾。
+            // 服务端按 `len` 截断：拿回来的比要的少 = **对端到这里就没了**。
+            // `end` 可能比平台真正要的 `required_end` 多一段（区间向上对齐），那一段短读无所谓；
+            // 但只要还没盖住 `required_end`，就绝不能当成功收工 —— 平台不会"以后再要剩下的"，
+            // 它会让那个读一直挂着（见函数头）。这里必须明确判失败，让目标当场报错。
+            if offset + length < required_end {
+                return Err(Stop::Failed(format!(
+                    "对端「{}」在 {offset} 处提前结束（这次只拿到 {length} 字节，平台需要到 \
+                     {required_end}，占位符报的大小是 {}）",
+                    id.path,
+                    info.FileSize.max(0)
+                )));
+            }
             break;
         }
+    }
+    if start + delivered < required_end {
+        // 防御：正常路径只会在"短读已经盖住 required_end"时提前结束（上面那条）。
+        // 真走到这里说明还有别的提前退出，同样必须判失败，绝不能静默返回。
+        return Err(Stop::Failed(format!(
+            "只交付了 {delivered} 字节，没盖住平台需要的区间（{start}..{required_end}）"
+        )));
     }
     // 一行"这一段搬完了"：验证期要靠它把"目标侧看到的等待"和"我们实际拉了多少/多久"对上，
     // 也是唯一能直接看出水合吞吐的地方。
     info!(
         path = %id.path, bytes = delivered, range_start = start, range_end = end,
-        ms = began.elapsed().as_millis() as u64,
+        required_end, ms = began.elapsed().as_millis() as u64,
         "水合完成"
     );
     Ok(())
@@ -1376,6 +1414,10 @@ fn platform_dropped(e: &windows::core::Error) -> bool {
 /// 必须用 `STATUS_CLOUD_FILE_*` 里的状态：这个范围之外的状态会被平台一律折成
 /// `STATUS_CLOUD_FILE_UNSUCCESSFUL`。绝不报成功 —— 那会让目标拷出一份静默残缺的文件。
 fn fail_range(info: &CF_CALLBACK_INFO, offset: u64, length: u64, why: &str) {
+    // 平台按 `[offset, offset+length)` 作废**重叠**的挂起 IO：长度为 0 等于什么也没作废，
+    // 那个读会一直挂到 60 秒超时（期间别的有效操作还会重置计时器）。这里补一页兜底 ——
+    // 宁可多判失败一页，也不能让一个读永远挂着。
+    let length = if length == 0 { ALIGN } else { length };
     warn!(
         file_id = info.FileId,
         offset, length, why, "把这一段读判失败"

@@ -574,6 +574,64 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
         "空文件复制出来还是 0 字节"
     );
 
+    // ---- 4.75 对端比占位符报的短：必须**立刻判失败**，绝不能"交付一部分就当完成" ----
+    //
+    // 这是实机那条循环的另一半：占位符报的大小来自建它时的 `/stat`，对端文件后来变小
+    // （被截断/换了内容）时，我们只能拿到一段短读。旧实现把"拿回来的比要的少"一律当成
+    // "到文件末尾"，交付那半截、返回成功 —— 平台那个读既不完整也没被作废，就一直挂着
+    // （60 秒超时，期间任何别的有效操作还会重置计时器）。目标侧：文件一直不出现、
+    // 资源管理器不响应，日志里只有一对对 开始水合/水合完成。
+    //
+    // 这里用死线把"挂住"变成一条能读的失败信息；再断言"刷新占位符之后同一项还能读" ——
+    // 失败不能把占位符弄坏。
+    const TRUNC_LEN: usize = 512 * 1024;
+    std::fs::write(share_root.join("trunc.bin"), vec![7u8; TRUNC_LEN]).unwrap();
+    let trunc_item = MirroredItem {
+        peer_id: peer.clone(),
+        share_id: share_id.clone(),
+        path: "trunc.bin".into(),
+        name: "trunc.bin".into(),
+        is_dir: false,
+    };
+    let trunc_local = mirror::place(&state, &trunc_item)
+        .await
+        .expect("放 trunc 项");
+    assert_eq!(
+        std::fs::metadata(&trunc_local).unwrap().len() as usize,
+        TRUNC_LEN,
+        "占位符先按真实大小建"
+    );
+    // 对端变小，占位符不知道。
+    std::fs::write(share_root.join("trunc.bin"), vec![7u8; 4096]).unwrap();
+    let hang_path = trunc_local.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::fs::read(&hang_path));
+    });
+    let read = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("短读必须当场判失败：只交一部分就返回会让平台那个读一直挂着（= 实机上的卡死）");
+    assert!(
+        read.is_err(),
+        "对端比占位符短时，读必须报错（不许静默交半截）"
+    );
+    // 刷新：占位符大小改成对端现在的大小，同一项还要能正常读出来。
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let refreshed_trunc = mirror::place_with_meta(&state, &trunc_item, true)
+        .await
+        .expect("对端变小后刷新占位符")
+        .path;
+    assert_eq!(
+        std::fs::metadata(&refreshed_trunc).unwrap().len(),
+        4096,
+        "刷新后占位符要报对端现在的大小"
+    );
+    assert_eq!(
+        std::fs::read(&refreshed_trunc).expect("刷新后重读"),
+        vec![7u8; 4096],
+        "刷新后拿到的必须是对端现在的字节"
+    );
+
     // ---- 4.8 目标正在读同一项时，再拖一次必须复用原路径 ----
     //
     // 资源管理器还在复制时用户又拖了同一项：旧实现会先删同名再建 —— 正在复制的源
