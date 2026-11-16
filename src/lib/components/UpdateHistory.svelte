@@ -49,7 +49,7 @@
 {#if open}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div
-    class="overlay open"
+    class="overlay open history-overlay"
     role="dialog"
     aria-modal="true"
     aria-label={t('更新记录：{name}', { name: title })}
@@ -133,14 +133,21 @@
 {/if}
 
 <style>
+  /* 固定高度的卡片：外层遮罩不滚，只有中间的 `.history-list` 滚。高度同时受视口约束，
+     小窗口上也不会把卡片顶出遮罩（`min-height: 0` 是给 grid/flex 的自动最小尺寸兜底）。 */
+  .overlay.history-overlay {
+    overflow: hidden;
+  }
   .history-dialog {
     width: min(460px, calc(100% - 32px));
-    height: calc(100% - 12px);
-    max-height: calc(100% - 12px);
+    height: min(560px, calc(100% - 32px));
+    max-height: calc(100% - 32px);
+    min-height: 0;
     padding: 18px;
     display: flex;
     flex-direction: column;
     gap: 10px;
+    overflow: hidden;
   }
   .history-dialog > :not(.history-list) {
     flex: none;
@@ -215,9 +222,14 @@
     flex-direction: column;
     gap: 2px;
     flex: 1 1 auto;
-    min-height: 180px;
+    min-height: 0;
     overflow-y: auto;
     padding-right: 2px;
+  }
+  /* 固定卡片里没有列表时（加载中 / 空 / 出错），关闭键仍贴在卡片底部。
+     写成 `.dialog.history-dialog` 是为了压过全局 `.dialog .d-acts { margin-top: 18px }`。 */
+  .dialog.history-dialog .d-acts {
+    margin-top: auto;
   }
   .history-row {
     display: flex;

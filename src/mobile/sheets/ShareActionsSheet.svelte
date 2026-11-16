@@ -4,6 +4,7 @@
   import * as api from "$lib/api";
   import * as store from "../store.svelte";
   import * as shares from "$lib/stores/shares.svelte";
+  import { openLocalShareEntry } from "../shareTree";
   import { t } from "$lib/i18n.svelte";
 
   /**
@@ -15,6 +16,18 @@
   let { shareId, onClose }: { shareId: string; onClose: () => void } = $props();
 
   const share = $derived(shares.getShares().find((s) => s.id === shareId));
+
+  /** 共享项本身就是一个文件（例如 APK）：与行上短按同一个落点，交给系统应用打开。 */
+  async function open(): Promise<void> {
+    const s = share;
+    if (!s || s.isDir) return;
+    try {
+      await openLocalShareEntry(s, "");
+      onClose();
+    } catch (e) {
+      store.failed(t("打开"), e);
+    }
+  }
 
   async function copyLink(): Promise<void> {
     const s = share;
@@ -69,6 +82,16 @@
   {#if !share}
     <div class="empty"><Icon name="folder" /><p>{t("共享项已不存在")}</p></div>
   {:else}
+    {#if !share.isDir}
+      <button class="opt" type="button" onclick={() => void open()}>
+        <span class="oi"><Icon name="file" /></span>
+        <span class="om">
+          <span class="on">{t("打开")}</span>
+          <span class="od">{t("用系统应用打开这份文件。")}</span>
+        </span>
+      </button>
+    {/if}
+
     <button class="opt" type="button" onclick={() => void copyLink()}>
       <span class="oi"><Icon name="link" /></span>
       <span class="om">

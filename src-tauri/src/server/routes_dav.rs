@@ -154,7 +154,7 @@ const ALLOW_METHODS: &str =
     "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, COPY";
 
 /// 对端通过 WebDAV 写/删/移动时，在 watcher 看到之前登记归属。
-fn attribute_peer(state: &AppState, caller: &Caller, share_id: &str, path: &str) {
+pub(crate) fn attribute_peer(state: &AppState, caller: &Caller, share_id: &str, path: &str) {
     let Caller::Peer(peer_id) = caller else {
         return; // 本机回环 DAV 由 watcher 默认记成本机
     };

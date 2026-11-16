@@ -4563,7 +4563,7 @@ F2 把"记录里那个名字"播进了设备行的名字格，于是暴露出一
 
 - `ShareStoragePlugin.kt`：`state`（supported / granted / sdk）、`request`（打开系统「所有文件访问」页，失败退通用列表页/应用详情）、`roots`（`StorageManager.storageVolumes`，只收 mounted，主存储排第一）、`list`（后台线程列一层；先 canonical 校验必须落在某个存储根下；跳过隐藏项；一层最多 500 项并返回 `truncated`）。
 - `mobile.rs`：插件句柄 + 四个 `#[cfg(mobile)]` 命令（`android_share_state` / `android_share_request` / `android_share_roots` / `android_share_list`）。只做 DTO 与 `run_mobile_plugin_async` 桥接，**共享链路本身没有平台分叉**。
-- `FilesTab.svelte`：文件页多一段「本机」。列表与桌面端 `LocalTab` 共用 `shares.svelte.ts` / `add_share` / `toggle_broadcast` / `rename_share` / `remove_share`；行上的开关就是广播开关，点行进操作表（复制下载链接 / 重命名 / 移除）。
+- `FilesTab.svelte`：文件页多一段「本机」。列表与桌面端 `LocalTab` 共用 `shares.svelte.ts` / `add_share` / `toggle_broadcast` / `rename_share` / `remove_share`；行上的开关就是广播开关；**点目录行展开/收起（文件行用系统应用打开），长按行才进操作表**（共享项根 / 树内条目两档，见 §51）。
 - `SharePathSheet.svelte`：真实路径选择器。未授权时只显示说明与「去授权」；从系统页回来由 `visibilitychange` 重读权限，不假装知道结果。目录行点进去，文件行点一下直接登记；底部「共享此文件夹」用于当前目录（空目录也能登记）。
 - `ShareActionsSheet.svelte` / `RenameShareSheet.svelte`：复制链接只对开着广播的项做；重命名只改显示名；移除只取消共享、不删手机上的文件（确认框里写明）。
 
@@ -4642,7 +4642,7 @@ F2 把"记录里那个名字"播进了设备行的名字格，于是暴露出一
 
 ### 入口
 
-设备页的对端文件**双击打开**（右键也有「打开」；「下载到本地」仍在右键菜单里）；目录双击展开，右键「打开」进资源管理器 / Finder。**正在下载的那一行双击仍是暂停/继续**（行标题会写）：下载和打开是两条独立链路，同时跑会抢同一份数据。返回本地真实路径后由前端 `open_path` 交给系统默认程序；成功提示写「已打开（本地副本）。保存后会自动写回；右键可立即重试或强制覆盖。」
+设备页的对端文件**双击打开**（右键也有「打开」；「下载到本地」仍在右键菜单里）；目录双击展开，右键「打开」进资源管理器 / Finder。**正在下载的那一行双击仍是暂停/继续**（行标题会写）：下载和打开是两条独立链路，同时跑会抢同一份数据。返回本地真实路径后由前端 `open_path` 交给系统默认程序；成功提示写「已打开（本地副本）。保存后会自动写回；冲突时可右键强制覆盖。」
 
 ### 一个远端项 = 一个稳定本地路径
 
@@ -4667,7 +4667,7 @@ dirty_remote = 最近探测到的远端 rev != 本地副本基于的 rev
 
 - 本地变化：`mirror::auto` 每 1s 只 stat 登记表里的少量文件；CFAPI 水合不会改 size/mtime，所以不会自己触发自己。
 - 远端变化：长连接 `ShareChanged` → `auto::note_share_changed(share_id)`；下一拍只对该共享项下的工作副本做一次 `/stat`。另保留 60s 兜底探测（老对端/长连接抖动）。
-- 冲突：发一次 `writeback://auto` 的 `conflict` 提示并停下；右键「强制写回」= 用户明确用本地覆盖（`force`，接收端跳过条件提交）；右键「用远端覆盖（本地另存）」= 先把本地修改另存成 `名字 (本地冲突 时间).扩展名`，再强制刷新同一路径。赢回本地干净后自动恢复跟踪。
+- 冲突：发一次 `writeback://auto` 的 `conflict` 提示并停下；右键「强制写回」= 用户明确用本地覆盖（`force`，接收端跳过条件提交）；要保留对端版本就用「下载到本地」另取一份（菜单里不再单列「用远端覆盖」）。赢回本地干净后自动恢复跟踪。
 - 失败：网络/对端暂时不可用 → `failed` 提示（同一条错误不反复弹）+ 5s→10s→…→5min 退避；副本/路径/文件名不可用 → `blocked`。刷新失败单独用 `refresh-failed`，同样退避。
 
 ### 登记与持久化
@@ -4686,7 +4686,7 @@ dirty_remote = 最近探测到的远端 rev != 本地副本基于的 rev
 - 写回前先 `/stat` 一次做**提前提示**；真正的闸门在接收端：上传邀请的 `dest` 带 `baseRev` 与 `expectPath`，接收端在 `finalize()` 原子改名之前重新算目标 `rev`，不一致/目标已删除/变成目录或链接 → 以 `写回冲突` 开头失败，**绝不改名**。旧发送端/旧接收端不再考虑兼容（这些改动未对外）。
 - 上传前把本地副本复制成 `<数据目录>/writeback/staging/<uuid>/<name>` 的稳定快照，真正传的是快照；成功后本地基线取**发起上传时原文件**的 size/mtime_ms，传输期间又改过的副本仍算未写回。
 - 接收端仍走 §48 的分块并发 + 断点续传 + 每块 SHA-256 + `.orbdrop-part` 原子改名；写回只是多一个前置条件。
-- 单文件共享项（`path == ""`）不写回：上传面只能写进共享项目录，写不到共享根那个文件。远端文件名含冒号、Windows 保留设备名、结尾点/空格等接收侧落不了盘的名字也明确拒绝；前导点（`.env` / `.gitignore`）按原名保留。
+- 单文件共享项根（`path == ""`）也写回：上传目标用 `dest.path == ""` 表示“共享根那个文件本身”，接收端把目标钉在 `share.path`（canonical）上整份原子替换，清单只允许一项；`baseRev`/`expectPath` 仍然绑定到这一项，删除/改名/变成目录都会按写回冲突拒绝。远端文件名含冒号、Windows 保留设备名、结尾点/空格等接收侧落不了盘的名字仍明确拒绝；前导点（`.env` / `.gitignore`）按原名保留。
 
 ### 对端更新
 
@@ -4700,10 +4700,10 @@ dirty_remote = 最近探测到的远端 rev != 本地副本基于的 rev
 
 - 自动同步只在本进程运行期间轮询；保存后至少给 2s 稳定窗口。Windows 正常退出会把未写回副本导出到 pending 后删镜像树；异常被杀时镜像树与登记会留下，下次启动先接上 provider 再 sweep/prune，登记仍能续传。占位符本身已损坏的那部分只能依赖编辑器缓冲。
 - 写回传的是**整份稳定快照**，不是块级 diff：Windows 占位符里还没水合的区间会先从对端拉回来再传回去。改一个小地方也要付一次完整文件的上传时间。
-- 自动检测看本地副本的 size/mtime_ms；编辑器若保存了同样大小且刻意保留时间戳的内容，可能识别不到，右键「写回对端」可立即补上。
+- 自动检测看本地副本的 size/mtime_ms；编辑器若保存了同样大小且刻意保留时间戳的内容，可能识别不到，右键「强制写回」可立即补上。
 - 写回要求对端已配对、共享项开着广播、且有长连接；对端版本过旧/不在线/磁盘写失败都会在通知卡上报原话，自动任务按退避重试。
 - 移动端目前没有「打开 / 写回」的界面入口：Android 后端路径已就绪（`open_peer_file` + `work/` + 进度 + 写回核心/自动任务），移动端浏览页还没接按钮。
-- 校验：`cargo check --lib` 通过；`cargo test --lib` 618 通过 + 1 既有 ignored（写回登记/稳定路径/冲突后缀/条件提交/自动门控/WS 失效/更新记录单测均通过）；`cargo test --test mirror_hydrate` 通过（含“远端更新后同一 file index 原地刷新、内容更新”断言）、`--test peer_metadata`、`--test p1_integration upload_lands_in_the_peer_share_not_the_download_dir` 通过（含上传归属与本机修改归属断言）；`npm run check` 0 errors / 1 既有 warning，`npm run check:i18n` 通过。真机 UI 的右键与系统默认程序打开未在手边设备上复核；macOS 分支本机没有 Apple SDK，未交叉编译。
+- 校验：`cargo check --lib` 通过；`cargo test --lib` 627 通过 + 2 ignored（其中 1 条是手动 E2E `single_file_share_writeback_end_to_end`；写回登记/稳定路径/冲突后缀/条件提交/自动门控/WS 失效/更新记录单测均通过；单文件共享项根的登记/命名、`resolve_upload_target` 用例通过）；手动 E2E（`--ignored --test-threads=1`）走真实 `perform_writeback`：A 打开 B 的单文件共享根 → 写回 → B 的文件被整份替换、历史 actor 是 A。`cargo test --test mirror_hydrate` 通过（含“远端更新后同一 file index 原地刷新、内容更新”断言）、`--test peer_metadata`、`--test p1_integration upload_lands_in_the_peer_share_not_the_download_dir` 通过（含上传归属与本机修改归属断言）、`--test p1_integration upload_replaces_a_single_file_share_root_and_honors_base_rev` 通过（整份替换共享根文件、旧 `baseRev` 冲突不改文件）；`npm run check` 0 errors / 1 既有 warning，`npm run check:i18n` 通过。真机 UI 的右键与系统默认程序打开未在手边设备上复核；macOS 分支本机没有 Apple SDK，未交叉编译。
 
 ## 50. 共享项更新记录（2026-11-11）
 
@@ -4738,3 +4738,46 @@ dirty_remote = 最近探测到的远端 rev != 本地副本基于的 rev
 - `share::history` 单测：本机/归属、精确归属消费、目录只取最新、落盘回读、临时文件过滤、`mine`。
 - `server::routes_history` 单测：长连接对端可见、`mine` 相对调用方。
 - `tests/p1_integration::upload_lands_in_the_peer_share_not_the_download_dir`：上传后记录 actor 为发送方；本机直接改共享文件后记录 actor 为本机。
+
+## 51. 安卓本机共享目录：点展开、长按菜单（2026-11-11）
+
+### 手势
+
+- **短按**：目录行展开 / 收起，文件行交给系统应用打开（`open_path`，`.apk` 落到安装器）。共享项根与树里每一层同一套。
+- **长按 500ms**：打开操作表。共享项根仍走 `ShareActionsSheet`（复制下载链接 / 重命名 / 移除共享项）；树里的文件或文件夹走新的 `ShareEntryActionsSheet`（打开（仅文件）/ 复制下载链接 / 复制路径 / 删除这一份）。指针挪动超过 8px 视为滑列表并撤销长按；长按后的那次 click 用 `consumed()` 吃掉，避免菜单一开目录又换一次状态。
+- 行内不再有「⋯」：宽度留给名字与路径；广播开关仍是行尾那颗独立按钮，按压它不会触发长按。
+
+### 实现
+
+- `mobile/longPress.ts`：与设备行同一套参数（500ms / 8px）的共用长按对象；`mobile/shareTree.ts` 负责共享项内相对路径 → 绝对路径的换算，目录列举走 Tauri 命令 `local_tree`（**不走页面 fetch**：安卓 release WebView 的 `usesCleartextTraffic=false` 会拦下 `http://127.0.0.1`，以前表现为 `Failed to fetch`）。后端 `local_tree` 与 `/tree` 共用 `server::routes_tree::list_entries`，`/tree` 仍留给桌面端与对端。
+- `mobile/components/LocalTreeNode.svelte`：递归树节点，首次展开调用 `local_tree`（共享项 id + 相对路径），之后按 `refreshSignal` 重拉已加载层；缩进按 `12 + 27 + depth * 20`（27 = 共享项根那行展开箭头 16 + 间距 11）。
+- `FilesTab.svelte`：本机段维护 `{expanded, entries, loaded, loading, error}`；树内删除后派 `od:local-tree-changed`，根层与已展开节点各自刷新。
+- `ShareEntryActionsSheet.svelte`：跨 `await` 的 props 在动作开始时抄成快照 —— 确认框会把这张表换掉（同一时刻只有一张底板），确认后再读父级 `sheet.path` 会撞上 null。共享项根是文件时，`ShareActionsSheet` 也补了同一项「打开」。
+- **打开共享文件**：`open_path` 的 Android 侧不能只走 `AppFiles.requireOwned`（那只认应用私有目录）。新增 `AppFiles.requireOpenable`：私有文件照旧，另在「所有文件访问」已授予时允许共享存储卷里的真实文件；卷的判断抽到 `SharedStorage`，与 `ShareStoragePlugin` 共用，避免“选择器能列出、打开却说不许”。`.apk` 仍由 `FileOpenPlugin` 按 `application/vnd.android.package-archive` 交给系统安装器。
+
+### 校验
+
+- `npm run check`：180 文件 0 errors / 1 既有 warning（`RemarkDeviceSheet`）；`npm run check:i18n`、`check:compat`（`legacy:gen` 后）、`build:mobile` 通过。
+- 真 Chromium（dev 与 `dist-mobile` 各一遍，393×852，假 IPC 的 `local_tree` 桩）：点目录行展开、再点收起；点文件行发出 `open_path`（根文件与嵌套文件各一次，路径为共享根 + 相对路径）；长按根行弹出共享项操作表；长按嵌套目录弹出「复制下载链接 / 复制路径 / 删除本机文件夹」，长按后的 click 没有改变展开状态；「复制路径」发出 `copy_text`（`/storage/emulated/0/DCIM/相册`）；确认删除后发出 `delete_share_entry`，根层与已展开的 `相册` 各调一次 `local_tree` 重拉，面板收起并提示「已删除「相册」」。控制台无新增错误。
+- Rust：`cargo check --lib` 通过（`local_tree` 与 `/tree` 共用 `list_entries`，后者原有行为不变）。
+- Kotlin：`./gradlew :app:compileUniversalDebugKotlin` 通过；`AppFiles.requireOpenable` 私有文件/共享存储两档、`SharedStorage` 与选择器共用同一份卷判断。
+- 打开：真 Chromium（假 IPC）里点共享的根文件与树内 `.apk` 均发出 `open_path`（路径分别为 `/storage/emulated/0/Download/demo.apk` 与 `/storage/emulated/0/DCIM/inner.apk`）；共享项长按菜单里能点「打开」。真机上的系统安装器/其它应用接手未复测（本机无设备）。
+
+## 52. 安卓文件页：收件与传输合并（2026-11-11）
+
+### 界面
+
+- 页签从「收件 / 传输 / 本机 / 浏览」改为「收件 / 本机 / 浏览」，`FilesSeg` 去掉 `transfer`。
+- 收件页顺序：**待接收 → 进行中 → 已接收文件**。进行中沿用原「传输」那张 `.trow`：推送的发送/接收进度、浏览页的下载进度都在这里，方向仍由每行副行写明（发送至 / 接收自 / 下载自）。
+- 进行中分组只在有行时画（`transferCount > 0`），没有就整段消失，不再留一个永远空的「传输」页；没有进行中的行时也没有空态文案。
+- 「收件」角标 = 已接收 + 待接收 + 进行中：原来「传输」那颗角标并进收件，避免合并后看不见正在传的条数。
+
+### 取舍
+
+- 进行中的行仍不提供「取消」：取消整批要 `batchId`，这条 UI 路上拿不到（与合并前一致，只显示 store 写好的状态文案）。
+- 不把进度塞进「已接收文件」的行内：收件列表只含已落盘的文件，进行中的文件还没有 `path` 可对；同一页用单独分组表达进度，语义更准确，也不会出现“已接收行还有一个 42%”这种自相矛盾。
+
+### 校验
+
+- `npm run check` 0 errors / 1 既有 warning（`RemarkDeviceSheet`）；`npm run check:i18n` 通过（删掉两条因合并而不再使用的英文词条）。
+- 真 Chromium（dev，393×852，假 IPC）：`chat_snapshot` 带一条 `sending: true, pct: 42` 的文件消息时，收件页出现「进行中 1 个」、进度条 42%、「发送至 客厅台式机」「传输中 42%」，下面照常列「已接收文件」；页签只有三个，「收件」角标 = 1 条已接收 + 1 条进行中 = 2。换成没有进行中行的快照后，「进行中」整段不画，收件空态正常显示。

@@ -95,6 +95,17 @@ pub enum UploadConflict {
     Rename,
 }
 
+/// 一次上传实际落到哪里。
+///
+/// - `Dir`：普通共享项目录（`dest.path` 是共享项内的目录）；
+/// - `RootFile`：**单文件共享项**的根（`dest.path == ""` 且共享根本身是文件）。
+///   写入目标就是 `share.path` 本身；多文件清单、子路径一律拒绝。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UploadTarget {
+    Dir(PathBuf),
+    RootFile(PathBuf),
+}
+
 /// 找到共享项并返回它（上传面只认**开着广播**的共享项）。
 ///
 /// 长连接由调用方保证：`/push/upload/invite` 在受理前已经验过 `ws.has_connection(caller)`
@@ -116,25 +127,32 @@ fn upload_share(state: &AppState, dest: &UploadDest) -> Result<crate::config::Sh
     share.ok_or_else(|| "共享项不存在或已关闭广播".to_string())
 }
 
-/// 把 `dest.path` 解析成共享项内的真实目录（**不创建**，写入方自己建）。
+/// 把 `dest.path` 解析成共享项内的真实上传目标。
 ///
-/// 逐段校验与 `/dav` 的 `resolve_within` 同一套口径：段里不许 `..`/`:`/结尾点或空格/
-/// 保留设备名；目标允许尚不存在，但对**最近已存在祖先**做 canonicalize，确认它仍在共享根内
-/// （防共享项里的符号链接把写入带出磁盘边界）。
-pub fn resolve_upload_dir(state: &AppState, dest: &UploadDest) -> Result<PathBuf, String> {
+/// - `dest.path` 归一后为空、且共享根本身是**文件**：`RootFile(share.path canonical)`。
+///   **不创建任何目录** —— 目标就是那个文件，父目录必须已存在。
+/// - 其余：按目录解析（见 [`resolve_upload_dir`]）。
+pub fn resolve_upload_target(
+    state: &AppState,
+    dest: &UploadDest,
+) -> Result<UploadTarget, String> {
     let share = upload_share(state, dest)?;
     let root = share
         .path
         .canonicalize()
         .map_err(|e| format!("共享项目录不可用: {e}"))?;
-    if !root.is_dir() {
-        return Err("共享项不是一个目录".into());
-    }
     if !crate::server::safe_relative_share_path(&dest.path) {
         return Err("上传目录不合法".into());
     }
+    let rel = crate::server::normalized_share_path(&dest.path);
+    if rel.is_empty() && root.is_file() {
+        return Ok(UploadTarget::RootFile(root));
+    }
+    if !root.is_dir() {
+        return Err("共享项不是一个目录".into());
+    }
     let mut dir = root.clone();
-    for part in dest.path.replace('\\', "/").split('/') {
+    for part in rel.split('/') {
         if part.is_empty() || part == "." {
             continue;
         }
@@ -160,7 +178,22 @@ pub fn resolve_upload_dir(state: &AppState, dest: &UploadDest) -> Result<PathBuf
     if dir.exists() && !dir.is_dir() {
         return Err("上传目标不是目录".into());
     }
-    Ok(dir)
+    Ok(UploadTarget::Dir(dir))
+}
+
+/// 把 `dest.path` 解析成共享项内的真实目录（**不创建**，写入方自己建）。
+///
+/// 逐段校验与 `/dav` 的 `resolve_within` 同一套口径：段里不许 `..`/`:`/结尾点或空格/
+/// 保留设备名；目标允许尚不存在，但对**最近已存在祖先**做 canonicalize，确认它仍在共享根内
+/// （防共享项里的符号链接把写入带出磁盘边界）。
+///
+/// 单文件共享项的根不是目录：它走 [`resolve_upload_target`] 的 `RootFile`，
+/// 这里明确拒绝。
+pub fn resolve_upload_dir(state: &AppState, dest: &UploadDest) -> Result<PathBuf, String> {
+    match resolve_upload_target(state, dest)? {
+        UploadTarget::Dir(dir) => Ok(dir),
+        UploadTarget::RootFile(_) => Err("共享项不是一个目录".into()),
+    }
 }
 
 /// 在 `base` 下面逐段建出 `target` 的父目录，**不跟随符号链接**。
@@ -189,18 +222,28 @@ pub fn create_dirs_within(base: &Path, target: &Path) -> Result<(), String> {
 /// 邀请到达时的轻量校验：共享项存在、开着广播、目标路径合法。返回共享项显示名。
 pub fn validate_upload_dest(state: &AppState, dest: &UploadDest) -> Result<String, String> {
     let share = upload_share(state, dest)?;
-    resolve_upload_dir(state, dest)?;
+    resolve_upload_target(state, dest)?;
     Ok(share.name)
 }
 
 /// 逐段建出上传目录，**不跟随符号链接**（共享项是用户的真实磁盘，别让一次上传沿着
 /// 已有链接写到共享项外面）。返回最终目录。
 ///
-/// 与 `resolve_upload_dir` 的分工：那个只校验（邀请到达时用），这个在同意接收/重启续传时
+/// 与 `resolve_upload_target` 的分工：那个只校验（邀请到达时用），这个在同意接收/重启续传时
 /// 真正建目录。每段都用 `symlink_metadata` 判"这是不是一个真目录"——链接（含 junction）
 /// 一律拒绝，而不是 `create_dir_all` 跟过去。
+///
+/// 单文件共享项根（`RootFile`）没有目录要建：返回文件的父目录，父目录必须已经存在。
 pub fn ensure_upload_dir(state: &AppState, dest: &UploadDest) -> Result<PathBuf, String> {
-    let dir = resolve_upload_dir(state, dest)?;
+    let dir = match resolve_upload_target(state, dest)? {
+        UploadTarget::RootFile(file) => {
+            return file
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| "上传目标没有父目录".to_string());
+        }
+        UploadTarget::Dir(dir) => dir,
+    };
     let share = upload_share(state, dest)?;
     let root = share
         .path
@@ -1535,9 +1578,25 @@ pub fn accept_invite(
 
     if let Some(dest) = invite.dest.clone() {
         // 共享项目录：逐段校验 + 建目录（不跟随链接），建完 `resolve_upload_conflicts` 才有东西可查。
+        // 单文件共享项根不是目录：目标就是那个文件本身，只允许一个清单项，不做改名/跳过。
+        let target = resolve_upload_target(&state, &dest)?;
         let dir = ensure_upload_dir(&state, &dest)?;
         let policy = conflict.unwrap_or_default();
-        resolve_upload_conflicts(&mut invite, &dir, policy)?;
+        match target {
+            UploadTarget::RootFile(_) => {
+                if !invite.is_dir {
+                    invite.files = invite.manifest();
+                    invite.is_dir = true;
+                }
+                if invite.files.len() != 1 {
+                    return Err("单文件共享项只能写回一个文件".into());
+                }
+                invite.resolved.clear();
+                invite.skipped_files = 0;
+                invite.skipped_bytes = 0;
+            }
+            UploadTarget::Dir(_) => resolve_upload_conflicts(&mut invite, &dir, policy)?,
+        }
         invite.conflict = policy;
         invite.root = None;
         // 写回的条件提交必须绑定到清单里**唯一**一项；否则一份邀请可以拿别人的
@@ -2057,6 +2116,36 @@ mod tests {
         // 同名文件挡在路径上：不能把它当成目录继续建。
         std::fs::write(dir.join("share").join("blocked"), b"x").unwrap();
         assert!(ensure_upload_dir(&state, &upload_dest("blocked")).is_err());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 共享根本身是一个文件时，`dest.path == ""` 表示“覆盖这个文件本身”，不是“写进
+    /// 一个名为空串的目录”；子路径仍然拒绝。
+    #[test]
+    fn upload_target_can_be_a_single_file_share_root() {
+        let (state, dir) = upload_state("upload_root_file");
+        let share = dir.join("share");
+        std::fs::remove_dir_all(&share).unwrap();
+        std::fs::write(&share, b"old").unwrap();
+        let dest = upload_dest("");
+        let canonical = share.canonicalize().unwrap();
+
+        assert_eq!(
+            resolve_upload_target(&state, &dest).unwrap(),
+            UploadTarget::RootFile(canonical.clone())
+        );
+        assert!(resolve_upload_dir(&state, &dest).is_err(), "文件根不是目录");
+        assert_eq!(
+            ensure_upload_dir(&state, &dest).unwrap(),
+            canonical.parent().unwrap().to_path_buf(),
+            "文件根没有目录要建，只返回父目录"
+        );
+        assert_eq!(validate_upload_dest(&state, &dest).unwrap(), "共享项");
+
+        let mut sub = dest;
+        sub.path = "sub".into();
+        assert!(resolve_upload_target(&state, &sub).is_err());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -3,14 +3,17 @@
   import Icon from "../Icon.svelte";
   import FileTile from "../components/FileTile.svelte";
   import DownloadRing from "../components/DownloadRing.svelte";
+  import LocalTreeNode from "../components/LocalTreeNode.svelte";
   import * as store from "../store.svelte";
   import * as chat from "$lib/stores/chat.svelte";
   import * as devices from "$lib/stores/devices.svelte";
   import * as sharesStore from "$lib/stores/shares.svelte";
   import { fileIcon } from "../util";
+  import { createLongPress } from "../longPress";
+  import { fetchLocalTree, openLocalShareEntry } from "../shareTree";
   import { t } from "$lib/i18n.svelte";
   import type { BrowseDownload, FilesSeg } from "../store.svelte";
-  import type { InboxEntry, PeerShareItem, ShareItem } from "$lib/types";
+  import type { InboxEntry, PeerShareItem, ShareItem, TreeEntry } from "$lib/types";
 
   const seg = $derived(store.currentSeg());
   const inbox = $derived(store.getInbox());
@@ -29,15 +32,13 @@
 
   const SEGS: { id: FilesSeg; label: string }[] = [
     { id: "inbox", label: "收件" },
-    { id: "transfer", label: "传输" },
     { id: "local", label: "本机" },
     { id: "browse", label: "浏览" },
   ];
 
-  /** 段角标：收件把「待接收」一起数（它们也是没处理完的文件）；本机数共享项；浏览恒 0。 */
+  /** 段角标：收件把「待接收」与进行中的传输一起数（它们都是没处理完的文件）；本机数共享项；浏览恒 0。 */
   function segCount(id: FilesSeg): number {
-    if (id === "inbox") return inbox.length + invites.length;
-    if (id === "transfer") return transferCount;
+    if (id === "inbox") return inbox.length + invites.length + transferCount;
     if (id === "local") return localShares.length;
     return 0;
   }
@@ -55,7 +56,19 @@
       if (document.visibilityState === "visible") void store.refreshShareAccess();
     };
     document.addEventListener("visibilitychange", onVisible);
-    return () => document.removeEventListener("visibilitychange", onVisible);
+    // 树里删掉一项后本机就地刷新，不等 watcher 的防抖与 `/shares` 的重新拉取
+    // （与桌面端 `od:entry-deleted` 那条同一个思路，只是手机上名字叫 `od:local-tree-changed`）。
+    const onTreeChanged = (e: Event) => {
+      const d = (e as CustomEvent).detail as { shareId?: string } | undefined;
+      if (!d?.shareId) return;
+      treeRefresh += 1;
+      void reloadLocalRoot(d.shareId);
+    };
+    document.addEventListener("od:local-tree-changed", onTreeChanged);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      document.removeEventListener("od:local-tree-changed", onTreeChanged);
+    };
   });
 
   function addLocalShare(): void {
@@ -77,6 +90,118 @@
       store.toast(enabled ? t("已开启广播") : t("已停止广播该共享项"), enabled ? "share" : "lock");
     } catch (e) {
       store.failed(t("切换广播"), e);
+    }
+  }
+
+  // ── 本机共享项：点一下展开目录 / 长按打开菜单 ─────────────────────────────────
+  //
+  // 桌面端是本机页右键菜单 + 双击展开（`LocalTab` / `TreeNode`）；手机没有右键，所以按
+  // 文件管理器的手感来：**短按 = 主操作**（目录展开、文件打开），**长按 = 菜单**
+  // （共享项根 = 原来的 `ShareActionsSheet`，树里的项 = `ShareEntryActionsSheet`）。
+  // 行内不再放「⋯」：省下来的宽度留给名字与路径。
+  interface LocalTreeState {
+    expanded: boolean;
+    entries: TreeEntry[];
+    loaded: boolean;
+    loading: boolean;
+    error: string | null;
+  }
+  let localTrees = $state<Record<string, LocalTreeState>>({});
+  // 尚未展开过的共享项用这个只读占位：模板里只读状态，建条目必须发生在事件处理里，
+  // 否则等于在渲染期写 `$state`（Svelte 5 抛 state_unsafe_mutation，整块列表渲染中断）。
+  const EMPTY_LOCAL_TREE: LocalTreeState = Object.freeze({
+    expanded: false,
+    entries: [],
+    loaded: false,
+    loading: false,
+    error: null,
+  });
+  /** 删除树里的一项后递增：已加载的节点各自重拉那一层（与桌面 `refreshSignal` 同一套）。 */
+  let treeRefresh = $state(0);
+
+  function localTree(shareId: string): LocalTreeState {
+    return localTrees[shareId] ?? EMPTY_LOCAL_TREE;
+  }
+
+  function ensureLocalTree(shareId: string): LocalTreeState {
+    let st = localTrees[shareId];
+    if (!st) {
+      localTrees = {
+        ...localTrees,
+        [shareId]: { expanded: false, entries: [], loaded: false, loading: false, error: null },
+      };
+      // 必须从 `$state` 里**重新读**：上面交给它的是普通对象，模板要通知的是代理那一份。
+      st = localTrees[shareId];
+    }
+    return st;
+  }
+
+  /** 展开 / 收起共享项根这一层；第一次展开时拉 `/tree`（失败也保持展开，把原话露出来）。 */
+  async function toggleLocalTree(s: ShareItem): Promise<void> {
+    if (!s.isDir) return;
+    const st = ensureLocalTree(s.id);
+    st.expanded = !st.expanded;
+    if (!st.expanded || st.loaded || st.loading) return;
+    st.loading = true;
+    st.error = null;
+    try {
+      st.entries = await fetchLocalTree(s.id, "");
+      st.loaded = true;
+    } catch (e) {
+      st.error = e instanceof Error ? e.message : String(e);
+    } finally {
+      st.loading = false;
+    }
+  }
+
+  /** 删除后重拉共享项根那一层（展开状态与已加载标记保持不变）。 */
+  async function reloadLocalRoot(shareId: string): Promise<void> {
+    const st = localTrees[shareId];
+    if (!st?.loaded) return;
+    try {
+      st.entries = await fetchLocalTree(shareId, "");
+      st.error = null;
+    } catch (e) {
+      st.error = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  let pressingShare = $state<string | null>(null);
+  /** 这一次按住的共享项：长按回调触发时用它开对应的菜单。 */
+  let pressedShare: ShareItem | null = null;
+
+  const sharePress = createLongPress(() => {
+    pressingShare = null;
+    const s = pressedShare;
+    if (s) store.openSheet({ kind: "shareActions", shareId: s.id });
+  });
+
+  function startSharePress(e: PointerEvent, s: ShareItem): void {
+    pressingShare = s.id;
+    pressedShare = s;
+    sharePress.start(e);
+  }
+
+  function endSharePress(): void {
+    pressingShare = null;
+    sharePress.end();
+  }
+
+  /** 短按共享项根：目录展开 / 收起，文件用系统应用打开。 */
+  function activateLocalShare(s: ShareItem): void {
+    if (sharePress.consumed()) return;
+    if (s.isDir) {
+      void toggleLocalTree(s);
+      return;
+    }
+    void openLocalFile(s);
+  }
+
+  async function openLocalFile(s: ShareItem): Promise<void> {
+    try {
+      await openLocalShareEntry(s, "");
+    } catch (e) {
+      store.failed(t("打开"), e);
     }
   }
 
@@ -186,8 +311,8 @@
 
   /** 嵌套行的缩进：原型 `flattenNodes` 是按深度算的（12 + depth * 20），长度同样走 `--u`
       缩放 —— 别写死 px，宽视口上整列都放大了，只有缩进不跟，层级看着会挤平。 */
-  function indent(depth: number): string {
-    return `padding-left:calc(${12 + depth * 20} * var(--u))`;
+  function indent(depth: number, base = 0): string {
+    return `padding-left:calc(${12 + base + depth * 20} * var(--u))`;
   }
 </script>
 
@@ -245,49 +370,12 @@
       </div>
     {/if}
 
-    <div class="sec">
-      <div class="sec-label"><span>{t("已接收文件")}</span><span class="num">{t("{n} 个", { n: inbox.length })}</span></div>
-      <div class="card list">
-        {#if inboxState.error}
-          <!-- 原型这一档没有异步（列表是 mock）；真数据在后端失败时要如实露出原话，不吞。 -->
-          <div class="empty">
-            <Icon name="x" />
-            <p>{t("读取收件目录失败")}</p>
-            <p class="es">{inboxState.error}</p>
-          </div>
-        {:else if inboxState.loading && !inbox.length}
-          <div class="empty"><Icon name="inbox" /><p>{t("正在读取收件目录…")}</p></div>
-        {:else if !inbox.length}
-          <div class="empty">
-            <Icon name="inbox" />
-            <p>{t("还没有收到的文件")}</p>
-            <p class="es">{t("收到推送并同意后，文件会落到收件目录并出现在这里。")}</p>
-          </div>
-        {:else}
-          {#each inbox as f (f.path)}
-            <button
-              class="frow"
-              type="button"
-              onclick={() => store.openSheet({ kind: "fileActions", entry: f })}
-            >
-              <FileTile name={f.name} isDir={f.isDir} />
-              <span class="fmain">
-                <span class="fname2">{f.name}</span>
-                <span class="fmeta">{inboxMeta(f)}</span>
-              </span>
-              <span class="fgo" aria-hidden="true"><Icon name="more" cls="ic-fill" /></span>
-            </button>
-          {/each}
-        {/if}
-      </div>
-    </div>
-  </div>
-{:else if seg === "transfer"}
-  <div class="body">
-    <div class="sec">
-      <div class="sec-label"><span>{t("进行中")}</span><span class="num">{t("{n} 个", { n: transferCount })}</span></div>
-      <div class="card list">
-        {#if transferCount}
+    <!-- 进行中的传输并进「收件」：同一页里就能看到进度，不用再切一个页签。传输方向仍由
+         每行的副行写明（发送至 / 接收自 / 下载自），空的时候整段不画。 -->
+    {#if transferCount}
+      <div class="sec">
+        <div class="sec-label"><span>{t("进行中")}</span><span class="num">{t("{n} 个", { n: transferCount })}</span></div>
+        <div class="card list">
           {#each transfers as item (item.id)}
             <div class="trow">
               <div class="t-top">
@@ -330,17 +418,46 @@
               </div>
             </div>
           {/each}
-        {:else}
+        </div>
+      </div>
+    {/if}
+
+    <div class="sec">
+      <div class="sec-label"><span>{t("已接收文件")}</span><span class="num">{t("{n} 个", { n: inbox.length })}</span></div>
+      <div class="card list">
+        {#if inboxState.error}
+          <!-- 原型这一档没有异步（列表是 mock）；真数据在后端失败时要如实露出原话，不吞。 -->
           <div class="empty">
-            <Icon name="files" />
-            <p>{t("当前没有进行中的传输")}</p>
-            <p class="es">{t("推送或下载文件时会在这里显示进度。")}</p>
+            <Icon name="x" />
+            <p>{t("读取收件目录失败")}</p>
+            <p class="es">{inboxState.error}</p>
           </div>
+        {:else if inboxState.loading && !inbox.length}
+          <div class="empty"><Icon name="inbox" /><p>{t("正在读取收件目录…")}</p></div>
+        {:else if !inbox.length}
+          <div class="empty">
+            <Icon name="inbox" />
+            <p>{t("还没有收到的文件")}</p>
+            <p class="es">{t("收到推送并同意后，文件会落到收件目录并出现在这里。")}</p>
+          </div>
+        {:else}
+          {#each inbox as f (f.path)}
+            <button
+              class="frow"
+              type="button"
+              onclick={() => store.openSheet({ kind: "fileActions", entry: f })}
+            >
+              <FileTile name={f.name} isDir={f.isDir} />
+              <span class="fmain">
+                <span class="fname2">{f.name}</span>
+                <span class="fmeta">{inboxMeta(f)}</span>
+              </span>
+              <span class="fgo" aria-hidden="true"><Icon name="more" cls="ic-fill" /></span>
+            </button>
+          {/each}
         {/if}
       </div>
     </div>
-    <!-- 原型的「最近完成」分组不画：`activeTransfers()` / `activeBrowseDownloads()` 都只给
-         还在动的行，做完的那些这里列不出来。 -->
   </div>
 {:else if seg === "local"}
   <div class="body">
@@ -413,29 +530,63 @@
           </div>
         {:else}
           {#each localShares as s (s.id)}
-            <div class="lrow">
-              <button
-                class="lmain"
-                type="button"
-                onclick={() => store.openSheet({ kind: "shareActions", shareId: s.id })}
-              >
-                <FileTile name={s.name} isDir={s.isDir} />
-                <span class="fmain">
-                  <span class="fname2">{s.name}</span>
-                  <span class="fmeta">
-                    {shareAccess && !shareAccess.granted ? t("权限未授予") : shareMeta(s)}
+            {@const st = localTree(s.id)}
+            <div class="litem">
+              <div class="lrow" class:is-pressing={pressingShare === s.id}>
+                <button
+                  class="lmain"
+                  type="button"
+                  aria-expanded={s.isDir ? st.expanded : undefined}
+                  oncontextmenu={(e) => e.preventDefault()}
+                  onpointerdown={(e) => startSharePress(e, s)}
+                  onpointermove={(e) => sharePress.move(e)}
+                  onpointerup={endSharePress}
+                  onpointercancel={endSharePress}
+                  onpointerleave={endSharePress}
+                  onclick={() => activateLocalShare(s)}
+                >
+                  <span class="chev" class:open={st.expanded} aria-hidden="true">
+                    {#if s.isDir}<Icon name="chev" />{/if}
                   </span>
-                  <span class="lpath" title={s.path}>{s.path}</span>
-                </span>
-              </button>
-              <label class="switch" aria-label={t("广播")}>
-                <input
-                  type="checkbox"
-                  checked={s.broadcastEnabled}
-                  onchange={(e) => void setBroadcast(s, e.currentTarget.checked)}
-                />
-                <span class="track"></span>
-              </label>
+                  <FileTile name={s.name} isDir={s.isDir} />
+                  <span class="fmain">
+                    <span class="fname2">{s.name}</span>
+                    <span class="fmeta">
+                      {shareAccess && !shareAccess.granted ? t("权限未授予") : shareMeta(s)}
+                    </span>
+                    <span class="lpath" title={s.path}>{s.path}</span>
+                  </span>
+                </button>
+                <label class="switch" aria-label={t("广播")}>
+                  <input
+                    type="checkbox"
+                    checked={s.broadcastEnabled}
+                    onchange={(e) => void setBroadcast(s, e.currentTarget.checked)}
+                  />
+                  <span class="track"></span>
+                </label>
+              </div>
+              {#if s.isDir && st.expanded}
+                <div class="ltree">
+                  {#if st.loading}
+                    <div class="node" style={indent(1, 27)}>
+                      <span class="fname2" style="color:var(--muted)">{t("加载中…")}</span>
+                    </div>
+                  {:else if st.error}
+                    <div class="node" style={indent(1, 27)}>
+                      <span class="fname2" style="color:var(--warn)">{st.error}</span>
+                    </div>
+                  {:else if st.entries.length === 0}
+                    <div class="node" style={indent(1, 27)}>
+                      <span class="fname2" style="color:var(--muted)">{t("空目录")}</span>
+                    </div>
+                  {:else}
+                    {#each st.entries as entry (entry.name)}
+                      <LocalTreeNode shareId={s.id} {entry} level={1} refreshSignal={treeRefresh} />
+                    {/each}
+                  {/if}
+                </div>
+              {/if}
             </div>
           {/each}
         {/if}

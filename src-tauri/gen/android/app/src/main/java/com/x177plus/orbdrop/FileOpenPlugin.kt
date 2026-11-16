@@ -27,6 +27,9 @@ import java.io.File
  * 所以这里自己走一遍：`FileProvider` 的 `content://`（根见 `res/xml/file_paths.xml`）+ 按扩展名
  * 给的 MIME + `FLAG_GRANT_READ_URI_PERMISSION`（不授这个读权限，接收方读不了，安装器会当场失败）。
  *
+ * **两档文件**：收件 / 聊天附件在应用私有目录；本机共享项在共享存储的真实路径。二者都从
+ * 这里打开 —— 共享存储那一档由 `AppFiles.requireOpenable` 在「所有文件访问」已授予时放行。
+ *
  * **`.apk` 那一档就是"点一下安装"**：`application/vnd.android.package-archive` 正是系统安装器
  * （PackageInstaller）认领的那个 MIME，`ACTION_VIEW` 一到就进安装界面 —— 这是侧载的标准姿势，
  * 不需要（也不该）自己去开 `PackageInstaller` 会话。清单里声明 `REQUEST_INSTALL_PACKAGES` 是为了
@@ -56,8 +59,9 @@ class FileOpenPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   private fun intentFor(path: String): Intent {
-    // 「只能是应用自己的文件」这道闸与「保存到手机」共用一份实现，见 `AppFiles`。
-    val file = AppFiles.requireOwned(activity, path, R.string.file_open_not_owned)
+    // 收件 / 聊天附件在应用私有目录；本机共享项在用户自己的共享存储里（`/storage/...`）。
+    // 两档都放行，闸门的具体判据见 `AppFiles.requireOpenable`。
+    val file = AppFiles.requireOpenable(activity, path)
     if (!file.exists()) throw IllegalArgumentException(activity.getString(R.string.file_open_missing, path))
     // 文件夹这一档没有出路：收件落在应用私有目录里，`content://` 也换不来一个"能浏览它"的应用
     // （FileProvider 给不出目录枚举）。与其丢一个系统解析不出的 Intent 让用户看到

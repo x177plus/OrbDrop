@@ -12,9 +12,8 @@
     <string name="notif_channel_messages_desc">"Notifies you when a device sends you a message. Turning this off does not affect OrbDrop staying online in the background."</string>
 
     <!-- User-facing errors surfaced from the Android plugins (invoke.reject / thrown exceptions). -->
-    <string name="file_open_not_owned">"Only files owned by this app can be opened: %1$s"</string>
     <string name="file_open_missing">"The file is gone: %1$s"</string>
-    <string name="file_open_is_directory">"This is a folder: no app on Android can open a directory inside private app storage"</string>
+    <string name="file_open_is_directory">"This is a folder: Android has no generic app to open a directory"</string>
 
     <!-- “Save to phone” (ExportFilePlugin): copies one inbox file into the system gallery / Downloads. -->
     <string name="export_not_owned">"Only files owned by this app can be saved: %1$s"</string>

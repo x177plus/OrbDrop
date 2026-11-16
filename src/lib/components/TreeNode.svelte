@@ -74,7 +74,15 @@
   }
 
   function fileDblClick(e: MouseEvent) {
-    if (!peerId) return; // 本机项没有"打开远端"这回事
+    if (!peerId) {
+      // 本机共享项里的文件：直接交给系统默认程序（与对端的「打开」同一手势）。
+      e.preventDefault();
+      e.stopPropagation();
+      document.dispatchEvent(new CustomEvent('od:open-local', {
+        detail: { shareId, path: ownPath, name: entry.name, isDir: false },
+      }));
+      return;
+    }
     if (download && (download.status === 'running' || download.status === 'paused')) {
       void toggleDownload(e);
       return;
@@ -202,7 +210,7 @@
       ? t('已暂停 · 双击继续「{name}」', { name: entry.name })
       : download?.status === 'running'
         ? t('双击暂停「{name}」', { name: entry.name })
-        : peerId ? t('双击打开「{name}」', { name: entry.name }) : undefined}
+        : t('双击打开「{name}」', { name: entry.name })}
     ondblclick={fileDblClick}
     oncontextmenu={openCtx}
     use:dragOut={{ source: dragSource, onMessage: notify }}

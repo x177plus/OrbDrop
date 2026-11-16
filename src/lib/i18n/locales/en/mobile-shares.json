@@ -29,5 +29,8 @@
   "广播": "Broadcasting",
   "只显示前 {n} 项，进入子目录继续查看。": "Showing the first {n} items; open a subfolder to see the rest.",
   "已有共享项在重新授权前暂时读不到。": "Existing shares can't be read until access is granted again.",
-  "权限未授予": "Access not granted"
+  "权限未授予": "Access not granted",
+  "共享内容操作": "Shared content actions",
+  "复制手机上的完整路径。": "Copy the full path on this device.",
+  "从手机磁盘上删除这一项，无法恢复。": "Delete this item from your phone's disk. This can't be undone."
 }

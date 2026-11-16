@@ -5851,3 +5851,152 @@ async fn upload_lands_in_the_peer_share_not_the_download_dir() {
     let _ = std::fs::remove_dir_all(&share_root);
     let _ = std::fs::remove_dir_all(&save_dir);
 }
+
+/// 单文件共享项根也能整份写回：`dest.path == ""` 时接收端把落点钉在共享根文件本身，
+/// 不是拼一个同名子文件；条件提交仍然生效（旧 baseRev 拒绝，文件不变）。
+#[tokio::test]
+async fn upload_replaces_a_single_file_share_root_and_honors_base_rev() {
+    const TOKEN: &str = "b1c2d3e4f5a60718293a4b5c6d7e8f91";
+    let share_parent =
+        std::env::temp_dir().join(format!("orbdrop_it_sfshare_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&share_parent).unwrap();
+    let share_file = share_parent.join("single.txt");
+    std::fs::write(&share_file, b"old content").unwrap();
+    let src = std::env::temp_dir().join(format!("orbdrop_it_sfsrc_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&src).unwrap();
+    let src_file = src.join("single.txt");
+    std::fs::write(&src_file, b"first writeback").unwrap();
+    let save_dir =
+        std::env::temp_dir().join(format!("orbdrop_it_sfsave_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&save_dir).unwrap();
+
+    let (port_a, port_b) = two_free_ports();
+    let state_a = make_state(port_a, "device-sfa", "PC-SFA", save_dir.clone());
+    let state_b = make_state(port_b, "device-sfb", "PC-SFB", save_dir.clone());
+    let port_a = orbdrop_lib::server::start_server_loopback(state_a.clone(), port_a)
+        .await
+        .expect("A server");
+    let port_b = orbdrop_lib::server::start_server_loopback(state_b.clone(), port_b)
+        .await
+        .expect("B server");
+
+    credential::set_peer("device-sfb", TOKEN).unwrap();
+    credential::set_peer("device-sfa", TOKEN).unwrap();
+    state_a.add_peer_book(PeerDevice {
+        id: "device-sfb".into(),
+        name: "PC-SFB".into(),
+        ip: "127.0.0.1".into(),
+        port: port_b,
+        online: true,
+        paired: true,
+        auto_connect: false,
+        paused: false,
+        relay: None,
+    });
+    state_b.add_peer_book(PeerDevice {
+        id: "device-sfa".into(),
+        name: "PC-SFA".into(),
+        ip: "127.0.0.1".into(),
+        port: port_a,
+        online: true,
+        paired: true,
+        auto_connect: false,
+        paused: false,
+        relay: None,
+    });
+
+    let mut share = ShareItem::new(share_file.clone());
+    share.broadcast_enabled = true;
+    let share_id = share.id.clone();
+    state_b.config.lock().shares.push(share);
+    orbdrop_lib::share::watcher::watch_share(&state_b, &share_id, share_file.clone());
+
+    orbdrop_lib::ws::ensure_link_now(&state_a, "device-sfb");
+    wait_until("WS 长连接建立", || {
+        state_a.ws.has_connection("device-sfb") && state_b.ws.has_connection("device-sfa")
+    })
+    .await;
+
+    let dest = orbdrop_lib::transfer::UploadDest {
+        share_id: share_id.clone(),
+        path: String::new(),
+        share_name: "single.txt".into(),
+        silent: false,
+        base_rev: None,
+        expect_path: None,
+    };
+    let view = orbdrop_lib::transfer::upload_to_share(
+        state_a.clone(),
+        "device-sfb".into(),
+        dest,
+        vec![src_file.to_string_lossy().to_string()],
+        None,
+    )
+    .await
+    .expect("单文件共享项上传要发得出去");
+    let invite_id = view.targets[0].invite_id.clone();
+    wait_until("发送方收到单文件根上传完成回执", || {
+        state_a.push.jobs.lock().get(&invite_id).is_none()
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(&share_file).unwrap(),
+        b"first writeback",
+        "落点必须是共享根文件本身"
+    );
+    assert_eq!(
+        std::fs::read_dir(&share_parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy() != "single.txt")
+            .count(),
+        0,
+        "不能在共享根旁边多出子文件/目录"
+    );
+
+    wait_until("单文件根写入更新记录", || {
+        state_b
+            .history
+            .query_file(&share_id, "", 10)
+            .iter()
+            .any(|entry| entry.actor_id == "device-sfa" && entry.source == "upload")
+    })
+    .await;
+
+    // 用旧版本再写一次：接收端在原子改名之前按 `写回冲突` 拒绝，文件一个字节都不动。
+    let stale = orbdrop_lib::transfer::UploadDest {
+        share_id: share_id.clone(),
+        path: String::new(),
+        share_name: "single.txt".into(),
+        silent: false,
+        base_rev: Some("stale-rev".into()),
+        expect_path: Some("single.txt".into()),
+    };
+    let view = orbdrop_lib::transfer::upload_to_share(
+        state_a.clone(),
+        "device-sfb".into(),
+        stale,
+        vec![src_file.to_string_lossy().to_string()],
+        None,
+    )
+    .await
+    .expect("条件写回邀请要发得出去");
+    let stale_invite = view.targets[0].invite_id.clone();
+    wait_until("旧 baseRev 的写回收尾", || {
+        state_a.push.jobs.lock().get(&stale_invite).is_none()
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(&share_file).unwrap(),
+        b"first writeback",
+        "条件提交失败时共享根文件必须保持上一版"
+    );
+
+    orbdrop_lib::server::stop_server(&state_a).await;
+    orbdrop_lib::server::stop_server(&state_b).await;
+    credential::remove_peer("device-sfa").ok();
+    credential::remove_peer("device-sfb").ok();
+    let _ = std::fs::remove_dir_all(&share_parent);
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&save_dir);
+}

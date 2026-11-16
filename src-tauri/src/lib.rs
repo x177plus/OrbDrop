@@ -364,6 +364,114 @@ fn remove_share(share_id: String, state: State<'_, Arc<AppState>>) -> Result<(),
     Ok(())
 }
 
+/// 删除本机共享项里的一个**文件或目录**（本机页右键「删除文件 / 删除文件夹」）。
+///
+/// 文件与目录都删（目录递归）；共享项根一律拒绝 —— 根是用户整项共享的落点，
+/// 误点一次会丢掉整棵树，根级操作仍只由「移除共享项」负责。
+/// 路径先归一化再校验，绝对路径/UNC/盘符/`..` 由 [`crate::server::safe_relative_share_path`]
+/// 挡在 `join` 之前；落盘动作放阻塞线程池（掉线的映射盘/慢盘不能把界面卡住）。
+/// 删除成功后**立即记一条 `deleted`**：watcher 300ms 后也会记一条，同一路径同一 actor
+/// 在合并窗口内会并成一条，不会出现两条删除记录。
+#[tauri::command]
+async fn delete_share_entry(
+    share_id: String,
+    path_in_share: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    if !crate::ids::is_segment(&share_id) {
+        return Err("共享项 id 不合法".to_string());
+    }
+    let rel = crate::server::normalized_share_path(&path_in_share);
+    if rel.is_empty() {
+        return Err("不能删除共享项根".to_string());
+    }
+    if !crate::server::safe_relative_share_path(&rel) {
+        return Err("路径不合法".to_string());
+    }
+    let (root, local_id, local_name) = {
+        let config = state.config.lock();
+        let share = config
+            .shares
+            .iter()
+            .find(|s| s.id == share_id)
+            .ok_or_else(|| format!("共享项不存在: {share_id}"))?;
+        (
+            share.path.clone(),
+            config.device_id.clone(),
+            config.device_name.clone(),
+        )
+    };
+
+    let state = state.inner().clone();
+    let sid = share_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = root
+            .canonicalize()
+            .map_err(|e| format!("共享项目录不可用：{e}"))?;
+        let target = root.join(&rel);
+        let canonical = target
+            .canonicalize()
+            .map_err(|_| "文件不存在或已被移动".to_string())?;
+        if !canonical.starts_with(&root) {
+            return Err("路径越界".to_string());
+        }
+        // 检查的是**这一条路径本身**而不是 canonicalize 之后的目标：符号链接要被当作
+        // 一个文件删掉（删链接，不删它指向的东西）；canonicalize 只用来做越界检查。
+        let meta = std::fs::symlink_metadata(&target)
+            .map_err(|e| format!("读取文件信息失败：{e}"))?;
+        let is_dir = meta.is_dir();
+        // 先摘掉这条路径的短时归属：watcher 可能在本线程删完文件的同时醒来，留着对端
+        // 上一次写入的归属就会把这次本机删除记成"对端删的"。
+        state.history.forget_attribution(&sid, &rel);
+        let removed = if is_dir {
+            std::fs::remove_dir_all(&target)
+        } else {
+            std::fs::remove_file(&target)
+        };
+        removed.map_err(|e| format!("删除失败：{e}"))?;
+        state
+            .history
+            .record_local(&sid, &rel, "deleted", None, is_dir, &local_id, &local_name);
+        info!(share = %sid, path = %rel, is_dir, "共享项条目已删除");
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("删除任务失败：{e}"))?
+}
+
+/// 读本机共享项里的一层目录（安卓「本机」页展开目录树用）。
+///
+/// **为什么不走 `/tree`**：安卓 release WebView 的 `usesCleartextTraffic=false`（见
+/// `gen/android/app/build.gradle.kts`），页面从 `https://tauri.localhost` 发往
+/// `http://127.0.0.1` 的 `fetch` 会被明文/混合内容策略拦下，前端只拿得到
+/// `TypeError: Failed to fetch`。本机文件本来就有 IPC 这条更直接的路，与 `peer_tree`
+/// 对称；`/tree` 仍留着给桌面端与对端。
+///
+/// 可见性不在这里判：本机 UI 对自己的共享项永远全量可见（`Caller::Local`）。
+#[tauri::command]
+async fn local_tree(
+    share_id: String,
+    path: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    if !crate::ids::is_segment(&share_id) {
+        return Err("共享项 id 不合法".to_string());
+    }
+    let share_root = {
+        let config = state.config.lock();
+        config
+            .shares
+            .iter()
+            .find(|s| s.id == share_id)
+            .map(|s| s.path.clone())
+            .ok_or_else(|| format!("共享项不存在：{share_id}"))?
+    };
+    let entries = crate::server::list_entries(&share_root, &path)
+        .await
+        .map_err(|(_, message)| message)?;
+    Ok(serde_json::json!({ "entries": entries }))
+}
+
 #[tauri::command]
 fn rename_share(
     share_id: String,
@@ -2597,6 +2705,72 @@ async fn peer_tree(
     Ok(body)
 }
 
+/// 删除对端共享项里的一个**文件或目录**（设备页右键「删除文件 / 删除文件夹」）。
+///
+/// 走对端的 `DELETE /entry`（带 token 的认证面）：对端接受文件与目录（目录递归删除），
+/// 共享项根会被它拒绝。对端在删除前登记归属，所以它自己的更新记录里这条 `deleted` 会写成
+/// "本机删除"，本机右键「更新记录」向它查询时就能看到。
+///
+/// 成功后把本地「打开过的工作副本」登记摘掉：远端文件已经不在了，自动写回不该再拿一份
+/// 本地副本往那个路径上传（那会让删除突然"复活"）。本地副本文件本身不动 —— 用户可能还
+/// 开着它；要不要留由用户自己决定。
+#[tauri::command]
+async fn delete_peer_entry(
+    peer_id: String,
+    share_id: String,
+    path_in_share: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    if !crate::ids::is_segment(&peer_id) {
+        return Err("设备 id 不合法".to_string());
+    }
+    if !crate::ids::is_segment(&share_id) {
+        return Err("共享项 id 不合法".to_string());
+    }
+    let rel = crate::server::normalized_share_path(&path_in_share);
+    if rel.is_empty() {
+        return Err("不能删除共享项根".to_string());
+    }
+    if !crate::server::safe_relative_share_path(&rel) {
+        return Err("路径不合法".to_string());
+    }
+
+    let query = format!(
+        "/entry?share={}&path={}",
+        urlencode(&share_id),
+        urlencode(&rel)
+    );
+    let (url, token, ip) = peer_endpoint(state.inner(), &peer_id, &query)?;
+    let pin = state
+        .get_peer(&peer_id)
+        .map(|p| p.dial_pin())
+        .unwrap_or(net::DialPin::Tofu);
+    let response = net::dial_client(&ip, &pin)
+        .delete(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| peer_call_error(&e))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = net::read_text_capped(response, net::CONTROL_BODY_MAX)
+            .await
+            .unwrap_or_default();
+        return Err(format!(
+            "删除对端文件失败: HTTP {status}{}",
+            if body.trim().is_empty() {
+                String::new()
+            } else {
+                format!("（{}）", body.trim())
+            }
+        ));
+    }
+    state::remember_peer_fingerprint(state.inner(), &peer_id, &ip);
+    crate::mirror::writeback::forget_opened_under(&peer_id, &share_id, &rel);
+    info!(peer = %peer_id, share = %share_id, path = %rel, "对端共享项条目已删除");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Download commands (F-40 / F-44)
 // ---------------------------------------------------------------------------
@@ -2922,13 +3096,7 @@ pub(crate) async fn refresh_opened_copy(
         &opened.path,
     )
     .ok_or_else(|| WritebackFailure::busy("这个文件正在写回，刷新稍后再试"))?;
-    let name = opened
-        .path
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or(opened.path.as_str())
-        .to_string();
+    let name = crate::mirror::writeback::display_name(opened);
     let placed = open_work_copy_for(
         &state,
         &app,
@@ -3002,7 +3170,7 @@ async fn open_peer_file(
         {
             if crate::mirror::writeback::local_changed(&opened) {
                 return Err(
-                    "本地副本还有未写回的修改；自动写回完成前不能重新打开；如需立即写回请右键「写回对端」"
+                    "本地副本还有未写回的修改；自动写回完成前不能重新打开；如需立即写回请右键「强制写回」"
                         .to_string(),
                 );
             }
@@ -3026,6 +3194,63 @@ async fn open_peer_file(
         crate::mirror::writeback::record_opened(&peer_id, &share_id, &path_in_share, &placed);
     }
     Ok(placed.path.to_string_lossy().into_owned())
+}
+
+/// 返回对端一项在本机工作副本**所在的文件夹**（右键「打开所在文件夹」）。
+///
+/// 已经打开/登记过的文件直接用登记里的本地路径，不因"有未写回修改"拒绝 —— 我们只是
+/// 打开目录；没有登记时才走一次 `open_work_copy_for`（Windows 是 CFAPI 占位符，几乎零成本；
+/// macOS/Android 会暂存整份，与「打开」同一代价）。这条命令**不登记为已打开**，不参与
+/// 自动写回，也不改变已有的写回基线。
+#[tauri::command]
+async fn open_peer_folder(
+    peer_id: String,
+    share_id: String,
+    path_in_share: String,
+    name: Option<String>,
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> Result<String, String> {
+    if !crate::ids::is_segment(&peer_id) {
+        return Err("设备 id 不合法".to_string());
+    }
+    if !crate::ids::is_segment(&share_id) {
+        return Err("共享项 id 不合法".to_string());
+    }
+    if !crate::server::safe_relative_share_path(&path_in_share) {
+        return Err("路径不合法".to_string());
+    }
+    if let Some(opened) =
+        crate::mirror::writeback::find_opened(&peer_id, &share_id, &path_in_share)
+    {
+        if let Some(parent) = opened.local.parent() {
+            return Ok(parent.to_string_lossy().into_owned());
+        }
+    }
+    let raw_name = Path::new(&path_in_share)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+        .or(name)
+        .unwrap_or_else(|| "打开".into());
+    let file_name = safe_download_name(&raw_name)?;
+    let placed = open_work_copy_for(
+        &state,
+        &app,
+        &peer_id,
+        &share_id,
+        &path_in_share,
+        &file_name,
+        false,
+        false,
+        false,
+    )
+    .await?;
+    let parent = placed
+        .path
+        .parent()
+        .ok_or_else(|| "无法定位本地副本所在的文件夹".to_string())?;
+    Ok(parent.to_string_lossy().into_owned())
 }
 
 /// 非 Windows/macOS 的「打开」：把一项流式落成**稳定工作副本**
@@ -3229,6 +3454,25 @@ impl WritebackFailure {
     }
 }
 
+/// 写回目标：普通项按远端相对路径拆父目录 + 原名；单文件共享项根（`path == ""`）
+/// 没有父目录，上传目标就是共享根文件本身，名字取本地工作副本的文件名。
+fn writeback_target(
+    remote_path: &str,
+    opened: &crate::mirror::writeback::OpenedCopy,
+) -> Result<(String, String), WritebackFailure> {
+    if remote_path.is_empty() {
+        let name = opened
+            .local
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| WritebackFailure::gone("本地工作副本没有文件名"))?;
+        Ok((String::new(), name))
+    } else {
+        crate::mirror::writeback::remote_target(remote_path).map_err(WritebackFailure::gone)
+    }
+}
+
 /// 把「打开」得到的本地副本写回对端原来的那一项（**覆盖原文件**）。
 ///
 /// 自动轮询与右键菜单共用这一条：
@@ -3243,8 +3487,9 @@ impl WritebackFailure {
 ///    时那一份本地快照"写回登记：这样重复编辑可以继续写，而写回期间又被改过的本地副本
 ///    仍会被识别为"有未写回修改"，不会在重新打开时被静默覆盖。
 ///
-/// 单文件共享项（`path == ""`）不走这条路：上传面只能写进共享项目录，写不到共享根那个
-/// 文件本身；前端也不给这一项画菜单。
+/// 单文件共享项（`path == ""`）也走这条路：上传目标用 `dest.path == ""` 表示“共享根
+/// 就是那个文件”，接收端整份原子替换；清单名取本地工作副本的文件名，条件提交仍然绑定
+/// 到这一项。
 pub(crate) async fn perform_writeback(
     state: Arc<AppState>,
     peer_id: String,
@@ -3268,17 +3513,14 @@ pub(crate) async fn perform_writeback(
         .replace('\\', "/")
         .trim_matches('/')
         .to_string();
-    if remote_path.is_empty() {
-        return Err(WritebackFailure::gone("单文件共享项暂不支持写回"));
-    }
-    let (parent, name) = crate::mirror::writeback::remote_target(&remote_path)
-        .map_err(WritebackFailure::gone)?;
     let opened = crate::mirror::writeback::find_opened(&peer_id, &share_id, &remote_path)
         .ok_or_else(|| {
             WritebackFailure::gone(
                 "这个文件还没有通过「打开」建立本地副本（或副本已被回收）；请重新打开后再写回",
             )
         })?;
+    let (parent, name) = writeback_target(&remote_path, &opened)?;
+    let share_name = share_name.unwrap_or_else(|| name.clone());
     // 同项只跑一条：两条上传同时写同一个远端文件，最后谁赢看运气。
     let _flight = crate::mirror::writeback::begin_writeback(&peer_id, &share_id, &remote_path)
         .ok_or_else(|| WritebackFailure::busy("这个文件正在写回，请等这一条结束"))?;
@@ -3293,6 +3535,13 @@ pub(crate) async fn perform_writeback(
     match &pre {
         Ok(Some(meta)) if meta.is_dir => {
             return Err(WritebackFailure::conflict("对端这一项是目录，不能写回"));
+        }
+        // 单文件共享项根问不到（`/stat` 404）：文件已被删除或改名。旧对端没有 `/stat`
+        // 也会走到这里，但它同样没有上传路由；按冲突停下，别让自动任务无限重试。
+        Ok(None) if remote_path.is_empty() && !force => {
+            return Err(WritebackFailure::conflict(
+                "对端共享根文件已被删除或改名；本次没有写回",
+            ));
         }
         Ok(Some(meta)) if !force => {
             let same = match (opened.rev.as_deref(), meta.rev.as_deref()) {
@@ -3350,7 +3599,7 @@ pub(crate) async fn perform_writeback(
     let dest = transfer::UploadDest {
         share_id: share_id.clone(),
         path: parent,
-        share_name: share_name.unwrap_or_default(),
+        share_name,
         silent,
         base_rev,
         expect_path,
@@ -3456,7 +3705,7 @@ pub(crate) async fn perform_writeback(
     Ok(())
 }
 
-/// 手动写回命令（右键「写回对端」/「强制写回」）。核心见 [`perform_writeback`]。
+/// 手动写回命令（右键「强制写回」）。核心见 [`perform_writeback`]。
 #[tauri::command]
 async fn writeback_peer_file(
     peer_id: String,
@@ -3477,84 +3726,6 @@ async fn writeback_peer_file(
     )
     .await
     .map_err(|failure| failure.message)
-}
-
-/// 把本地副本另存成 `名字 (本地冲突 时间).扩展名`，返回落点。
-fn save_conflict_copy(opened: &crate::mirror::writeback::OpenedCopy) -> Result<PathBuf, String> {
-    let local = &opened.local;
-    let parent = local
-        .parent()
-        .ok_or_else(|| "本地副本没有父目录".to_string())?;
-    let name = local
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .ok_or_else(|| "本地副本没有文件名".to_string())?;
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => {
-            (stem.to_string(), format!(".{ext}"))
-        }
-        _ => (name, String::new()),
-    };
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let candidate = format!("{stem} (本地冲突 {stamp}){ext}");
-    let dest = crate::config::unique_path(&parent.to_path_buf(), &candidate);
-    crate::mirror::writeback::copy_plain(local, &dest)
-        .map_err(|e| format!("另存本地冲突副本失败: {e}"))?;
-    Ok(dest)
-}
-
-/// 冲突处理：
-/// - `use_local = true`：用本地副本强制覆盖对端（等价于右键「强制写回」）。
-/// - `use_local = false`：先把本地内容另存为冲突副本（有修改时），再刷新成远端版本。
-///   返回另存的本地冲突副本路径（没有本地修改时为空串）。
-#[tauri::command]
-async fn resolve_writeback_conflict(
-    peer_id: String,
-    share_id: String,
-    path_in_share: String,
-    use_local: Option<bool>,
-    state: State<'_, Arc<AppState>>,
-    app: AppHandle,
-) -> Result<String, String> {
-    if use_local.unwrap_or(false) {
-        perform_writeback(
-            state.inner().clone(),
-            peer_id,
-            share_id,
-            path_in_share,
-            None,
-            true,
-            false,
-        )
-        .await
-        .map_err(|failure| failure.message)?;
-        return Ok(String::new());
-    }
-
-    let opened = crate::mirror::writeback::find_opened(&peer_id, &share_id, &path_in_share)
-        .ok_or_else(|| "这一项没有打开副本登记".to_string())?;
-    if crate::mirror::is_open(&opened.local) {
-        return Err("这个文件正在使用；请先在编辑器里关闭，再用远端覆盖".into());
-    }
-    if crate::unsendable::is_equal_or_under(
-        &opened.local,
-        &crate::mirror::writeback::pending_root(),
-    ) {
-        return Err("这是上次退出前抢救出来的待写回副本；请先强制写回或重新打开".into());
-    }
-    let saved = if crate::mirror::writeback::local_changed(&opened) {
-        Some(save_conflict_copy(&opened)?)
-    } else {
-        None
-    };
-    let opened = crate::mirror::writeback::find_opened(&peer_id, &share_id, &path_in_share)
-        .ok_or_else(|| "这一项没有打开副本登记".to_string())?;
-    refresh_opened_copy(state.inner().clone(), app, &opened, true)
-        .await
-        .map_err(|failure| failure.message)?;
-    Ok(saved
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_default())
 }
 
 /// 读取共享项的更新记录。
@@ -4772,6 +4943,8 @@ pub fn run() {
             add_share,
             list_shares,
             remove_share,
+            delete_share_entry,
+            local_tree,
             rename_share,
             toggle_broadcast,
             get_settings,
@@ -4809,6 +4982,7 @@ pub fn run() {
             get_peer_token,
             peer_shares,
             peer_tree,
+            delete_peer_entry,
             connect_peer,
             disconnect_peer,
             accept_link_request,
@@ -4859,8 +5033,8 @@ pub fn run() {
             group_clear_history,
             download_from_peer,
             open_peer_file,
+            open_peer_folder,
             writeback_peer_file,
-            resolve_writeback_conflict,
             share_update_history,
             set_browse_download_paused,
             download_file,
@@ -5134,6 +5308,36 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    /// 单文件共享项根没有父目录：写回目标的名字必须取工作副本文件名，不能是空串。
+    #[test]
+    fn writeback_target_uses_the_copy_name_for_a_single_file_share_root() {
+        let opened = crate::mirror::writeback::OpenedCopy {
+            peer_id: "peer".into(),
+            share_id: "share".into(),
+            path: String::new(),
+            local: std::path::PathBuf::from("mirror/work/report.pdf"),
+            rev: Some("7-18f".into()),
+            size: Some(7),
+            mtime_ms: None,
+            local_size: Some(7),
+            local_mtime_ms: None,
+            dirty: false,
+        };
+        assert_eq!(
+            writeback_target("", &opened).unwrap(),
+            (String::new(), "report.pdf".to_string())
+        );
+
+        let opened = crate::mirror::writeback::OpenedCopy {
+            path: "dir/a.txt".into(),
+            ..opened
+        };
+        assert_eq!(
+            writeback_target("dir/a.txt", &opened).unwrap(),
+            ("dir".to_string(), "a.txt".to_string())
+        );
+    }
+
     /// 同一台机器既跑 OrbDrop 又开着 LocalSend：两条发现结果只能剩 OrbDrop 一行。
     ///
     /// 两条协议的监听端口本来就不一样（LocalSend 53317 / OrbDrop 主端口），所以单靠
@@ -5349,6 +5553,180 @@ mod tests {
         assert!(json["size"].is_null(), "目录的大小是 null，不是 0");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 单文件共享项根的完整写回：A 打开 B 的共享根文件（手工登记工作副本）→
+    /// `perform_writeback` → B 的共享文件被整份替换 → 历史 actor 是 A。
+    ///
+    /// 这条用例会改 `ORBDROP_DATA_DIR`（写回登记/历史/凭据都在里面），所以**默认 ignore**，
+    /// 只允许单独跑：
+    /// `cargo test --lib single_file_share_writeback_end_to_end -- --ignored --test-threads=1`
+    #[ignore = "manual e2e: sets ORBDROP_DATA_DIR; run alone with --ignored --test-threads=1"]
+    #[tokio::test]
+    async fn single_file_share_writeback_end_to_end() {
+        fn free_port() -> u16 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+            listener.local_addr().expect("local_addr").port()
+        }
+
+        crate::net::install_crypto_provider();
+        let data_dir = std::env::temp_dir().join(format!(
+            "orbdrop_sf_writeback_data_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        // 写回登记、历史、凭据、chat-vault 都走 data_dir；这条用例单独跑，结束时还原。
+        std::env::set_var("ORBDROP_DATA_DIR", &data_dir);
+
+        let root = std::env::temp_dir().join(format!(
+            "orbdrop_sf_writeback_root_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let share_dir = root.join("share");
+        std::fs::create_dir_all(&share_dir).unwrap();
+        let share_file = share_dir.join("report.txt");
+        std::fs::write(&share_file, b"old content").unwrap();
+        let save_dir = root.join("save");
+        std::fs::create_dir_all(&save_dir).unwrap();
+        let (port_a, port_b) = (free_port(), free_port());
+        let mut cfg_a = crate::config::test_config();
+        cfg_a.download_dir = save_dir.clone();
+        let mut cfg_b = crate::config::test_config();
+        cfg_b.download_dir = save_dir.clone();
+        let state_a = Arc::new(AppState::new(cfg_a, root.join("a.toml")));
+        let state_b = Arc::new(AppState::new(cfg_b, root.join("b.toml")));
+        let port_a = crate::server::start_server_loopback(state_a.clone(), port_a)
+            .await
+            .expect("A server");
+        let port_b = crate::server::start_server_loopback(state_b.clone(), port_b)
+            .await
+            .expect("B server");
+
+        let a_id = state_a.config.lock().device_id.clone();
+        let b_id = state_b.config.lock().device_id.clone();
+        const TOKEN: &str = "f0e1d2c3b4a5968778695a4b3c2d1e0f";
+        crate::credential::set_peer(&b_id, TOKEN).unwrap();
+        crate::credential::set_peer(&a_id, TOKEN).unwrap();
+        for (state, peer_id, peer_name, port) in [
+            (state_a.clone(), b_id.clone(), "PC-SF-B", port_b),
+            (state_b.clone(), a_id.clone(), "PC-SF-A", port_a),
+        ] {
+            state.add_peer_book(PeerDevice {
+                id: peer_id,
+                name: peer_name.into(),
+                ip: "127.0.0.1".into(),
+                port,
+                online: true,
+                paired: true,
+                auto_connect: false,
+                paused: false,
+                relay: None,
+            });
+        }
+
+        let mut share = ShareItem::new(share_file.clone());
+        share.broadcast_enabled = true;
+        let share_id = share.id.clone();
+        state_b.config.lock().shares.push(share);
+        crate::share::watcher::watch_share(&state_b, &share_id, share_file.clone());
+
+        crate::ws::ensure_link_now(&state_a, &b_id);
+        assert!(
+            wait_until_async(|| {
+                let (a, b) = (state_a.clone(), state_b.clone());
+                let (a_id, b_id) = (a_id.clone(), b_id.clone());
+                async move {
+                    a.ws.has_connection(&b_id) && b.ws.has_connection(&a_id)
+                }
+            })
+            .await,
+            "长连接没建立"
+        );
+
+        // 模拟 open_peer_file：工作副本 + 登记（真实打开链路里的同一份账）。
+        let meta = std::fs::metadata(&share_file).unwrap();
+        let work = crate::mirror::root()
+            .join(&b_id)
+            .join(&share_id)
+            .join("work")
+            .join("report.txt");
+        std::fs::create_dir_all(work.parent().unwrap()).unwrap();
+        std::fs::write(&work, b"edited on A").unwrap();
+        let mtime_ms = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        crate::mirror::writeback::record_opened(
+            &b_id,
+            &share_id,
+            "",
+            &crate::mirror::PlacedItem {
+                path: work.clone(),
+                size: Some(meta.len()),
+                mtime: Some(mtime_ms / 1000),
+                mtime_ms: Some(mtime_ms),
+                rev: Some(crate::server::rev_for_metadata(&meta)),
+                is_dir: false,
+            },
+        );
+
+        crate::perform_writeback(
+            state_a.clone(),
+            b_id.clone(),
+            share_id.clone(),
+            String::new(),
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect("单文件共享项写回");
+
+        assert_eq!(
+            std::fs::read(&share_file).unwrap(),
+            b"edited on A",
+            "共享根文件必须被整份替换"
+        );
+        assert_eq!(
+            std::fs::read_dir(&share_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .count(),
+            1,
+            "共享根旁边不能多出子文件/目录"
+        );
+        wait_until_async(|| {
+            let state = state_b.clone();
+            let share_id = share_id.clone();
+            let a_id = a_id.clone();
+            async move {
+                state
+                    .history
+                    .query_file(&share_id, "", 10)
+                    .iter()
+                    .any(|entry| entry.actor_id == a_id && entry.source == "upload")
+            }
+        })
+        .await;
+        assert!(
+            state_b
+                .history
+                .query_file(&share_id, "", 10)
+                .iter()
+                .any(|entry| entry.actor_id == a_id && entry.source == "upload"),
+            "写回必须记到 A 名下"
+        );
+
+        crate::server::stop_server(&state_a).await;
+        crate::server::stop_server(&state_b).await;
+        crate::credential::remove_peer(&a_id).ok();
+        crate::credential::remove_peer(&b_id).ok();
+        std::env::remove_var("ORBDROP_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// 手动添加（F-11）：**留空端口**时要在端口段里找到真正答话的那一台，且**跳过本机自己**。

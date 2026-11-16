@@ -94,8 +94,12 @@ pub async fn push_invite_handler(
     headers: HeaderMap,
     Json(body): Json<InviteBody>,
 ) -> Result<Json<InviteResponse>, (StatusCode, String)> {
-    // 本机地址簿里这台是不是"已绑定"（已配对）。
-    let paired = state.is_paired(&body.sender.id);
+    // 本机地址簿里这台是不是"已绑定"（已配对）。**不看凭据库的单边记录**：地址簿没标
+    // paired 时发送方不会带 token，这里若按凭据库判成"已配对"就会要求一枚它不会带的
+    // token（401，邀请根本到不了）。凭据只用于"地址簿说是已配对"时的身份核验。
+    let paired = state
+        .get_peer(&body.sender.id)
+        .is_some_and(|p| p.paired);
     // 信任等级：已配对 + 长连接在线 = 直接收（与共享项写入同一级）；已配对但当前没连 =
     // 看「已配对设备自动接收」开关；未配对 = 永远同意。
     let auto_accept_paired = state.config.lock().auto_accept_paired;

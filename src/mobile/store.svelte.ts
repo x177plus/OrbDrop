@@ -31,8 +31,8 @@ export function setTab(next: string): void {
   tab = (TABS as string[]).includes(next) ? (next as TabId) : "convos";
 }
 
-/** 文件页的四段：收件 / 传输 / 本机共享 / 浏览对端。 */
-export type FilesSeg = "inbox" | "transfer" | "local" | "browse";
+/** 文件页的三段：收件（含进行中的传输）/ 本机共享 / 浏览对端。 */
+export type FilesSeg = "inbox" | "local" | "browse";
 
 let filesSeg = $state<FilesSeg>("inbox");
 
@@ -1053,6 +1053,7 @@ export type Sheet =
   /** 安卓作为共享方：选真实路径 / 管理本机共享项 / 改显示名。 */
   | { kind: "sharePath" }
   | { kind: "shareActions"; shareId: string }
+  | { kind: "shareEntryActions"; shareId: string; path: string; name: string; isDir: boolean; size: number }
   | { kind: "renameShare"; shareId: string }
   /** 只由 `confirmAction` 创建：直接 `openSheet` 一个 confirm 不会有人结算 Promise。 */
   | { kind: "confirm"; prompt: ConfirmPrompt };

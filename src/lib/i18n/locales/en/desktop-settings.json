@@ -112,7 +112,7 @@
   "与局域网里的 LocalSend 设备互相发现、收发消息与文件（UDP 53317）": "Discover and exchange messages and files with LocalSend devices on the LAN (UDP 53317)",
   "默认关闭。打开且本机在线时，会加入 UDP 53317 组播，与局域网里的 LocalSend 设备互相发现并收发消息/文件；本机离线时自动停止，关掉后不再监听。": "Off by default. When on and this device is online, it joins the UDP 53317 multicast group to discover and exchange messages and files with LocalSend devices on the LAN; it stops automatically while offline and stops listening once turned off.",
   "LocalSend 设备不配对、不进聊天群，只走一对一；文本和图片始终自动接收并显示在会话里，普通文件仍要你确认。": "LocalSend devices are never paired and never join chat groups — only one-to-one conversations. Text and images are always accepted automatically and shown in the conversation; ordinary files still need your confirmation.",
-  "开启后立即生效，不等「保存设置」。53317 被占用时先回落主端口，端口空出后自动接管；不会因此自动关闭。": "Takes effect immediately, without waiting for “Save settings”. If 53317 is taken, it falls back to the main port and takes 53317 back automatically once it is free; it will not turn itself off.",
+  "开启后立即生效。53317 被占用时先回落主端口，端口空出后自动接管；不会因此自动关闭。": "Takes effect immediately. If 53317 is taken, it falls back to the main port and takes 53317 back automatically once it is free; it will not turn itself off.",
   "已开启；本机离线时自动暂停，上线后恢复。": "On. Paused while this device is offline; it resumes when you go online.",
   "发现服务未启动：{error}。仍会从临时端口公告，端口空出后自动恢复。": "Discovery is not running: {error}. Announcements still go out from an ephemeral port and recovery is automatic once the port is free.",
   "运行中：已监听 53317。": "Running: listening on 53317.",
