@@ -298,13 +298,39 @@ WARN 把这次目录枚举判失败 {'why': '身份解不出来'}
 清洗会让同一个 id 在镜像目录、BC profile 的 BaseURL、对端 DAV 路径里变成三个不同字符串。
 合法值只有本机生成的 UUID（`Uuid::new_v4()`），对真实流量零影响。
 
+### 3.18 一次取数据回调：**交齐平台要的那一段，或者明确判失败** —— 不许"交一半就收工"
+
+平台对每个 `FETCH_DATA` 只做一件事：把 `[RequiredFileOffset, +RequiredLength)` 这段字节
+挂起，等 provider 用 `TRANSFER_DATA` 补齐。**部分交付不会让它"以后再要剩下那半"**：挂起的
+IO 就地等着，直到 60 秒超时；而任何一次别的有效操作还会重置**全部**挂起请求的计时器。
+也就是说，漏答一次 = 那个读可能永远不返回。
+
+实机症状（另一台机器上复现）：日志里 `开始水合` / `水合完成` 一对对不停地刷（那些是
+别的读在正常跑），但目标目录里**文件一直不出现**，资源管理器**未响应**，拖放循环不返回。
+
+两个能造成这个的洞，现在都堵上了：
+
+| 洞 | 旧行为 | 现在 |
+|---|---|---|
+| 对端短读（占位符报的大小 > 对端实际大小：远端被截断/换了内容） | `length < want` 一律当"到文件末尾"，交付那半截后返回**成功** | 只要还没盖住 `required_end` 就 `Stop::Failed`，`fail_range` 把整段判失败；日志写明 `offset`、`required_end`、占位符大小 |
+| `fail_range` 的 `length = 0`（空区间 / 0 字节文件） | `CfExecute` 只作废**与区间重叠**的挂起 IO，长度 0 = 什么也没作废 → 读同样挂着 | `fail_range` 把 0 长度补成对齐的一页；区间为空那一支也按一页判失败 |
+
+规矩（改 `transfer_range` / `fetch_data` 前先读这一条）：**任何一条提前返回都必须有回音** ——
+交付覆盖 `[required_start, required_end)`，或者 `STATUS_CLOUD_FILE_*` 判失败且区间与它重叠。
+新增的日志字段 `required_start` / `required_end` / `flags` 就是为对照这件事：
+`水合完成` 的 `bytes` 必须盖住 `required_end`。
+
+回归在 `tests/mirror_hydrate.rs` 的 4.75：背着占位符把对端文件截短 → 读必须**当场报错**
+（20 秒死线；旧实现会挂到 60 秒超时），随后 `place_with_meta(refresh=true)` 把大小改对，
+同一项还要能正常读出来。
+
 ## 4. 代码地图
 
 | 文件 | 职责 |
 |---|---|
 | `src/mirror/mod.rs` | 公开面：`place()`、`ensure_ready()`、`start_sweeper()`、`shutdown()`、`sweep()`、生命周期记账（open/idle/placed/identities，见 3.10/3.16） |
 | `src/mirror/identity.rs` | 身份 blob 编解码（≤4 KiB，版本化）+ 镜像路径映射（id 白名单、单段清洗、落点必须仍在镜像根下，见 3.17） |
-| `src/mirror/win.rs` | CFAPI：注册/连接/自愈、建占位符（同身份复用、同名等待重试、仅撞名或落点不是本机占位符时换名，见 3.16）、四个回调（水合/填充/撤销/开关句柄）、`CfExecute`；路径归一（3.15）与撤销只认领一条（3.14） |
+| `src/mirror/win.rs` | CFAPI：注册/连接/自愈、建占位符（同身份复用、同名等待重试、仅撞名或落点不是本机占位符时换名，见 3.16）、四个回调（水合/填充/撤销/开关句柄）、`CfExecute`；路径归一（3.15）、撤销只认领一条（3.14）、取数据必须交齐或判失败（3.18） |
 | `src/peer_fs.rs` | 对端 HTTP 助手（从 `drag.rs` 抽出来的共用面：`/tree`、`/stat`、`/file`） |
 | `src/drag.rs` | 对端项的准备（`prepare_peer_payload`）就是一句 `mirror::place`；OLE 拖放源只剩 `CF_HDROP` |
 | `tests/mirror_hydrate.rs` | 端到端：占位符 → 分段读 → 拉 → 字节一致 → **撤销之后重发同一段仍要能水合**（3.13）→ 目录按需填充 → 幂等 → 父链可列 → 拖放入口 → 不可共享 → 退出不留残骸 |
