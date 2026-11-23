@@ -36,7 +36,7 @@
 //! 本机演练（还没有远端仓库时）用环境变量 `ORBDROP_UPDATE_MANIFEST` 覆盖上面那份常量，
 //! 指向本机镜像台 —— 见 `scripts/dev-mirror.mjs`。
 //!
-//! **这两条地址连的是公网域名，靠的是 reqwest 内置的公共 CA 列表**（`Cargo.toml` 里的
+//! **这些地址连的都是公网域名，靠的是 reqwest 内置的公共 CA 列表**（`Cargo.toml` 里的
 //! `rustls-tls-webpki-roots-no-provider`）：到对端那一跳用指纹判身份、不需要信任库，而这里没有
 //! pinning 可用，只能走普通证书校验。所以那份 feature 一被改回"只装 provider、不带 roots"
 //! （`rustls-tls-no-provider` = manual-roots = 空信任库），这里每条 https 都会
