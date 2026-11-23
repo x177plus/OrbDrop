@@ -3242,6 +3242,15 @@ impl AppState {
             } else {
                 false
             };
+            // 备注也一样是**按设备 id 存**的用户数据：id 换了就该跟着搬，否则换 id 之后
+            // 用户起的名字原地消失（旧 id 那一格成了永远没人再用的孤儿）。新 id 已经有
+            // 备注时以新 id 那份为准 —— 那是重置之后用户重新起的，比旧的更接近本意。
+            let remark_changed = if let Some(remark) = config.device_remarks.remove(from) {
+                config.device_remarks.entry(to.id.clone()).or_insert(remark);
+                true
+            } else {
+                false
+            };
             let mut row_changed = false;
             if let Some(pos) = config.peers.iter().position(|p| p.id == from) {
                 let mut row = config.peers.remove(pos);
@@ -3255,7 +3264,7 @@ impl AppState {
                 config.peers.push(row);
                 row_changed = true;
             }
-            if row_changed || fp_changed {
+            if row_changed || fp_changed || remark_changed {
                 let _ = crate::config::save_config_at(&self.config_path, &config);
             }
         }
@@ -3306,7 +3315,26 @@ impl AppState {
     /// 已配对的行返回 `false`（调用方应先「解除配对」；否则清掉 token 之外的记录会让
     /// 对端还认着本机，而本机这里已经没有它 —— 那是最糟的半清状态）。凭据读不到时也不动，
     /// 宁可让用户重试，不拿一次瞬时 IO 故障去删用户数据。
+    ///
+    /// **只给用户明示的「忘记设备」用**：它连备注一起清是有意的（菜单里写明了"只清本机
+    /// 记录：设备行、地址、备注与观察指纹"）。自动清扫走 [`Self::prune_peer`] —— 行是
+    /// 观察值、备注是用户数据，两者不能一起丢。
     pub fn forget_peer(&self, peer_id: &str) -> bool {
+        self.forget_peer_inner(peer_id, true)
+    }
+
+    /// 自动清扫一台没有关系的行（探活连续失败、同地址重复行合并）：设备行与临时状态收走，
+    /// **用户备注留着**。
+    ///
+    /// 真机回归（2026-11-23）：一台未配对设备离线后，12 拍探活失败就把整行忘掉；旧实现
+    /// 复用 `forget_peer`，把 `deviceRemarks` 也删了 —— 用户设的备注在启动约一分钟后
+    /// 无声消失，而配置里别处的数据完好。备注按设备 id 独立存放（见 `Config::device_remarks`），
+    /// 不依赖"此刻有没有那一行"；设备下次被 mDNS 带回来时，备注要原样还在。
+    fn prune_peer(&self, peer_id: &str) -> bool {
+        self.forget_peer_inner(peer_id, false)
+    }
+
+    fn forget_peer_inner(&self, peer_id: &str, drop_remark: bool) -> bool {
         match crate::credential::get_peer_token(peer_id) {
             Ok(None) => {}
             Ok(Some(_)) => return false,
@@ -3325,7 +3353,9 @@ impl AppState {
         {
             let mut config = self.config.lock();
             config.known_peers.remove(peer_id);
-            config.device_remarks.remove(peer_id);
+            if drop_remark {
+                config.device_remarks.remove(peer_id);
+            }
             config.observed_fingerprints.remove(peer_id);
             config.peers.retain(|p| p.id != peer_id);
             let _ = crate::config::save_config_at(&self.config_path, &config);
@@ -3371,7 +3401,7 @@ impl AppState {
         }
         let mut removed = 0;
         for id in doomed {
-            if self.forget_peer(&id) {
+            if self.prune_peer(&id) {
                 removed += 1;
             }
         }
@@ -3412,7 +3442,7 @@ impl AppState {
             debug!(%peer_id, count, "连续探活失败已达上限：已配对行保留地址");
         } else {
             info!(%peer_id, count, "连续探活失败：忘掉未配对设备行");
-            self.forget_peer(peer_id);
+            self.prune_peer(peer_id);
         }
     }
 
@@ -6975,21 +7005,84 @@ mod tests {
             row("stale-a", "10.0.0.9", 3890, false),
             row("stale-b", "10.0.0.9", 3890, false),
         ]);
+        state
+            .config
+            .lock()
+            .device_remarks
+            .insert("stale-a".into(), "旧名字".into());
         assert_eq!(state.dedupe_known_addresses(), 2);
         let ids: Vec<String> = state.peers.lock().iter().map(|p| p.id.clone()).collect();
         assert_eq!(ids, vec!["paired".to_string()]);
+        assert_eq!(
+            state
+                .config
+                .lock()
+                .device_remarks
+                .get("stale-a")
+                .map(String::as_str),
+            Some("旧名字"),
+            "自动合并重复行不能顺手删用户备注"
+        );
     }
 
     #[test]
     fn unpaired_row_is_forgotten_after_the_failure_limit() {
         let state = memory_state();
         state.peers.lock().push(row("dead", "10.0.0.8", 3891, false));
+        state
+            .config
+            .lock()
+            .device_remarks
+            .insert("dead".into(), "客厅台式机".into());
         for _ in 0..PROBE_FAIL_LIMIT_UNPAIRED - 1 {
             state.note_probe_outcome("dead");
         }
         assert!(state.get_peer("dead").is_some(), "未到阈值前不能忘");
         state.note_probe_outcome("dead");
         assert!(state.get_peer("dead").is_none(), "到阈值后整行忘掉");
+        assert_eq!(
+            state
+                .config
+                .lock()
+                .device_remarks
+                .get("dead")
+                .map(String::as_str),
+            Some("客厅台式机"),
+            "自动清扫设备行不能删用户备注（真机回归 2026-11-23）"
+        );
+    }
+
+    /// 用户自己点「忘记设备」才连备注一起清 —— 与自动清扫分开，别把两条语义又并回去。
+    #[test]
+    fn explicit_forget_still_drops_the_remark() {
+        let state = memory_state();
+        state.peers.lock().push(row("gone", "10.0.0.7", 3890, false));
+        state
+            .config
+            .lock()
+            .device_remarks
+            .insert("gone".into(), "不要了".into());
+        assert!(state.forget_peer("gone"));
+        assert!(!state.config.lock().device_remarks.contains_key("gone"));
+    }
+
+    /// 对端被重置过、device id 换了：备注跟着这一行走（按 id 存，不跟地址）。
+    #[test]
+    fn rekey_moves_the_remark_to_the_new_id() {
+        let state = memory_state();
+        state.peers.lock().push(row("old-id", "10.0.0.6", 3890, false));
+        state
+            .config
+            .lock()
+            .device_remarks
+            .insert("old-id".into(), "会议室那台".into());
+        state.rekey_peer("old-id", &row("new-id", "10.0.0.6", 3890, false));
+        let config = state.config.lock();
+        assert_eq!(
+            config.device_remarks.get("new-id").map(String::as_str),
+            Some("会议室那台")
+        );
+        assert!(!config.device_remarks.contains_key("old-id"), "旧 id 不该留孤儿");
     }
 
     fn route_device(id: &str) -> crate::relay::RouteDevice {

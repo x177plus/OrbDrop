@@ -742,8 +742,11 @@ pub fn server_config(identity: &Identity) -> Arc<rustls::ServerConfig> {
 /// 校验器在**每一次 TLS 握手**里都要读它，所以必须是一份进程级的共享表。
 static TRUST: LazyLock<Arc<Trust>> = LazyLock::new(|| Arc::new(Trust::new()));
 
-static CLIENT: LazyLock<reqwest::Client> =
-    LazyLock::new(|| client_builder().build().unwrap_or_default());
+static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    client_builder()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::builder().no_proxy().build().unwrap_or_default())
+});
 
 /// 进程启动时调用一次：把身份**当场**读出来/生成出来，失败要在启动日志里看得见，
 /// 而不是等到某次拨号才暴露。
@@ -794,6 +797,11 @@ pub fn client_builder() -> reqwest::ClientBuilder {
 pub fn client_builder_with_trust(trust: Arc<Trust>) -> reqwest::ClientBuilder {
     install_crypto_provider();
     reqwest::Client::builder()
+        // 这些 client 只连**局域网对端**（自签证书 + 指纹 pinning）。reqwest 开了
+        // `system-proxy` 后默认会读系统代理，必须显式关掉：否则用户开着一个全局代理时，
+        // 发往 10.x/192.168.x 的配对、传输、探活都会被塞进代理（ProxyOverride 不一定覆盖）。
+        // 自更新那条路不经过这里，仍然享受系统代理。
+        .no_proxy()
         .use_preconfigured_tls((*client_config(trust)).clone())
         // 数据面全是小写入（256KB 帧、4MB 块），默认的 Nagle 会和延迟 ACK 互相等：
         // 关掉它，写多少发多少。对端那一侧另有 `set_nodelay`（见 `dispatch_conn`）。
@@ -963,8 +971,12 @@ fn dial_client_inner(
         Err(e) => {
             // 退回默认客户端（只信公共根证书）：自签对端本来就连不上，最多是这一跳失败；
             // 绝不退回"不校验"，那等于把 token 发给任何出示证书的一方。
+            // `no_proxy()` 与上面同理：这是到对端的拨号，不能被系统代理接管。
             warn!(%host, "按目标钉住的 HTTP 客户端建不起来: {e}");
-            reqwest::Client::new()
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_default()
         }
     };
     let mut clients = DIAL_CLIENTS.lock();

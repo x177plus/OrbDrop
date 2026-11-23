@@ -28,8 +28,10 @@
 //!
 //! 清单地址是**编译期常量**（[`MANIFEST_ENDPOINTS`]）：检查更新用的地址必须与版本无关，
 //! 所以 GitHub 那条走 `releases/latest/download/update.json`（要求最新一版不是 prerelease），
-//! Gitee 那条走仓库根目录的 `raw/master/update.json`。而**产物**地址由清单里的 `mirrors`
-//! 给（钉住 tag，避免"清单说是 0.0.2、下到的却是别的东西"）。
+//! Gitee 那条优先走 `releases/download/latest/update.json`（Release 附件，落在
+//! `foruda.gitee.com`），仓库根的 `raw/master/update.json` 留作兜底 —— 后者会 302 到
+//! `raw.giteeusercontent.com`，部分网络会按 SNI 重置 TLS（见 `docs/update.md` §13）。
+//! 而**产物**地址由清单里的 `mirrors` 给（钉住 tag，避免"清单说是 0.0.2、下到的却是别的东西"）。
 //!
 //! 本机演练（还没有远端仓库时）用环境变量 `ORBDROP_UPDATE_MANIFEST` 覆盖上面那份常量，
 //! 指向本机镜像台 —— 见 `scripts/dev-mirror.mjs`。
@@ -63,12 +65,16 @@ use crate::ws::events::ui;
 // 常量（要改的地方都在这）
 // ---------------------------------------------------------------------------
 
-/// 检查更新用的清单地址，**顺序即优先级**（先 GitHub，失败/太慢再 Gitee）。
+/// 检查更新用的清单地址，**顺序即优先级**（先 GitHub，失败再 Gitee Release 附件，最后 raw）。
 ///
 /// ⚠️ `x177plus/OrbDrop` 是待填的仓库位：GitHub/Gitee 上的发布仓建好后，如果 owner 或仓库名
-/// 不是这个，改这两行就够了（清单里的产物地址由发布脚本生成，不在这里）。
+/// 不是这个，改这几行就够了（清单里的产物地址由发布脚本生成，不在这里）。
 const MANIFEST_ENDPOINTS: &[&str] = &[
     "https://github.com/x177plus/OrbDrop/releases/latest/download/update.json",
+    // Gitee Release 附件：与 GitHub 的 `latest` 同一语义，且不经过 `raw.giteeusercontent.com`
+    // —— 那个域名在部分网络会被按 SNI 重置 TLS，raw 也就从"兜底"变成了"必挂"。
+    "https://gitee.com/x177plus/OrbDrop/releases/download/latest/update.json",
+    // 仓库根 raw：给 `foruda.gitee.com` 不可达、但 raw CDN 可达的网络留的最后一条路。
     "https://gitee.com/x177plus/OrbDrop/raw/master/update.json",
 ];
 
@@ -795,6 +801,11 @@ fn fail_check(
             return Err(e);
         }
     }
+    // 手动点的那次已经会用界面显示完整错误；日志里也留一条，用户截日志时不用再猜。
+    // 后台那趟仍只记 debug（没网/被墙是常态，`info` 日志不该每 5 分钟刷一行）。
+    if !count_failure {
+        tracing::warn!("检查更新失败：{e}");
+    }
     put(app, |c| {
         c.state.phase = Phase::Error;
         c.state.error = Some(e.clone());
@@ -830,10 +841,11 @@ fn version_code_of(v: &semver::Version) -> u64 {
 /// 与下载不同的是：清单很小，这里**不需要测速**（8 秒总超时已经覆盖"连上了但不回数据"）。
 async fn fetch_manifest(app: &AppHandle) -> Result<Manifest, String> {
     let urls = manifest_endpoints();
-    let mut last = String::from("没有任何清单地址");
+    let mut failures = Vec::new();
     for url in ordered_by_pref(app, urls) {
         if let Err(e) = ensure_url_ok(&url) {
-            last = e;
+            // `ensure_url_ok` 的错误里已经带了地址。
+            failures.push(e);
             continue;
         }
         match fetch_manifest_at(&url).await {
@@ -843,11 +855,18 @@ async fn fetch_manifest(app: &AppHandle) -> Result<Manifest, String> {
             }
             Err(e) => {
                 tracing::debug!("清单地址 {url} 不行：{e}");
-                last = format!("{url}：{e}");
+                failures.push(format!("{url}：{e}"));
             }
         }
     }
-    Err(format!("所有清单地址都拿不到更新信息（{last}）"))
+    // 所有地址都失败时，界面与日志要同时看见**每条**的原因：只留最后一条会把 GitHub 的超时
+    // 藏到 Gitee 的 reset 后面，排障时最容易误判成"只有 Gitee 挂了"。
+    let reason = if failures.is_empty() {
+        "没有任何清单地址".to_string()
+    } else {
+        failures.join("；")
+    };
+    Err(format!("所有清单地址都拿不到更新信息（{reason}）"))
 }
 
 async fn fetch_manifest_at(url: &str) -> Result<Manifest, String> {
@@ -902,11 +921,12 @@ async fn download(app: &AppHandle, art: &Artifact, dest: &Path) -> Result<(), St
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("建不了下载目录：{e}"))?;
     }
-    let mut last = String::from("清单里没有可用的下载地址");
+    let mut failures = Vec::new();
     let mut first = true;
     for url in ordered_by_pref(app, art.mirrors.clone()) {
         if let Err(e) = ensure_url_ok(&url) {
-            last = e;
+            // `ensure_url_ok` 的错误里已经带了地址。
+            failures.push(e);
             continue;
         }
         if !first {
@@ -923,11 +943,16 @@ async fn download(app: &AppHandle, art: &Artifact, dest: &Path) -> Result<(), St
                 put(app, |c| {
                     c.state.error = Some(e.clone());
                 });
-                last = format!("{url}：{e}");
+                failures.push(format!("{url}：{e}"));
             }
         }
     }
-    Err(format!("所有镜像都没下成（{last}）"))
+    let reason = if failures.is_empty() {
+        "清单里没有可用的下载地址".to_string()
+    } else {
+        failures.join("；")
+    };
+    Err(format!("所有镜像都没下成（{reason}）"))
 }
 
 /// 单镜像下载：带首字节超时、静默超时与速率看门狗。
@@ -1310,12 +1335,17 @@ fn ordered_by_pref(app: &AppHandle, urls: Vec<String>) -> Vec<String> {
     first
 }
 
+/// 偏好是否还在有效期内（含时钟回拨：`now < at` 按过期处理）。
+fn pref_age_ok(pref: &crate::config::UpdateMirror, now: i64) -> bool {
+    let age = now.saturating_sub(pref.at);
+    (0..=MIRROR_PREF_TTL.as_millis() as i64).contains(&age)
+}
+
 fn read_pref(app: &AppHandle) -> Option<String> {
     let state = app.state::<Arc<AppState>>();
     let cfg = state.config.lock();
     let pref = cfg.update_mirror.as_ref()?;
-    let age = now_ms().saturating_sub(pref.at);
-    if age < 0 || age as u64 > MIRROR_PREF_TTL.as_millis() as u64 {
+    if !pref_age_ok(pref, now_ms()) {
         // 过期就当作没有：网络环境可能变了（挂上代理、Gitee 抽风），别把用户永久钉在
         // 一条坏路上。
         return None;
@@ -1328,12 +1358,19 @@ fn remember_mirror(app: &AppHandle, url: &str) {
     if host.is_empty() {
         return;
     }
+    let now = now_ms();
     let state = app.state::<Arc<AppState>>();
     let mut cfg = state.config.lock();
-    if cfg.update_mirror.as_ref().is_some_and(|p| p.host == host) {
+    // 同一个 host 也要看时间戳：过期后再成功必须续期。否则"清单已经从 Gitee 拿到了"
+    // 却因为 24h 窗口过期而让下载又先试 GitHub，正好违背"GitHub 不通就整趟走 Gitee"。
+    if cfg
+        .update_mirror
+        .as_ref()
+        .is_some_and(|p| p.host == host && pref_age_ok(p, now))
+    {
         return;
     }
-    cfg.update_mirror = Some(crate::config::UpdateMirror { host, at: now_ms() });
+    cfg.update_mirror = Some(crate::config::UpdateMirror { host, at: now });
     if let Err(e) = crate::config::save_config_at(&state.config_path, &cfg) {
         tracing::warn!("记不住更新镜像偏好：{e}");
     }
@@ -1344,6 +1381,10 @@ fn remember_mirror(app: &AppHandle, url: &str) {
 // ---------------------------------------------------------------------------
 
 fn http_client() -> Result<reqwest::Client, String> {
+    // 自更新是唯一连公网的路，默认 client 会带 `system-proxy`（Cargo.toml 里的 reqwest
+    // 特性）：用户开着系统代理时，检查/下载跟着代理走，而不是傻等直连超时。到对端那些
+    // 局域网 client 由 `net::client_builder_with_trust` 显式 `no_proxy()`，不受影响。
+    crate::net::install_crypto_provider();
     // 只设连接超时：读的超时由下载看门狗按"有没有数据进来"判，比一刀切的总超时准得多
     // （大文件在慢网上下 5 分钟是正常的，只要它一直在动）。
     reqwest::Client::builder()
@@ -1356,7 +1397,7 @@ fn http_client() -> Result<reqwest::Client, String> {
 ///
 /// `reqwest::Error` 的 `Display` 只有一句 `error sending request for url (...)` —— 真正的原因
 /// （证书不受信、连接超时、DNS 失败）全挂在 `source()` 链上，不走一遍就看不见。而这行字是用户
-/// 排障时**唯一**的线索：真机上出过一次"两条清单地址都拿不到更新信息"，链上写的是
+/// 排障时**唯一**的线索：真机上出过一次"所有清单地址都拿不到更新信息"，链上写的是
 /// `invalid peer certificate: UnknownIssuer`（信任库是空的，见 `Cargo.toml` 里 reqwest 那段），
 /// 只看 `Display` 的话根本无从下手。
 fn err_chain(e: &(dyn std::error::Error + 'static)) -> String {

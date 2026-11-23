@@ -56,10 +56,11 @@ APK 装不上时按机型选包：手机上绝大多数是 arm64（`OrbDrop_<版
 
 ### 更新清单与校验
 
-清单地址是客户端的**编译期常量**，所以本仓承担两个固定位置：
+清单地址是客户端的**编译期常量**，所以本仓承担这几个固定位置：
 
 - GitHub：Release 附件 `update.json` —— `https://github.com/x177plus/OrbDrop/releases/latest/download/update.json`
-- Gitee：仓库根目录 `update.json` —— `https://gitee.com/x177plus/OrbDrop/raw/master/update.json`
+- Gitee：Release 附件 `update.json` —— `https://gitee.com/x177plus/OrbDrop/releases/download/latest/update.json`
+- Gitee 兜底：仓库根目录 `update.json` —— `https://gitee.com/x177plus/OrbDrop/raw/master/update.json`
 
 清单里的下载地址都钉了 tag（`releases/download/vX.Y.Z/...`），老版本客户端不会因为新版本发布而下错包。每个产物都带 `size` 与 `sha256`（Windows / macOS 版另有 Tauri 更新签名 `sig`），下载后可以自己核对：`sha256sum OrbDrop_<版本>_windows_x64.exe` 或 `shasum -a 256 OrbDrop_<版本>_macos_universal.app.zip`。
 

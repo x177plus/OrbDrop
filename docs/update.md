@@ -26,11 +26,12 @@
 
 **单仓**：发布与源码是**同一个仓库**（GitHub / Gitee 两个远端同址）。GitHub 的 `master` 是唯一的
 开发历史，发布脚本在它上面追加提交、打 tag、push；Gitee 的 `master` 是一条**发布快照链**（见 §19），
-不承载逐条开发提交。清单地址是编译期常量里的那两条（GitHub 走 Release 附件 `update.json`，
-Gitee 走仓库根 `raw/master/update.json`）—— 所以**发布必须落在 `master` 分支**，`update.json` 必须
-在仓库根。tag 分两套：发布的 `vX.Y.Z` 指向那次发布提交、Release 挂在它上面；源码侧的对应关系用
-`src-vX.Y.Z`（0.0.1 / 0.0.2 的源码提交是 `0f4a760` / `8b4582a`），两套不撞名。Gitee 侧只保留
-`vX.Y.Z`，`src-vX.Y.Z` 只在 GitHub。
+不承载逐条开发提交。清单地址是编译期常量里的那几条（GitHub 走 Release 附件 `update.json`；
+Gitee 优先走 Release 附件 `releases/download/latest/update.json`，仓库根 `raw/master/update.json`
+作最后兜底）—— 所以**发布必须落在 `master` 分支**，`update.json` 必须在仓库根，且每个 Gitee
+Release 都要带 `update.json` 附件。tag 分两套：发布的 `vX.Y.Z` 指向那次发布提交、Release 挂在它上面；
+源码侧的对应关系用 `src-vX.Y.Z`（0.0.1 / 0.0.2 的源码提交是 `0f4a760` / `8b4582a`），两套不撞名。
+Gitee 侧只保留 `vX.Y.Z`，`src-vX.Y.Z` 只在 GitHub。
 
 > **口径变更（2026-10-14 / 2026-10-20）**：本节原写「发布仓（公开）+ 源码仓（私有）」与「源码将来要
 > 公开时，把源码推同一个仓（`main`）即可」，后来一版写「源码在 `main`、产物与清单在 `master`」。
@@ -75,14 +76,23 @@ arm64 包，armv7/x86 的机器装上去只会得到 `INSTALL_FAILED_NO_MATCHING
 ```
 
 - **清单地址是编译期常量**（`update::MANIFEST_ENDPOINTS`），与版本无关：GitHub 走
-  `releases/latest/download/update.json`、Gitee 走仓库根 `raw/master/update.json`。
-  - 发行版页上那个 `releases/download/v0.0.1/update.json` 与 GitHub 这条是**同一份文件**：`latest`
-    是别名，服务器 302 到当前最新那一版（`draft`/`prerelease` 不指）。Gitee 那条则**不是**发行版附件，
-    而是仓库文件 —— 发布脚本会把同一份清单**两处都写**（仓库根 + 本次发行版附件），所以内容一致、
-    地址不同。
-- **这两条连的是公网域名，靠 reqwest 内置的公共 CA 列表校验**（`rustls-tls-webpki-roots-no-provider`）。
+  `releases/latest/download/update.json`；Gitee 优先走 Release 附件
+  `releases/download/latest/update.json`，仓库根 `raw/master/update.json` 是最后兜底。
+  - 发行版页上那个 `releases/download/v0.0.1/update.json`、GitHub 的 `latest` 与本次 Gitee Release
+    附件是**同一份文件**：`latest` 是别名，服务器 302 到当前最新那一版（`draft`/`prerelease` 不指）。
+    Gitee 仓库根那条则**不是**发行版附件，而是仓库文件 —— 发布脚本会把同一份清单写成**三处**
+    （仓库根 + GitHub Release 附件 + Gitee Release 附件），所以内容一致、地址不同。
+  - **为什么 Gitee 不再把 raw 当第一条**：`gitee.com/.../raw/...` 会 302 到
+    `raw.giteeusercontent.com`；这个域名在部分网络会被按 SNI 重置 TLS（本机实测 connect 后
+    `tls handshake eof`，同一 IP 换 SNI 能完成握手）。Release 附件落在 `foruda.gitee.com`，
+    不受这条路径影响。raw 仍保留为最后一条，给 foruda 不可达、但 raw CDN 可达的网络。
+- **这些地址连的是公网域名，靠 reqwest 内置的公共 CA 列表校验**（`rustls-tls-webpki-roots-no-provider`）。
   到对端那一跳用指纹判身份、用不到信任库，但自更新只能走普通证书校验 —— 别把那条 reqwest 特性
   改回 `rustls-tls-no-provider`（= manual-roots = **空**信任库），出事的样子见 §13。
+- **自更新跟随系统代理**：reqwest 开了 `system-proxy` 特性，Windows/macOS 的系统代理会作用于
+  清单与安装包下载（国内直连 GitHub 时通时不通，代理是用户已有的兜底）。到对端的局域网 client
+  在 `net::client_builder_with_trust` 里显式 `no_proxy()`，不会被系统代理劫走；改这一层时
+  必须同时跑局域网配对/传输回归。
 - **产物地址由清单给**，且钉住 tag（`releases/download/v0.0.2/...`）：老客户端不会因为新版本发布
   而下错包。两条镜像都指向同一份内容。
 - `versionCode` 是安卓的安装门槛（`major*1000000 + minor*1000 + patch`，Tauri 的算法）。客户端在
@@ -104,14 +114,15 @@ arm64 包，armv7/x86 的机器装上去只会得到 `INSTALL_FAILED_NO_MATCHING
 | 静默超时 | 10s | 传到一半卡住 |
 | 速率下限 | 32 KB/s（10s 窗口） | "能下但只有几 B" |
 
-清单那一趟是 8 秒总超时（几百字节的东西）。
+每个清单地址是 8 秒总超时（几百字节的东西）；按 `MANIFEST_ENDPOINTS` 顺序逐条试，任一条成功即停。
 
 换镜像时**从零重下**：Gitee 的发行版附件实测**不支持 Range**（发 `Range: bytes=…` 回来的是 `200`
 + 完整 `Content-Length`，没有 `Content-Range`），跨镜像续传没有意义。
 
 **镜像记忆**：成功的镜像主机名落盘在 `config.toml` 的 `updateMirror`，24 小时内优先用它。没有这条，
-国内用户每次检查都要先白等一遍 GitHub 那条超时路径。过期自动作废（挂上代理、Gitee 抽风的场景能
-自己爬回来）。
+国内用户每次检查都要先白等一遍 GitHub 那条超时路径。每次成功（清单或安装包）都会**续期**——同一个
+host 也续期，否则 24h 后清单虽从 Gitee 拿到，下载又会先试 GitHub。过期自动作废（挂上代理、Gitee
+抽风的场景能自己爬回来）。
 
 清单与下载都会在**演练台**（`scripts/dev-mirror.mjs`）上实测三档：挂起（`--gh-hang`）、限速
 （`--gh-kbps` / `--gitee-kbps`）、正常。
@@ -232,8 +243,9 @@ macOS 包用 `--macos-zip` / `--macos-dmg` 显式传入（不传 zip 会让 macO
 都跟"这一版已经存在"有关：
 
 - **仓库里的 tag 不新建、也不移动**：只往本仓 `master` 上追加一个提交（`update.json` 与 `CHANGELOG.md`
-  变了）。于是 tag 指向的那次提交与 Release 的附件不再一致 —— 客户端读的是清单（GitHub 走 Release
-  附件、Gitee 走分支上的仓库文件），两处都是新的；只有"拿 git 去核对 tag 内容"的场合要知道这一层。
+  变了）。于是 tag 指向的那次提交与 Release 的附件不再一致 —— 客户端读的是清单（GitHub 与 Gitee
+  都优先走 Release 附件，Gitee 分支上的仓库文件只作兜底），这些地方都是新的；只有"拿 git 去核对
+  tag 内容"的场合要知道这一层。
 - **Release 是复用的**：GitHub 先 `DELETE` 掉旧附件再传新的（不删的话同名附件会 422）；Gitee 直接
   删掉整个 Release（连同附件，顺带释放配额）再建一个同 tag 的。**这是脚本唯一会删远端东西的地方**，
   只在显式给了 `--republish` 时才发生。
@@ -242,9 +254,9 @@ macOS 包用 `--macos-zip` / `--macos-dmg` 显式传入（不传 zip 会让 macO
 0.0.1 的客户端只会说"已是最新版"。重发的作用是"让**新装**的人拿到修好的包"（本机与真机重装、
 README/发行版页的下载链接）；要让老客户端自己升上来，只能发一个更高的版本号。
 
-回读校验里 **GitHub 那几条"本机够不着"只报警告、不算失败**：发布是从你本机发起的，而国内直连
-github.com 时通时不通（实测同一条命令上一秒 200、下一秒 connect timeout）——那说明这台机器此刻的
-网络不通，不是发布发错了。HTTP 层的问题（404、版本对不上）照旧硬失败。
+回读校验里 **任何"本机够不着"只报警告、不算失败**：发布是从你本机发起的，而国内直连 github.com
+时通时不通（实测同一条命令上一秒 200、下一秒 connect timeout），Gitee raw 的 CDN 也可能被按 SNI
+重置——那说明这台机器此刻的网络不通，不是发布发错了。HTTP 层的问题（404、版本对不上）照旧硬失败。
 
 Gitee 侧有两道容量约束（官方帮助中心）：单附件 ≤ 100MB、仓库附件总量 ≤ 1GB。一次发布约 78MB
 （exe 13 + 通用包 51 + arm64 15），**所以攒到十来个版本就该去 Gitee 删旧发行版**；脚本每次发布都会
@@ -298,7 +310,9 @@ Gitee 的公开仓需人工审核，审核期仓库"仅限成员访问"——所
 4. 重跑 §10 的镜像三档（`--gh-hang` / `--gh-kbps 5` / 两者都坏）：该成功的成功，该失败的一次都不装。
 5. `cargo test --lib update::`：签名、地址策略、调度与 `update.json` 的回归。**联网的那条另跑**：
    `cargo test --lib update:: -- --ignored`（`manifest_endpoints_really_load_over_https` —— 用客户端
-   自己的 reqwest 拿一遍编译期那两条清单地址，钉住 §13 那个信任库；两条里至少一条通就算过）。
+   自己的 reqwest 拿一遍编译期那几条清单地址，钉住 §13 那个信任库；至少一条通就算过，失败的会打印
+   在输出里）。这一条现在还会顺便验证 reqwest 的 `system-proxy`：本机开着系统代理时，失败原因从
+   直连的 `os error 10054` 变成代理链路上的 `tls handshake eof`。
 6. 安卓：`npm run tauri -- android build --apk`（通用包）与 `--apk --split-per-abi`（arm64 包）→ 装到
    设备上确认能起来（旧的 versionCode 更大时要先卸载）；清单地址与仓库建好后，在手机上点一次
    「检查更新 → 下载并安装」，确认走到系统安装器。
@@ -539,8 +553,8 @@ Gitee 的 `master` 不再承载逐条开发提交，只保留**每个发布版�
 - 本地快照分支：`gitee-mirror`。它的每个提交都是一整棵树：`C1` = v0.0.1 的树、`C2` = v0.0.2、
   `C3` = v0.0.3、`C4` = 当前 `HEAD`。所有提交的 author/committer 都是
   `x177plus <x177plus@users.noreply.github.com>`，不继承本机全局身份。
-- Gitee `master` = `gitee-mirror` 的 tip；`raw/master/update.json` 仍然由这条分支的树提供，
-  所以客户端编译期常量不用改。
+- Gitee `master` = `gitee-mirror` 的 tip；客户端优先读本次 Release 的 `update.json` 附件，
+  `raw/master/update.json` 作为最后兜底仍由这条分支的树提供，所以发布分支必须继续是 `master`。
 - Gitee 的 `vX.Y.Z` tag 指向对应的快照提交（`C1`/`C2`/`C3`），Release 附件挂同名 tag；
   `src-vX.Y.Z` 只在 GitHub 保留。
 - 发布脚本里 Gitee 侧改为：`rev-parse HEAD:` 取根树 → `commit-tree <tree> -p gitee-mirror` → 推

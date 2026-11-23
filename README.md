@@ -58,10 +58,11 @@ If an APK refuses to install, pick by device: almost every phone is arm64
 
 ### Update manifest and verification
 
-The manifest URL is a compile-time constant in the client, so this repository serves two fixed locations:
+The manifest URL is a compile-time constant in the client, so this repository serves fixed locations:
 
 - GitHub: the `update.json` release asset — `https://github.com/x177plus/OrbDrop/releases/latest/download/update.json`
-- Gitee: `update.json` at the repository root — `https://gitee.com/x177plus/OrbDrop/raw/master/update.json`
+- Gitee: the `update.json` release asset — `https://gitee.com/x177plus/OrbDrop/releases/download/latest/update.json`
+- Gitee fallback: `update.json` at the repository root — `https://gitee.com/x177plus/OrbDrop/raw/master/update.json`
 
 Every artifact URL inside the manifest is pinned to a tag (`releases/download/vX.Y.Z/...`), so an old client
 never fetches the wrong build after a new release. Each artifact carries `size` and `sha256` (Windows builds

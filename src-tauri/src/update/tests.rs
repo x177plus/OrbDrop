@@ -169,7 +169,7 @@ fn host_extraction() {
     assert_eq!(host_of("不是一个地址"), "");
 }
 
-/// **联网的**回归：编译期那两条清单地址，用**客户端自己的** reqwest 拿一遍。
+/// **联网的**回归：编译期那几条清单地址，用**客户端自己的** reqwest 拿一遍。
 ///
 /// 为什么值得留着一条要联网的测试：其余测试全在离线夹具与明文回环上跑，而 2026-10-10 真机上
 /// 出事的那一格恰恰是"**https 能不能过证书校验**" —— `reqwest` 当时是按 `rustls-tls-no-provider`
@@ -180,9 +180,9 @@ fn host_extraction() {
 /// `#[ignore]`：它要真的连公网，离线/CI 环境必然失败，所以不进默认那一轮。
 /// 跑法：`cargo test --lib update:: -- --ignored`（真机上验证自更新时按 `docs/update.md` §11 走）。
 ///
-/// **判据与客户端一致：两条里至少一条能拿到**（客户端自己就是"第一个能解析成清单的赢"）。
-/// 不要求两条都通 —— 国内直连 github.com 时通时不通是常态，那是网络的事，不该让这条测试变红；
-/// 而信任库坏掉时**两条会一起死**，所以它照样抓得住。
+/// **判据与客户端一致：至少一条能拿到**（客户端自己就是"第一个能解析成清单的赢"）。
+/// 不要求全部通过 —— 国内直连 github.com 时通时不通、Gitee raw 域名偶发被按 SNI 重置，
+/// 都是网络的事，不该让这条测试变红；而信任库坏掉时**所有地址会一起死**，所以它照样抓得住。
 #[tokio::test]
 #[ignore = "要联网：离线环境必然失败，只在真的验证自更新链路时跑"]
 async fn manifest_endpoints_really_load_over_https() {
@@ -202,11 +202,11 @@ async fn manifest_endpoints_really_load_over_https() {
     }
     assert!(
         ok > 0,
-        "两条清单地址一条都没拿到（信任库/网络？）：\n  {}",
+        "所有清单地址都没拿到（信任库/网络？）：\n  {}",
         failures.join("\n  ")
     );
     if !failures.is_empty() {
-        // 只剩一条通不算失败（就是 GitHub 那种时通时不通），但要知道是哪条、为什么。
+        // 只剩部分通不算失败（GitHub 时通时不通、Gitee raw 偶发被重置），但要知道是哪条、为什么。
         println!("这一条没能拿到（不判失败）：\n  {}", failures.join("\n  "));
     }
 }
@@ -223,6 +223,27 @@ fn pref_reorder_is_a_stable_partition() {
     first.extend(urls.iter().filter(|u| host_of(u) != "gitee.com").cloned());
     assert_eq!(first[0], "https://gitee.com/o/r/a.exe");
     assert_eq!(first.len(), urls.len());
+}
+
+/// 镜像偏好的有效期判定：同 host 的成功也必须能续期。
+///
+/// 回归的是"清单已经从 Gitee 拿到了，但 24h 窗口过期后 `remember_mirror` 因为 host 没变
+/// 直接 return，下载又先试 GitHub"——语义上是"GitHub 不通就该整趟走 Gitee"，这里把
+/// 过期边界钉死。
+#[test]
+fn mirror_pref_expires_at_the_ttl_boundary() {
+    let now = 1_800_000_000_000i64;
+    let ttl = MIRROR_PREF_TTL.as_millis() as i64;
+    let at = |age: i64| crate::config::UpdateMirror {
+        host: "gitee.com".into(),
+        at: now - age,
+    };
+
+    assert!(pref_age_ok(&at(0), now), "刚成功必须有效");
+    assert!(pref_age_ok(&at(ttl / 2), now), "窗口内必须有效");
+    assert!(pref_age_ok(&at(ttl), now), "边界值仍算有效");
+    assert!(!pref_age_ok(&at(ttl + 1), now), "超过 24h 必须失效");
+    assert!(!pref_age_ok(&at(-1), now), "时钟回拨按失效处理");
 }
 
 // ---------------------------------------------------------------------------

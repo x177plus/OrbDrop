@@ -2,7 +2,9 @@
  * 清单仓 = 源码仓（`E:/177plus/Apps/OrbDrop`）的落盘逻辑。
  *
  * 取消独立发布仓后，清单（`update.json`）与更新日志（`CHANGELOG.md`）直接落在**本仓根目录**：
- *  - Gitee 的清单地址是编译期常量 `raw/master/update.json`，所以文件必须在仓库根、发布分支必须 `master`；
+ *  - 客户端优先读 Gitee Release 附件 `releases/download/latest/update.json`，仓库根
+ *    `raw/master/update.json` 是最后兜底；所以文件必须在仓库根、发布分支必须 `master`，且每个
+ *    Release 都要带 `update.json` 附件；
  *  - 产物缓存落在根目录 `assets/v{ver}/`（本仓根 `.gitignore` 已忽略 `/assets/`，不进 git）。
  *
  * `update.json` 由 release.mjs 自己拼（要 sha256、sig、mirrors），这里只管文本文件的骨架与 CHANGELOG。

@@ -18,9 +18,9 @@
  *  3. `tauri signer sign` 会在**文件旁边**写 `<文件>.sig`。私钥不在仓库里，构建产物在
  *     `src-tauri/` 下（不该多出文件），而清单里的 sig 是**内联字符串**，所以这里先把 exe
  *     拷到临时目录去签，读完 .sig 就地删掉临时文件，磁盘上不留多余文件。
- *  4. update.json 要写**两份**：本仓根目录（客户端走 Gitee raw 读它）＋ 本次 Release 的附件
- *     （客户端走 GitHub `releases/latest/download/` 读它，所以 Release 绝不能是 draft/prerelease，
- *     否则 `latest` 别名不指它）。
+ *  4. update.json 要写**三处**：本仓根目录（Gitee raw 兜底）＋ GitHub Release 附件 ＋
+ *     Gitee Release 附件（两边的 `latest` 别名都读各自的附件，所以 Release 绝不能是
+ *     draft/prerelease，否则 `latest` 别名不指它）。
  *  5. 本仓**不提交** assets/ —— 那是本机演练用的产物缓存，十几 MB × N 个版本进 git 会把仓库搞爆
  *     （本仓根 `.gitignore` 已经忽略 `/assets/`）。
  *
@@ -66,7 +66,7 @@ const USAGE = `用法：node scripts/release.mjs [选项]
   --version <版本号>   要发布的版本（默认取 src-tauri/tauri.conf.json 里的 version）
   --notes "<说明>"     本次更新说明（进 update.json 与 Release 说明；远端模式必填）
   --local              本机演练：不联网、不 push、不调 API，mirrors 指向本机镜像台
-  --verify-only        只回读校验某个已发布的版本（两个清单地址 + 每个资产 URL），不构建、不 push、不调 API
+  --verify-only        只回读校验某个已发布的版本（全部清单地址 + 每个资产 URL），不构建、不 push、不调 API
   --skip-build         不构建，直接发布现有产物（本机演练、或刚手动构建过）
   --macos-zip <文件>   随本版一起发布的 macOS 通用 .app zip（在 Mac 上用 npm run mac:artifact 生成）。
                        不给时清单里就没有 macOS 产物，macOS 客户端会明确报「这一版没出包」。
@@ -165,7 +165,7 @@ if (!notes) {
 /* ---------- 只回读校验（--verify-only）：不构建、不 push、不调 API ---------- */
 
 if (VERIFY_ONLY) {
-  step(`只回读校验 v${ver.raw}：两个清单地址 + 每个资产 URL`);
+  step(`只回读校验 v${ver.raw}：全部清单地址 + 每个资产 URL`);
   await verifyRemote(cfg, ver);
   log();
   process.exit(0);
@@ -360,7 +360,7 @@ for (const a of UPLOAD_ARTIFACTS) {
 upsertChangelog(cfg.repoPath, cfg, ver.raw, notes, pubDate.slice(0, 10));
 const manifestPath = path.join(cfg.repoPath, ASSET_NAMES.manifest);
 fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-ok(`${ASSET_NAMES.manifest} · 本仓根目录（Gitee raw 走这里）`);
+ok(`${ASSET_NAMES.manifest} · 本仓根目录（Gitee raw 兜底）`);
 for (const f of listTracked(cfg.repoPath)) note(`  跟踪文件 ${f}`);
 if (LOCAL) warn("根目录 update.json 现在指向本机镜像台；正式发布要重跑一次远端模式才会换回真实地址。");
 
@@ -826,7 +826,7 @@ function unreachable(url, why) {
 }
 
 async function verifyRemote(cfg, ver) {
-  step("回读校验：两个清单地址 + 每个资产 URL（GitHub 资产 + Gitee 资产）");
+  step("回读校验：全部清单地址 + 每个资产 URL（GitHub 资产 + Gitee 资产）");
   // 资产 URL 从**清单本身**取：这样 `--verify-only` 也能校验 macOS 等所有已发布的档位，
   // 不依赖本次命令行有没有带 `--macos-zip`。
   const assetUrls = new Set();
@@ -856,7 +856,7 @@ async function verifyRemote(cfg, ver) {
     ok(`清单 OK（version=${json.version}，${assetUrls.size} 条资产地址）：${url}`);
   }
   if (assetUrls.size === 0) {
-    die("清单里没有任何资产地址", "两个清单地址都读不到内容？检查 Release 与 Gitee raw 分支。");
+    die("清单里没有任何资产地址", "所有清单地址都读不到内容？检查 Release 附件与 Gitee master 分支。");
   }
   for (const url of assetUrls) {
     const got = await fetchSoft(url, { headers: { Range: "bytes=0-0" }, timeoutMs: 60_000 });

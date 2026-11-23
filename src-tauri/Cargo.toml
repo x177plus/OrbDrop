@@ -78,7 +78,10 @@ dirs = "5"
 # 顺手把 quinn 那一族弱依赖解进 `Cargo.lock`（一个都不会编，但锁文件里凭空多出十几个包）。
 # 内置的公共 CA 列表也顺手挡掉了"设备上装个根证书就能 MITM 更新"。
 # 也因此**不再有 native-tls**：除自更新之外都只连内网自签证书，系统信任库用不上。
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "stream", "json"] }
+# `system-proxy` 单独开：自更新要跟着 Windows/macOS 的系统代理走（国内直连 GitHub
+# 时通时不通）；到对端的局域网 client 在 `net::client_builder_with_trust` 里显式
+# `no_proxy()`，不会被系统代理劫走。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "system-proxy", "stream", "json"] }
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
 pathdiff = "0.2"

@@ -132,8 +132,9 @@ function deepMerge(base, patch) {
 
 const DEFAULTS = {
   // owner/repo 必须与客户端**编译期常量**一致（src-tauri/src/update/mod.rs 的 MANIFEST_ENDPOINTS：
-  // github.com/x177plus/OrbDrop/releases/latest/download/update.json 与 gitee.com/x177plus/OrbDrop/raw/master/update.json），
-  // 否则清单与资产 URL 会指到别的仓库，客户端读不到。配置里显式写了就以配置为准（写空字符串也能覆盖默认值）。
+  // github.com/.../releases/latest/download/update.json、gitee.com/.../releases/download/latest/update.json、
+  // gitee.com/.../raw/master/update.json），否则清单与资产 URL 会指到别的仓库，客户端读不到。
+  // 配置里显式写了就以配置为准（写空字符串也能覆盖默认值）。
   github: { owner: "x177plus", repo: "OrbDrop", remote: "github", tokenEnv: "GITHUB_TOKEN" },
   gitee: {
     owner: "x177plus",
@@ -231,13 +232,15 @@ export function mirrorsFor(cfg, version, file, { local = false } = {}) {
 }
 
 /**
- * 客户端的清单地址是**编译期常量**（不进清单），所以发布侧必须往这两个地方都放 update.json：
+ * 客户端的清单地址是**编译期常量**（不进清单），所以发布侧必须把这些地方都放上 update.json：
  *  - GitHub：本次 Release 的附件（`latest/download` 别名要求该 Release 不是 prerelease/draft）
- *  - Gitee：本仓分支（master）上的仓库文件（raw 直出）
+ *  - Gitee：本次 Release 的附件（`latest` 别名；客户端优先读它，见 docs/update.md §4）
+ *  - Gitee：本仓分支（master）上的仓库文件（raw 直出，最后兜底）
  */
 export function manifestUrls(cfg) {
   return [
     `https://github.com/${cfg.github.owner}/${cfg.github.repo}/releases/latest/download/${ASSET_NAMES.manifest}`,
+    `https://gitee.com/${cfg.gitee.owner}/${cfg.gitee.repo}/releases/download/latest/${ASSET_NAMES.manifest}`,
     `https://gitee.com/${cfg.gitee.owner}/${cfg.gitee.repo}/raw/${cfg.gitee.manifestBranch}/${ASSET_NAMES.manifest}`,
   ];
 }
