@@ -37,7 +37,14 @@ export function unlockSound(): void {
   if (c && c.state === 'suspended') void c.resume().catch(() => {});
 }
 
-if (typeof window !== 'undefined') {
+// `typeof window !== 'undefined'` 不够：测试/SSR 会把 `window` 桩成 globalThis（没有
+// `addEventListener`）。模块顶层挂监听必须再确认这两个方法真的存在，否则整个 chat store
+// 在加载时就会抛错（`npm run test:snapshot` 就是在这一步炸的）。
+if (
+  typeof window !== 'undefined' &&
+  typeof window.addEventListener === 'function' &&
+  typeof window.removeEventListener === 'function'
+) {
   const unlock = () => {
     unlockSound();
     window.removeEventListener('pointerdown', unlock);
