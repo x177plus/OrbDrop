@@ -486,7 +486,10 @@ mod tests {
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await;
-        assert!(blocked.is_err(), "非共享链接的局域网明文必须连不上，实际拿到 {blocked:?}");
+        assert!(
+            blocked.is_err(),
+            "非共享链接的局域网明文必须连不上，实际拿到 {blocked:?}"
+        );
 
         // TLS 那条路照旧可用（老链接/手改成 https 也不坏）。
         let tls = crate::net::client()
