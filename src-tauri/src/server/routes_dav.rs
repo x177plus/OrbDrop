@@ -1266,7 +1266,11 @@ mod tests {
             return;
         };
 
-        let plain = Client::new()
+        // 系统代理会让 `Client::new()` 把这些请求塞给代理，测的就不是“局域网直连”了。
+        let plain = Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .get(format!("http://{ip}:{port}/dav/{share_id}/"))
             .timeout(std::time::Duration::from_secs(5))
             .send()

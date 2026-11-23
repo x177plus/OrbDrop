@@ -456,7 +456,9 @@ mod tests {
 
         // 另一台设备的浏览器真实会走的那条路：**非回环 + 明文 + 无 token**。
         // `dispatch_conn` 对 `/s/<id>` 与 `/s/<id>/<文件名>` 放行明文，浏览器打开即开始下载。
-        let plain = reqwest::Client::new()
+        // 系统代理会让 `Client::new()` 把这些请求塞给代理，测的就不是“局域网直连”了。
+        let direct = || reqwest::Client::builder().no_proxy().build().unwrap();
+        let plain = direct()
             .get(format!("http://{ip}:{port}/s/{share_id}/lan.txt"))
             .timeout(std::time::Duration::from_secs(5))
             .send()
@@ -469,7 +471,7 @@ mod tests {
         );
 
         // 旧链接（不带文件名段）也仍然可用。
-        let legacy = reqwest::Client::new()
+        let legacy = direct()
             .get(format!("http://{ip}:{port}/s/{share_id}"))
             .timeout(std::time::Duration::from_secs(5))
             .send()
@@ -479,7 +481,7 @@ mod tests {
 
         // 同一个端口上的普通明文路径仍然要被丢掉：`/shares` 是认证路由，不能因为
         // 共享链接开了明文口子就退化成可选 TLS。
-        let blocked = reqwest::Client::new()
+        let blocked = direct()
             .get(format!("http://{ip}:{port}/shares"))
             .timeout(std::time::Duration::from_secs(5))
             .send()
