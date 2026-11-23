@@ -112,6 +112,15 @@ pub async fn file_handler(
         })?;
     }
 
+    // 越过 EOF 的 offset 必须明确报错，不能回 200 + 0 字节：客户端把“空包”当 EOF，
+    // 会把手里那份前缀原子改名成最终文件 —— 对端文件在传输中变小/被替换时，用户就得到
+    // 一份“长度短了但界面显示成功”的截断下载。`offset == file_size` 仍是合法 EOF。
+    if offset > file_size {
+        return Err((
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            format!("offset {offset} 超过文件大小 {file_size}（文件可能已变化）"),
+        ));
+    }
     let remaining = file_size.saturating_sub(offset);
     let read_len = len.map(|l| l.min(remaining)).unwrap_or(remaining);
 

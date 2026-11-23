@@ -880,6 +880,10 @@ async fn run(
     let mut received: u64 = 0;
     let mut made_dirs: HashSet<PathBuf> = HashSet::new();
     let mut pending_finalize: Vec<Arc<FileWork>> = Vec::new();
+    // 同一落地路径只允许一个写者：两条邀请/一条 DAV PUT 同时落同一个目标时，各自的
+    // `.part`/续传记录会互相覆盖，最后可能交出一份“长度对、内容坏”的文件。租约活到
+    // 整个 `run` 结束（workers/finalize 都在里面），拿不到就明确失败、由待续传退避重试。
+    let mut target_leases = Vec::new();
 
     // 单文件共享项根只有一个落点：清单多于一项时，接收端无法判断该保留哪一份，
     // 直接按终态失败（`accept_invite` 已经拦过一次，这里是重启续传的兜底）。
@@ -905,6 +909,13 @@ async fn run(
         } else {
             safe_join(&dir, &local_rel).ok_or_else(|| format!("非法路径: {}", entry.path))?
         };
+        let Some(lease) = super::target_lock::TargetLease::try_acquire(&target) else {
+            return Err(format!(
+                "同一文件正在被另一条操作写入，稍后重试: {}",
+                target.display()
+            ));
+        };
+        target_leases.push(lease);
         if root_file.is_none() {
             if let Some(parent) = target.parent() {
                 if made_dirs.insert(parent.to_path_buf()) {

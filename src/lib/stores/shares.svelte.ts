@@ -6,6 +6,8 @@ let items = $state<ShareItem[]>([]);
 let loading = $state(false);
 let error = $state<string | null>(null);
 let serverPort = $state(0);
+/** 请求序号：多选添加会并发触发多次 `loadShares`，旧响应不能覆盖新列表。 */
+let loadSeq = 0;
 
 export function getShares() { return items; }
 export function isSharesLoading() { return loading; }
@@ -15,15 +17,19 @@ export function getServerPort() { return serverPort; }
 export function setServerPort(p: number) { serverPort = p; }
 
 export async function loadShares() {
+  const seq = ++loadSeq;
   loading = true;
   error = null;
   try {
-    items = await api.listShares();
+    const next = await api.listShares();
+    if (seq === loadSeq) items = next;
   } catch (e) {
-    error = e instanceof Error ? e.message : String(e);
-    console.error('Failed to load shares:', e);
+    if (seq === loadSeq) {
+      error = e instanceof Error ? e.message : String(e);
+      console.error('Failed to load shares:', e);
+    }
   } finally {
-    loading = false;
+    if (seq === loadSeq) loading = false;
   }
 }
 

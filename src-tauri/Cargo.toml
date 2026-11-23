@@ -1,6 +1,6 @@
 [package]
 name = "orbdrop"
-version = "0.3.1"
+version = "0.3.2"
 description = "OrbDrop — LAN file sharing tool"
 authors = ["you"]
 license = "GPL-3.0-or-later"
@@ -172,6 +172,12 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSView",
     "NSWindow",
 ] }
+
+[profile.dev]
+# dev 默认 debug = 2（全量变量/类型信息）：单个集成测试的 PDB 就 300MB+，而 Cargo 不会回收旧
+# metadata hash 的产物，两三个月能堆出几十 GB。改成 1（行号表）后体积明显下降，panic 仍能定位到
+# 源码行；需要逐变量调试时临时改回 2 再构建。
+debug = 1
 
 [profile.release]
 # 每个 ABI 的 cargo 编译:1m56s/2m13s(fat + 1 CGU)→ 37.6s/38.9s/39.6s/39.8s(thin + 16),四 ABI 全量

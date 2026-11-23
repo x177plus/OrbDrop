@@ -38,12 +38,12 @@ use tracing::{debug, error, info, warn};
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Foundation::{
     ERROR_CLOUD_FILE_REQUEST_ABORTED, ERROR_CLOUD_FILE_REQUEST_CANCELED,
-    ERROR_CLOUD_FILE_REQUEST_TIMEOUT, STATUS_CLOUD_FILE_UNSUCCESSFUL, STATUS_SUCCESS,
+    ERROR_CLOUD_FILE_REQUEST_TIMEOUT, HANDLE, STATUS_CLOUD_FILE_UNSUCCESSFUL, STATUS_SUCCESS,
 };
 use windows::Win32::Storage::CloudFilters::*;
 use windows::Win32::Storage::FileSystem::{
-    FindClose, FindFirstFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
-    WIN32_FIND_DATAW,
+    FindClose, FindFirstFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_BASIC_INFO, WIN32_FIND_DATAW,
 };
 
 use super::{identity, note_closed, note_deleted, note_opened, note_placed, MirroredItem};
@@ -514,12 +514,19 @@ pub async fn place_item(
 /// 重启后第一次打开/刷新会把一个**同一项**误判成“另一项”，走删除重建 —— 编辑器就会提示
 /// 文件已删除。`CfGetPlaceholderInfo` 不触发水合。
 fn placeholder_identity(path: &Path) -> Option<Vec<u8>> {
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
 
-    let file = std::fs::File::open(path).ok()?;
+    // `File::open` 不带给目录用的 `FILE_FLAG_BACKUP_SEMANTICS`，在 Windows 上打开目录会
+    // 直接拒绝；目录占位符的身份 blob 一样要能读（否则重启后目录项永远被当成"没有记录"）。
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(path)
+        .ok()?;
     let handle = HANDLE(file.as_raw_handle() as _);
-    let base = std::mem::size_of::<CF_PLACEHOLDER_STANDARD_INFO>();
+    let base = std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>();
     let capacity = base + CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH as usize;
     // 结构体有 8 字节对齐要求；用 u64 的 Vec 保证缓冲区对齐。
     let mut words = vec![0u64; capacity.div_ceil(8)];
@@ -537,7 +544,7 @@ fn placeholder_identity(path: &Path) -> Option<Vec<u8>> {
         debug!(path = %path.display(), error = ?e, "读占位符身份失败");
         return None;
     }
-    let info = unsafe { &*(words.as_ptr() as *const CF_PLACEHOLDER_STANDARD_INFO) };
+    let info = unsafe { &*(words.as_ptr() as *const CF_PLACEHOLDER_BASIC_INFO) };
     let identity_len = (info.FileIdentityLength as usize)
         .min(CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH as usize);
     if identity_len == 0 {
@@ -697,17 +704,11 @@ fn update_placeholder_in_place(
     size: u64,
     mtime: Option<i64>,
 ) -> Result<(), String> {
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::HANDLE;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| format!("打开占位符失败: {e}"))?;
-    let handle = HANDLE(file.as_raw_handle() as _);
+    // `CF_UPDATE_FLAG_DEHYDRATE` 要求**独占句柄**（文档明说平台不校验，并发读会损坏内容）。
+    // 普通的 `File::open` 共享模式不够；用 `CfOpenFileWithOplock(EXCLUSIVE|WRITE_ACCESS)`。
+    let handle = open_exclusive_for_write(path)?;
     let metadata = fs_metadata(size, mtime, false);
-    unsafe {
+    let result = unsafe {
         CfUpdatePlaceholder(
             handle,
             Some(&metadata),
@@ -718,10 +719,43 @@ fn update_placeholder_in_place(
             None,
             None,
         )
+    };
+    unsafe { CfCloseHandle(handle) };
+    result.map_err(|e| format!("原地更新占位符失败: {e:?}"))
+}
+
+/// 打开一个**独占**的 CFAPI 句柄；拿不到就失败（宁可不做，也不能在别人读的时候脱水/更新）。
+fn open_exclusive_for_write(path: &Path) -> Result<HANDLE, String> {
+    let wide = to_wide(path.as_os_str());
+    unsafe {
+        CfOpenFileWithOplock(
+            PCWSTR(wide.as_ptr()),
+            CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAG_WRITE_ACCESS,
+        )
     }
-    .map_err(|e| format!("原地更新占位符失败: {e:?}"))?;
-    drop(file);
-    Ok(())
+    .map_err(|e| format!("打开独占占位符失败（可能仍被读取）: {e:?}"))
+}
+
+/// 把损坏/删不掉的占位符改名到同目录的隐藏名，给原名让路。
+///
+/// 改名只动目录项，不读坏掉的云文件元数据，所以 `remove_file`/`remove_dir_all` 报
+/// `ERROR_CLOUD_FILE_METADATA_CORRUPTED` 时它通常还能成功。隔离出来的项不再参与同名判定
+/// （`sweep` 跳过 `.orbdrop-corrupt-` 前缀），失败时原路径仍可用。
+pub(crate) fn quarantine_corrupt(path: &Path, error: &std::io::Error) -> bool {
+    // 只隔离**元数据损坏**（ERROR_CLOUD_FILE_METADATA_CORRUPTED = 363）。普通占用/权限失败
+    // 仍按原逻辑等待，避免把外部程序正打开着的文件改名搬走。
+    if error.raw_os_error() != Some(363) {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "item".into());
+    let dest = parent.join(format!(".orbdrop-corrupt-{}-{name}", uuid::Uuid::new_v4()));
+    std::fs::rename(path, &dest).is_ok()
 }
 
 /// 用**同一个本地名**放下这一项；同名暂时不可用就等它释放，绝不换名。
@@ -757,13 +791,23 @@ async fn place_same_name(
                 std::fs::remove_file(&desired)
             };
             if let Err(e) = removed {
-                last = format!("清理同名镜像项失败（{}）: {e}", desired.display());
-                warn!(
-                    path = %desired.display(), attempt, error = %e,
-                    "同名落点仍被占用，等待后用同一个名字重试"
-                );
-                tokio::time::sleep(SAME_NAME_RETRY_DELAY).await;
-                continue;
+                // 元数据损坏（os error 363）/ provider 已终止时，正常删除会一直失败；
+                // 把这一项**改名隔离**到同目录的隐藏名字，原路径就空出来可以新建。
+                // 改名不读占位符元数据，通常比 remove 更容易成功。
+                if quarantine_corrupt(&desired, &e) {
+                    warn!(
+                        path = %desired.display(), attempt, error = %e,
+                        "同名落点元数据损坏，已隔离到隐藏名，按原名重建"
+                    );
+                } else {
+                    last = format!("清理同名镜像项失败（{}）: {e}", desired.display());
+                    warn!(
+                        path = %desired.display(), attempt, error = %e,
+                        "同名落点仍被占用，等待后用同一个名字重试"
+                    );
+                    tokio::time::sleep(SAME_NAME_RETRY_DELAY).await;
+                    continue;
+                }
             }
         }
         match create_one(dir, name, blob, size, mtime, is_dir) {
@@ -1001,7 +1045,9 @@ unsafe extern "system" fn open_completion_cb(
             if is_self(info) {
                 return;
             }
-            info!(path = %path, process = %process, "镜像项被打开");
+            // 每打开一个文件就一行，复制一个万文件目录就是一万行；这不是用户事件，
+            // 排障（谁在读它/为什么回收不掉）时用 `RUST_LOG=debug` 看。
+            debug!(path = %path, process = %process, "镜像项被打开");
             note_opened(&path);
         }
     });
@@ -1016,7 +1062,8 @@ unsafe extern "system" fn close_completion_cb(
             let flags = unsafe { params.Anonymous.CloseCompletion.Flags };
             let path = win_path(info);
             let process = process_name(info);
-            info!(
+            // 与打开同一口径：每个文件一行，复制大目录时是噪声；默认只在 debug 里看。
+            debug!(
                 path = %path, deleted = flags.contains(CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED),
                 process = %process,
                 "镜像项已关闭（此后可回收）"
@@ -1031,9 +1078,130 @@ unsafe extern "system" fn close_completion_cb(
                 note_deleted(&path);
             } else {
                 note_closed(&path);
+                settle_drag_hover(&path);
             }
         }
     });
+}
+
+/// 拖拽悬停读留下的**部分水合**占位符会在复制时直接 `ERROR_CLOUD_FILE_NOT_SUPPORTED`
+/// （0x8007017B）：完全脱水或完全水合都能复制，只有“读了几 MB 就停”的中间态不行
+/// （`CopyFileW` / 资源管理器 `IFileOperation` 都一样）。
+///
+/// 资源管理器悬停时读 4 KiB 看文件头、关句柄、再读几 MB；最后一次关闭后到落下通常还有
+/// 几百毫秒。这里在**每次**关闭后检查：只要这一项还在“拖出”标记里、没有别的句柄、且磁盘上
+/// 是部分水合，就回脱水成 0 字节。随后复制从 offset 0 顺序水合，不会再走中间态。
+fn settle_drag_hover(path: &str) {
+    if !super::drag_pending(path) {
+        return;
+    }
+    let local = Path::new(path);
+    // 关闭回调可能和最后一次 `CfExecute(TRANSFER_DATA)` 的收尾挨着：失败时等一拍再试，
+    // 但要始终先看 `is_open` —— 复制已经开了句柄就绝不能跟它抢。
+    for attempt in 0..3 {
+        if super::is_open(local) {
+            return;
+        }
+        match hydration_state(local) {
+            Some(Hydration::Partial) => {}
+            Some(_) => return,
+            None => return,
+        }
+        match dehydrate_path(local) {
+            Ok(()) => {
+                info!(
+                    path,
+                    attempt,
+                    "拖拽悬停读已回脱水（部分水合的占位符无法被复制引擎复制）"
+                );
+                return;
+            }
+            Err(e) => {
+                debug!(path, attempt, error = %e, "拖拽悬停回脱水失败（等一拍再试）");
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        }
+    }
+}
+
+/// 起拖前把整份文件水合到本地（可靠版：复制引擎不能复制部分水合占位符）。
+pub fn hydrate_full(path: &Path) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let handle = HANDLE(file.as_raw_handle() as _);
+    unsafe { CfHydratePlaceholder(handle, 0, -1, CF_HYDRATE_FLAG_NONE, None) }
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// 起拖前把“上一次留下的”部分水合项回脱水（悬停读造成的那次由 [`settle_drag_hover`] 处理）。
+pub fn dehydrate_partial_for_drag(path: &Path) {
+    if super::is_open(path) {
+        return;
+    }
+    if !matches!(hydration_state(path), Some(Hydration::Partial)) {
+        return;
+    }
+    match dehydrate_path(path) {
+        Ok(()) => info!(path = %path.display(), "起拖前把部分水合的占位符回脱水"),
+        Err(e) => debug!(path = %path.display(), error = %e, "起拖前回脱水失败"),
+    }
+}
+
+enum Hydration {
+    /// 磁盘上 0 字节，完全没水合。
+    Empty,
+    /// 整个文件都在本地。
+    Full,
+    /// 读了一部分；复制引擎会在这种状态下报 0x8007017B。
+    Partial,
+}
+
+fn hydration_state(path: &Path) -> Option<Hydration> {
+    use std::os::windows::io::AsRawHandle;
+
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.is_dir() {
+        return None;
+    }
+    let size = meta.len();
+    if size == 0 {
+        return Some(Hydration::Full);
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let handle = HANDLE(file.as_raw_handle() as _);
+    let mut ranges = [CF_FILE_RANGE::default(); 64];
+    let mut returned = 0u32;
+    let result = unsafe {
+        CfGetPlaceholderRangeInfo(
+            handle,
+            CF_PLACEHOLDER_RANGE_INFO_ONDISK,
+            0,
+            -1,
+            ranges.as_mut_ptr() as *mut core::ffi::c_void,
+            (ranges.len() * std::mem::size_of::<CF_FILE_RANGE>()) as u32,
+            Some(&mut returned),
+        )
+    };
+    let count = (returned as usize / std::mem::size_of::<CF_FILE_RANGE>()).min(ranges.len());
+    if result.is_err() && count == 0 {
+        return None;
+    }
+    if count == 0 {
+        return Some(Hydration::Empty);
+    }
+    if count == 1 && ranges[0].StartingOffset == 0 && ranges[0].Length as u64 >= size {
+        return Some(Hydration::Full);
+    }
+    Some(Hydration::Partial)
+}
+
+fn dehydrate_path(path: &Path) -> Result<(), String> {
+    // 同上：脱水必须独占，否则复制引擎正在读的区间可能被抽走，目标副本会坏。
+    let handle = open_exclusive_for_write(path)?;
+    let result = unsafe { CfDehydratePlaceholder(handle, 0, -1, CF_DEHYDRATE_FLAG_NONE, None) };
+    unsafe { CfCloseHandle(handle) };
+    result.map_err(|e| format!("{e:?}"))
 }
 
 /// 目标要读一段字节：按需从对端拉，交给平台。
@@ -1089,7 +1257,9 @@ fn fetch_data(info: &CF_CALLBACK_INFO, params: &CF_CALLBACK_PARAMETERS) {
 
     // 登记这次请求：平台随后的撤销只认领**它**（见 [`note_cancel`]），落地时（含提前返回）摘掉。
     let fetch_guard = FetchGuard::begin(info.FileId, start, end);
-    info!(
+    // 每次区间请求一行（大文件会被要很多段）：属于排障用的吞吐/时序明细，默认不进文件。
+    // 目标长时间卡住时用 `RUST_LOG=debug` 能同时看到这行与下面的「水合完成」。
+    debug!(
         path = %id.path, start, end, required_start, required_end, size,
         flags = fetch.Flags.0,
         resume = fetch.Flags.contains(CF_CALLBACK_FETCH_DATA_FLAG_RECOVERY),
@@ -1200,9 +1370,9 @@ fn transfer_range(
             "只交付了 {delivered} 字节，没盖住平台需要的区间（{start}..{required_end}）"
         )));
     }
-    // 一行"这一段搬完了"：验证期要靠它把"目标侧看到的等待"和"我们实际拉了多少/多久"对上，
-    // 也是唯一能直接看出水合吞吐的地方。
-    info!(
+    // 一行"这一段搬完了"：把"目标侧看到的等待"和"我们实际拉了多少/多久"对上，
+    // 是唯一能直接看出水合吞吐的地方 —— 排障用，默认 `info` 不写（`RUST_LOG=debug` 可开）。
+    debug!(
         path = %id.path, bytes = delivered, range_start = start, range_end = end,
         required_end, ms = began.elapsed().as_millis() as u64,
         "水合完成"
@@ -1341,7 +1511,8 @@ fn fetch_placeholders(info: &CF_CALLBACK_INFO, _params: &CF_CALLBACK_PARAMETERS)
         })
         .collect();
 
-    info!(path = %path, count = array.len(), "填充目录：交回这一层");
+    // 每层目录一行；深目录树按目录数增长，默认只在 debug 里看。
+    debug!(path = %path, count = array.len(), "填充目录：交回这一层");
     let mut params = CF_OPERATION_PARAMETERS::default();
     params.ParamSize = param_size::<CF_OPERATION_PARAMETERS_0_4>();
     params.Anonymous.TransferPlaceholders = CF_OPERATION_PARAMETERS_0_4 {

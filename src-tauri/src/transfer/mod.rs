@@ -5,6 +5,7 @@ pub mod push_out;
 pub mod resume;
 pub mod stream;
 pub mod stream_send;
+pub mod target_lock;
 pub mod watch;
 
 use std::collections::HashMap;

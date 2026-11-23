@@ -324,6 +324,53 @@ IO 就地等着，直到 60 秒超时；而任何一次别的有效操作还会�
 （20 秒死线；旧实现会挂到 60 秒超时），随后 `place_with_meta(refresh=true)` 把大小改对，
 同一项还要能正常读出来。
 
+### 3.19 **部分水合**的占位符不能被复制：0x8007017B
+
+Windows 的复制引擎（`CopyFileW` / 资源管理器的 `IFileOperation`）对**部分水合**的占位符
+直接返回 `ERROR_CLOUD_FILE_NOT_SUPPORTED`（`0x8007017B`，中文“操作不受云同步提供程序支持”）。
+两端状态都正常，只有“读了一段就停”的中间态不行：
+
+| 占位符状态 | 复制结果 |
+|---|---|
+| 完全脱水（磁盘 0 字节） | 正常，复制时顺序水合 |
+| 完全水合（整个文件都在本地） | 正常 |
+| 部分水合（例如只读了 3 MB） | **0x8007017B**，目标文件不出现 |
+
+实测（Win11 26200）：同一份 145 MB 占位符，未水合时 `IFileOperation` 复制成功；先读 3 MB
+再复制，`PostCopyItem` 收到 `0x8007017B`，而 `std::fs::copy` 同样报 379。`CopyFile2` 加上
+`COPY_FILE_NO_BUFFERING` 或 `COPY_FILE_RESTARTABLE` 能绕过，但目标进程用什么标志不归我们管。
+
+拖拽场景正好会制造这个中间态：资源管理器悬停时读 4 KiB 看文件头、关句柄，再读几 MB 做
+图标/版本信息；用户落下后复制从“已水合末尾”开始，撞上中间态。小文件（例如 19.5 MB 的 mp4）
+悬停时往往被读完整份，所以以前看不出问题；145 MB 的 exe 只读了 3 MB 就落下，必现。
+
+两条修法（`src-tauri/src/drag.rs` + `mirror/win.rs`）：
+
+1. **≤ 256 MB 的文件起拖前整份水合**（`mirror::hydrate_full_for_drag`）。目标看到的是完整本地
+   数据，任何复制路径都不会再碰中间态；代价是起拖前要等下载完（界面已有“请按住不放”提示）。
+2. **大文件**仍按需水合；在 `drag::prepare_peer_payload` 给路径打“正在拖出”标记，资源管理器
+   悬停的句柄一关，`close_completion_cb` 就检查 `CfGetPlaceholderRangeInfo(ONDISK)`：
+   若是部分水合且没有别的句柄，调用 `CfDehydratePlaceholder` 回到 0 字节，让落下后的复制
+   从 offset 0 顺序水合。句柄还开着时平台会拒绝脱水（`ERROR_CLOUD_FILE_IN_USE`），所以
+   “悬停没关就立刻落下”的极端快拖仍可能失败 —— 这也是为什么小文件优先走整份水合。
+
+回归在 `tests/mirror_hydrate.rs` 的 7.7 / 7.8：子进程读 3 MB 后关句柄 → 必须回脱水 → 复制成功；
+以及整份水合后**悬停句柄还开着**时复制也必须成功。
+
+脱水/原地更新必须用**独占句柄**：`CF_UPDATE_FLAG_DEHYDRATE` 的文档明确要求调用方持有独占句柄，
+且平台不校验——共享句柄下并发读会把正在读的区间抽走，目标副本可能损坏。实现用
+`CfOpenFileWithOplock(CF_OPEN_FILE_FLAG_EXCLUSIVE | WRITE_ACCESS)`，拿不到就放弃本次脱水/更新。
+
+另外：`CfGetPlaceholderInfo` 走的是 **`CF_PLACEHOLDER_BASIC_INFO`**（不是 STANDARD），目录占位符
+还要用 `FILE_FLAG_BACKUP_SEMANTICS` 打开；否则重启后读不回身份 blob，同一项会被误判成新项，
+走删除重建或在被占用时多出一份 `(2)`。
+
+元数据已损坏（`CfGetPlaceholderInfo` 返回 `ERROR_CLOUD_FILE_METADATA_CORRUPTED`，os error 363）的
+占位符既删不掉也不能原地重建。`mirror::sweep` 和 `place` 的撞名分支现在把它**改名为同目录的
+`.orbdrop-corrupt-<uuid>` 隔离**，再决定是否清空登记表；回收器跳过这些隔离项（包括它们下面的
+子项），不再每 2 分钟为同一路径刷 WARN，也不会卡死同名的下一次拖出。改名本身若因句柄占用失败，
+仍按原逻辑保留，等待下一轮。
+
 ## 4. 代码地图
 
 | 文件 | 职责 |
@@ -369,7 +416,9 @@ IO 就地等着，直到 60 秒超时；而任何一次别的有效操作还会�
 cargo test --test mirror_hydrate -- --nocapture
 
 # 实机：启动后日志里应当看到"同步根已就绪/已注册" + "同步根已连接（镜像可用）"
-RUST_LOG=orbdrop_lib=info cargo run   # 在 src-tauri 下（没有开关了，镜子就是唯一的路）
+# 逐文件/逐区间的明细（镜像项被打开/已关闭、开始水合/水合完成、填充目录）只在 debug，
+# 默认 info 不写文件 —— 验拖放时用 debug。
+RUST_LOG=orbdrop_lib=debug cargo run   # 在 src-tauri 下（没有开关了，镜子就是唯一的路）
 ```
 
 实机验证要点（**尚未由人手做过**）：
@@ -378,8 +427,8 @@ RUST_LOG=orbdrop_lib=info cargo run   # 在 src-tauri 下（没有开关了，�
 2. 拖一个**目录**到资源管理器 → 应当秒起拖，子树边复制边出现；
 3. 拖到微信/QQ（只认 `CF_HDROP` 的应用）→ 应当能收到；
 4. 抓起后**不落下**（拖回原处/按 Esc）→ 镜像里应当**什么都没下**（对比旧路：已经下完并留 6 小时）；
-5. 观察日志里 `镜像项被打开/已关闭` 那两行带 `process=` 的字段：如果有个进程在没有任何人拖放的
-   时候反复读镜像（索引器/杀软），会在这里现形 —— 那是白下载的来源。
+5. 带 `RUST_LOG=orbdrop_lib=debug` 观察日志里 `镜像项被打开/已关闭` 那两行带 `process=` 的字段：
+   如果有个进程在没有任何人拖放的时候反复读镜像（索引器/杀软），会在这里现形 —— 那是白下载的来源。
 6. **复制过程中再拖一次**（同一项或另一项）：两个复制都应当完成；正在读的占位符不能被删。
    同一项在错误后重试应当**沿用原来的文件名**（复用/重建同名占位符，保留已水合字节），
    目标目录不该多出 `(2)`；只有确认是另一项清洗后撞名且正在使用时才会带后缀。

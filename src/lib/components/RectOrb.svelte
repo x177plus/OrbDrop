@@ -86,6 +86,15 @@
   const FLIP_MS = 400;
   /** 滚轮累积到这么多像素才翻页（原型同值）：先让列表自己滚，到底/到顶才换页。 */
   const FLIP_AT = 40;
+  /**
+   * “滚到底”的判定余量（px）。
+   *
+   * `scrollHeight - clientHeight` 是 84px 视口的理论值，浏览器实际能到的 `scrollTop`
+   * 会比它小 2px 左右（列表上下各 3px 的 `--rq-scroll-pad` 与取整叠加）。原来按 1.5px
+   * 判，向下永远差这一点点 —— 表现就是“只能往上翻页，往下滚到底也不换卡”。
+   * 4px 比一行 30px 小得多，视觉上仍然是“到底再滚”。
+   */
+  const FLIP_EDGE_PX = 4;
   /** 一次翻页后多久才接下一次滚轮翻页（原型同值）：免得滚轮一甩飞过去好几页。 */
   const LOCK_MS = 520;
   const DRAG_THRESHOLD_PX = 4;
@@ -224,7 +233,7 @@
     if (!el) return true;
     const max = maxScroll(el);
     const target = targets[idx] ?? el.scrollTop;
-    if (dir > 0) return target >= max - 0.5 && el.scrollTop >= max - 1.5;
+    if (dir > 0) return target >= max - FLIP_EDGE_PX && el.scrollTop >= max - FLIP_EDGE_PX;
     return target <= 0.5 && el.scrollTop <= 1.5;
   }
 

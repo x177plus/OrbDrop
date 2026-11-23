@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::credential;
 use crate::state::AppState;
@@ -1400,6 +1400,9 @@ pub fn report_to_sender(
     let paired = state.get_peer(peer_id).is_some_and(|p| p.paired);
     let client = crate::net::dial_client(&ip, &crate::credential::dial_pin(peer_id, paired));
     crate::task::spawn("push report", async move {
+        // 单次失败只在 debug 里留一行：三次重试是同一个回执，按 WARN 记就是一次事件
+        // 刷三行（实测 14 天 154 行）。默认 `info` 只看最终结果，且把最后一次原因带上。
+        let mut last = String::from("（没有尝试）");
         for (attempt, delay) in [
             Duration::ZERO,
             Duration::from_secs(1),
@@ -1417,13 +1420,19 @@ pub fn report_to_sender(
             }
             match req.send().await {
                 Ok(resp) if resp.status().is_success() => return,
-                Ok(resp) => warn!(%url, attempt, status = %resp.status(), "推送回执被拒"),
-                Err(e) => warn!(%url, attempt, %e, "推送回执发送失败"),
+                Ok(resp) => {
+                    last = format!("HTTP {}", resp.status());
+                    debug!(%url, attempt, status = %resp.status(), "推送回执被拒（重试）");
+                }
+                Err(e) => {
+                    last = e.to_string();
+                    debug!(%url, attempt, %e, "推送回执发送失败（重试）");
+                }
             }
         }
         // 三次都没成：这条回执就真没了。发送方那边有对账（`PushAsk`）兜底 ——
         // 链路回来时它会问一遍，接收方的结局记录会给出真实答案。
-        error!(%url, "推送回执三次都发不出去，等发送方对账");
+        error!(%url, error = %last, "推送回执三次都发不出去，等发送方对账");
     });
 }
 
@@ -1646,6 +1655,21 @@ fn spawn_download_legacy(
                 }
             }
 
+            // 同一目标只允许一个写者：两条老协议接收（或一条老协议 + 一条新协议）同时
+            // 落同一路径时，最终路径会被两边交替截断/写入。拿不到租约就保留待续传、
+            // 退避后再试，不能并发写。
+            let _target_lease = match super::target_lock::TargetLease::try_acquire(&file_target) {
+                Some(lease) => lease,
+                None => {
+                    fail_attempt(
+                        &state,
+                        &peer_id,
+                        &invite_id,
+                        format!("同一文件正在被另一条操作写入: {}", file_target.display()),
+                    );
+                    return;
+                }
+            };
             let mut offset = state.push.resume.load(&invite_id, &file.path);
             let mut last_saved = offset;
             let mut last_persist_time = Instant::now();
@@ -1653,9 +1677,6 @@ fn spawn_download_legacy(
             // 决定的是"崩溃后最多重传多少"，不再是磁盘写入次数。
             const PERSIST_CHUNK: u64 = 8 * 1024 * 1024;
             const PERSIST_INTERVAL: Duration = Duration::from_secs(5);
-            // 连续几次"一个字节都没拿到"就判这条文件失败（见循环尾部的守卫）。
-            const MAX_STALLS: u32 = 3;
-            let mut stalled = 0u32;
 
             // 句柄**一次开到底**：续传时它跨多次尝试复用，收尾那次 `sync_data` 也用它，
             // 不必为了确认落盘再开一次。
@@ -1677,12 +1698,37 @@ fn spawn_download_legacy(
                     return;
                 }
             };
-            // 记录长度以外的尾巴一律截掉：上次可能崩在"字节写完"与"进度记上"之间，
-            // 那截尾巴没被记账，留着只会卡在文件中间当垃圾。
-            if fh.metadata().await.map(|m| m.len()).unwrap_or(0) > offset {
+            // 续传记录只在“字节真的落盘”之后才写；但断电/磁盘错误仍可能让记录比盘上的文件长。
+            // 记录比文件短/长都不能直接信任：
+            // - 文件更短：从 offset 接着写会在中间留一个洞，最后长度对、内容是坏的；
+            //   这条文件必须从 0 重下（记录也一起归零）。
+            // - 文件更长：截掉记录之外的尾巴（上次可能崩在“写完”与“记上”之间）。
+            let file_len = fh.metadata().await.map(|m| m.len()).unwrap_or(0);
+            if file_len < offset {
+                warn!(
+                    %invite_id,
+                    path = %file.path,
+                    offset,
+                    file_len,
+                    "续传记录比磁盘文件长：从 0 重下，不能从空洞后继续"
+                );
+                if let Err(e) = fh.set_len(0).await {
+                    fail_file(fh, &file_target, format!("截断续传文件失败: {e}"));
+                    return;
+                }
+                offset = 0;
+                last_saved = 0;
+                state.push.resume.save(&invite_id, &file.path, 0);
+            } else if file_len > offset {
                 let _ = fh.set_len(offset).await;
             }
 
+            // 非 410/409 的 HTTP 错误或连接失败：有限次重试后把这一轮交回 `resume_pending`
+            // 的退避队列。以前这里只 `sleep(2s); continue`，对端 404/401/500 或地址失联
+            // 时会无限循环，这条推送永远停在接收中。
+            const MAX_HTTP_FAILURES: u32 = 15;
+            let mut http_failures = 0u32;
+            let mut last_http_error: String;
             'file: loop {
                 if state.push.inbound.lock().get(&invite_id).is_none() {
                     // 邀请被取走了 = 用户点了取消（或拒绝）—— 话已经由 `cancel_receive` 带过去了，
@@ -1740,12 +1786,38 @@ fn spawn_download_legacy(
                     }
                     Ok(r) if !r.status().is_success() => {
                         error!(%invite_id, status = %r.status(), "download failed");
+                        http_failures += 1;
+                        last_http_error = format!("HTTP {}", r.status());
+                        if http_failures >= MAX_HTTP_FAILURES {
+                            fail_attempt(
+                                &state,
+                                &peer_id,
+                                &invite_id,
+                                format!(
+                                    "连续 {http_failures} 次请求失败（最后一次 {last_http_error}），稍后重试"
+                                ),
+                            );
+                            return;
+                        }
                         sleep(Duration::from_secs(2)).await;
                         continue;
                     }
                     Ok(r) => r,
                     Err(e) => {
                         warn!(%invite_id, %e, "download error, retry");
+                        http_failures += 1;
+                        last_http_error = e.to_string();
+                        if http_failures >= MAX_HTTP_FAILURES {
+                            fail_attempt(
+                                &state,
+                                &peer_id,
+                                &invite_id,
+                                format!(
+                                    "连续 {http_failures} 次连接失败（最后一次 {last_http_error}），稍后重试"
+                                ),
+                            );
+                            return;
+                        }
                         sleep(Duration::from_secs(2)).await;
                         continue;
                     }
@@ -1755,7 +1827,6 @@ fn spawn_download_legacy(
                     fail_file(fh, &file_target, format!("定位写入位置失败: {e}"));
                     return;
                 }
-                let attempt_start = offset;
                 // 一次尝试一个缓冲：客户端交给我们的块常常只有十几 KB（TLS 记录的粒度），
                 // 逐块写就是每 16KB 一次阻塞任务派发；256KB 缓冲把写系统调用除十几倍。
                 let mut out =
@@ -1775,8 +1846,31 @@ fn spawn_download_legacy(
                             //
                             // **先把缓冲交出去再退**：`offset` 已经把缓冲里的字节算进去了，
                             // 丢掉它们就等于"以为收过、其实没写"（后续续传直接从洞后面接着写）。
-                            let _ = out.flush().await;
+                            if let Err(fe) = out.flush().await {
+                                // offset 已经把缓冲里的字节算进去了；flush 失败代表这些字节
+                                // 没落盘，不能从前进后的 offset 继续（会留洞）。
+                                drop(out);
+                                fail_file(
+                                    fh,
+                                    &file_target,
+                                    format!("断流时写入失败: {fe}"),
+                                );
+                                return;
+                            }
                             warn!(%invite_id, %e, "stream error");
+                            http_failures += 1;
+                            last_http_error = e.to_string();
+                            if http_failures >= MAX_HTTP_FAILURES {
+                                fail_attempt(
+                                    &state,
+                                    &peer_id,
+                                    &invite_id,
+                                    format!(
+                                        "连续 {http_failures} 次断流（最后一次 {last_http_error}），稍后重试"
+                                    ),
+                                );
+                                return;
+                            }
                             continue 'file;
                         }
                     };
@@ -1868,24 +1962,33 @@ fn spawn_download_legacy(
                 }
                 drop(out);
 
-                // 一次尝试零字节：等一拍再来；连续 `MAX_STALLS` 次判这条邀请失败。
-                //
-                // 没有这道守卫，只要"对端能回 200 空包"而清单又说还有字节，两边就会进入
-                // "狂发请求 / 狂回空包"的死循环 —— 谁也不报错，用户只看到永远停在某个百分比。
-                if offset == attempt_start {
-                    stalled += 1;
-                    if stalled >= MAX_STALLS {
-                        fail_file(
-                            fh,
-                            &file_target,
-                            format!("传输没有进展（对端没有数据）: {}", file.path),
+                // 200 也可能在清单长度之前结束（对端换了文件/内容长度写短/连接被切）。
+                // 这不是 EOF：必须从当前落盘 offset 继续要，否则会把截断文件判成完成。
+                if offset < file.size {
+                    http_failures += 1;
+                    last_http_error = format!("流提前结束（{offset}/{}）", file.size);
+                    warn!(
+                        %invite_id,
+                        path = %file.path,
+                        offset,
+                        size = file.size,
+                        "stream ended before the file size"
+                    );
+                    if http_failures >= MAX_HTTP_FAILURES {
+                        fail_attempt(
+                            &state,
+                            &peer_id,
+                            &invite_id,
+                            format!(
+                                "连续 {http_failures} 次流提前结束（最后一次 {last_http_error}），稍后重试"
+                            ),
                         );
                         return;
                     }
                     sleep(Duration::from_secs(2)).await;
-                } else {
-                    stalled = 0;
+                    continue 'file;
                 }
+
             }
             // 这个文件收完了：把最后的字节确认到盘上，再记终点（同上一条纪律）。
             let _ = fh.sync_data().await;

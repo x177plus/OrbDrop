@@ -44,12 +44,12 @@
 //! 注意：镜像与已经被删掉的 `staging` 只是"都在数据目录里"这一点相同，语义完全不同 ——
 //! `staging` 放的是**真实字节**，镜像放的是**占位符**。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::state::AppState;
 
@@ -80,6 +80,14 @@ const MIRROR_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 /// 目标关句柄之后多久可以回收。留一段余地：复制完再校验一遍、杀软顺手扫一眼都会重新打开，
 /// 关掉就删会把紧接着的那次读打成失败。
 const CLOSE_GRACE: Duration = Duration::from_secs(60);
+
+/// 「这一项正在被拖出」的标记保留多久。
+///
+/// 标记在 `drag::prepare_peer_payload` 交出路径时写下；资源管理器悬停读文件（缩略图/版本信息）
+/// 会把占位符读成**部分水合**，而 Windows 的复制引擎复制部分水合的占位符会直接失败
+/// （`ERROR_CLOUD_FILE_NOT_SUPPORTED`，0x8007017B）。句柄一关就把这部分数据回脱水，复制才能
+/// 从 0 开始按需水合。标记只在这段时间内有效，防止很久以后误脱水用户正常打开的文件。
+const DRAG_SETTLE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// 后台回收的节拍。回收**不在拖拽路径上**：拖拽路径里做扫描既慢，又会和"刚放好的项"抢同一
 /// 路径（并发拖两个项时，后一个的扫描可能把前一个正在复制的占位符删掉）。
@@ -310,6 +318,9 @@ struct Lifecycle {
     /// 本地路径 → 我们写进去的身份 blob。同名复用/撞名判定用它，不用再去平台问
     /// （`CfGetPlaceholderInfo` 的返回布局/打开行为都多一层不确定性）。
     identities: HashMap<String, Vec<u8>>,
+    /// 正在拖出的项：路径 → 标记时刻。句柄全关后若占位符是**部分水合**，就回脱水
+    /// （见 [`note_drag_out`] / [`drag_pending`]）。
+    drag_settle: HashMap<String, Instant>,
 }
 
 static LIFE: LazyLock<Mutex<Lifecycle>> = LazyLock::new(|| Mutex::new(Lifecycle::default()));
@@ -358,6 +369,7 @@ pub fn note_deleted(path: &str) {
     }
     life.idle.remove(&key);
     life.placed.remove(&key);
+    life.drag_settle.remove(&key);
 }
 
 /// 某项刚被放入镜像（新建或复用）：TTL 从这一刻起算，并记下它的身份 blob。
@@ -366,7 +378,70 @@ pub fn note_placed(path: &Path, blob: &[u8]) {
     let mut life = LIFE.lock().unwrap();
     life.placed.insert(key.clone(), Instant::now());
     life.idle.remove(&key);
+    // 新的一次放置重新开始算：旧的拖出标记不能留到这次之后的关闭上。
+    life.drag_settle.remove(&key);
     life.identities.insert(key, blob.to_vec());
+}
+
+/// 这一项刚被交给拖放目标：记住它，句柄关掉后如果是**部分水合**就回脱水。
+///
+/// Windows 的复制引擎遇到部分水合的占位符会直接 `ERROR_CLOUD_FILE_NOT_SUPPORTED`
+/// （0x8007017B）；完全脱水或完全水合都正常。资源管理器在拖拽悬停时会把文件读几 MB 做
+/// 图标/版本信息，正好制造出“部分水合”。所以拖出路径在这里登记，等悬停句柄关闭后由
+/// [`drag_pending`] 在每次关闭时检查。
+pub fn note_drag_out(path: &Path) {
+    let key = normalize(&path.to_string_lossy());
+    let now = Instant::now();
+    let mut life = LIFE.lock().unwrap();
+    life.drag_settle
+        .retain(|_, at| now.saturating_duration_since(*at) < DRAG_SETTLE_TTL);
+    life.drag_settle.insert(key, now);
+}
+
+/// 这一项现在是否仍带着“正在拖出”的标记（过期的顺手清掉）。
+///
+/// 标记**不在回脱水成功后摘掉**：资源管理器悬停会开/关多次句柄（读一页、关掉、重开），
+/// 第一次关闭时脱水 4 KiB，随后还会读到几 MB；每次关闭都要再看一眼，直到 TTL 过期。
+pub fn drag_pending(path: &str) -> bool {
+    let key = normalize(path);
+    let now = Instant::now();
+    let mut life = LIFE.lock().unwrap();
+    match life.drag_settle.get(&key) {
+        Some(at) if now.saturating_duration_since(*at) < DRAG_SETTLE_TTL => true,
+        Some(_) => {
+            life.drag_settle.remove(&key);
+            false
+        }
+        None => false,
+    }
+}
+
+/// 起拖前把整份内容水合到本地（Windows）。失败返回原因，由调用方决定是中止还是降级。
+///
+/// 这是绕开“Windows 复制引擎不能复制部分水合占位符（0x8007017B）”的**可靠**路径：
+/// 文件已完全水合时，目标看到的是完整本地数据，复制不会再走中间态。代价是起拖前要等下载
+/// 完 —— 界面已经有「正在准备…（请按住不放）」提示。只对调用方判定为“小到可以等”的文件用。
+pub fn hydrate_full_for_drag(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        win::hydrate_full(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// 第 `path` 项如果现在就是“部分水合”，在起拖前先回脱水。
+///
+/// 覆盖“上一次拖拽/打开留下的中间态”：Windows 复制部分水合的占位符会直接报
+/// 0x8007017B。当前这次拖拽的悬停读由 [`drag_pending`] 在关闭时处理。
+pub fn dehydrate_partial_for_drag(path: &Path) {
+    #[cfg(windows)]
+    win::dehydrate_partial_for_drag(path);
+    #[cfg(not(windows))]
+    let _ = path;
 }
 
 /// 这个本地路径最近一次放的是哪一项（创建/复用/删除后都保留）。
@@ -409,6 +484,30 @@ fn normalize(path: &str) -> String {
     path.to_ascii_lowercase()
 }
 
+/// 回收失败的路径：同一路径**只在第一次失败时**记一条 WARN。
+///
+/// `sweep` 每 2 分钟跑一次，而损坏的占位符（实测 Windows `ERROR_CLOUD_FILE_METADATA_CORRUPTED`，
+/// os error 363）删不掉也不会自愈。按"每次失败一行 WARN"记，单项就是 720 行/天；
+/// 本机 14 天里这一条占了 6828 行、2.1 MB，是日志总量的六成。首次失败留 WARN 供排障，
+/// 后续重试降到 debug（`RUST_LOG=debug` 仍能看到全过程）；回收成功就摘掉，下次再失败重新 WARN。
+static SWEEP_FAILED: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 记一次回收失败；返回「这是该路径的第一次失败」。只有第一次值得 WARN。
+fn first_sweep_failure(path: &Path) -> bool {
+    SWEEP_FAILED
+        .lock()
+        .unwrap()
+        .insert(normalize(&path.to_string_lossy()))
+}
+
+fn clear_sweep_failure(path: &Path) {
+    SWEEP_FAILED
+        .lock()
+        .unwrap()
+        .remove(&normalize(&path.to_string_lossy()));
+}
+
 /// 清掉可以回收的镜像项：关句柄满 [`CLOSE_GRACE`] 的，或按龄超过 [`MIRROR_TTL`] 的。
 ///
 /// 只在启动时和后台周期里跑，**不在拖拽路径上**：拖拽路径里跑扫描会和"刚放好的项"抢路径
@@ -431,6 +530,14 @@ pub fn sweep() {
             };
             for item in items.flatten() {
                 let path = item.path();
+                // 已隔离的损坏项不再重试（它的元数据删不掉；再扫只会每 2 分钟刷一条日志）。
+                // 名字前缀由 `win::quarantine_corrupt` 写入。
+                if path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(".orbdrop-corrupt-"))
+                {
+                    continue;
+                }
                 // 登记过的工作副本（含它所在的 `work/` 顶层目录）一律不回收。
                 let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                 if protected.iter().any(|entry| {
@@ -453,10 +560,26 @@ pub fn sweep() {
                 };
                 match removed {
                     Ok(()) => {
+                        clear_sweep_failure(&path);
                         note_deleted(&path.to_string_lossy());
                         info!(path = %path.display(), "镜像项已回收");
                     }
-                    Err(e) => warn!(path = %path.display(), error = %e, "镜像项回收失败"),
+                    Err(e) => {
+                        // 元数据损坏（363）/ provider 已终止：正常删除永远失败。改名隔离到
+                        // 隐藏名，至少不再占着原路径（用户重拖同名项时能新建）。
+                        #[cfg(windows)]
+                        if win::quarantine_corrupt(&path, &e) {
+                            clear_sweep_failure(&path);
+                            note_deleted(&path.to_string_lossy());
+                            info!(path = %path.display(), error = %e, "镜像项元数据损坏，已改名隔离");
+                            continue;
+                        }
+                        if first_sweep_failure(&path) {
+                            warn!(path = %path.display(), error = %e, "镜像项回收失败（后续重试不再重复记录）");
+                        } else {
+                            debug!(path = %path.display(), error = %e, "镜像项回收失败（重试）");
+                        }
+                    }
                 }
             }
             // 空的共享项/对端目录**不删**：那会和并发 `place` 的 `create_dir_all` 抢同一路径
@@ -598,5 +721,18 @@ mod tests {
             normalize(r"C:\Mirror\P\A.BIN"),
             normalize(r"c:\mirror\p\a.bin")
         );
+    }
+
+    /// 同一路径反复回收失败只算"第一次"：WARN 只留一行，回收成功后重新计数。
+    #[test]
+    fn repeated_sweep_failures_are_reported_once() {
+        let path = Path::new(r"C:\mirror\sweep-dedupe-test\a.bin");
+        clear_sweep_failure(path);
+        assert!(first_sweep_failure(path));
+        assert!(!first_sweep_failure(path));
+        assert!(!first_sweep_failure(path));
+        clear_sweep_failure(path);
+        assert!(first_sweep_failure(path), "回收成功后再次失败要重新记录");
+        clear_sweep_failure(path);
     }
 }

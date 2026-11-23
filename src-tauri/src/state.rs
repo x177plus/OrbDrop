@@ -1136,7 +1136,7 @@ impl AppState {
     /// 不可伪造；仍按 `/chat/*` / `/pair/hello` 的同一套判据排除"本机自己的监听端点"
     /// （模拟器回连）与"经中转过来的"（来源是中转方，不是对端）。端口优先用对端自报的
     /// （`?port=`：服务器可能顺延），老版本不带时沿用地址簿里的旧端口。
-    pub fn learn_link_endpoint(
+    pub async fn learn_link_endpoint(
         self: &Arc<Self>,
         peer_id: &str,
         source: std::net::IpAddr,
@@ -1171,6 +1171,38 @@ impl AppState {
                 %source,
                 "长连接来源是本机认识的另一台设备（经它中转），不据此改地址"
             );
+            return;
+        }
+        // 来源地址变了（或原先没有地址）时，**先用对端证书指纹探一次 `/pair/info`**：
+        // 经中转拨入的连接来源是中转方，直接写进地址簿会让本机之后永远去拨中转方。
+        // 探测答不出同一个设备 id（证书也对不上）就不改地址；真正换 IP 的直连对端会通过。
+        if known.ip != ip.to_string() || known.port != port {
+            let fingerprint = crate::credential::get_peer_fingerprint(peer_id)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if !fingerprint.is_empty()
+                && !probe_peer_id_at(&ip.to_string(), port, peer_id, &fingerprint).await
+            {
+                debug!(
+                    %peer_id,
+                    %source,
+                    %ip,
+                    port,
+                    "长连接来源与已知地址不同，且身份探测未通过，不更新直连地址"
+                );
+                return;
+            }
+        }
+        self.adopt_link_endpoint(peer_id, ip, port);
+    }
+
+    /// 把一条已核实的长连接来源写进地址簿（[`Self::learn_link_endpoint`] 的收尾）。
+    fn adopt_link_endpoint(self: &Arc<Self>, peer_id: &str, ip: String, port: u16) {
+        let Some(known) = self.get_peer(peer_id) else {
+            return;
+        };
+        if known.ip == ip && known.port == port {
             return;
         }
         let name = if known.name.is_empty() {

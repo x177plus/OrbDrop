@@ -420,6 +420,8 @@
   let remarkState = $state<{ peerId: string; rawName: string; value: string; saved: string; busy: boolean; error: string | null } | null>(null);
   // Toast messages
   let toasts = $state<{ id: number; msg: string; leaving: boolean }[]>([]);
+  /** 收起态也要让用户知道的提示（目前是自动写回冲突/失败）：排队等面板展开再弹，并计入角标。 */
+  let importantToasts = $state<{ id: number; msg: string }[]>([]);
   let toastId = $state(0);
 
   let connectedCount = $derived(getDevices().filter(d => d.connected).length);
@@ -456,7 +458,9 @@
   let pushPendingCount = $derived(pushBatches.filter(batchSticky).length);
   // 「更新这件事」也算一件：后台检查发现新版（或已经点过「立即更新」）时，
   // 它就和那些"等你确认"的通知一样占着右下角一格（见上面的 `upd.updateTask`）。
-  let notifCount = $derived(notices.length + pushPendingCount + (updateTask ? 1 : 0));
+  let notifCount = $derived(
+    notices.length + pushPendingCount + (updateTask ? 1 : 0) + importantToasts.length,
+  );
   // 底栏右下角那格版本号：**与设置里「当前版本」同一个源**（后端 `UpdateState.current`，
   // 也就是 `tauri.conf.json` 的 version）。写死字面量的话，`npm run bump` 之后底栏就停在
   // 上一版上，跟设置里那格对不上 —— 版本号只该有一处真源。
@@ -1739,10 +1743,7 @@
   }
 
   // Toast
-  function toast(msg: string) {
-    // 提示是主面板上的瞬时反馈：面板收着（只剩悬浮球）时一律不弹 —— 通知/进度卡才是
-    // 收起态要看的东西，旧提示排到下次展开再冒出来只会对不上眼前的状态。
-    if (!expanded) return;
+  function pushToast(msg: string) {
     const id = ++toastId;
     toasts = [...toasts, { id, msg, leaving: false }];
     setTimeout(() => {
@@ -1750,6 +1751,33 @@
       setTimeout(() => { toasts = toasts.filter(t => t.id !== id); }, 260);
     }, 2200);
   }
+
+  function toast(msg: string) {
+    // 普通提示是主面板上的瞬时反馈：面板收着时一律不弹（旧提示排到下次展开再冒出来
+    // 只会对不上眼前的状态）。需要在收起态也让用户知道的走 `toastImportant`。
+    if (!expanded) return;
+    pushToast(msg);
+  }
+
+  /**
+   * 收起态也要送达的提示（自动写回冲突/失败）。面板收着时进队列并计入通知角标，
+   * 展开后按顺序补弹；不这样的话，用户保存完文件、面板一收，写回失败就彻底无声。
+   */
+  function toastImportant(msg: string) {
+    if (expanded) {
+      pushToast(msg);
+      return;
+    }
+    importantToasts = [...importantToasts, { id: ++toastId, msg }].slice(-20);
+  }
+
+  // 展开时把收起态排队的“重要提示”补成正常 toast（角标随之归零）。
+  $effect(() => {
+    if (!expanded || importantToasts.length === 0) return;
+    const queued = importantToasts;
+    importantToasts = [];
+    for (const item of queued) pushToast(item.msg);
+  });
 
   // ── 自更新（F-110）─────────────────────────────────────────────────────
   // 启动时的静默检查发现新版（后端 `state.silent` 认这一档）时，右下角那组通知里就多一格
@@ -2902,6 +2930,8 @@
     try {
       code = await pairStart(peerId);
     } catch (e) {
+      // `addAndPair` 在调用前把 busy 置真；这里必须复位，否则失败一次按钮就永久 disabled。
+      if (pairState) pairState = { ...pairState, busy: false, error: String(e) };
       toast(t('生成配对码失败：{error}', { error: String(e) }));
       return;
     }
@@ -3782,19 +3812,19 @@
     }>('writeback://auto', (ev) => {
       const { name, state, error, localDirty } = ev.payload;
       if (state === 'conflict') {
-        toast(t('自动写回「{name}」未执行：{error}', { name, error: error ?? t('对端文件已变化') }));
+        toastImportant(t('自动写回「{name}」未执行：{error}', { name, error: error ?? t('对端文件已变化') }));
       } else if (state === 'blocked') {
-        toast(t('自动写回「{name}」已暂停：{error}', { name, error: error ?? '' }));
+        toastImportant(t('自动写回「{name}」已暂停：{error}', { name, error: error ?? '' }));
       } else if (state === 'failed') {
-        toast(t('自动写回「{name}」失败，稍后自动重试：{error}', { name, error: error ?? '' }));
+        toastImportant(t('自动写回「{name}」失败，稍后自动重试：{error}', { name, error: error ?? '' }));
       } else if (state === 'remote-changed') {
-        toast(
+        toastImportant(
           localDirty
             ? t('对端已更新「{name}」，本地也有修改；写回会冲突')
             : t('对端已更新「{name}」；关闭后重新打开可获取最新内容'),
         );
       } else if (state === 'refresh-failed') {
-        toast(t('刷新本地副本「{name}」失败：{error}', { name, error: error ?? '' }));
+        toastImportant(t('刷新本地副本「{name}」失败：{error}', { name, error: error ?? '' }));
       }
     });
 

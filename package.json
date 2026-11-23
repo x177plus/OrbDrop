@@ -1,6 +1,6 @@
 {
   "name": "orbdrop",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "OrbDrop — LAN file sharing tool",
   "type": "module",
   "scripts": {
@@ -16,6 +16,8 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test:snapshot": "node scripts/test-snapshot-order.mjs",
     "check:watch": "svelte-check --tsconfig ./tsconfig.json --watch",
+    "clean:builds": "node scripts/clean-builds.mjs",
+    "clean:builds:dry": "node scripts/clean-builds.mjs --dry-run",
     "tauri": "tauri",
     "mac:dev": "tauri dev",
     "mac:build": "tauri build --target universal-apple-darwin",

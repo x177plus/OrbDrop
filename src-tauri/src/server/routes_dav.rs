@@ -615,6 +615,17 @@ async fn write_response(
     if target.is_dir() {
         return Err((StatusCode::METHOD_NOT_ALLOWED, "目标是目录".into()));
     }
+    // 同一目标只允许一个写者：固定 `<name>.orbdrop-part` 在两路并发 PUT 时会互相截断/
+    // 交错写，最后 rename 成功的那个请求返回 204，共享文件却是两份内容拼起来的。
+    // 拿不到租约就让客户端稍后重试（BC/WebDAV 客户端都按 409/503 重试）。
+    let Some(_target_lease) =
+        crate::transfer::target_lock::TargetLease::try_acquire(target)
+    else {
+        return Err((
+            StatusCode::CONFLICT,
+            "同一文件正在被另一条操作写入，稍后重试".into(),
+        ));
+    };
     // 体积预检：`Content-Length` 摆在那儿就先拒，不必先读一遍再拒（BC 保存超大文件时立刻
     // 拿到明确原因，而不是等传完才 413）。放在建父目录之前 —— 被拒的请求不该在磁盘上留痕。
     if let Some(len) = req
@@ -1384,6 +1395,23 @@ mod tests {
 
     /// 写回的三种动作（新建 / 覆盖 / 删除）都要真落到共享方磁盘上，
     /// 且新文件落在还不存在的子目录里也要能写（BC 保存新建文件时不一定先 MKCOL）。
+    #[tokio::test]
+    async fn a_put_on_a_target_locked_by_a_receive_is_refused() {
+        let (_state, port, root, share_id) = serve(4121).await;
+        let target = root.canonicalize().unwrap().join("locked.txt");
+        let _lease = crate::transfer::target_lock::TargetLease::try_acquire(&target)
+            .expect("先拿到写租约，模拟一条正在接收的推送");
+        let url = format!("http://127.0.0.1:{port}/dav/{share_id}/locked.txt");
+        let resp = Client::new()
+            .put(&url)
+            .body("must not interleave")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::CONFLICT);
+        assert!(!target.exists(), "被拒的 PUT 不应在磁盘上留下文件");
+    }
+
     #[tokio::test]
     async fn put_get_range_and_delete_touch_real_files() {
         let (state, port, root, share_id) = serve(4120).await;

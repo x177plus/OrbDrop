@@ -104,13 +104,23 @@
     }));
   }
 
-  function handleBroadcastToggle(shareId: string, checked: boolean) {
-    toggleBroadcast(shareId, checked).catch(console.error);
-    onToast(checked
-      ? (connectedDevices.length > 0
-        ? t('已开启广播 · 自动广播至 {names}', { names: connectedDevices.map(deviceShortName).join(t('、')) })
-        : t('已开启广播'))
-      : t('已停止广播该共享项'));
+  async function handleBroadcastToggle(
+    shareId: string,
+    checked: boolean,
+    input: HTMLInputElement,
+  ) {
+    try {
+      await toggleBroadcast(shareId, checked);
+      onToast(checked
+        ? (connectedDevices.length > 0
+          ? t('已开启广播 · 自动广播至 {names}', { names: connectedDevices.map(deviceShortName).join(t('、')) })
+          : t('已开启广播'))
+        : t('已停止广播该共享项'));
+    } catch (e) {
+      // `checked` 是单向属性：后端失败时 Svelte 不会自己把 DOM 拨回去，必须手动复位。
+      input.checked = !checked;
+      onToast(t('操作失败：{error}', { error: String(e) }));
+    }
   }
 
   function openCtx(e: MouseEvent, el: HTMLElement, share: ShareItem) {
@@ -197,7 +207,11 @@
               <input
                 type="checkbox"
                 checked={share.broadcastEnabled}
-                onchange={(e) => handleBroadcastToggle(share.id, (e.currentTarget as HTMLInputElement).checked)}
+                onchange={(e) => void handleBroadcastToggle(
+                  share.id,
+                  (e.currentTarget as HTMLInputElement).checked,
+                  e.currentTarget as HTMLInputElement,
+                )}
               />
               <span class="track"></span>
             </label>

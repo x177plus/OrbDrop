@@ -862,8 +862,8 @@ mod tests {
         ))
         .await
         .unwrap();
-        let body = resp.bytes().await.unwrap();
-        assert!(body.is_empty());
+        // 越过 EOF 必须是明确错误：回 200 空包会被下载端当成 EOF，把截断文件当成功发布。
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
 
         let resp = reqwest::get(format!(
             "http://127.0.0.1:{port}/file?share=nonexistent&path=hello.txt"

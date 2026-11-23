@@ -2048,14 +2048,34 @@ async fn an_inbound_link_corrects_the_peers_stale_address() {
         paused: false,
         relay: None,
     });
-    credential::set_peer_credential("device-roam", "tok-roam", &"a".repeat(64)).unwrap();
+    // 真实的对端服务：地址变更现在先用对端证书指纹探一次 `/pair/info` 才落库
+    // （经中转拨入的来源是中转方，不能直接写进地址簿）。起一台同证书、id 为 device-roam
+    // 的回环服务顶替那台手机。
+    let peer_port = free_port();
+    let peer_state = make_state(
+        peer_port,
+        "device-roam",
+        "Phone",
+        temp_share_dir("roam_peer_save"),
+    );
+    let peer_serving = orbdrop_lib::server::start_server_loopback(peer_state.clone(), peer_port)
+        .await
+        .expect("peer server");
+    let own_fp = orbdrop_lib::net::local_fingerprint().expect("identity");
+    credential::set_peer_credential("device-roam", "tok-roam", &own_fp).unwrap();
 
     let serving = orbdrop_lib::server::start_server_loopback(state.clone(), port)
         .await
         .expect("server");
 
-    // 对端拨进来：来源是 127.0.0.1（测试里代替新网段），自报端口 3890。
-    let url = orbdrop_lib::net::peer_ws_url("127.0.0.1", serving, "tok-roam", false, 3890);
+    // 对端拨进来：来源是 127.0.0.1（测试里代替新网段），自报的是它真正的服务端口。
+    let url = orbdrop_lib::net::peer_ws_url(
+        "127.0.0.1",
+        serving,
+        "tok-roam",
+        false,
+        peer_serving,
+    );
     let ws =
         orbdrop_lib::net::connect_ws(&url, "127.0.0.1", serving, &orbdrop_lib::net::DialPin::Tofu)
             .await
@@ -2063,7 +2083,7 @@ async fn an_inbound_link_corrects_the_peers_stale_address() {
     wait_until("链路建立后旧地址被纠正", || {
         state
             .get_peer("device-roam")
-            .is_some_and(|p| p.ip == "127.0.0.1" && p.port == 3890)
+            .is_some_and(|p| p.ip == "127.0.0.1" && p.port == peer_serving)
     })
     .await;
     assert!(
@@ -2077,10 +2097,11 @@ async fn an_inbound_link_corrects_the_peers_stale_address() {
         .iter()
         .find(|p| p.id == "device-roam")
         .expect("地址簿里应该有这一行");
-    assert_eq!((row.ip.as_str(), row.port), ("127.0.0.1", 3890));
+    assert_eq!((row.ip.as_str(), row.port), ("127.0.0.1", peer_serving));
 
     drop(ws);
     orbdrop_lib::server::stop_server(&state).await;
+    orbdrop_lib::server::stop_server(&peer_state).await;
     credential::remove_peer("device-roam").ok();
     let _ = std::fs::remove_dir_all(&save_dir);
 }
@@ -4257,6 +4278,7 @@ fn commit_pairing_replaces_a_stale_fingerprint_instead_of_keeping_it() {
     let state = make_state(3998, "device-cp-a", "PC-CP-A", dir.clone());
 
     credential::set_peer_credential("device-cp-b", "stale-token", &"cd".repeat(32)).unwrap();
+    let fresh_token = "a".repeat(64);
     orbdrop_lib::pair::commit_pairing(
         &state,
         orbdrop_lib::pair::PairedPeer {
@@ -4266,7 +4288,7 @@ fn commit_pairing_replaces_a_stale_fingerprint_instead_of_keeping_it() {
             port: 3890,
             fingerprint: String::new(),
         },
-        "fresh-token",
+        &fresh_token,
         None,
     )
     .expect("配对落定");
@@ -4282,7 +4304,7 @@ fn commit_pairing_replaces_a_stale_fingerprint_instead_of_keeping_it() {
         credential::get_peer_token("device-cp-b")
             .unwrap()
             .as_deref(),
-        Some("fresh-token")
+        Some(fresh_token.as_str())
     );
     credential::remove_peer("device-cp-b").ok();
     let _ = std::fs::remove_dir_all(&dir);

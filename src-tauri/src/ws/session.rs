@@ -33,7 +33,7 @@ pub async fn run_inbound_session(
     // 都按 `peer.dial()` 取址。对端换网后这条连接是它此刻唯一的地址证据 —— 链路活着时
     // 5s 探活会跳过它（`probe_peers_once`），mDNS 也未必重新解析得到（移动端/跨段），
     // 不在这里学，旧 IP 就一直挂着（消息走链路发得到，共享目录却拨旧地址）。
-    state.learn_link_endpoint(&peer_id, addr.ip(), listen_port);
+    state.learn_link_endpoint(&peer_id, addr.ip(), listen_port).await;
     state.set_peer_online(&peer_id, true);
     // 被拨号的一端同样是"处于长连接"（F-16）：重启后这一侧也要能自动接回来。
     // 同一次写入清掉「断开」的暂停 —— 能走到这里，就说明本机不是暂停态（闸门放行了）。
@@ -134,6 +134,11 @@ pub async fn run_inbound_session(
 /// appear under both ids, and resolving the wrong one leaves the *real* peer's
 /// online flag stale forever.
 pub fn peer_id_from_token(state: &AppState, token: &str) -> Option<String> {
+    // 空 token 绝不能参与匹配：历史/异常配对可能把 `{id: ""}` 落进凭据库，而缺失
+    // `token` 查询参数的 WS 握手默认就是空串 —— 那会让任何人冒充那条记录。
+    if token.is_empty() {
+        return None;
+    }
     let own_id = state.config.lock().device_id.clone();
     // `peer_tokens()` 是带版本失效的缓存版（见 `credential::peer_tokens`）：这条函数在
     // **每个** HTTP 请求上都会被调一次，原来是"读盘 + 解析 + 建表"，2 万文件的推送就是
@@ -722,6 +727,17 @@ mod tests {
             crate::config::Config::default(),
             dir.join("config.toml"),
         ))
+    }
+
+    /// 缺失 `token` 查询参数的握手默认是空串；凭据库里哪怕真有一条空 token 的历史记录，
+    /// 也不能让它把任意匿名连接认成那台设备。
+    #[tokio::test]
+    async fn empty_token_never_matches_a_peer() {
+        let st = state("empty-token");
+        crate::credential::set_peer_credential("device-empty-token", "", &"a".repeat(64))
+            .unwrap();
+        assert_eq!(peer_id_from_token(&st, ""), None);
+        crate::credential::remove_peer("device-empty-token").ok();
     }
 
     /// WS 上的 `Unpair` 只认**连接自己的身份**：报文里那个 id 一律不采信。

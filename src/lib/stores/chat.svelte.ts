@@ -4,6 +4,7 @@ import { hasContent, revokeSegs, type ComposerSeg } from '$lib/composer';
 import type { ChatDelivery, ChatFileMsg, ChatGroup, ChatGroupMsg, ChatSnapshot, ChatMessage, ChatPeerConvo, ConvoMode, LocalPick, PendingGroup, PushBatch, PushInvite, PushTargetState } from '$lib/types';
 import * as api from '$lib/api';
 import { t } from '$lib/i18n.svelte';
+import { playMessageSound } from '$lib/sound';
 import { getDevices, deviceById, deviceState, threadDotState, threadTrusted, peerShortName, type DeviceDotState } from './devices.svelte';
 
 /**
@@ -63,6 +64,13 @@ let files = $state<Record<string, ChatFileMsg[]>>({});
 let receivePaused = $state<Record<string, boolean>>({});
 /** 已经种过了：快照里的文件消息只在启动那一刻取一次，之后这份内存就是实时的真相。 */
 let filesSeeded = false;
+/**
+ * 是否已经收过第一份快照。
+ *
+ * 启动时那一份装的是**上次关掉应用之后攒下的旧未读**，不是刚收到的新消息 —— 它不该
+ * 触发提示音（见 `replace`；同样地，标已读、删会话让未读变少时也不响）。
+ */
+let heardAnySnapshot = false;
 /**
  * 正在补拉的群 id（见 `syncGroup`）：同一条会话被连着开两次（连点两下、或刚建完群紧接着
  * 打开）时，补拉只飞一次 —— 一次补拉回来的是整份快照，重复飞几遍只是白花几个来回。
@@ -212,7 +220,8 @@ export function pendingGroups(): PendingGroup[] {
  *
  * - 一对一：那台设备还在设备表里，**或**跟它的记录还在（解绑又离线之后，会话不跟着消失 ——
  *   见 `hasHistory`）；
- * - 群发：名单还在，且**有两台以上**成员还在设备表里（少于两台就不再是"多台记录"了）；
+ * - 群发：名单（`b.members`）还在且**有两台以上**；成员此刻在不在设备表里只影响
+ *   可发送的 `participants` 与状态点，不再把整条历史隐藏掉；
  * - 群聊：后端那份群还在（退出 / 被解散后它就从快照里消失了）。**名册就是唯一依据**：
  *   成员列出来就是成员，不看它在不在设备表里（群是后端的一份实体，不随本机的设备表缩水）。
  *
@@ -230,8 +239,10 @@ function threadOf(key: string | null): ConvoThread | null {
   if (ref.mode === 'broadcast') {
     const b = snapshot.batches.find((x) => x.id === ref.id);
     if (!b) return null;
+    // **名单本身**才是这条记录存在过的证据。成员暂时都掉出设备表（未配对 + 离线）时
+    // 也要保留这一行：历史还在，用户还能打开查看；能不能发出去由发送那一步现判。
+    if (b.members.length < 2) return null;
     const participants = b.members.filter(known);
-    if (participants.length < 2) return null;
     return { key: batchKey(b.id), mode: 'broadcast', id: b.id, name: b.name, participants, title: titleOf('broadcast', b.name, participants) };
   }
   const g = groupOf(ref.id);
@@ -1059,6 +1070,10 @@ function replace(next: ChatSnapshot) {
   // `sent` —— 前者晚到就会把后者盖回去，消息于是一直停在「发送中」，直到重新拉一次整份
   // 状态（关掉再打开会话）。只往版本大的那份走。
   if (typeof next.rev === 'number' && next.rev <= snapshot.rev) return;
+  // 未读比上一份多 = 有新消息进来（一对一 / 群聊 / LocalSend 都记在 `unread` 里）。
+  // 少的那一档是"已读 / 删除"，不出声；第一份快照也不算（见 `heardAnySnapshot`）。
+  if (heardAnySnapshot && next.unread > snapshot.unread) playMessageSound();
+  heardAnySnapshot = true;
   snapshot = next;
   // 第一次拿到快照（启动时 `refresh` / 第一条 `chat://changed`）：把落盘的文件消息种进内存。
   // 之后这份内存就是实时的真相 —— 每次 `replace` 再种一遍会把正在传的进度抹回上一次落盘的样子。
@@ -1197,7 +1212,11 @@ async function editThread(key: string, ids: string[], name: string): Promise<voi
     replace(await api.groupEdit(t.id, roster, name.trim()));
     return;
   }
-  const peers = ids.filter(known);
+  // 群发与群聊同一条：选择框只列得出设备表里的设备，名册里那些“此刻看不见”的成员
+  // 必须原样留着；否则改一次名字/收件人就把它们从名单里静默删掉（之后再也收不到消息）。
+  const current = snapshot.batches.find((b) => b.id === t.id)?.members ?? [];
+  const invisible = current.filter((id) => !known(id));
+  const peers = [...new Set([...ids.filter(known), ...invisible])];
   if (peers.length < 2) return;
   const updated = await api.chatBatchEnsure(peers, t.id);
   replace(updated.snapshot);

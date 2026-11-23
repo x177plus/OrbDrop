@@ -430,6 +430,12 @@ pub fn commit_pairing_with_fingerprint(
         warn!(peer_id = %peer.id, "配对被拒：对方设备标识不合法");
         return Err("对方设备标识不合法（只允许字母、数字与 `-_.`），已拒绝配对".into());
     }
+    // 所有配对路径的汇合点：空 token / 非 64 位 hex 一律拒绝。空 token 落库后，
+    // 任何知道对端 id 的局域网主机都能用空 token 通过 `peer_id_from_token` 冒充它。
+    if !is_token_shape(token) {
+        warn!(peer_id = %peer.id, "配对被拒：token 形状不合法");
+        return Err("配对回执里的 token 形状不合法，已拒绝配对".into());
+    }
     credential::set_peer_credential(&peer.id, token, fingerprint)
         .map_err(|e| format!("凭据存储失败: {e}"))?;
     // 刚配对：还没长连接，没有要恢复的东西。`online` 要看**有没有可拨的地址**：有地址
@@ -798,7 +804,7 @@ fn accept_grant(
 }
 
 /// 本机铸的 token 是 32 字节 hex（64 个字符）；协议上不再接受别的形状。
-fn is_token_shape(token: &str) -> bool {
+pub(crate) fn is_token_shape(token: &str) -> bool {
     token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())
 }
 

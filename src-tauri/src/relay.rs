@@ -148,6 +148,9 @@ struct ActiveRelay {
     host: String,
     /// 这条端点要连的目标地址；复用与控制面回话都用它。
     target_addr: SocketAddr,
+    /// 开端点时控制面的来源地址（也用于来源白名单）。请求方换 IP 后必须重开，
+    /// 否则旧白名单会永远拒绝新地址。
+    opened_from: StdIpAddr,
     /// 关停信号：`send(true)` 让监听任务与它底下所有在跑的连接一起收。
     stop: watch::Sender<bool>,
 }
@@ -183,12 +186,16 @@ impl RelayRegistry {
     }
 
     /// 同一对 (请求方, 目标) 已经开着的端点：复用它的端口与地址。
-    fn find(&self, requester: &str, target: &str) -> Option<(u16, String, SocketAddr)> {
+    fn find(
+        &self,
+        requester: &str,
+        target: &str,
+    ) -> Option<(u64, u16, String, SocketAddr, StdIpAddr)> {
         self.inner
             .lock()
-            .values()
-            .find(|r| r.requester == requester && r.target == target)
-            .map(|r| (r.port, r.host.clone(), r.target_addr))
+            .iter()
+            .find(|(_, r)| r.requester == requester && r.target == target)
+            .map(|(id, r)| (*id, r.port, r.host.clone(), r.target_addr, r.opened_from))
     }
 
     /// 全局中转连接额度（`serve` 的 accept 循环用它兜住突发）。
@@ -246,7 +253,11 @@ impl RelayRegistry {
     }
 
     fn remove(&self, id: u64) {
-        self.inner.lock().remove(&id);
+        if let Some(relay) = self.inner.lock().remove(&id) {
+            // 从表里摘掉还不够：serve 的监听任务与已建立的连接都要收到关停信号，
+            // 否则旧端点会继续占着端口转到 120s 空闲超时。
+            let _ = relay.stop.send(true);
+        }
     }
 
     /// 收掉本机开出去的全部中转（关闭开关、退出时用）。
@@ -502,24 +513,38 @@ pub async fn open(
     //
     // 请求方（`ensure_for`）在目标暂时不可达时每 30s 重问一次控制面；每次都新开监听器 +
     // 出站连接，旧端点还要空转 120s，日志里就是一串不同端口。复用只花一次查表。
-    if let Some((port, host, target_addr)) = state.relays.find(requester, target) {
-        // 每 30s 一次的复用是稳态，不是事件；端点开/关那两条（也降为 debug）才是。
-        debug!(%requester, %target, port, "复用已开的中转端点");
-        return Ok(Opened {
-            host,
-            port,
-            target: target.to_string(),
-            expires_in_secs: IDLE_TIMEOUT.as_secs(),
-            via_cidr: own_net
-                .as_ref()
-                .map(|c| c.to_cidr_string())
-                .unwrap_or_default(),
-            via_devices: own_net
-                .as_ref()
-                .map(|c| state.relay_devices_in(c, &[requester, target]))
-                .unwrap_or_default(),
-            target_addr: target_addr.to_string(),
-        });
+    if let Some((endpoint_id, port, host, old_target_addr, old_from)) =
+        state.relays.find(requester, target)
+    {
+        // 目标换了地址（DHCP/换网）或请求方换了来源 IP：旧端点的出站地址/白名单是快照，
+        // 复用只会永远拨旧地址/拒绝新来源。关掉重开，别让一条陈旧端点把这条路径钉死。
+        if old_target_addr != target_addr || old_from != from {
+            debug!(
+                %requester, %target, port,
+                old_target = %old_target_addr, new_target = %target_addr,
+                old_from = %old_from, new_from = %from,
+                "中转端点的目标/请求方地址变了，关闭旧端点"
+            );
+            state.relays.remove(endpoint_id);
+        } else {
+            // 每 30s 一次的复用是稳态，不是事件；端点开/关那两条（也降为 debug）才是。
+            debug!(%requester, %target, port, "复用已开的中转端点");
+            return Ok(Opened {
+                host,
+                port,
+                target: target.to_string(),
+                expires_in_secs: IDLE_TIMEOUT.as_secs(),
+                via_cidr: own_net
+                    .as_ref()
+                    .map(|c| c.to_cidr_string())
+                    .unwrap_or_default(),
+                via_devices: own_net
+                    .as_ref()
+                    .map(|c| state.relay_devices_in(c, &[requester, target]))
+                    .unwrap_or_default(),
+                target_addr: old_target_addr.to_string(),
+            });
+        }
     }
     // 刚连不上的目标地址：冷却期内不再新开端点。请求方 30s 后会再问一次，那一次才放行。
     if state.relays.target_cooling(target_addr) {
@@ -544,6 +569,7 @@ pub async fn open(
             port,
             host: host.clone(),
             target_addr,
+            opened_from: from,
             stop,
         })
         .map_err(|_| OpenError::Busy(format!("本机同时在转的中转已达上限（{MAX_RELAYS}）")))?;
@@ -1566,6 +1592,7 @@ mod tests {
                     port: 0,
                     host: "127.0.0.1".into(),
                     target_addr: "127.0.0.1:1".parse().unwrap(),
+                    opened_from: "127.0.0.1".parse().unwrap(),
                     stop,
                 })
                 .expect("上限之内的插入必须成功");
@@ -1579,6 +1606,7 @@ mod tests {
                     port: 0,
                     host: "127.0.0.1".into(),
                     target_addr: "127.0.0.1:1".parse().unwrap(),
+                    opened_from: "127.0.0.1".parse().unwrap(),
                     stop,
                 })
                 .is_err(),
@@ -1600,10 +1628,12 @@ mod tests {
                 port: 41000,
                 host: "10.0.0.1".into(),
                 target_addr: addr,
+                opened_from: "127.0.0.1".parse().unwrap(),
                 stop,
             })
             .unwrap();
-        let (port, host, target) = registry.find("requester", "target").expect("同一对应能复用");
+        let (_, port, host, target, _) =
+            registry.find("requester", "target").expect("同一对应能复用");
         assert_eq!(port, 41000);
         assert_eq!(host, "10.0.0.1");
         assert_eq!(target, addr);

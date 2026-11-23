@@ -325,6 +325,11 @@ pub async fn run_client(
     if !payload.cert_fingerprint.eq_ignore_ascii_case(peer_fp) {
         return Err("对端证书指纹与本次连接不一致".into());
     }
+    // token 是接下来写进凭据库、并用来认长连接的身份。空串/任意形状一旦落库，
+    // 空 token 会匹配到任何未带 token 的 WS 握手；在进库之前就拒绝。
+    if !crate::pair::is_token_shape(&payload.token) {
+        return Err("配对回执里的 token 形状不合法".into());
+    }
     Ok(payload)
 }
 

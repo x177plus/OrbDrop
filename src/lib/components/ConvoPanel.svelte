@@ -277,6 +277,8 @@
    * 新的一条顶掉旧的并重置计时：连着发几条时，用户要看到的是最新那一台/那个原因。
    */
   let undeliverable = $state<{ id: number; text: string } | null>(null);
+  /** 发送中闸门：回车自动重复/快速双击不会把同一份草稿发两遍。 */
+  let sending = $state(false);
   let undeliverableSeq = 0;
   let undeliverableTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -401,6 +403,16 @@
    * `chat://changed` 还会更新回执（对端上线后，等待发送的那几台会自己变成已送达）。
    */
   async function send() {
+    if (sending) return;
+    sending = true;
+    try {
+      await sendNow();
+    } finally {
+      sending = false;
+    }
+  }
+
+  async function sendNow() {
     const th = thread;
     if (!th) return;
     const res = await (localSendThread

@@ -316,7 +316,34 @@ async fn prepare_peer_payload(
         name: req.name.clone(),
         is_dir: req.is_dir,
     };
-    let path = crate::mirror::place(state, &item).await?;
+    let placed = crate::mirror::place_with_meta(state, &item, false).await?;
+    let is_dir = placed.is_dir;
+    let size = placed.size;
+    let path = placed.path;
+    // Windows 的复制引擎不能复制“部分水合”的占位符（0x8007017B）。两条防线：
+    //
+    // 1. 小到可以等的文件，起拖前直接整份水合 —— 目标拿到的就是完整本地数据，任何复制路径
+    //    都不会再碰中间态（Win10/11 都成立）。阈值只限制“愿意按住鼠标等多久”。
+    // 2. 大文件不预下载，仍走按需水合；资源管理器悬停读几 MB 后关句柄时，provider 会把这
+    //    部分数据回脱水（见 `settle_drag_hover`），让落下后的复制从 0 开始顺序水合。
+    const PREHYDRATE_MAX: u64 = 256 * 1024 * 1024;
+    if !is_dir && size.is_some_and(|size| size <= PREHYDRATE_MAX) {
+        let target = path.clone();
+        let result =
+            tokio::task::spawn_blocking(move || crate::mirror::hydrate_full_for_drag(&target))
+                .await;
+        match result {
+            Ok(Ok(())) => info!(path = %path.display(), "起拖前已整份水合"),
+            Ok(Err(e)) => {
+                // 预下载失败就别交给目标一个半截占位符：清回脱水态后明确报错，用户重拖即可。
+                crate::mirror::dehydrate_partial_for_drag(&path);
+                return Err(format!("预下载失败（{}）: {e}", path.display()));
+            }
+            Err(e) => return Err(format!("预下载任务失败: {e}")),
+        }
+    }
+    crate::mirror::note_drag_out(&path);
+    crate::mirror::dehydrate_partial_for_drag(&path);
     info!(path = %path.display(), "镜像就绪，按本地真实路径拖出");
     Ok(vec![path])
 }

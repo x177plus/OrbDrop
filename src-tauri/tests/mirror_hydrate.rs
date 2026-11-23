@@ -814,6 +814,118 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
     );
     assert_eq!(meta.len(), SMALL.len() as u64, "而且报的是真实大小");
 
+    // ---- 7.6 空文件走拖放准备：整份水合 0 字节也必须是成功，而不是把拖拽卡失败 ----
+    let empty_ticket = state
+        .drag
+        .prepare(&state, &drag_req("empty.bin", "empty.bin", false))
+        .expect("登记空文件拖拽");
+    let empty_paths = wait_payload(&state, &empty_ticket.ticket).await;
+    assert!(empty_paths[0].exists(), "空文件占位符应当存在");
+    assert_eq!(on_disk_bytes(&empty_paths[0]), 0, "空文件磁盘占用为 0");
+
+    // ---- 7.7 拖拽悬停把占位符读成部分水合后，关闭句柄要回脱水；随后复制必须成功 ----
+    //
+    // 实机 0x8007017B：资源管理器拖拽悬停先读 4 KiB / 几 MB 做图标与版本信息，落下后
+    // 复制剩余部分。Windows 的复制引擎对“部分水合”的占位符直接报 ERROR_CLOUD_FILE_
+    // NOT_SUPPORTED；完全脱水或完全水合都正常。这里用子进程读 3 MB（模拟 Explorer），
+    // 关闭后 provider 应把它回脱水成 0 字节，然后 IFileOperation 复制整份。
+    const HOVER_LEN: usize = 8 * 1024 * 1024;
+    std::fs::write(share_root.join("hover.bin"), vec![0x3Cu8; HOVER_LEN]).unwrap();
+    let hover_item = MirroredItem {
+        peer_id: peer.clone(),
+        share_id: share_id.clone(),
+        path: "hover.bin".into(),
+        name: "hover.bin".into(),
+        is_dir: false,
+    };
+    let hover_local = mirror::place(&state, &hover_item)
+        .await
+        .expect("放 hover 项");
+    mirror::note_drag_out(&hover_local);
+    let hover_script = format!(
+        "$fs=[IO.File]::Open('{}','Open','Read','ReadWrite');          $b=New-Object byte[] 3145728; $left=$b.Length;          while($left -gt 0) {{ $n=$fs.Read($b,$b.Length-$left,$left); if($n -le 0) {{ break }}; $left-=$n }};          $fs.Close()",
+        hover_local.to_string_lossy().replace('\'', "''")
+    );
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &hover_script])
+        .status()
+        .expect("起子进程模拟拖拽悬停读");
+    assert!(status.success(), "悬停读 3 MB 应当成功");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while on_disk_bytes(&hover_local) != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "悬停句柄关闭后没有回脱水（磁盘上的大小仍不是 0）：{}",
+            on_disk_bytes(&hover_local)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let hover_dest = data_dir.join("hover-copied");
+    std::fs::create_dir_all(&hover_dest).unwrap();
+    let hover_src2 = hover_local.clone();
+    let hover_dest2 = hover_dest.clone();
+    let copied = tokio::task::spawn_blocking(move || shell_copy(&hover_src2, &hover_dest2))
+        .await
+        .unwrap();
+    assert!(
+        copied.is_ok(),
+        "回脱水后复制部分水合占位符应当成功：{copied:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(hover_dest.join("hover.bin"))
+            .expect("复制结果")
+            .len(),
+        HOVER_LEN as u64
+    );
+
+    // ---- 7.8 小文件起拖前整份水合：悬停句柄还开着时立刻复制也必须成功 ----
+    //
+    // 这就是 `drag::prepare_peer_payload` 对 ≤256 MB 文件走的那条路。预水合后目标看到的是
+    // 完整本地文件，复制引擎不会再碰“部分水合”的中间态 —— 即使悬停句柄还没关。
+    std::fs::write(share_root.join("prehyd.bin"), vec![0x5Au8; HOVER_LEN]).unwrap();
+    let prehyd_ticket = state
+        .drag
+        .prepare(&state, &drag_req("prehyd.bin", "prehyd.bin", false))
+        .expect("登记 prehyd 拖拽");
+    let prehyd_paths = wait_payload(&state, &prehyd_ticket.ticket).await;
+    let prehyd_local = prehyd_paths[0].clone();
+    assert_eq!(
+        on_disk_bytes(&prehyd_local),
+        HOVER_LEN as u64,
+        "拖放准备阶段应当把 ≤256 MB 的文件整份水合"
+    );
+    let prehyd_script = format!(
+        "$fs=[IO.File]::Open('{}','Open','Read','ReadWrite'); \
+         $b=New-Object byte[] 3145728; $left=$b.Length; \
+         while($left -gt 0) {{ $n=$fs.Read($b,$b.Length-$left,$left); if($n -le 0) {{ break }}; $left-=$n }}; \
+         Start-Sleep -Seconds 5; $fs.Close()",
+        prehyd_local.to_string_lossy().replace('\'', "''")
+    );
+    let mut prehyd_child = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &prehyd_script])
+        .spawn()
+        .expect("起子进程按住悬停句柄");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let prehyd_dest = data_dir.join("prehyd-copied");
+    std::fs::create_dir_all(&prehyd_dest).unwrap();
+    let prehyd_src = prehyd_local.clone();
+    let prehyd_dest2 = prehyd_dest.clone();
+    let fast = tokio::task::spawn_blocking(move || shell_copy(&prehyd_src, &prehyd_dest2))
+        .await
+        .unwrap();
+    assert!(
+        fast.is_ok(),
+        "整份预水合后，即使悬停句柄还开着，复制也必须成功：{fast:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(prehyd_dest.join("prehyd.bin"))
+            .expect("预水合复制结果")
+            .len(),
+        HOVER_LEN as u64
+    );
+    let _ = prehyd_child.kill();
+    let _ = prehyd_child.wait();
+
     // ---- 8. 退出清干净：镜像树与同步根注册都不留 ----
     let mirror_root = mirror::root();
     assert!(mirror_root.exists(), "跑的时候镜像根应当在");
@@ -828,6 +940,56 @@ async fn placeholder_hydrates_from_peer_and_leaves_nothing_behind() {
     credential::remove_peer(&peer).ok();
     let _ = std::fs::remove_dir_all(&share_root);
     let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// 用资源管理器的复制引擎（`IFileOperation`）复制一项。
+fn shell_copy(src: &std::path::Path, dest_dir: &std::path::Path) -> Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, IBindCtx, CLSCTX_ALL,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{
+        FileOperation, IFileOperation, IFileOperationProgressSink, IShellItem,
+        SHCreateItemFromParsingName, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
+    };
+
+    fn wide(path: &std::path::Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let result = (|| -> Result<(), String> {
+            let op: IFileOperation =
+                CoCreateInstance(&FileOperation, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
+            op.SetOperationFlags(FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI)
+                .map_err(|e| e.to_string())?;
+            let src_w = wide(src);
+            let src_item: IShellItem =
+                SHCreateItemFromParsingName(PCWSTR(src_w.as_ptr()), None::<&IBindCtx>)
+                    .map_err(|e| format!("解析源: {e}"))?;
+            let dest_w = wide(dest_dir);
+            let dest_item: IShellItem =
+                SHCreateItemFromParsingName(PCWSTR(dest_w.as_ptr()), None::<&IBindCtx>)
+                    .map_err(|e| format!("解析落点: {e}"))?;
+            op.CopyItem(
+                &src_item,
+                &dest_item,
+                PCWSTR::null(),
+                None::<&IFileOperationProgressSink>,
+            )
+            .map_err(|e| format!("CopyItem: {e}"))?;
+            op.PerformOperations()
+                .map_err(|e| format!("PerformOperations: {e}"))?;
+            if op.GetAnyOperationsAborted().map_err(|e| e.to_string())?.as_bool() {
+                return Err("shell 报告操作被取消".into());
+            }
+            Ok(())
+        })();
+        CoUninitialize();
+        result
+    }
 }
 
 /// 失败（panic）时也要收摊：否则每次跑挂的测试都会在本机留下一个同步根注册 —— 实测踩过这坑，
