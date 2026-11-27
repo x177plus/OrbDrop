@@ -32,7 +32,7 @@
   "对方拒绝了本机的连接请求：想再试一次就再点一次「连接」（那会重新发一次请求）": "The peer declined this device's connection request: tap Connect again to retry (that sends a new request)",
   "已与「{name}」断开长连接（临时暂停，不是解除配对）：本机不再自动接回，对方点「连接」可立刻恢复": "Disconnected the live link with “{name}” (paused, not unpaired): this device won't reconnect automatically; the peer can tap Connect to restore it at once",
   "还没有已配对设备": "No paired devices yet",
-  "点击上方「添加设备 · 配对码」，在对方设备的 OrbDrop 中输入本机配对码即可完成配对。": "Tap “Add device · Pairing code” above, then enter this device's pairing code in OrbDrop on the other device.",
+  "点上方「添加设备 · 配对码」开始配对。": "Tap “Add device · Pairing code” above to start pairing.",
   "没有匹配「{query}」的设备": "No devices match “{query}”",
   "搜索只匹配设备名与 IP（{n} 台都没命中）。": "Search only matches device name and IP (none of the {n} devices matched).",
   "清除搜索": "Clear search",

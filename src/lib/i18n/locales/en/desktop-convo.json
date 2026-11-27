@@ -49,7 +49,7 @@
   "关闭会话": "Close conversation",
   "会话列表": "Conversation list",
   "还没有会话": "No conversations yet",
-  "用「＋ 新建会话」选设备开始，或到「设备」页那一行点「发消息」；对方先发来消息也会出现在这里。": "Start with “+ New conversation” and pick devices, or tap “Message” on a row in the Devices page; messages another device sends first show up here too.",
+  "点「＋」选一台设备开始会话。": "Tap “+” and pick a device to start a conversation.",
   "群发": "Broadcast",
   "群聊": "Group chat",
   "返回会话列表": "Back to conversations",
@@ -68,8 +68,6 @@
   "会话操作": "Conversation actions",
   "群发模式": "Broadcast mode",
   "群聊模式": "Group mode",
-  "单向发送，对方各自单独收到": "one-way sending; each device gets its own copy",
-  "任意参与者共享同一条消息流": "every participant shares a single message stream",
   "编辑群发": "Edit broadcast",
   "编辑群聊": "Edit group chat",
   "关闭提示": "Dismiss notice",
@@ -86,12 +84,12 @@
     "other": "{n} messages couldn't be synced (the source device is offline)"
   },
   "还没有群发消息": "No broadcast messages yet",
-  "你发出的每条消息都会作为单独的一对一消息，分别送达 {n} 台设备；这里只显示你发出的内容。": {
-    "one": "Each message you send goes out as a separate one-to-one message to {n} device; only your own messages are shown here.",
-    "other": "Each message you send goes out as a separate one-to-one message to {n} devices; only your own messages are shown here."
+  "每条内容会分别单独送达 {n} 台设备。": {
+    "one": "Each item is delivered separately to {n} device.",
+    "other": "Each item is delivered separately to {n} devices."
   },
   "还没有消息": "No messages yet",
-  "在这里说一句，名册上的成员都会看到（同一条消息流）；传文件则按成员逐台推送。": "Say something here and every member on the roster sees it (one shared stream); files are pushed to each member individually.",
+  "名册上的成员都会看到这里的内容。": "Everyone on the roster sees what is posted here.",
   "发一条消息或传一个文件，开始和设备对话。": "Send a message or a file to start talking with your devices.",
   "已发送 · {n} 条 · 单向": {
     "one": "Sent · {n} message · one-way",

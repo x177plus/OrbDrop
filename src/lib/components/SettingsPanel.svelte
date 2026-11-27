@@ -157,8 +157,8 @@
   let saveAgain = false;
   /** 文本输入正在编辑（还没失焦）：关闭面板时用它决定要不要补一次提交。 */
   let textDirty = false;
-  /** 标题栏的状态字：空闲 / 正在保存 / 已自动保存 / 保存失败。 */
-  let saveState = $state<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  /** 标题栏的状态：只有保存失败需要露面（自动保存本身不提示）。 */
+  let saveState = $state<'idle' | 'saving' | 'error'>('idle');
   /** 滚动区还在下面有内容时画一道底部渐隐；滚到底就撤掉（不留永久阴影）。 */
   let bodyEl = $state<HTMLDivElement | null>(null);
   let moreBelow = $state(false);
@@ -469,7 +469,7 @@
           applySettings(next);
         }
       }
-      saveState = 'saved';
+      saveState = 'idle';
     } catch (e: any) {
       failed = true;
       saveState = 'error';
@@ -504,19 +504,13 @@
     <span class="panel-brand" style="margin-right:auto">
       <Logo size={20} />{t('设置')}
     </span>
-    <span class="autosave-status" class:is-error={saveState === 'error'} role="status">
-      {#if saveState === 'error'}
+    {#if saveState === 'error'}
+      <span class="autosave-status is-error" role="status">
         <button class="autosave-retry" type="button" onclick={scheduleSave}>
           {t('保存失败 · 点此重试')}
         </button>
-      {:else if saveState === 'saving'}
-        {t('正在自动保存…')}
-      {:else if saveState === 'saved'}
-        {t('已自动保存')}
-      {:else}
-        {t('改动会自动保存')}
-      {/if}
-    </span>
+      </span>
+    {/if}
     <button class="icon-btn" onclick={close} aria-label={t('关闭设置')}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
         <path d="M6 6l12 12M18 6 6 18"/>

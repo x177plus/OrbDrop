@@ -35,8 +35,8 @@
   let saveAgain = false;
   /** 文本输入正在编辑（还没失焦）：离开页面时用它决定要不要补一次提交。 */
   let textDirty = false;
-  /** 状态条：空闲 / 正在保存 / 已自动保存 / 保存失败。 */
-  let saveState = $state<"idle" | "saving" | "saved" | "error">("idle");
+  /** 状态：只有保存失败需要露面（自动保存本身不提示）。 */
+  let saveState = $state<"idle" | "saving" | "error">("idle");
   /** 界面语言（具体语言，没有「跟随系统」）：改它 = 立刻生效并落后端。 */
   let languagePref = $state<Locale>(normalizePreference(null));
 
@@ -393,7 +393,7 @@
           saved = next;
         }
       }
-      saveState = "saved";
+      saveState = "idle";
     } catch (e) {
       failed = true;
       saveState = "error";
@@ -436,18 +436,12 @@
   </div>
 {:else}
   <div class="body">
-    <div class="autosave-bar" class:is-error={saveState === "error"} role="status">
-      {#if saveState === "error"}
+    {#if saveState === "error"}
+      <div class="autosave-bar is-error" role="status">
         <span>{t("保存失败")}</span>
         <button class="btn btn-secondary btn-sm" type="button" onclick={scheduleSave}>{t("重试")}</button>
-      {:else if saveState === "saving"}
-        <span>{t("正在自动保存…")}</span>
-      {:else if saveState === "saved"}
-        <span class="tone-ok">{t("已自动保存")}</span>
-      {:else}
-        <span>{t("改动会自动保存")}</span>
-      {/if}
-    </div>
+      </div>
+    {/if}
     <div class="sec">
       <div class="sec-label"><span>{t("语言")}</span></div>
       <div class="card gcard lang-card">
@@ -455,7 +449,7 @@
           <span class="slabel">{t("界面语言")}</span>
           <LanguageSelect value={languagePref} ariaLabel={t("界面语言")} onChange={changeLanguage} />
           <p class="shelp">
-            {t("界面正文与通知栏会立刻切换。首次启动使用系统语言，系统语言不在支持列表里时使用英语。")}
+            {t("切换后立即生效。")}
           </p>
         </div>
       </div>
@@ -528,9 +522,7 @@
             </label>
           </div>
           <p class="shelp">
-            {t(
-              "打开（默认）时，接收到的推送放在以发送方名字命名的子目录里（「文件」页按“发送方”分组就是它）；关掉则和手动下载的文件落在同一层 —— 同名的会自动改名，但别人推来的目录会并进你本来就有的同名目录。",
-            )}
+            {t("开启后按发送方分目录存放推送。")}
           </p>
         </div>
         <div class="srow">
@@ -550,9 +542,7 @@
             </label>
           </div>
           <p class="shelp">
-            {t(
-              "已配对且当前有长连接的设备推来的文件始终直接接收。这颗开关只管已配对但当前没有长连接的设备：开启后它们也免确认、直接保存到下载目录；关闭（默认）时仍要你点「接收」。未配对设备始终需要你确认。",
-            )}
+            {t("已配对但没有长连接的设备也免确认直接接收。")}
           </p>
         </div>
         <div class="srow">
@@ -591,9 +581,7 @@
           </label>
           {:else}
             <p class="shelp">
-              {t(
-                "安卓上固定为「直接保存到下载目录」：系统选择器返回的是 content://，落盘层只能写文件系统路径。",
-              )}
+              {t("安卓上固定保存到下载目录。")}
             </p>
           {/if}
         </div>
@@ -619,7 +607,7 @@
               if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
             }}
           />
-          <p class="shelp">{t("一次接收同时跑几路传输；取值 1–8，默认 4，超出范围保存时自动夹住。")}</p>
+          <p class="shelp">{t("取值 1–8，默认 4。")}</p>
         </div>
         <div class="srow">
           <span class="slabel">{t("分块大小（MB）")}</span>
@@ -637,7 +625,7 @@
               if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
             }}
           />
-          <p class="shelp">{t("大文件按它切片、片与片之间并行；取值 1–32，默认 4，超出范围保存时自动夹住。")}</p>
+          <p class="shelp">{t("取值 1–32，默认 4。")}</p>
         </div>
       </div>
     </div>
@@ -662,9 +650,7 @@
             </label>
           </div>
           <p class="shelp">
-            {t(
-              "替够不着彼此的其它设备搬字节（有些 Wi‑Fi 把同网段客户端之间的单播隔开），也替够不着的同群成员转消息；不限已配对设备。会占用本机上行带宽（手机上是流量），默认打开（首次启动就是开的，不想出这笔开销就关掉），关掉立刻收掉正在替别人转的每一条。",
-            )}
+            {t("替够不着彼此的设备和同群成员转发数据，会占用本机上行带宽。")}
           </p>
         </div>
         <div class="srow">
@@ -684,12 +670,7 @@
             </label>
           </div>
           <p class="shelp">
-            {t(
-              "默认关闭。打开且本机在线时，会加入 UDP 53317 组播，与局域网里的 LocalSend 设备互相发现并收发消息/文件；离线时自动停止，关掉后不再监听。LocalSend 设备不配对、不进聊天群，只走一对一；文本和图片始终自动接收，普通文件仍需确认。",
-            )}
-          </p>
-          <p class="shelp">
-            {t("开启后立即生效。53317 被占用时先回落主端口，端口空出后自动接管；不会因此自动关闭。")}
+            {t("与局域网里的 LocalSend 设备互相发现、互传文件；设备不配对，普通文件仍需确认。")}
           </p>
           {#if localSendView}
             <div class="shelp-row">
@@ -723,7 +704,7 @@
               )}
             </p>
           {:else}
-            <p class="shelp">{t("还没有替别人中转 —— 有设备借本机中转之后才会有这个数。")}</p>
+            <p class="shelp">{t("还没有中转流量。")}</p>
           {/if}
         </div>
       </div>
@@ -745,7 +726,7 @@
               <span class="track"></span>
             </label>
           </div>
-          <p class="shelp">{t("关掉＝隐身：停止广播、断开全部长连接，也收不到别人的推送。")}</p>
+          <p class="shelp">{t("关闭后对局域网隐身。")}</p>
         </div>
         <div class="srow">
           <div class="srow-top">
@@ -784,7 +765,7 @@
           </div>
           <p class="shelp">
             {t(
-              "电池优化：{status}。系统那一层（自启动 / 后台活动）与通知横幅都在这里检查 —— 留在默认档时，应用在后台会被系统冻结：通知栏那条「OrbDrop 正在运行」还挂着，对端却已经看不到你了。",
+              "电池优化：{status}。留在默认档时系统会在后台冻结应用。",
               {
                 status:
                   keepAlive === null

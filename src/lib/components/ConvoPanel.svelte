@@ -595,7 +595,7 @@
         <div class="empty">
           {@render icChat()}
           <p>{t('还没有会话')}</p>
-          <p class="e-sub">{t('用「＋ 新建会话」选设备开始，或到「设备」页那一行点「发消息」；对方先发来消息也会出现在这里。')}</p>
+          <p class="e-sub">{t('点「＋」选一台设备开始会话。')}</p>
         </div>
       {:else}
         {#each rows as row (row.key)}
@@ -684,13 +684,12 @@
           </div>
         </header>
 
-        <!-- 模式条：一对一不画（它就是默认）；群发与群聊各说自己的规则，并各带一颗「编辑」。 -->
+        <!-- 模式条：一对一不画（它就是默认）；群发与群聊只标模式，并各带一颗「编辑」。 -->
         {#if thread.mode !== 'direct'}
           <div class="convo-mode" data-mode={thread.mode}>
             <span class="cm-ic" aria-hidden="true">{#if thread.mode === 'broadcast'}{@render icBc()}{:else}{@render icGrp()}{/if}</span>
             <span class="cm-txt">
               <b>{thread.mode === 'broadcast' ? t('群发模式') : t('群聊模式')}</b>
-              {' · '}{thread.mode === 'broadcast' ? t('单向发送，对方各自单独收到') : t('任意参与者共享同一条消息流')}
             </span>
             <button class="cm-act" type="button" onclick={() => chat.askParticipants(thread.key)}>
               {thread.mode === 'broadcast' ? t('编辑群发') : t('编辑群聊')}
@@ -793,12 +792,12 @@
               {@render icBc()}
               <p>{t('还没有群发消息')}</p>
               <p class="ce-sub">
-                {t('你发出的每条消息都会作为单独的一对一消息，分别送达 {n} 台设备；这里只显示你发出的内容。', { n: thread.participants.length })}
+                {t('每条内容会分别单独送达 {n} 台设备。', { n: thread.participants.length })}
               </p>
             {:else if thread.mode === 'group'}
               {@render icGrp()}
               <p>{t('还没有消息')}</p>
-              <p class="ce-sub">{t('在这里说一句，名册上的成员都会看到（同一条消息流）；传文件则按成员逐台推送。')}</p>
+              <p class="ce-sub">{t('名册上的成员都会看到这里的内容。')}</p>
             {:else}
               {@render icChat()}
               <p>{t('还没有消息')}</p>

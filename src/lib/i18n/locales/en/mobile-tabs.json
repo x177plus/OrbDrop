@@ -83,7 +83,7 @@
     "one": "From {from} · {n} device{extra}",
     "other": "From {from} · {n} devices{extra}"
   },
-  "点右上「＋」选一台设备开始；设备发来消息也会出现在这里。": "Tap “＋” in the top right and pick a device to start; messages from devices show up here too.",
+  "点右上「＋」选一台设备开始。": "Tap “＋” in the top right and pick a device to start.",
   "收件": "Inbox",
   "浏览": "Browse",
   "替够不着彼此的其它设备搬字节（有些 Wi‑Fi 把同网段客户端之间的单播隔开），也替够不着的同群成员转消息；不限已配对设备。会占用本机上行带宽（手机上是流量），默认打开（首次启动就是开的，不想出这笔开销就关掉），关掉立刻收掉正在替别人转的每一条。": "Move bytes for other devices that can't reach each other (some Wi‑Fi networks isolate clients on the same subnet), and forward messages for group members that can't reach each other; not limited to paired devices. It uses this device's upload bandwidth (mobile data on a phone) and is on by default (enabled on first launch — turn it off if you don't want that cost); turning it off immediately stops every relay currently running for others.",
@@ -96,5 +96,16 @@
   "移除": "Remove",
   "已从列表移除「{name}」": "Removed “{name}” from the list",
   "移除失败": "Remove failed",
+  "切换后立即生效。": "Takes effect immediately.",
+  "开启后按发送方分目录存放推送。": "Pushes are stored in a subfolder named after the sender.",
+  "已配对但没有长连接的设备也免确认直接接收。": "Paired devices without a live link are also accepted without confirmation.",
+  "安卓上固定保存到下载目录。": "On Android files are always saved to the download folder.",
+  "取值 1–8，默认 4。": "1–8, default 4.",
+  "取值 1–32，默认 4。": "1–32, default 4.",
+  "替够不着彼此的设备和同群成员转发数据，会占用本机上行带宽。": "Forwards data for devices and group members that can't reach each other; uses this device's upload bandwidth.",
+  "与局域网里的 LocalSend 设备互相发现、互传文件；设备不配对，普通文件仍需确认。": "Discovers and exchanges files with LocalSend devices on the LAN; devices are not paired, and ordinary files still need confirmation.",
+  "还没有中转流量。": "No relay traffic yet.",
+  "关闭后对局域网隐身。": "When off, this device is invisible on the LAN.",
+  "电池优化：{status}。留在默认档时系统会在后台冻结应用。": "Battery optimization: {status}. At the default setting the system freezes the app in the background.",
   "默认关闭。打开且本机在线时，会加入 UDP 53317 组播，与局域网里的 LocalSend 设备互相发现并收发消息/文件；离线时自动停止，关掉后不再监听。LocalSend 设备不配对、不进聊天群，只走一对一；文本和图片始终自动接收，普通文件仍需确认。": "Off by default. When on and this device is online, it joins the UDP 53317 multicast group to discover and exchange messages and files with LocalSend devices on the LAN; it stops automatically while offline and stops listening once turned off. LocalSend devices are never paired and never join chat groups — only one-to-one conversations; text and images are always accepted automatically, while ordinary files still need confirmation."
 }

@@ -296,10 +296,9 @@ export function unicastBlocked(d: PeerDevice | undefined): boolean {
  */
 export function unicastBlockedTip(d: PeerDevice | undefined): string | null {
   if (!d || !unicastBlocked(d)) return null;
-  return t(
-    '「{name}」直连不通：它在同一网段（能收到它的 mDNS 记录），但这张 Wi-Fi 可能把客户端之间的单播隔开了。要立刻连上它，得有一台两端都够得着的设备打开设置里的「允许为其它设备中转」。',
-    { name: deviceShortName(d) },
-  );
+  return t('「{name}」连不上：这张 Wi-Fi 可能隔离了设备，可让一台双方都连得上的设备开启中转。', {
+    name: deviceShortName(d),
+  });
 }
 
 /**

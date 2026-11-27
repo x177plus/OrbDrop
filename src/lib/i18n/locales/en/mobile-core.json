@@ -8,7 +8,6 @@
   "{pending} 个待接收 · {inbox} 个已接收": "{pending} waiting · {inbox} received",
   "本机 · {addr}:{port}": "This device · {addr}:{port}",
   "长连接 · 在线": "Connected · online",
-  "离线 · 消息不会送达": "Offline · messages won't be delivered",
   "{reachable}/{total} 台在线": "{reachable}/{total} online",
   "已送达 {delivered}/{total} 台": "Delivered to {delivered}/{total} devices",
   "已送达 {delivered}/{total} 台 · {offline} 台离线": "Delivered to {delivered}/{total} devices · {offline} offline",
@@ -19,14 +18,6 @@
     "other": "{n} items failed to send: {error}"
   },
   "{status} · 点一下打开": "{status} · tap to open",
-  "群发（单向）：每条内容都会作为一条独立的一对一消息分别发给 {n} 台设备，这里只显示你发出的部分。": {
-    "one": "Broadcast (one-way): each item is sent as a separate 1:1 message to {n} device. Only your own messages are shown here.",
-    "other": "Broadcast (one-way): each item is sent as a separate 1:1 message to {n} devices. Only your own messages are shown here."
-  },
-  "群聊：{n} 台设备共享此会话，任何设备发送的消息所有人都能看到。": {
-    "one": "Group chat: {n} device shares this conversation. Messages sent from any device are visible to everyone.",
-    "other": "Group chat: {n} devices share this conversation. Messages sent from any device are visible to everyone."
-  },
   "来自 {name} · 接收后保存到收件目录": "From {name} · saved to the inbox once received",
   "发送消息…": "Send a message…",
   "消息内容": "Message content",

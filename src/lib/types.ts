@@ -1003,9 +1003,9 @@ export interface Undeliverable {
   peerId: string;
   /** 目标设备的显示名（后端给的是它自报的名字，界面上要「」框住）。 */
   name: string;
-  /** `no_relay` = 找不到愿意中转的设备；`relay_failed` = 有候选但这次没转成。 */
+  /** `no_relay` = 找不到愿意中转的设备；`relay_failed` = 有候选但这次没转成。界面只报"已排队"，不再展开原因。 */
   reason: 'no_relay' | 'relay_failed';
-  /** 目标此刻"看得见"吗（mDNS 记录还在）——据此补一句"可能这张 Wi-Fi 隔离了客户端"。 */
+  /** 目标此刻"看得见"吗（mDNS 记录还在）。随事件带来，界面不再据此追加解释。 */
   seen: boolean;
 }
 
@@ -1122,19 +1122,9 @@ export function updateTitleText(u: UpdateState): string {
 /**
  * 一条消息暂时送不出去时给用户的那句话（**桌面与移动共用同一份文案**）。
  *
- * 以前是静默的：消息照排队，界面上却什么都没说，用户只看到"发了没反应"。这里只补解释 ——
- * 排队本身是既有语义（等它上线再发，不丢）。
+ * 只说结果与后续：消息已排队、对方上线会自动发。中转为什么没成、Wi-Fi 是否隔离了客户端
+ * 这些解释不再往界面上堆 —— 用户此刻只关心"丢没丢"。
  */
 export function undeliverableText(u: Undeliverable): string {
-  const why = u.reason === 'no_relay' ? t('没有可用的中转方') : t('中转方这次没转成');
-  let text = t('发给「{name}」的消息暂时送不出去：{why}。已排队，等它上线会自动发出。', {
-    name: u.name,
-    why,
-  });
-  if (u.seen) {
-    text += t(
-      '它在同一网段，可能这张 Wi-Fi 隔离了客户端 —— 让一台两端都够得着的设备打开设置里的「允许为其它设备中转」就能自动接管。',
-    );
-  }
-  return text;
+  return t('发给「{name}」的消息已排队，对方上线后自动发出。', { name: u.name });
 }

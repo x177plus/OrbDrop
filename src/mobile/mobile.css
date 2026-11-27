@@ -339,10 +339,6 @@ a { color: inherit; text-decoration: none; }
   display: grid; place-items: center;
 }
 .cb-elsewhere:active { transform: scale(.95); }
-.chat-banner { flex: none; display: flex; align-items: flex-start; gap: calc(8 * var(--u)); padding: calc(9 * var(--u)) calc(14 * var(--u)); font-size: var(--fs-xs); line-height: 1.5; }
-.chat-banner .ic { width: calc(15 * var(--u)); height: calc(15 * var(--u)); flex: none; margin-top: 1px; }
-.chat-banner.bc { background: var(--bc-soft); color: var(--bc-deep); }
-.chat-banner.grp { background: var(--accent-soft); color: var(--accent-deep); }
 
 .chatlog {
   flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
@@ -701,7 +697,6 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .shelp-row .shelp { min-width: 0; }
 .shelp-row .btn { flex: none; }
 /* 文案语义色（原来散在各组件的 inline `color:var(--…)` 里）：只给文字，不参与布局。 */
-.tone-ok { color: var(--ok); }
 .tone-accent { color: var(--accent); }
 .tone-warn { color: var(--warn); }
 .tone-danger { color: var(--danger); }

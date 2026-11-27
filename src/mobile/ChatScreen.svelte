@@ -95,7 +95,7 @@
         ? t("长连接 · 在线")
         : reachable > 0
           ? t("在线")
-          : t("离线 · 消息不会送达")
+          : t("离线")
       : t("{reachable}/{total} 台在线", { reachable, total: participants.length }),
   );
 
@@ -117,21 +117,22 @@
     return chat.deviceNameOf(speakerOf(item));
   }
 
-  /** 一条消息底下那行小字（原型 `msgHTML` 里的 `meta`；`chat.stamp` = 日期 + 时刻）。 */
+  /**
+   * 一条消息底下那行小字（原型 `msgHTML` 里的 `meta`；`chat.stamp` = 日期 + 时刻）。
+   *
+   * 与桌面端 `ConvoPanel.metaOf` 同一套：**别人发的只写时刻** —— 一对一标题就是那台设备
+   * （备注优先），群聊的发言人在上面那行 `.who` 里；这里再写一遍名字纯属重复。
+   */
   function metaOf(item: ChatItem): string {
     const time = chat.stamp(item.at);
-    if (item.fromMe) {
-      // 群发那条视图里只有"我发出去的"：没有"某台的送达状态"可言，逐台都在下面那张回执卡里。
-      if (mode === "broadcast") return time;
-      // 群聊是共享的一条消息流，没有"各台各一份副本"那套账 —— 逐台走群自己那行小字。
-      const status = mode === "group"
-        ? chat.groupReceiptText(item, chat.groupDeclinedIds(thread?.id ?? ""))
-        : chat.deliveryText(participants[0], item);
-      return [time, status].filter(Boolean).join(" · ");
-    }
-    // 群聊里发言人已经写在上面的 `.who` 行了，这里只写时刻（原型同款）。
-    if (mode === "group") return time;
-    return [speakerName(item), time].filter(Boolean).join(" · ");
+    if (!item.fromMe) return time;
+    // 群发那条视图里只有"我发出去的"：没有"某台的送达状态"可言，逐台都在下面那张回执卡里。
+    if (mode === "broadcast") return time;
+    // 群聊是共享的一条消息流，没有"各台各一份副本"那套账 —— 逐台走群自己那行小字。
+    const status = mode === "group"
+      ? chat.groupReceiptText(item, chat.groupDeclinedIds(thread?.id ?? ""))
+      : chat.deliveryText(participants[0], item);
+    return [time, status].filter(Boolean).join(" · ");
   }
 
   /** 文件气泡里那句状态（原型 `fileStatus`）。 */
@@ -649,18 +650,6 @@
     <Icon name="more" cls="ic-fill" />
   </button>
 </header>
-
-{#if mode === "broadcast"}
-  <div class="chat-banner bc">
-    <Icon name="bc" />
-    <span>{t("群发（单向）：每条内容都会作为一条独立的一对一消息分别发给 {n} 台设备，这里只显示你发出的部分。", { n: participants.length })}</span>
-  </div>
-{:else if mode === "group"}
-  <div class="chat-banner grp">
-    <Icon name="group" />
-    <span>{t("群聊：{n} 台设备共享此会话，任何设备发送的消息所有人都能看到。", { n: participants.length })}</span>
-  </div>
-{/if}
 
 <div
   class="chatlog"
