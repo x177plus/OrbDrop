@@ -4,10 +4,11 @@
   import * as api from "$lib/api";
   import { t } from "$lib/i18n.svelte";
 
-  // 长按一条消息后贴在气泡旁边的「复制」小气泡 —— 移动端的"消息右键菜单"
-  // （桌面端见 `ContextMenu.svelte` 的 `kind === 'chat'`）。当前只有一项：复制整条。
+  // 长按一条消息后贴在气泡旁边的动作小气泡 —— 移动端的"消息右键菜单"
+  // （桌面端见 `ContextMenu.svelte` 的 `kind === 'chat'`）。当前有「引用」「复制」两项；
+  // 引用由调用方决定给不给（LocalSend 会话没有这套线上协议）。
   //
-  // **为什么不是底板**：长按只为一个动作，而底板要铺满整屏的遮罩、再从底部推一张表上来 ——
+  // **为什么不是底板**：长按只出几个轻量动作，而底板要铺满整屏的遮罩、再从底部推一张表上来 ——
   // 动作被推到离手指按着的那个气泡最远的地方，会话还整个压暗了。这里只弹一颗贴着气泡的
   // 小气泡，点别处即收，与系统"长按文字弹复制工具栏"是同一套手感。
   // 以后要加"转发 / 引用"之类，就往这颗小气泡里加一项（它自己会长宽），不要退回底板。
@@ -18,8 +19,11 @@
     /** 尾巴靠哪边：`me` 的气泡靠右，尾巴也跟着靠右（指着气泡靠近屏幕边缘的那一角）。 */
     side,
     onClose,
+    onQuote,
   }: {
     copyText: string;
+    /** 「引用」：不传 = 不画这一项（LocalSend 会话）。 */
+    onQuote?: () => void;
     /** 视口坐标下这颗小气泡的落点：只写其中两条边，见 `ChatScreen.openMessageActions`。 */
     layout: { left?: number; right?: number; top?: number; bottom?: number };
     /** 挂在气泡上方（尾巴朝下）还是下方（尾巴朝上）。 */
@@ -72,7 +76,7 @@
 </script>
 
 <!-- 点别处 = 收起（与底板遮罩同一个手势），但这一层**不画底色**：会话仍然看得见，
-     动作就贴着那颗气泡 —— 长按只为一个动作，把整屏压暗比动作本身重得多。 -->
+     动作就贴着那颗气泡 —— 长按只出几个轻量动作，把整屏压暗比动作本身重得多。 -->
 <div class="msgpop-layer">
   <div
     class="msgpop-scrim"
@@ -92,6 +96,19 @@
     tabindex="-1"
     bind:this={popEl}
   >
+    {#if onQuote}
+      <button
+        class="msgpop-btn"
+        type="button"
+        aria-label={t("引用整条消息")}
+        onclick={() => {
+          onQuote();
+        }}
+      >
+        <Icon name="quote" />
+        <span>{t("引用")}</span>
+      </button>
+    {/if}
     <button
       class="msgpop-btn"
       type="button"

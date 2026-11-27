@@ -149,7 +149,7 @@
   // 右键菜单：开在哪（窗口 CSS px）、开的是什么（`kind` 决定菜单画哪一组），外加一个"这次是
   // 折叠态卡片上开的那一份"的标记（`orb`，见 `orbCtxOpen`）。开与关只有两条路：面板里的各行
   // 派 `od:ctx` 事件（见 `handleCtx`），卡片那一档直接调 `openRectCtx`。
-  type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer' | 'chat' | 'convo'; el?: HTMLElement; shareId?: string; shareName?: string; path?: string; isDir?: boolean; size?: number; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; name?: string; chatId?: string; chatFull?: string; chatSel?: string; convoKey?: string; convoPeerId?: string; convoThread?: boolean; convoBc?: boolean; convoBrowse?: boolean; orb?: boolean; placed?: boolean; menuW?: number; menuH?: number };
+  type CtxState = { x: number; y: number; kind: 'share' | 'device' | 'peer' | 'chat' | 'convo'; el?: HTMLElement; shareId?: string; shareName?: string; path?: string; isDir?: boolean; size?: number; deviceState?: string; deviceOnline?: boolean; deviceNeedsPair?: boolean; deviceId?: string; peerId?: string; name?: string; chatId?: string; chatFull?: string; chatSel?: string; chatKey?: string; chatQuote?: boolean; convoKey?: string; convoPeerId?: string; convoThread?: boolean; convoBc?: boolean; convoBrowse?: boolean; orb?: boolean; placed?: boolean; menuW?: number; menuH?: number };
   let ctxState = $state<CtxState | null>(null);
 
   type HistoryPanel = {
@@ -2360,7 +2360,18 @@
   }
 
   function openMessageCtx(x: number, y: number, id: string, full: string, sel: string) {
-    ctxState = { x, y, kind: 'chat', chatId: id, chatFull: full, chatSel: sel };
+    const th = chat.activeThread();
+    ctxState = {
+      x,
+      y,
+      kind: 'chat',
+      chatId: id,
+      chatFull: full,
+      chatSel: sel,
+      chatKey: th?.key,
+      // LocalSend 没有引用这套线上协议：菜单里不摆「引用」这一档（见 `chat.canQuote`）。
+      chatQuote: !!th && chat.canQuote(th.key),
+    };
   }
 
   /**
@@ -2415,6 +2426,28 @@
       () => toast(which === 'sel' ? t('已复制所选文字') : t('已复制整条消息')),
       () => toast(t('复制失败，请手动选中文字后复制')),
     );
+  }
+
+  /**
+   * 消息菜单的「引用」：把这条（或选中的那段）做成引用快照，挂到这条会话的输入区上方。
+   *
+   * 快照在这一刻就定下来（`chat.quoteOf`）：之后原消息被裁掉也不影响引用块显示；
+   * 点引用块能不能跳回去，由会话详情按 id 找 DOM 决定。
+   */
+  function ctxChatQuote(which: 'all' | 'sel') {
+    const c = ctxState;
+    hideCtx();
+    const key = c?.chatKey;
+    const id = c?.chatId;
+    if (!key || !id) return;
+    const item = chat.itemById(key, id);
+    if (!item) {
+      toast(t('原消息不在当前记录里'));
+      return;
+    }
+    const quote = chat.quoteOf(item, which === 'sel' ? c?.chatSel ?? '' : '');
+    if (!quote) return;
+    chat.setQuoteDraft(key, quote);
   }
 
   /** 设备菜单的「发消息」：把 ctxState 里那台设备的会话开出来。 */
@@ -4841,6 +4874,7 @@
       bcCompareLabel={bcMenu.compareLabel}
       bcCompareEnabled={bcMenu.compareEnabled}
       chatSel={!!ctxState.chatSel}
+      chatQuote={ctxState.chatQuote === true}
       convoBrowse={ctxState.convoBrowse === true}
       convoThread={ctxState.convoThread === true}
       convoBc={ctxState.convoBc === true}
@@ -4864,6 +4898,7 @@
       onRemark={ctxRemark}
       onMessage={ctxMessage}
       onChatCopy={ctxChatCopy}
+      onChatQuote={ctxChatQuote}
       onConvoFiles={ctxConvoFiles}
       onConvoEdit={ctxConvoEdit}
       onConvoUpgrade={() => void ctxConvoUpgrade()}

@@ -18,6 +18,7 @@
     bcCompareLabel = '',
     bcCompareEnabled = true,
     chatSel = false,
+    chatQuote = false,
     convoBrowse = false,
     convoThread = false,
     convoBc = false,
@@ -56,6 +57,7 @@
     onBcCompare,
     onBcAddLeft,
     onChatCopy,
+    onChatQuote,
     onConvoFiles,
     onConvoEdit,
     onConvoClear,
@@ -92,6 +94,11 @@
     bcCompareEnabled?: boolean;
     /** 消息右键时选区里那段可复制的文字（空 = 不显示「复制所选文字」）。 */
     chatSel?: boolean;
+    /**
+     * 消息右键时给不给「引用」：LocalSend 会话没有这套线上协议，调用方传 false。
+     * `onChatQuote` 不传 = 不画引用项。
+     */
+    chatQuote?: boolean;
     /** 会话菜单：「查看该设备文件」只在对方**正处在长连接**时给 —— 对端浏览标签只存在于长连接设备。 */
     convoBrowse?: boolean;
     /** 会话菜单：这是不是一个**多台会话**（群发 / 群聊）—— 决定有哪些项、又是哪几句话。 */
@@ -164,6 +171,8 @@
     onBcAddLeft: () => void;
     /** 复制会话里的一条消息：`all` = 整条，`sel` = 只复制选中的那段。 */
     onChatCopy: (which: 'all' | 'sel') => void;
+    /** 引用会话里的一条消息：`all` = 整条，`sel` = 只引用选中的那段。不传 = 不画。 */
+    onChatQuote?: (which: 'all' | 'sel') => void;
     /** 会话菜单：切到那台设备的文件标签页（一对一才有）。 */
     onConvoFiles: () => void;
     /** 会话菜单：编辑收件人与名字（多台会话才有）。 */
@@ -257,6 +266,19 @@
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div class="ctx" class:show={!pending} class:is-compact={compact} bind:this={root} data-od-id="ctx-menu" use:ctxPlacement={{ x, y, bounds: pinned ? null : bounds }} role="menu" tabindex="-1" onclick={onClose}>
   {#if kind === 'chat'}
+    {#if chatQuote && onChatQuote}
+      {#if chatSel}
+        <button class="ctx-item" onclick={() => handleItem(() => onChatQuote('sel'))}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7H5v5h3c0 2-1 3-3 3v2c3 0 5-2 5-5V7Z"/><path d="M19 7h-4v5h3c0 2-1 3-3 3v2c3 0 5-2 5-5V7Z"/></svg>
+          {t('引用所选文字')}
+        </button>
+      {/if}
+      <button class="ctx-item" onclick={() => handleItem(() => onChatQuote('all'))}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7H5v5h3c0 2-1 3-3 3v2c3 0 5-2 5-5V7Z"/><path d="M19 7h-4v5h3c0 2-1 3-3 3v2c3 0 5-2 5-5V7Z"/></svg>
+        {t('引用整条消息')}
+      </button>
+      <div class="ctx-sep"></div>
+    {/if}
     {#if chatSel}
       <button class="ctx-item" onclick={() => handleItem(() => onChatCopy('sel'))}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11v13H4z"/><path d="M8 4h12v12"/></svg>

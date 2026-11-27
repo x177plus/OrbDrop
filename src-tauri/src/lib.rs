@@ -2086,6 +2086,7 @@ fn chat_send(
     text: String,
     batch_id: Option<String>,
     at: Option<u64>,
+    quote: Option<chat::ChatQuote>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<ChatSendView, String> {
     ensure_online(&state)?;
@@ -2110,7 +2111,14 @@ fn chat_send(
     if targets.is_empty() {
         return Err("收件人不存在".to_string());
     }
-    let result = chat::send_text(&state, &targets, &text, batch_id.as_deref(), at);
+    let result = chat::send_text_quoted(
+        &state,
+        &targets,
+        &text,
+        batch_id.as_deref(),
+        at,
+        quote,
+    );
     group::emit(&state);
     Ok(ChatSendView {
         id: result.id,
@@ -2138,6 +2146,7 @@ fn chat_send_image(
     name: String,
     at: Option<u64>,
     batch_id: Option<String>,
+    quote: Option<chat::ChatQuote>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<ChatSendView, String> {
     ensure_online(&state)?;
@@ -2153,7 +2162,15 @@ fn chat_send_image(
     if targets.is_empty() {
         return Err("收件人不存在".to_string());
     }
-    let result = chat::send_image(&state, &targets, &name, &bytes, at, batch_id.as_deref())?;
+    let result = chat::send_image_quoted(
+        &state,
+        &targets,
+        &name,
+        &bytes,
+        at,
+        batch_id.as_deref(),
+        quote,
+    )?;
     group::emit(&state);
     Ok(ChatSendView {
         id: result.id,
@@ -2477,6 +2494,7 @@ fn group_send(
     id: String,
     text: String,
     at: Option<u64>,
+    quote: Option<chat::ChatQuote>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<GroupRef, String> {
     ensure_online(&state)?;
@@ -2484,8 +2502,8 @@ fn group_send(
     if text.is_empty() {
         return Err("消息为空".to_string());
     }
-    let msg_id =
-        group::send_text(&state, &id, &text, at).ok_or_else(|| "本机不在这个群里".to_string())?;
+    let msg_id = group::send_text_quoted(&state, &id, &text, at, quote)
+        .ok_or_else(|| "本机不在这个群里".to_string())?;
     Ok(GroupRef {
         id: msg_id,
         snapshot: group::snapshot(&state),
@@ -2505,11 +2523,12 @@ fn group_send_image(
     path: String,
     name: String,
     at: Option<u64>,
+    quote: Option<chat::ChatQuote>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<GroupRef, String> {
     ensure_online(&state)?;
     let bytes = std::fs::read(&path).map_err(|e| format!("读不到那张图（{path}）：{e}"))?;
-    let msg_id = group::send_image(&state, &id, &name, &bytes, at)?
+    let msg_id = group::send_image_quoted(&state, &id, &name, &bytes, at, quote)?
         .ok_or_else(|| "本机不在这个群里".to_string())?;
     Ok(GroupRef {
         id: msg_id,

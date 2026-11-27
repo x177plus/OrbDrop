@@ -1921,7 +1921,40 @@ input { font: inherit; }
 .chat-msg.me .chat-bubble { background: var(--accent-deep); color: var(--surface); border-bottom-right-radius: 4px; }
 /* 右键菜单指着的那一条：给个同色系的圈，别用"选中态"那种实心变化（消息是只读的） */
 .chat-msg.picked .chat-bubble { box-shadow: 0 0 0 2px rgba(23, 121, 225, 0.45); }
+/* 点引用块跳过来的那一条：闪一下就收，别把"选中态"那种常驻描边留给它。 */
+.chat-msg.jump .chat-bubble,
+.chat-msg.jump .invite-card { animation: chat-jump 1.3s ease; }
+@keyframes chat-jump {
+  0%, 100% { box-shadow: none; }
+  18%, 65% { box-shadow: 0 0 0 2px var(--accent); }
+}
 .chat-text { display: block; white-space: pre-wrap; }
+
+/* 引用与消息是两个独立气泡：引用框在消息气泡上方，设备名在引用框左侧外面。
+   圆角与消息气泡同一档，但不共享外框。 */
+.chat-quote {
+  max-width: 100%; min-width: 0; display: flex; align-items: center; gap: 6px;
+  margin: 0 0 4px;
+}
+.chat-quote .cq-who {
+  flex: none; max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--font-display); font-size: 10px; font-weight: 650;
+  color: var(--muted);
+}
+.chat-quote .cq-box {
+  flex: 1 1 auto; min-width: 0; display: block;
+  /* CJK 字形的视觉重心比行盒几何中心略高：上 5 / 下 3 做 1px 光学下沉。 */
+  padding: 5px 9px 3px;
+  border: 0; border-left: 3px solid rgba(127, 127, 127, 0.55); border-radius: 10px;
+  background: rgba(127, 127, 127, 0.12);
+  color: var(--muted); font: inherit; text-align: left; cursor: pointer;
+  transition: background 0.15s ease;
+}
+.chat-quote .cq-box:hover { background: rgba(127, 127, 127, 0.19); }
+.chat-quote .cq-text {
+  min-width: 0; font-size: 11px; line-height: 1.45; white-space: pre-wrap;
+  overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+}
 .chat-meta { margin-top: 3px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
 /* 群发那条视图里，一条记录下面要写清"哪台已读、哪台还没送到"：逐台一段小字，颜色跟着状态走
    （绿 = 已读、灰 = 已送达、琥珀 = 未送达 —— 与设备状态那套配色同一个含义）。 */
@@ -1970,9 +2003,52 @@ input { font: inherit; }
 .ic-open:hover .ic-name { color: var(--accent); }
 
 /* ── 输入行 ── */
+/* 输入行外面多包一层：引用预览要长在**输入框那一行上方**，而输入行本身是横向 flex ——
+   塞进去会跟输入框抢同一行。边框挪到这一层，预览与输入行之间不会再出现第二条线。 */
+.chat-compose-wrap { position: relative; flex: none; border-top: 1px solid var(--border); }
+/* 回到最新：浮在输入区上方正中，只有翻离底部时才渐显。 */
+.chat-to-latest {
+  position: absolute; left: 50%; bottom: calc(100% + 8px); z-index: 5;
+  width: 30px; height: 30px; display: grid; place-items: center;
+  border: 1px solid var(--border); border-radius: 50%;
+  background: var(--surface); color: var(--accent-deep);
+  box-shadow: 0 2px 10px -3px rgba(14, 18, 23, 0.28);
+  opacity: 0; pointer-events: none;
+  transform: translate(-50%, 4px);
+  transition: opacity 0.16s ease, transform 0.16s ease, background 0.15s ease;
+}
+.chat-to-latest.show { opacity: 1; pointer-events: auto; transform: translate(-50%, 0); }
+.chat-to-latest:hover { background: var(--accent-soft); }
+.chat-to-latest svg { width: 15px; height: 15px; }
 /* `flex-end` 而不是居中：输入区长高（多行 / 里面夹了图）时，两颗圆按钮要贴着底边不动
    —— 与它们在同一行里上下漂相比，贴着输入区的最后一行更像聊天软件。 */
-.chat-compose { flex: none; display: flex; align-items: flex-end; gap: 6px; padding: 9px 12px; border-top: 1px solid var(--border); }
+.chat-compose { flex: none; display: flex; align-items: flex-end; gap: 6px; padding: 9px 12px; border-top: 0; }
+/* 输入行上方的引用预览：设备名在灰度框左侧外面，与消息里的两个气泡同一套排法。
+   发送成功后由 store 收掉；点 ✕ 只取消这一次引用。 */
+.chat-quote-draft {
+  display: flex; align-items: center; gap: 8px;
+  margin: 8px 12px 0;
+}
+.chat-quote-draft .cqd-who {
+  flex: none; max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--font-display); font-size: 10px; font-weight: 650;
+  color: var(--muted);
+}
+.chat-quote-draft .cqd-box {
+  flex: 1 1 auto; min-width: 0; padding: 5px 6px 3px 9px;
+  border-left: 3px solid rgba(127, 127, 127, 0.55); border-radius: 10px;
+  background: rgba(127, 127, 127, 0.12);
+}
+.chat-quote-draft .cqd-text {
+  min-width: 0; font-size: 11px; line-height: 1.45; color: var(--muted); white-space: pre-wrap;
+  overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+}
+.chat-quote-draft .cqd-x {
+  flex: none; width: 22px; height: 22px; display: grid; place-items: center;
+  border: 0; border-radius: 6px; background: none; color: var(--muted); cursor: pointer;
+}
+.chat-quote-draft .cqd-x:hover { background: rgba(127, 127, 127, 0.18); color: var(--fg); }
+.chat-quote-draft .cqd-x svg { width: 12px; height: 12px; }
 .chat-plus, .chat-send { flex: none; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; transition: background 0.15s ease, color 0.15s ease, transform 0.06s ease, opacity 0.15s ease; }
 .chat-plus { background: var(--fg-soft); color: var(--muted); }
 .chat-plus:hover { background: rgba(23, 121, 225, 0.14); color: var(--accent); }
@@ -2154,7 +2230,7 @@ input { font: inherit; }
 .field-hint b { color: var(--fg); font-weight: 600; }
 
 @media (prefers-reduced-motion: reduce) {
-  .orb-stage, .panel, .orb, .orb-arm, .orb-badge, .rq, .rq-card, .rq-dock, .rq-dots, .rq-dotlist, .rq-dot, .rq-shellbadge, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin, .chat-msg, .convo-pop, .foot-msg, .chat-receipt, .mode-opt, .cm-act { transition: none !important; animation: none !important; }
+  .orb-stage, .panel, .orb, .orb-arm, .orb-badge, .rq, .rq-card, .rq-dock, .rq-dots, .rq-dotlist, .rq-dot, .rq-shellbadge, .toast, .ctx, .sheet, .dialog, .tree, .chev, .cart-caret, .p-bar i, .pulse, .state-chip .dot, .overlay, .picker-layer, .picker, .pk-spin, .chat-msg, .convo-pop, .foot-msg, .chat-receipt, .mode-opt, .cm-act, .chat-to-latest { transition: none !important; animation: none !important; }
 }
 
 /* ↓↓↓ 生成区：高保真颜色（Chrome 111+），老引擎整块跳过 —— 见 scripts/gen-color-tokens.mjs ↓↓↓ */

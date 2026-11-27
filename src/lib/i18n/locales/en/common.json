@@ -109,5 +109,14 @@
   "界面语言已切换": "Display language changed",
   "切换语言失败：{error}": "Failed to change language: {error}",
   "切换语言": "Switch language",
-  "界面正文、托盘菜单与通知栏会立刻切换。首次启动使用系统语言，系统语言不在支持列表里时使用英语。": "The interface, tray menu and notifications switch immediately. The system language is used on first launch and falls back to English when the system language is not supported."
+  "界面正文、托盘菜单与通知栏会立刻切换。首次启动使用系统语言，系统语言不在支持列表里时使用英语。": "The interface, tray menu and notifications switch immediately. The system language is used on first launch and falls back to English when the system language is not supported.",
+  "引用": "Quote",
+  "引用所选文字": "Quote selected text",
+  "引用整条消息": "Quote whole message",
+  "取消引用": "Remove quote",
+  "点击查看原消息": "Click to view the original message",
+  "原消息不在当前记录里": "The original message is no longer in this conversation",
+  "回到最新消息": "Back to the latest message",
+  "你": "You",
+  "对方": "The other side"
 }

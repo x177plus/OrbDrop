@@ -88,6 +88,9 @@ pub struct ChatMessageBody {
     port: u16,
     /// 发送方自报的身份（未配对时本机只能采信它 —— 与推送邀请同一档信任）。
     sender: PeerInfo,
+    /// 这条消息引用了哪一条（老对端不带）。
+    #[serde(default)]
+    quote: Option<crate::chat::ChatQuote>,
 }
 
 /// POST /chat/read —— 收到对端一枚已读回执（没有长连接时走这条路）。
@@ -118,6 +121,7 @@ pub async fn chat_message_handler(
         text: body.text,
         at: body.at,
         from_name: body.sender.name.clone(),
+        quote: body.quote,
     };
     accept(
         &state,
@@ -147,6 +151,9 @@ pub struct ChatImageBody {
     data: String,
     port: u16,
     sender: PeerInfo,
+    /// 这条图片消息引用了哪一条（老对端不带）。
+    #[serde(default)]
+    quote: Option<crate::chat::ChatQuote>,
 }
 
 pub async fn chat_image_handler(
@@ -164,6 +171,7 @@ pub async fn chat_image_handler(
         size: body.size,
         data: body.data,
         from_name: body.sender.name.clone(),
+        quote: body.quote,
     };
     accept(
         &state,
@@ -231,6 +239,9 @@ pub struct GroupTextBody {
     pubkey: String,
     #[serde(default)]
     sig: String,
+    /// 这条群消息引用了哪一条（老对端不带）。
+    #[serde(default)]
+    quote: Option<crate::chat::ChatQuote>,
     port: u16,
     /// 信封上的身份（本帧是谁发来的）：认人、`upsert_peer` 都用它，与 `author` 是两件事。
     sender: PeerInfo,
@@ -280,6 +291,7 @@ pub async fn group_text_handler(
         epoch: body.epoch,
         pubkey: body.pubkey,
         sig: body.sig,
+        quote: body.quote,
     };
     accept(
         &state,
@@ -711,11 +723,18 @@ mod tests {
     /// 字段名必须与线上形状逐字对上 —— 对不上是 422，发送方那边只看到"没打通"。
     #[test]
     fn body_shapes_match_the_wire_event() {
+        let quote = crate::chat::ChatQuote {
+            id: "orig-1".into(),
+            text: "被引用的那句".into(),
+            from_me: false,
+            from_name: "PC-A".into(),
+        };
         let mut text = serde_json::to_value(WsEvent::ChatText {
             id: "m1".into(),
             text: "在吗".into(),
             at: 42,
             from_name: "PC-B".into(),
+            quote: Some(quote.clone()),
         })
         .unwrap();
         text["port"] = serde_json::json!(3890);
@@ -727,6 +746,7 @@ mod tests {
         assert_eq!(parsed.at, 42);
         assert_eq!(parsed.port, 3890);
         assert_eq!(parsed.sender.id, "p1");
+        assert_eq!(parsed.quote, Some(quote), "HTTP 体里的引用要逐字对上");
 
         let mut read = serde_json::to_value(WsEvent::ChatRead { up_to: 42 }).unwrap();
         read["port"] = serde_json::json!(3890);
@@ -748,6 +768,12 @@ mod tests {
         };
         // 中转过来的那一条最容易写错：**作者**是 A，**信封上的发送方**是搬运工 B ——
         // HTTP 体上这两个字段必须各是各的（同名会被信封覆盖掉，作者就变成搬运工）。
+        let quote = crate::chat::ChatQuote {
+            id: "orig-1".into(),
+            text: "群里被引用的那句".into(),
+            from_me: false,
+            from_name: "PC-A".into(),
+        };
         let mut text = serde_json::to_value(WsEvent::GroupText {
             group_id: "g1".into(),
             id: "m1".into(),
@@ -768,6 +794,7 @@ mod tests {
             epoch: 1,
             pubkey: "pk".into(),
             sig: "sig".into(),
+            quote: Some(quote.clone()),
         })
         .unwrap();
         text["port"] = serde_json::json!(3890);
@@ -785,6 +812,11 @@ mod tests {
         assert_eq!(parsed.name, "图片-1.png");
         assert_eq!(parsed.size, 7);
         assert_eq!(parsed.data, "REFUQQ==");
+        assert_eq!(
+            parsed.quote,
+            Some(quote),
+            "HTTP 体里的群消息引用也要逐字对上"
+        );
         assert_eq!(parsed.reached, vec!["p0".to_string()]);
         assert_eq!(sender.name, "PC-B");
 
@@ -1214,6 +1246,7 @@ mod tests {
             text: "你好".into(),
             at: 1,
             port: 5000,
+            quote: None,
             sender: PeerInfo {
                 id: sender_id.into(),
                 name: "PC-A".into(),

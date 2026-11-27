@@ -316,6 +316,9 @@ pub struct GroupMsg {
     /// 图片消息的字节数（界面上写"多大"）。
     #[serde(default)]
     pub size: u64,
+    /// 这条消息引用了群里哪一条（`None` = 不是引用回复）。老文件里没有这个键。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<crate::chat::ChatQuote>,
     /// 作者在发这条消息时的名册纪元。
     #[serde(default)]
     pub epoch: u64,
@@ -510,6 +513,9 @@ pub struct GroupMsgWire {
     pub data: String,
     #[serde(default)]
     pub epoch: u64,
+    /// 这条消息引用了群里哪一条（补拉也原样带回来）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<crate::chat::ChatQuote>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pubkey: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1818,7 +1824,23 @@ impl GroupStore {
         at: u64,
         deliveries: &[(String, Delivery)],
     ) -> GroupMsg {
-        self.record_outbound_signed(group_id, msg_id, from, content, at, deliveries, "")
+        self.record_outbound_quoted(group_id, msg_id, from, content, at, deliveries, None)
+    }
+
+    /// 与 [`Self::record_outbound`] 同一条路，额外带上这条群消息的引用块。
+    pub fn record_outbound_quoted(
+        &self,
+        group_id: &str,
+        msg_id: &str,
+        from: &str,
+        content: impl Into<crate::blobs::Content>,
+        at: u64,
+        deliveries: &[(String, Delivery)],
+        quote: Option<crate::chat::ChatQuote>,
+    ) -> GroupMsg {
+        self.record_outbound_signed(
+            group_id, msg_id, from, content, at, deliveries, "", quote,
+        )
     }
 
     pub fn record_outbound_signed(
@@ -1830,6 +1852,7 @@ impl GroupStore {
         at: u64,
         deliveries: &[(String, Delivery)],
         data: &str,
+        quote: Option<crate::chat::ChatQuote>,
     ) -> GroupMsg {
         let content = content.into();
         let mut guard = self.inner.lock();
@@ -1847,6 +1870,7 @@ impl GroupStore {
             at,
             seq,
             deliveries.iter().cloned().collect(),
+            quote,
         );
         if let Some(g) = guard.groups.iter().find(|g| g.id == group_id) {
             msg.epoch = g.epoch;
@@ -1880,7 +1904,26 @@ impl GroupStore {
         at: u64,
         seq: u64,
     ) -> bool {
-        self.record_inbound_signed(group_id, from, from_name, id, content, at, seq, 0, "", "")
+        self.record_inbound_signed(
+            group_id, from, from_name, id, content, at, seq, 0, "", "", None,
+        )
+    }
+
+    /// 与 [`Self::record_inbound`] 同一条路，额外带上对方发来的引用块。
+    pub fn record_inbound_quoted(
+        &self,
+        group_id: &str,
+        from: &str,
+        from_name: &str,
+        id: &str,
+        content: impl Into<crate::blobs::Content>,
+        at: u64,
+        seq: u64,
+        quote: Option<crate::chat::ChatQuote>,
+    ) -> bool {
+        self.record_inbound_signed(
+            group_id, from, from_name, id, content, at, seq, 0, "", "", quote,
+        )
     }
 
     /// 带群签名的入站消息：签名/公钥/纪元跟随消息落盘，补发与补拉都要原样再送。
@@ -1896,6 +1939,7 @@ impl GroupStore {
         epoch: u64,
         pubkey: &str,
         sig: &str,
+        quote: Option<crate::chat::ChatQuote>,
     ) -> bool {
         let content = content.into();
         let mut guard = self.inner.lock();
@@ -1911,7 +1955,16 @@ impl GroupStore {
                 debug!(%id, %from, group_id, seq, "群消息在本地已清空的历史下界之下，丢弃");
                 return false;
             }
-            let mut msg = msg_with(content, id, from, from_name, at, seq, HashMap::new());
+            let mut msg = msg_with(
+                content,
+                id,
+                from,
+                from_name,
+                at,
+                seq,
+                HashMap::new(),
+                quote,
+            );
             msg.epoch = epoch;
             msg.pubkey = pubkey.to_string();
             msg.sig = sig.to_string();
@@ -1977,7 +2030,7 @@ impl GroupStore {
         seq: u64,
     ) -> bool {
         self.buffer_pending_message_signed(
-            group_id, from, from_name, id, content, at, seq, 0, "", "",
+            group_id, from, from_name, id, content, at, seq, 0, "", "", None,
         )
     }
 
@@ -1993,6 +2046,7 @@ impl GroupStore {
         epoch: u64,
         pubkey: &str,
         sig: &str,
+        quote: Option<crate::chat::ChatQuote>,
     ) -> bool {
         let content = content.into();
         let mut guard = self.inner.lock();
@@ -2006,7 +2060,16 @@ impl GroupStore {
         if list.iter().any(|m| m.from == from && m.id == id) {
             return false;
         }
-        let mut msg = msg_with(content, id, from, from_name, at, seq, HashMap::new());
+        let mut msg = msg_with(
+            content,
+            id,
+            from,
+            from_name,
+            at,
+            seq,
+            HashMap::new(),
+            quote,
+        );
         msg.epoch = epoch;
         msg.pubkey = pubkey.to_string();
         msg.sig = sig.to_string();
@@ -2587,6 +2650,7 @@ impl GroupStore {
                     image: m.image,
                     name: m.name.clone(),
                     size: m.size,
+                    quote: crate::chat::clean_quote(m.quote.clone()),
                     epoch: m.epoch,
                     pubkey: m.pubkey.clone(),
                     sig: m.sig.clone(),
@@ -3019,6 +3083,7 @@ fn wire_of(root: &std::path::Path, m: &GroupMsg) -> GroupMsgWire {
             String::new()
         },
         epoch: m.epoch,
+        quote: m.quote.clone(),
         pubkey: m.pubkey.clone(),
         sig: m.sig.clone(),
     }
@@ -3044,6 +3109,9 @@ pub struct GroupMsgView {
     pub name: String,
     pub size: u64,
     pub path: String,
+    /// 这条消息引用了群里哪一条（界面据此在气泡上方画引用块）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote: Option<crate::chat::ChatQuote>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3124,6 +3192,7 @@ fn view_of(
                 size: m.size,
                 // 图片内容文件**本机此刻**在哪（不进 `groups.dat`：换台机器就错了）。
                 path: content_path(blobs_root, m),
+                quote: m.quote.clone(),
             }
         })
         .collect();
@@ -3335,6 +3404,17 @@ pub fn send_text(
     text: &str,
     at: Option<u64>,
 ) -> Option<String> {
+    send_text_quoted(state, group_id, text, at, None)
+}
+
+/// 与 [`send_text`] 同一条路，额外带上这条群消息的引用块。
+pub fn send_text_quoted(
+    state: &Arc<AppState>,
+    group_id: &str,
+    text: &str,
+    at: Option<u64>,
+    quote: Option<crate::chat::ChatQuote>,
+) -> Option<String> {
     if text.len() > MAX_TEXT_BYTES {
         return None;
     }
@@ -3359,6 +3439,7 @@ pub fn send_text(
             )
         },
         None,
+        quote,
     );
     Some(msg.id)
 }
@@ -3377,6 +3458,18 @@ pub fn send_image(
     name: &str,
     bytes: &[u8],
     at: Option<u64>,
+) -> Result<Option<String>, String> {
+    send_image_quoted(state, group_id, name, bytes, at, None)
+}
+
+/// 与 [`send_image`] 同一条路，额外带上这条群图片消息的引用块。
+pub fn send_image_quoted(
+    state: &Arc<AppState>,
+    group_id: &str,
+    name: &str,
+    bytes: &[u8],
+    at: Option<u64>,
+    quote: Option<crate::chat::ChatQuote>,
 ) -> Result<Option<String>, String> {
     if bytes.len() as u64 > crate::blobs::MAX_IMAGE_BYTES {
         return Err(format!(
@@ -3413,6 +3506,7 @@ pub fn send_image(
             )
         },
         Some(&id),
+        quote,
     );
     Ok(Some(msg.id))
 }
@@ -3446,6 +3540,7 @@ fn send_group_msg(
     data: String,
     event_of: impl FnOnce(&GroupMsg) -> WsEvent,
     pre_id: Option<&str>,
+    quote: Option<crate::chat::ChatQuote>,
 ) -> GroupMsg {
     let group_id = group.id.as_str();
     let queued_group = state.groups.has_queued(group_id);
@@ -3467,10 +3562,16 @@ fn send_group_msg(
     let id = pre_id
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let msg =
-        state
-            .groups
-            .record_outbound_signed(group_id, &id, own_id, content, at, &deliveries, &data);
+    let msg = state.groups.record_outbound_signed(
+        group_id,
+        &id,
+        own_id,
+        content,
+        at,
+        &deliveries,
+        &data,
+        quote,
+    );
     // 落账之后才有 seq：事件在这之后造（内容也只编一次）。
     let event = event_of(&msg);
     // 长连接那条路当场发（写成功 = 已送达），写不进去的交给后台那一跳。
@@ -3755,6 +3856,7 @@ fn group_event_with(
         epoch: msg.epoch,
         pubkey: msg.pubkey.clone(),
         sig: msg.sig.clone(),
+        quote: msg.quote.clone(),
     }
 }
 
@@ -3852,7 +3954,14 @@ impl GroupTextOutcome {
 }
 
 /// 收到一条群消息。
-pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -> GroupTextOutcome {
+pub fn on_group_text(
+    state: &Arc<AppState>,
+    peer_id: &str,
+    mut event: GroupTextIn,
+) -> GroupTextOutcome {
+    // 引用块先收口（空 id/空正文 → None，过长截断）：后面落账、攒邀请、中转都用这一份 ——
+    // 否则一条带着几 MB 假引用的群消息会被原样再转发给其他成员。
+    event.quote = crate::chat::clean_quote(event.quote);
     let own_id = state.config.lock().device_id.clone();
     // 本机**拒绝过**这个群：这一条不管谁发来的都收不下 —— 理由如实说（`declined`），发送方
     // 才知道该把那台设备标出来（"一直显示已送达"就是这么来的）。
@@ -3901,6 +4010,7 @@ pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -
             event.epoch,
             &event.pubkey,
             &event.sig,
+            event.quote.clone(),
         ) {
             debug!(group = %event.group_id, %peer_id, "邀请还没确认：先把这条群消息攒着");
             return GroupTextOutcome::Buffered;
@@ -4051,6 +4161,7 @@ pub fn on_group_text(state: &Arc<AppState>, peer_id: &str, event: GroupTextIn) -
         event.epoch,
         &event.pubkey,
         &event.sig,
+        event.quote.clone(),
     );
     if !inserted {
         // 重复投递（补发/重连重投）：这条早就在群里了，对发送方**算收下** —— 别拿它回一条拒收。
@@ -4182,6 +4293,7 @@ fn maybe_relay(
             epoch: event.epoch,
             pubkey: event.pubkey.clone(),
             sig: event.sig.clone(),
+            quote: event.quote.clone(),
         };
         if let Ok(body) = serde_json::to_vec(&ev) {
             relayed_bytes += body.len() as u64;
@@ -4560,6 +4672,8 @@ pub struct GroupTextIn {
     pub name: String,
     pub size: u64,
     pub data: String,
+    /// 这条消息引用了群里哪一条（老对端不带 = 不是引用）。
+    pub quote: Option<crate::chat::ChatQuote>,
     /// 作者名册纪元 + 群签名公钥/签名（老对端不带）。
     pub epoch: u64,
     pub pubkey: String,
@@ -4636,8 +4750,19 @@ fn sync_post_signing_bytes(
     roster: &Option<RosterPayload>,
     messages: &[GroupMsgWire],
 ) -> Vec<u8> {
+    // 引用块**不进签名**（与 `from_name` 同一档显示元数据）：这里把它剥掉再序列化，
+    // 于是带不带引用的同一批消息签出来是同一串字节 —— 老对端验得过（它们的结构里根本没这
+    // 一格），新对端也不会因为引用而互相拒收补拉回答。正文 / 图片仍按消息自带签名验。
+    let unsigned: Vec<GroupMsgWire> = messages
+        .iter()
+        .cloned()
+        .map(|mut m| {
+            m.quote = None;
+            m
+        })
+        .collect();
     let mut out = b"orbdrop-group-sync-post-v1\n".to_vec();
-    match serde_json::to_vec(&(group_id, ask_id, ts, has_more, roster, messages)) {
+    match serde_json::to_vec(&(group_id, ask_id, ts, has_more, roster, &unsigned)) {
         Ok(mut body) => out.append(&mut body),
         Err(e) => warn!(%e, "补拉回答签名载荷序列化失败"),
     }
@@ -4828,6 +4953,7 @@ fn msg_with(
     at: u64,
     seq: u64,
     delivery: HashMap<String, Delivery>,
+    quote: Option<crate::chat::ChatQuote>,
 ) -> GroupMsg {
     let name = content
         .image
@@ -4847,6 +4973,7 @@ fn msg_with(
         image: content.image.is_some(),
         name,
         size,
+        quote: crate::chat::clean_quote(quote),
         epoch: 1,
         pubkey: String::new(),
         sig: String::new(),
@@ -5010,6 +5137,83 @@ mod tests {
             1
         ));
         assert_eq!(s.view("g1", "me").unwrap().messages.len(), 2);
+    }
+
+    /// 群消息的引用：出站视图、补拉线上形状、入站落盘三处都要原样带着。
+    #[test]
+    fn a_group_quote_round_trips_through_view_wire_and_inbound() {
+        let s = store("group_quote");
+        joined(&s, "g1");
+        let quote = crate::chat::ChatQuote {
+            id: "orig-1".into(),
+            text: "被引用的那一句".into(),
+            from_me: false,
+            from_name: "PC-A".into(),
+        };
+        let msg = s.record_outbound_quoted(
+            "g1",
+            "q-1",
+            "me",
+            "回复",
+            100,
+            &[(String::from("a"), Delivery::Sent)],
+            Some(quote.clone()),
+        );
+        assert_eq!(msg.quote.as_ref(), Some(&quote), "落账那条带引用");
+        let event = group_event_with(
+            s.group("g1").as_ref().unwrap(),
+            "me",
+            "PC-ME",
+            &msg,
+            vec!["me".into()],
+            String::new(),
+        );
+        match event {
+            WsEvent::GroupText { quote: sent, .. } => {
+                assert_eq!(sent.as_ref(), Some(&quote), "线上事件带引用");
+            }
+            other => panic!("应当是群文本事件：{other:?}"),
+        }
+        let view = s.view("g1", "me").unwrap();
+        assert_eq!(
+            view.messages[0].quote.as_ref(),
+            Some(&quote),
+            "界面视图带引用"
+        );
+        let (wire, _) = s.messages_after("g1", 0, 10);
+        assert_eq!(wire[0].quote.as_ref(), Some(&quote), "补拉的那份带引用");
+        // 引用块不进补拉回答的签名：带与不带签出来必须是同一串字节（老对端也验得过）。
+        let with_quote = wire[0].clone();
+        let mut without_quote = with_quote.clone();
+        without_quote.quote = None;
+        assert_eq!(
+            sync_post_signing_bytes("g1", "ask-1", 1, false, &None, &[with_quote]),
+            sync_post_signing_bytes("g1", "ask-1", 1, false, &None, &[without_quote]),
+            "引用不影响补拉回答的签名字节"
+        );
+
+        let inbound = crate::chat::ChatQuote {
+            id: "orig-2".into(),
+            text: "另一句".into(),
+            from_me: true,
+            from_name: String::new(),
+        };
+        assert!(s.record_inbound_quoted(
+            "g1",
+            "a",
+            "PC-A",
+            "q-2",
+            "群里的回复",
+            200,
+            1,
+            Some(inbound.clone()),
+        ));
+        let view = s.view("g1", "me").unwrap();
+        assert_eq!(
+            view.messages[1].quote.as_ref(),
+            Some(&inbound),
+            "入站群消息的引用原样落盘"
+        );
     }
 
     /// 补拉：发回去的那几条**带上内容**；收方按 `(from,id)` 并进来，内容也落下来。
@@ -5669,6 +5873,7 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            quote: None,
             epoch: 1,
             pubkey: String::new(),
             sig: String::new(),
@@ -5699,6 +5904,7 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            quote: None,
             epoch: 1,
             pubkey: String::new(),
             sig: String::new(),
@@ -6072,6 +6278,7 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            quote: None,
             epoch: 1,
             pubkey: b_key.clone(),
             sig,
@@ -6111,6 +6318,7 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            quote: None,
             epoch: 1,
             pubkey: a_key.clone(),
             sig,
@@ -6476,6 +6684,7 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            quote: None,
             epoch: 1,
             pubkey: attacker_key.clone(),
             sig,
@@ -6537,6 +6746,7 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            quote: None,
             epoch: 1,
             pubkey: String::new(),
             sig: String::new(),
@@ -6775,6 +6985,7 @@ mod tests {
                 name: String::new(),
                 size: 0,
                 data: String::new(),
+                quote: None,
                 epoch: 1,
                 pubkey: String::new(),
                 sig: String::new(),
@@ -6820,6 +7031,7 @@ mod tests {
                 name: String::new(),
                 size: 0,
                 data: String::new(),
+                quote: None,
                 epoch: 1,
                 pubkey: String::new(),
                 sig: String::new(),
@@ -7174,6 +7386,7 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            quote: None,
             epoch: 1,
             pubkey: String::new(),
             sig: String::new(),
@@ -7246,6 +7459,7 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            quote: None,
             epoch: 1,
             pubkey: String::new(),
             sig: String::new(),
@@ -7372,6 +7586,7 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            quote: None,
             epoch: 1,
             pubkey: String::new(),
             sig: String::new(),
@@ -7442,6 +7657,7 @@ mod tests {
             name: String::new(),
             size: 0,
             data: String::new(),
+            quote: None,
             epoch: 1,
             pubkey: pubkey.clone(),
             sig,

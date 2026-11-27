@@ -480,6 +480,7 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             text,
             at,
             from_name,
+            quote,
         } => {
             // 名字：载荷里那个自报的名字算**核实过**的（这条连接是 token 换来的身份）→
             // 直接更新设备行（`note_peer_name`：对端改名跟着走），再从表里取。表里那份是权威
@@ -492,7 +493,10 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| peer_id.to_string());
             debug!(%id, %peer_id, "inbound chat text");
-            let (fresh, _) = state.chat.record_inbound(peer_id, &name, &id, &text, at);
+            let (fresh, _) =
+                state
+                    .chat
+                    .record_inbound_quoted(peer_id, &name, &id, &text, at, quote);
             crate::group::emit(state);
             // 手机上人没看着屏幕时，这条通知才是他知道"有人在说话"的唯一途径（进程活着、
             // 界面可能早就没了）—— 见 `notify` 的说明。重复投递不再响一遍。
@@ -514,14 +518,16 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             size: _,
             data,
             from_name,
+            quote,
         } => {
             // 与 `ChatText` 同一个口径：载荷里的名字算核实过的（token 换来的身份）→ 直接更新。
             state.note_peer_name(peer_id, &from_name);
             let sender = crate::group::display_name(state, peer_id, &from_name);
             debug!(%id, %peer_id, name = %name, "inbound chat image");
             // 内容先落盘再记账（见 `chat::accept_inbound_image`）：落不下来就不记。
-            match crate::chat::accept_inbound_image(state, peer_id, &sender, &id, &name, &data, at)
-            {
+            match crate::chat::accept_inbound_image(
+                state, peer_id, &sender, &id, &name, &data, at, quote,
+            ) {
                 Ok(fresh) => {
                     crate::group::emit(state);
                     if fresh {
@@ -568,6 +574,7 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
             epoch,
             pubkey,
             sig,
+            quote,
         } => {
             debug!(%group_id, %id, %peer_id, hops, image, "inbound group text");
             // 通知里要"哪个群、谁说的"，这两样都得在 `author` 被搬进事件里之前留一份
@@ -594,6 +601,7 @@ pub async fn handle_inbound(state: &Arc<AppState>, peer_id: &str, event: WsEvent
                     name,
                     size,
                     data,
+                    quote,
                     epoch,
                     pubkey,
                     sig,
@@ -864,6 +872,7 @@ mod tests {
                 text: "你好".into(),
                 at: 42,
                 from_name: "示例设备".into(),
+                quote: None,
             },
         )
         .await;
@@ -894,9 +903,46 @@ mod tests {
                 text: "再一句".into(),
                 at: 43,
                 from_name: "示例设备 Pro".into(),
+                quote: None,
             },
         )
         .await;
         assert_eq!(st.get_peer("dev-hw").unwrap().name, "示例设备 Pro");
+    }
+
+    /// 长连接收到的引用回复要原样落进会话（与 HTTP 兜底走同一个 `handle_inbound`）。
+    #[tokio::test]
+    async fn an_inbound_quote_is_recorded() {
+        let st = state("chat_quote");
+        let quote = crate::chat::ChatQuote {
+            id: "orig-1".into(),
+            text: "被引用的那一句".into(),
+            from_me: false,
+            from_name: "PC-A".into(),
+        };
+        let _ = handle_inbound(
+            &st,
+            "dev-q",
+            WsEvent::ChatText {
+                id: "m-q".into(),
+                text: "收到".into(),
+                at: 100,
+                from_name: "PC-Q".into(),
+                quote: Some(quote.clone()),
+            },
+        )
+        .await;
+        let convo = st
+            .chat
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == "dev-q")
+            .expect("这条引用回复该被记下来");
+        assert_eq!(
+            convo.messages[0].quote.as_ref(),
+            Some(&quote),
+            "长连接那条路也要把引用带到会话里"
+        );
     }
 }

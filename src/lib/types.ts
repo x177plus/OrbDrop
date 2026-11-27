@@ -629,6 +629,28 @@ export interface PushBatch {
 export type ChatDelivery = 'sending' | 'sent' | 'read' | 'synced' | 'queued' | 'failed' | 'received';
 
 /**
+ * 一条消息引用（"引用回复"）：引用的是**选中的那段文字**或整条消息。
+ *
+ * 引用的正文是**引用那一刻的快照**（`text`），不依赖原消息还在不在本机：被引用的记录可能
+ * 已经被 500 条上限裁掉、或对方清空过历史，引用块仍要能显示。`id` 只用于"点它跳回原消息"，
+ * 跳不到就如实说一句，不假装引用的是别的东西。
+ *
+ * `fromMe` 是**引用者视角**下"被引用的那条是不是我自己说的"（不是收件人视角）：
+ * 收件人看到发送方引用它自己说过的话时，这个标记仍然成立，用来把作者写成发送方的名字。
+ * `fromName` 只在 `fromMe === false` 时有意义（被引用的对端当时叫什么）。
+ */
+export interface ChatQuote {
+  /** 被引用消息的 id。 */
+  id: string;
+  /** 引用块里显示的文字（选中片段或整条消息；图片/文件是 `[图片] 名字` / `名字（大小）`）。 */
+  text: string;
+  /** 引用者视角：被引用的那条是不是引用者自己发的。 */
+  fromMe: boolean;
+  /** 被引用的那条是谁说的（`fromMe === false` 时有值；空串 = 不知道）。 */
+  fromName: string;
+}
+
+/**
  * 会话里的一条文本消息。
  *
  * 群发时**每台设备各存一份副本、共用同一个 `id`**（各自落在与该设备的 1:1 会话里）：
@@ -648,6 +670,8 @@ export interface ChatMessage {
   targets: string[];
   /** 这条是走哪个群发发出去的（`null`/缺省 = 一对一发的）。 */
   batchId?: string | null;
+  /** 这条消息引用了哪一条（`null`/缺省 = 不是引用回复）。 */
+  quote?: ChatQuote | null;
   /**
    * 这条是不是**图片消息**：图片是**消息内容**，不是推送文件 —— 对端直接就能看，
    * 没有"接收 / 同意"那一步，也不进"传输中"那本账（见 `src-tauri/src/blobs.rs`）。
@@ -755,6 +779,11 @@ export interface ChatFileMsg {
   path: string;
   /** 接收侧：发送方这次选了几项（>1 = 多选合并成的一条推送）；落盘路径的判据，见 `landingPath`。 */
   count: number;
+  /**
+   * 文件消息本身不携带引用（引用跟着**新的**文本/图片消息走）；这一格只为 `ChatItem`
+   * 三种成员都能统一读 `item.quote` 而保留。永远缺省/`null`。
+   */
+  quote?: ChatQuote | null;
 }
 
 /** 群成员（名册里的一行）。 */
@@ -832,6 +861,8 @@ export interface ChatGroupMsg {
   delivery: Record<string, ChatDelivery>;
   /** **仅 `fromMe` 有意义**：读过这条的成员数（配 `delivery` 的台数就是「已读 n/m」）。 */
   readCount: number;
+  /** 这条消息引用了群里哪一条（`null`/缺省 = 不是引用回复）。 */
+  quote?: ChatQuote | null;
   /**
    * 图片消息那几格，与 [`ChatMessage`] 同一套语义（图片是**消息内容**，不是推送文件）。
    * **群聊那一半的收发还没落地**（见 `docs/p1-implementation.md` §33）：这里先让时间线那一层

@@ -84,6 +84,68 @@ pub enum Delivery {
     Failed,
 }
 
+/// 一条引用回复所引用的那一条（`ChatMessage.quote` / `GroupMsg.quote` 共用）。
+///
+/// `text` 是**引用那一刻**的快照（选中的片段，或整条消息的显示文字）：原消息可能已经被
+/// 每个会话 500 条的上限裁掉、或对端清空过历史，引用块仍要能显示。`id` 只用于点它跳回原消息
+/// —— 跳不到时界面如实说一句，不拿别的消息冒充。
+///
+/// 与 `from_name` 同一档：它是**显示元数据**，不在群消息签名覆盖范围内（老对端读到不认识
+/// 的字段会忽略，消息本体照收；签名协议保持逐字节不变）。正文与图片内容本身仍按原协议验签。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatQuote {
+    /// 被引用消息的 id。
+    pub id: String,
+    /// 引用块里显示的文字。
+    pub text: String,
+    /// 引用者视角：被引用的那条是不是引用者自己发的。
+    #[serde(default)]
+    pub from_me: bool,
+    /// 被引用的对端当时叫什么（`from_me = true` 时为空）。
+    #[serde(default)]
+    pub from_name: String,
+}
+
+/// 引用块最长保留多少个字符（按 Unicode 标量算；不是字节）。
+///
+/// 引用是"看一眼"的预览，正文原消息里还在。上限只挡住"把一整段 16KB 的群消息再抄一遍"
+/// 这种没有意义的放大；超出部分从尾上截掉并留一个省略号。
+const MAX_QUOTE_CHARS: usize = 500;
+
+/// 引用块里 `from_name` 的上限（设备名通常只有几十个字符）。
+const MAX_QUOTE_NAME_CHARS: usize = 120;
+
+/// 按字符截断（不切坏 UTF-8），超出时补一个省略号。
+fn clip_chars(value: &str, max: usize) -> String {
+    let mut out = String::new();
+    for (i, ch) in value.chars().enumerate() {
+        if i >= max {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// 把界面上来的引用收成可落盘、可上线的那一份：去空白、挡住空 id / 空正文、截断过长正文。
+///
+/// 入站那条也走它（对端可能不带这个字段，也可能带一份超长的）：坏引用按**没有引用**收下，
+/// 不让一条消息因为引用块而整条丢掉。
+pub fn clean_quote(quote: Option<ChatQuote>) -> Option<ChatQuote> {
+    let mut quote = quote?;
+    quote.id = quote.id.trim().to_string();
+    quote.text = quote.text.trim().to_string();
+    quote.from_name = quote.from_name.trim().to_string();
+    if quote.id.is_empty() || quote.text.is_empty() {
+        return None;
+    }
+    quote.text = clip_chars(&quote.text, MAX_QUOTE_CHARS);
+    quote.from_name = clip_chars(&quote.from_name, MAX_QUOTE_NAME_CHARS);
+    Some(quote)
+}
+
 /// 会话里的一条文本消息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,6 +165,9 @@ pub struct ChatMessage {
     /// 这条是走哪个群发发出去的（`None` = 一对一发的）。老文件里没有这个键。
     #[serde(default)]
     pub batch_id: Option<String>,
+    /// 这条消息引用了哪一条（`None` = 不是引用回复）。老文件/老对端没有这个键。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<ChatQuote>,
     /// 这条是不是**图片消息**（图片是消息内容，不是文件 —— 对端直接就能看，见 `blobs`）。
     /// 老文件里没有这个键 = 文字消息。
     #[serde(default)]
@@ -466,9 +531,26 @@ impl ChatStore {
         targets: &[(String, Delivery)],
         batch_id: Option<&str>,
     ) -> Snapshot {
+        self.record_outbound_quoted(id, content, at, targets, batch_id, None)
+    }
+
+    /// 与 [`Self::record_outbound`] 同一条路，额外带上这条消息的引用块。
+    ///
+    /// 引用在每个收件人的副本上原样存一份（群发时每台各看到的都是同一条引用），由
+    /// [`clean_quote`] 先做长度/空白收口 —— 落盘与上网的都是收口之后的那份。
+    pub fn record_outbound_quoted(
+        &self,
+        id: &str,
+        content: impl Into<blobs::Content>,
+        at: u64,
+        targets: &[(String, Delivery)],
+        batch_id: Option<&str>,
+        quote: Option<ChatQuote>,
+    ) -> Snapshot {
         let content = content.into();
         let ids: Vec<String> = targets.iter().map(|(p, _)| p.clone()).collect();
         let image = content.image.clone();
+        let quote = clean_quote(quote);
         {
             let mut guard = self.inner.lock();
             for (peer_id, delivery) in targets {
@@ -482,6 +564,7 @@ impl ChatStore {
                     delivery: *delivery,
                     targets: ids.clone(),
                     batch_id: batch_id.map(str::to_string),
+                    quote: quote.clone(),
                     image: image.is_some(),
                     name: image.as_ref().map(|(n, _)| n.clone()).unwrap_or_default(),
                     size: image.as_ref().map(|(_, s)| *s).unwrap_or(0),
@@ -510,7 +593,27 @@ impl ChatStore {
         text: &str,
         at: u64,
     ) -> (bool, Snapshot) {
-        self.record_inbound_msg(peer_id, from_name, id, blobs::Content::text(text), at)
+        self.record_inbound_msg(peer_id, from_name, id, blobs::Content::text(text), at, None)
+    }
+
+    /// 与 [`Self::record_inbound`] 同一条路，额外带上对方发来的引用块。
+    pub fn record_inbound_quoted(
+        &self,
+        peer_id: &str,
+        from_name: &str,
+        id: &str,
+        text: &str,
+        at: u64,
+        quote: Option<ChatQuote>,
+    ) -> (bool, Snapshot) {
+        self.record_inbound_msg(
+            peer_id,
+            from_name,
+            id,
+            blobs::Content::text(text),
+            at,
+            quote,
+        )
     }
 
     /// 收到对端一条**图片消息**（内容已经由调用方写进 `blobs` 了）。
@@ -532,6 +635,28 @@ impl ChatStore {
             id,
             blobs::Content::image(name, size),
             at,
+            None,
+        )
+    }
+
+    /// 与 [`Self::record_inbound_image`] 同一条路，额外带上对方发来的引用块。
+    pub fn record_inbound_image_quoted(
+        &self,
+        peer_id: &str,
+        from_name: &str,
+        id: &str,
+        name: &str,
+        size: u64,
+        at: u64,
+        quote: Option<ChatQuote>,
+    ) -> (bool, Snapshot) {
+        self.record_inbound_msg(
+            peer_id,
+            from_name,
+            id,
+            blobs::Content::image(name, size),
+            at,
+            quote,
         )
     }
 
@@ -543,6 +668,7 @@ impl ChatStore {
         id: &str,
         content: blobs::Content,
         at: u64,
+        quote: Option<ChatQuote>,
     ) -> (bool, Snapshot) {
         let duplicate = {
             let guard = self.inner.lock();
@@ -556,6 +682,7 @@ impl ChatStore {
             return (false, self.snapshot());
         }
         let image = content.image.clone();
+        let quote = clean_quote(quote);
         {
             let mut guard = self.inner.lock();
             if !guard.convos.contains_key(peer_id) && guard.convos.len() >= MAX_CONVOS {
@@ -573,6 +700,7 @@ impl ChatStore {
                 delivery: Delivery::Received,
                 targets: vec![peer_id.to_string()],
                 batch_id: None,
+                quote,
                 image: image.is_some(),
                 name: image.as_ref().map(|(n, _)| n.clone()).unwrap_or_default(),
                 size: image.as_ref().map(|(_, s)| *s).unwrap_or(0),
@@ -657,6 +785,7 @@ impl ChatStore {
                 // LocalSend 没有群发/逐台回执：目标留空，别让 OrbDrop 的逐台逻辑把它算进去。
                 targets: Vec::new(),
                 batch_id: None,
+                quote: None,
                 image: image.is_some(),
                 name: image.as_ref().map(|(n, _)| n.clone()).unwrap_or_default(),
                 size: image.as_ref().map(|(_, s)| *s).unwrap_or(0),
@@ -691,6 +820,7 @@ impl ChatStore {
                 delivery,
                 targets: Vec::new(),
                 batch_id: None,
+                quote: None,
                 image: image.is_some(),
                 name: image.as_ref().map(|(n, _)| n.clone()).unwrap_or_default(),
                 size: image.as_ref().map(|(_, s)| *s).unwrap_or(0),
@@ -1361,8 +1491,24 @@ pub fn send_text(
     batch_id: Option<&str>,
     at: Option<u64>,
 ) -> SendResult {
+    send_text_quoted(state, targets, text, batch_id, at, None)
+}
+
+/// 与 [`send_text`] 同一条路，额外带上这条消息的引用块。
+///
+/// 引用跟着线上事件走（`ChatText.quote`）：对端落盘后，两端的消息气泡上方都看得到同一份
+/// 引用；老对端读到不认识的字段会忽略，正文照收。
+pub fn send_text_quoted(
+    state: &Arc<AppState>,
+    targets: &[String],
+    text: &str,
+    batch_id: Option<&str>,
+    at: Option<u64>,
+    quote: Option<ChatQuote>,
+) -> SendResult {
     let id = uuid::Uuid::new_v4().to_string();
     let at = at.unwrap_or_else(now_ms);
+    let quote = clean_quote(quote);
     let event = crate::ws::events::WsEvent::ChatText {
         id: id.clone(),
         text: text.to_string(),
@@ -1370,6 +1516,7 @@ pub fn send_text(
         // 本机此刻的名字：长连接那条路上没有信封，接收方只能从这里知道"这台叫什么"
         // （否则它只能拿设备表里那份占位名 —— 表现就是一串 deviceid）。
         from_name: state.config.lock().device_name.clone(),
+        quote: quote.clone(),
     };
     let (deliveries, inflight) = dispatch(state, targets, &event);
     // 多台 = 群发（复用/新建一份名单）；单台且没点名某个群发 = 一对一发。
@@ -1378,9 +1525,14 @@ pub fn send_text(
         (None, true) => Some(state.chat.resolve_batch(None, targets)),
         (None, false) => None,
     };
-    let snapshot = state
-        .chat
-        .record_outbound(&id, text, at, &deliveries, batch.as_deref());
+    let snapshot = state.chat.record_outbound_quoted(
+        &id,
+        text,
+        at,
+        &deliveries,
+        batch.as_deref(),
+        quote,
+    );
     follow_up_http(state, &id, event, inflight);
     SendResult {
         id,
@@ -1405,6 +1557,19 @@ pub fn send_image(
     at: Option<u64>,
     batch_id: Option<&str>,
 ) -> Result<SendResult, String> {
+    send_image_quoted(state, targets, name, bytes, at, batch_id, None)
+}
+
+/// 与 [`send_image`] 同一条路，额外带上这条图片消息的引用块。
+pub fn send_image_quoted(
+    state: &Arc<AppState>,
+    targets: &[String],
+    name: &str,
+    bytes: &[u8],
+    at: Option<u64>,
+    batch_id: Option<&str>,
+    quote: Option<ChatQuote>,
+) -> Result<SendResult, String> {
     use base64::Engine;
     if bytes.len() as u64 > crate::blobs::MAX_IMAGE_BYTES {
         return Err(format!(
@@ -1416,6 +1581,7 @@ pub fn send_image(
     let id = uuid::Uuid::new_v4().to_string();
     crate::blobs::save_in(state.chat.blobs_root(), &id, name, bytes)?;
     let at = at.unwrap_or_else(now_ms);
+    let quote = clean_quote(quote);
     let event = crate::ws::events::WsEvent::ChatImage {
         id: id.clone(),
         at,
@@ -1424,6 +1590,7 @@ pub fn send_image(
         data: base64::engine::general_purpose::STANDARD.encode(bytes),
         // 与 `ChatText` 同一条理由：名字只用来填对端的占位行。
         from_name: state.config.lock().device_name.clone(),
+        quote: quote.clone(),
     };
     let (deliveries, inflight) = dispatch(state, targets, &event);
     let batch = match (batch_id, targets.len() > 1) {
@@ -1431,12 +1598,13 @@ pub fn send_image(
         (None, true) => Some(state.chat.resolve_batch(None, targets)),
         (None, false) => None,
     };
-    let snapshot = state.chat.record_outbound(
+    let snapshot = state.chat.record_outbound_quoted(
         &id,
         blobs::Content::image(name, bytes.len() as u64),
         at,
         &deliveries,
         batch.as_deref(),
+        quote,
     );
     follow_up_http(state, &id, event, inflight);
     Ok(SendResult {
@@ -1539,14 +1707,15 @@ pub fn accept_inbound_image(
     name: &str,
     data: &str,
     at: u64,
+    quote: Option<ChatQuote>,
 ) -> Result<bool, String> {
     // 解码 → 过上限 → 落盘只有一份实现（见 `blobs::save_base64`）；名字只用来取扩展名
     // （`blobs::path_in` 自己过名单），字节数按**解出来的**算（收方以自己那份为准）。
     let path = crate::blobs::save_base64(state.chat.blobs_root(), id, name, data)?;
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    let (fresh, _) = state
-        .chat
-        .record_inbound_image(peer_id, from_name, id, name, size, at);
+    let (fresh, _) = state.chat.record_inbound_image_quoted(
+        peer_id, from_name, id, name, size, at, quote,
+    );
     Ok(fresh)
 }
 
@@ -1566,6 +1735,7 @@ fn queued_event(
             text: msg.text.clone(),
             at: msg.at,
             from_name: from_name.to_string(),
+            quote: msg.quote.clone(),
         });
     }
     let bytes = crate::blobs::read_in(root, &msg.id, &msg.name)
@@ -1577,6 +1747,7 @@ fn queued_event(
         size: bytes.len() as u64,
         data: base64::engine::general_purpose::STANDARD.encode(bytes),
         from_name: from_name.to_string(),
+        quote: msg.quote.clone(),
     })
 }
 
@@ -1935,6 +2106,107 @@ mod tests {
         assert!(
             queued_event(&msg, &root, "PC-ME").is_err(),
             "内容不在了要报错，不能装作发得出去"
+        );
+    }
+
+    /// 排队补发那一路也要带着引用：离线时发的一条引用回复，对端上线后收到的仍是同一条引用。
+    #[test]
+    fn a_queued_text_keeps_its_quote() {
+        let s = store("quote_queued");
+        let quote = ChatQuote {
+            id: "orig-1".into(),
+            text: "被引用的那一句".into(),
+            from_me: true,
+            from_name: String::new(),
+        };
+        s.record_outbound_quoted(
+            "q-1",
+            "排队等它上线",
+            100,
+            &[(String::from("a"), Delivery::Queued)],
+            None,
+            Some(quote.clone()),
+        );
+        let msg = s.next_queued("a").expect("排队了就该取得到");
+        match queued_event(&msg, s.blobs_root(), "PC-ME") {
+            Ok(crate::ws::events::WsEvent::ChatText { quote: sent, .. }) => {
+                assert_eq!(sent, Some(quote), "补发那一跳也要原样带着引用");
+            }
+            other => panic!("应当是文本事件：{other:?}"),
+        }
+    }
+
+    /// 引用回复：出站那份带上引用、重启后还在；入站那份原样收下；坏引用按"没有引用"收，
+    /// 不让一条消息因为引用块而整条丢掉。
+    #[test]
+    fn a_quote_survives_outbound_inbound_and_restart() {
+        let s = store("quote_round_trip");
+        let outbound_quote = ChatQuote {
+            id: "orig-1".into(),
+            text: "被引用的那一句".into(),
+            from_me: false,
+            from_name: "PC-A".into(),
+        };
+        s.record_outbound_quoted(
+            "q-1",
+            "回复",
+            100,
+            &peers(&["a"]),
+            None,
+            Some(outbound_quote.clone()),
+        );
+        let reopened = ChatStore::with_path(s.path.clone());
+        let convo = reopened
+            .snapshot()
+            .convos
+            .into_iter()
+            .find(|c| c.peer_id == "a")
+            .unwrap();
+        assert_eq!(
+            convo.messages[0].quote.as_ref(),
+            Some(&outbound_quote),
+            "出站消息的引用要落盘，重启后还在"
+        );
+
+        let inbound_quote = ChatQuote {
+            id: "orig-2".into(),
+            text: "另一句".into(),
+            from_me: true,
+            from_name: String::new(),
+        };
+        let (fresh, snap) = reopened.record_inbound_quoted(
+            "a",
+            "PC-A",
+            "q-2",
+            "对方的回复",
+            200,
+            Some(inbound_quote.clone()),
+        );
+        assert!(fresh);
+        let convo = snap.convos.into_iter().find(|c| c.peer_id == "a").unwrap();
+        assert_eq!(
+            convo.messages[1].quote.as_ref(),
+            Some(&inbound_quote),
+            "入站消息的引用原样收下"
+        );
+
+        let (_, snap) = reopened.record_inbound_quoted(
+            "a",
+            "PC-A",
+            "q-3",
+            "坏引用",
+            300,
+            Some(ChatQuote {
+                id: String::new(),
+                text: String::new(),
+                from_me: false,
+                from_name: String::new(),
+            }),
+        );
+        let convo = snap.convos.into_iter().find(|c| c.peer_id == "a").unwrap();
+        assert_eq!(
+            convo.messages[2].quote, None,
+            "空 id / 空正文的引用收成 None，消息本身照收"
         );
     }
 

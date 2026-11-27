@@ -1,11 +1,11 @@
 import { listen } from '@tauri-apps/api/event';
 import { formatFileSize } from '$lib/types';
 import { hasContent, revokeSegs, type ComposerSeg } from '$lib/composer';
-import type { ChatDelivery, ChatFileMsg, ChatGroup, ChatGroupMsg, ChatSnapshot, ChatMessage, ChatPeerConvo, ConvoMode, LocalPick, PendingGroup, PushBatch, PushInvite, PushTargetState } from '$lib/types';
+import type { ChatDelivery, ChatFileMsg, ChatGroup, ChatGroupMsg, ChatQuote, ChatSnapshot, ChatMessage, ChatPeerConvo, ConvoMode, LocalPick, PendingGroup, PushBatch, PushInvite, PushTargetState } from '$lib/types';
 import * as api from '$lib/api';
 import { t } from '$lib/i18n.svelte';
 import { playMessageSound } from '$lib/sound';
-import { getDevices, deviceById, deviceState, threadDotState, threadTrusted, peerShortName, type DeviceDotState } from './devices.svelte';
+import { getDevices, deviceById, deviceRemarkOf, deviceState, threadDotState, threadTrusted, peerShortName, type DeviceDotState } from './devices.svelte';
 
 /**
  * 会话（聊天）：后端那份记录在前端的影子 + 会话界面自己的状态。
@@ -51,6 +51,8 @@ let open = $state(false);
 let openKey = $state<string | null>(null);
 /** 还没发出去的草稿：**按会话**存，切来切去不丢（分段表，见 `lib/composer.ts`）。 */
 let draft = $state<Record<string, ComposerSeg[]>>({});
+/** 输入框上方那块引用预览：按会话存，与草稿同寿命（`null`/缺省 = 没有引用）。 */
+let draftQuotes = $state<Record<string, ChatQuote | null>>({});
 /** 收件人选择框（「新建会话」「编辑参与者」共用一份）。 */
 let recipientReq = $state<RecipientReq | null>(null);
 /** 文件消息：设备 id → 那几条（见文件头说明）。启动时由 `seedFiles` 从快照种下。 */
@@ -961,6 +963,8 @@ const pendingDraftDrop = new Map<string, ComposerSeg[]>();
 
 /** 清掉一条会话的草稿（`clearPeer` 用）：正开着则推迟到离开时（见 `pendingDraftDrop`）。 */
 function dropDraft(key: string) {
+  // 引用没有 `blob:` 之类的预览资源，可以当场清掉；正开着也不怕（那块预览直接消失即可）。
+  clearQuoteDraft(key);
   const segs = draft[key];
   if (!segs) return;
   if (openKey === key) {
@@ -1011,6 +1015,96 @@ function flushPendingDraftDrop(key: string | null) {
 /** 这条草稿里有没有值得发的东西（两段空白文字不算）。 */
 export function draftHasContent(key: string): boolean {
   return hasContent(draftSegsOf(key));
+}
+
+/** 引用块正文最多存多少个字符（后端 `MAX_QUOTE_CHARS` 同一档；超出补一个省略号）。 */
+const QUOTE_MAX_CHARS = 500;
+
+function clipQuote(value: string): string {
+  const chars = Array.from(value);
+  if (chars.length <= QUOTE_MAX_CHARS) return value;
+  return `${chars.slice(0, QUOTE_MAX_CHARS).join('')}…`;
+}
+
+/**
+ * 把一条消息做成引用快照（`sel` 非空 = 引用选中的那段文字，否则整条）。
+ *
+ * 文件/图片消息没有可选文字：引用的是它们的显示文字（`copyTextOf` 同一份写法）。
+ * `fromMe` 是**引用者视角**（被引用的那句是不是引用者自己说的），收件人看到发送方引用
+ * 它自己旧消息时仍然成立；`fromName` 只在不是引用者自己时说——那时它是原消息的发送方。
+ */
+export function quoteOf(item: ChatItem, sel = ''): ChatQuote | null {
+  const text = (sel.trim() || copyTextOf(item).trim()).trim();
+  if (!text) return null;
+  const fromMe = item.fromMe;
+  const fromName = fromMe
+    ? ''
+    : item.kind === 'file'
+      ? deviceNameOf(item.peerId)
+      : 'from' in item
+        ? deviceRemarkOf(item.from) ||
+          item.fromName.trim() ||
+          deviceNameOf(item.from)
+        : item.fromName.trim();
+  return {
+    id: item.id,
+    text: clipQuote(text),
+    fromMe,
+    fromName: fromName.trim(),
+  };
+}
+
+/**
+ * 引用块抬头那个名字（空串 = 这一档不写名字）。
+ *
+ * `quote.fromMe` 是**引用者视角**：在一条"我发的"消息上，它表示"我引用了自己的话"；
+ * 在一条"对方发的"消息上，它表示"对方引用了它自己的话"——两种情况抬头都应写
+ * 那条消息的发送方（我 / 对方的名字），而不是被引用的那条。
+ */
+export function quoteAuthorOf(quote: ChatQuote, item: ChatItem): string {
+  if (!quote.fromMe) return quote.fromName.trim() || t('对方');
+  if (item.fromMe) return t('你');
+  if (item.kind === 'file') return deviceNameOf(item.peerId);
+  return (
+    ('from' in item ? deviceRemarkOf(item.from) || item.fromName.trim() : '') ||
+    item.fromName.trim() ||
+    t('对方')
+  );
+}
+
+/** 这条会话支不支持引用（LocalSend 没有这套线上协议：菜单里不摆这一项）。 */
+export function canQuote(key: string): boolean {
+  const thread = threadOf(key);
+  if (!thread) return false;
+  if (thread.mode === 'group') return true;
+  return !thread.participants.every(localSendPeer);
+}
+
+/**
+ * 输入区预览里那个抬头：预览是**我**刚选的引用，所以 `fromMe` 直接读作「你」；
+ * 不是自己说的才用快照里记下的对端名字。
+ */
+export function quoteDraftAuthorOf(quote: ChatQuote): string {
+  return quote.fromMe ? t('你') : quote.fromName.trim() || t('对方');
+}
+
+/** 输入框上方那条引用预览（`null` = 没有引用）。 */
+export function quoteDraftOf(key: string): ChatQuote | null {
+  return draftQuotes[key] ?? null;
+}
+
+/** 选中一条消息的引用（给输入区上方那块灰度预览用；不支持引用的会话一律不记）。 */
+export function setQuoteDraft(key: string, quote: ChatQuote | null): void {
+  if (quote && !canQuote(key)) return;
+  draftQuotes = { ...draftQuotes, [key]: quote };
+}
+
+/** 取消引用（预览右上角那颗 ✕ / 发送成功后）。 */
+export function clearQuoteDraft(key: string): void {
+  if (!(key in draftQuotes)) return;
+  const next = { ...draftQuotes };
+  delete next[key];
+  draftQuotes = next;
 }
 
 /** 收件人选择框的那份请求：种子、锁定的模式、预填名字、确认回调。 */
@@ -1313,12 +1407,13 @@ export async function sendText(
   key: string,
   text: string,
   at?: number,
+  quote: ChatQuote | null = null,
 ): Promise<{ id: string; batchId: string | null } | null> {
   const t = threadOf(key);
   const body = text.trim();
   if (!t || !body) return null;
   if (t.mode === 'group') {
-    const res = await api.groupSend(t.id, body, at);
+    const res = await api.groupSend(t.id, body, at, quote);
     replace(res.snapshot);
     return { id: res.id, batchId: null };
   }
@@ -1328,8 +1423,8 @@ export async function sendText(
   const peers = t.participants.filter((id) => !localSendPeer(id));
   if (!peers.length) return null;
   const res = t.mode === 'direct'
-    ? await api.chatSend([peers[0]], body, null, at)
-    : await api.chatSend(peers, body, t.id, at);
+    ? await api.chatSend([peers[0]], body, null, at, quote)
+    : await api.chatSend(peers, body, t.id, at, quote);
   replace(res.snapshot);
   return { id: res.id, batchId: res.batchId };
 }
@@ -1371,6 +1466,8 @@ export async function sendComposer(key: string): Promise<ComposerSendResult | nu
   if (!thread) return null;
   const segs = draftSegsOf(key);
   if (!hasContent(segs)) return null;
+  // 这一整条发送共用同一份引用（"图夹在两段文字中间"仍是一条回复）：每一段落成消息都带上。
+  const quote = quoteDraftOf(key);
   // LocalSend 会话有专用发送路径（`sendLocalSendComposer`）；这里拦住误走 OrbDrop
   // `sendComposer` 的调用。草稿原样留着，不写回（用户没发出去的东西不该被这里吞掉）。
   if (thread.mode !== 'group' && thread.participants.length > 0 && thread.participants.every(localSendPeer)) {
@@ -1417,7 +1514,7 @@ export async function sendComposer(key: string): Promise<ComposerSendResult | nu
       if (seg.kind === 'text') {
         // 空白的文字段（比如两张图之间用户多敲了个空格）不该落成一条空消息。
         if (!seg.text.trim()) continue;
-        const res = await sendText(key, seg.text, nextStamp());
+        const res = await sendText(key, seg.text, nextStamp(), quote);
         if (res) {
           result.textId = res.id;
           if (res.batchId) result.batchId = res.batchId;
@@ -1429,11 +1526,18 @@ export async function sendComposer(key: string): Promise<ComposerSendResult | nu
       const at = nextStamp();
       if (thread.mode === 'group') {
         // 群聊：与一对一同一套（图片走会话协议，对端直接就能看）。
-        const res = await api.groupSendImage(thread.id, seg.path, seg.name, at);
+        const res = await api.groupSendImage(thread.id, seg.path, seg.name, at, quote);
         replace(res.snapshot);
       } else {
         // 图片走**会话协议**（`chat_send_image`）：对端直接就能看，没有同意那一步。
-        const res = await api.chatSendImage(peers, seg.path, seg.name, at, chatBatchId || null);
+        const res = await api.chatSendImage(
+          peers,
+          seg.path,
+          seg.name,
+          at,
+          chatBatchId || null,
+          quote,
+        );
         replace(res.snapshot);
         // 界面上那句"群发战果"读的是**最后一条文本**的消息 id；这一条是图，就不动它。
         result.batchId ??= res.batchId;
@@ -1455,6 +1559,8 @@ export async function sendComposer(key: string): Promise<ComposerSendResult | nu
     if (!failedSegs.includes(seg)) revokeSegs([seg]);
   }
   writeDraft(key, failedSegs);
+  // 引用跟着这一整条走：全都发出去了才收掉；有段落留在草稿里就留着它，重发时还是同一条回复。
+  if (!failedSegs.length) clearQuoteDraft(key);
   return result;
 }
 
@@ -1536,6 +1642,8 @@ export async function sendLocalSendComposer(key: string): Promise<ComposerSendRe
     if (!failedSegs.includes(seg)) revokeSegs([seg]);
   }
   writeDraft(key, failedSegs);
+  // LocalSend 不支持引用；万一还挂着一条（切换过会话类型），发完就把它收掉。
+  if (!failedSegs.length) clearQuoteDraft(key);
   return result;
 }
 

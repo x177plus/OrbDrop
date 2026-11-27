@@ -160,6 +160,9 @@ pub enum WsEvent {
         /// `default` 让老对端（不带这个字段）照旧可用。
         #[serde(default)]
         from_name: String,
+        /// 这条消息引用了哪一条（引用回复）。老对端不带这个字段 = 不是引用。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quote: Option<crate::chat::ChatQuote>,
     },
     /// 会话：Sender → Receiver 的一条**图片消息**。
     ///
@@ -181,6 +184,9 @@ pub enum WsEvent {
         /// 发送方自报的设备名 —— 与 `ChatText::from_name` 同一个用途（核实过 → 直接更新设备行）。
         #[serde(default)]
         from_name: String,
+        /// 这条图片消息引用了哪一条（引用回复）。老对端不带这个字段 = 不是引用。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quote: Option<crate::chat::ChatQuote>,
     },
     /// 会话：Receiver → Sender 的已读回执。`up_to` 是接收方**见到过的、你发来的最大 `at`**。
     ///
@@ -240,6 +246,12 @@ pub enum WsEvent {
         pubkey: String,
         #[serde(default)]
         sig: String,
+        /// 这条群消息引用了群里哪一条（引用回复）。老对端不带 = 不是引用。
+        ///
+        /// 与 `from_name` 同一档显示元数据，**不在群消息签名覆盖范围内**：老对端读到不认识的
+        /// 字段会忽略，签名协议保持逐字节不变；正文/图片仍按原协议验签。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quote: Option<crate::chat::ChatQuote>,
     },
     /// 群聊：Receiver → Sender 的已读回执。`up_to` = 读到的、**你在这个群里发的**最大 `at`。
     ///

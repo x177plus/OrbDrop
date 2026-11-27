@@ -1160,6 +1160,7 @@ async fn addressless_peer_borrows_the_recorded_relay_and_gets_the_message() {
         text: "回去".into(),
         at: 42,
         from_name: String::new(),
+        quote: None,
     };
     assert_eq!(
         orbdrop_lib::chat::deliver(&b, &a_id, &event).await,

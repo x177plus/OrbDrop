@@ -77,8 +77,12 @@
   const items = $derived<ChatItem[]>(thread ? chat.itemsOf(thread.key) : []);
   /** 输入区里有没有值得发的东西（文字或图，见 `lib/composer.ts`）。 */
   const canSend = $derived(thread ? chat.draftHasContent(thread.key) : false);
+  /** 输入区上方那条引用预览（按会话存，切会话跟着换）。 */
+  const draftQuote = $derived(thread ? chat.quoteDraftOf(thread.key) : null);
   /** 最后一条的 id：新消息进来就跳到底（按 id 而不是长度，编辑/替换也算变化）。 */
   const tail = $derived(items.length ? items[items.length - 1].id : '');
+  /** 上一次因为"刚选了一条引用"而把焦点送回输入框的那一份（防同一份重复抢焦点）。 */
+  let focusedQuote = '';
   /** 会话键的字符串值：`thread` 每次都是新对象，直接依赖它会让吸底跟着每次快照重跑。 */
   const threadKey = $derived(thread?.key ?? '');
   const openDev = $derived(thread?.mode === 'direct' ? deviceById(thread.participants[0]) : undefined);
@@ -132,6 +136,9 @@
   let inputEl = $state<HTMLDivElement | null>(null);
   /** 正开着大图的那条（点缩略图进去，见 `ImageViewer`；`null` = 没开）。 */
   let viewing = $state<ChatItem | null>(null);
+  /** 刚点引用块跳过去的那条（闪一下，告诉用户"就是这一条"；`''` = 没在闪）。 */
+  let jumpId = $state('');
+  let jumpTimer: ReturnType<typeof setTimeout> | undefined;
 
   /**
    * 正在认领浏览器塞进输入区的图（见 `composer.adoptDomImages`）：认领会改 DOM、而改 DOM 又会
@@ -145,7 +152,7 @@
    * 图片缩略图要等 `ImagePreview` 把 `<img>` 挂上才有最终高度 —— 那一下晚于吸底；
    * 只有当时确实在底部才跟着再贴一次，翻上去看历史时不许被拽走。
    */
-  let pinned = true;
+  let pinned = $state(true);
 
   /** 滚到最底下。 */
   function pinBottom(): void {
@@ -158,6 +165,53 @@
   function onLogScroll(): void {
     if (!open || !logEl) return;
     pinned = logEl.scrollHeight - logEl.clientHeight - logEl.scrollTop <= 2;
+  }
+
+  /** 回到最新：平滑滚到底；到位后由 `onLogScroll` 把按钮渐隐掉。 */
+  function jumpToLatest(): void {
+    const el = logEl;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+  }
+
+  /**
+   * 点消息气泡上方那块引用：滚回被引用的那一条并闪一下。
+   *
+   * 原消息可能已经被 500 条上限裁掉、被清空、或本来就不在这台设备上：那时如实说一句，
+   * 引用块本身照旧显示（快照里那段文字还在）。按 `data-id` 找节点，不用 CSS 选择器拼 id
+   * （id 来自网络，拼进选择器要转义，找一圈更省事也更稳）。
+   */
+  function jumpToMessage(id: string, text = ''): void {
+    const nodes = logEl?.querySelectorAll<HTMLElement>('[data-id]');
+    let target: HTMLElement | null = null;
+    for (const node of nodes ?? []) {
+      if (node.dataset.id === id) {
+        target = node;
+        break;
+      }
+    }
+    // 文件消息的 id 两端不同（发送方是 `file:<批次>:i`，接收方是 `invite:<邀请 id>`）：
+    // 按引用块里那段显示文字再找一遍，让对端引用文件时也能跳回那条气泡。
+    if (!target && text.trim()) {
+      const wanted = text.trim();
+      for (const node of nodes ?? []) {
+        const item = items.find((i) => i.id === node.dataset.id);
+        if (item && chat.copyTextOf(item).trim() === wanted) {
+          target = node;
+          break;
+        }
+      }
+    }
+    if (!target) {
+      onToast(t('原消息不在当前记录里'));
+      return;
+    }
+    target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    jumpId = id;
+    clearTimeout(jumpTimer);
+    jumpTimer = setTimeout(() => {
+      if (jumpId === id) jumpId = '';
+    }, 1400);
   }
 
   /** 图片缩略图挂上来了：高度差是这一刻才出现的，当时在底部就补一次吸底。 */
@@ -216,8 +270,29 @@
     if (!el || !key) return;
     // 换会话 / 关掉浮层：大图跟着收掉（它不是"第二个窗口"，只是这一条会话里的一次摊开）。
     viewing = null;
+    jumpId = '';
+    clearTimeout(jumpTimer);
     // 组合期间不动输入区：那一下会把预编辑串固化成普通文本（见 `paintWhenNotComposing`）。
     paintWhenNotComposing(el, paintComposer);
+  });
+
+  /**
+   * 刚选好一条引用（右键 → 引用）：把焦点送回输入框 —— 用户下一步就是接着打字，不该还要
+   * 再点一下输入区。同一份引用只送一次；取消 / 换一条会重新认。
+   */
+  $effect(() => {
+    const q = draftQuote;
+    const key = threadKey;
+    if (!open || !q || !key) {
+      focusedQuote = '';
+      return;
+    }
+    const token = `${key}\u0000${q.id}\u0000${q.text}`;
+    if (token === focusedQuote) return;
+    focusedQuote = token;
+    requestAnimationFrame(() => {
+      if (open && inputEl) inputEl.focus();
+    });
   });
 
   /** 输入区那句占位文案的判据（`:empty` 认不出"只剩一个空文本节点"的框，见 `main.css`）。 */
@@ -303,6 +378,7 @@
     }).then((f) => (off = f));
     return () => {
       clearTimeout(undeliverableTimer);
+      clearTimeout(jumpTimer);
       off?.();
     };
   });
@@ -817,12 +893,15 @@
           {/if}
           {#each items as item, i (item.id)}
             {@const who = speakerOf(i)}
+            {@const quote = item.quote}
+            {@const quoteAuthor = quote ? chat.quoteAuthorOf(quote, item) : ''}
             <div
               class="chat-msg"
               class:me={item.fromMe}
               class:peer={!item.fromMe}
               class:bc={thread.mode === 'broadcast'}
               class:picked={pickedId === item.id}
+              class:jump={jumpId === item.id}
               data-id={item.id}
             >
               <!-- 群聊：换个人说话就在这条上面插一行发言人（头像字 + 名字，颜色按设备 id 哈希）——
@@ -831,6 +910,21 @@
                 <div class="chat-who {who.cls}">
                   <span class="cw-av">{who.initial}</span>
                   <span class="cw-nm">{who.name}</span>
+                </div>
+              {/if}
+              {#if quote}
+                <!-- 引用与消息是两个独立气泡；设备名在引用框左侧外面，不占引用框高度。 -->
+                <div class="chat-quote">
+                  <span class="cq-who" title={quoteAuthor}>{quoteAuthor}</span>
+                  <button
+                    class="cq-box"
+                    type="button"
+                    title={t('点击查看原消息')}
+                    aria-label={t('点击查看原消息')}
+                    onclick={() => jumpToMessage(quote.id, quote.text)}
+                  >
+                    <span class="cq-text">{quote.text}</span>
+                  </button>
                 </div>
               {/if}
               {#if item.kind === 'text'}
@@ -996,14 +1090,46 @@
         {/if}
       </div>
 
-      <form
-        class="chat-compose"
-        class:bc={thread.mode === 'broadcast'}
-        onsubmit={(e) => {
-          e.preventDefault();
-          void send();
-        }}
-      >
+      <div class="chat-compose-wrap">
+        <button
+          class="chat-to-latest"
+          class:show={!pinned && items.length > 0}
+          type="button"
+          aria-label={t('回到最新消息')}
+          title={t('回到最新消息')}
+          aria-hidden={pinned || items.length === 0}
+          tabindex={pinned || items.length === 0 ? -1 : 0}
+          onclick={jumpToLatest}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14" /><path d="m6 13 6 6 6-6" /></svg>
+        </button>
+        {#if draftQuote}
+          {@const draftAuthor = chat.quoteDraftAuthorOf(draftQuote)}
+          <!-- 输入行上方的引用预览：设备名在灰度框左侧外面，与消息里的两个气泡同一套排法。 -->
+          <div class="chat-quote-draft" role="note">
+            <span class="cqd-who" title={draftAuthor}>{draftAuthor}</span>
+            <div class="cqd-box">
+              <span class="cqd-text">{draftQuote.text}</span>
+            </div>
+            <button
+              class="cqd-x"
+              type="button"
+              aria-label={t('取消引用')}
+              title={t('取消引用')}
+              onclick={() => chat.clearQuoteDraft(thread.key)}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
+            </button>
+          </div>
+        {/if}
+        <form
+          class="chat-compose"
+          class:bc={thread.mode === 'broadcast'}
+          onsubmit={(e) => {
+            e.preventDefault();
+            void send();
+          }}
+        >
         <!-- 富输入区（`contenteditable`）：文字与图片**在同一行流里**，图可以夹在前后两段文字
              中间（需求要的就是这个顺序）。LocalSend 也走这一份：图片会进框，点发送才按
              图片消息发出去；图片/文件不走这里时仍用右侧「＋」。 -->
@@ -1065,7 +1191,8 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V6" /><path d="M6 12l6-6 6 6" /></svg>
           {/if}
         </button>
-      </form>
+        </form>
+      </div>
     </div>
   {/if}
 

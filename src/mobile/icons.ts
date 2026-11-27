@@ -270,6 +270,23 @@ export const ICONS = {
       }
     ]
   },
+  "quote": {
+    "viewBox": "0 0 24 24",
+    "prims": [
+      {
+        "tag": "path",
+        "attrs": {
+          "d": "M9.5 7H5v5h3c0 1.8-.9 2.8-2.8 3.2V17c3.2-.2 4.3-2.2 4.3-5V7Z"
+        }
+      },
+      {
+        "tag": "path",
+        "attrs": {
+          "d": "M19 7h-4.5v5h3c0 1.8-.9 2.8-2.8 3.2V17c3.2-.2 4.3-2.2 4.3-5V7Z"
+        }
+      }
+    ]
+  },
   "share": {
     "viewBox": "0 0 24 24",
     "prims": [

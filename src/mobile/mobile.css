@@ -347,15 +347,46 @@ a { color: inherit; text-decoration: none; }
 }
 .chatlog::-webkit-scrollbar { display: none; }
 .chatlog > .empty { margin: auto; }
-/* 消息气泡上的长按 = 复制整条（移动端的"右键菜单"，见 `ChatScreen.pressStart`）。
+/* 消息气泡上的长按 = 引用 / 复制整条（移动端的"右键菜单"，见 `ChatScreen.pressStart`）。
    不挡住 WebView 自己的长按，手指按住时会先走去选文字 / 弹系统菜单，那 500ms 的自定义计时
    永远等不到；`-webkit-touch-callout` 再挡掉图片/链接的系统长按菜单。桌面端仍可选中文字后
-   右键（只复制选中的那段），手机这条手势让位给整条复制。 */
+   右键（可引用 / 复制选中的那段），手机这条手势让位给贴着气泡的动作小气泡。 */
 .msg { display: flex; flex-direction: column; max-width: 84%; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
 /* 待接收的推送邀请也走同一条长按（卡片不在 `.msg` 里，见 `ChatScreen.pressStart`）。 */
 .chatlog .invite { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
 .msg.me { align-self: flex-end; align-items: flex-end; }
 .msg.peer { align-self: flex-start; align-items: flex-start; }
+/* 点引用块跳过来的那一条：闪一下就收。 */
+.msg.jump .bubble,
+.msg.jump .invite { animation: msg-jump 1.3s ease; }
+@keyframes msg-jump {
+  0%, 100% { box-shadow: none; }
+  18%, 65% { box-shadow: 0 0 0 2px var(--accent); }
+}
+/* 引用与消息是两个独立气泡：引用框在消息气泡上方，设备名在引用框左侧外面。 */
+.chat-quote {
+  max-width: 100%; min-width: 0; display: flex; align-items: center; gap: calc(6 * var(--u));
+  margin: 0 0 calc(4 * var(--u));
+}
+.chat-quote .cq-who {
+  flex: none; max-width: calc(76 * var(--u)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--font-display); font-size: calc(11 * var(--u)); font-weight: 650;
+  color: var(--muted);
+}
+.chat-quote .cq-box {
+  flex: 1 1 auto; min-width: 0; display: block;
+  /* CJK 字形的视觉重心比行盒几何中心略高：上 6 / 下 4 做 1u 光学下沉。 */
+  padding: calc(6 * var(--u)) calc(10 * var(--u)) calc(4 * var(--u));
+  border: 0; border-left: calc(3 * var(--u)) solid rgba(127, 127, 127, 0.55);
+  border-radius: calc(12 * var(--u));
+  background: rgba(127, 127, 127, 0.12);
+  color: var(--muted); font: inherit; text-align: left;
+}
+.chat-quote .cq-box:active { background: rgba(127, 127, 127, 0.2); }
+.chat-quote .cq-text {
+  min-width: 0; font-size: calc(12 * var(--u)); line-height: 1.45; white-space: pre-wrap;
+  overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+}
 .bubble {
   max-width: 100%; padding: calc(9 * var(--u)) calc(12 * var(--u)); border-radius: calc(16 * var(--u));
   font-size: var(--fs-md); line-height: 1.55; overflow-wrap: anywhere;
@@ -438,7 +469,53 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .rc-dev.off { opacity: .62; }
 .rc-dev.off .rc-ic { color: var(--muted); }
 
-.compose { flex: none; display: flex; align-items: flex-end; gap: calc(8 * var(--u)); padding: calc(10 * var(--u)) calc(12 * var(--u)); background: var(--bg); border-top: 1px solid var(--border); }
+/* 输入行外面多包一层：引用预览长在输入框那一行上方（输入行本身是横向 flex）。 */
+.compose-wrap { position: relative; flex: none; border-top: 1px solid var(--border); background: var(--bg); }
+/* 回到最新：浮在输入区上方正中，只有翻离底部时才渐显。 */
+.chat-to-latest {
+  position: absolute; left: 50%; bottom: calc(100% + calc(8 * var(--u))); z-index: 5;
+  width: calc(36 * var(--u)); height: calc(36 * var(--u)); display: grid; place-items: center;
+  border: 1px solid var(--border); border-radius: 50%;
+  background: var(--surface); color: var(--accent-deep);
+  box-shadow: 0 calc(4 * var(--u)) calc(14 * var(--u)) calc(-5 * var(--u)) rgba(14, 18, 23, 0.3);
+  opacity: 0; pointer-events: none;
+  transform: translate(-50%, calc(4 * var(--u)));
+  transition: opacity .16s ease, transform .16s ease, background .15s ease;
+}
+.chat-to-latest.show { opacity: 1; pointer-events: auto; transform: translate(-50%, 0); }
+.chat-to-latest:active { background: var(--accent-soft); }
+.chat-to-latest svg { width: calc(18 * var(--u)); height: calc(18 * var(--u)); }
+.compose { flex: none; display: flex; align-items: flex-end; gap: calc(8 * var(--u)); padding: calc(10 * var(--u)) calc(12 * var(--u)); background: var(--bg); border-top: 0; }
+/* 输入行上方的引用预览：设备名在灰度框左侧外面，与消息里的两个气泡同一套排法。
+   点 ✕ 取消这一次引用；发送成功后由 store 收掉。 */
+.chat-quote-draft {
+  display: flex; align-items: center; gap: calc(8 * var(--u));
+  margin: calc(8 * var(--u)) calc(12 * var(--u)) 0;
+}
+.chat-quote-draft .cqd-who {
+  flex: none; max-width: calc(76 * var(--u)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--font-display); font-size: calc(11 * var(--u)); font-weight: 650;
+  color: var(--muted);
+}
+.chat-quote-draft .cqd-box {
+  flex: 1 1 auto; min-width: 0;
+  padding: calc(6 * var(--u)) calc(6 * var(--u)) calc(4 * var(--u)) calc(10 * var(--u));
+  border-left: calc(3 * var(--u)) solid rgba(127, 127, 127, 0.55);
+  border-radius: calc(12 * var(--u));
+  background: rgba(127, 127, 127, 0.12);
+}
+.chat-quote-draft .cqd-text {
+  min-width: 0; font-size: calc(12 * var(--u)); line-height: 1.45; color: var(--muted);
+  white-space: pre-wrap; overflow: hidden;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+}
+.chat-quote-draft .cqd-x {
+  flex: none; width: calc(28 * var(--u)); height: calc(28 * var(--u));
+  display: grid; place-items: center;
+  border: 0; border-radius: calc(7 * var(--u)); background: none; color: var(--muted);
+}
+.chat-quote-draft .cqd-x:active { background: rgba(127, 127, 127, 0.2); color: var(--fg); }
+.chat-quote-draft .cqd-x .ic { width: calc(14 * var(--u)); height: calc(14 * var(--u)); }
 
 .cbtn { flex: none; width: calc(40 * var(--u)); height: calc(40 * var(--u)); border-radius: 50%; display: grid; place-items: center; transition: background .15s ease, transform .08s ease; }
 .cbtn .ic { width: calc(19 * var(--u)); height: calc(19 * var(--u)); }
@@ -503,7 +580,13 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
    这一层只接手指、不画底色 —— 会话不压暗，点别处即收。 */
 .msgpop-layer { position: fixed; inset: 0; z-index: 40; }
 .msgpop-scrim { position: absolute; inset: 0; }
-.msgpop { position: absolute; z-index: 1; display: flex; transform-origin: 50% 100%; animation: msgpop-in .16s cubic-bezier(.2,.8,.2,1); }
+.msgpop {
+  position: absolute; z-index: 1; display: flex;
+  padding: calc(4 * var(--u));
+  border: 1px solid var(--border); border-radius: 999px; background: var(--surface);
+  box-shadow: 0 calc(10 * var(--u)) calc(26 * var(--u)) calc(-14 * var(--u)) rgba(14, 18, 23, 0.36);
+  transform-origin: 50% 100%; animation: msgpop-in .16s cubic-bezier(.2,.8,.2,1);
+}
 /* 挂在气泡下方时尾巴朝上：张开的支点跟着翻到顶边（一直从贴着气泡的那条边长出来）。 */
 .msgpop.below { transform-origin: 50% 0; }
 /* 容器只是脚本聚焦的落点（`tabindex="-1"`，为读屏念出"消息操作"），不是可操作目标：
@@ -522,12 +605,12 @@ button.fbub { width: 100%; padding: 0; border: 0; background: none; text-align: 
 .msgpop-btn {
   display: flex; align-items: center; gap: calc(7 * var(--u));
   padding: calc(9 * var(--u)) calc(15 * var(--u));
-  border: 1px solid var(--border); border-radius: 999px;
-  background: var(--surface); color: var(--fg);
+  border: 0; border-radius: 999px;
+  background: none; color: var(--fg);
   font-size: var(--fs-sm); font-weight: 620; line-height: 1.4;
-  box-shadow: 0 calc(10 * var(--u)) calc(26 * var(--u)) calc(-14 * var(--u)) rgba(14, 18, 23, 0.36);
   transition: background .15s ease, transform .08s ease;
 }
+.msgpop-btn + .msgpop-btn { margin-left: calc(4 * var(--u)); }
 .msgpop-btn .ic { width: calc(15 * var(--u)); height: calc(15 * var(--u)); color: var(--accent-deep); }
 .msgpop-btn:active { transform: scale(.96); background: var(--accent-soft); }
 @keyframes msgpop-in { from { opacity: 0; transform: scale(.86); } }

@@ -4926,6 +4926,7 @@ async fn messages_sent_while_the_peer_is_offline_arrive_when_it_comes_back() {
         at: first_at,
         // 这条用例只管"按 id 幂等"，名字走老对端那一档（不带 = 空串）。
         from_name: String::new(),
+        quote: None,
     };
     assert_eq!(
         chat::deliver(&state_a, "device-off-b", &dup).await,

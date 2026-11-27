@@ -1,6 +1,7 @@
 <script lang="ts">
   import * as chat from "$lib/stores/chat.svelte";
   import type { ChatItem, Receipt } from "$lib/stores/chat.svelte";
+  import type { ChatQuote } from "$lib/types";
   import * as devices from "$lib/stores/devices.svelte";
   import Icon from "./Icon.svelte";
   import * as store from "./store.svelte";
@@ -60,11 +61,16 @@
   let inputEl = $state<HTMLDivElement | null>(null);
   /** 正开着大图的那条（点缩略图进去，见 `ImageViewer`；`null` = 没开）。 */
   let viewing = $state<ChatItem | null>(null);
+  /** 刚点引用块跳过去的那条（闪一下；`''` = 没在闪）。 */
+  let jumpId = $state("");
+  let jumpTimer: ReturnType<typeof setTimeout> | undefined;
   /** 正在认领输入法剪贴板塞进输入框的图（见 `composer.adoptDomImages`）—— 挡住重入。 */
   let adopting = false;
 
   /** 输入区里有没有值得发的东西（文字或图，见 `lib/composer.ts`）。 */
   const canSend = $derived(chat.draftHasContent(convoKey));
+  /** 输入区上方那条引用预览（按会话存，切会话跟着换）。 */
+  const draftQuote = $derived(chat.quoteDraftOf(convoKey));
 
   const dot = $derived(devices.threadDotState(participants));
   /** 这条会话里的设备是否都验证过：决定标题那颗点实心/空心。 */
@@ -326,7 +332,7 @@
    * 图片的缩略图要等 `ImagePreview` 把 `<img>` 挂上才有最终高度 —— 那一下晚于吸底，
    * 只有当时确实在底部才该跟着再贴一次；用户已经翻上去看历史时不许把他拽走。
    */
-  let pinned = true;
+  let pinned = $state(true);
 
   /** 滚到最底下。**没吸住之前不许动 `pinned`**：吸底本身触发的那次 `scroll` 会把它算回 true。 */
   function pinBottom(): void {
@@ -346,6 +352,50 @@
     pinned = el.scrollHeight - el.clientHeight - el.scrollTop <= 2;
   }
 
+  /** 回到最新：平滑滚到底；到位后由 `onLogScroll` 把按钮渐隐掉。 */
+  function jumpToLatest(): void {
+    const el = logEl;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  }
+
+  /**
+   * 点消息上方的引用块：滚回被引用的那一条并闪一下。
+   * 原消息可能已经被裁掉 / 清空 / 本来就不在本机：那时如实说一句，引用块照旧显示。
+   */
+  function jumpToMessage(id: string, text = ""): void {
+    const nodes = logEl?.querySelectorAll<HTMLElement>("[data-id]");
+    let target: HTMLElement | null = null;
+    for (const node of nodes ?? []) {
+      if (node.dataset.id === id) {
+        target = node;
+        break;
+      }
+    }
+    // 文件消息的 id 两端不同（发送方 `file:<批次>:i`、接收方 `invite:<邀请 id>`）：
+    // 按引用块里那段显示文字再找一遍，对端引用文件时也能跳回那条气泡。
+    if (!target && text.trim()) {
+      const wanted = text.trim();
+      for (const node of nodes ?? []) {
+        const item = items.find((i) => i.id === node.dataset.id);
+        if (item && chat.copyTextOf(item).trim() === wanted) {
+          target = node;
+          break;
+        }
+      }
+    }
+    if (!target) {
+      store.toast(t("原消息不在当前记录里"), "x");
+      return;
+    }
+    target.scrollIntoView({ block: "center", behavior: "smooth" });
+    jumpId = id;
+    clearTimeout(jumpTimer);
+    jumpTimer = setTimeout(() => {
+      if (jumpId === id) jumpId = "";
+    }, 1400);
+  }
+
   /** 图片缩略图挂上来了：高度差是这一刻才出现的，当时在底部就补一次吸底。 */
   function onImageLayout(): void {
     if (!pinned) return;
@@ -354,11 +404,11 @@
     });
   }
 
-  // ── 长按一条消息 = 复制整条（移动端的"消息右键菜单"） ────────────────────────
+  // ── 长按一条消息 = 引用 / 复制整条（移动端的"消息右键菜单"） ──────────────────
   //
   // 与设备行同一套手势（`DevicesTab.pressStart`）：自己计时，不用 `contextmenu`。
   // 消息里全是文字，WebView 的长按会先走去选文字 / 弹系统菜单，所以 `mobile.css` 把
-  // `.msg` 的 `user-select` / `-webkit-touch-callout` 关掉了 —— 这条手势让位给"复制整条"。
+  // `.msg` 的 `user-select` / `-webkit-touch-callout` 关掉了 —— 这条手势让位给动作小气泡。
   // 手指挪动超过 slop 就当成在滑记录，撤销这次按压；长按触发后紧跟的那次 click 不能
   // 再打开图片/文件（见 `pressEnd` / `onPressClick`）。
   const LONG_PRESS_MS = 500;
@@ -380,6 +430,8 @@
   /** 正开着的那颗「复制」小气泡（`null` = 没开，见 `MessageActionsPopover`）。 */
   let msgActions = $state<{
     copyText: string;
+    /** LocalSend 会话没有引用这套线上协议：`null` = 小气泡里不摆「引用」。 */
+    quote: ChatQuote | null;
     layout: { left?: number; right?: number; top?: number; bottom?: number };
     above: boolean;
     side: "l" | "r";
@@ -394,7 +446,10 @@
       closeMessageActions();
       return true;
     });
-    return () => store.setBackCloser(null);
+    return () => {
+      clearTimeout(jumpTimer);
+      store.setBackCloser(null);
+    };
   });
 
   function pressStart(e: PointerEvent): void {
@@ -464,6 +519,8 @@
    */
   function openMessageActions(item: ChatItem, el: HTMLElement): void {
     const copyText = chat.copyTextOf(item);
+    // 长按不选字（`mobile.css` 关掉了系统选字）：引用的是整条消息；LocalSend 不支持引用。
+    const quote = localSendThread ? null : chat.quoteOf(item);
     // 消息可能在按住这 500ms 里被重画掉（列表按 id 复用，理论上还在）：量一个已卸载的节点
     // 只会得到全零矩形，小气泡就跑到左上角去了。
     if (!copyText || !el.isConnected) return;
@@ -484,6 +541,7 @@
     const side = item.fromMe ? "r" : "l";
     msgActions = {
       copyText,
+      quote,
       side,
       above,
       layout: {
@@ -503,6 +561,18 @@
   /** 收起那颗「复制」小气泡（点别处 / 滚记录 / 换尺寸都走这一条）。 */
   function closeMessageActions(): void {
     msgActions = null;
+  }
+
+  /** 小气泡里的「引用」：挂到输入区上方，收起小气泡并把焦点送回输入框。 */
+  function quoteMessage(): void {
+    const quote = msgActions?.quote;
+    closeMessageActions();
+    if (!quote) return;
+    chat.setQuoteDraft(convoKey, quote);
+    requestAnimationFrame(() => {
+      inputEl?.focus();
+      if (inputEl) setCaretEnd(inputEl);
+    });
   }
 
   // 来了新消息就贴到底。依赖的是**最后一条的 id**，不是数组长度/数组身份：文件进度、
@@ -530,8 +600,10 @@
     const el = inputEl;
     void convoKey;
     if (!el) return;
-    // 一张已经不属于这条会话的图不该还挂在屏幕上。
+    // 一张已经不属于这条会话的图不该还挂在屏幕上；跳转高亮也跟着这条会话清掉。
     viewing = null;
+    jumpId = "";
+    clearTimeout(jumpTimer);
     paintWhenNotComposing(el, paintComposer);
   });
 
@@ -678,6 +750,8 @@
   {/if}
   {#each items as item (item.id)}
     {@const receipt = mode === "broadcast" && item.fromMe ? chat.receiptOf(item) : null}
+    {@const quote = item.quote}
+    {@const quoteAuthor = quote ? chat.quoteAuthorOf(quote, item) : ""}
     {#if item.kind === "file" && item.inviteState === "pending"}
       <!-- 收进来的推送邀请：接收 / 拒绝要落到后端（`answerInvite`），这张卡才会跟着事件变成
            "接收中 / 已接收"（这条消息的状态是推送事件写的，不是这里自己记的）。 -->
@@ -706,6 +780,7 @@
         class:me={item.fromMe}
         class:peer={!item.fromMe}
         class:bc={mode === "broadcast"}
+        class:jump={jumpId === item.id}
         data-id={item.id}
       >
         {#if mode === "group" && !item.fromMe}
@@ -714,6 +789,20 @@
           <div class="who sp-{chat.speakerIndex(speakerOf(item)) + 1}">
             <span class="who-av">{speakerName(item).charAt(0)}</span>
             <span class="who-nm">{speakerName(item)}</span>
+          </div>
+        {/if}
+        {#if quote}
+          <!-- 引用与消息是两个独立气泡；设备名在引用框左侧外面，不占引用框高度。 -->
+          <div class="chat-quote">
+            <span class="cq-who" title={quoteAuthor}>{quoteAuthor}</span>
+            <button
+              class="cq-box"
+              type="button"
+              aria-label={t("点击查看原消息")}
+              onclick={() => jumpToMessage(quote.id, quote.text)}
+            >
+              <span class="cq-text">{quote.text}</span>
+            </button>
           </div>
         {/if}
         <div
@@ -849,13 +938,43 @@
      进来的那个 `<img>` 由 `onInput` 认领成一份本机暂存文件（见 `lib/composer.ts`）。
      交给 Svelte 管的只有"哪条会话 / 哪个节点"，框里的内容由 `lib/composer.ts` 直接读写 DOM
      —— 受控的话每敲一个字光标都会被拽回最前。 -->
-<form
-  class="compose"
-  onsubmit={(e) => {
-    e.preventDefault();
-    void send();
-  }}
->
+<div class="compose-wrap">
+  <button
+    class="chat-to-latest"
+    class:show={!pinned && items.length > 0}
+    type="button"
+    aria-label={t("回到最新消息")}
+    aria-hidden={pinned || items.length === 0}
+    tabindex={pinned || items.length === 0 ? -1 : 0}
+    onclick={jumpToLatest}
+  >
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14" /><path d="m6 13 6 6 6-6" /></svg>
+  </button>
+  {#if draftQuote}
+    {@const draftAuthor = chat.quoteDraftAuthorOf(draftQuote)}
+    <!-- 输入行上方的引用预览：设备名在灰度框左侧外面，与消息里的两个气泡同一套排法。 -->
+    <div class="chat-quote-draft" role="note">
+      <span class="cqd-who" title={draftAuthor}>{draftAuthor}</span>
+      <div class="cqd-box">
+        <span class="cqd-text">{draftQuote.text}</span>
+      </div>
+      <button
+        class="cqd-x"
+        type="button"
+        aria-label={t("取消引用")}
+        onclick={() => chat.clearQuoteDraft(convoKey)}
+      >
+        <Icon name="x" />
+      </button>
+    </div>
+  {/if}
+  <form
+    class="compose"
+    onsubmit={(e) => {
+      e.preventDefault();
+      void send();
+    }}
+  >
   <div
     class="cinput cx"
     contenteditable="true"
@@ -896,7 +1015,8 @@
   >
     <Icon name="send" />
   </button>
-</form>
+  </form>
+</div>
 
 <!-- 长按一条消息后贴着气泡弹出的「复制」小气泡（见 `openMessageActions`）：
      位置在打开那一刻就算好了，所以滚动 / 换尺寸都会收起它。 -->
@@ -907,6 +1027,7 @@
     above={msgActions.above}
     side={msgActions.side}
     onClose={closeMessageActions}
+    onQuote={msgActions.quote ? quoteMessage : undefined}
   />
 {/if}
 

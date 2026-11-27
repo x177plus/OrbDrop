@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, PickedFile, InstalledApp, ChatFileMsg, ChatSnapshot, InboxEntry, SavedFile, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState, LocalSendStatus, AndroidShareState, AndroidShareRoot, AndroidShareListing, ShareUpdateEntry } from './types';
+import type { ShareItem, AppSettings, PeerDevice, PeerShareItem, TreeEntry, PushInvite, PushBatch, BcTarget, BcStatus, DragOutSource, DragTicket, FsDrive, FsListing, LocalPick, PickerFavorite, PickedFile, InstalledApp, ChatFileMsg, ChatQuote, ChatSnapshot, InboxEntry, SavedFile, RelayTraffic, UpdateState, KeepAliveState, OpenedPage, NotifyState, LocalSendStatus, AndroidShareState, AndroidShareRoot, AndroidShareListing, ShareUpdateEntry } from './types';
 import type { ScreenMetrics, ScreenRect } from './orbLayout';
 
 // Share management
@@ -503,8 +503,15 @@ export function chatSend(
   text: string,
   batchId?: string | null,
   at?: number,
+  quote?: ChatQuote | null,
 ): Promise<{ id: string; batchId: string | null; snapshot: ChatSnapshot }> {
-  return invoke('chat_send', { peerIds, text, batchId: batchId ?? null, at: at ?? null });
+  return invoke('chat_send', {
+    peerIds,
+    text,
+    batchId: batchId ?? null,
+    at: at ?? null,
+    quote: quote ?? null,
+  });
 }
 
 /**
@@ -563,8 +570,16 @@ export function chatSendImage(
   name: string,
   at?: number,
   batchId?: string | null,
+  quote?: ChatQuote | null,
 ): Promise<{ id: string; batchId: string | null; snapshot: ChatSnapshot }> {
-  return invoke('chat_send_image', { peerIds, path, name, at: at ?? null, batchId: batchId ?? null });
+  return invoke('chat_send_image', {
+    peerIds,
+    path,
+    name,
+    at: at ?? null,
+    batchId: batchId ?? null,
+    quote: quote ?? null,
+  });
 }
 
 /**
@@ -611,8 +626,13 @@ export function groupEdit(id: string, members: string[], name: string): Promise<
 }
 
 /** 往群里发一条文本；返回的 `id` 是**这条消息**的 id（不是群的）。 */
-export function groupSend(id: string, text: string, at?: number): Promise<{ id: string; snapshot: ChatSnapshot }> {
-  return invoke('group_send', { id, text, at: at ?? null });
+export function groupSend(
+  id: string,
+  text: string,
+  at?: number,
+  quote?: ChatQuote | null,
+): Promise<{ id: string; snapshot: ChatSnapshot }> {
+  return invoke('group_send', { id, text, at: at ?? null, quote: quote ?? null });
 }
 
 /** 本机读到哪儿了：推进群里的已读水位（未读清零）。 */
@@ -642,8 +662,15 @@ export function groupSendImage(
   path: string,
   name: string,
   at?: number,
+  quote?: ChatQuote | null,
 ): Promise<{ id: string; snapshot: ChatSnapshot }> {
-  return invoke('group_send_image', { id, path, name, at: at ?? null });
+  return invoke('group_send_image', {
+    id,
+    path,
+    name,
+    at: at ?? null,
+    quote: quote ?? null,
+  });
 }
 
 /** 接受一条群邀请 —— 从这一刻起它才算群（进会话列表，不再只是那张邀请卡）。 */
