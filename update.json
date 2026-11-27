@@ -1,43 +1,34 @@
 {
-  "version": "0.3.3",
-  "versionCode": 3003,
-  "notes": "\n修复：**Gitee raw 被按 SNI 重置 TLS 时，更新检查整趟失败**。清单地址新增 Gitee Release 附件 `releases/download/latest/update.json`（落在 `foruda.gitee.com`），raw 降为最后兜底；三个地址按顺序逐条试，全部失败时把每条原因一起带回界面与日志，不再只留最后一条。\n\n修复：**自更新不跟随系统代理，局域网请求反而可能被代理劫走**。reqwest 开启 `system-proxy`：检查更新与下载安装包走 Windows/macOS 系统代理；到对端的配对、探活、传输客户端显式 `no_proxy()`。镜像偏好同一 host 成功也会续期，避免 24h 后清单从 Gitee 拿到、下载却又先试 GitHub。\n\n修复：**未配对设备离线后，用户给它起的备注会在一分钟左右无声消失**。根因是探活连续失败（12 拍 × 5s）触发「忘掉未配对设备行」时复用了「忘记设备」那条路径，把 `config.toml` 里的 `deviceRemarks` 与设备行一起删了；同一地址重复行自动合并也有同一个问题。现在自动清扫只收设备行与观察记忆，备注按设备 id 留着（设备下次被 mDNS 带回来时原样还在）；用户主动点「忘记设备」仍连备注一起清（菜单文案本来就这么写）。顺带补上「对端重置后换 device id」的对账路径：备注跟着这一行迁到新 id，不再留在旧 id 下变成孤儿。",
-  "pubDate": "2026-11-23T09:38:47Z",
+  "version": "0.3.4",
+  "versionCode": 3004,
+  "notes": "新增：**回到最新消息**。会话翻离底部时，输入区上方居中渐显一颗向下箭头，点一下平滑滚到最新；贴底后自动渐隐。桌面端与安卓端共用同一套行为。",
+  "pubDate": "2026-11-27T06:07:52Z",
   "desktop": {
     "windows-x86_64": {
-      "size": 18681856,
-      "sha256": "6f90dcfb9e9171095ba9f2245d480f84294f1245c787015ae007f5191c81bb79",
-      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NHJ0bDIvNjgwNWpFamg0ai8vTDA3V1ZyYitZN2xRdG9YNTBka2JhbUJnZVNmak85Uk9NajlOV0tGSFk4ck83N2piK25sbS94VlU0cmd3YU9Qdk4yWlFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NDI2NzI2CWZpbGU6b3JiZHJvcC5leGUKYXVMbGFxWXA2aHY2alN6Ymlhd3NnVWtKMkErMktOREFuLzd0L1dCNXg4eUxRV1k3VkJsdzlEZmJZS0NlNklPY2htcWptYjJwOVlDN2IyMTRBZDl1RGc9PQo=",
+      "size": 18715648,
+      "sha256": "09ed4d281fe4342d874f7fa1dd50215a349436589b57e96f7c015c9a8d9fd24f",
+      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NHNVTnBSNjhYOHRLOEtIOHQ4R2VGV0ZlR0pMalJWVWp4Q1lZWnV5RzJKZEc1bHJxT0FrOW9QekNMV0FjdWs3QUVNQnNMOW9pMFZ4VGdqbE5VWGZVMHdvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NzU5NjcyCWZpbGU6b3JiZHJvcC5leGUKRFhSTDJrckI0L1pNN2ppVmdzRnFtVDVMa251VGJnUEJoRXlFOUpCZVNQSmFLdlo5L25LZjA5aHcvQldHZ0JIUk9qNU5nYTgxUlBCNmMySGhBRWY0QXc9PQo=",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.3.3/OrbDrop_0.3.3_windows_x64.exe",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.3.3/OrbDrop_0.3.3_windows_x64.exe"
-      ]
-    },
-    "macos-universal": {
-      "size": 15296361,
-      "sha256": "b292325fdb4f22d4720ae9cc796d6cc74d0eb402e8eb5d8f928ba3010d907e7d",
-      "sig": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWHoyZHp5WHU0NGoxUkRiUzJyYkN2REdNODgzWllESDVoekhkbWd4R3JKVS92K25sdmdsM1kyNzVTVHMrSzcwalRaUDZSSkhUdm9EbkF1WFlNbVpMbDdyUzVVZy9mRkFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NDI2NzI3CWZpbGU6T3JiRHJvcF8wLjMuM19tYWNvc191bml2ZXJzYWwuYXBwLnppcApIcjl0U0hOMCswL3JvdlVOTmhzcWQ1dTRSL0ExQnpXbzBpM1AvbG45YkpHKytybkgyWlNHbWJ1TVJDL0xoMmhBekNqRE5NVlpuSEFJcDZQRUk2ZHJCdz09Cg==",
-      "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.3.3/OrbDrop_0.3.3_macos_universal.app.zip",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.3.3/OrbDrop_0.3.3_macos_universal.app.zip"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.3.4/OrbDrop_0.3.4_windows_x64.exe",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.3.4/OrbDrop_0.3.4_windows_x64.exe"
       ]
     }
   },
   "android": {
     "universal": {
-      "size": 31713475,
-      "sha256": "c8b457f34741ab8d0a3d4c7d595f5c356f31d081fe30c360fdf89e40fd106da0",
+      "size": 31762443,
+      "sha256": "85bb192d713933f46d9461496b2acd0b7475b6f81d649b392a4eaa72d9cc5778",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.3.3/OrbDrop_0.3.3_android_universal.apk",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.3.3/OrbDrop_0.3.3_android_universal.apk"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.3.4/OrbDrop_0.3.4_android_universal.apk",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.3.4/OrbDrop_0.3.4_android_universal.apk"
       ]
     },
     "arm64-v8a": {
-      "size": 9786911,
-      "sha256": "0146c499772d9e3a72c8147e7b3ed0542ba1cba2f9ad24d53e75f6524b8f0dc9",
+      "size": 9808495,
+      "sha256": "f60fdc5c92f8a6370057bd73e5085d3be63a3f468c089c530648f483594753e7",
       "mirrors": [
-        "https://github.com/x177plus/OrbDrop/releases/download/v0.3.3/OrbDrop_0.3.3_android_arm64.apk",
-        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.3.3/OrbDrop_0.3.3_android_arm64.apk"
+        "https://github.com/x177plus/OrbDrop/releases/download/v0.3.4/OrbDrop_0.3.4_android_arm64.apk",
+        "https://gitee.com/x177plus/OrbDrop/releases/download/v0.3.4/OrbDrop_0.3.4_android_arm64.apk"
       ]
     }
   }
