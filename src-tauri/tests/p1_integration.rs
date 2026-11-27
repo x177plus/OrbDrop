@@ -3727,6 +3727,90 @@ async fn discover_reports_the_whole_view_and_needs_a_paired_token() {
     let _ = std::fs::remove_dir_all(&save_dir);
 }
 
+/// `/discover` 除了报视野，还必须把**调用方自己**的拨号地址学下来。
+///
+/// 回归的是这条真机症状：跨网段时手机每 5s 来问一次 `/discover`，电脑据此把手机画成
+/// 蓝色「在线」，但地址簿里仍是换网前的旧 IP；推送文件一直失败，直到手机主动发一条聊天
+/// 消息（那条路会学地址）。现在来源地址 + 自报端口在 `/discover` 这一问里就写回去。
+#[tokio::test]
+async fn discover_learns_the_callers_dial_address() {
+    let Some(lan_ip) = local_lan_ip() else {
+        eprintln!("跳过：本机没有局域网地址，模拟不出「来自另一台设备」的请求");
+        return;
+    };
+    let save_dir =
+        std::env::temp_dir().join(format!("orbdrop_it_disc_addr_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&save_dir).unwrap();
+
+    let tag = &uuid::Uuid::new_v4().to_string()[..8];
+    let b_id = format!("disc-addr-b-{tag}");
+    let a_id = format!("disc-addr-a-{tag}");
+    let state_b = make_state(4405, &b_id, "PC-B", save_dir.clone());
+    let stale = |ip: &str, port: u16| PeerDevice {
+        id: a_id.clone(),
+        name: "PHONE".into(),
+        ip: ip.into(),
+        port,
+        online: false,
+        paired: true,
+        auto_connect: false,
+        paused: false,
+        relay: None,
+    };
+    state_b.add_peer_book(stale("198.51.100.10", 4407));
+
+    let token = format!("tok-{}", uuid::Uuid::new_v4());
+    credential::set_peer(&a_id, &token).unwrap();
+
+    let port_b = orbdrop_lib::server::start_server(state_b.clone(), 4405)
+        .await
+        .expect("B server");
+    let client = orbdrop_lib::net::client();
+
+    // 走真正的发送端 `fetch_discover`（它会带上本机监听端口），不是手工拼 URL：
+    // 这一步同时钉住"发送方确实把 `?port=` 发出去"和"接收方确实写回地址"。
+    let outcome = orbdrop_lib::state::fetch_discover(
+        &client,
+        &lan_ip.to_string(),
+        port_b,
+        &token,
+        &a_id,
+        4407,
+    )
+    .await;
+    assert!(
+        matches!(outcome, orbdrop_lib::state::DiscoverOutcome::Ok { .. }),
+        "discover 应当成功: {outcome:?}"
+    );
+    let row = state_b.get_peer(&a_id).expect("设备行还在");
+    assert_eq!(row.ip, lan_ip.to_string(), "来源 IP 必须写回设备行");
+    assert_eq!(row.port, 4407, "自报端口必须写回设备行");
+    assert!(row.online, "这一问本身就是在线证据");
+    assert!(row.paired, "关系不能被地址观察写丢");
+
+    // 老版本只发 /discover、不带端口：至少把换过的 IP 纠正过来，端口沿用旧值。
+    state_b.add_peer_book(stale("198.51.100.11", 4407));
+    let url = format!("https://{lan_ip}:{port_b}/discover");
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    let row = state_b.get_peer(&a_id).expect("设备行还在");
+    assert_eq!(row.ip, lan_ip.to_string(), "不带端口也要更新 IP");
+    assert_eq!(row.port, 4407, "不带端口时沿用设备行里的旧端口");
+    assert!(row.online);
+
+    orbdrop_lib::server::stop_server(&state_b).await;
+    credential::remove_peer(&a_id).ok();
+    let _ = std::fs::remove_dir_all(&save_dir);
+}
+
 /// 请求方那半边（F-106）：目标**直连探不通**时，向一台"已配对 + 自报可中转 + 在线"的设备
 /// 请一条端点；拿到之后本机对目标的**拨号地址**就改走端点（`PeerDevice::dial`），直连恢复
 /// 再收起。这条用例同时钉住"请求方不需要自己的开关"和"只挑自报愿意中转的那台"。

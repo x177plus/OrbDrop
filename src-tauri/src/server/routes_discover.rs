@@ -25,7 +25,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -34,6 +34,16 @@ use tracing::debug;
 
 use crate::server::auth::Caller;
 use crate::state::AppState;
+
+/// `/discover` 的查询参数。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverQuery {
+    /// 调用方**实际监听**的端口（服务器顺延过的话，配置值不对）。
+    /// 老版本不带 = 0：只更新 IP，端口沿用设备行里已有的值。
+    #[serde(default)]
+    pub port: u16,
+}
 
 /// 表里的一台设备：**只有身份和地址**。
 ///
@@ -82,9 +92,15 @@ pub struct DiscoverResponse {
 /// 失败路径都要想清楚：**本机离线（隐身）时**由 `presence_middleware` 拦成 503，
 /// 对端据此判本机不在网上（与探活同一套语义）；**没带/带错 token** 由 `auth_middleware`
 /// 拦成 401 —— 对端会退回 `/pair/info` 去问"它还认不认我们"，这一问不带 token 也答。
+///
+/// 这一问还顺带是**地址自报**：调用方 id 由 token 反解、来源地址由 TCP 连接给出，
+/// 再配上它自报的监听端口，就是一条可信的"我此刻在这里"。少了这一步，本机只能把它记成
+/// "听到过"（蓝点），却拿旧地址去拨它 —— 跨网段/换 IP 之后的表现正是"设备在线，但发不出文件"。
 pub async fn discover(
     State(state): State<Arc<AppState>>,
     Extension(caller): Extension<Caller>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    Query(query): Query<DiscoverQuery>,
 ) -> Response {
     // 本机 UI（回环）没有"从哪个网段拨进来"这回事，也不需要这张表：它读共享项走 /shares。
     let Caller::Peer(caller_id) = caller else {
@@ -99,6 +115,11 @@ pub async fn discover(
             config.allow_relay,
         )
     };
+    // **先学地址，再记在线**：`note_heard_online` 在"离线→在线"那一拍会立刻补发排队消息，
+    // 顺序反了会先往旧地址补发一次。学地址本身也会把这一行标成在线并补发一次。
+    // 这一问的来源地址 + 它自报的监听端口就是它下一次可拨的地址；已配对、带 token 的身份
+    // 与入站会话同一条信任链（排除本机自己的监听端点与经中转来的来源）。
+    state.learn_inbound_address(&caller_id, addr.ip(), query.port);
     // 它来问"本机此刻看得见谁"：这一问本身就说明**它在网上**（token 换来的身份，这一档
     // 只对已配对对端开放，见上）。本机拨不回去的那些（AP 隔开单播 / 跨段）靠这条证据
     // 才不会被画成离线 —— 见 `AppState::heard`。

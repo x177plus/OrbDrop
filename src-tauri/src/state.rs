@@ -1009,6 +1009,69 @@ impl AppState {
         let _ = crate::config::save_config_at(&self.config_path, &config);
     }
 
+    /// 一条**已鉴权**的入站请求说明了调用方此刻从哪来（`/discover` 的 TCP 来源 + 自报监听端口）。
+    ///
+    /// 与 `/chat/*` 的地址学习同一条信任链：调用方 id 由 token 反解，来源地址由 TCP 连接给出，
+    /// 不可伪造；已配对的关系由 token 证明。这里只是把“听到过”推进成“知道该往哪拨”——
+    /// 少了这一步，对端每 5s 来探活仍能把设备行撑成蓝色“在线”，但本机手里可能还是旧地址，
+    /// 推送文件会一直失败到对端主动发来一条聊天消息为止。
+    ///
+    /// 排除两类来源：本机自己的监听端点（模拟器/NAT 回连），以及**经另一台设备中转**来的
+    /// 连接（来源是中转方，不是对端；写成对端地址后本机会去拨中转方）。只有地址真的变了才
+    /// 落盘/广播，并把排队等这个地址的消息补发出去。
+    pub fn learn_inbound_address(
+        self: &Arc<Self>,
+        peer_id: &str,
+        source: std::net::IpAddr,
+        reported_port: u16,
+    ) {
+        if peer_id.is_empty() || peer_id == self.own_id {
+            return;
+        }
+        let Some(existing) = self.get_peer(peer_id) else {
+            return;
+        };
+        // 老版本不带端口（0）：沿用设备行里已有的值，至少把换过的 IP 纠正过来。
+        let port = if reported_port != 0 {
+            reported_port
+        } else {
+            existing.port
+        };
+        if port == 0 {
+            return;
+        }
+        let Some((ip, port)) =
+            crate::net::observed_dial_target(source, port, self.listening_port())
+        else {
+            return;
+        };
+        if self.is_relayed_source(source, peer_id) {
+            return;
+        }
+        if existing.ip == ip && existing.port == port {
+            return;
+        }
+        let name = if existing.name.is_empty() {
+            peer_id.to_string()
+        } else {
+            existing.name.clone()
+        };
+        let paired = self.is_paired(peer_id) || existing.paired;
+        self.upsert_peer(&PeerDevice {
+            id: peer_id.to_string(),
+            name,
+            ip: ip.clone(),
+            port,
+            online: true,
+            paired,
+            ..Default::default()
+        });
+        info!(%peer_id, %ip, port, "入站 /discover 自报地址，已更新直连地址");
+        // 地址变了：排队等它上线的消息与群补拉现在有地方可去。
+        crate::chat::flush_queued(self, peer_id);
+        crate::group::sync_with_peer(self, peer_id);
+    }
+
     /// 对端每 5s 的 `/pair/info` 探活：请求本身不带 id/端口，但**带客户端证书**。
     ///
     /// 如果这枚证书正好是本机观察过的某台未配对设备，而来源 IP 与设备行里的地址不同，
@@ -4087,14 +4150,22 @@ pub enum DiscoverOutcome {
 /// 走 `Fallback`），所以"它把带这个 token 的调用方认作谁"的答案恒等于本机 id。
 /// 对端换过 device id 的情形不在这里 —— 那时它不认旧 token，401 退回 `/pair/info`，
 /// 由那条路去问出新的 id。
+///
+/// `own_port` 是本机实际监听端口，随查询参数一起发过去：对端据此把「TCP 来源 + 端口」
+/// 写成下一次可拨回本机的地址（见 `routes_discover::discover` 的地址自报）。老对端会
+/// 忽略这个参数，退回只按来源地址观察。
 pub async fn fetch_discover(
     client: &reqwest::Client,
     ip: &str,
     port: u16,
     token: &str,
     own_id: &str,
+    own_port: u16,
 ) -> DiscoverOutcome {
-    let url = format!("{}/discover", crate::net::peer_base(ip, port));
+    let mut url = format!("{}/discover", crate::net::peer_base(ip, port));
+    if own_port != 0 {
+        url.push_str(&format!("?port={own_port}"));
+    }
     let response = match client.get(&url).bearer_auth(token).send().await {
         Ok(r) => r,
         // 指纹不符是"这个地址上不是它"，不是"它没开机" —— 必须单独报出去，
@@ -4196,7 +4267,7 @@ async fn learn_from_peer(
         entries,
         nets,
         listening_port,
-    } = fetch_discover(&client, ip, port, token, own_id).await
+    } = fetch_discover(&client, ip, port, token, own_id, state.listening_port()).await
     {
         absorb_discover_view(
             state,
@@ -4391,7 +4462,7 @@ async fn probe_addr(
         None => client,
     };
     let probe = match token {
-        Some(t) => match fetch_discover(client, host, port, t, own_id).await {
+        Some(t) => match fetch_discover(client, host, port, t, own_id, state.listening_port()).await {
             DiscoverOutcome::Ok {
                 identity,
                 entries,
